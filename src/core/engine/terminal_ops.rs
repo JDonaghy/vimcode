@@ -178,8 +178,241 @@ impl Engine {
 
     /// Hide the terminal panel but keep all PTY panes running.
     pub fn close_terminal(&mut self) {
+        self.terminal_maximized = false;
         self.terminal_open = false;
         self.terminal_has_focus = false;
+    }
+
+    /// Resolve which zone of the bottom panel contains the click y-coordinate
+    /// using the geometry cached at paint time. Returns `None` if the panel
+    /// isn't currently painted or `y` is above the panel top. `y` is in the
+    /// caller's unit (pixels for GTK, character rows for TUI) — must match
+    /// what the backend wrote into [`BottomPanelGeometry`] at paint time.
+    pub fn resolve_bottom_panel_zone(&self, y: f64) -> Option<BottomPanelZone> {
+        let g = (*self.bottom_panel_geometry.borrow())?;
+        if y < g.top_y || y >= g.top_y + g.height {
+            return None;
+        }
+        let rel = y - g.top_y;
+        let zone = if rel < g.toolbar_y {
+            BottomPanelZone::TabBar
+        } else if rel < g.content_y {
+            BottomPanelZone::Toolbar
+        } else if g.content_row_h > 0.0 {
+            BottomPanelZone::Content {
+                row_offset: ((rel - g.content_y) / g.content_row_h) as u16,
+            }
+        } else {
+            BottomPanelZone::Content { row_offset: 0 }
+        };
+        Some(zone)
+    }
+
+    /// Handle a content click on a non-split terminal pane. Focuses the
+    /// terminal, resets scrollback, and starts a zero-length selection
+    /// at `(col, row)` (0-based cells within the pane). Backends call
+    /// this when there is no `TerminalSplitLayout` cached — in the split
+    /// case, [`Self::handle_terminal_split_click`] delegates here after
+    /// setting the active pane (#429).
+    pub fn handle_terminal_pane_click(&mut self, col: u16, row: u16) {
+        self.terminal_has_focus = true;
+        self.terminal_scroll_reset();
+        if let Some(term) = self.active_terminal_mut() {
+            term.selection = Some(crate::core::terminal::TermSelection {
+                start_row: row,
+                start_col: col,
+                end_row: row,
+                end_col: col,
+            });
+        }
+    }
+
+    /// Handle a click on the terminal content area using a
+    /// `TerminalSplitHit` from the cached layout. Sets pane focus,
+    /// starts selection, or signals a divider drag. Returns `true` if
+    /// the caller should start a split-divider drag.
+    pub fn handle_terminal_split_click(&mut self, hit: quadraui::TerminalSplitHit) -> bool {
+        use quadraui::TerminalSplitHit;
+        self.terminal_has_focus = true;
+        match hit {
+            TerminalSplitHit::Divider => true,
+            TerminalSplitHit::LeftPane { col, row } => {
+                self.terminal_active = 0;
+                self.handle_terminal_pane_click(col, row);
+                false
+            }
+            TerminalSplitHit::RightPane { col, row } => {
+                self.terminal_active = 1;
+                self.handle_terminal_pane_click(col, row);
+                false
+            }
+            TerminalSplitHit::Scrollbar | TerminalSplitHit::Outside => false,
+        }
+    }
+
+    /// Dispatch a click on the bottom panel tab bar using the cached
+    /// `TabBarHits` from the last paint. Returns `true` if the click
+    /// was consumed (tab switch or panel close).
+    pub fn handle_bottom_tab_bar_click(&mut self, click_x: f64) -> bool {
+        enum Action {
+            Close,
+            Switch(BottomPanelKind),
+            None,
+        }
+        let action = {
+            let hits = self.bottom_tab_bar_hits.borrow();
+            let Some(ref hits) = *hits else {
+                return false;
+            };
+            if hits
+                .right_segment_bounds
+                .first()
+                .is_some_and(|&(sx, ex)| click_x >= sx && click_x < ex)
+            {
+                Action::Close
+            } else {
+                let mut kinds = Vec::new();
+                if self.terminal_open {
+                    kinds.push(BottomPanelKind::Terminal);
+                }
+                if !self.dap_output_lines.is_empty() {
+                    kinds.push(BottomPanelKind::DebugOutput);
+                }
+                hits.slot_positions
+                    .iter()
+                    .enumerate()
+                    .find(|(_, &(sx, ex))| click_x >= sx && click_x < ex)
+                    .and_then(|(idx, _)| kinds.get(idx).cloned())
+                    .map_or(Action::None, Action::Switch)
+            }
+        };
+        match action {
+            Action::Close => {
+                self.bottom_panel_open = false;
+                self.close_terminal();
+                true
+            }
+            Action::Switch(kind) => {
+                self.bottom_panel_kind = kind;
+                true
+            }
+            Action::None => false,
+        }
+    }
+
+    /// Resolve a terminal toolbar click to an action using cached hit data.
+    /// Both TUI (cell columns) and GTK (pixel positions) pass screen-absolute
+    /// coordinates; the method accounts for coordinate-system differences
+    /// between `StatusBarLayout` (bar-relative) and `TabBarHits` (absolute).
+    pub fn resolve_terminal_toolbar_click(&self, click_x: f64) -> TerminalToolbarAction {
+        let hits = self.terminal_toolbar_hits.borrow();
+        let Some(ref hits) = *hits else {
+            return TerminalToolbarAction::None;
+        };
+        match hits {
+            TerminalToolbarHits::FindBar { layout, origin_x } => {
+                let rel_x = click_x - origin_x;
+                match layout.hit_test(rel_x as f32, 0.0) {
+                    quadraui::StatusBarHit::Segment(id)
+                        if id.as_str() == "term_toolbar:find_close" =>
+                    {
+                        TerminalToolbarAction::CloseFindBar
+                    }
+                    _ => TerminalToolbarAction::None,
+                }
+            }
+            TerminalToolbarHits::TabStrip(hits) => {
+                for (i, &(sx, ex)) in hits.right_segment_bounds.iter().enumerate() {
+                    if click_x >= sx && click_x < ex {
+                        return match i {
+                            0 => TerminalToolbarAction::AddTab,
+                            1 => TerminalToolbarAction::ToggleSplit,
+                            2 => TerminalToolbarAction::ToggleMaximize,
+                            3 => TerminalToolbarAction::CloseTab,
+                            _ => TerminalToolbarAction::None,
+                        };
+                    }
+                }
+                for (idx, &(sx, ex)) in hits.slot_positions.iter().enumerate() {
+                    if click_x >= sx && click_x < ex && sx < ex {
+                        return TerminalToolbarAction::SwitchTab(idx);
+                    }
+                }
+                TerminalToolbarAction::StartResize
+            }
+        }
+    }
+
+    /// Execute a terminal toolbar action. Returns `false` for `StartResize`
+    /// (backend-local drag state) and `None`; returns `true` for all other
+    /// actions handled internally.
+    pub fn execute_terminal_toolbar_action(
+        &mut self,
+        action: TerminalToolbarAction,
+        ctx: UiEventContext,
+    ) -> bool {
+        match action {
+            TerminalToolbarAction::SwitchTab(idx) => self.terminal_switch_tab(idx),
+            TerminalToolbarAction::CloseTab => self.terminal_close_active_tab(),
+            TerminalToolbarAction::ToggleMaximize => {
+                self.toggle_terminal_maximize();
+                let effective = self.effective_terminal_panel_rows(ctx.terminal_max_rows);
+                if self.terminal_panes.is_empty() {
+                    self.terminal_new_tab(ctx.terminal_cols, effective);
+                } else {
+                    self.terminal_resize(ctx.terminal_cols, effective);
+                }
+            }
+            TerminalToolbarAction::ToggleSplit => {
+                let rows = self.session.terminal_panel_rows;
+                self.terminal_toggle_split(ctx.terminal_cols, rows);
+            }
+            TerminalToolbarAction::AddTab => {
+                let rows = self.session.terminal_panel_rows;
+                self.terminal_new_tab(ctx.terminal_cols, rows);
+            }
+            TerminalToolbarAction::CloseFindBar => {
+                self.terminal_find_active = false;
+            }
+            TerminalToolbarAction::StartResize | TerminalToolbarAction::None => return false,
+        }
+        true
+    }
+
+    /// Toggle "terminal maximized" state.
+    ///
+    /// This only flips `terminal_maximized`; the stored user-preferred panel
+    /// height (`session.terminal_panel_rows`) is left untouched. Each
+    /// backend's layout code is responsible for asking
+    /// [`Engine::effective_terminal_panel_rows`] on every frame, so window
+    /// resizes automatically re-derive the maximized panel size without any
+    /// re-trigger from the keybinding / click handlers.
+    ///
+    /// Opens the terminal panel if it's not already visible, and grabs focus
+    /// on maximize.
+    pub fn toggle_terminal_maximize(&mut self) {
+        if self.terminal_maximized {
+            self.terminal_maximized = false;
+        } else {
+            self.terminal_open = true;
+            self.terminal_has_focus = true;
+            self.terminal_maximized = true;
+        }
+    }
+
+    /// Return the effective content-row count for the terminal panel: either
+    /// the maximized target (backend-computed `max_target_rows`) when the
+    /// maximize flag is set, or the user-preferred `session.terminal_panel_rows`.
+    ///
+    /// Backends call this **every frame** during layout, after they've
+    /// computed how many rows the panel could take given current window
+    /// dimensions. That's what makes window-resize handling automatic.
+    pub fn effective_terminal_panel_rows(&self, max_target_rows: u16) -> u16 {
+        if self.terminal_maximized {
+            max_target_rows.max(self.session.terminal_panel_rows).max(5)
+        } else {
+            self.session.terminal_panel_rows
+        }
     }
 
     /// Toggle the integrated terminal:
@@ -486,6 +719,173 @@ impl Engine {
                 .min(self.terminal_find_matches.len() - 1);
         } else {
             self.terminal_find_selected = 0;
+        }
+    }
+
+    /// Shared terminal key dispatch (#351). The engine decides what a
+    /// keypress means; the backend only needs to execute the returned
+    /// action (clipboard I/O, PTY write). `key_name` uses the same
+    /// canonical names as `handle_key` (e.g. "Return", "Escape", "Up").
+    pub fn handle_terminal_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> TerminalKeyAction {
+        // Alt+1–9: switch terminal tab.
+        if alt && !ctrl && !shift {
+            if let Some(ch) = unicode {
+                if ch.is_ascii_digit() && ch != '0' {
+                    self.terminal_switch_tab((ch as u8 - b'1') as usize);
+                    return TerminalKeyAction::Handled;
+                }
+            }
+        }
+
+        // PageUp / PageDown: scroll scrollback.
+        if !ctrl && !alt && !shift {
+            if key_name == "Page_Up" || key_name == "Prior" {
+                self.terminal_scroll_up(12);
+                return TerminalKeyAction::Handled;
+            }
+            if key_name == "Page_Down" || key_name == "Next" {
+                self.terminal_scroll_down(12);
+                return TerminalKeyAction::Handled;
+            }
+        }
+
+        // Ctrl+Y or Ctrl+Shift+C: copy selection.
+        if ctrl && !alt {
+            if let Some(ch) = unicode {
+                if (ch == 'y' || ch == 'Y') && !shift {
+                    return TerminalKeyAction::CopySelection;
+                }
+                if (ch == 'c' || ch == 'C') && shift {
+                    return TerminalKeyAction::CopySelection;
+                }
+            }
+        }
+
+        // Ctrl+V / Ctrl+Shift+V: paste clipboard.
+        if ctrl && !alt {
+            if let Some(ch) = unicode {
+                if ch == 'v' || ch == 'V' {
+                    return TerminalKeyAction::PasteClipboard;
+                }
+            }
+        }
+
+        // Ctrl+F: toggle terminal find bar.
+        if ctrl && !shift && !alt {
+            if let Some(ch) = unicode {
+                if ch == 'f' || ch == 'F' {
+                    if self.terminal_find_active {
+                        self.terminal_find_close();
+                    } else {
+                        self.terminal_find_open();
+                    }
+                    return TerminalKeyAction::Handled;
+                }
+            }
+        }
+
+        // Find bar active: intercept all keys for search navigation.
+        if self.terminal_find_active {
+            match key_name {
+                "Escape" => self.terminal_find_close(),
+                "Return" if shift => self.terminal_find_prev(),
+                "Return" => self.terminal_find_next(),
+                "BackSpace" => self.terminal_find_backspace(),
+                _ => {
+                    if !ctrl && !alt {
+                        if let Some(ch) = unicode {
+                            self.terminal_find_char(ch);
+                        }
+                    }
+                }
+            }
+            return TerminalKeyAction::Handled;
+        }
+
+        // Ctrl+W in split mode: switch focus between panes.
+        if ctrl && !shift && !alt && self.terminal_split {
+            if let Some(ch) = unicode {
+                if ch == 'w' || ch == 'W' {
+                    self.terminal_split_switch_focus();
+                    return TerminalKeyAction::Handled;
+                }
+            }
+        }
+
+        // Any other key: reset scrollback and forward to PTY.
+        self.terminal_scroll_reset();
+        let data = key_to_pty_bytes(key_name, unicode, ctrl);
+        if data.is_empty() {
+            TerminalKeyAction::Ignore
+        } else {
+            TerminalKeyAction::SendToPty(data)
+        }
+    }
+}
+
+/// Translate a key event to PTY input bytes. Shared by both backends (#351).
+pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
+    if ctrl {
+        if let Some(ch) = unicode {
+            let b = ch as u8;
+            if b.is_ascii() {
+                return vec![b & 0x1f];
+            }
+        }
+        if key_name.len() == 1 {
+            let b = key_name.as_bytes()[0].to_ascii_lowercase();
+            if b.is_ascii_lowercase() {
+                return vec![b & 0x1f];
+            }
+        }
+        return match key_name {
+            "Return" | "KP_Enter" => b"\r".to_vec(),
+            "BackSpace" => b"\x7f".to_vec(),
+            "Tab" => b"\t".to_vec(),
+            _ => vec![],
+        };
+    }
+
+    match key_name {
+        "Return" | "KP_Enter" => b"\r".to_vec(),
+        "BackSpace" => b"\x7f".to_vec(),
+        "Tab" | "ISO_Left_Tab" => b"\t".to_vec(),
+        "Escape" => b"\x1b".to_vec(),
+        "Up" | "KP_Up" => b"\x1b[A".to_vec(),
+        "Down" | "KP_Down" => b"\x1b[B".to_vec(),
+        "Right" | "KP_Right" => b"\x1b[C".to_vec(),
+        "Left" | "KP_Left" => b"\x1b[D".to_vec(),
+        "Home" | "KP_Home" => b"\x1b[H".to_vec(),
+        "End" | "KP_End" => b"\x1b[F".to_vec(),
+        "Delete" | "KP_Delete" => b"\x1b[3~".to_vec(),
+        "Insert" | "KP_Insert" => b"\x1b[2~".to_vec(),
+        "Page_Up" | "KP_Page_Up" | "Prior" => b"\x1b[5~".to_vec(),
+        "Page_Down" | "KP_Page_Down" | "Next" => b"\x1b[6~".to_vec(),
+        "F1" => b"\x1bOP".to_vec(),
+        "F2" => b"\x1bOQ".to_vec(),
+        "F3" => b"\x1bOR".to_vec(),
+        "F4" => b"\x1bOS".to_vec(),
+        "F5" => b"\x1b[15~".to_vec(),
+        "F6" => b"\x1b[17~".to_vec(),
+        "F7" => b"\x1b[18~".to_vec(),
+        "F8" => b"\x1b[19~".to_vec(),
+        "F9" => b"\x1b[20~".to_vec(),
+        "F10" => b"\x1b[21~".to_vec(),
+        "F11" => b"\x1b[23~".to_vec(),
+        "F12" => b"\x1b[24~".to_vec(),
+        _ => {
+            if let Some(ch) = unicode {
+                ch.to_string().into_bytes()
+            } else {
+                vec![]
+            }
         }
     }
 }

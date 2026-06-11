@@ -32,17 +32,24 @@ required-features = ["gui"]
 name = "vcd"
 path = "src/tui_bin.rs"
 
-[[bin]]
-name = "vimcode-win"
-path = "src/win_gui_bin.rs"
-required-features = ["win-gui"]
-
 [features]
 default = ["gui"]
-gui = ["gtk4", "relm4", "pangocairo", "gio"]
-win-gui = ["windows"]
+# `quadraui/gtk` enables the public `quadraui::gtk::draw_*` rasterisers
+# (#223). vimcode adopts them one primitive at a time inside
+# `src/gtk/quadraui_gtk.rs`.
+gui = ["gtk4", "relm4", "pangocairo", "gio", "quadraui/gtk"]
 
 [dependencies]
+# `quadraui/tui` enables the public `quadraui::tui::draw_*` rasterisers
+# (#223). vimcode's TUI binary always builds, so the feature is on by
+# default in the dependency line; the GTK feature ships gated behind
+# vimcode's own `gui` feature above.
+# Quadraui lives in its own repo since Session 346 extraction (see PLAN.md).
+# Path-dep to a sibling checkout: clone https://github.com/JDonaghy/quadraui
+# next to vimcode (i.e. `~/src/quadraui` and `~/src/vimcode` as siblings).
+# CI configuration that doesn't have quadraui sibling-checked-out is
+# currently disabled — see `.github/workflows/*.disabled`.
+quadraui = { path = "../quadraui/quadraui", features = ["tui"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 relm4 = { version = "0.7", optional = true }
 pangocairo = { version = "0.18", optional = true }
@@ -85,27 +92,6 @@ pulldown-cmark = { version = "0.13", default-features = false }
 streaming-iterator = "0.1.9"
 spellbook = "0.4.0"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
-windows = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_System_Com",
-    "Win32_System_LibraryLoader",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Input_Ime",
-    "Win32_UI_Controls",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Shell",
-    "Win32_UI_Shell_Common",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Direct2D",
-    "Win32_Graphics_Direct2D_Common",
-    "Win32_Graphics_DirectWrite",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Gdi",
-    "Win32_System_Registry",
-    "Win32_Security",
-], optional = true }
 
 [dev-dependencies]
 insta = "1.39"

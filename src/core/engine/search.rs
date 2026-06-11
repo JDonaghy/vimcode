@@ -1,5 +1,18 @@
 use super::*;
 
+pub enum SearchInputAction {
+    Consumed,
+    StartSearch,
+    StartReplace,
+    Unfocused,
+    Ignored,
+}
+
+pub enum SearchKeyResult {
+    Consumed,
+    Unfocused,
+}
+
 /// Find word boundaries around char position `pos` in `text`.
 /// Returns `(start, end)` where `start..end` is the word range.
 /// A "word" character is alphanumeric or underscore.
@@ -64,23 +77,94 @@ impl Engine {
     }
 
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
+    ///
+    /// #185: `view.viewport_lines` is updated by the backends on the next
+    /// draw pass, but engine-side operations (e.g. `quickfix_jump`)
+    /// may call this synchronously BEFORE the next draw — at which
+    /// point the cached `viewport_lines` reflects the previous chrome
+    /// configuration. If a panel (quickfix, terminal, debug output,
+    /// wildmenu, debug toolbar) just opened, the cursor can be
+    /// positioned into what used to be the visible area but is now
+    /// hidden behind the new panel. Compute an effective viewport
+    /// that subtracts the currently-visible bottom chrome here.
+    pub(crate) fn effective_viewport_lines(&self) -> usize {
+        let cached = self.view().viewport_lines;
+        let bottom_chrome = self.bottom_chrome_rows_since_last_draw();
+        cached.saturating_sub(bottom_chrome)
+    }
+
+    /// Rows of bottom-of-editor chrome that may have been added since
+    /// the last draw refreshed `view.viewport_lines`. Used to keep
+    /// `ensure_cursor_visible` from scrolling the cursor into a newly
+    /// opened quickfix / terminal / wildmenu panel's area.
+    ///
+    /// Backends are the source of truth for chrome heights and
+    /// normally keep `viewport_lines` fresh — this helper is the
+    /// safety-net for the "state changed in the current tick, draw
+    /// hasn't happened yet" window.
+    fn bottom_chrome_rows_since_last_draw(&self) -> usize {
+        // Quickfix panel. Fixed 6-row height in both backends when open.
+        let qf = if self.quickfix_open && !self.quickfix_items.is_empty() {
+            6
+        } else {
+            0
+        };
+        // Terminal / bottom panel. `effective_terminal_panel_rows` +
+        // 2 (1 for the tab bar, 1 for the panel header) matches what
+        // both backends reserve.
+        let term = if self.terminal_open || self.bottom_panel_open {
+            // `0` as the `target` argument gives the current effective
+            // size — we're not in a maximize transition here, just
+            // reading the steady-state row count.
+            self.effective_terminal_panel_rows(0).saturating_add(2) as usize
+        } else {
+            0
+        };
+        // Wildmenu row (command-line Tab-complete).
+        let wildmenu = if !self.wildmenu_items.is_empty() {
+            1
+        } else {
+            0
+        };
+        // Debug toolbar row (F5 / F6 / F9 / F10 / F11 buttons).
+        let dbg = if self.debug_toolbar_visible { 1 } else { 0 };
+        qf + term + wildmenu + dbg
+    }
+
+    /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
     pub fn ensure_cursor_visible(&mut self) {
         if self.settings.wrap && self.view().viewport_cols > 0 {
             self.ensure_cursor_visible_wrap();
         } else {
             let scrolloff = self.settings.scrolloff;
-            if scrolloff == 0 {
-                self.view_mut().ensure_cursor_visible();
-            } else {
-                let cursor_line = self.view().cursor.line;
-                let viewport_lines = self.view().viewport_lines;
-                let scroll_top = self.view().scroll_top;
-                if cursor_line < scroll_top + scrolloff {
-                    self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
-                } else if viewport_lines > 0
-                    && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
-                {
-                    self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
+            let viewport_lines = self.effective_viewport_lines();
+            let cursor_line = self.view().cursor.line;
+            let scroll_top = self.view().scroll_top;
+            if cursor_line < scroll_top + scrolloff {
+                self.view_mut().scroll_top = cursor_line.saturating_sub(scrolloff);
+            } else if viewport_lines > 0
+                && cursor_line + scrolloff + 1 > scroll_top + viewport_lines
+            {
+                self.view_mut().scroll_top = cursor_line + scrolloff + 1 - viewport_lines;
+            }
+
+            // Horizontal: keep cursor within the visible column range.
+            // Prefer paint-time viewport_cols (exact) over the resize
+            // handler's approximate value.
+            let wid = self.active_window_id();
+            let viewport_cols = self
+                .paint_viewport_cols
+                .borrow()
+                .get(&wid)
+                .copied()
+                .unwrap_or(self.view().viewport_cols);
+            let cursor_col = self.view().cursor.col;
+            let scroll_left = self.view().scroll_left;
+            if viewport_cols > 0 {
+                if cursor_col < scroll_left {
+                    self.view_mut().scroll_left = cursor_col;
+                } else if cursor_col >= scroll_left + viewport_cols {
+                    self.view_mut().scroll_left = cursor_col + 1 - viewport_cols;
                 }
             }
         }
@@ -90,7 +174,9 @@ impl Engine {
     /// soft-wrapped buffer lines) to determine when to adjust `scroll_top`.
     pub(crate) fn ensure_cursor_visible_wrap(&mut self) {
         let viewport_cols = self.view().viewport_cols;
-        let viewport_lines = self.view().viewport_lines;
+        // #185: use effective viewport (accounts for bottom chrome like
+        // the quickfix panel that may have opened in the current tick).
+        let viewport_lines = self.effective_viewport_lines();
         let cursor_line = self.view().cursor.line;
         let cursor_col = self.view().cursor.col;
         let scroll_top = self.view().scroll_top;
@@ -274,6 +360,13 @@ impl Engine {
     /// Synchronise the scroll_top of scroll-bound window pairs.
     /// Called after every key that may move the cursor or scroll, and also
     /// after direct scroll_top mutations (e.g. scrollbar drag).
+    ///
+    /// In aligned-diff mode, also stamps `view.aligned_top` on both panes
+    /// to a single shared aligned-row index so the render starts both
+    /// panes at exactly the same row. Without this, scrolling past a
+    /// hunk drifts the panes by `(adds − removes)` rows of every prior
+    /// hunk because `scroll_top` (a buffer line) cannot identify a
+    /// padding row uniquely (#166).
     pub fn sync_scroll_binds(&mut self) {
         if self.scroll_bind_pairs.is_empty() {
             return;
@@ -288,6 +381,26 @@ impl Engine {
             .map(|s| s.buffer.len_lines())
             .unwrap_or(1)
             .max(1);
+
+        // Pre-compute the active pane's effective aligned-row index from
+        // its scroll_top using the same seek + backup-over-padding logic
+        // the render uses, so both sides see one consistent index.
+        let active_aligned_top: Option<usize> = self.diff_aligned.get(&active_id).map(|aligned| {
+            let seek_idx = aligned
+                .iter()
+                .position(|e| e.source_line.is_some_and(|l| l >= active_scroll))
+                .unwrap_or(aligned.len().saturating_sub(1));
+            let mut k = seek_idx;
+            while k > 0 && aligned[k - 1].source_line.is_none() {
+                k -= 1;
+            }
+            k
+        });
+
+        // Stamp active's aligned_top up front; mirror onto partners below.
+        if let Some(w) = self.windows.get_mut(&active_id) {
+            w.view.aligned_top = active_aligned_top;
+        }
 
         let pairs = self.scroll_bind_pairs.clone();
         for (a, b) in pairs {
@@ -304,6 +417,32 @@ impl Engine {
                     self.md_preview_links.contains_key(&pb)
                         || self.md_preview_links.contains_key(&active_buf_id)
                 });
+                // Compute partner's target (line + aligned_top) ahead of
+                // taking a mutable borrow on the partner window.
+                let partner_aligned_target: Option<(usize, usize)> =
+                    match (active_aligned_top, self.diff_aligned.get(&pid)) {
+                        (Some(k), Some(partner_aligned)) if !partner_aligned.is_empty() => {
+                            let line = if k < partner_aligned.len() {
+                                partner_aligned[k..]
+                                    .iter()
+                                    .find_map(|e| e.source_line)
+                                    .or_else(|| {
+                                        partner_aligned[..k]
+                                            .iter()
+                                            .rev()
+                                            .find_map(|e| e.source_line)
+                                    })
+                                    .unwrap_or(0)
+                            } else {
+                                partner_aligned
+                                    .last()
+                                    .and_then(|e| e.source_line)
+                                    .unwrap_or(0)
+                            };
+                            Some((k, line))
+                        }
+                        _ => None,
+                    };
                 if let Some(w) = self.windows.get_mut(&pid) {
                     if is_md_pair {
                         // Proportional scroll: map source position to preview position.
@@ -315,44 +454,13 @@ impl Engine {
                         let ratio = active_scroll as f64 / active_lines as f64;
                         w.view.scroll_top = ((ratio * partner_lines as f64).round() as usize)
                             .min(partner_lines.saturating_sub(1));
-                    } else if let (Some(active_aligned), Some(partner_aligned)) = (
-                        self.diff_aligned.get(&active_id),
-                        self.diff_aligned.get(&pid),
-                    ) {
-                        // Aligned diff scroll: map active scroll_top through
-                        // aligned sequences so both sides stay in visual lockstep
-                        // even when one side has large padding blocks.
-                        let target_idx = active_aligned
-                            .iter()
-                            .position(|e| e.source_line == Some(active_scroll))
-                            .unwrap_or_else(|| {
-                                // Fallback: find nearest aligned entry at or after active_scroll.
-                                active_aligned
-                                    .iter()
-                                    .position(|e| e.source_line.is_some_and(|l| l >= active_scroll))
-                                    .unwrap_or(active_aligned.len().saturating_sub(1))
-                            });
-                        // Map that aligned index to the partner's buffer line.
-                        let partner_line = if target_idx < partner_aligned.len() {
-                            partner_aligned[target_idx..]
-                                .iter()
-                                .find_map(|e| e.source_line)
-                                .or_else(|| {
-                                    partner_aligned[..target_idx]
-                                        .iter()
-                                        .rev()
-                                        .find_map(|e| e.source_line)
-                                })
-                                .unwrap_or(0)
-                        } else {
-                            partner_aligned
-                                .last()
-                                .and_then(|e| e.source_line)
-                                .unwrap_or(0)
-                        };
+                        w.view.aligned_top = None;
+                    } else if let Some((aligned_top, partner_line)) = partner_aligned_target {
                         w.view.scroll_top = partner_line;
+                        w.view.aligned_top = Some(aligned_top);
                     } else {
                         w.view.scroll_top = active_scroll;
+                        w.view.aligned_top = None;
                     }
                 }
             }
@@ -372,7 +480,6 @@ impl Engine {
         let query = self.project_search_query.clone();
         if query.is_empty() {
             self.project_search_results.clear();
-            self.project_search_selected = 0;
             self.message = "Search query is empty".to_string();
             return;
         }
@@ -381,7 +488,6 @@ impl Engine {
             Ok(results) => self.apply_search_results(results, &query),
             Err(e) => {
                 self.project_search_results.clear();
-                self.project_search_selected = 0;
                 self.message = format!("Invalid regex: {}", e.0);
             }
         }
@@ -394,7 +500,6 @@ impl Engine {
         let query = self.project_search_query.clone();
         if query.is_empty() {
             self.project_search_results.clear();
-            self.project_search_selected = 0;
             self.message = "Search query is empty".to_string();
             return;
         }
@@ -432,7 +537,6 @@ impl Engine {
             Ok(results) => self.apply_search_results(results, &query),
             Err(e) => {
                 self.project_search_results.clear();
-                self.project_search_selected = 0;
                 self.message = format!("Invalid regex: {}", e.0);
             }
         }
@@ -442,55 +546,556 @@ impl Engine {
     /// Store search results and update the status message. Called by both sync and async paths.
     pub(crate) fn apply_search_results(&mut self, results: Vec<ProjectMatch>, query: &str) {
         let capped = results.len() >= 10_000;
-        if results.is_empty() {
-            self.message = format!("No results for \"{}\"", query);
+        let file_count = {
+            let mut files: Vec<&std::path::Path> =
+                results.iter().map(|m| m.file.as_path()).collect();
+            files.sort();
+            files.dedup();
+            files.len()
+        };
+        let status = if results.is_empty() {
+            format!("No results for \"{}\"", query)
         } else {
-            let file_count = {
-                let mut files: Vec<&std::path::Path> =
-                    results.iter().map(|m| m.file.as_path()).collect();
-                files.sort();
-                files.dedup();
-                files.len()
-            };
-            self.message = format!(
+            format!(
                 "{} match{} in {} file{}{}",
                 results.len(),
                 if results.len() == 1 { "" } else { "es" },
                 file_count,
                 if file_count == 1 { "" } else { "s" },
                 if capped { " (capped at 10000)" } else { "" }
-            );
-        }
+            )
+        };
+        self.message = status.clone();
+        self.project_search_status = status;
         self.project_search_results = results;
-        self.project_search_selected = 0;
+        self.search_collapsed_files.borrow_mut().clear();
+        self.search_sidebar_system
+            .borrow_mut()
+            .set_selected_path(1, None);
     }
 
-    /// Toggle case-sensitive project search.
+    /// Toggle case-sensitive project search and re-run if a query exists.
     pub fn toggle_project_search_case(&mut self) {
         self.project_search_options.case_sensitive = !self.project_search_options.case_sensitive;
+        self.rerun_project_search_if_active();
     }
 
-    /// Toggle whole-word project search.
+    /// Toggle whole-word project search and re-run if a query exists.
     pub fn toggle_project_search_whole_word(&mut self) {
         self.project_search_options.whole_word = !self.project_search_options.whole_word;
+        self.rerun_project_search_if_active();
     }
 
-    /// Toggle regex project search.
+    /// Toggle regex project search and re-run if a query exists.
     pub fn toggle_project_search_regex(&mut self) {
         self.project_search_options.use_regex = !self.project_search_options.use_regex;
+        self.rerun_project_search_if_active();
     }
 
-    /// Move the project search selection down by one, clamped to the last result.
-    pub fn project_search_select_next(&mut self) {
-        if !self.project_search_results.is_empty() {
-            self.project_search_selected =
-                (self.project_search_selected + 1).min(self.project_search_results.len() - 1);
+    fn rerun_project_search_if_active(&mut self) {
+        if !self.project_search_query.is_empty() && !self.project_search_results.is_empty() {
+            let root = self.cwd.clone();
+            self.start_project_search(root);
         }
     }
 
-    /// Move the project search selection up by one, clamped to 0.
-    pub fn project_search_select_prev(&mut self) {
-        self.project_search_selected = self.project_search_selected.saturating_sub(1);
+    pub fn handle_search_input_key(
+        &mut self,
+        key: &str,
+        unicode: Option<char>,
+    ) -> SearchInputAction {
+        let focus = self.search_panel_form_focus.borrow().clone();
+        let is_replace = focus.as_deref() == Some("search:replace");
+        let is_query = focus.as_deref() == Some("search:query");
+
+        match key {
+            "Return" => {
+                if is_replace {
+                    let cwd = self.cwd.clone();
+                    self.start_project_replace(cwd);
+                    return SearchInputAction::StartReplace;
+                }
+                let cwd = self.cwd.clone();
+                self.start_project_search(cwd);
+                SearchInputAction::StartSearch
+            }
+            "BackSpace" => {
+                self.search_input_backspace(is_replace);
+                SearchInputAction::Consumed
+            }
+            "Delete" => {
+                self.search_input_delete(is_replace);
+                SearchInputAction::Consumed
+            }
+            "Left" | "Right" | "Home" | "End" => {
+                self.search_input_move_caret(is_replace, key);
+                SearchInputAction::Consumed
+            }
+            "Tab" | "BackTab" => {
+                if is_query {
+                    self.search_panel_form_focus
+                        .replace(Some("search:replace".to_string()));
+                } else {
+                    self.search_panel_form_focus
+                        .replace(Some("search:query".to_string()));
+                }
+                SearchInputAction::Consumed
+            }
+            "Escape" => {
+                self.search_panel_form_focus.replace(None);
+                SearchInputAction::Unfocused
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    let target_replace = if !is_query && !is_replace {
+                        self.search_panel_form_focus
+                            .replace(Some("search:query".to_string()));
+                        false
+                    } else {
+                        is_replace
+                    };
+                    self.search_input_insert_char(target_replace, ch);
+                    SearchInputAction::Consumed
+                } else {
+                    SearchInputAction::Ignored
+                }
+            }
+        }
+    }
+
+    pub fn search_input_insert_char(&mut self, is_replace: bool, ch: char) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        text.insert(pos, ch);
+        caret.set(pos + ch.len_utf8());
+    }
+
+    pub fn search_input_backspace(&mut self, is_replace: bool) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        if pos == 0 {
+            return;
+        }
+        let prev = text[..pos]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        text.remove(prev);
+        caret.set(prev);
+    }
+
+    pub fn search_input_delete(&mut self, is_replace: bool) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        if pos < text.len() {
+            text.remove(pos);
+        }
+    }
+
+    pub fn search_input_move_caret(&mut self, is_replace: bool, key: &str) {
+        let (text, caret) = if is_replace {
+            (&mut self.project_replace_text, &self.replace_text_caret)
+        } else {
+            (&mut self.project_search_query, &self.search_query_caret)
+        };
+        let pos = caret.get().min(text.len());
+        match key {
+            "Left" => {
+                let prev = text[..pos]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                caret.set(prev);
+            }
+            "Right" => {
+                let next = text[pos..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| pos + i)
+                    .unwrap_or(text.len());
+                caret.set(next);
+            }
+            "Home" => caret.set(0),
+            "End" => caret.set(text.len()),
+            _ => {}
+        }
+    }
+
+    pub fn search_input_paste(&mut self, is_replace: bool, clip: &str) {
+        let line = clip.lines().next().unwrap_or("");
+        for ch in line.chars() {
+            if !ch.is_control() {
+                self.search_input_insert_char(is_replace, ch);
+            }
+        }
+    }
+
+    /// Handle a click on a search-panel form element (toggle, button) by widget ID.
+    pub fn handle_search_form_hit(&mut self, id: &str) {
+        match id {
+            "search:case" => self.toggle_project_search_case(),
+            "search:word" => self.toggle_project_search_whole_word(),
+            "search:regex" => self.toggle_project_search_regex(),
+            "search:find_next" => {
+                let root = self.cwd.clone();
+                self.start_project_search(root);
+            }
+            "search:replace_all" => {
+                if self.project_search_results.is_empty() {
+                    self.message = "No search results to replace".to_string();
+                    return;
+                }
+                let query = self.project_search_query.clone();
+                let replace = self.project_replace_text.clone();
+                let file_count = {
+                    let mut files: Vec<&std::path::Path> = self
+                        .project_search_results
+                        .iter()
+                        .map(|m| m.file.as_path())
+                        .collect();
+                    files.sort();
+                    files.dedup();
+                    files.len()
+                };
+                let match_count = self.project_search_results.len();
+                let replace_display = if replace.is_empty() {
+                    "(empty string)".to_string()
+                } else {
+                    format!("\"{}\"", replace)
+                };
+                self.show_dialog(
+                    "search_replace_all",
+                    "Replace All",
+                    vec![format!(
+                        "Replace {} occurrence{} of \"{}\" with {} across {} file{}?",
+                        match_count,
+                        if match_count == 1 { "" } else { "s" },
+                        query,
+                        replace_display,
+                        file_count,
+                        if file_count == 1 { "" } else { "s" },
+                    )],
+                    vec![
+                        DialogButton {
+                            label: "Cancel".to_string(),
+                            hotkey: 'c',
+                            action: "cancel".to_string(),
+                        },
+                        DialogButton {
+                            label: "Replace All".to_string(),
+                            hotkey: 'r',
+                            action: "replace".to_string(),
+                        },
+                    ],
+                );
+            }
+            "search:replace_next" => {
+                if let Some(idx) = self.search_selected_result_idx() {
+                    self.open_search_result(idx);
+                }
+            }
+            "search:buttons" => {
+                let root = self.cwd.clone();
+                self.start_project_search(root);
+            }
+            "search:toggles" => {}
+            "search:query" => {
+                self.search_panel_form_focus
+                    .replace(Some("search:query".to_string()));
+            }
+            "search:replace" => {
+                self.search_panel_form_focus
+                    .replace(Some("search:replace".to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    /// Map a tree path (file_idx, match_within_file) back to a flat result index.
+    fn tree_path_to_result_idx(&self, file_idx: usize, match_idx: usize) -> Option<usize> {
+        let mut current_file: usize = 0;
+        let mut last_file: Option<&std::path::Path> = None;
+        let mut match_within: usize = 0;
+
+        for (i, m) in self.project_search_results.iter().enumerate() {
+            if last_file != Some(m.file.as_path()) {
+                if last_file.is_some() {
+                    current_file += 1;
+                }
+                last_file = Some(m.file.as_path());
+                match_within = 0;
+            }
+            if current_file == file_idx && match_within == match_idx {
+                return Some(i);
+            }
+            match_within += 1;
+        }
+        None
+    }
+
+    /// Set search panel focus state. Both backends call this when
+    /// activating/deactivating the search panel.
+    pub fn search_set_focus(&mut self, focused: bool) {
+        self.search_has_focus = focused;
+        if focused {
+            if matches!(
+                self.mode,
+                Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            ) {
+                if let Some((text, _)) = self.get_visual_selection_text() {
+                    let first_line = text.lines().next().unwrap_or("").to_string();
+                    if !first_line.is_empty() {
+                        self.project_search_query = first_line;
+                        self.search_query_caret.set(self.project_search_query.len());
+                    }
+                }
+                self.mode = Mode::Normal;
+                self.visual_anchor = None;
+            }
+            self.search_panel_form_focus
+                .replace(Some("search:query".to_string()));
+            self.search_sidebar_system
+                .borrow_mut()
+                .set_active_section(Some(0));
+        }
+    }
+
+    /// Switch the search panel from form input to results navigation.
+    /// Called when search results arrive.
+    pub fn search_switch_to_results(&mut self) {
+        if self.search_has_focus && !self.project_search_results.is_empty() {
+            self.search_panel_form_focus.replace(None);
+            self.search_sidebar_system
+                .borrow_mut()
+                .set_active_section(Some(1));
+        }
+    }
+
+    /// Open the file at the given result index and jump to the match line.
+    pub(crate) fn open_search_result(&mut self, result_idx: usize) {
+        if let Some(m) = self.project_search_results.get(result_idx) {
+            let path = m.file.clone();
+            let line = m.line;
+            self.open_file_in_tab(&path);
+            let wid = self.active_window_id();
+            self.set_cursor_for_window(wid, line, 0);
+            self.ensure_cursor_visible();
+        }
+    }
+
+    // =======================================================================
+    // SidebarSystem unified dispatch
+    // =======================================================================
+
+    pub fn dispatch_search_sidebar_key_unified(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        alt: bool,
+        unicode: Option<char>,
+    ) -> SearchKeyResult {
+        // Alt shortcuts work in both form and results mode.
+        if alt {
+            match key {
+                "c" => {
+                    self.toggle_project_search_case();
+                    return SearchKeyResult::Consumed;
+                }
+                "w" => {
+                    self.toggle_project_search_whole_word();
+                    return SearchKeyResult::Consumed;
+                }
+                "r" => {
+                    self.toggle_project_search_regex();
+                    return SearchKeyResult::Consumed;
+                }
+                "h" => {
+                    let root = self.cwd.clone();
+                    self.start_project_replace(root);
+                    return SearchKeyResult::Consumed;
+                }
+                _ => {}
+            }
+        }
+
+        if ctrl && key == "b" {
+            self.search_has_focus = false;
+            return SearchKeyResult::Unfocused;
+        }
+
+        let active = self.search_sidebar_system.borrow().active_section();
+        let form_active = active == Some(0);
+
+        if form_active {
+            let action = self.handle_search_input_key(key, unicode);
+            if let SearchInputAction::Unfocused = action {
+                self.search_panel_form_focus.replace(None);
+                self.search_sidebar_system
+                    .borrow_mut()
+                    .set_active_section(Some(1));
+            }
+            return SearchKeyResult::Consumed;
+        }
+
+        // Results section active — navigation + domain keys.
+        use quadraui::{Key, NamedKey};
+        let nav_key = match key {
+            "j" | "Down" => Some(Key::Named(NamedKey::Down)),
+            "k" | "Up" => Some(Key::Named(NamedKey::Up)),
+            "Home" => Some(Key::Named(NamedKey::Home)),
+            "End" => Some(Key::Named(NamedKey::End)),
+            "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
+            "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
+            _ => None,
+        };
+        if let Some(k) = nav_key {
+            self.search_sidebar_navigate(k);
+            return SearchKeyResult::Consumed;
+        }
+
+        match key {
+            "Return" | "Enter" => {
+                if let Some(idx) = self.search_selected_result_idx() {
+                    self.open_search_result(idx);
+                    self.search_has_focus = false;
+                    return SearchKeyResult::Unfocused;
+                }
+                SearchKeyResult::Consumed
+            }
+            "Tab" => {
+                self.search_panel_form_focus
+                    .replace(Some("search:query".to_string()));
+                self.search_sidebar_system
+                    .borrow_mut()
+                    .set_active_section(Some(0));
+                SearchKeyResult::Consumed
+            }
+            "Escape" | "q" => {
+                self.search_has_focus = false;
+                SearchKeyResult::Unfocused
+            }
+            "h" | "Left" => {
+                self.search_has_focus = false;
+                SearchKeyResult::Unfocused
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    if !ctrl {
+                        self.search_panel_form_focus
+                            .replace(Some("search:query".to_string()));
+                        self.search_input_insert_char(false, ch);
+                        self.search_sidebar_system
+                            .borrow_mut()
+                            .set_active_section(Some(0));
+                        return SearchKeyResult::Consumed;
+                    }
+                }
+                SearchKeyResult::Consumed
+            }
+        }
+    }
+
+    fn search_sidebar_navigate(&mut self, key: quadraui::Key) {
+        let rect = self.search_sidebar_body_rect.get();
+        let ev = quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        };
+        let sidebar_event = self
+            .search_sidebar_system
+            .borrow_mut()
+            .handle_cached(&ev, rect);
+        self.dispatch_search_sidebar_event(sidebar_event);
+    }
+
+    pub fn dispatch_search_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { .. } => {
+                if let Some(idx) = self.search_selected_result_idx() {
+                    self.open_search_result(idx);
+                    self.search_has_focus = false;
+                }
+                true
+            }
+            quadraui::SidebarEvent::FormEvent { event, .. } => {
+                use quadraui::FormEvent;
+                match event {
+                    FormEvent::ButtonClicked { id } => {
+                        self.handle_search_form_hit(id.as_str());
+                    }
+                    FormEvent::FocusChanged { id } => {
+                        let id_str = id.as_str();
+                        if id_str == "search:query" || id_str == "search:replace" {
+                            self.search_panel_form_focus
+                                .replace(Some(id_str.to_string()));
+                            self.search_sidebar_system
+                                .borrow_mut()
+                                .set_active_section(Some(0));
+                        }
+                    }
+                    FormEvent::ToggleChanged { id, .. } => {
+                        self.handle_search_form_hit(id.as_str());
+                    }
+                    _ => {}
+                }
+                true
+            }
+            quadraui::SidebarEvent::RowSelected { section, path } => {
+                self.search_panel_form_focus.replace(None);
+                if section == 1 && path.len() == 1 {
+                    let fi = path[0] as usize;
+                    let mut collapsed = self.search_collapsed_files.borrow_mut();
+                    if collapsed.contains(&fi) {
+                        collapsed.remove(&fi);
+                    } else {
+                        collapsed.insert(fi);
+                    }
+                }
+                true
+            }
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.search_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
+                true
+            }
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true,
+        }
+    }
+
+    pub fn handle_search_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
+        let rect = self.search_sidebar_body_rect.get();
+        let sidebar_event = self
+            .search_sidebar_system
+            .borrow_mut()
+            .handle_cached(&event, rect);
+        self.dispatch_search_sidebar_event(sidebar_event)
+    }
+
+    pub fn search_selected_result_idx(&self) -> Option<usize> {
+        let sidebar = self.search_sidebar_system.borrow();
+        let path = sidebar.selected_path(1)?;
+        if path.len() >= 2 {
+            self.tree_path_to_result_idx(path[0] as usize, path[1] as usize)
+        } else {
+            None
+        }
     }
 
     // =======================================================================
@@ -630,7 +1235,9 @@ impl Engine {
 
         // Clear stale search results since files have changed.
         self.project_search_results.clear();
-        self.project_search_selected = 0;
+        self.search_sidebar_system
+            .borrow_mut()
+            .set_selected_path(1, None);
     }
 }
 

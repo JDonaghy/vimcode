@@ -1,175 +1,107 @@
+## Platform-Neutrality Rule (MANDATORY — overrides all other guidance)
+
+**NEVER add per-backend code to vimcode to fix a problem.** If a feature requires new code in `src/gtk/` or `src/tui_main/` beyond thin event-to-engine wiring, STOP. Do not attempt the fix. Instead:
+
+1. Identify what quadraui infrastructure is missing.
+2. File a quadraui issue describing the gap.
+3. Build the infrastructure in quadraui first.
+4. Only then implement the vimcode side through the shared API.
+
+**Push back actively.** If the user asks to implement something that would require per-backend code, say so upfront and propose the quadraui-first alternative.
+
+**How to verify:** Before writing any code in a backend file, compare against the relevant quadraui example (`~/src/quadraui/quadraui/examples/`). If the example achieves the same feature with zero backend-specific code, your approach is wrong. Build the shared function in `render.rs` or the engine, have each backend call it in 1-3 lines of wiring.
+
+**Negative example (#319, Session 353):** Menu dropdown keyboard nav was implemented with a GTK overlay DA + Msg dispatch + separate click/motion handlers (~100 lines GTK-specific) vs TUI inline handling (~50 lines TUI-specific). The quadraui `menu_bar_app` example does the same thing with ZERO backend-specific code — one `dropdown_layout()` function called by both backends, one `handle()` method for keyboard/mouse. Three attempts were made and reverted before recognising the architectural mistake.
+
+**Never edit the quadraui repo directly.** The vimcode agent must not modify files under `~/src/quadraui/`. File a GitHub issue on `JDonaghy/quadraui` describing the gap, then wait for the user to confirm the quadraui change has landed.
+
+## Codebase navigation — query the graph first
+
+This repo ships a **graphify** knowledge graph in `graphify-out/` (`graph.json`,
+`GRAPH_REPORT.md`), kept current automatically by `post-commit` / `post-checkout`
+git hooks. For any architecture / "where is this handled" / "what calls this" /
+file-relationship question, **query the graph first** (the `graphify` skill, or the
+graphify CLI) before reaching for grep/Read. Grep/Read are for exact-string or
+line-level confirmation — not the first move.
+
 ## Session Start Protocol
 1. Read `PROJECT_STATE.md` for current progress
-2. Check `.opencode/specs/` for detailed feature specs before starting
-3. Run `gh issue list --state open` and `gh issue list --state open --milestone` to see active work, milestones, and priorities
-4. Prompt user to update `PROJECT_STATE.md` after significant tasks
+2. Read `PLAN.md` if present — pickup doc for in-flight multi-stage features
+3. **If the work touches `quadraui/`** — read `docs/QUADRAUI_GUIDE.md` and quadraui repo's `DECISIONS.md` + `BACKEND_TRAIT_PROPOSAL.md` §9
+4. **If navigating unfamiliar code** — read `docs/ARCHITECTURE.md` for directory layout, engine submodule map, and data model
+5. Check `.opencode/specs/` for detailed feature specs before starting
+6. Run `gh issue list --state open` to see active work and priorities
+7. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
 
-## Issue-Driven Workflow
-All non-trivial work should be tracked via GitHub Issues. Issues are the source of truth for what needs doing, why, and what the design is.
+### Stale quadraui checkout — first thing to suspect on a build break
 
-**Starting work on an issue:**
-1. Create a feature branch from `develop`: `git checkout -b issue-{number}-{short-description} develop`
-2. Do the work on that branch, committing as you go
-3. **Do NOT push or create a PR until the user has run smoke tests and confirmed the changes work.** Commit locally, offer smoke tests, wait for approval before pushing.
-4. When the user approves, push and create a PR to `develop` using `gh pr create` — reference the issue with "Closes #{number}" in the PR body
-5. The user reviews and merges the PR. When the user confirms the merge, immediately close the issue with `gh issue close <number> -c "Implemented in PR #N"` — do not rely on GitHub auto-close
+Vimcode depends on `quadraui` via a **path dependency** to the sibling `~/src/quadraui` checkout (see `Cargo.toml` line ~48), not a crates.io version. There is **no version pinning** — whatever is checked out at `~/src/quadraui` is what gets compiled.
 
-**Creating issues:**
-- At session end, create issues for any planned but unstarted work discussed during the session
-- Include full design context in the issue body — file paths, API details, expected behavior, Neovim reference values
-- Use milestones to group related work (e.g., "Vim Conformance")
-- Use labels for categorization (`conformance`, `testing`, `bug:vim-deviation`, `lua-api`, etc.)
-- Issues should be self-contained — a new session should be able to pick one up and implement it from the issue body alone
+If `cargo build` on a fresh `develop` (or any branch) fails with errors like "no variant named X found for enum Y", "no method named Z found", or "expected N args, found M" on a `quadraui::*` type, **the most likely cause is that your local quadraui checkout lags behind the API vimcode was written against** — not a vimcode bug.
 
-**Bug fixes found during other work:**
-- If a bug is found while working on something else, create a separate issue for it
-- Fix it on the current branch if it's small and directly related, or leave it for a separate branch if it's independent
+Before debugging further:
 
-## Documentation Maintenance (MANDATORY)
-After completing any feature or significant change, update ALL of these files:
-- **`README.md`** — the primary user-facing reference; keep the feature tables, key reference, and command list accurate and complete; update the test count in the intro line
-- **`PROJECT_STATE.md`** — internal progress tracker; update session date, test counts, file sizes, recent work entry, and roadmap checkboxes
-- **GitHub Issues** — close completed issues, create new ones for planned work; update milestones as needed (PLAN.md archived — issues are the source of truth)
-- **`EXTENSIONS.md`** — extension development guide; update if any Lua API functions, events, manifest fields, or plugin loading behavior change
-- **`SUMMARIES/`** — update any summary file whose source file was modified (new methods, changed types, significant line count changes); see below
+```bash
+cd ~/src/quadraui && git pull && cd -
+cargo build
+```
 
-## Code Summaries (`SUMMARIES/`)
-The `SUMMARIES/` directory contains concise summaries of every major source file. These save tokens by letting you understand file contents without reading thousands of lines.
+Only investigate the vimcode side if the error persists after pulling quadraui. Do not "fix" vimcode to match a stale quadraui — you'll just undo work that already shipped on the quadraui side.
 
-**When to read:** At session start or before working on a file you haven't read yet — check the summary first to understand structure and find the right methods.
+## Conditional Reference Files
 
-**When to update:** After modifying any source file that has a summary, update the corresponding summary to reflect:
-- New or removed public methods/functions
-- New or removed structs/enums/types
-- Changed line count (update the number)
-- Changed file purpose or responsibilities
+| File | Load when |
+|------|-----------|
+| `docs/ARCHITECTURE.md` | Working on code structure, adding files, navigating unfamiliar modules |
+| `docs/QUADRAUI_GUIDE.md` | Quadraui migrations, cross-backend rendering, paint↔click integration |
+| `docs/PATTERNS.md` | Adding new keys, commands, settings, theme colors, or clickable UI |
+| `docs/DOC_MAINTENANCE.md` | After completing any feature — lists all files to update |
+| `docs/COORDINATOR.md` | Designated as coordinator for multi-machine parallel work |
 
-**Format:** Each summary file covers one source file and contains: purpose, line count, key types, and key public methods. Keep entries to one line each — no implementation details.
+## Agent Roles
 
-**Naming:** `SUMMARIES/gtk_mod.md`, `SUMMARIES/engine_keys.md`, `SUMMARIES/render.md`, etc. (path segments joined with `_`, no extension in name).
+The default role is **developer** — read issues, write code, run tests, open PRs.
 
-**README.md update rules:**
-- Add new keys/commands to the appropriate Key Reference table
-- Add new `:` commands to the Command Mode table
-- Add new git commands to the git commands table
-- Add new settings to the settings table
-- Update architecture section if new files are added or line counts change significantly
-- Do NOT add speculative/planned features — only document what is implemented
+If the user designates you as **coordinator**, switch to planning mode: read `docs/COORDINATOR.md` and follow that protocol. Coordinators don't write code — they track work across machines, prevent file conflicts, and assign the next issue when an agent finishes.
 
+## Development Workflow
+
+All non-trivial work should be tracked via GitHub Issues.
+
+**Documentation-only changes** (pure `.md` edits) may be committed directly to `develop` and pushed. No branch, no smoke test. If any code changes accompany the doc edit, use the full branch workflow.
+
+**For all other changes:**
+
+1. **Claim the issue before starting work.** Multiple agents may be active concurrently — claim publicly so nobody picks up the same issue. Run `gh issue edit <N> --add-assignee @me`, create the feature branch from `develop` (`issue-{number}-{short-description}`), and push it empty so it appears on the remote as the claim signal. Pushing an empty branch is NOT opening a PR.
+2. **Work on that branch**, committing as you go. Never commit code directly to `develop`. For non-issue work, use `{kind}-{short-description}` naming and you may skip the claim step.
+3. **Do NOT open a PR yet.** Keep the branch in "commits pushed, no PR" state until the user has run smoke tests or explicitly agreed testing is not needed. Subsequent pushes to the claim branch are fine.
+4. **Once approved, ask the user which landing path:**
+   - **Path A — merge locally + push.** For small/trivial changes: `git merge --ff-only <branch>`, push `develop`, delete the branch.
+   - **Path B — open PR.** For normal feature/bugfix work: open a PR to `develop` against the already-pushed branch. Reference "Closes #{number}" if it closes an issue.
+5. **When the user confirms a merge that closes an issue**, immediately `gh issue close <number>` and unassign yourself.
+
+**Creating issues:** Include full design context in the body — file paths, API details, expected behavior. Issues should be self-contained so a new session can pick one up.
 
 ## Architecture
 
-**VimCode**: Vim-like code editor in Rust with GTK4/Relm4. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI) vs `src/win_gui/` (native Windows). `src/main.rs` is a thin CLI dispatcher.
+**VimCode**: Vim-like code editor in Rust. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI). `src/main.rs` is a thin CLI dispatcher. A native Windows backend will be re-added as a thin wrapper when the quadraui Win backend ships (quadraui#19–#31).
 
-**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey (text rope), Tree-sitter (parsing), Pango+Cairo (rendering), ratatui+crossterm (TUI), windows-rs+Direct2D+DirectWrite (Win-GUI)
+**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey, Tree-sitter, Pango+Cairo, ratatui+crossterm
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
 
-**Multi-backend rule:** There are THREE UI backends (GTK, TUI, Win-GUI). When fixing bugs or adding features that touch mouse handling, drag behavior, layout calculations, click detection, rendering, or panel interactions — check and update ALL THREE backends. The Win-GUI backend (`src/win_gui/`) is the newest and may lag behind on features; at minimum verify whether the change applies there. When building a new native GUI backend (e.g. macOS), read **`docs/NATIVE_GUI_LESSONS.md`** first — it documents pitfalls from Win-GUI (breadcrumb offset bugs, multi-group layout issues, click/draw parity, backend checklist).
+**Multi-backend rule:** TWO UI backends (GTK, TUI). When fixing bugs or adding features that touch mouse handling, drag, layout, click detection, or rendering — check and update BOTH backends. See `docs/ARCHITECTURE.md` for directory layout and engine submodule map.
 
-### GTK directory (`src/gtk/`)
+## Commands & Quality Checks
 
-| File | What goes here |
-|------|---------------|
-| `mod.rs` | App struct, Msg enum, `SimpleComponent` impl (view/init/update), `impl App`, geometry helpers |
-| `draw.rs` | All `draw_*` free functions (editor, panels, popups, sidebars) |
-| `click.rs` | `ClickTarget` enum, `pixel_to_click_target()`, mouse click/drag/double-click handlers |
-| `css.rs` | `make_theme_css()`, `STATIC_CSS`, `load_css()` |
-| `util.rs` | `matches_gtk_key()`, settings form builders, GTK utilities, icon install |
-| `tree.rs` | File tree building/expansion/indicators, name prompt/validation |
-
-### TUI directory (`src/tui_main/`)
-
-| File | What goes here |
-|------|---------------|
-| `mod.rs` | Structs, `run()`, `event_loop()`, clipboard, key translation, cell helpers |
-| `render_impl.rs` | `draw_frame()`, `build_screen_for_tui()`, tab bar, editor/popup rendering |
-| `panels.rs` | Sidebar panel rendering (activity bar, explorer, git, debug, extensions, AI, search, terminal) |
-| `mouse.rs` | `handle_mouse()` — all click/drag/scroll interactions |
-
-### Win-GUI directory (`src/win_gui/`)
-
-Native Windows backend using `windows-rs` + Direct2D + DirectWrite. Behind `win-gui` Cargo feature. Consumes `ScreenLayout` from `render.rs` — same pattern as GTK/TUI. Some features are still missing (see BUGS.md for known Win-GUI gaps).
-
-| File | What goes here |
-|------|---------------|
-| `mod.rs` | Win32 window creation, D2D/DWrite setup, event loop, keyboard/mouse handling, rendering |
-
-### Engine directory (`src/core/engine/`)
-
-The Engine is split into focused submodules. Each file adds `impl Engine` blocks — Rust resolves methods across files transparently.
-
-| File | What goes here |
-|------|---------------|
-| `mod.rs` | Types, enums, `Engine` struct def, `new()`, free functions, `mod` declarations |
-| `keys.rs` | `handle_key`, `handle_normal_key`, `handle_pending_key`, operator motions, macros, repeat, user keymaps |
-| `insert.rs` | *(future)* `handle_insert_key`, `handle_replace_key` — currently in keys.rs |
-| `command.rs` | *(future)* `handle_command_key`, `handle_search_key` — currently in keys.rs |
-| `visual.rs` | `handle_visual_key`, visual helpers, multi-cursor |
-| `execute.rs` | `execute_command()` — the ex-command dispatcher |
-| `motions.rs` | Cursor movement, word/paragraph/scroll, bracket nav, join, indent, jump list |
-| `buffers.rs` | File I/O, syntax update, undo/redo, git diff, markdown preview, netrw, workspace |
-| `windows.rs` | Window/tab/group splits, focus, resize, session restore |
-| `accessors.rs` | Group/buffer/window facades |
-| `search.rs` | Project search/replace, search highlighting |
-| `source_control.rs` | All `sc_*` methods, `handle_sc_*` key handlers |
-| `lsp_ops.rs` | All `lsp_*` methods, code actions, diagnostics, hover, completion |
-| `ext_panel.rs` | `ext_*` methods, `handle_ext_*`, extension + settings panel |
-| `panels.rs` | AI (`ai_*`), dialog system, swap files |
-| `plugins.rs` | Plugin init, event dispatch, command/keymap hooks |
-| `dap_ops.rs` | DAP/debug: poll_dap, breakpoints, sidebar, stepping |
-| `vscode.rs` | VSCode mode, menu bar methods |
-| `picker.rs` | Fuzzy score, unified picker, quickfix |
-| `terminal_ops.rs` | All `terminal_*` methods |
-| `spell_ops.rs` | Spell checking methods |
-| `tests.rs` | All test functions + helpers |
-
-**File size rule:** No single file should exceed ~5,000 lines. If a submodule grows past that, split it further (e.g. `keys.rs` → `keys.rs` + `insert.rs` + `command.rs`). Place new `impl Engine` methods in the submodule matching their responsibility — never dump unrelated methods into `mod.rs`.
-
-**Submodule conventions:**
-- Each submodule starts with `use super::*;` to import all engine types
-- Methods that other submodules call must be `pub(crate) fn`, not `fn`
-- References to sibling core modules use `crate::core::module::` (not `super::module::`, which would look inside engine/)
-- Free functions used across submodules stay in `mod.rs` and are accessed via `super::function_name`
-
-## Data Model
-```
-Engine
-├── BufferManager { HashMap<BufferId, BufferState> }
-│   └── BufferState { buffer: Buffer, file_path, dirty, syntax, undo/redo }
-├── windows: HashMap<WindowId, Window { buffer_id, view }>
-├── tabs: Vec<Tab { layout: WindowLayout (binary tree), active_window }>
-├── registers: HashMap<char, (String, bool)>  # (content, is_linewise)
-└── State: mode, command_buffer, message, search_*, pending_key, pending_operator
-```
-
-**Concepts:** Buffer (in-memory file) | Window (viewport+cursor) | Tab (window layout) | Multiple windows can show same buffer.
-
-## Commands
 ```bash
-cargo build               # Compile
-cargo test                # Run all tests
-cargo clippy -- -D warnings  # Lint (must pass)
-cargo fmt                 # Format
+cargo build                       # Compile
+cargo test --no-default-features  # Run all tests
+cargo clippy -- -D warnings       # Lint (must pass)
+cargo fmt                         # Format
 ```
 
-## Quality Checks (MANDATORY Before Commits)
-**CRITICAL:** After making ANY code changes and before creating commits, ALWAYS run:
-1. `cargo fmt` - Format code
-2. `cargo clippy -- -D warnings` - Check linting (must have zero warnings)
-3. `cargo test` - Verify all tests pass
-4. `cargo build` - Ensure compilation succeeds
-
-If any check fails, fix immediately and re-run. Only commit when ALL checks pass.
-This prevents CI failures and maintains code quality.
-
-## Branching & Releases
-- All work happens on `develop`; `main` is the release branch
-- Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
-- Before creating the PR: bump version in `Cargo.toml` (minor for features, patch for fixes)
-- If `Cargo.lock` changed since the last release: regenerate `flatpak/cargo-sources.json` with `python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json` (script from `flatpak/flatpak-builder-tools` repo)
-- Merging the PR to `main` triggers `release.yml` which creates a GitHub Release tagged `v$VERSION`
-- Never push directly to `main` — always merge from `develop` via PR
+**MANDATORY before commits:** Run all four commands above. If any fails, fix and re-run. `cargo test --no-default-features --lib` is faster for dev loops but the full suite is the pre-commit gate.
 
 ## Code Style
 - `rustfmt` defaults (4-space indent)
@@ -177,48 +109,14 @@ This prevents CI failures and maintains code quality.
 - Core: Return `Result<T, E>` for I/O, silent no-ops for bounds
 - Tests in `#[cfg(test)] mod tests` at file bottom
 
-## Theme Colors (CRITICAL)
-**NEVER introduce new hex color literals for derived theme fields.** Every new color added to the `Theme` struct must be derived from an existing foundational theme field (`background`, `foreground`, etc.) using `lighten()`/`darken()`/`cursorline_tint()`/`colorcolumn_tint()` or similar. Use a local variable to avoid repeating hex strings:
-```rust
-pub fn onedark() -> Self {
-    let bg = Color::from_hex("#1a1a1a");
-    Self {
-        background: bg,
-        new_derived_color: bg.some_tint(),  // GOOD: derived from variable
-        // bad_color: Color::from_hex("#2c313a"),  // BAD: hardcoded hex
-    }
-}
-```
-**Why:** Hardcoded hex values don't adapt to custom themes or VSCode theme imports. Only foundational colors (background, foreground, keyword, string, etc.) should have hex literals. VSCode theme imports (`from_vscode_json`) can override derived values with user-specified exact colors.
-
 ## Testing (CRITICAL)
-**NEVER run `cargo test` with the `win-gui` feature enabled.** This spawns hundreds of real Win32 windows and locks up the machine. Use these commands instead:
-- **Run tests:** `cargo test --no-default-features --lib` (no GTK, no win-gui)
-- **Build win-gui:** `cargo build --bin vimcode-win --features win-gui --no-default-features`
-- **Clippy win-gui:** `cargo clippy --features win-gui --no-default-features`
-- NEVER combine `cargo test` with `--features win-gui`
+- **Full test suite:** `cargo test --no-default-features` — lib + integration tests
+- **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only
 
-## Common Patterns
-
-**Hit regions for clickable UI elements:** When adding clickable elements to the find/replace overlay (or future UI panels), define hit regions in `engine/mod.rs` using `FrHitRegion` + `FindReplaceClickTarget` types. Compute regions once in `build_screen_layout()`, then backends walk the region list to resolve clicks. Dispatch through a shared `Engine::handle_*_click()` method. This avoids per-backend geometry duplication and is the established pattern for crate extraction. See `compute_find_replace_hit_regions()` as the reference implementation.
-
-**Add Normal Mode Key:** `engine/keys.rs` → `handle_normal_key()` → add match arm → test
-
-**Add Command:** `engine/execute.rs` → `execute_command()` → add match arm → test
-
-**Add Operator+Motion:** `engine/keys.rs` → set `pending_operator` → implement in `handle_operator_motion()` → test
-
-**Ctrl-W Command:** `engine/keys.rs` → `handle_pending_key()` under `'\x17'` case
-
-**Engine Facade Methods:** `buffer()`, `buffer_mut()`, `view()`, `view_mut()`, `cursor()` — all operate on active window's buffer
-
-**Show User-Facing Info (About, errors, confirmations):** Use the modal dialog system (`show_dialog()` / `show_error_dialog()`) rather than `self.message`. Dialogs are preferred for anything that deserves user attention — the message bar is for transient status only.
-
-**Add New Setting:** When adding a new user-configurable setting, update ALL FOUR of these:
-1. Add field to `Settings` struct in `settings.rs` with `#[serde(default = "default_fn_name")]`
-2. Create default function returning sensible default value
-3. Update `Default` impl to include the field
-4. Add to `get_value_str()` and `set_value_str()` in `settings.rs`
-5. Add a `SettingDef` entry to `SETTING_DEFS` in `render.rs` (controls the Settings sidebar UI)
-6. Settings are automatically merged: new fields are added to existing settings files without overwriting user values
-7. Document the setting name and purpose in comments
+## Branching & Releases
+- All work happens on `develop`; `main` is the release branch
+- Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
+- Before creating the PR: bump version in `Cargo.toml`
+- If `Cargo.lock` changed: regenerate `flatpak/cargo-sources.json` with `python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json`
+- Merging the PR to `main` triggers `release.yml` which creates a GitHub Release tagged `v$VERSION`
+- Never push directly to `main`

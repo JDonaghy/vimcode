@@ -1,5 +1,132 @@
 use super::*;
 
+/// Compute the `grab_offset` to seed [`quadraui::DragTarget::ScrollbarY`]
+/// at click-down time so the thumb doesn't jump out from under the cursor.
+///
+/// Mirrors the thumb math `dispatch_mouse_drag` uses: if `cursor_y` lands
+/// inside the visible thumb (between `thumb_top` and `thumb_top + thumb_length`),
+/// returns the cursor's offset from the thumb top — the cursor stays at
+/// the same relative spot on the thumb during the drag.
+///
+/// If `cursor_y` is on the track outside the thumb (or above/below the
+/// track entirely), returns `0.0` — the standard "click track to jump"
+/// behavior where the thumb hops to put its top at the cursor.
+fn scrollbar_grab_offset(
+    cursor_y: f32,
+    track_start: f32,
+    track_length: f32,
+    visible_rows: usize,
+    total_items: usize,
+    current_scroll: usize,
+) -> f32 {
+    if track_length <= 0.0 || total_items == 0 {
+        return 0.0;
+    }
+    let thumb_ratio = (visible_rows as f32 / total_items as f32).min(1.0);
+    let thumb_length = (track_length * thumb_ratio).max(1.0);
+    let max_scroll = total_items.saturating_sub(visible_rows);
+    let effective_track = (track_length - thumb_length).max(1.0);
+    let scroll_ratio = if max_scroll == 0 {
+        0.0
+    } else {
+        (current_scroll as f32 / max_scroll as f32).clamp(0.0, 1.0)
+    };
+    let thumb_top = track_start + scroll_ratio * effective_track;
+    let dy = cursor_y - thumb_top;
+    if dy >= 0.0 && dy < thumb_length {
+        dy
+    } else {
+        0.0
+    }
+}
+
+/// Run [`quadraui::dispatch_mouse_drag`] for an active drag and apply the
+/// resulting `ScrollOffsetChanged` events to the matching scroll-state
+/// fields. Returns `true` if any event was handled (caller can short-circuit).
+///
+/// Used by both the mouse-drag path (to handle continued drags) and the
+/// mouse-down path (to apply the click-time offset using the same
+/// thumb-aware math the drag will use, eliminating the visual "jump and
+/// correct" jankiness when the click-down math differs from drag math).
+fn apply_scrollbar_drag(
+    drag_state: &quadraui::DragState,
+    point: quadraui::Point,
+    engine: &mut Engine,
+    _sidebar: &mut TuiSidebar,
+) -> bool {
+    let events = quadraui::dispatch_mouse_drag(drag_state, point, Default::default());
+    let mut handled = false;
+    for ev in &events {
+        if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
+            let key = widget.as_str();
+            match key {
+                "explorer:sb" => {
+                    engine
+                        .explorer_tree
+                        .borrow_mut()
+                        .set_scroll_offset(*new_offset);
+                    handled = true;
+                }
+                "ext_panel:sb" => {
+                    engine.ext_panel_scroll_top = *new_offset;
+                    handled = true;
+                }
+                "editor_hover" => {
+                    engine.editor_hover_set_scroll(*new_offset);
+                    handled = true;
+                }
+                "tui:search_results" => {
+                    handled = true;
+                }
+                // Inverted scrollbars: top of track = max offset (oldest
+                // content), bottom = 0 (newest). dispatch_mouse_drag
+                // reports the raw forward offset; flip it here.
+                "tui:terminal_scrollback" => {
+                    if let Some(term) = engine.active_terminal_mut() {
+                        term.set_scroll_offset(*new_offset);
+                    }
+                    handled = true;
+                }
+                "tui:debug_output" => {
+                    engine.debug_output_scroll = *new_offset;
+                    engine.debug_output_auto_scroll = false;
+                    handled = true;
+                }
+                // debug_sidebar:N — no longer needed, SidebarSystem handles scrollbar internally
+                other if other.starts_with("debug_sidebar:") => {
+                    handled = true;
+                }
+                // Editor window scrollbars — widget id format
+                // `tui:editor:<window_id>:<vsb|hsb>`. Apply-side parses the
+                // window id and routes to the per-window scroll setters.
+                other if other.starts_with("tui:editor:") => {
+                    if let Some(rest) = other.strip_prefix("tui:editor:") {
+                        if let Some((wid_str, axis)) = rest.split_once(':') {
+                            if let Ok(wid) = wid_str.parse::<usize>() {
+                                let window_id = crate::core::WindowId(wid);
+                                match axis {
+                                    "vsb" => {
+                                        engine.set_scroll_top_for_window(window_id, *new_offset);
+                                        engine.sync_scroll_binds();
+                                        handled = true;
+                                    }
+                                    "hsb" => {
+                                        engine.set_scroll_left_for_window(window_id, *new_offset);
+                                        handled = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    handled
+}
+
 // ─── Mouse handling ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -10,24 +137,16 @@ pub(super) fn handle_mouse(
     terminal_size: &Option<Size>,
     sidebar_width: u16,
     dragging_sidebar: &mut bool,
-    dragging_scrollbar: &mut Option<ScrollDragState>,
-    dragging_sidebar_search: &mut Option<SidebarScrollDrag>,
-    dragging_debug_sb: &mut Option<DebugSidebarScrollDrag>,
-    dragging_terminal_sb: &mut Option<(u16, u16, usize)>,
-    debug_output_scroll: &mut usize,
-    dragging_debug_output_sb: &mut Option<(u16, u16, usize)>,
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
     dragging_group_divider: &mut Option<usize>,
-    dragging_settings_sb: &mut Option<SidebarScrollDrag>,
-    dragging_generic_sb: &mut Option<SidebarScrollDrag>,
+    drag_state: &mut quadraui::DragState,
+    modal_stack: &mut quadraui::ModalStack,
     last_layout: Option<&render::ScreenLayout>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
     mouse_text_drag: &mut bool,
     folder_picker: &mut Option<FolderPickerState>,
-    quit_confirm: &mut bool,
-    close_tab_confirm: &mut bool,
     cmd_sel: &mut Option<(usize, usize)>,
     cmd_dragging: &mut bool,
     should_quit: &mut bool,
@@ -39,24 +158,26 @@ pub(super) fn handle_mouse(
     hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_link_rects: &[(u16, u16, u16, u16, String)],
+    editor_hover_scrollbar: Option<crate::render::PopupScrollbarHit>,
     hover_selecting: &mut bool,
     fr_input_dragging: &mut bool,
+    completion_layout: Option<&quadraui::CompletionsLayout>,
+    context_menu_layout: Option<&quadraui::ContextMenuLayout>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
     let term_height = terminal_size.map(|s| s.height).unwrap_or(24);
 
-    let ab_width = if engine.settings.autohide_panels && !sidebar.visible {
+    // ── Quit-confirm overlay click interception ─────────────────────────────
+    // Route clicks through DialogLayout::hit_test. Swallow all clicks while
+    // the overlay is visible so they don't fall through to the editor.
+    let sb_visible = engine.app_shell.sidebar_visible();
+    let ab_width = if engine.settings.autohide_panels && !sb_visible {
         0
     } else {
         ACTIVITY_BAR_WIDTH
     };
-    let editor_left = ab_width
-        + if sidebar.visible {
-            sidebar_width + 1
-        } else {
-            0
-        };
+    let editor_left = ab_width + if sb_visible { sidebar_width + 1 } else { 0 };
 
     // Bottom chrome rows: rows below the terminal panel.
     let has_separated = last_layout
@@ -80,6 +201,54 @@ pub(super) fn handle_mouse(
     // Check if mouse is on the editor hover popup (exact bounds).
     let mouse_on_editor_hover = editor_hover_popup_rect
         .is_some_and(|(px, py, pw, ph)| col >= px && col < px + pw && row >= py && row < py + ph);
+
+    // Reconcile the editor hover popup with the modal stack (#216).
+    // Push whenever the popup is visible — even unfocused. Right-click
+    // dispatch consults the stack's hit_test below so the editor's
+    // context menu can't steal events from the popup.
+    {
+        let editor_hover_id = quadraui::WidgetId::new("editor_hover");
+        match (engine.editor_hover.is_some(), editor_hover_popup_rect) {
+            (true, Some((px, py, pw, ph))) => {
+                modal_stack.push(
+                    editor_hover_id,
+                    quadraui::Rect {
+                        x: px as f32,
+                        y: py as f32,
+                        width: pw as f32,
+                        height: ph as f32,
+                    },
+                );
+            }
+            _ => {
+                modal_stack.pop(&editor_hover_id);
+            }
+        }
+    }
+
+    // Reconcile stale picker modal: if the picker closed (keyboard
+    // Escape / confirm) without a backdrop-dismiss click, the "picker"
+    // entry lingers on the stack and swallows all dispatch_scroll events.
+    if !engine.picker_open {
+        modal_stack.pop(&quadraui::WidgetId::new("picker"));
+    }
+
+    // ── Toast click (× dismiss / action) ───────────────────────────────────────
+    // #450: toasts overlay the editor in the bottom-right. Run hit_test
+    // before any underlying handler so clicking × dismisses the toast
+    // instead of falling through to whatever sits underneath.
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
+        let toast_hit = engine
+            .toast_layout
+            .borrow()
+            .as_ref()
+            .map(|layout| layout.hit_test(col as f32, row as f32));
+        if let Some(hit) = toast_hit {
+            if engine.handle_toast_hit(hit) {
+                return sidebar_width;
+            }
+        }
+    }
 
     // ── Hover link click-to-copy ────────────────────────────────────────────────
     if !hover_link_rects.is_empty() {
@@ -287,7 +456,7 @@ pub(super) fn handle_mouse(
                     let action = engine.dialog_click_button(idx);
                     if engine.explorer_needs_refresh {
                         engine.explorer_needs_refresh = false;
-                        sidebar.build_rows();
+                        engine.explorer_rebuild_rows();
                     }
                     if handle_action(engine, action) {
                         *should_quit = true;
@@ -339,126 +508,264 @@ pub(super) fn handle_mouse(
 
     // ── Unified picker mouse handling ────────────────────────────────────────
     if engine.picker_open {
+        // Active scrollbar drag — feed through the cross-backend
+        // dispatcher. Same math GTK uses (0f3e0d0), same primitive
+        // event type; TUI just supplies cell-unit track geometry
+        // instead of pixels.
+        if let MouseEventKind::Drag(MouseButton::Left) = ev.kind {
+            if drag_state.is_active() {
+                let visible_rows =
+                    if let Some(quadraui::DragTarget::ScrollbarY { track_length, .. }) =
+                        drag_state.target()
+                    {
+                        *track_length as usize
+                    } else {
+                        0
+                    };
+                let events = quadraui::dispatch_mouse_drag(
+                    drag_state,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    Default::default(),
+                );
+                for ev in &events {
+                    if let quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } = ev {
+                        engine.picker_scroll_top = *new_offset;
+                        // `draw_palette` clamps its effective scroll
+                        // offset to keep `picker_selected` on-screen, so
+                        // a drag that leaves selection outside the new
+                        // viewport would snap back visually. Pull
+                        // selection to the nearest visible edge.
+                        if engine.picker_selected < *new_offset {
+                            engine.picker_selected = *new_offset;
+                        } else if visible_rows > 0
+                            && engine.picker_selected >= *new_offset + visible_rows
+                        {
+                            engine.picker_selected = *new_offset + visible_rows - 1;
+                        }
+                        engine.picker_load_preview();
+                    }
+                }
+                return sidebar_width;
+            }
+        }
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
                 let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
                 let has_preview = engine.picker_preview.is_some();
-                let popup_w = if has_preview {
-                    (term_cols * 4 / 5).max(60)
-                } else {
-                    (term_cols * 55 / 100).max(55)
-                };
-                let popup_h = if has_preview {
-                    (term_rows * 65 / 100).max(18)
-                } else {
-                    (term_rows * 60 / 100).max(16)
-                };
-                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
-                let popup_y = (term_rows.saturating_sub(popup_h)) / 2;
-                let results_start = popup_y + 3;
-                let results_end = popup_y + popup_h - 1;
+                let geo = render::PickerGeometry::compute(
+                    term_cols as f32,
+                    term_rows as f32,
+                    has_preview,
+                    &render::TUI_PICKER_SIZING,
+                );
+                let popup_x = geo.popup_x.round() as u16;
+                let popup_y = geo.popup_y.round() as u16;
+                let popup_w = geo.popup_w.round() as u16;
+                let popup_h = geo.popup_h.round() as u16;
+                let total_items = engine.picker_items.len();
 
-                if col >= popup_x
-                    && col < popup_x + popup_w
-                    && row >= results_start
-                    && row < results_end
-                {
-                    let clicked_idx = engine.picker_scroll_top + (row - results_start) as usize;
-                    if clicked_idx < engine.picker_items.len() {
-                        if engine.picker_selected == clicked_idx {
-                            // Second click on same item — toggle expand or confirm
-                            let in_tree_mode = engine.picker_source
-                                == crate::core::engine::PickerSource::CommandCenter
-                                && engine.picker_query == "@";
-                            if in_tree_mode && engine.picker_toggle_expand() {
-                                engine.picker_load_preview();
+                let list_w = if has_preview {
+                    ((popup_w as f32) * 0.4).round() as u16
+                } else {
+                    popup_w
+                };
+                let items_row0 = popup_y + 3;
+                let items_row_end = popup_y + popup_h - 1;
+                let visible_rows = items_row_end.saturating_sub(items_row0) as usize;
+
+                let max_offset = total_items.saturating_sub(visible_rows);
+                let effective_offset = if visible_rows == 0 {
+                    0
+                } else if engine.picker_selected < engine.picker_scroll_top {
+                    engine.picker_selected
+                } else if engine.picker_selected >= engine.picker_scroll_top + visible_rows {
+                    engine.picker_selected + 1 - visible_rows
+                } else {
+                    engine.picker_scroll_top
+                }
+                .min(max_offset);
+
+                let picker_id = quadraui::WidgetId::new("picker");
+                modal_stack.push(
+                    picker_id.clone(),
+                    quadraui::Rect {
+                        x: geo.popup_x,
+                        y: geo.popup_y,
+                        width: geo.popup_w,
+                        height: geo.popup_h,
+                    },
+                );
+                let events = quadraui::dispatch_mouse_down(
+                    modal_stack,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    quadraui::MouseButton::Left,
+                    quadraui::Modifiers::default(),
+                );
+                let mut hit_modal = false;
+                let mut dismiss_modal = false;
+                for ev in &events {
+                    match ev {
+                        quadraui::UiEvent::MouseDown {
+                            widget: Some(wid), ..
+                        } if *wid == picker_id => {
+                            hit_modal = true;
+                        }
+                        quadraui::UiEvent::Palette(_, quadraui::PaletteEvent::Closed) => {
+                            dismiss_modal = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if hit_modal {
+                    let has_scrollbar = total_items > visible_rows;
+                    let sb_col = popup_x + list_w - 1;
+                    let on_scrollbar = has_scrollbar
+                        && col == sb_col
+                        && row >= items_row0
+                        && row < items_row_end
+                        && visible_rows > 0;
+
+                    if on_scrollbar {
+                        let tl = visible_rows as f32;
+                        let thumb_len =
+                            (tl * visible_rows as f32 / total_items.max(1) as f32).max(1.0);
+                        let max_scroll = total_items.saturating_sub(visible_rows);
+                        let grab_offset = scrollbar_grab_offset(
+                            row as f32,
+                            items_row0 as f32,
+                            tl,
+                            visible_rows,
+                            total_items,
+                            effective_offset,
+                        );
+                        let on_thumb = grab_offset > 0.0 || {
+                            let eff_track = (tl - thumb_len).max(1.0);
+                            let ratio = if max_scroll == 0 {
+                                0.0
                             } else {
-                                engine.picker_confirm();
-                            }
+                                effective_offset as f32 / max_scroll as f32
+                            };
+                            let thumb_top = items_row0 as f32 + ratio * eff_track;
+                            let dy = row as f32 - thumb_top;
+                            dy >= 0.0 && dy < thumb_len
+                        };
+
+                        if on_thumb {
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: picker_id.clone(),
+                                track_start: items_row0 as f32,
+                                track_length: tl,
+                                thumb_length: thumb_len,
+                                max_scroll,
+                                grab_offset,
+                                inverted: false,
+                            });
                         } else {
-                            engine.picker_selected = clicked_idx;
+                            let click_above_thumb = {
+                                let eff_track = (tl - thumb_len).max(1.0);
+                                let ratio = if max_scroll == 0 {
+                                    0.0
+                                } else {
+                                    effective_offset as f32 / max_scroll as f32
+                                };
+                                let thumb_top = items_row0 as f32 + ratio * eff_track;
+                                (row as f32) < thumb_top
+                            };
+                            let page = visible_rows.max(1);
+                            let new_offset = if click_above_thumb {
+                                effective_offset.saturating_sub(page)
+                            } else {
+                                (effective_offset + page).min(max_scroll)
+                            };
+                            engine.picker_scroll_top = new_offset;
+                            if engine.picker_selected < new_offset {
+                                engine.picker_selected = new_offset;
+                            } else if engine.picker_selected >= new_offset + visible_rows {
+                                engine.picker_selected = new_offset + visible_rows - 1;
+                            }
                             engine.picker_load_preview();
                         }
+                    } else if row >= items_row0 && row < items_row_end {
+                        let clicked_idx = effective_offset + (row - items_row0) as usize;
+                        if clicked_idx < engine.picker_items.len() {
+                            if engine.picker_selected == clicked_idx {
+                                let in_tree_mode = engine.picker_source
+                                    == crate::core::engine::PickerSource::CommandCenter
+                                    && engine.picker_query == "@";
+                                if in_tree_mode && engine.picker_toggle_expand() {
+                                    engine.picker_load_preview();
+                                } else {
+                                    engine.picker_confirm();
+                                }
+                            } else {
+                                engine.picker_selected = clicked_idx;
+                                engine.picker_load_preview();
+                            }
+                        }
                     }
-                } else if col < popup_x
-                    || col >= popup_x + popup_w
-                    || row < popup_y
-                    || row >= popup_y + popup_h
-                {
+                }
+                if dismiss_modal {
                     engine.close_picker();
+                    modal_stack.pop(&picker_id);
                 }
             }
-            MouseEventKind::ScrollDown => {
-                // Check if scroll is over the preview pane (right side).
-                let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                let has_preview = engine.picker_preview.is_some();
-                let popup_w = if has_preview {
-                    (term_cols * 4 / 5).max(60)
-                } else {
-                    (term_cols * 55 / 100).max(55)
-                };
-                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
-                let left_w = if has_preview {
-                    (popup_w as usize * 35 / 100) as u16
-                } else {
-                    0
-                };
-                if has_preview && col > popup_x + left_w {
-                    // Scroll the preview pane.
-                    let max = engine
-                        .picker_preview
-                        .as_ref()
-                        .map(|p| p.lines.len())
-                        .unwrap_or(0);
-                    engine.picker_preview_scroll =
-                        (engine.picker_preview_scroll + 3).min(max.saturating_sub(1));
-                } else {
-                    let step = 3;
-                    let max = engine.picker_items.len().saturating_sub(1);
-                    engine.picker_selected = (engine.picker_selected + step).min(max);
-                    let visible = 20usize;
-                    if engine.picker_selected >= engine.picker_scroll_top + visible {
-                        engine.picker_scroll_top = engine.picker_selected + 1 - visible;
-                    }
-                    engine.picker_load_preview();
-                }
+            MouseEventKind::Up(MouseButton::Left) => {
+                drag_state.end();
             }
-            MouseEventKind::ScrollUp => {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
                 let has_preview = engine.picker_preview.is_some();
-                let popup_w = if has_preview {
-                    (term_cols * 4 / 5).max(60)
-                } else {
-                    (term_cols * 55 / 100).max(55)
-                };
-                let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
-                let left_w = if has_preview {
-                    (popup_w as usize * 35 / 100) as u16
-                } else {
-                    0
-                };
+                let geo = render::PickerGeometry::compute(
+                    term_cols as f32,
+                    term_rows as f32,
+                    has_preview,
+                    &render::TUI_PICKER_SIZING,
+                );
+                let popup_x = geo.popup_x.round() as u16;
+                let left_w = geo.left_pane_w.round() as u16;
+                let scroll_down = matches!(ev.kind, MouseEventKind::ScrollDown);
                 if has_preview && col > popup_x + left_w {
-                    // Scroll the preview pane.
-                    engine.picker_preview_scroll = engine.picker_preview_scroll.saturating_sub(3);
-                } else {
-                    let step = 3;
-                    engine.picker_selected = engine.picker_selected.saturating_sub(step);
-                    if engine.picker_selected < engine.picker_scroll_top {
-                        engine.picker_scroll_top = engine.picker_selected;
+                    if scroll_down {
+                        let max = engine
+                            .picker_preview
+                            .as_ref()
+                            .map(|p| p.lines.len())
+                            .unwrap_or(0);
+                        engine.picker_preview_scroll =
+                            (engine.picker_preview_scroll + 3).min(max.saturating_sub(1));
+                    } else {
+                        engine.picker_preview_scroll =
+                            engine.picker_preview_scroll.saturating_sub(3);
                     }
-                    engine.picker_load_preview();
+                } else {
+                    let delta = if scroll_down { 3 } else { -3 };
+                    engine.picker_scroll(delta, geo.visible_rows);
                 }
             }
             _ => {} // consume all other events
         }
         return sidebar_width;
+    } else {
+        // Picker isn't open but the modal stack may carry a stale
+        // entry if the picker closed via keyboard (Esc / Enter) or
+        // programmatic close_picker() without the mouse path knowing.
+        // Keep them consistent.
+        modal_stack.pop(&quadraui::WidgetId::new("picker"));
     }
 
     // ── Sidebar separator drag (works anywhere, regardless of row) ────────────
-    let sep_col = ab_width + if sidebar.visible { sidebar_width } else { 0 };
+    let sep_col = ab_width + if sb_visible { sidebar_width } else { 0 };
     match ev.kind {
-        MouseEventKind::Down(MouseButton::Left) if sidebar.visible && col == sep_col => {
+        MouseEventKind::Down(MouseButton::Left) if sb_visible && col == sep_col => {
             *dragging_sidebar = true;
             return sidebar_width;
         }
@@ -480,20 +787,70 @@ pub(super) fn handle_mouse(
             }
             return sidebar_width;
         }
+        MouseEventKind::Drag(MouseButton::Left)
+            if sb_visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && engine.active_panel_is(PANEL_SEARCH) =>
+        {
+            let move_ev = quadraui::UiEvent::MouseMoved {
+                position: quadraui::Point::new(col as f32, row as f32),
+                buttons: quadraui::ButtonMask {
+                    left: true,
+                    right: false,
+                    middle: false,
+                },
+            };
+            engine.handle_search_sidebar_ui_event(move_ev);
+            return sidebar_width;
+        }
+        MouseEventKind::Drag(MouseButton::Left)
+            if sb_visible
+                && engine.active_panel_is(PANEL_SETTINGS)
+                && col >= ab_width
+                && col < ab_width + sidebar_width =>
+        {
+            let content_start = 2_u16;
+            let content_height = term_height.saturating_sub(4);
+            let q_rect = quadraui::Rect::new(
+                ab_width as f32,
+                content_start as f32,
+                sidebar_width as f32,
+                content_height as f32,
+            );
+            let move_ev = quadraui::UiEvent::MouseMoved {
+                position: quadraui::Point::new(col as f32, row as f32),
+                buttons: quadraui::ButtonMask {
+                    left: true,
+                    middle: false,
+                    right: false,
+                },
+            };
+            render::populate_settings_form_controller(engine);
+            let result = engine
+                .settings_form_controller
+                .borrow_mut()
+                .handle_cached(&move_ev, q_rect);
+            if !matches!(result, quadraui::FormControllerEvent::Ignored) {
+                engine.settings_scroll_top =
+                    engine.settings_form_controller.borrow().scroll_offset();
+            }
+            return sidebar_width;
+        }
         MouseEventKind::Drag(MouseButton::Left) => {
             // Explorer drag-and-drop: activate or update target row.
             if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
                 let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                if sidebar.visible
-                    && sidebar.active_panel == TuiPanel::Explorer
+                if sb_visible
+                    && engine.active_panel_is(PANEL_EXPLORER)
                     && col >= ab_width
                     && col < ab_width + sidebar_width
                 {
                     let sidebar_row = row.saturating_sub(menu_rows);
                     if sidebar_row >= 1 {
-                        let tree_row =
-                            (sidebar_row as usize).saturating_sub(1) + sidebar.scroll_top;
-                        if tree_row < sidebar.rows.len() {
+                        let tree_row = (sidebar_row as usize).saturating_sub(1)
+                            + engine.explorer_tree.borrow().scroll_offset();
+                        if tree_row < engine.explorer_rows.len() {
                             if let Some(src_row) = *explorer_drag_src {
                                 // Only activate drag if target differs from source.
                                 if tree_row != src_row {
@@ -554,57 +911,21 @@ pub(super) fn handle_mouse(
                 }
                 return sidebar_width;
             }
-            // Debug sidebar section scrollbar drag
-            if let Some(ref drag) = *dragging_debug_sb {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
-                    engine.dap_sidebar_scroll[drag.sec_idx] =
-                        (ratio * max_scroll as f64).round() as usize;
+            // Phase B.4 Stage 5c: every scrollbar drag flows through the
+            // shared `quadraui::DragState::ScrollbarY` + `dispatch_mouse_drag`.
+            // Widget id routes the resulting `ScrollOffsetChanged` to the
+            // matching scroll-state field. Sites covered:
+            // - `explorer:sb`, `ext_panel:sb`, `editor_hover` (Stage 5a)
+            // - `tui:search_results`, `tui:debug_sidebar:N` (5c)
+            // - `tui:terminal_scrollback`, `tui:debug_output` (5c, inverted)
+            if drag_state.is_active() {
+                let point = quadraui::Point {
+                    x: col as f32,
+                    y: row as f32,
+                };
+                if apply_scrollbar_drag(drag_state, point, engine, sidebar) {
+                    return sidebar_width;
                 }
-                return sidebar_width;
-            }
-            // Sidebar search-results scrollbar drag
-            if let Some(ref drag) = *dragging_sidebar_search {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let new_scroll = (ratio * drag.total as f64) as usize;
-                    sidebar.search_scroll_top =
-                        new_scroll.min(drag.total.saturating_sub(drag.track_len as usize));
-                }
-                return sidebar_width;
-            }
-            // Generic sidebar scrollbar drag (explorer, ext panel, etc.)
-            if let Some(ref drag) = *dragging_generic_sb {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let new_scroll = (ratio * drag.total as f64) as usize;
-                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
-                    // Route to the right panel's scroll state
-                    if sidebar.ext_panel_name.is_some() {
-                        engine.ext_panel_scroll_top = new_scroll.min(drag.total.saturating_sub(1));
-                    } else if sidebar.active_panel == TuiPanel::Explorer {
-                        sidebar.scroll_top = new_scroll.min(max_scroll);
-                    }
-                }
-                return sidebar_width;
-            }
-            // Settings panel scrollbar drag
-            if let Some(ref drag) = *dragging_settings_sb {
-                if drag.track_len > 0 && drag.total > 0 {
-                    let end = drag.track_abs_start + drag.track_len - 1;
-                    let clamped = row.clamp(drag.track_abs_start, end);
-                    let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                    let max_scroll = drag.total.saturating_sub(drag.track_len as usize);
-                    engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
-                }
-                return sidebar_width;
             }
             // Terminal panel resize drag
             if *dragging_terminal_resize {
@@ -642,88 +963,52 @@ pub(super) fn handle_mouse(
             }
             // Terminal split divider drag — update visual column position (no PTY resize yet).
             if *dragging_terminal_split {
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                let sb_col = term_width.saturating_sub(1);
-                let left_cols = col.clamp(5, sb_col.saturating_sub(5));
+                let panel_col = col.saturating_sub(editor_left);
+                let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
+                let panel_w = screen_w.saturating_sub(editor_left);
+                let left_cols = panel_col.clamp(5, panel_w.saturating_sub(6));
                 engine.terminal_split_set_drag_cols(left_cols);
                 return sidebar_width;
             }
-            // Debug output panel scrollbar drag
-            if let Some((track_start, track_len, total)) = *dragging_debug_output_sb {
-                if track_len > 0 && total > 0 {
-                    let offset_in_track = row.saturating_sub(track_start).min(track_len) as f64;
-                    let ratio = offset_in_track / track_len as f64;
-                    // ratio=0 (top) → max scroll (oldest); ratio=1 (bottom) → 0 (newest)
-                    let max_scroll = total.saturating_sub(track_len as usize);
-                    *debug_output_scroll = ((1.0 - ratio) * max_scroll as f64).round() as usize;
-                }
-                return sidebar_width;
-            }
-            // Terminal scrollbar drag
-            if let Some((track_start, track_len, total)) = *dragging_terminal_sb {
-                if track_len > 0 && total > 0 {
-                    // Use saturating_sub + min(track_len) so ratio reaches exactly 1.0
-                    // at the bottom of the track (allowing scroll_offset to reach 0).
-                    let offset_in_track = row.saturating_sub(track_start).min(track_len) as f64;
-                    let ratio = offset_in_track / track_len as f64;
-                    // top (ratio=0) → max offset; bottom (ratio=1) → 0 (live view)
-                    let new_offset = ((1.0 - ratio) * total as f64) as usize;
-                    if let Some(term) = engine.active_terminal_mut() {
-                        term.set_scroll_offset(new_offset);
-                    }
-                }
-                return sidebar_width;
-            }
-            // Scrollbar thumb drag (vertical or horizontal)
-            if let Some(ref drag) = *dragging_scrollbar {
-                if drag.track_len > 0 && drag.total > 0 {
-                    if drag.is_horizontal {
-                        let end = drag.track_abs_start + drag.track_len - 1;
-                        let clamped = col.clamp(drag.track_abs_start, end);
-                        let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                        let new_left = (ratio * drag.total as f64) as usize;
-                        engine.set_scroll_left_for_window(drag.window_id, new_left);
-                    } else {
-                        let end = drag.track_abs_start + drag.track_len - 1;
-                        let clamped = row.clamp(drag.track_abs_start, end);
-                        let ratio = (clamped - drag.track_abs_start) as f64 / drag.track_len as f64;
-                        let new_top = (ratio * drag.total as f64) as usize;
-                        engine.set_scroll_top_for_window(drag.window_id, new_top);
-                        engine.sync_scroll_binds();
-                    }
-                }
-                return sidebar_width;
-            }
+            // Phase B.4 Stage 5c: terminal scrollback + debug output
+            // scrollbars are inverted (top of track = oldest content,
+            // bottom = live view). Their drag math now lives in the
+            // shared `if drag_state.is_active()` block above; the
+            // receive site for `tui:terminal_scrollback` /
+            // `tui:debug_output` flips the offset with `max - new_offset`
+            // so `term.set_scroll_offset` / `engine.debug_output_scroll`
+            // continue to mean "lines from the bottom".
+
+            // Phase B.4 Stage 5d: editor-window scrollbar drag math now
+            // lives in the shared `if drag_state.is_active()` block above
+            // via `tui:editor:N:vsb` / `tui:editor:N:hsb` widget ids. The
+            // legacy `dragging_scrollbar` local + `ScrollDragState` are
+            // gone.
             // Text drag-to-select — find window under cursor and extend visual selection
             if col >= editor_left {
                 if let Some(layout) = last_layout {
                     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                     let editor_row = row.saturating_sub(menu_rows);
-                    for rw in &layout.windows {
-                        let wx = rw.rect.x as u16;
-                        let wy = rw.rect.y as u16;
-                        let ww = rw.rect.width as u16;
-                        let wh = rw.rect.height as u16;
-                        let gutter = rw.gutter_char_width as u16;
-                        let rel_col = col - editor_left;
-                        if rel_col >= wx
-                            && rel_col < wx + ww
-                            && editor_row >= wy
-                            && editor_row < wy + wh
+                    let rel_col = col - editor_left;
+                    if let Some(idx) =
+                        render::find_window_at(layout, rel_col as f64, editor_row as f64)
+                    {
+                        let rw = &layout.windows[idx];
+                        let zone = render::window_zone_hit_test(
+                            rw,
+                            (rel_col as f64) - rw.rect.x,
+                            (editor_row as f64) - rw.rect.y,
+                            1.0,
+                            1.0,
+                        );
+                        if let render::WindowZone::TextArea {
+                            buf_line,
+                            seg_col_offset,
+                            text_rel_x,
+                            ..
+                        } = zone
                         {
-                            // Skip per-window status bar row
-                            if rw.status_line.is_some() && wh > 1 && editor_row == wy + wh - 1 {
-                                break;
-                            }
-                            let view_row = (editor_row - wy) as usize;
-                            let drag_rl = rw.lines.get(view_row);
-                            let buf_line = drag_rl
-                                .map(|l| l.line_idx)
-                                .unwrap_or_else(|| rw.scroll_top + view_row);
-                            let seg_offset = drag_rl.map(|l| l.segment_col_offset).unwrap_or(0);
-                            let col_in_text = (rel_col - wx).saturating_sub(gutter) as usize
-                                + rw.scroll_left
-                                + seg_offset;
+                            let col_in_text = text_rel_x as usize + rw.scroll_left + seg_col_offset;
                             engine.mouse_drag(rw.window_id, buf_line, col_in_text);
                             *mouse_text_drag = true;
                             return sidebar_width;
@@ -742,7 +1027,7 @@ pub(super) fn handle_mouse(
             {
                 let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
                 let strip_rows: u16 = if engine.terminal_open {
-                    engine.session.terminal_panel_rows + 1
+                    super::effective_terminal_panel_rows_tui(engine, term_height) + 1
                 } else {
                     0
                 };
@@ -758,7 +1043,24 @@ pub(super) fn handle_mouse(
                         .is_some_and(|t| t.selection.is_some())
                 {
                     let term_row = row - term_strip_top - 1;
-                    let term_col = col.saturating_sub(editor_left);
+                    // #444: pane-relative col. Click uses
+                    // TerminalSplitLayout::hit_test which returns
+                    // 0-based col from the active pane's left edge.
+                    // Drag must match, otherwise right-pane drag
+                    // overshoots by left_pane_cols. Left pane is
+                    // unaffected because left.x == editor_left.
+                    let split_layout = engine.terminal_split_layout.borrow();
+                    let active_pane_x = if let Some(ref sl) = *split_layout {
+                        if engine.terminal_active == 1 {
+                            sl.right.x as u16
+                        } else {
+                            sl.left.x as u16
+                        }
+                    } else {
+                        editor_left
+                    };
+                    drop(split_layout);
+                    let term_col = col.saturating_sub(active_pane_x);
                     if let Some(term) = engine.active_terminal_mut() {
                         if let Some(ref mut sel) = term.selection {
                             sel.end_row = term_row;
@@ -768,6 +1070,16 @@ pub(super) fn handle_mouse(
                     return sidebar_width;
                 }
             }
+        }
+        MouseEventKind::Up(MouseButton::Left)
+            if sb_visible && engine.active_panel_is(PANEL_SEARCH) =>
+        {
+            let up_ev = quadraui::UiEvent::MouseUp {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(col as f32, row as f32),
+            };
+            engine.handle_search_sidebar_ui_event(up_ev);
         }
         MouseEventKind::Up(MouseButton::Left) => {
             // Tab drag-and-drop: execute drop on release.
@@ -782,9 +1094,9 @@ pub(super) fn handle_mouse(
             // Explorer drag-and-drop: execute move on release.
             if let Some((src_row, Some(target_row))) = explorer_drag_active.take() {
                 *explorer_drag_src = None;
-                if src_row < sidebar.rows.len() && target_row < sidebar.rows.len() {
-                    let src_path = sidebar.rows[src_row].path.clone();
-                    let target = &sidebar.rows[target_row];
+                if src_row < engine.explorer_rows.len() && target_row < engine.explorer_rows.len() {
+                    let src_path = engine.explorer_rows[src_row].path.clone();
+                    let target = &engine.explorer_rows[target_row];
                     let dest_dir = if target.is_dir {
                         target.path.clone()
                     } else {
@@ -801,20 +1113,18 @@ pub(super) fn handle_mouse(
             *explorer_drag_src = None;
             *explorer_drag_active = None;
             *dragging_sidebar = false;
-            *dragging_scrollbar = None;
-            *dragging_sidebar_search = None;
-            *dragging_debug_sb = None;
-            *dragging_terminal_sb = None;
-            *dragging_debug_output_sb = None;
-            *dragging_settings_sb = None;
-            *dragging_generic_sb = None;
+            // Stage 5c+5d: scrollbar drags (search, settings, debug-sidebar,
+            // terminal, debug-output, editor v/h scrollbars) clear via
+            // `drag_state.end()` — single source of truth.
+            drag_state.end();
             *dragging_group_divider = None;
             *cmd_dragging = false;
             *hover_selecting = false;
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
                 let rows = engine.session.terminal_panel_rows;
-                let cols = terminal_size.map(|s| s.width).unwrap_or(80);
+                let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
+                let cols = screen_w.saturating_sub(editor_left);
                 engine.terminal_resize(cols, rows);
                 let _ = engine.session.save();
             }
@@ -822,9 +1132,9 @@ pub(super) fn handle_mouse(
                 *dragging_terminal_split = false;
                 let left_cols = engine.terminal_split_left_cols;
                 if left_cols > 0 {
-                    let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let sb_col = term_width.saturating_sub(1);
-                    let right_cols = sb_col.saturating_sub(left_cols).saturating_sub(1);
+                    let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
+                    let panel_w = screen_w.saturating_sub(editor_left);
+                    let right_cols = panel_w.saturating_sub(left_cols).saturating_sub(1);
                     let rows = engine.session.terminal_panel_rows;
                     engine.terminal_split_finalize_drag(left_cols, right_cols, rows);
                 }
@@ -845,192 +1155,198 @@ pub(super) fn handle_mouse(
         }
         // Scroll wheel — sidebar or editor
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            // Editor hover popup scroll wheel — scroll content without focusing
-            if mouse_on_editor_hover && engine.editor_hover.is_some() {
-                let delta = if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                    -3
-                } else {
-                    3
-                };
-                engine.editor_hover_scroll(delta);
+            let scroll_up = matches!(ev.kind, MouseEventKind::ScrollUp);
+            // When an extension panel is showing, its surface bounds (registered
+            // by `render_ext_panel`) own the sidebar area — the activity-bar
+            // `active_panel_id` is unchanged from before the ext panel opened,
+            // so without this guard the wheel scrolls whatever the underlying
+            // panel was (#485 was explorer routing).
+            let ext_panel_showing = sidebar.ext_panel_name.is_some();
+            if sb_visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && !ext_panel_showing
+                && engine.active_panel_is(PANEL_EXPLORER)
+            {
+                let delta = if scroll_up { -3_isize } else { 3 };
+                engine.explorer_scroll(delta);
                 return sidebar_width;
             }
-            // Sidebar scroll wheel
-            if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
-                if sidebar.ext_panel_name.is_some() {
-                    // Extension-provided panel (e.g. Git Log): scroll viewport
-                    let flat_len = engine.ext_panel_flat_len();
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.ext_panel_scroll_top = engine.ext_panel_scroll_top.saturating_sub(3);
-                    } else {
-                        engine.ext_panel_scroll_top =
-                            (engine.ext_panel_scroll_top + 3).min(flat_len.saturating_sub(1));
-                    }
-                } else if sidebar.active_panel == TuiPanel::Explorer {
-                    let tree_height = term_height.saturating_sub(3) as usize;
-                    let total = sidebar.rows.len();
-                    if total > tree_height {
-                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                            sidebar.scroll_top = sidebar.scroll_top.saturating_sub(3);
-                        } else {
-                            sidebar.scroll_top =
-                                (sidebar.scroll_top + 3).min(total.saturating_sub(tree_height));
-                        }
-                    }
-                } else if sidebar.active_panel == TuiPanel::Search {
-                    // Scroll the viewport directly; render will keep selection visible.
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        sidebar.search_scroll_top = sidebar.search_scroll_top.saturating_sub(3);
-                    } else {
-                        sidebar.search_scroll_top += 3; // clamped in render_search_panel
-                    }
-                } else if sidebar.active_panel == TuiPanel::Git {
-                    // SC panel: scroll selection
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.sc_selected = engine.sc_selected.saturating_sub(3);
-                    } else {
-                        let flat_len = engine.sc_flat_len();
-                        engine.sc_selected =
-                            (engine.sc_selected + 3).min(flat_len.saturating_sub(1));
-                    }
-                } else if sidebar.active_panel == TuiPanel::Debug {
-                    use crate::core::engine::DebugSidebarSection;
-                    // Determine which section the mouse is over.
-                    let menu_offset = if engine.menu_bar_visible { 1u16 } else { 0 };
-                    let sidebar_row = row.saturating_sub(menu_offset);
-                    let sections = [
-                        (DebugSidebarSection::Variables, 0usize),
-                        (DebugSidebarSection::Watch, 1),
-                        (DebugSidebarSection::CallStack, 2),
-                        (DebugSidebarSection::Breakpoints, 3),
-                    ];
-                    let mut cur_row: u16 = 2;
-                    let mut target_idx: Option<usize> = None;
-                    for (_section, sec_idx) in &sections {
-                        let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
-                        let section_end = cur_row + 1 + sec_height; // header + content
-                        if sidebar_row >= cur_row && sidebar_row < section_end {
-                            target_idx = Some(*sec_idx);
-                            break;
-                        }
-                        cur_row = section_end;
-                    }
-                    if let Some(sec_idx) = target_idx {
-                        let item_count = engine.dap_sidebar_section_item_count(sections[sec_idx].0);
-                        let height = engine.dap_sidebar_section_heights[sec_idx] as usize;
-                        let max_scroll = item_count.saturating_sub(height);
-                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                            engine.dap_sidebar_scroll[sec_idx] =
-                                engine.dap_sidebar_scroll[sec_idx].saturating_sub(3);
-                        } else {
-                            engine.dap_sidebar_scroll[sec_idx] =
-                                (engine.dap_sidebar_scroll[sec_idx] + 3).min(max_scroll);
-                        }
-                    }
-                } else if sidebar.active_panel == TuiPanel::Settings {
-                    let flat = engine.settings_flat_list();
-                    let content_height = term_height.saturating_sub(4) as usize; // header+search+status+cmd
-                    let max_scroll = flat.len().saturating_sub(content_height);
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.settings_scroll_top = engine.settings_scroll_top.saturating_sub(3);
-                    } else {
-                        engine.settings_scroll_top =
-                            (engine.settings_scroll_top + 3).min(max_scroll);
-                    }
-                } else if sidebar.active_panel == TuiPanel::Extensions {
-                    // Scroll selection up/down
-                    let total = engine.ext_available_manifests().len();
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.ext_sidebar_selected = engine.ext_sidebar_selected.saturating_sub(3);
-                    } else {
-                        engine.ext_sidebar_selected =
-                            (engine.ext_sidebar_selected + 3).min(total.saturating_sub(1));
-                    }
+            if sb_visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && !ext_panel_showing
+                && engine.active_panel_is(PANEL_GIT)
+            {
+                let scroll_ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
+                    position: quadraui::Point::new(col as f32, row as f32),
+                };
+                engine.handle_sc_sidebar_ui_event(scroll_ev);
+                return sidebar_width;
+            }
+            if sb_visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && !ext_panel_showing
+                && engine.active_panel_is(PANEL_SEARCH)
+            {
+                let scroll_ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
+                    position: quadraui::Point::new(col as f32, row as f32),
+                };
+                engine.handle_search_sidebar_ui_event(scroll_ev);
+                return sidebar_width;
+            }
+            if sb_visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && !ext_panel_showing
+                && engine.active_panel_is(PANEL_SETTINGS)
+            {
+                let content_start = 2_u16;
+                let content_height = term_height.saturating_sub(4);
+                let q_rect = quadraui::Rect::new(
+                    ab_width as f32,
+                    content_start as f32,
+                    sidebar_width as f32,
+                    content_height as f32,
+                );
+                let scroll_ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
+                    position: quadraui::Point::new(col as f32, row as f32),
+                };
+                render::populate_settings_form_controller(engine);
+                let result = engine
+                    .settings_form_controller
+                    .borrow_mut()
+                    .handle_cached(&scroll_ev, q_rect);
+                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
+                    engine.settings_scroll_top =
+                        engine.settings_form_controller.borrow().scroll_offset();
                 }
                 return sidebar_width;
             }
-            // Terminal panel scroll (must check before editor scroll).
+            // Terminal panel scroll now routes through dispatch_scroll
+            // via the registered "tui:terminal_scrollback" surface.
+            // Scroll-surface wheel dispatch — routes to registered surfaces.
             {
-                let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                let strip_rows: u16 = if engine.terminal_open {
-                    engine.session.terminal_panel_rows + 1
+                let surfaces = engine.scroll_surfaces.borrow();
+                let delta_y = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                    -1.0
                 } else {
-                    0
+                    1.0
                 };
-                let term_strip_top =
-                    term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
-                if engine.terminal_open
-                    && strip_rows > 0
-                    && row >= term_strip_top
-                    && row < term_strip_top + strip_rows
-                {
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.terminal_scroll_up(3);
-                    } else {
-                        engine.terminal_scroll_down(3);
-                    }
-                    return sidebar_width;
-                }
-            }
-            // Debug output panel scroll wheel.
-            {
-                let debug_output_open = engine.bottom_panel_kind
-                    == render::BottomPanelKind::DebugOutput
-                    && !engine.dap_output_lines.is_empty();
-                if debug_output_open {
-                    let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-                    let panel_height = engine.session.terminal_panel_rows + 2;
-                    let panel_y =
-                        term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
-                    let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
-                    if row >= panel_y && row < panel_end {
-                        let content_rows = engine.session.terminal_panel_rows as usize;
-                        let total = engine.dap_output_lines.len();
-                        let max_scroll = total.saturating_sub(content_rows);
-                        if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                            *debug_output_scroll = (*debug_output_scroll + 3).min(max_scroll);
-                        } else {
-                            *debug_output_scroll = debug_output_scroll.saturating_sub(3);
+                let scroll_events = quadraui::dispatch_scroll(
+                    modal_stack,
+                    &surfaces,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    quadraui::ScrollDelta::new(0.0, delta_y),
+                );
+                drop(surfaces);
+                for sev in &scroll_events {
+                    if let quadraui::UiEvent::Scroll {
+                        widget: Some(id),
+                        delta,
+                        ..
+                    } = sev
+                    {
+                        let step = (delta.y.abs() * 3.0).round() as usize;
+                        let down = delta.y > 0.0;
+                        match id.as_str() {
+                            "editor_hover" => {
+                                let signed = if down { step as i32 } else { -(step as i32) };
+                                engine.editor_hover_scroll(signed);
+                                return sidebar_width;
+                            }
+                            "debug_output" => {
+                                engine.handle_debug_output_scroll(delta.y);
+                                return sidebar_width;
+                            }
+                            "explorer:sb" => {
+                                let delta = if down {
+                                    step as isize
+                                } else {
+                                    -(step as isize)
+                                };
+                                engine.explorer_scroll(delta);
+                                return sidebar_width;
+                            }
+                            "ext_panel:sb" => {
+                                let flat_len = engine.ext_panel_flat_len();
+                                if down {
+                                    engine.ext_panel_scroll_top = (engine.ext_panel_scroll_top
+                                        + step)
+                                        .min(flat_len.saturating_sub(1));
+                                } else {
+                                    engine.ext_panel_scroll_top =
+                                        engine.ext_panel_scroll_top.saturating_sub(step);
+                                }
+                                return sidebar_width;
+                            }
+                            "tui:search_results" => {
+                                // SidebarSystem handles scroll internally
+                                return sidebar_width;
+                            }
+                            other if other.starts_with("debug_sidebar:") => {
+                                // SidebarSystem handles scroll internally
+                                return sidebar_width;
+                            }
+                            "tui:terminal_scrollback" => {
+                                if down {
+                                    engine.terminal_scroll_down(step);
+                                } else {
+                                    engine.terminal_scroll_up(step);
+                                }
+                                return sidebar_width;
+                            }
+                            "tui:editor_viewport" => {
+                                let scroll_menu_rows: u16 =
+                                    if engine.menu_bar_visible { 1 } else { 0 };
+                                let editor_row = row.saturating_sub(scroll_menu_rows);
+                                let rel_col = col.saturating_sub(editor_left);
+                                let target = last_layout.and_then(|layout| {
+                                    render::find_window_at(
+                                        layout,
+                                        rel_col as f64,
+                                        editor_row as f64,
+                                    )
+                                    .map(|idx| &layout.windows[idx])
+                                });
+                                if let Some(rw) = target {
+                                    let dir = if down { 1 } else { -1 };
+                                    engine.scroll_viewport_with_cursor_for_window(
+                                        rw.window_id,
+                                        dir,
+                                        step,
+                                    );
+                                    engine.sync_scroll_binds();
+                                }
+                                return sidebar_width;
+                            }
+                            _ => {}
                         }
-                        return sidebar_width;
                     }
                 }
             }
 
+            // Editor viewport scroll is now handled via dispatch_scroll
+            // "tui:editor_viewport" surface above — fallback to active window
+            // for scroll events that don't hit any registered surface.
             if col >= editor_left && row + 2 < term_height {
-                let rel_col = col - editor_left;
-                let scroll_menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                let editor_row = row.saturating_sub(scroll_menu_rows);
-                // Find which window the mouse is over; scroll that window
-                let scrolled = last_layout.and_then(|layout| {
-                    layout.windows.iter().find(|rw| {
-                        let wx = rw.rect.x as u16;
-                        let wy = rw.rect.y as u16;
-                        let ww = rw.rect.width as u16;
-                        let wh = rw.rect.height as u16;
-                        rel_col >= wx
-                            && rel_col < wx + ww
-                            && editor_row >= wy
-                            && editor_row < wy + wh
-                    })
-                });
-                if let Some(rw) = scrolled {
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.scroll_up_visible_for_window(rw.window_id, 3);
-                    } else {
-                        engine.scroll_down_visible_for_window(rw.window_id, 3);
-                    }
-                    engine.sync_scroll_binds();
+                let dir = if matches!(ev.kind, MouseEventKind::ScrollUp) {
+                    -1
                 } else {
-                    // Fallback: scroll active window
-                    if matches!(ev.kind, MouseEventKind::ScrollUp) {
-                        engine.scroll_up_visible(3);
-                    } else {
-                        engine.scroll_down_visible(3);
-                    }
-                    engine.ensure_cursor_visible();
-                    engine.sync_scroll_binds();
-                }
+                    1
+                };
+                engine.scroll_viewport_with_cursor(dir, 3);
+                engine.sync_scroll_binds();
             }
             return sidebar_width;
         }
@@ -1038,32 +1354,69 @@ pub(super) fn handle_mouse(
     }
 
     // ── Right-click: open context menus ────────────────────────────────────────
-    if ev.kind == MouseEventKind::Down(MouseButton::Right) {
+    // #451: Alacritty + crossterm 0.28 only emit `Up(MouseButton::Right)` for a
+    // right-click (no preceding `Down(Right)` event). Other terminals send both.
+    // Matching `Up` instead of `Down` is also the standard ctx-menu trigger in
+    // most GUI toolkits — menus open on release. Either-or makes both terminal
+    // conventions work; the `close_context_menu` at the top of the handler
+    // would re-close on the Up if both fired, but in practice every terminal
+    // we've seen drops one or the other.
+    if matches!(
+        ev.kind,
+        MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
+    ) {
+        // Swallow if the click landed on a focused modal that wants
+        // to consume it (#216 — editor hover popup). The modal stack
+        // was reconciled at the top of this function.
+        if modal_stack
+            .hit_test(quadraui::Point {
+                x: col as f32,
+                y: row as f32,
+            })
+            .is_some()
+        {
+            return sidebar_width;
+        }
+
         // Close any existing context menu first.
         engine.close_context_menu();
 
         let menu_rows = if engine.menu_bar_visible { 1_u16 } else { 0 };
 
-        // Right-click on explorer sidebar → open explorer context menu
-        if sidebar.visible && col >= ab_width && col < ab_width + sidebar_width {
-            if sidebar.active_panel == TuiPanel::Explorer {
+        // Right-click on explorer sidebar → open explorer context menu.
+        // #451: relaxed the panel gate. The original `active_panel_is(PANEL_EXPLORER)`
+        // check meant clicks in the sidebar area silently did nothing whenever
+        // the active panel wasn't the explorer. Now: if the explorer is showing
+        // (rows present) we hit-test against its rows; otherwise no-op. Either
+        // way clicks in sidebar always consume here.
+        if sb_visible && col >= ab_width && col < ab_width + sidebar_width {
+            let explorer_active = engine.active_panel_is(PANEL_EXPLORER);
+            let has_rows = !engine.explorer_rows.is_empty();
+            if explorer_active || has_rows {
                 let sidebar_row = row.saturating_sub(menu_rows);
-                let tree_row = sidebar_row as usize + sidebar.scroll_top;
-                if tree_row < sidebar.rows.len() {
-                    sidebar.selected = tree_row;
-                    let path = sidebar.rows[tree_row].path.clone();
-                    let is_dir = sidebar.rows[tree_row].is_dir;
+                let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
+                if tree_row < engine.explorer_rows.len() {
+                    engine
+                        .explorer_tree
+                        .borrow_mut()
+                        .set_selected_path(Some(vec![tree_row as u16]));
+                    let path = engine.explorer_rows[tree_row].path.clone();
+                    let is_dir = engine.explorer_rows[tree_row].is_dir;
                     engine.open_explorer_context_menu(path, is_dir, col, row);
                 } else {
                     // Empty space below last entry → context menu for root folder
-                    let root = sidebar.root.clone();
+                    let root = engine.cwd.clone();
                     engine.open_explorer_context_menu(root, true, col, row);
                 }
             }
             return sidebar_width;
         }
 
-        // Right-click on tab bar → open tab context menu
+        // Right-click on tab bar → open tab context menu.
+        //
+        // B5c.2: hit-test via primitive `bar.layout(...).hit_test(...)`
+        // — same code path the rasteriser uses to paint, so click
+        // resolution doesn't drift from the rendered positions.
         if col >= editor_left {
             let rel_col = col - editor_left;
             if let Some(layout) = last_layout {
@@ -1076,17 +1429,39 @@ pub(super) fn handle_mouse(
                         let gw = gtb.bounds.width as u16;
                         if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
                             let local_col = rel_col - gx;
-                            let ov_cols: u16 = if gtb.tab_scroll_offset > 0 { 2 } else { 0 };
-                            let mut x: u16 = ov_cols;
-                            for (i, tab) in gtb.tabs.iter().enumerate().skip(gtb.tab_scroll_offset)
+                            let bar = render::build_tab_bar_primitive(
+                                &gtb.tabs,
+                                false,
+                                gtb.diff_toolbar.as_ref(),
+                                gtb.tab_scroll_offset,
+                                None,
+                            );
+                            let tab_widths: Vec<usize> = gtb
+                                .tabs
+                                .iter()
+                                .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
+                                .collect();
+                            let bar_layout = bar.layout(
+                                gw as f32,
+                                1.0,
+                                0.0,
+                                |i| {
+                                    quadraui::TabMeasure::new(
+                                        tab_widths[i] as f32,
+                                        render::TAB_CLOSE_COLS as f32,
+                                    )
+                                },
+                                |i| {
+                                    quadraui::SegmentMeasure::new(
+                                        bar.right_segments[i].width_cells as f32,
+                                    )
+                                },
+                            );
+                            if let quadraui::TabBarHit::Tab(i) | quadraui::TabBarHit::TabClose(i) =
+                                bar_layout.hit_test(local_col as f32, 0.0)
                             {
-                                let name_w = tab.name.chars().count() as u16;
-                                let tab_w = name_w + TAB_CLOSE_COLS;
-                                if local_col >= x && local_col < x + tab_w {
-                                    engine.open_tab_context_menu(gtb.group_id, i, col, row + 1);
-                                    return sidebar_width;
-                                }
-                                x += tab_w;
+                                engine.open_tab_context_menu(gtb.group_id, i, col, row + 1);
+                                return sidebar_width;
                             }
                             break;
                         }
@@ -1094,17 +1469,43 @@ pub(super) fn handle_mouse(
                 } else {
                     // Single-group tab bar (row == menu_rows)
                     if row == menu_rows && !engine.is_tab_bar_hidden(engine.active_group) {
-                        let sg_offset = layout.tab_scroll_offset;
-                        let ov_cols: u16 = if sg_offset > 0 { 2 } else { 0 };
-                        let mut x: u16 = ov_cols;
-                        for (i, tab) in layout.tab_bar.iter().enumerate().skip(sg_offset) {
-                            let name_w = tab.name.chars().count() as u16;
-                            let tab_w = name_w + TAB_CLOSE_COLS;
-                            if rel_col >= x && rel_col < x + tab_w {
-                                engine.open_tab_context_menu(engine.active_group, i, col, row + 1);
-                                return sidebar_width;
-                            }
-                            x += tab_w;
+                        let editor_col_width = terminal_size
+                            .map(|s| s.width)
+                            .unwrap_or(80)
+                            .saturating_sub(editor_left);
+                        let bar = render::build_tab_bar_primitive(
+                            &layout.tab_bar,
+                            true,
+                            layout.diff_toolbar.as_ref(),
+                            layout.tab_scroll_offset,
+                            None,
+                        );
+                        let tab_widths: Vec<usize> = layout
+                            .tab_bar
+                            .iter()
+                            .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
+                            .collect();
+                        let bar_layout = bar.layout(
+                            editor_col_width as f32,
+                            1.0,
+                            0.0,
+                            |i| {
+                                quadraui::TabMeasure::new(
+                                    tab_widths[i] as f32,
+                                    render::TAB_CLOSE_COLS as f32,
+                                )
+                            },
+                            |i| {
+                                quadraui::SegmentMeasure::new(
+                                    bar.right_segments[i].width_cells as f32,
+                                )
+                            },
+                        );
+                        if let quadraui::TabBarHit::Tab(i) | quadraui::TabBarHit::TabClose(i) =
+                            bar_layout.hit_test(rel_col as f32, 0.0)
+                        {
+                            engine.open_tab_context_menu(engine.active_group, i, col, row + 1);
+                            return sidebar_width;
                         }
                     }
                 }
@@ -1115,7 +1516,7 @@ pub(super) fn handle_mouse(
         {
             let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
             let strip_rows: u16 = if engine.terminal_open {
-                engine.session.terminal_panel_rows + 1
+                super::effective_terminal_panel_rows_tui(engine, term_height) + 1
             } else {
                 0
             };
@@ -1138,44 +1539,72 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
+    // ── Completion popup click intercept ──────────────────────────────────────────
+    if engine.completion_idx.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
+        let hit = completion_layout
+            .map(|cl| cl.hit_test(col as f32, row as f32))
+            .unwrap_or(quadraui::CompletionsHit::Empty);
+        if engine.handle_completion_click(hit) {
+            return sidebar_width;
+        }
+    }
+
     // ── Context menu click intercept ────────────────────────────────────────────
-    if engine.context_menu.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
-        if let Some(ref cm) = engine.context_menu {
-            let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
-            let result = crate::core::engine::resolve_context_menu_click(
-                &cm.items,
-                cm.screen_x,
-                cm.screen_y,
-                term_w,
-                term_height,
-                col,
-                row,
-            );
-            use crate::core::engine::ContextMenuClickResult;
-            match result {
-                ContextMenuClickResult::Item(idx) => {
-                    engine.context_menu.as_mut().unwrap().selected = idx;
-                    let ctx = engine.context_menu_target_path();
-                    if let Some(act) = engine.context_menu_confirm() {
-                        if let Some((ctx_path, ctx_is_dir)) = ctx {
-                            handle_explorer_context_action(
-                                &act,
-                                engine,
-                                sidebar,
-                                *terminal_size,
-                                ctx_path,
-                                ctx_is_dir,
-                            );
+    // #456: accept both `Down(Left)` and `Up(Left)`.  Some terminals (alacritty
+    // via SGR mouse mode + tmux, and apparently gnome-terminal in certain
+    // configurations) drop `Down(Left)` and only emit `Up(Left)` for clicks
+    // — the same quirk #451 handled for right-clicks.  Without this the
+    // menu item action never fires and the menu stays open until the user
+    // clicks somewhere outside.
+    //
+    // Safety: when the terminal sends both `Down` + `Up`, the `Down` runs
+    // first (action fires + menu closes via `context_menu_confirm` /
+    // `close_context_menu`), then the `Up` sees `context_menu.is_none()`
+    // and falls through — no double-fire.
+    if engine.context_menu.is_some()
+        && matches!(
+            ev.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        )
+    {
+        if let Some(cl) = context_menu_layout {
+            let hit = cl.hit_test(col as f32, row as f32);
+            match hit {
+                quadraui::ContextMenuHit::Item(_) => {
+                    if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
+                        engine.context_menu.as_mut().unwrap().selected = idx;
+                        let ctx = engine.context_menu_target_path();
+                        if let Some(act) = engine.context_menu_confirm() {
+                            if let Some((ctx_path, ctx_is_dir)) = ctx {
+                                handle_explorer_context_action(
+                                    &act,
+                                    engine,
+                                    sidebar,
+                                    *terminal_size,
+                                    ctx_path,
+                                    ctx_is_dir,
+                                );
+                            }
                         }
                     }
                     return sidebar_width;
                 }
-                ContextMenuClickResult::InsidePopup => {
+                quadraui::ContextMenuHit::Inert => {
                     return sidebar_width;
                 }
-                ContextMenuClickResult::Outside => {
+                quadraui::ContextMenuHit::Empty => {
+                    // Check if click is on the 1-cell border around the
+                    // inner layout bounds (TUI rasteriser draws border
+                    // outside layout.bounds).
+                    let b = &cl.bounds;
+                    let on_border = col as f32 >= b.x - 1.0
+                        && (col as f32) < b.x + b.width + 1.0
+                        && row as f32 >= b.y - 1.0
+                        && (row as f32) < b.y + b.height + 1.0;
+                    if on_border {
+                        return sidebar_width;
+                    }
                     engine.close_context_menu();
-                    // Fall through to process the click normally
                 }
             }
         } else {
@@ -1185,42 +1614,19 @@ pub(super) fn handle_mouse(
 
     // ── Context menu mouse hover ──────────────────────────────────────────────
     if engine.context_menu.is_some() && matches!(ev.kind, MouseEventKind::Moved) {
-        // Compute hit item by examining the menu geometry.
-        let mut hit_idx: Option<usize> = None;
-        if let Some(ref cm) = engine.context_menu {
-            let sep_count = cm.items.iter().filter(|i| i.separator_after).count() as u16;
-            let popup_h = cm.items.len() as u16 + sep_count + 2;
-            let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
-            let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
-            let popup_w = (max_label + max_sc + 6).clamp(20, 50) as u16;
-            let term_w = terminal_size.map(|s| s.width).unwrap_or(80);
-            let px = cm.screen_x.min(term_w.saturating_sub(popup_w));
-            let py = cm.screen_y.min(term_height.saturating_sub(popup_h));
-
-            if col >= px && col < px + popup_w && row >= py && row < py + popup_h {
-                let inner_row = row - py;
-                if inner_row >= 1 && inner_row < popup_h - 1 {
-                    let mut visual_row: u16 = 1;
-                    for (idx, item) in cm.items.iter().enumerate() {
-                        if visual_row == inner_row && item.enabled {
-                            hit_idx = Some(idx);
-                            break;
-                        }
-                        visual_row += 1;
-                        if item.separator_after {
-                            visual_row += 1;
-                        }
-                    }
+        if let Some(cl) = context_menu_layout {
+            let hit = cl.hit_test(col as f32, row as f32);
+            if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
+                if let Some(ref mut cm) = engine.context_menu {
+                    cm.selected = idx;
                 }
-            }
-        }
-        if let Some(idx) = hit_idx {
-            if let Some(ref mut cm) = engine.context_menu {
-                cm.selected = idx;
             }
         }
         return sidebar_width;
     }
+
+    // Menu bar hover-to-switch is handled by MenuSystem::handle() in the
+    // UiEvent intercept (mod.rs).
 
     // ── Cancel hover dismiss if mouse is on the popup ─────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) && mouse_on_hover_popup {
@@ -1233,40 +1639,42 @@ pub(super) fn handle_mouse(
 
     // ── SC button hover (mouse moved) ───────────────────────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) {
-        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        if sidebar.visible
-            && sidebar.active_panel == TuiPanel::Git
+        if sb_visible
+            && engine.active_panel_is(PANEL_GIT)
             && col >= ab_width
             && col < ab_width + sidebar_width
         {
-            let sidebar_row = row.saturating_sub(menu_rows);
-            let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
-            let btn_row = 1 + commit_rows + 1; // header + commit + pad_above
-            if sidebar_row == btn_row {
-                let rel_col = col.saturating_sub(ab_width);
-                let commit_w = sidebar_width / 2;
-                let btn_idx = if rel_col < commit_w {
-                    0
-                } else {
-                    let icon_w = (sidebar_width - commit_w) / 3;
-                    (1 + ((rel_col - commit_w) / icon_w.max(1))).min(3) as usize
-                };
-                engine.sc_button_hovered = Some(btn_idx);
-            } else {
-                engine.sc_button_hovered = None;
-                // SC item hover dwell tracking (sections area).
-                let section_start = 4 + commit_rows; // btn + pad_below + 1
-                if sidebar_row >= section_start {
-                    let adjusted = sidebar_row - section_start + 3;
+            // Route via cached SidebarPanelLayout (#509) — no per-frame
+            // arithmetic; hit_test uses absolute terminal coordinates.
+            let hit = {
+                let layout = engine.sc_panel_layout.borrow();
+                layout.as_ref().map(|l| l.hit_test(col as f32, row as f32))
+            };
+            match hit {
+                Some(quadraui::SidebarPanelHit::ToolbarButton(_))
+                | Some(quadraui::SidebarPanelHit::ToolbarEmpty) => {
+                    engine.sc_button_hovered = engine.sc_button_hit(col as f32, row as f32);
+                    if !mouse_on_hover_popup {
+                        engine.dismiss_panel_hover();
+                    }
+                }
+                Some(quadraui::SidebarPanelHit::Content { y: content_y, .. }) => {
+                    engine.sc_button_hovered = None;
+                    // content_y is content-local (row 0 = first section row).
+                    let content_row = content_y as usize;
                     if let Some((flat_idx, _is_header)) =
-                        engine.sc_visual_row_to_flat(adjusted as usize, true)
+                        engine.sc_content_row_to_flat(content_row, true)
                     {
                         engine.panel_hover_mouse_move("source_control", "", flat_idx);
                     } else if !mouse_on_hover_popup {
                         engine.dismiss_panel_hover();
                     }
-                } else if !mouse_on_hover_popup {
-                    engine.dismiss_panel_hover();
+                }
+                _ => {
+                    engine.sc_button_hovered = None;
+                    if !mouse_on_hover_popup {
+                        engine.dismiss_panel_hover();
+                    }
                 }
             }
         } else {
@@ -1282,7 +1690,7 @@ pub(super) fn handle_mouse(
     // ── Ext panel hover (mouse moved) ───────────────────────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) {
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        if sidebar.visible
+        if sb_visible
             && sidebar.ext_panel_name.is_some()
             && col >= ab_width
             && col < ab_width + sidebar_width
@@ -1361,29 +1769,27 @@ pub(super) fn handle_mouse(
         if let Some(layout) = last_layout {
             let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
             let editor_row = row.saturating_sub(menu_rows);
+            let rel_col = col - editor_left;
             let mut found = false;
-            for rw in &layout.windows {
-                let wx = rw.rect.x as u16;
-                let wy = rw.rect.y as u16;
-                let ww = rw.rect.width as u16;
-                let wh = rw.rect.height as u16;
-                let gutter = rw.gutter_char_width as u16;
-                let rel_col = col - editor_left;
-                if rel_col >= wx + gutter
-                    && rel_col < wx + ww
-                    && editor_row >= wy
-                    && editor_row < wy + wh
+            if let Some(idx) = render::find_window_at(layout, rel_col as f64, editor_row as f64) {
+                let rw = &layout.windows[idx];
+                let zone = render::window_zone_hit_test(
+                    rw,
+                    (rel_col as f64) - rw.rect.x,
+                    (editor_row as f64) - rw.rect.y,
+                    1.0,
+                    1.0,
+                );
+                if let render::WindowZone::TextArea {
+                    buf_line,
+                    seg_col_offset,
+                    text_rel_x,
+                    ..
+                } = zone
                 {
-                    let view_row = (editor_row - wy) as usize;
-                    let buf_line = rw
-                        .lines
-                        .get(view_row)
-                        .map(|l| l.line_idx)
-                        .unwrap_or_else(|| rw.scroll_top + view_row);
-                    let text_col = (rel_col - wx).saturating_sub(gutter) as usize + rw.scroll_left;
+                    let text_col = text_rel_x as usize + rw.scroll_left + seg_col_offset;
                     engine.editor_hover_mouse_move(buf_line, text_col, mouse_on_editor_hover);
                     found = true;
-                    break;
                 }
             }
             if !found
@@ -1400,7 +1806,7 @@ pub(super) fn handle_mouse(
     if ev.kind != MouseEventKind::Down(MouseButton::Left) {
         return sidebar_width;
     }
-
+    // DEBUG: trace every left-click
     // ── Click on editor hover popup link → execute command or copy URL ─────
     if mouse_on_editor_hover && !editor_hover_link_rects.is_empty() {
         for &(lx, ly, lw, _lh, ref url) in editor_hover_link_rects {
@@ -1411,6 +1817,44 @@ pub(super) fn handle_mouse(
                     tui_copy_to_clipboard(url, engine);
                     engine.dismiss_editor_hover();
                 }
+                return sidebar_width;
+            }
+        }
+    }
+    // ── Click on editor hover popup scrollbar → jump-scroll or arm drag ────
+    // Same pattern as picker/explorer scrollbars (#215). Track click jumps
+    // to that offset and begins a drag so the mouse-move dispatcher
+    // updates the offset live; thumb click just begins the drag.
+    if mouse_on_editor_hover {
+        if let Some(sb_hit) = editor_hover_scrollbar {
+            let cx = col as f32;
+            let cy = row as f32;
+            let on_thumb = cx >= sb_hit.thumb.x
+                && cx < sb_hit.thumb.x + sb_hit.thumb.width
+                && cy >= sb_hit.thumb.y
+                && cy < sb_hit.thumb.y + sb_hit.thumb.height;
+            let on_track = !on_thumb
+                && cx >= sb_hit.track.x
+                && cx < sb_hit.track.x + sb_hit.track.width
+                && cy >= sb_hit.track.y
+                && cy < sb_hit.track.y + sb_hit.track.height;
+            if on_track || on_thumb {
+                let grab_offset = if on_thumb { cy - sb_hit.thumb.y } else { 0.0 };
+                drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                    widget: quadraui::WidgetId::new("editor_hover"),
+                    track_start: sb_hit.track.y,
+                    track_length: sb_hit.track.height,
+                    thumb_length: sb_hit.thumb.height,
+                    max_scroll: sb_hit.total.saturating_sub(sb_hit.visible_rows),
+                    grab_offset,
+                    inverted: false,
+                });
+                apply_scrollbar_drag(
+                    drag_state,
+                    quadraui::Point { x: cx, y: cy },
+                    engine,
+                    sidebar,
+                );
                 return sidebar_width;
             }
         }
@@ -1477,21 +1921,8 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // ── Status bar branch click — open branch picker ───────────────────────
-    // (only when global status bar exists — per-window status replaces it)
-    // Skip when click is in the activity bar column (settings button lives there).
+    // Global status bar row — consume click (no interactive segments).
     if row + 2 == term_height && !engine.settings.window_status_line && col >= ab_width {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            if let Some(layout) = last_layout {
-                if let Some((start, end)) = layout.status_branch_range {
-                    let click_col = col as usize;
-                    if click_col >= start && click_col < end {
-                        engine.open_picker(crate::core::engine::PickerSource::GitBranches);
-                        return sidebar_width;
-                    }
-                }
-            }
-        }
         return sidebar_width;
     }
 
@@ -1500,217 +1931,113 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // ── Menu bar row click ─────────────────────────────────────────────────────
+    // ── Menu bar row click — command center only ──────────────────────────────
+    // Menu bar item clicks and dropdown clicks are handled by
+    // MenuSystem::handle() in the UiEvent intercept (mod.rs).
+    // The command center (nav arrows + search box) is still separate.
     if engine.menu_bar_visible && row == 0 {
-        let mut col_pos: u16 = 1; // 1-cell left pad
-        for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-            let item_w = name.chars().count() as u16 + 2; // space + name + space
-            if col >= col_pos && col < col_pos + item_w {
-                if engine.menu_open_idx == Some(idx) {
-                    engine.close_menu();
-                } else {
-                    engine.open_menu(idx);
-                }
-                return sidebar_width;
-            }
-            col_pos += item_w;
-        }
-        // Nav arrows + search box are centered between menu_end and right edge.
-        let menu_end = col_pos;
-        let arrows_w: u16 = 4; // "◀ ▶ "
-        let title = engine
-            .cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "VimCode".to_string());
-        let display = format!("\u{1f50d} {}", title);
-        let text_len = display.chars().count() as u16;
-        let box_width = if !title.is_empty() { text_len + 4 } else { 0 };
-        let gap: u16 = if box_width > 0 { 1 } else { 0 };
-        let total_unit = arrows_w + gap + box_width;
-        let term_w = terminal_size.map(|r| r.width).unwrap_or(80);
-        let available = term_w.saturating_sub(menu_end);
-        if available >= total_unit + 2 {
-            let unit_start = menu_end + (available - total_unit) / 2;
-            // Back arrow at unit_start, forward at unit_start+2
-            if col == unit_start {
+        let cc_hit = engine
+            .command_center_layout
+            .borrow()
+            .as_ref()
+            .map(|l| l.hit_test(col as f32, row as f32 + 0.5));
+        match cc_hit {
+            Some(quadraui::CommandCenterHit::Back) => {
                 engine.tab_nav_back();
                 return sidebar_width;
             }
-            if col == unit_start + 2 {
+            Some(quadraui::CommandCenterHit::Forward) => {
                 engine.tab_nav_forward();
                 return sidebar_width;
             }
-            // Search box area: from arrows_w past unit_start to end of box
-            let search_start = unit_start + arrows_w + gap;
-            let search_end = unit_start + total_unit;
-            if col >= search_start && col < search_end {
+            Some(quadraui::CommandCenterHit::SearchBox) => {
                 engine.open_command_center();
                 return sidebar_width;
             }
+            _ => {}
         }
-        engine.close_menu(); // click in empty area of menu bar
+        // Click on menu bar area outside command center / menu items is
+        // handled by MenuSystem (it closes the dropdown if open).
         return sidebar_width;
     }
 
-    // ── Menu dropdown item click ───────────────────────────────────────────────
-    if let Some(open_idx) = engine.menu_open_idx {
-        if let Some((_, _, items)) = render::MENU_STRUCTURE.get(open_idx) {
-            // Determine the dropdown anchor column (same formula as render_menu_dropdown)
-            let mut popup_col: u16 = 1;
-            for i in 0..open_idx {
-                if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                    popup_col += name.chars().count() as u16 + 2;
-                }
-            }
-            let max_label = items.iter().map(|i| i.label.len()).max().unwrap_or(4);
-            let max_shortcut = items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
-            let popup_width = (max_label + max_shortcut + 6).clamp(20, 50) as u16;
-            let popup_x = popup_col.min(term_height.saturating_sub(popup_width));
-            // Dropdown rows: border(1) + items
-            let menu_bar_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-            let popup_y = menu_bar_row; // dropdown starts below menu bar
-            if row > popup_y && col >= popup_x && col < popup_x + popup_width {
-                let item_idx = (row - popup_y - 1) as usize;
-                if item_idx < items.len() && !items[item_idx].separator && items[item_idx].enabled {
-                    let action = items[item_idx].action.to_string();
-                    if action == "open_file_dialog" {
-                        engine.close_menu();
-                        engine.open_picker(crate::core::engine::PickerSource::Files);
-                    } else {
-                        let act = engine.menu_activate_item(open_idx, item_idx, &action);
-                        if act == EngineAction::OpenTerminal {
-                            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                            engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
-                        } else if let EngineAction::RunInTerminal(cmd) = act {
-                            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                            engine.terminal_run_command(
-                                &cmd,
-                                cols,
-                                engine.session.terminal_panel_rows,
-                            );
-                        } else if act == EngineAction::OpenFolderDialog {
-                            *folder_picker = Some(FolderPickerState::new(
-                                &engine.cwd.clone(),
-                                FolderPickerMode::OpenFolder,
-                                engine.settings.show_hidden_files,
-                            ));
-                        } else if act == EngineAction::OpenWorkspaceDialog {
-                            // open_workspace_from_file() already ran in the engine;
-                            // refresh the sidebar to reflect the new cwd.
-                            *sidebar = TuiSidebar::new(engine.cwd.clone(), sidebar.visible);
-                            sidebar.show_hidden_files = engine.settings.show_hidden_files;
-                        } else if act == EngineAction::SaveWorkspaceAsDialog {
-                            let ws_path = engine.cwd.join(".vimcode-workspace");
-                            engine.save_workspace_as(&ws_path);
-                        } else if act == EngineAction::OpenRecentDialog {
-                            *folder_picker = Some(FolderPickerState::new_recent(
-                                &engine.session.recent_workspaces,
-                            ));
-                        } else if act == EngineAction::QuitWithUnsaved {
-                            *quit_confirm = true;
-                        } else if act == EngineAction::ToggleSidebar {
-                            sidebar.visible = !sidebar.visible;
-                        } else if handle_action(engine, act) {
-                            *should_quit = true;
+    // ── Bottom panel tab bar click (shared row above Terminal / Debug Output) ──
+    // Geometry is cached at paint time on engine.bottom_panel_geometry (#418).
+    if col >= editor_left
+        && matches!(
+            engine.resolve_bottom_panel_zone(row as f64),
+            Some(crate::core::engine::BottomPanelZone::TabBar)
+        )
+    {
+        engine.handle_bottom_tab_bar_click(col as f64);
+        return sidebar_width;
+    }
+
+    // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
+    {
+        let surfaces = engine.scroll_surfaces.borrow();
+        let click_events = quadraui::dispatch_click(
+            modal_stack,
+            &surfaces,
+            &[],
+            drag_state,
+            quadraui::Point {
+                x: col as f32,
+                y: row as f32,
+            },
+            quadraui::MouseButton::Left,
+            Default::default(),
+        );
+        drop(surfaces);
+        for cev in &click_events {
+            match cev {
+                quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } => {
+                    match widget.as_str() {
+                        "debug_output" => {
+                            engine.debug_output_scroll = *new_offset;
+                            engine.debug_output_auto_scroll = false;
+                            return sidebar_width;
                         }
+                        "explorer:sb" => {
+                            engine
+                                .explorer_tree
+                                .borrow_mut()
+                                .set_scroll_offset(*new_offset);
+                            return sidebar_width;
+                        }
+                        "ext_panel:sb" => {
+                            engine.ext_panel_scroll_top = *new_offset;
+                            return sidebar_width;
+                        }
+                        "tui:settings" => {
+                            engine.settings_scroll_top = *new_offset;
+                            return sidebar_width;
+                        }
+                        other if other.starts_with("debug_sidebar:") => {
+                            // SidebarSystem handles scrollbar internally
+                            return sidebar_width;
+                        }
+                        _ => {}
                     }
                 }
-                return sidebar_width;
-            }
-            // Click outside dropdown — close it
-            engine.close_menu();
-        }
-    }
-
-    // ── Debug toolbar row click ────────────────────────────────────────────────
-    if engine.debug_toolbar_visible {
-        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let strip_rows: u16 = if engine.terminal_open {
-            engine.session.terminal_panel_rows + 1
-        } else {
-            0
-        };
-        let toolbar_row = term_height.saturating_sub(3 + qf_rows + strip_rows);
-        if row == toolbar_row {
-            let mut col_pos: u16 = 1;
-            for (idx, btn) in render::DEBUG_BUTTONS.iter().enumerate() {
-                if idx == 4 {
-                    col_pos += 2; // separator gap
-                }
-                let btn_w = (btn.icon.chars().count() + btn.key_hint.chars().count() + 4) as u16;
-                if col >= col_pos && col < col_pos + btn_w {
-                    let _ = engine.execute_command(btn.action);
+                quadraui::UiEvent::MouseDown {
+                    widget: Some(id), ..
+                } if id.as_str() == "debug_output" => {
                     return sidebar_width;
                 }
-                col_pos += btn_w;
-            }
-            return sidebar_width; // click in toolbar row, consume event
-        }
-    }
-
-    // ── Bottom panel tab bar click (shared row above Terminal / Debug Output) ──
-    {
-        let bottom_panel_visible = engine.terminal_open || engine.bottom_panel_open;
-        if bottom_panel_visible && col >= editor_left {
-            let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-            let wildmenu_rows: u16 = if !engine.wildmenu_items.is_empty() {
-                1
-            } else {
-                0
-            };
-            let global_status_rows: u16 = if engine.settings.window_status_line {
-                0
-            } else {
-                1
-            };
-            let panel_height = engine.session.terminal_panel_rows + 2;
-            // Bottom panel y = term_height - cmd(1) - status - wildmenu - debug_toolbar - panel
-            let tab_bar_row = term_height
-                .saturating_sub(1 + global_status_rows + wildmenu_rows + dt_rows + panel_height);
-            if row == tab_bar_row {
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                let rel_col = col - editor_left; // column relative to editor area
-                                                 // Close button (×) at rightmost 2 cols of editor area
-                if col >= term_width.saturating_sub(2) {
-                    engine.bottom_panel_open = false;
-                    engine.close_terminal();
+                quadraui::UiEvent::MouseDown {
+                    widget: Some(id), ..
+                } if matches!(id.as_str(), "explorer:sb" | "ext_panel:sb")
+                    && drag_state.is_active() =>
+                {
                     return sidebar_width;
                 }
-                // Tab label click — switch between Terminal and Debug Output.
-                // Labels: "  Terminal  " (12 chars), "  Debug Output  " (16 chars)
-                if rel_col < 12 {
-                    engine.bottom_panel_kind = render::BottomPanelKind::Terminal;
-                } else if rel_col < 28 {
-                    engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
+                quadraui::UiEvent::MouseDown {
+                    widget: Some(id), ..
+                } if id.as_str().starts_with("debug_sidebar:") && drag_state.is_active() => {
+                    return sidebar_width;
                 }
-                return sidebar_width;
-            }
-        }
-    }
-
-    // ── Debug output panel click (scrollbar) ──────────────────────────────────
-    {
-        let debug_output_open = engine.bottom_panel_kind == render::BottomPanelKind::DebugOutput
-            && !engine.dap_output_lines.is_empty();
-        if debug_output_open {
-            let dt_rows: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-            let panel_height = engine.session.terminal_panel_rows + 2;
-            let panel_y = term_height.saturating_sub(bottom_chrome + dt_rows + panel_height);
-            let panel_end = term_height.saturating_sub(bottom_chrome + dt_rows);
-            if row >= panel_y && row < panel_end {
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                let sb_col = term_width.saturating_sub(1);
-                let total = engine.dap_output_lines.len();
-                let content_rows = engine.session.terminal_panel_rows as usize;
-                if total > content_rows && col == sb_col && row >= panel_y + 2 {
-                    // Click on scrollbar track — start drag.
-                    let track_start = panel_y + 2; // after tab-bar row + header row
-                    let track_len = engine.session.terminal_panel_rows;
-                    *dragging_debug_output_sb = Some((track_start, track_len, total));
-                }
-                return sidebar_width;
+                _ => {}
             }
         }
     }
@@ -1718,7 +2045,7 @@ pub(super) fn handle_mouse(
     if sep_status_rows > 0 {
         let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
         let strip_rows: u16 = if engine.terminal_open {
-            engine.session.terminal_panel_rows + 1
+            super::effective_terminal_panel_rows_tui(engine, term_height) + 1
         } else {
             0
         };
@@ -1735,7 +2062,7 @@ pub(super) fn handle_mouse(
                             use crate::core::engine::EngineAction;
                             match ea {
                                 EngineAction::ToggleSidebar => {
-                                    sidebar.visible = !sidebar.visible;
+                                    // Engine handles this internally now.
                                 }
                                 EngineAction::OpenTerminal => {
                                     let cols =
@@ -1753,90 +2080,85 @@ pub(super) fn handle_mouse(
         }
     }
     // ── Terminal panel click ───────────────────────────────────────────────────
-    {
-        let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-        let strip_rows: u16 = if engine.terminal_open {
-            engine.session.terminal_panel_rows + 1
-        } else {
-            0
-        };
-        let term_strip_top = term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
-        if engine.terminal_open
-            && strip_rows > 0
-            && col >= editor_left
-            && row >= term_strip_top
-            && row < term_strip_top + strip_rows
-        {
-            if row == term_strip_top {
-                // Header row — tab switch, toolbar buttons, or resize drag.
+    // Zone resolved from cached geometry written at paint time (#418). Toolbar
+    // and content rows live inside the bottom panel area; their absolute y
+    // (e.g. for the scrollbar track) is recovered from the cached top_y.
+    if engine.terminal_open && col >= editor_left {
+        let zone = engine.resolve_bottom_panel_zone(row as f64);
+        let geom = *engine.bottom_panel_geometry.borrow();
+        if let (Some(zone), Some(geom)) = (zone, geom) {
+            use crate::core::engine::BottomPanelZone;
+            // Tab bar was already dispatched above; only Toolbar / Content land here.
+            if matches!(zone, BottomPanelZone::Toolbar) {
+                // Header row — dispatch through cached toolbar hit regions.
                 engine.terminal_has_focus = true;
-                const TERMINAL_TAB_COLS: u16 = 4;
-                let tab_count = engine.terminal_panes.len() as u16;
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                if tab_count > 0 && col < tab_count * TERMINAL_TAB_COLS {
-                    engine.terminal_switch_tab((col / TERMINAL_TAB_COLS) as usize);
-                } else if col >= term_width.saturating_sub(2) {
-                    // Close icon (rightmost 2 cols)
-                    engine.terminal_close_active_tab();
-                } else if col >= term_width.saturating_sub(4) {
-                    // Split button (2 cols left of close)
-                    let full_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let rows = engine.session.terminal_panel_rows;
-                    engine.terminal_toggle_split(full_cols, rows);
-                } else if col >= term_width.saturating_sub(6) {
-                    // Add button (2 cols left of split)
-                    let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-                    let rows = engine.session.terminal_panel_rows;
-                    engine.terminal_new_tab(cols, rows);
-                } else {
+                let action = engine.resolve_terminal_toolbar_click(col as f64);
+                let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
+                let panel_cols = terminal_size
+                    .map(|s| s.width)
+                    .unwrap_or(80)
+                    .saturating_sub(editor_left);
+                let ctx = crate::core::engine::UiEventContext {
+                    terminal_cols: panel_cols,
+                    terminal_max_rows: super::terminal_target_maximize_rows_tui(engine, screen_h),
+                };
+                if !engine.execute_terminal_toolbar_action(action, ctx)
+                    && matches!(
+                        action,
+                        crate::core::engine::TerminalToolbarAction::StartResize
+                    )
+                {
                     *dragging_terminal_resize = true;
                 }
-            } else {
-                // Content row — focus split pane or start divider drag.
-                if engine.terminal_split && engine.terminal_panes.len() >= 2 {
-                    // Mirror render.rs: use drag-override if set, else actual PTY cols.
-                    let div_col = if engine.terminal_split_left_cols > 0 {
-                        engine.terminal_split_left_cols
-                    } else {
-                        engine.terminal_panes[0].cols
-                    };
-                    // Allow clicking within ±1 column of the divider to start a resize drag.
-                    if col.abs_diff(div_col) <= 1 {
-                        engine.terminal_has_focus = true;
-                        *dragging_terminal_split = true;
-                        return sidebar_width; // skip selection start
-                    } else {
-                        engine.terminal_active = if col < div_col { 0 } else { 1 };
+            } else if let BottomPanelZone::Content { row_offset } = zone {
+                // Use cached TerminalSplitLayout for divider/pane/scrollbar
+                // detection (#430). Non-split fallback uses row_offset directly.
+                let split_layout = engine.terminal_split_layout.borrow();
+                if let Some(ref sl) = *split_layout {
+                    let abs_y = geom.top_y + geom.content_y + row_offset as f64;
+                    let hit = sl.hit_test(col as f32, abs_y as f32);
+                    drop(split_layout);
+                    match hit {
+                        quadraui::TerminalSplitHit::Scrollbar => {
+                            let track_start = (geom.top_y + geom.content_y) as u16;
+                            let track_len = (geom.height - geom.content_y).max(0.0) as u16;
+                            let total = engine
+                                .active_terminal()
+                                .map(|t| t.history.len())
+                                .unwrap_or(0);
+                            let tl = track_len as f32;
+                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                                widget: quadraui::WidgetId::new("tui:terminal_scrollback"),
+                                track_start: track_start as f32,
+                                track_length: tl,
+                                thumb_length: (tl / total.max(1) as f32).max(1.0),
+                                max_scroll: total,
+                                grab_offset: 0.0,
+                                inverted: true,
+                            });
+                            apply_scrollbar_drag(
+                                drag_state,
+                                quadraui::Point {
+                                    x: col as f32,
+                                    y: row as f32,
+                                },
+                                engine,
+                                sidebar,
+                            );
+                        }
+                        _ => {
+                            if engine.handle_terminal_split_click(hit) {
+                                *dragging_terminal_split = true;
+                            }
+                        }
                     }
-                }
-                // Check for scrollbar click first.
-                let term_width = terminal_size.map(|s| s.width).unwrap_or(80);
-                let sb_col = term_width.saturating_sub(1);
-                engine.terminal_has_focus = true;
-                if col == sb_col {
-                    // Scrollbar column — start drag.
-                    let track_start = term_strip_top + 1;
-                    let track_len = strip_rows.saturating_sub(1); // content rows
-                                                                  // Cap total to one screenful (vt100 API limit) so the drag range
-                                                                  // [0, total] exactly matches what set_scroll_offset can deliver.
-                    let total = engine
-                        .active_terminal()
-                        .map(|t| t.history.len())
-                        .unwrap_or(0);
-                    *dragging_terminal_sb = Some((track_start, track_len, total));
                 } else {
-                    // Content area — start a selection.
-                    let term_row = row - term_strip_top - 1;
+                    drop(split_layout);
+                    // #429: focus + scroll reset + selection are now owned by
+                    // the engine. TUI still does the col conversion (panel
+                    // is offset by sidebar/activity-bar width on the left).
                     let term_col = col.saturating_sub(editor_left);
-                    engine.terminal_scroll_reset();
-                    if let Some(term) = engine.active_terminal_mut() {
-                        term.selection = Some(crate::core::terminal::TermSelection {
-                            start_row: term_row,
-                            start_col: term_col,
-                            end_row: term_row,
-                            end_col: term_col,
-                        });
-                    }
+                    engine.handle_terminal_pane_click(term_col, row_offset);
                 }
             }
             return sidebar_width;
@@ -1863,90 +2185,72 @@ pub(super) fn handle_mouse(
         match ab_target {
             Some(ActivityBarTarget::MenuToggle) => {
                 engine.toggle_menu_bar();
+                if !engine.menu_bar_visible {
+                    // Close the dropdown. MenuSystem::close() needs &mut Backend,
+                    // but the mouse handler only has (drag_state, modal_stack).
+                    // Pop the modal directly and reset the MenuSystem state by
+                    // re-creating it with the same menu definitions.
+                    modal_stack.pop(&quadraui::WidgetId::new("menu-system-dropdown"));
+                    let menus = crate::render::build_menu_defs(engine.is_vscode_mode());
+                    *engine.menu_system.borrow_mut() = quadraui::MenuSystem::new(menus);
+                }
                 return sidebar_width;
             }
             Some(ActivityBarTarget::ExtensionPanel(name)) => {
-                if sidebar.ext_panel_name.as_deref() == Some(&name) && sidebar.visible {
-                    sidebar.visible = false;
+                if sidebar.ext_panel_name.as_deref() == Some(&name)
+                    && engine.app_shell.sidebar_visible()
+                {
+                    engine.app_shell.hide_sidebar();
                     sidebar.ext_panel_name = None;
                     engine.ext_panel_has_focus = false;
                     engine.ext_panel_active = None;
                 } else {
                     sidebar.ext_panel_name = Some(name.clone());
-                    sidebar.visible = true;
+                    if !engine.app_shell.sidebar_visible() {
+                        engine.toggle_sidebar();
+                    }
                     sidebar.has_focus = true;
                     engine.ext_panel_active = Some(name.clone());
                     engine.ext_panel_has_focus = true;
                     engine.ext_panel_selected = 0;
                     engine.plugin_event("panel_focus", &name);
                 }
-                engine.session.explorer_visible = sidebar.visible;
+                engine.session.explorer_visible = engine.app_shell.sidebar_visible();
                 let _ = engine.session.save();
                 return sidebar_width;
             }
             _ => {}
         }
-        // Map shared SidebarPanel to TUI-local TuiPanel
-        let target_panel = match ab_target {
-            Some(ActivityBarTarget::Panel(p)) => match p {
-                SidebarPanel::Explorer => Some(TuiPanel::Explorer),
-                SidebarPanel::Search => Some(TuiPanel::Search),
-                SidebarPanel::Debug => Some(TuiPanel::Debug),
-                SidebarPanel::Git => Some(TuiPanel::Git),
-                SidebarPanel::Extensions => Some(TuiPanel::Extensions),
-                SidebarPanel::Ai => Some(TuiPanel::Ai),
-            },
-            Some(ActivityBarTarget::Settings) => Some(TuiPanel::Settings),
+        let target_panel_id = match ab_target {
+            Some(ActivityBarTarget::Panel(p)) => Some(match p {
+                SidebarPanel::Explorer => PANEL_EXPLORER,
+                SidebarPanel::Search => PANEL_SEARCH,
+                SidebarPanel::Debug => PANEL_DEBUG,
+                SidebarPanel::Git => PANEL_GIT,
+                SidebarPanel::Extensions => PANEL_EXTENSIONS,
+                SidebarPanel::Ai => PANEL_AI,
+            }),
+            Some(ActivityBarTarget::Settings) => Some(PANEL_SETTINGS),
             _ => None,
         };
-        if let Some(panel) = target_panel {
-            // Clear extension panel state when switching to a built-in panel
+        if let Some(panel_id) = target_panel_id {
             sidebar.ext_panel_name = None;
             engine.ext_panel_has_focus = false;
             engine.ext_panel_active = None;
-            if sidebar.active_panel == panel && sidebar.visible {
-                sidebar.visible = false;
-            } else {
-                sidebar.active_panel = panel;
-                sidebar.visible = true;
-                if panel == TuiPanel::Search {
-                    sidebar.has_focus = true;
-                    sidebar.search_input_mode = true;
-                }
-                if panel == TuiPanel::Git {
-                    engine.sc_refresh();
-                }
-                if panel == TuiPanel::Extensions {
-                    engine.ext_sidebar_has_focus = true;
-                    if engine.ext_registry.is_none() && !engine.ext_registry_fetching {
-                        engine.ext_refresh();
-                    }
-                    sidebar.has_focus = true;
-                }
-                if panel == TuiPanel::Ai {
-                    engine.ai_has_focus = true;
-                    sidebar.has_focus = true;
-                }
-                if panel == TuiPanel::Settings {
-                    engine.settings_has_focus = true;
-                    sidebar.has_focus = true;
-                }
+            engine.toggle_sidebar_panel(panel_id);
+            if engine.app_shell.sidebar_visible() {
+                sidebar.has_focus = true;
             }
-            engine.session.explorer_visible = sidebar.visible;
-            let _ = engine.session.save();
         }
         return sidebar_width;
     }
 
     // ── Sidebar panel area ────────────────────────────────────────────────────
-    if sidebar.visible && col < ab_width + sidebar_width {
-        // Rightmost column of the sidebar is the scrollbar column.
-        let sb_col = ab_width + sidebar_width - 1;
+    if engine.app_shell.sidebar_visible() && col < ab_width + sidebar_width {
         // Account for menu bar: when visible it occupies absolute row 0, so the
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         let sidebar_row = row.saturating_sub(menu_rows);
-
         // Extension panel must be checked FIRST — ext_panel_name overrides active_panel
         if sidebar.ext_panel_name.is_some() {
             sidebar.has_focus = true;
@@ -1968,7 +2272,11 @@ pub(super) fn handle_mouse(
             let content_start = 1 + input_rows; // header + optional input
 
             // Right-click fires panel_context_menu event.
-            if ev.kind == MouseEventKind::Down(MouseButton::Right) {
+            // #451: accept Up(Right) too (Alacritty/crossterm-0.28 only sends Up).
+            if matches!(
+                ev.kind,
+                MouseEventKind::Down(MouseButton::Right) | MouseEventKind::Up(MouseButton::Right)
+            ) {
                 if sidebar_row >= content_start {
                     let flat_idx =
                         engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
@@ -1981,22 +2289,7 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
 
-            // Scrollbar click/drag → jump-scroll + arm drag
             let flat_len = engine.ext_panel_flat_len();
-            let content_h =
-                term_height.saturating_sub(bottom_chrome + menu_rows + content_start) as usize;
-            if col == sb_col && flat_len > content_h && sidebar_row >= content_start {
-                let rel_row = (sidebar_row - content_start) as usize;
-                let ratio = rel_row as f64 / content_h as f64;
-                let new_top = (ratio * flat_len as f64) as usize;
-                engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
-                *dragging_generic_sb = Some(SidebarScrollDrag {
-                    track_abs_start: content_start + menu_rows,
-                    track_len: content_h as u16,
-                    total: flat_len,
-                });
-                return sidebar_width;
-            }
 
             if sidebar_row == 0 {
                 // Header — no-op
@@ -2014,177 +2307,110 @@ pub(super) fn handle_mouse(
                     *last_click_pos = (col, row);
                     if is_double {
                         engine.handle_ext_panel_double_click();
+                    } else {
+                        // Single-click toggles sections/expandable items.
+                        // Suppressed on double-click so the second Down doesn't
+                        // un-toggle what the first one just toggled (#484).
+                        engine.handle_ext_panel_key("Return", false, None);
                     }
-                    // Single-click toggles sections/expandable items
-                    engine.handle_ext_panel_key("Return", false, None);
                 }
             }
-        } else if sidebar.active_panel == TuiPanel::Explorer {
+        } else if engine.active_panel_is(PANEL_EXPLORER) {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
-            // tree_height = total height - bottom chrome rows (no header)
-            let tree_height = term_height.saturating_sub(bottom_chrome) as usize;
-            let total_rows = sidebar.rows.len();
 
-            // Click on the scrollbar column → jump-scroll + arm drag
-            if col == sb_col && total_rows > tree_height {
-                let rel_row = sidebar_row as usize;
-                let ratio = rel_row as f64 / tree_height as f64;
-                let new_top = (ratio * total_rows as f64) as usize;
-                sidebar.scroll_top = new_top.min(total_rows.saturating_sub(tree_height));
-                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                *dragging_generic_sb = Some(SidebarScrollDrag {
-                    track_abs_start: menu_rows,
-                    track_len: tree_height as u16,
-                    total: total_rows,
-                });
-                return sidebar_width;
-            }
-
-            let tree_row = sidebar_row as usize + sidebar.scroll_top;
-            if tree_row < sidebar.rows.len() {
+            let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
+            if tree_row < engine.explorer_rows.len() {
                 // Record potential drag source for DnD.
                 *explorer_drag_src = Some(tree_row);
-                if sidebar.rows[tree_row].is_dir {
-                    sidebar.selected = tree_row;
-                    sidebar.toggle_dir(tree_row);
+                engine
+                    .explorer_tree
+                    .borrow_mut()
+                    .set_selected_path(Some(vec![tree_row as u16]));
+                if engine.explorer_rows[tree_row].is_dir {
+                    engine.explorer_toggle_dir(tree_row);
                 } else {
-                    sidebar.selected = tree_row;
-                    let path = sidebar.rows[tree_row].path.clone();
-                    let now = Instant::now();
-                    let is_double = now.duration_since(*last_click_time)
-                        < Duration::from_millis(400)
-                        && *last_click_pos == (col, row);
-                    *last_click_time = now;
-                    *last_click_pos = (col, row);
-                    if is_double {
-                        engine.open_file_in_tab(&path);
-                    } else {
-                        engine.open_file_preview(&path);
-                    }
+                    let path = engine.explorer_rows[tree_row].path.clone();
+                    engine.open_file_preview(&path);
                 }
             }
-        } else if sidebar.active_panel == TuiPanel::Debug {
-            use crate::core::engine::DebugSidebarSection;
+        } else if engine.active_panel_is(PANEL_DEBUG) {
             sidebar.has_focus = true;
             engine.dap_sidebar_has_focus = true;
 
-            if sidebar_row == 0 {
-                // Header row — no-op
-            } else if sidebar_row == 1 {
-                // Run/Stop button
-                if engine.dap_session_active && engine.dap_stopped_thread.is_some() {
-                    engine.dap_continue();
-                } else if engine.dap_session_active {
-                    engine.execute_command("stop");
-                } else {
-                    engine.execute_command("debug");
+            if sidebar_row < 2 {
+                // Chrome rows (title + action button).
+                let guard = engine.dap_sidebar_action_hits.borrow();
+                let matched = guard
+                    .as_ref()
+                    .map(|l| {
+                        matches!(
+                            l.hit_test(col as f32, 0.0),
+                            quadraui::StatusBarHit::Segment(_)
+                        )
+                    })
+                    .unwrap_or(false);
+                drop(guard);
+                if matched {
+                    engine.handle_dap_sidebar_action_click();
                 }
             } else {
-                // Walk sections using fixed-allocation layout:
-                // row 2+ = [section_header(1) + content(height)]×4
-                let sections = [
-                    (DebugSidebarSection::Variables, 0usize),
-                    (DebugSidebarSection::Watch, 1),
-                    (DebugSidebarSection::CallStack, 2),
-                    (DebugSidebarSection::Breakpoints, 3),
-                ];
-                let mut cur_row: u16 = 2;
-                for (section, sec_idx) in &sections {
-                    let sec_height = engine.dap_sidebar_section_heights[*sec_idx];
-                    let section_header_row = cur_row;
-                    let items_start = cur_row + 1;
-                    let items_end = items_start + sec_height;
-
-                    if sidebar_row == section_header_row {
-                        engine.dap_sidebar_section = *section;
-                        engine.dap_sidebar_selected = 0;
-                        break;
-                    } else if sidebar_row >= items_start && sidebar_row < items_end {
-                        let item_count = engine.dap_sidebar_section_item_count(*section);
-                        let height = sec_height as usize;
-                        let sb_col = ab_width + sidebar_width - 1;
-                        // Scrollbar click: rightmost column when items overflow.
-                        if col == sb_col && item_count > height && height > 0 {
-                            let rel_row = (sidebar_row - items_start) as usize;
-                            let ratio = rel_row as f64 / height as f64;
-                            let max_scroll = item_count.saturating_sub(height);
-                            engine.dap_sidebar_scroll[*sec_idx] =
-                                (ratio * max_scroll as f64) as usize;
-                            engine.dap_sidebar_section = *section;
-                            // Arm drag state for subsequent Drag events.
-                            *dragging_debug_sb = Some(DebugSidebarScrollDrag {
-                                sec_idx: *sec_idx,
-                                track_abs_start: items_start + menu_rows,
-                                track_len: sec_height,
-                                total: item_count,
-                            });
-                        } else {
-                            let scroll_off = engine.dap_sidebar_scroll[*sec_idx];
-                            let row_offset = (sidebar_row - items_start) as usize;
-                            let item_idx = scroll_off + row_offset;
-                            if item_count > 0 && item_idx < item_count {
-                                engine.dap_sidebar_section = *section;
-                                engine.dap_sidebar_selected = item_idx;
-                                engine.handle_debug_sidebar_key("Return", false);
-                            }
-                        }
-                        break;
-                    }
-                    cur_row = items_end;
-                }
+                // Route body click through SidebarSystem.
+                let rect = engine.dap_sidebar_body_rect.get();
+                crate::render::populate_dap_sidebar_system(engine);
+                let click_event = quadraui::UiEvent::MouseDown {
+                    widget: None,
+                    button: quadraui::MouseButton::Left,
+                    position: quadraui::Point::new(col as f32, row as f32),
+                    modifiers: quadraui::Modifiers::default(),
+                };
+                let mut tui_backend = super::backend::TuiBackend::default();
+                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                    &click_event,
+                    &mut tui_backend,
+                    rect,
+                );
+                engine.dispatch_dap_sidebar_event(sidebar_event);
             }
             return sidebar_width;
-        } else if sidebar.active_panel == TuiPanel::Git {
+        } else if engine.active_panel_is(PANEL_GIT) {
             sidebar.has_focus = true;
-            engine.sc_has_focus = true;
+            engine.sc_set_focus(true);
 
-            // sidebar_row layout:
-            //   0 = header
-            //   1 .. commit_rows = commit input
-            //   1+commit_rows = pad above
-            //   2+commit_rows = button row
-            //   3+commit_rows = pad below
-            //   4+commit_rows .. = sections
+            // sidebar_row layout after #509 (option a, no padding):
+            //   0               = header
+            //   1 .. commit_end = commit input
+            //   commit_end      = toolbar slot (button row, SidebarPanel)
+            //   commit_end+1 .. = sections (SidebarPanel content area)
             let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
-            let commit_end = 1 + commit_rows; // first row after commit input
-            let btn_row = 2 + commit_rows; // pad_above + 1
-            let section_start = 4 + commit_rows; // btn + pad_below + 1
+            let commit_end = 1 + commit_rows;
+
             if sidebar_row == 0 {
-                // Panel header — no-op
                 engine.sc_commit_input_active = false;
             } else if sidebar_row >= 1 && sidebar_row < commit_end {
-                // Commit input row(s) — enter commit mode
                 engine.sc_commit_input_active = true;
                 engine.sc_commit_cursor = engine.sc_commit_message.len();
-            } else if sidebar_row == btn_row {
+            } else {
+                // Route via cached SidebarPanelLayout (#509).
                 engine.sc_commit_input_active = false;
-                // Button row: Commit (~50%), Push/Pull/Sync (~17% each, icon-only).
-                // Use column relative to the sidebar content area start.
-                let rel_col = col.saturating_sub(ab_width);
-                let commit_w = sidebar_width / 2;
-                let btn_idx = if rel_col < commit_w {
-                    0
-                } else {
-                    let icon_w = (sidebar_width - commit_w) / 3;
-                    let x = rel_col - commit_w;
-                    (1 + (x / icon_w.max(1))).min(3) as usize
+                let hit = {
+                    let layout = engine.sc_panel_layout.borrow();
+                    layout.as_ref().map(|l| l.hit_test(col as f32, row as f32))
                 };
-                engine.sc_activate_button(btn_idx);
-            } else if sidebar_row >= section_start {
-                engine.sc_commit_input_active = false;
-                // Sections area — map to flat index.
-                // sc_visual_row_to_flat expects: 0=header,1=commit,2=buttons,3+=sections.
-                let adjusted = sidebar_row - section_start + 3;
-                // TUI shows a "(no changes)" hint for expanded-but-empty sections
-                // (extra visual row with no flat-index entry), so empty_section_hint = true.
-                if let Some((flat_idx, is_header)) =
-                    engine.sc_visual_row_to_flat(adjusted as usize, true)
-                {
-                    engine.sc_selected = flat_idx;
-                    if is_header {
-                        engine.handle_sc_key("Tab", false, None);
-                    } else {
+                match hit {
+                    Some(quadraui::SidebarPanelHit::ToolbarButton(_)) => {
+                        if let Some(idx) = engine.sc_button_hit(col as f32, row as f32) {
+                            engine.sc_activate_button(idx);
+                        }
+                    }
+                    Some(quadraui::SidebarPanelHit::Content { .. }) => {
+                        let click_ev = quadraui::UiEvent::MouseDown {
+                            widget: None,
+                            button: quadraui::MouseButton::Left,
+                            position: quadraui::Point::new(col as f32, row as f32),
+                            modifiers: quadraui::Modifiers::default(),
+                        };
+                        engine.handle_sc_sidebar_ui_event(click_ev);
                         let now = Instant::now();
                         let is_double = now.duration_since(*last_click_time)
                             < Duration::from_millis(400)
@@ -2192,175 +2418,74 @@ pub(super) fn handle_mouse(
                         *last_click_time = now;
                         *last_click_pos = (col, row);
                         if is_double {
-                            engine.sc_open_selected_async();
-                            engine.sc_has_focus = true;
-                            sidebar.has_focus = true;
+                            let double_ev = quadraui::UiEvent::DoubleClick {
+                                widget: None,
+                                position: quadraui::Point::new(col as f32, row as f32),
+                            };
+                            engine.handle_sc_sidebar_ui_event(double_ev);
                         }
                     }
+                    _ => {}
                 }
             }
             return sidebar_width;
-        } else if sidebar.active_panel == TuiPanel::Search {
+        } else if engine.active_panel_is(PANEL_SEARCH) {
             sidebar.has_focus = true;
-            // results_height = (total height - 2 status rows) - 5 panel header rows
-            let results_height = term_height.saturating_sub(7) as usize;
-            let results = &engine.project_search_results;
-
-            // Click on the scrollbar column in the results area → jump-scroll
-            if col == sb_col && !results.is_empty() && sidebar_row >= 5 {
-                // Count total display rows (result rows + file header rows)
-                let total_display = {
-                    let mut count = 0usize;
-                    let mut last_file: Option<&std::path::Path> = None;
-                    for m in results.iter() {
-                        if last_file != Some(m.file.as_path()) {
-                            last_file = Some(m.file.as_path());
-                            count += 1;
-                        }
-                        count += 1;
-                    }
-                    count
-                };
-                if total_display > results_height {
-                    let rel_row = sidebar_row.saturating_sub(5) as usize;
-                    let ratio = rel_row as f64 / results_height as f64;
-                    let new_scroll = (ratio * total_display as f64) as usize;
-                    sidebar.search_scroll_top =
-                        new_scroll.min(total_display.saturating_sub(results_height));
-                    // Arm drag state so subsequent Drag events continue scrolling.
-                    // track_abs_start is the absolute terminal row of the track top.
-                    *dragging_sidebar_search = Some(SidebarScrollDrag {
-                        track_abs_start: 5 + menu_rows,
-                        track_len: results_height as u16,
-                        total: total_display,
-                    });
-                }
-                return sidebar_width;
+            if !engine.search_has_focus {
+                engine.search_set_focus(true);
             }
-
-            // sidebar_rows 0-2: header + search + replace inputs — clicking enters input mode
-            if sidebar_row <= 2 {
-                sidebar.search_input_mode = true;
-                sidebar.replace_input_focused = sidebar_row == 2;
-            } else {
-                sidebar.search_input_mode = false;
-                sidebar.replace_input_focused = false;
-                // sidebar_row 3 = toggles, 4 = status line; 5+ = results area
-                // Add scroll offset so clicks map to the correct result.
-                let content_row =
-                    (sidebar_row as usize).saturating_sub(5) + sidebar.search_scroll_top;
-                if !results.is_empty() {
-                    let selected = visual_row_to_result_idx(results, content_row);
-                    if let Some(idx) = selected {
-                        engine.project_search_selected = idx;
-                        // Open the file immediately on click
-                        let result = engine
-                            .project_search_results
-                            .get(idx)
-                            .map(|m| (m.file.clone(), m.line));
-                        if let Some((file, line)) = result {
-                            engine.open_file_in_tab(&file);
-                            let win_id = engine.active_window_id();
-                            engine.set_cursor_for_window(win_id, line, 0);
-                            engine.ensure_cursor_visible();
-                            sidebar.has_focus = false;
-                        }
-                    }
-                }
+            let click_x = col as f32;
+            let click_y = row as f32 + 0.5;
+            let event = quadraui::UiEvent::MouseDown {
+                widget: None,
+                position: quadraui::Point::new(click_x, click_y),
+                button: quadraui::MouseButton::Left,
+                modifiers: quadraui::Modifiers::default(),
+            };
+            engine.handle_search_sidebar_ui_event(event);
+            if !engine.search_has_focus {
+                sidebar.has_focus = false;
             }
-        } else if sidebar.active_panel == TuiPanel::Extensions {
+        } else if engine.active_panel_is(PANEL_EXTENSIONS) {
             sidebar.has_focus = true;
             engine.ext_sidebar_has_focus = true;
-
-            // Row layout: 0=header, 1=search, 2=INSTALLED header, 3..=items/headers
             if sidebar_row == 0 {
-                // Header — no-op
+                // Panel header — no-op
             } else if sidebar_row == 1 {
-                // Search box — activate search input
                 engine.ext_sidebar_input_active = true;
-            } else {
-                let installed = engine.ext_installed_items();
-                let installed_len = if engine.ext_sidebar_sections_expanded[0] {
-                    installed.len()
-                } else {
-                    0
-                };
-                let installed_header_row: u16 = 2;
-                let installed_display =
-                    installed_len.max(if engine.ext_sidebar_sections_expanded[0] {
-                        1
-                    } else {
-                        0
-                    });
-                let available_header_row = installed_header_row + 1 + installed_display as u16;
-
-                if sidebar_row == installed_header_row {
-                    engine.ext_sidebar_sections_expanded[0] =
-                        !engine.ext_sidebar_sections_expanded[0];
-                } else if sidebar_row > installed_header_row
-                    && sidebar_row < available_header_row
-                    && installed_len > 0
-                {
-                    let idx = (sidebar_row - installed_header_row - 1) as usize;
-                    if idx < installed_len {
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
-                        engine.ext_sidebar_selected = idx;
-                        if is_double {
-                            engine.ext_open_selected_readme();
-                        }
-                    }
-                } else if sidebar_row == available_header_row {
-                    engine.ext_sidebar_sections_expanded[1] =
-                        !engine.ext_sidebar_sections_expanded[1];
-                } else if sidebar_row > available_header_row {
-                    let avail_len = if engine.ext_sidebar_sections_expanded[1] {
-                        engine.ext_available_items().len()
-                    } else {
-                        0
-                    };
-                    let avail_idx = (sidebar_row - available_header_row - 1) as usize;
-                    if avail_idx < avail_len {
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
-                        engine.ext_sidebar_selected = installed_len + avail_idx;
-                        if is_double {
-                            // Double-click opens README
-                            engine.ext_open_selected_readme();
-                        }
-                        // Single-click just selects
-                    }
-                }
             }
-        } else if sidebar.active_panel == TuiPanel::Settings {
+            // Rows 2+ handled by SidebarSystem mouse intercept in main loop
+        } else if engine.active_panel_is(PANEL_SETTINGS) {
             sidebar.has_focus = true;
             engine.settings_has_focus = true;
-
-            // Row 0: header, Row 1: search input, Row 2+: scrollable content
-            let content_height = term_height.saturating_sub(4) as usize; // header+search+status+cmd
             let flat_total = engine.settings_flat_list().len();
 
-            // Scrollbar column → jump-scroll + start drag
-            if col == sb_col && sidebar_row >= 2 && flat_total > content_height {
-                let track_start = row - (sidebar_row - 2);
-                let track_len = content_height as u16;
-                let rel = (sidebar_row - 2) as f64;
-                let ratio = rel / track_len as f64;
-                let max_scroll = flat_total.saturating_sub(content_height);
-                engine.settings_scroll_top = (ratio * max_scroll as f64).round() as usize;
-                *dragging_settings_sb = Some(SidebarScrollDrag {
-                    track_abs_start: track_start,
-                    track_len,
-                    total: flat_total,
-                });
+            // Route scrollbar clicks through FormController.
+            let sb_col = ab_width + sidebar_width - 1;
+            if col == sb_col && sidebar_row >= 2 {
+                let content_start = 2_u16;
+                let content_height = term_height.saturating_sub(4);
+                let q_rect = quadraui::Rect::new(
+                    ab_width as f32,
+                    content_start as f32,
+                    sidebar_width as f32,
+                    content_height as f32,
+                );
+                let click_ev = quadraui::UiEvent::MouseDown {
+                    button: quadraui::MouseButton::Left,
+                    position: quadraui::Point::new(col as f32, row as f32),
+                    modifiers: Default::default(),
+                    widget: None,
+                };
+                render::populate_settings_form_controller(engine);
+                let result = engine
+                    .settings_form_controller
+                    .borrow_mut()
+                    .handle_cached(&click_ev, q_rect);
+                if !matches!(result, quadraui::FormControllerEvent::Ignored) {
+                    engine.settings_scroll_top =
+                        engine.settings_form_controller.borrow().scroll_offset();
+                }
             } else if sidebar_row == 0 {
                 // Header — no-op
             } else if sidebar_row == 1 {
@@ -2389,8 +2514,9 @@ pub(super) fn handle_mouse(
 
     // ── Editor area ───────────────────────────────────────────────────────────
     sidebar.has_focus = false;
-    sidebar.toolbar_focused = false;
-    engine.sc_has_focus = false;
+    engine.activity_bar_focused = false;
+    engine.explorer_has_focus = false;
+    engine.sc_set_focus(false);
     engine.dap_sidebar_has_focus = false;
     engine.ext_sidebar_has_focus = false;
     engine.ai_has_focus = false;
@@ -2407,35 +2533,20 @@ pub(super) fn handle_mouse(
     // ── Breadcrumb click ────────────────────────────────────────────────────
     if engine.settings.breadcrumbs {
         if let Some(layout) = last_layout {
-            for bc in &layout.breadcrumbs {
-                // Match the renderer: bc_y = editor_area.y + bounds.y - 1
-                // where editor_area.y == menu_rows in TUI coordinates.
-                let bc_row = if bc.bounds.y >= 1.0 {
-                    menu_rows + bc.bounds.y as u16 - 1
-                } else {
-                    menu_rows
-                };
-                let bc_x = editor_left + bc.bounds.x as u16;
-                let bc_w = bc.bounds.width as u16;
-                if row == bc_row && col >= bc_x && col < bc_x + bc_w {
+            let bc_x = (col - editor_left) as f64;
+            let bc_y = (row - menu_rows) as f64;
+            match render::resolve_breadcrumb_click(&layout.breadcrumbs, bc_x, bc_y, 1.0) {
+                render::BreadcrumbClickResult::Hit(idx) => {
                     if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        return sidebar_width; // consume non-click events on breadcrumb row
+                        return sidebar_width;
                     }
-                    let local_col = (col - bc_x) as usize;
-                    let sep_len = 3; // " › "
-                    let mut x = 1usize; // match left padding in renderer
-                    engine.rebuild_breadcrumb_segments();
-                    for (i, seg) in bc.segments.iter().enumerate() {
-                        let label_len = seg.label.chars().count();
-                        if local_col >= x && local_col < x + label_len {
-                            engine.breadcrumb_selected = i;
-                            engine.breadcrumb_open_scoped();
-                            return sidebar_width;
-                        }
-                        x += label_len + sep_len;
-                    }
+                    engine.handle_breadcrumb_click(idx);
                     return sidebar_width;
                 }
+                render::BreadcrumbClickResult::OnBar => {
+                    return sidebar_width;
+                }
+                render::BreadcrumbClickResult::Miss => {}
             }
         }
     }
@@ -2495,29 +2606,33 @@ pub(super) fn handle_mouse(
                         TabBarClickTarget::Tab(_) => {
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
                             if needs_confirm {
-                                *close_tab_confirm = true;
+                                engine.show_close_tab_confirm();
                             }
                             *tab_drag_start = Some((col, row));
-                            if let Some(path) = engine.file_path().cloned() {
-                                sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
-                            }
                         }
                         TabBarClickTarget::CloseTab(_) => {
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
                             if needs_confirm {
-                                *close_tab_confirm = true;
+                                engine.show_close_tab_confirm();
                             }
                         }
                         TabBarClickTarget::ActionMenu => {
                             engine.active_group = group_id;
-                            engine.open_editor_action_menu(group_id, col, row + 1);
+                            // #434: pass tab-row height (1.0 row in TUI) so the
+                            // engine drives Below placement; replaces the prior
+                            // `row + 1` hack.
+                            engine.open_editor_action_menu(group_id, col, row, 1.0);
                         }
                         _ => {
                             engine.handle_tab_bar_click(group_id, target);
                         }
                     }
+                    return sidebar_width;
                 }
-                return sidebar_width;
+                // #452: matched a group's tab-bar row but no actual tab/button.
+                // For horizontal splits, the second group's tab bar IS the visual
+                // divider — fall through to the group-divider hit-test below so
+                // clicks on empty tab-bar space can start a resize drag.
             }
         }
         // Single group: check top tab bar row only.
@@ -2533,85 +2648,76 @@ pub(super) fn handle_mouse(
             let local_col = rel_col;
             let scroll_offset = layout.tab_scroll_offset;
 
-            let mut x: u16 = 0;
-            let mut tab_matched = false;
-            for (i, tab) in layout.tab_bar.iter().enumerate().skip(scroll_offset) {
-                let name_width = tab.name.chars().count() as u16;
-                let tab_width = name_width + TAB_CLOSE_COLS;
-                if local_col >= x && local_col < x + tab_width {
-                    tab_matched = true;
+            // B5c.2: hand-rolled tab/diff/split geometry replaced by the
+            // primitive's `hit_test` so the click resolution uses the
+            // exact same layout the rasteriser painted.
+            let bar = render::build_tab_bar_primitive(
+                &layout.tab_bar,
+                true,
+                layout.diff_toolbar.as_ref(),
+                scroll_offset,
+                None,
+            );
+            let tab_widths: Vec<usize> = layout
+                .tab_bar
+                .iter()
+                .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
+                .collect();
+            let bar_layout = bar.layout(
+                bar_width as f32,
+                1.0,
+                0.0,
+                |i| quadraui::TabMeasure::new(tab_widths[i] as f32, render::TAB_CLOSE_COLS as f32),
+                |i| quadraui::SegmentMeasure::new(bar.right_segments[i].width_cells as f32),
+            );
+            match bar_layout.hit_test(local_col as f32, 0.0) {
+                quadraui::TabBarHit::Tab(i) => {
                     if i < engine.active_group().tabs.len() {
-                        let close_col = x + name_width;
-                        if local_col >= close_col {
-                            engine.active_group_mut().active_tab = i;
-                            engine.line_annotations.clear();
-                            if engine.dirty() {
-                                *close_tab_confirm = true;
-                            } else {
-                                engine.close_tab();
-                            }
+                        engine.goto_tab(i);
+                        *tab_drag_start = Some((col, row));
+                    }
+                }
+                quadraui::TabBarHit::TabClose(i) => {
+                    if i < engine.active_group().tabs.len() {
+                        engine.active_group_mut().active_tab = i;
+                        engine.line_annotations.clear();
+                        if engine.dirty() {
+                            engine.show_close_tab_confirm();
                         } else {
-                            engine.goto_tab(i);
-                            // Record drag start position for tab drag-and-drop.
-                            *tab_drag_start = Some((col, row));
-                            engine.lsp_ensure_active_buffer();
-                            if let Some(path) = engine.file_path().cloned() {
-                                sidebar.reveal_path(&path, term_height.saturating_sub(4) as usize);
+                            engine.close_tab();
+                        }
+                    }
+                }
+                quadraui::TabBarHit::RightSegment(id) => {
+                    let has_win = engine.windows.contains_key(&engine.active_window_id());
+                    match id.as_str() {
+                        "tab:diff_prev" => {
+                            if has_win {
+                                engine.jump_prev_hunk();
                             }
                         }
-                    }
-                    break;
-                }
-                x += tab_width;
-            }
-            if !tab_matched {
-                let diff_total_cols = if let Some(dt) = layout.diff_toolbar.as_ref() {
-                    let label_cols = dt
-                        .change_label
-                        .as_ref()
-                        .map(|l| l.len() as u16 + 1)
-                        .unwrap_or(0);
-                    DIFF_TOOLBAR_BTN_COLS + label_cols
-                } else {
-                    0
-                };
-                let split_end = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
-                let split_start = split_end.saturating_sub(TAB_SPLIT_BOTH_COLS);
-                let diff_end = split_start;
-                let diff_start = diff_end.saturating_sub(diff_total_cols);
-                // Check diff toolbar FIRST to avoid boundary overlap with split buttons.
-                if diff_total_cols > 0 && local_col >= diff_start && local_col < diff_end {
-                    let in_diff = local_col - diff_start;
-                    let label_cols = diff_total_cols - DIFF_TOOLBAR_BTN_COLS;
-                    let in_btns = in_diff.saturating_sub(label_cols);
-                    let has_win = engine.windows.contains_key(&engine.active_window_id());
-                    if in_diff < label_cols {
-                        // Clicked on label — no-op.
-                    } else if in_btns < DIFF_BTN_COLS {
-                        if has_win {
-                            engine.jump_prev_hunk();
+                        "tab:diff_next" => {
+                            if has_win {
+                                engine.jump_next_hunk();
+                            }
                         }
-                    } else if in_btns < DIFF_BTN_COLS * 2 {
-                        if has_win {
-                            engine.jump_next_hunk();
+                        "tab:diff_toggle" => {
+                            engine.diff_toggle_hide_unchanged();
                         }
-                    } else {
-                        engine.diff_toggle_hide_unchanged();
+                        "tab:split_right" => {
+                            engine.open_editor_group(SplitDirection::Vertical);
+                        }
+                        "tab:split_down" => {
+                            engine.open_editor_group(SplitDirection::Horizontal);
+                        }
+                        "tab:action_menu" => {
+                            // #434: pass tab-row height (1.0 row in TUI).
+                            engine.open_editor_action_menu(engine.active_group, col, row, 1.0);
+                        }
+                        _ => {}
                     }
-                } else if local_col >= split_start
-                    && local_col < split_start + TAB_SPLIT_BOTH_COLS
-                    && bar_width >= TAB_SPLIT_BOTH_COLS
-                {
-                    let in_split = local_col - split_start;
-                    if in_split >= TAB_SPLIT_BTN_COLS {
-                        engine.open_editor_group(SplitDirection::Horizontal);
-                    } else {
-                        engine.open_editor_group(SplitDirection::Vertical);
-                    }
-                } else if local_col >= bar_width.saturating_sub(TAB_ACTION_BTN_COLS) {
-                    // Editor action menu button ("…") at far right.
-                    engine.open_editor_action_menu(engine.active_group, col, row + 1);
                 }
+                _ => {}
             }
             return sidebar_width;
         }
@@ -2624,19 +2730,29 @@ pub(super) fn handle_mouse(
     let editor_row = row.saturating_sub(menu_rows);
 
     // ── Group divider click — start drag ──────────────────────────────────────
+    // #452: must use the same float-to-int conversion as the divider
+    // renderer (`render_impl.rs::draw_frame` truncates with `as u16`).
+    // Using `.round()` here meant clicks on a divider at e.g. col 40.5
+    // (rendered at 40) were hit-tested at 41 and missed.
+    //
+    // For horizontal splits the "visual divider" is the second group's
+    // entire tab-bar block (per render_impl.rs:359). When breadcrumbs are
+    // on the block is 2 rows tall — accept a click on either row.
     if let Some(layout) = last_layout {
         if let Some(ref split) = layout.editor_group_split {
+            let tab_bar_rows: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
             for div in &split.dividers {
                 let hit = match div.direction {
                     crate::core::window::SplitDirection::Vertical => {
-                        let div_col = div.position.round() as u16;
+                        let div_col = div.position as u16;
                         rel_col == div_col
                             && (editor_row as f64) >= div.cross_start
                             && (editor_row as f64) < div.cross_start + div.cross_size
                     }
                     crate::core::window::SplitDirection::Horizontal => {
-                        let div_row = div.position.round() as u16;
-                        editor_row == div_row
+                        let div_row = div.position as u16;
+                        editor_row >= div_row
+                            && editor_row < div_row + tab_bar_rows
                             && (rel_col as f64) >= div.cross_start
                             && (rel_col as f64) < div.cross_start + div.cross_size
                     }
@@ -2668,7 +2784,7 @@ pub(super) fn handle_mouse(
                                 use crate::core::engine::EngineAction;
                                 match ea {
                                     EngineAction::ToggleSidebar => {
-                                        sidebar.visible = !sidebar.visible;
+                                        // Engine handles this internally now.
                                     }
                                     EngineAction::OpenTerminal => {
                                         let cols =
@@ -2686,107 +2802,218 @@ pub(super) fn handle_mouse(
                     return sidebar_width;
                 }
 
-                let viewport_lines = wh as usize;
+                // Per-window status line (when enabled) occupies the
+                // bottom row of the window — render_window subtracts it
+                // before computing viewport / scrollbar geometry. Mirror
+                // that here so the click hit-tests match what's actually
+                // drawn.
+                let status_rows: u16 = if rw.status_line.is_some() && wh > 1 {
+                    1
+                } else {
+                    0
+                };
+                let content_height = wh.saturating_sub(status_rows);
+                let viewport_lines = content_height as usize;
                 let has_v_scrollbar = rw.total_lines > viewport_lines;
                 let gutter = rw.gutter_char_width as u16;
                 let viewport_cols = (ww as usize)
                     .saturating_sub(gutter as usize + if has_v_scrollbar { 1 } else { 0 });
-                let has_h_scrollbar = rw.max_col > viewport_cols && wh > 1;
+                let has_h_scrollbar = rw.max_col > viewport_cols && content_height > 1;
 
                 // Vertical scrollbar click/drag-start (rightmost column)
                 if has_v_scrollbar && rel_col == wx + ww - 1 {
                     // menu_rows = menu bar offset; wy already includes tab_bar_height
                     let track_abs_start = menu_rows + wy;
-                    // If there's also a h-scrollbar, v-track is 1 row shorter
-                    let track_len = if has_h_scrollbar {
-                        wh.saturating_sub(1)
-                    } else {
-                        wh
-                    };
-                    *dragging_scrollbar = Some(ScrollDragState {
-                        window_id: rw.window_id,
-                        is_horizontal: false,
-                        track_abs_start,
-                        track_len,
-                        total: rw.total_lines,
-                    });
-                    let track_rel_row = editor_row.saturating_sub(wy);
-                    let viewport_lines = track_len as usize;
-                    let new_top = crate::render::scrollbar_click_to_scroll_top(
-                        track_rel_row as f64,
-                        track_len as f64,
-                        rw.total_lines,
-                        viewport_lines,
+                    // V-track loses 1 row to each of: per-window status line,
+                    // horizontal scrollbar (if either present).
+                    let track_len =
+                        content_height.saturating_sub(if has_h_scrollbar { 1 } else { 0 });
+                    let track_visible = track_len as usize;
+                    // Track-click vs thumb-click: page-jump on empty
+                    // track, drag-start on thumb. Standard editor UX —
+                    // clicking the empty track moves by one viewport
+                    // toward the click direction; clicking the thumb
+                    // begins a drag.
+                    let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                        rw.scroll_top as f32,
+                        rw.total_lines as f32,
+                        track_visible as f32,
+                        track_len as f32,
+                        1.0,
                     );
-                    engine.set_scroll_top_for_window(rw.window_id, new_top);
+                    let thumb_top = thumb_start.floor() as u16;
+                    let thumb_size = thumb_len.ceil().max(1.0) as u16;
+                    let cursor_offset = row.saturating_sub(track_abs_start);
+                    if cursor_offset < thumb_top {
+                        let new_scroll = rw.scroll_top.saturating_sub(track_visible);
+                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
+                        engine.sync_scroll_binds();
+                        return sidebar_width;
+                    } else if cursor_offset >= thumb_top.saturating_add(thumb_size) {
+                        let max_scroll = rw.total_lines.saturating_sub(track_visible);
+                        let new_scroll = (rw.scroll_top + track_visible).min(max_scroll);
+                        engine.set_scroll_top_for_window(rw.window_id, new_scroll);
+                        engine.sync_scroll_binds();
+                        return sidebar_width;
+                    }
+                    // Phase B.4 Stage 5d: editor scrollbars on the shared
+                    // `quadraui::DragState`. Widget id encodes the window id
+                    // so the apply-side router can call
+                    // `engine.set_scroll_*_for_window(...)` against the
+                    // right window. `grab_offset` preserves cursor position
+                    // on the thumb during drag — same UX every other
+                    // migrated scrollbar gives.
+                    let grab_offset = scrollbar_grab_offset(
+                        row as f32,
+                        track_abs_start as f32,
+                        track_len as f32,
+                        track_visible,
+                        rw.total_lines,
+                        rw.scroll_top,
+                    );
+                    let tl = track_len as f32;
+                    drag_state.begin(quadraui::DragTarget::ScrollbarY {
+                        widget: quadraui::WidgetId::new(format!(
+                            "tui:editor:{}:vsb",
+                            rw.window_id.0
+                        )),
+                        track_start: track_abs_start as f32,
+                        track_length: tl,
+                        thumb_length: (tl * track_visible as f32 / rw.total_lines.max(1) as f32)
+                            .max(1.0),
+                        max_scroll: rw.total_lines.saturating_sub(track_visible),
+                        grab_offset,
+                        inverted: false,
+                    });
+                    apply_scrollbar_drag(
+                        drag_state,
+                        quadraui::Point {
+                            x: col as f32,
+                            y: row as f32,
+                        },
+                        engine,
+                        sidebar,
+                    );
                     engine.sync_scroll_binds();
                     return sidebar_width;
                 }
 
-                // Horizontal scrollbar click/drag-start (bottom row)
-                if has_h_scrollbar && editor_row == wy + wh - 1 {
+                // Horizontal scrollbar click/drag-start.
+                // The renderer reserves the bottommost row of the window
+                // for a per-window status line when one is enabled, then
+                // shrinks the content area and draws the h-scrollbar at
+                // the last row of the *shrunken* area. So the h-scrollbar
+                // sits at `wy + wh - 1` when no per-window status line
+                // and `wy + wh - 2` when there is one.
+                let h_sb_row = if rw.status_line.is_some() && wh > 1 {
+                    wy + wh - 2
+                } else {
+                    wy + wh - 1
+                };
+                if has_h_scrollbar && editor_row == h_sb_row {
                     let track_x = wx + gutter;
                     let track_w = ww.saturating_sub(gutter + if has_v_scrollbar { 1 } else { 0 });
                     if rel_col >= track_x && rel_col < track_x + track_w && track_w > 0 {
                         let track_abs_start = editor_left + track_x;
-                        *dragging_scrollbar = Some(ScrollDragState {
-                            window_id: rw.window_id,
-                            is_horizontal: true,
-                            track_abs_start,
-                            track_len: track_w,
-                            total: rw.max_col,
+                        let track_visible = viewport_cols;
+                        // Track-click vs thumb-click: page-jump on the
+                        // empty track, drag-start on the thumb (mirrors
+                        // the v-scrollbar above).
+                        let (thumb_start, thumb_len) = quadraui::fit_thumb(
+                            rw.scroll_left as f32,
+                            rw.max_col as f32,
+                            track_visible as f32,
+                            track_w as f32,
+                            1.0,
+                        );
+                        let thumb_left = thumb_start.floor() as u16;
+                        let thumb_size = thumb_len.ceil().max(1.0) as u16;
+                        let cursor_offset = col.saturating_sub(track_abs_start);
+                        if cursor_offset < thumb_left {
+                            let new_left = rw.scroll_left.saturating_sub(track_visible);
+                            engine.set_scroll_left_for_window(rw.window_id, new_left);
+                            return sidebar_width;
+                        } else if cursor_offset >= thumb_left.saturating_add(thumb_size) {
+                            let max_left = rw.max_col.saturating_sub(track_visible);
+                            let new_left = (rw.scroll_left + track_visible).min(max_left);
+                            engine.set_scroll_left_for_window(rw.window_id, new_left);
+                            return sidebar_width;
+                        }
+                        let grab_offset = scrollbar_grab_offset(
+                            col as f32,
+                            track_abs_start as f32,
+                            track_w as f32,
+                            track_visible,
+                            rw.max_col,
+                            rw.scroll_left,
+                        );
+                        let tl = track_w as f32;
+                        drag_state.begin(quadraui::DragTarget::ScrollbarX {
+                            widget: quadraui::WidgetId::new(format!(
+                                "tui:editor:{}:hsb",
+                                rw.window_id.0
+                            )),
+                            track_start: track_abs_start as f32,
+                            track_length: tl,
+                            thumb_length: (tl * track_visible as f32 / rw.max_col.max(1) as f32)
+                                .max(1.0),
+                            max_scroll: rw.max_col.saturating_sub(track_visible),
+                            grab_offset,
+                            inverted: false,
                         });
-                        let ratio = (rel_col - track_x) as f64 / track_w as f64;
-                        let new_left = (ratio * rw.max_col as f64) as usize;
-                        engine.set_scroll_left_for_window(rw.window_id, new_left);
+                        apply_scrollbar_drag(
+                            drag_state,
+                            quadraui::Point {
+                                x: col as f32,
+                                y: row as f32,
+                            },
+                            engine,
+                            sidebar,
+                        );
                         return sidebar_width;
                     }
                 }
 
-                // Check gutter area
+                // Check gutter area — shared resolution via render::resolve_gutter_action (#344).
                 let view_row = (editor_row - wy) as usize;
                 if gutter > 0 && rel_col >= wx && rel_col < wx + gutter {
                     if let Some(rl) = rw.lines.get(view_row) {
                         let gutter_col = (rel_col - wx) as usize;
-                        let bp_offset: usize = if rw.has_breakpoints { 1 } else { 0 };
-                        let git_col = if rw.has_git_diff {
-                            bp_offset
-                        } else {
-                            usize::MAX
-                        };
-
-                        if rw.has_breakpoints && gutter_col == 0 {
-                            // Breakpoint column (leftmost).
-                            let file = engine
-                                .windows
-                                .get(&rw.window_id)
-                                .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-                                .and_then(|bs| bs.file_path.as_ref())
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let bp_line = rl.line_idx as u64 + 1;
-                            engine.dap_toggle_breakpoint(&file, bp_line);
-                        } else if gutter_col == git_col {
-                            // Git diff column — open diff peek popup.
-                            engine.active_tab_mut().active_window = rw.window_id;
-                            engine.view_mut().cursor.line = rl.line_idx;
-                            engine.open_diff_peek();
-                        } else if engine.has_diagnostic_on_line(rl.line_idx) {
-                            // Diagnostic gutter indicator — show hover popup.
-                            engine.active_tab_mut().active_window = rw.window_id;
-                            engine.view_mut().cursor.line = rl.line_idx;
-                            engine.trigger_editor_hover_for_line(rl.line_idx);
-                        } else if engine.has_code_actions_on_line(rl.line_idx) {
-                            // Code action lightbulb — show code actions popup.
-                            engine.active_tab_mut().active_window = rw.window_id;
-                            engine.view_mut().cursor.line = rl.line_idx;
-                            engine.show_code_actions_popup();
-                        } else {
-                            let has_fold_indicator =
-                                rl.gutter_text.chars().any(|c| c == '+' || c == '-');
-                            if has_fold_indicator {
-                                engine.toggle_fold_at_line(rl.line_idx);
+                        use crate::render::GutterAction;
+                        match crate::render::resolve_gutter_action(rw, rl.line_idx, gutter_col) {
+                            Some(GutterAction::ToggleBreakpoint(line)) => {
+                                let file = engine
+                                    .windows
+                                    .get(&rw.window_id)
+                                    .and_then(|w| engine.buffer_manager.get(w.buffer_id))
+                                    .and_then(|bs| bs.file_path.as_ref())
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                engine.dap_toggle_breakpoint(&file, line as u64 + 1);
                             }
+                            Some(GutterAction::DiffPeek(line)) => {
+                                engine.active_tab_mut().active_window = rw.window_id;
+                                engine.view_mut().cursor.line = line;
+                                engine.open_diff_peek();
+                            }
+                            Some(GutterAction::DiagnosticHover(line)) => {
+                                engine.active_tab_mut().active_window = rw.window_id;
+                                engine.view_mut().cursor.line = line;
+                                engine.trigger_editor_hover_for_line(line);
+                            }
+                            Some(GutterAction::CodeAction(line)) => {
+                                engine.active_tab_mut().active_window = rw.window_id;
+                                engine.view_mut().cursor.line = line;
+                                engine.show_code_actions_popup();
+                            }
+                            Some(GutterAction::ToggleFold(line)) => {
+                                let has_fold_indicator =
+                                    rl.gutter_text.chars().any(|c| c == '+' || c == '-');
+                                if has_fold_indicator {
+                                    engine.toggle_fold_at_line(line);
+                                }
+                            }
+                            None => {}
                         }
                     }
                     return sidebar_width;
@@ -2833,15 +3060,28 @@ pub(super) fn handle_mouse(
 }
 
 /// Walk status line segments and find which action (if any) is at `click_col`.
+///
+/// Per D6: builds the StatusBar primitive and its layout, then calls
+/// `StatusBarLayout::hit_test()`. Same layout math as the draw path
+/// (`render_window_status_line`), so clicks on dropped (invisible)
+/// segments can't fire — the layout's hit_regions only include segments
+/// that actually rendered.
 fn status_segment_hit_test(
     status: &crate::render::WindowStatusLine,
     width: usize,
     click_col: usize,
 ) -> Option<crate::render::StatusAction> {
-    let regions = crate::render::compute_status_hit_regions(
-        &status.left_segments,
-        &status.right_segments,
-        width,
+    let bar = crate::render::window_status_line_to_status_bar(
+        status,
+        quadraui::WidgetId::new("status:window"),
     );
-    crate::render::resolve_status_bar_click(&regions, click_col as u16)
+    // Must match the min_gap used in render_window_status_line.
+    const MIN_GAP_CELLS: f32 = 2.0;
+    let layout = bar.layout(width as f32, 1.0, MIN_GAP_CELLS, |seg| {
+        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
+    });
+    match layout.hit_test(click_col as f32, 0.0) {
+        quadraui::StatusBarHit::Segment(id) => crate::render::status_action_from_id(id.as_str()),
+        quadraui::StatusBarHit::Empty => None,
+    }
 }

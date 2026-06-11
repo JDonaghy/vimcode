@@ -165,12 +165,28 @@ pub struct LoadedPlugin {
 
 /// Data passed into (and modified by) Lua callbacks during a plugin call.
 ///
-/// `cwd`, `buf_path`, `buf_lines` are inputs; the output fields start empty.
+/// `cwd`, `buf_path`, `buf_rope` are inputs; the output fields start empty.
+///
+/// `buf_rope` holds a cheap clone of the active buffer's `Rope` (the ropey
+/// `Rope` is reference-counted, so cloning is O(1)). Lua callers that ask
+/// for line contents via `vimcode.buf.lines()` / `buf.line(n)` /
+/// `buf.get_lines(s, e)` pay the `String` allocation only for the range
+/// they actually read. A previous design eagerly materialised every line
+/// into `buf_lines: Vec<String>` on every plugin event — on a 190k-line
+/// buffer that was a 100 MB allocation per event, which pegged CPU at
+/// 100 % when any plugin chained `async_shell` calls in its callback
+/// (each completion fired a plugin event → new ctx → new allocation).
+/// See issue #153.
 #[derive(Default)]
 pub struct PluginCallContext {
     // ── Inputs ──────────────────────────────────────────────────────────────
     pub cwd: String,
     pub buf_path: Option<String>,
+    pub buf_rope: Option<ropey::Rope>,
+    /// Legacy eager-lines cache. Kept for back-compat with callers that
+    /// populate it manually (e.g. tests); new code should leave it empty
+    /// and read via `buf_rope`. The Lua API accessors fall back to this
+    /// only when `buf_rope` is `None`.
     pub buf_lines: Vec<String>,
     /// Cursor line (1-indexed) in the active buffer.
     pub cursor_line: usize,
@@ -621,7 +637,12 @@ impl PluginManager {
                 } else if expr == "col('.')" {
                     Ok(LuaValue::Integer(ctx.cursor_col as i64))
                 } else if expr == "line('$')" {
-                    Ok(LuaValue::Integer(ctx.buf_lines.len() as i64))
+                    let n = ctx
+                        .buf_rope
+                        .as_ref()
+                        .map(|r| r.len_lines() as i64)
+                        .unwrap_or(ctx.buf_lines.len() as i64);
+                    Ok(LuaValue::Integer(n))
                 } else if expr == "mode()" {
                     Ok(LuaValue::String(lua.create_string(&ctx.mode_name).unwrap()))
                 } else {
@@ -688,17 +709,23 @@ impl PluginManager {
         // ── vimcode.buf subtable ────────────────────────────────────────────
         let buf = lua.create_table()?;
 
-        // vimcode.buf.lines() → table of strings (1-indexed)
+        // vimcode.buf.lines() → table of strings (1-indexed). Lazy: reads
+        // from `buf_rope` on demand so plugins pay only for what they ask.
         buf.set(
             "lines",
             lua.create_function(|lua, ()| {
-                let lines = lua
-                    .app_data_ref::<PluginCallContext>()
-                    .map(|ctx| ctx.buf_lines.clone())
-                    .unwrap_or_default();
+                let ctx = lua.app_data_ref::<PluginCallContext>();
                 let t = lua.create_table()?;
-                for (i, line) in lines.into_iter().enumerate() {
-                    t.set(i + 1, line)?;
+                if let Some(ctx) = ctx {
+                    if let Some(ref rope) = ctx.buf_rope {
+                        for (i, line) in rope.lines().enumerate() {
+                            t.set(i + 1, line.to_string())?;
+                        }
+                    } else {
+                        for (i, line) in ctx.buf_lines.iter().enumerate() {
+                            t.set(i + 1, line.as_str())?;
+                        }
+                    }
                 }
                 Ok(t)
             })?,
@@ -708,9 +735,20 @@ impl PluginManager {
         buf.set(
             "line",
             lua.create_function(|lua, n: usize| {
-                Ok(lua
-                    .app_data_ref::<PluginCallContext>()
-                    .and_then(|ctx| ctx.buf_lines.get(n.saturating_sub(1)).cloned()))
+                let ctx = lua.app_data_ref::<PluginCallContext>();
+                let Some(ctx) = ctx else { return Ok(None) };
+                if n == 0 {
+                    return Ok(None);
+                }
+                let idx = n - 1;
+                if let Some(ref rope) = ctx.buf_rope {
+                    if idx >= rope.len_lines() {
+                        return Ok(None);
+                    }
+                    Ok(Some(rope.line(idx).to_string()))
+                } else {
+                    Ok(ctx.buf_lines.get(idx).cloned())
+                }
             })?,
         )?;
 
@@ -735,7 +773,11 @@ impl PluginManager {
                 let ctx = lua.app_data_ref::<PluginCallContext>();
                 let t = lua.create_table()?;
                 if let Some(ctx) = ctx {
-                    let len = ctx.buf_lines.len() as i64;
+                    let len = if let Some(ref rope) = ctx.buf_rope {
+                        rope.len_lines() as i64
+                    } else {
+                        ctx.buf_lines.len() as i64
+                    };
                     // Negative indices count from end (Neovim convention)
                     let s = if start < 0 {
                         (len + start).max(0) as usize
@@ -747,8 +789,14 @@ impl PluginManager {
                     } else {
                         (end as usize).min(len as usize)
                     };
-                    for (i, line) in ctx.buf_lines[s..e].iter().enumerate() {
-                        t.set(i + 1, line.as_str())?;
+                    if let Some(ref rope) = ctx.buf_rope {
+                        for (out_i, line_i) in (s..e).enumerate() {
+                            t.set(out_i + 1, rope.line(line_i).to_string())?;
+                        }
+                    } else {
+                        for (i, line) in ctx.buf_lines[s..e].iter().enumerate() {
+                            t.set(i + 1, line.as_str())?;
+                        }
                     }
                 }
                 Ok(t)
@@ -761,7 +809,11 @@ impl PluginManager {
             "set_lines",
             lua.create_function(|lua, (start, end, lines): (i64, i64, LuaTable)| {
                 if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
-                    let len = ctx.buf_lines.len() as i64;
+                    let len = if let Some(ref rope) = ctx.buf_rope {
+                        rope.len_lines() as i64
+                    } else {
+                        ctx.buf_lines.len() as i64
+                    };
                     let s = if start < 0 {
                         (len + start).max(0) as usize
                     } else {
@@ -800,7 +852,12 @@ impl PluginManager {
             lua.create_function(|lua, ()| {
                 Ok(lua
                     .app_data_ref::<PluginCallContext>()
-                    .map(|ctx| ctx.buf_lines.len())
+                    .map(|ctx| {
+                        ctx.buf_rope
+                            .as_ref()
+                            .map(|r| r.len_lines())
+                            .unwrap_or(ctx.buf_lines.len())
+                    })
                     .unwrap_or(0))
             })?,
         )?;

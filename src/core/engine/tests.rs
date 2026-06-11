@@ -6736,6 +6736,175 @@ fn test_auto_popup_appears_on_type() {
 }
 
 #[test]
+fn test_insert_completion_intercepts_key() {
+    // #287: predicate that backends consult to suppress global accelerators
+    // (Ctrl-P → fuzzy_finder, etc.) when insert-mode completion would
+    // otherwise consume the key. Mirrors the gates in handle_insert_key.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+
+    // Normal mode: no interception even with a popup-like state set
+    // (popup can't actually be active outside insert mode, but check
+    // the mode gate explicitly).
+    assert!(!engine.insert_completion_intercepts_key("n", true));
+    assert!(!engine.insert_completion_intercepts_key("p", true));
+
+    // Enter insert mode with no popup active.
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o');
+    // Ctrl-N / Ctrl-P always intercepted in insert (they can start completion).
+    assert!(engine.insert_completion_intercepts_key("n", true));
+    assert!(engine.insert_completion_intercepts_key("p", true));
+    // Tab / Down / Up NOT intercepted without an active popup.
+    assert!(!engine.insert_completion_intercepts_key("Tab", false));
+    assert!(!engine.insert_completion_intercepts_key("Down", false));
+    assert!(!engine.insert_completion_intercepts_key("Up", false));
+    // Non-completion keys never intercepted.
+    assert!(!engine.insert_completion_intercepts_key("a", false));
+    assert!(!engine.insert_completion_intercepts_key("f", true));
+
+    // Activate a display-only popup by typing a prefix that matches.
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    assert!(engine.completion_display_only && engine.completion_idx.is_some());
+    // Now Tab / Down / Up are intercepted.
+    assert!(engine.insert_completion_intercepts_key("Tab", false));
+    assert!(engine.insert_completion_intercepts_key("Down", false));
+    assert!(engine.insert_completion_intercepts_key("Up", false));
+    // Ctrl variants of those keys are NOT — only the bare versions cycle.
+    assert!(!engine.insert_completion_intercepts_key("Tab", true));
+}
+
+#[test]
+fn test_manual_trigger_with_empty_prefix_does_not_dismiss() {
+    // #422: Ctrl+Space should fire a completion request even with no prefix
+    // (VSCode parity — show all in-scope symbols). The auto path still bails
+    // on empty prefix to avoid drowning the user in every word while typing.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o'); // open new line, insert mode, no prefix yet
+
+    // Auto trigger with empty prefix: dismisses (popup state stays cleared).
+    engine.trigger_completion(false);
+    assert!(
+        engine.completion_idx.is_none(),
+        "auto trigger with empty prefix should NOT activate popup"
+    );
+
+    // Manual trigger with empty prefix: does not bail. `completion_start_col`
+    // is anchored to the cursor so an arriving LSP response can populate the
+    // popup at the right position. (No LSP in tests, so candidates stay empty.)
+    let cursor_col = engine.view().cursor.col;
+    engine.trigger_completion(true);
+    assert_eq!(
+        engine.completion_start_col, cursor_col,
+        "manual trigger should anchor completion_start_col to the cursor"
+    );
+}
+
+#[test]
+fn test_manual_trigger_with_prefix_still_scans_buffer() {
+    // Manual trigger with a non-empty prefix should behave like the auto path:
+    // run the nearby-buffer scan and populate the popup synchronously.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o');
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    // Clear popup state to simulate a re-trigger
+    engine.dismiss_completion();
+    engine.trigger_completion(true);
+    assert!(
+        engine.completion_idx.is_some(),
+        "manual trigger with prefix should populate popup from buffer scan"
+    );
+    assert!(
+        engine.completion_candidates.iter().any(|c| c == "foobar"),
+        "buffer-scan candidates should appear, got: {:?}",
+        engine.completion_candidates
+    );
+}
+
+#[test]
+fn test_completion_narrows_on_prefix_extension() {
+    // #467: typing more characters of an exact prefix should retain items
+    // the user already saw. Even when a fresh scan / LSP request at the
+    // narrower prefix would return fewer items, anything already in
+    // `completion_candidates` that still matches the new prefix must stay.
+    //
+    // Simulates an LSP response having populated extra items (Scrollbar,
+    // ScrollAxis) at prefix `S` that are NOT present in the buffer. When
+    // the user types `c`, the nearby-buffer scan at prefix `Sc` would
+    // return nothing — but the previously-collected items should survive
+    // the narrow step.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "let foo = ");
+    // Position cursor at end of line and enter insert mode at end.
+    press_char(&mut engine, 'A');
+    press_char(&mut engine, 'S');
+    // After typing `S`, the buffer-word scan produces no matches (the only
+    // word in the buffer is `foo`). Simulate an LSP-driven population of
+    // the popup at prefix `S` with three items.
+    engine.completion_candidates = vec![
+        "Scrollbar".to_string(),
+        "ScrollAxis".to_string(),
+        "ScreenLayout".to_string(),
+        "SomethingElse".to_string(), // matches `S` but not `Sc`
+    ];
+    engine.completion_idx = Some(0);
+    engine.completion_display_only = true;
+    engine.completion_filter_prefix = "S".to_string();
+    engine.completion_start_col = engine.view().cursor.col;
+    // Type `c` — prefix becomes `Sc`. Narrow-on-extension should retain the
+    // three `Sc*` items and drop the one that doesn't match.
+    press_char(&mut engine, 'c');
+    let cands = &engine.completion_candidates;
+    assert!(
+        cands.iter().any(|c| c == "Scrollbar"),
+        "Scrollbar should be retained, got: {cands:?}"
+    );
+    assert!(
+        cands.iter().any(|c| c == "ScrollAxis"),
+        "ScrollAxis should be retained, got: {cands:?}"
+    );
+    assert!(
+        cands.iter().any(|c| c == "ScreenLayout"),
+        "ScreenLayout should be retained, got: {cands:?}"
+    );
+    assert!(
+        !cands.iter().any(|c| c == "SomethingElse"),
+        "SomethingElse should be dropped (does not match Sc), got: {cands:?}"
+    );
+    assert_eq!(
+        engine.completion_filter_prefix, "Sc",
+        "completion_filter_prefix should track the current prefix"
+    );
+}
+
+#[test]
+fn test_completion_replaces_when_prefix_changes_unrelated() {
+    // Sanity check: when the new prefix doesn't extend the previous one
+    // (cursor moved to a new word entirely), candidates are cleared and
+    // repopulated from sources — not narrowed against the old set.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o');
+    // Simulate state from an earlier completion at prefix `S`.
+    engine.completion_candidates = vec!["Scrollbar".to_string()];
+    engine.completion_filter_prefix = "S".to_string();
+    // Now type a completely different word — prefix becomes `f`.
+    press_char(&mut engine, 'f');
+    let cands = &engine.completion_candidates;
+    assert!(
+        !cands.iter().any(|c| c == "Scrollbar"),
+        "Scrollbar should be cleared on unrelated prefix change, got: {cands:?}"
+    );
+}
+
+#[test]
 fn test_auto_popup_tab_accepts() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "foobar\n");
@@ -7487,7 +7656,10 @@ fn test_run_project_search_finds_matches() {
         !engine.project_search_results.is_empty(),
         "should find 'hello'"
     );
-    assert_eq!(engine.project_search_selected, 0);
+    assert!(
+        engine.search_selected_result_idx().is_none(),
+        "selection should be empty after fresh search"
+    );
     assert!(engine.message.contains("match"));
 }
 
@@ -7502,16 +7674,229 @@ fn test_run_project_search_empty_query() {
 }
 
 #[test]
-fn test_project_search_select_next_prev() {
-    let dir = make_search_dir("engine_select");
+fn test_search_unified_dispatch_escape_unfocuses() {
     let mut engine = Engine::new();
-    engine.project_search_query = "l".to_string(); // matches both lines
-    engine.run_project_search(&dir);
-    assert!(engine.project_search_results.len() >= 2);
-    engine.project_search_select_next();
-    assert_eq!(engine.project_search_selected, 1);
-    engine.project_search_select_prev();
-    assert_eq!(engine.project_search_selected, 0);
+    engine.search_has_focus = true;
+    engine.search_panel_form_focus.replace(None);
+    engine
+        .search_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    let result = engine.dispatch_search_sidebar_key_unified("Escape", false, false, None);
+    assert!(matches!(result, search::SearchKeyResult::Unfocused));
+    assert!(!engine.search_has_focus);
+}
+
+#[test]
+fn test_search_unified_dispatch_printable_reenters_form() {
+    let mut engine = Engine::new();
+    engine.search_has_focus = true;
+    engine.search_panel_form_focus.replace(None);
+    engine
+        .search_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    let result = engine.dispatch_search_sidebar_key_unified("", false, false, Some('x'));
+    assert!(matches!(result, search::SearchKeyResult::Consumed));
+    assert_eq!(
+        engine.search_panel_form_focus.borrow().as_deref(),
+        Some("search:query")
+    );
+    assert!(engine.project_search_query.contains('x'));
+}
+
+#[test]
+fn test_search_unified_dispatch_tab_switches_to_form() {
+    let mut engine = Engine::new();
+    engine.search_has_focus = true;
+    engine.search_panel_form_focus.replace(None);
+    engine
+        .search_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    let result = engine.dispatch_search_sidebar_key_unified("Tab", false, false, None);
+    assert!(matches!(result, search::SearchKeyResult::Consumed));
+    assert_eq!(
+        engine.search_panel_form_focus.borrow().as_deref(),
+        Some("search:query")
+    );
+    assert_eq!(
+        engine.search_sidebar_system.borrow().active_section(),
+        Some(0)
+    );
+}
+
+#[test]
+fn test_search_unified_dispatch_alt_toggles() {
+    let mut engine = Engine::new();
+    engine.search_has_focus = true;
+    assert!(!engine.project_search_options.case_sensitive);
+    engine.dispatch_search_sidebar_key_unified("c", false, true, None);
+    assert!(engine.project_search_options.case_sensitive);
+    engine.dispatch_search_sidebar_key_unified("w", false, true, None);
+    assert!(engine.project_search_options.whole_word);
+    engine.dispatch_search_sidebar_key_unified("r", false, true, None);
+    assert!(engine.project_search_options.use_regex);
+}
+
+#[test]
+fn test_search_input_insert_and_caret() {
+    let mut e = Engine::new();
+    e.project_search_query = "abc".to_string();
+    e.search_query_caret.set(3);
+    e.search_input_insert_char(false, 'X');
+    assert_eq!(e.project_search_query, "abcX");
+    assert_eq!(e.search_query_caret.get(), 4);
+    e.search_query_caret.set(1);
+    e.search_input_insert_char(false, 'Y');
+    assert_eq!(e.project_search_query, "aYbcX");
+    assert_eq!(e.search_query_caret.get(), 2);
+}
+
+#[test]
+fn test_search_input_backspace_mid() {
+    let mut e = Engine::new();
+    e.project_search_query = "hello".to_string();
+    e.search_query_caret.set(3);
+    e.search_input_backspace(false);
+    assert_eq!(e.project_search_query, "helo");
+    assert_eq!(e.search_query_caret.get(), 2);
+}
+
+#[test]
+fn test_search_input_backspace_at_start() {
+    let mut e = Engine::new();
+    e.project_search_query = "hi".to_string();
+    e.search_query_caret.set(0);
+    e.search_input_backspace(false);
+    assert_eq!(e.project_search_query, "hi");
+    assert_eq!(e.search_query_caret.get(), 0);
+}
+
+#[test]
+fn test_search_input_delete() {
+    let mut e = Engine::new();
+    e.project_search_query = "abcd".to_string();
+    e.search_query_caret.set(1);
+    e.search_input_delete(false);
+    assert_eq!(e.project_search_query, "acd");
+    assert_eq!(e.search_query_caret.get(), 1);
+}
+
+#[test]
+fn test_search_input_move_caret() {
+    let mut e = Engine::new();
+    e.project_search_query = "hello".to_string();
+    e.search_query_caret.set(3);
+    e.search_input_move_caret(false, "Left");
+    assert_eq!(e.search_query_caret.get(), 2);
+    e.search_input_move_caret(false, "Right");
+    assert_eq!(e.search_query_caret.get(), 3);
+    e.search_input_move_caret(false, "Home");
+    assert_eq!(e.search_query_caret.get(), 0);
+    e.search_input_move_caret(false, "End");
+    assert_eq!(e.search_query_caret.get(), 5);
+}
+
+#[test]
+fn test_search_input_move_caret_boundaries() {
+    let mut e = Engine::new();
+    e.project_search_query = "ab".to_string();
+    e.search_query_caret.set(0);
+    e.search_input_move_caret(false, "Left");
+    assert_eq!(e.search_query_caret.get(), 0);
+    e.search_query_caret.set(2);
+    e.search_input_move_caret(false, "Right");
+    assert_eq!(e.search_query_caret.get(), 2);
+}
+
+#[test]
+fn test_search_input_replace_field() {
+    let mut e = Engine::new();
+    e.project_replace_text = "old".to_string();
+    e.replace_text_caret.set(1);
+    e.search_input_insert_char(true, 'X');
+    assert_eq!(e.project_replace_text, "oXld");
+    assert_eq!(e.replace_text_caret.get(), 2);
+    e.search_input_backspace(true);
+    assert_eq!(e.project_replace_text, "old");
+    assert_eq!(e.replace_text_caret.get(), 1);
+}
+
+#[test]
+fn test_search_input_paste() {
+    let mut e = Engine::new();
+    e.project_search_query = "ab".to_string();
+    e.search_query_caret.set(1);
+    e.search_input_paste(false, "XY\nignored");
+    assert_eq!(e.project_search_query, "aXYb");
+    assert_eq!(e.search_query_caret.get(), 3);
+}
+
+#[test]
+fn test_search_input_unicode() {
+    let mut e = Engine::new();
+    e.project_search_query = "café".to_string();
+    let len = e.project_search_query.len();
+    e.search_query_caret.set(len);
+    e.search_input_insert_char(false, '!');
+    assert_eq!(e.project_search_query, "café!");
+    e.search_query_caret.set("caf".len());
+    e.search_input_backspace(false);
+    assert_eq!(e.project_search_query, "caé!");
+    e.search_input_move_caret(false, "Right");
+    e.search_input_move_caret(false, "Right");
+    assert_eq!(e.search_query_caret.get(), "caé!".len());
+}
+
+#[test]
+fn test_search_set_focus_prepopulates_from_visual_selection() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world foo bar");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 6;
+    press_char(&mut engine, 'v');
+    for _ in 0..4 {
+        press_char(&mut engine, 'l');
+    }
+    assert!(matches!(engine.mode, Mode::Visual));
+
+    engine.search_set_focus(true);
+    assert_eq!(engine.project_search_query, "world");
+    assert_eq!(engine.search_query_caret.get(), 5);
+    assert!(matches!(engine.mode, Mode::Normal));
+    assert!(engine.visual_anchor.is_none());
+    assert!(engine.search_has_focus);
+}
+
+#[test]
+fn test_search_set_focus_multiline_uses_first_line() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "line one\nline two\nline three");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    press_char(&mut engine, 'V');
+    press_char(&mut engine, 'j');
+    assert!(matches!(engine.mode, Mode::VisualLine));
+
+    engine.search_set_focus(true);
+    assert_eq!(engine.project_search_query, "line one");
+    assert_eq!(engine.search_query_caret.get(), "line one".len());
+    assert!(matches!(engine.mode, Mode::Normal));
+}
+
+#[test]
+fn test_search_set_focus_no_selection_keeps_existing_query() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.project_search_query = "existing".to_string();
+    engine.search_query_caret.set(8);
+
+    engine.search_set_focus(true);
+    assert_eq!(engine.project_search_query, "existing");
+    assert_eq!(engine.search_query_caret.get(), 8);
 }
 
 #[test]
@@ -7911,6 +8296,176 @@ fn test_lsp_dirty_buffer_tracking() {
     engine.handle_key("a", Some('a'), false);
     let active_id = engine.active_buffer_id();
     assert!(engine.lsp_dirty_buffers.contains_key(&active_id));
+}
+
+#[test]
+fn test_lsp_flush_clears_diagnostics_by_canonical_path() {
+    // #208: lsp_diagnostics is keyed by canonical absolute path (URI →
+    // uri_to_path). lsp_flush_changes used to remove by state.file_path,
+    // which is the original (possibly relative) path the user opened
+    // with. When they differed, remove was a silent no-op and the gutter
+    // kept showing stale error markers after a git discard / revert.
+    use std::path::PathBuf;
+    let dir = std::env::temp_dir().join("vimcode_test_diag_canonical");
+    let _ = std::fs::create_dir_all(&dir);
+    let abs_path = dir.join("file.rs");
+    std::fs::write(&abs_path, "fn main() {}\n").unwrap();
+    let canonical = abs_path.canonicalize().unwrap();
+
+    // Open the file via a relative path so state.file_path != canonical.
+    let prev_cwd = std::env::current_dir().ok();
+    std::env::set_current_dir(&dir).unwrap();
+    let rel_path = PathBuf::from("file.rs");
+    assert_ne!(
+        rel_path, canonical,
+        "relative path must differ from canonical"
+    );
+
+    let mut engine = Engine::new();
+    engine.new_tab(Some(&rel_path));
+    let buf_id = engine.active_buffer_id();
+    assert_eq!(
+        engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .file_path
+            .as_ref(),
+        Some(&rel_path),
+        "buffer kept the relative path the user opened with"
+    );
+    assert_eq!(
+        engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .canonical_path
+            .as_ref(),
+        Some(&canonical),
+        "buffer also cached the canonical path",
+    );
+
+    // Simulate a Diagnostics event for the canonical path (which is what
+    // uri_to_path produces from the server's URI).
+    engine.lsp_diagnostics.insert(
+        canonical.clone(),
+        vec![crate::core::lsp::Diagnostic {
+            range: crate::core::lsp::LspRange {
+                start: crate::core::lsp::LspPosition {
+                    line: 0,
+                    character: 0,
+                },
+                end: crate::core::lsp::LspPosition {
+                    line: 0,
+                    character: 3,
+                },
+            },
+            severity: crate::core::lsp::DiagnosticSeverity::Error,
+            message: "stale error".to_string(),
+            source: None,
+            code: None,
+        }],
+    );
+
+    // Mark dirty (like a git discard reload would) and flush.
+    engine.ensure_lsp_manager();
+    engine.lsp_dirty_buffers.insert(buf_id, true);
+    engine.lsp_flush_changes();
+
+    assert!(
+        !engine.lsp_diagnostics.contains_key(&canonical),
+        "lsp_flush_changes must clear diagnostics under the canonical key, \
+         not the original file_path key (#208)",
+    );
+
+    if let Some(cwd) = prev_cwd {
+        let _ = std::env::set_current_dir(cwd);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_lsp_flush_changes_resets_semantic_tokens_received() {
+    // #230: indicator was stuck on `name…` for files where the server
+    // returned zero semantic tokens, because `semantic_tokens.is_empty()`
+    // was used as the gate. The fix tracks receipt explicitly via the
+    // `semantic_tokens_received` bool. lsp_flush_changes must clear that
+    // bool when it clears the cached tokens, so the indicator can briefly
+    // return to Initializing while the re-request is in flight.
+    let path = std::env::temp_dir().join("vimcode_test_sem_tokens_received.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let mut engine = Engine::new();
+    engine.new_tab(Some(&path));
+    let buf_id = engine.active_buffer_id();
+
+    // Fresh buffer: no response received yet.
+    assert!(
+        !engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .semantic_tokens_received
+    );
+
+    // Simulate having received a response (with one fake token).
+    if let Some(state) = engine.buffer_manager.get_mut(buf_id) {
+        state.semantic_tokens.push(crate::core::lsp::SemanticToken {
+            line: 0,
+            start_char: 0,
+            length: 2,
+            token_type: "function".to_string(),
+            modifiers: Vec::new(),
+        });
+        state.semantic_tokens_received = true;
+    }
+
+    // Trigger an edit-like flush: lsp_dirty_buffers populated, manager up.
+    engine.ensure_lsp_manager();
+    engine.lsp_dirty_buffers.insert(buf_id, true);
+    engine.lsp_flush_changes();
+
+    let state = engine.buffer_manager.get(buf_id).unwrap();
+    assert!(
+        state.semantic_tokens.is_empty(),
+        "lsp_flush_changes should clear cached semantic_tokens"
+    );
+    assert!(
+        !state.semantic_tokens_received,
+        "lsp_flush_changes must also reset semantic_tokens_received \
+         so the LSP indicator can re-show Initializing until the new \
+         response arrives (#230)"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_reload_marks_lsp_dirty() {
+    // #222: external edits left semantic_tokens (which override
+    // tree-sitter coloring for Rust) cached and stale because reload
+    // paths didn't mark the buffer dirty for LSP. lsp_flush_changes only
+    // runs for buffers in lsp_dirty_buffers, so the resync (clear
+    // semantic_tokens + notify_did_change + re-request semantic_tokens)
+    // never happened.
+    let path = std::env::temp_dir().join("vimcode_test_reload_lsp_dirty.rs");
+    std::fs::write(&path, "fn main() {}\n").unwrap();
+    let mut engine = Engine::new();
+    engine.new_tab(Some(&path));
+    let buf_id = engine.active_buffer_id();
+    engine.lsp_dirty_buffers.clear();
+
+    // Mutate the file on disk to simulate `cargo fmt` / external edit.
+    std::fs::write(&path, "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+
+    // :edit! triggers state.reload_from_disk(). Without #222 this leaves
+    // lsp_dirty_buffers empty and semantic_tokens stale.
+    engine.execute_command("edit!");
+    assert!(
+        engine.lsp_dirty_buffers.contains_key(&buf_id),
+        ":edit! must mark the buffer LSP-dirty so semantic_tokens get refreshed",
+    );
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -8750,6 +9305,46 @@ fn test_ctrl_p_opens_picker() {
     assert_eq!(engine.picker_source, PickerSource::Files);
 }
 
+#[test]
+fn test_recent_workspaces_picker_lists_most_recent_first() {
+    // #274: engine-driven RecentWorkspaces picker. Seed three recent
+    // workspaces; opening the picker should list them most-recent first
+    // (session stores them oldest-first), wired to OpenWorkspace actions.
+    use crate::core::engine::PickerAction;
+
+    let mut engine = Engine::new();
+    let a = std::path::PathBuf::from("/tmp/vimcode-test-ws-a");
+    let b = std::path::PathBuf::from("/tmp/vimcode-test-ws-b");
+    let c = std::path::PathBuf::from("/tmp/vimcode-test-ws-c");
+    engine.session.recent_workspaces = vec![a.clone(), b.clone(), c.clone()];
+
+    engine.open_picker(PickerSource::RecentWorkspaces);
+    assert!(engine.picker_open);
+    assert_eq!(engine.picker_source, PickerSource::RecentWorkspaces);
+    assert_eq!(engine.picker_title, "Open Recent Workspace");
+
+    let actions: Vec<_> = engine
+        .picker_items
+        .iter()
+        .map(|item| item.action.clone())
+        .collect();
+    assert_eq!(actions.len(), 3, "expected 3 items, got {:?}", actions);
+
+    // Most-recent first: c, b, a.
+    match (&actions[0], &actions[1], &actions[2]) {
+        (
+            PickerAction::OpenWorkspace(p0),
+            PickerAction::OpenWorkspace(p1),
+            PickerAction::OpenWorkspace(p2),
+        ) => {
+            assert_eq!(p0, &c);
+            assert_eq!(p1, &b);
+            assert_eq!(p2, &a);
+        }
+        other => panic!("unexpected actions: {:?}", other),
+    }
+}
+
 // ── Unified picker tests ─────────────────────────────────────────────────
 
 #[test]
@@ -9574,10 +10169,17 @@ fn test_command_center_help_confirm_grep_prefix() {
 #[test]
 fn test_command_center_debug_prefix_no_launch_json() {
     let mut engine = Engine::new();
-    // Set cwd to a temp dir with no launch.json
+    // Set cwd to a temp dir with no launch.json.
+    // A minimal Cargo.toml anchors find_workspace_root to this dir,
+    // preventing it from walking up to /tmp which may have stale config.
     let dir = std::env::temp_dir().join("vimcode_test_cc_debug_none");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     engine.cwd = dir.clone();
     engine.open_command_center();
     for ch in "debug".chars() {
@@ -9598,6 +10200,12 @@ fn test_command_center_debug_prefix_with_configs() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let launch_json = vimcode_dir.join("launch.json");
     let mut f = std::fs::File::create(&launch_json).unwrap();
     write!(
@@ -9632,6 +10240,12 @@ fn test_command_center_debug_prefix_filter() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let launch_json = vimcode_dir.join("launch.json");
     let mut f = std::fs::File::create(&launch_json).unwrap();
     write!(
@@ -9666,6 +10280,12 @@ fn test_command_center_debug_confirm_sets_config_index() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let launch_json = vimcode_dir.join("launch.json");
     let mut f = std::fs::File::create(&launch_json).unwrap();
     write!(
@@ -9732,7 +10352,14 @@ fn test_command_center_debug_reads_vscode_fallback() {
     use std::io::Write;
     let dir = std::env::temp_dir().join("vimcode_test_cc_debug_vscode");
     let _ = std::fs::remove_dir_all(&dir);
-    // No .vimcode dir, but .vscode/launch.json exists
+    // No .vimcode dir, but .vscode/launch.json exists.
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let vscode_dir = dir.join(".vscode");
     std::fs::create_dir_all(&vscode_dir).unwrap();
     let launch_json = vscode_dir.join("launch.json");
@@ -9766,6 +10393,12 @@ fn test_command_center_task_prefix_no_tasks_json() {
     let dir = std::env::temp_dir().join("vimcode_test_cc_task_none");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     engine.cwd = dir.clone();
     engine.open_command_center();
     for ch in "task".chars() {
@@ -9784,6 +10417,12 @@ fn test_command_center_task_prefix_with_tasks() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let tasks_json = vimcode_dir.join("tasks.json");
     let mut f = std::fs::File::create(&tasks_json).unwrap();
     write!(
@@ -9820,6 +10459,12 @@ fn test_command_center_task_prefix_filter() {
     let _ = std::fs::remove_dir_all(&dir);
     let vimcode_dir = dir.join(".vimcode");
     std::fs::create_dir_all(&vimcode_dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let tasks_json = vimcode_dir.join("tasks.json");
     let mut f = std::fs::File::create(&tasks_json).unwrap();
     write!(
@@ -9888,6 +10533,13 @@ fn test_command_center_task_reads_vscode_fallback() {
     use std::io::Write;
     let dir = std::env::temp_dir().join("vimcode_test_cc_task_vscode");
     let _ = std::fs::remove_dir_all(&dir);
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
     let vscode_dir = dir.join(".vscode");
     std::fs::create_dir_all(&vscode_dir).unwrap();
     let tasks_json = vscode_dir.join("tasks.json");
@@ -9951,6 +10603,12 @@ fn test_command_center_task_create_tasks_json() {
     let dir = std::env::temp_dir().join("vimcode_test_cc_task_create");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // Anchor find_workspace_root to this dir so stale /tmp config is ignored.
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.0.0\"\n",
+    )
+    .unwrap();
 
     let mut engine = Engine::new();
     engine.cwd = dir.clone();
@@ -10285,8 +10943,8 @@ fn test_grep_populates_quickfix() {
     );
     assert!(engine.quickfix_open);
     assert!(
-        !engine.quickfix_has_focus,
-        "focus should return to editor after :grep"
+        engine.quickfix_has_focus,
+        ":grep should focus the quickfix panel so j/k/Enter drive the results"
     );
     assert!(engine.message.contains("match"));
 }
@@ -10931,6 +11589,141 @@ fn test_diff_aligned_scroll_sync() {
     );
 }
 
+/// Regression for #166: with two non-adjacent hunks, scrolling either
+/// pane past the first hunk used to drift the partner by the net
+/// `(adds − removes)` of every prior hunk because `sync_scroll_binds`
+/// set `partner.scroll_top` to a buffer line that the partner's render
+/// resolved at a different aligned-row index.  Both panes' renders
+/// must now start at the same aligned-row index.
+#[test]
+fn test_diff_aligned_no_drift_past_multi_hunks() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_diff_no_drift");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f1 = dir.join("a_drift.txt");
+    let f2 = dir.join("b_drift.txt");
+    // Two non-adjacent hunks, each Removed-only on A side (B side has
+    // matching padding via aligned-diff).  After the first hunk, OLD
+    // sync would put the partner one row off; after the second hunk,
+    // two rows off.
+    std::fs::write(&f1, "s0\ns1\nold_a1\nold_a2\ns2\ns3\nold_b\ns4\ns5\n").unwrap();
+    std::fs::write(&f2, "s0\ns1\ns2\ns3\ns4\ns5\n").unwrap();
+
+    engine
+        .open_file_with_mode(&f1, OpenMode::Permanent)
+        .unwrap();
+    engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+    let (a, b) = engine.diff_window_pair.unwrap();
+    let aligned_a = engine.diff_aligned.get(&a).cloned().unwrap();
+    let aligned_b = engine.diff_aligned.get(&b).cloned().unwrap();
+    assert_eq!(
+        aligned_a.len(),
+        aligned_b.len(),
+        "aligned sequences must be the same length"
+    );
+
+    // Scroll the working-tree (B) past the first hunk: line 2 ("s2")
+    // is the first Same line after the first hunk.  Pre-fix this set
+    // partner A's scroll_top so A skipped its preceding padding rows
+    // and rendered at a later aligned-row idx than B.
+    engine.active_tab_mut().active_window = b;
+    engine.windows.get_mut(&b).unwrap().view.scroll_top = 2;
+    engine.sync_scroll_binds();
+
+    let a_top = engine.windows[&a]
+        .view
+        .aligned_top
+        .expect("partner aligned_top must be pinned by sync_scroll_binds in aligned-diff mode");
+    let b_top = engine.windows[&b]
+        .view
+        .aligned_top
+        .expect("active aligned_top");
+    assert_eq!(
+        a_top, b_top,
+        "both panes must start at the same aligned-row idx after sync"
+    );
+
+    // Now drive from the A pane after the second hunk: line 4 ("s4")
+    // is the first Same line after the second hunk.  This is the
+    // scenario the user reported — drift compounds over multiple
+    // hunks if sync uses buffer-line semantics for partner.scroll_top.
+    engine.active_tab_mut().active_window = a;
+    engine.windows.get_mut(&a).unwrap().view.scroll_top = 7;
+    engine.sync_scroll_binds();
+
+    let a_top = engine.windows[&a]
+        .view
+        .aligned_top
+        .expect("active aligned_top");
+    let b_top = engine.windows[&b]
+        .view
+        .aligned_top
+        .expect("partner aligned_top");
+    assert_eq!(
+        a_top, b_top,
+        "panes must remain aligned after scrolling past the second hunk"
+    );
+    // And the index must point to the post-hunk Same row (s4 is the
+    // first non-padding entry on both sides past hunk 2).
+    let entry_a = aligned_a[a_top].source_line;
+    let entry_b = aligned_b[b_top].source_line;
+    assert_eq!(
+        entry_a,
+        Some(7),
+        "A's aligned[K] should reference A's line 7 (s4), got {entry_a:?}"
+    );
+    assert_eq!(
+        entry_b,
+        Some(4),
+        "B's aligned[K] should reference B's line 4 (s4), got {entry_b:?}"
+    );
+}
+
+/// Regression for #166: when the active pane is on the side WITH
+/// added lines and scrolled past them, the partner with padding
+/// would skip rendering its leading-padding rows.  The fix backs the
+/// render up over preceding padding so the visible aligned range
+/// matches the active pane row-for-row.
+#[test]
+fn test_diff_aligned_top_renders_leading_padding() {
+    let mut engine = Engine::new();
+    let dir = std::env::temp_dir().join("vimcode_diff_leading_pad");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f1 = dir.join("a_pad.txt");
+    let f2 = dir.join("b_pad.txt");
+    // A has just two same lines; B has 3 added lines between them.
+    // When user scrolls B to line 4 (last of the added block), A's
+    // aligned[K] is padding — pre-fix this row never rendered.
+    std::fs::write(&f1, "s0\ns1\n").unwrap();
+    std::fs::write(&f2, "s0\nnew0\nnew1\nnew2\nnew3\ns1\n").unwrap();
+
+    engine
+        .open_file_with_mode(&f1, OpenMode::Permanent)
+        .unwrap();
+    engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+    let (a, b) = engine.diff_window_pair.unwrap();
+    let aligned_a = engine.diff_aligned.get(&a).cloned().unwrap();
+
+    // Scroll B to line 3 (mid-added block).
+    engine.active_tab_mut().active_window = b;
+    engine.windows.get_mut(&b).unwrap().view.scroll_top = 3;
+    engine.sync_scroll_binds();
+
+    let a_top = engine.windows[&a].view.aligned_top.expect("a aligned_top");
+    let b_top = engine.windows[&b].view.aligned_top.expect("b aligned_top");
+    assert_eq!(a_top, b_top, "both panes pinned at same aligned idx");
+    // At aligned idx K==3 (counting from start), A side must be a
+    // padding entry (the whole hunk on A is padding).  This is the
+    // regression: pre-fix the partner could not target a None entry.
+    assert!(
+        aligned_a[a_top].source_line.is_none(),
+        "A's aligned[K]={:?} should be padding at this scroll position",
+        aligned_a[a_top].source_line
+    );
+}
+
 #[test]
 fn test_diff_current_change_index() {
     let mut engine = Engine::new();
@@ -11326,6 +12119,65 @@ fn test_mouse_click_positions_cursor() {
     engine.mouse_click(wid, 1, 3);
     assert_eq!(engine.view().cursor.line, 1);
     assert_eq!(engine.view().cursor.col, 3);
+}
+
+#[test]
+fn test_quickfix_j_k_q_work_with_tui_key_encoding() {
+    // TUI encodes printable keys as `key_name=""` + `unicode=Some(c)`,
+    // unlike GTK which sends `key_name="j"`. The quickfix intercept
+    // must normalise so j/k/q/n/p behave identically in both backends.
+    let mut engine = Engine::new();
+    engine.quickfix_items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    engine.quickfix_open = true;
+    engine.quickfix_has_focus = true;
+    engine.quickfix_selected = 0;
+
+    // j (TUI encoding) → selection advances
+    engine.handle_key("", Some('j'), false);
+    assert_eq!(engine.quickfix_selected, 1, "j should advance selection");
+
+    // j again → 2
+    engine.handle_key("", Some('j'), false);
+    assert_eq!(engine.quickfix_selected, 2);
+
+    // k (TUI encoding) → selection retreats
+    engine.handle_key("", Some('k'), false);
+    assert_eq!(engine.quickfix_selected, 1, "k should retreat selection");
+
+    // GTK encoding of j/k still works (regression guard)
+    engine.handle_key("j", Some('j'), false);
+    assert_eq!(engine.quickfix_selected, 2, "GTK-style j still works");
+    engine.handle_key("k", Some('k'), false);
+    assert_eq!(engine.quickfix_selected, 1, "GTK-style k still works");
+
+    // q (TUI encoding) → close panel
+    engine.handle_key("", Some('q'), false);
+    assert!(!engine.quickfix_open, "q should close the panel");
+    assert!(!engine.quickfix_has_focus);
+}
+
+#[test]
+fn test_mouse_click_clears_quickfix_focus() {
+    // Clicking into the editor must release quickfix focus so subsequent
+    // keystrokes route to the buffer and the `[FOCUS]` marker disappears.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+
+    // Simulate a focused quickfix panel.
+    engine.quickfix_open = true;
+    engine.quickfix_has_focus = true;
+
+    let wid = engine.active_window_id();
+    engine.mouse_click(wid, 0, 3);
+
+    assert!(!engine.quickfix_has_focus);
+    // Panel stays open — click only releases focus, it doesn't close.
+    assert!(engine.quickfix_open);
 }
 
 #[test]
@@ -11846,25 +12698,8 @@ fn test_menu_bar_toggle() {
 }
 
 #[test]
-fn test_menu_open_close() {
+fn test_menu_dispatch_action() {
     let mut engine = Engine::new();
-    engine.menu_bar_visible = true;
-    assert_eq!(engine.menu_open_idx, None);
-    engine.open_menu(2);
-    assert_eq!(
-        engine.menu_open_idx,
-        Some(2),
-        "open_menu sets dropdown index"
-    );
-    engine.close_menu();
-    assert_eq!(engine.menu_open_idx, None, "close_menu clears dropdown");
-    assert!(engine.menu_bar_visible, "close_menu keeps bar visible");
-}
-
-#[test]
-fn test_menu_activate_dispatches_command() {
-    let mut engine = Engine::new();
-    // Load a buffer with content so we can verify save via w command.
     let tmp = std::env::temp_dir().join("vimcode_menu_test_save.txt");
     let _ = std::fs::write(&tmp, "hello");
     engine
@@ -11878,74 +12713,20 @@ fn test_menu_activate_dispatches_command() {
         .unwrap()
         .dirty = true;
     engine.menu_bar_visible = true;
-    engine.menu_open_idx = Some(0);
-    // Activate the "Save" item (File menu, action "w") via menu_activate_item.
-    engine.menu_activate_item(0, 2, "w");
-    assert_eq!(
-        engine.menu_open_idx, None,
-        "menu_activate_item closes dropdown"
-    );
-    // Buffer should no longer be dirty after :w
+    engine.dispatch_menu_action("w");
     let dirty = engine
         .buffer_manager
         .get(engine.active_buffer_id())
         .map(|s| s.dirty)
         .unwrap_or(true);
-    assert!(!dirty, "buffer saved after menu activate");
+    assert!(!dirty, "buffer saved after dispatch_menu_action");
     let _ = std::fs::remove_file(&tmp);
 }
 
-// ── Session 82: menu navigation ────────────────────────────────────────────
-
 #[test]
-fn test_menu_item_navigation() {
-    let mut engine = Engine::new();
-    engine.menu_bar_visible = true;
-    engine.open_menu(0);
-    assert_eq!(
-        engine.menu_highlighted_item, None,
-        "starts with no highlight"
-    );
-
-    // Items: [non-sep(0), non-sep(1), sep(2), non-sep(3)]
-    let seps = [false, false, true, false];
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(0), "first non-sep");
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(1), "second non-sep");
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(3), "skips separator");
-
-    engine.menu_move_selection(1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(0), "wraps around");
-
-    // Reverse direction
-    engine.menu_move_selection(-1, &seps);
-    assert_eq!(engine.menu_highlighted_item, Some(3), "reverse wrap");
-}
-
-#[test]
-fn test_menu_activate_highlighted() {
-    let mut engine = Engine::new();
-    engine.menu_bar_visible = true;
-    engine.open_menu(2); // arbitrary menu index
-
-    // Nothing highlighted → returns None, menu stays open
-    let result = engine.menu_activate_highlighted();
-    assert!(result.is_none(), "None when nothing highlighted");
-    assert!(engine.menu_open_idx.is_some(), "menu stays open");
-
-    // Highlight an item, then activate
-    engine.menu_highlighted_item = Some(3);
-    let result = engine.menu_activate_highlighted();
-    assert_eq!(result, Some((2, 3)), "returns (menu_idx, item_idx)");
-    assert!(
-        engine.menu_open_idx.is_none(),
-        "menu is closed after activate"
-    );
+fn test_menu_system_starts_closed() {
+    let engine = Engine::new();
+    assert!(!engine.menu_system.borrow().is_open());
 }
 
 #[test]
@@ -12377,158 +13158,6 @@ fn test_dap_frames_and_vars_cleared_on_continued() {
 }
 
 #[test]
-fn test_dap_sidebar_section_navigation() {
-    let mut engine = Engine::new();
-    assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Variables);
-    engine.handle_debug_sidebar_key("Tab", false);
-    assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Watch);
-    engine.handle_debug_sidebar_key("Tab", false);
-    assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::CallStack);
-    engine.handle_debug_sidebar_key("Tab", false);
-    assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Breakpoints);
-    engine.handle_debug_sidebar_key("Tab", false);
-    assert_eq!(engine.dap_sidebar_section, DebugSidebarSection::Variables);
-}
-
-#[test]
-fn test_dap_sidebar_section_index() {
-    assert_eq!(
-        Engine::dap_sidebar_section_index(DebugSidebarSection::Variables),
-        0
-    );
-    assert_eq!(
-        Engine::dap_sidebar_section_index(DebugSidebarSection::Watch),
-        1
-    );
-    assert_eq!(
-        Engine::dap_sidebar_section_index(DebugSidebarSection::CallStack),
-        2
-    );
-    assert_eq!(
-        Engine::dap_sidebar_section_index(DebugSidebarSection::Breakpoints),
-        3
-    );
-}
-
-#[test]
-fn test_dap_sidebar_ensure_visible_scrolls_down() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_section = DebugSidebarSection::Variables;
-    engine.dap_sidebar_section_heights = [5, 5, 5, 5];
-    engine.dap_sidebar_scroll = [0; 4];
-    // Simulate selecting item 7 (beyond the 5-row viewport).
-    engine.dap_sidebar_selected = 7;
-    engine.dap_sidebar_ensure_visible();
-    // scroll should adjust so item 7 is the last visible: scroll = 7 - 5 + 1 = 3
-    assert_eq!(engine.dap_sidebar_scroll[0], 3);
-}
-
-#[test]
-fn test_dap_sidebar_ensure_visible_scrolls_up() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_section = DebugSidebarSection::Watch;
-    engine.dap_sidebar_section_heights = [5, 5, 5, 5];
-    engine.dap_sidebar_scroll = [0, 10, 0, 0]; // Watch scroll at 10
-                                               // Select item 3 which is before the scroll window.
-    engine.dap_sidebar_selected = 3;
-    engine.dap_sidebar_ensure_visible();
-    // scroll should jump to 3
-    assert_eq!(engine.dap_sidebar_scroll[1], 3);
-}
-
-#[test]
-fn test_dap_sidebar_ensure_visible_no_change_when_visible() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_section = DebugSidebarSection::CallStack;
-    engine.dap_sidebar_section_heights = [5, 5, 5, 5];
-    engine.dap_sidebar_scroll = [0, 0, 2, 0]; // CallStack scroll at 2
-    engine.dap_sidebar_selected = 4; // visible: items 2,3,4,5,6
-    engine.dap_sidebar_ensure_visible();
-    assert_eq!(engine.dap_sidebar_scroll[2], 2); // unchanged
-}
-
-#[test]
-fn test_dap_sidebar_ensure_visible_zero_height_noop() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_section = DebugSidebarSection::Variables;
-    engine.dap_sidebar_section_heights = [0, 0, 0, 0]; // not yet laid out
-    engine.dap_sidebar_selected = 10;
-    engine.dap_sidebar_ensure_visible();
-    assert_eq!(engine.dap_sidebar_scroll[0], 0); // unchanged
-}
-
-#[test]
-fn test_dap_sidebar_resize_section() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_section_heights = [10, 10, 10, 10];
-    // Grow section 0 by 3, shrink section 1 by 3.
-    engine.dap_sidebar_resize_section(0, 3);
-    assert_eq!(engine.dap_sidebar_section_heights[0], 13);
-    assert_eq!(engine.dap_sidebar_section_heights[1], 7);
-    // Total preserved.
-    assert_eq!(engine.dap_sidebar_section_heights.iter().sum::<u16>(), 40);
-}
-
-#[test]
-fn test_dap_sidebar_resize_section_clamps_min() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_section_heights = [3, 3, 10, 10];
-    // Try to shrink section 0 by 10 — should clamp to 1.
-    engine.dap_sidebar_resize_section(0, -10);
-    assert_eq!(engine.dap_sidebar_section_heights[0], 1);
-    assert_eq!(engine.dap_sidebar_section_heights[1], 5); // 3 + 3 - 1 = 5
-                                                          // Total preserved.
-    assert_eq!(
-        engine.dap_sidebar_section_heights[0] + engine.dap_sidebar_section_heights[1],
-        6
-    );
-}
-
-#[test]
-fn test_dap_sidebar_resize_section_last_noop() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_section_heights = [10, 10, 10, 10];
-    // section_idx=3 has no next section — should be a no-op.
-    engine.dap_sidebar_resize_section(3, 5);
-    assert_eq!(engine.dap_sidebar_section_heights, [10, 10, 10, 10]);
-}
-
-#[test]
-fn test_dap_sidebar_scroll_reset_on_stop() {
-    let mut engine = Engine::new();
-    engine.dap_sidebar_scroll = [5, 10, 3, 7];
-    engine.dap_session_active = true;
-    engine.dap_stop();
-    assert_eq!(engine.dap_sidebar_scroll, [0, 0, 0, 0]);
-}
-
-#[test]
-fn test_dap_sidebar_jk_triggers_ensure_visible() {
-    use crate::core::dap::DapVariable;
-    let mut engine = Engine::new();
-    engine.dap_sidebar_has_focus = true;
-    engine.dap_sidebar_section = DebugSidebarSection::Variables;
-    engine.dap_sidebar_section_heights = [3, 3, 3, 3];
-    // Create 10 variables so we can scroll.
-    engine.dap_variables = (0..10)
-        .map(|i| DapVariable {
-            name: format!("v{i}"),
-            value: format!("{i}"),
-            var_ref: 0,
-            is_nonpublic: false,
-        })
-        .collect();
-    engine.dap_sidebar_selected = 0;
-    // Press j 5 times to go to item 5.
-    for _ in 0..5 {
-        engine.handle_debug_sidebar_key("j", false);
-    }
-    assert_eq!(engine.dap_sidebar_selected, 5);
-    // Scroll should have adjusted: 5 >= 0 + 3 → scroll = 5 - 3 + 1 = 3
-    assert_eq!(engine.dap_sidebar_scroll[0], 3);
-}
-
-#[test]
 fn test_dap_select_frame_clamps() {
     use crate::core::dap::StackFrame;
     let mut engine = Engine::new();
@@ -12674,176 +13303,6 @@ fn test_debug_toolbar_default_false() {
 // ── Session 90: Interactive debug sidebar + conditional breakpoints ──────
 
 #[test]
-fn test_sidebar_var_expand_via_enter() {
-    use crate::core::dap::DapVariable;
-    let mut engine = Engine::new();
-    engine.dap_variables = vec![
-        DapVariable {
-            name: "x".to_string(),
-            value: "42".to_string(),
-            var_ref: 10,
-            is_nonpublic: false,
-        },
-        DapVariable {
-            name: "y".to_string(),
-            value: "7".to_string(),
-            var_ref: 0,
-            is_nonpublic: false,
-        },
-    ];
-    engine.dap_sidebar_section = DebugSidebarSection::Variables;
-    engine.dap_sidebar_selected = 0;
-    // Enter on expandable var should toggle expand.
-    engine.handle_debug_sidebar_key("Return", false);
-    assert!(
-        engine.dap_expanded_vars.contains(&10),
-        "var_ref 10 should be expanded"
-    );
-    // Enter again should collapse.
-    engine.dap_sidebar_selected = 0;
-    engine.handle_debug_sidebar_key("Return", false);
-    assert!(
-        !engine.dap_expanded_vars.contains(&10),
-        "var_ref 10 should be collapsed"
-    );
-}
-
-#[test]
-fn test_sidebar_var_enter_on_non_expandable() {
-    use crate::core::dap::DapVariable;
-    let mut engine = Engine::new();
-    engine.dap_variables = vec![DapVariable {
-        name: "x".to_string(),
-        value: "42".to_string(),
-        var_ref: 0,
-        is_nonpublic: false,
-    }];
-    engine.dap_sidebar_section = DebugSidebarSection::Variables;
-    engine.dap_sidebar_selected = 0;
-    engine.handle_debug_sidebar_key("Return", false);
-    // No expansion should happen for var_ref=0.
-    assert!(engine.dap_expanded_vars.is_empty());
-}
-
-#[test]
-fn test_sidebar_callstack_enter_selects_frame() {
-    use crate::core::dap::StackFrame;
-    let mut engine = Engine::new();
-    engine.dap_stack_frames = vec![
-        StackFrame {
-            id: 1,
-            name: "main".to_string(),
-            source: None,
-            line: 10,
-        },
-        StackFrame {
-            id: 2,
-            name: "foo".to_string(),
-            source: None,
-            line: 20,
-        },
-    ];
-    engine.dap_sidebar_section = DebugSidebarSection::CallStack;
-    engine.dap_sidebar_selected = 1;
-    engine.handle_debug_sidebar_key("Return", false);
-    assert_eq!(engine.dap_active_frame, 1, "should select frame 1");
-}
-
-#[test]
-fn test_sidebar_section_len_variables() {
-    use crate::core::dap::DapVariable;
-    let mut engine = Engine::new();
-    engine.dap_variables = vec![
-        DapVariable {
-            name: "a".to_string(),
-            value: "1".to_string(),
-            var_ref: 5,
-            is_nonpublic: false,
-        },
-        DapVariable {
-            name: "b".to_string(),
-            value: "2".to_string(),
-            var_ref: 0,
-            is_nonpublic: false,
-        },
-    ];
-    engine.dap_sidebar_section = DebugSidebarSection::Variables;
-    // 2 top-level vars, none expanded.
-    assert_eq!(engine.dap_sidebar_section_len(), 2);
-    // Expand var_ref=5 with 3 children.
-    engine.dap_expanded_vars.insert(5);
-    engine.dap_child_variables.insert(
-        5,
-        vec![
-            DapVariable {
-                name: "c1".to_string(),
-                value: "x".to_string(),
-                var_ref: 0,
-                is_nonpublic: false,
-            },
-            DapVariable {
-                name: "c2".to_string(),
-                value: "y".to_string(),
-                var_ref: 0,
-                is_nonpublic: false,
-            },
-            DapVariable {
-                name: "c3".to_string(),
-                value: "z".to_string(),
-                var_ref: 0,
-                is_nonpublic: false,
-            },
-        ],
-    );
-    assert_eq!(engine.dap_sidebar_section_len(), 5);
-}
-
-#[test]
-fn test_sidebar_j_k_clamped() {
-    use crate::core::dap::DapVariable;
-    let mut engine = Engine::new();
-    engine.dap_variables = vec![DapVariable {
-        name: "x".to_string(),
-        value: "1".to_string(),
-        var_ref: 0,
-        is_nonpublic: false,
-    }];
-    engine.dap_sidebar_section = DebugSidebarSection::Variables;
-    engine.dap_sidebar_selected = 0;
-    // j should not go past last item.
-    engine.handle_debug_sidebar_key("j", false);
-    assert_eq!(engine.dap_sidebar_selected, 0, "clamped at end");
-    // k should not go below 0.
-    engine.handle_debug_sidebar_key("k", false);
-    assert_eq!(engine.dap_sidebar_selected, 0, "clamped at start");
-}
-
-#[test]
-fn test_sidebar_delete_watch() {
-    let mut engine = Engine::new();
-    engine.dap_add_watch("expr1".to_string());
-    engine.dap_add_watch("expr2".to_string());
-    engine.dap_sidebar_section = DebugSidebarSection::Watch;
-    engine.dap_sidebar_selected = 0;
-    engine.handle_debug_sidebar_key("x", false);
-    assert_eq!(engine.dap_watch_expressions.len(), 1);
-    assert_eq!(engine.dap_watch_expressions[0], "expr2");
-}
-
-#[test]
-fn test_sidebar_delete_breakpoint() {
-    let mut engine = Engine::new();
-    engine.dap_toggle_breakpoint("/tmp/a.rs", 5);
-    engine.dap_toggle_breakpoint("/tmp/a.rs", 10);
-    engine.dap_sidebar_section = DebugSidebarSection::Breakpoints;
-    engine.dap_sidebar_selected = 0;
-    engine.handle_debug_sidebar_key("d", false);
-    let bps = engine.dap_breakpoints.get("/tmp/a.rs").unwrap();
-    assert_eq!(bps.len(), 1);
-    assert_eq!(bps[0].line, 10);
-}
-
-#[test]
 fn test_conditional_breakpoint() {
     let mut engine = Engine::new();
     engine.dap_toggle_breakpoint("/tmp/a.rs", 5);
@@ -12958,45 +13417,6 @@ fn test_dap_scope_groups_cleared_on_select_frame() {
     engine.dap_scope_groups.push(("Statics".to_string(), 42));
     engine.dap_select_frame(0);
     assert!(engine.dap_scope_groups.is_empty());
-}
-
-#[test]
-fn test_dap_var_flat_count_with_scope_groups() {
-    use crate::core::dap::DapVariable;
-    let mut engine = Engine::new();
-    engine.dap_variables = vec![DapVariable {
-        name: "x".to_string(),
-        value: "1".to_string(),
-        var_ref: 0,
-        is_nonpublic: false,
-    }];
-    // 1 variable, no scope groups.
-    assert_eq!(engine.dap_var_flat_count(), 1);
-    // Add two scope groups.
-    engine.dap_scope_groups = vec![("Statics".to_string(), 100), ("Registers".to_string(), 200)];
-    // 1 var + 2 group headers = 3.
-    assert_eq!(engine.dap_var_flat_count(), 3);
-    // Expand "Statics" with 2 children.
-    engine.dap_expanded_vars.insert(100);
-    engine.dap_child_variables.insert(
-        100,
-        vec![
-            DapVariable {
-                name: "s1".to_string(),
-                value: "a".to_string(),
-                var_ref: 0,
-                is_nonpublic: false,
-            },
-            DapVariable {
-                name: "s2".to_string(),
-                value: "b".to_string(),
-                var_ref: 0,
-                is_nonpublic: false,
-            },
-        ],
-    );
-    // 1 var + (1 header + 2 children) + 1 header = 5.
-    assert_eq!(engine.dap_var_flat_count(), 5);
 }
 
 #[test]
@@ -13601,7 +14021,9 @@ fn test_sc_stage_selected_on_changes_header_is_not_noop() {
 
 // ── Multi-cursor tests ────────────────────────────────────────────────────
 
-fn engine_with_text(text: &str) -> Engine {
+// #438: pub(crate) so render.rs's test module (and other engine sibling
+// modules) can build a populated Engine without duplicating the setup.
+pub(crate) fn engine_with_text(text: &str) -> Engine {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, text);
     engine
@@ -14351,6 +14773,91 @@ fn test_dialog_blocks_normal_keys() {
     assert_eq!(e.buffer().to_string(), "hello"); // Buffer unchanged.
 }
 
+/// Pressing a modifier-only key name (e.g. "Shift_L" from GDK) must not fire
+/// a dialog hotkey.  Before the fix, "Shift_L".chars().next() == 'S', which
+/// was lowercased to 's' and matched a "Save" button (hotkey 's'), causing an
+/// accidental dialog confirmation whenever the user pressed Shift alone (#207).
+#[test]
+fn test_dialog_modifier_only_key_does_not_fire_hotkey() {
+    let mut e = Engine::new();
+    e.show_dialog(
+        "test",
+        "Save?",
+        vec![],
+        vec![
+            DialogButton {
+                label: "Save".into(),
+                hotkey: 's',
+                action: "save".into(),
+            },
+            DialogButton {
+                label: "Cancel".into(),
+                hotkey: '\0',
+                action: "cancel".into(),
+            },
+        ],
+    );
+    // Simulate GDK modifier-only key events — these must NOT fire the hotkey.
+    e.handle_key("Shift_L", None, false);
+    assert!(e.dialog.is_some(), "Shift_L should not fire 's' hotkey");
+    e.handle_key("Shift_R", None, false);
+    assert!(e.dialog.is_some(), "Shift_R should not fire 's' hotkey");
+    e.handle_key("Control_L", None, false);
+    assert!(e.dialog.is_some(), "Control_L should not fire hotkey");
+    e.handle_key("Control_R", None, false);
+    assert!(e.dialog.is_some(), "Control_R should not fire hotkey");
+    e.handle_key("Alt_L", None, false);
+    assert!(e.dialog.is_some(), "Alt_L should not fire hotkey");
+    // A real 's' hotkey still works.
+    e.handle_key("s", Some('s'), false);
+    assert!(e.dialog.is_none(), "'s' must still fire the Save hotkey");
+}
+
+/// Shift+Tab (sent as "ISO_Left_Tab" by GDK or "BackTab" after map_gtk_key_name)
+/// must cycle the dialog selection backward (#207 side-effect).
+#[test]
+fn test_dialog_shift_tab_backward_navigation() {
+    let mut e = Engine::new();
+    e.show_dialog(
+        "test",
+        "Choose",
+        vec![],
+        vec![
+            DialogButton {
+                label: "A".into(),
+                hotkey: 'a',
+                action: "a".into(),
+            },
+            DialogButton {
+                label: "B".into(),
+                hotkey: 'b',
+                action: "b".into(),
+            },
+            DialogButton {
+                label: "C".into(),
+                hotkey: 'c',
+                action: "c".into(),
+            },
+        ],
+    );
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+    // Tab → forward (0 → 1)
+    e.handle_key("Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+    // ISO_Left_Tab (GDK's Shift+Tab) → backward (1 → 0)
+    e.handle_key("ISO_Left_Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+    // Backward at start wraps to last (0 → 2)
+    e.handle_key("ISO_Left_Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
+    // BackTab (from map_gtk_key_name("ISO_Left_Tab")) → backward (2 → 1)
+    e.handle_key("BackTab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
+    // Shift_Tab (TUI explicit) → backward (1 → 0)
+    e.handle_key("Shift_Tab", None, false);
+    assert_eq!(e.dialog.as_ref().unwrap().selected, 0);
+}
+
 #[test]
 fn test_show_error_dialog() {
     let mut e = Engine::new();
@@ -14382,13 +14889,16 @@ fn mock_bash_manifest() -> extensions::ExtensionManifest {
 fn test_ext_remove_dialog_shows_on_d() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
-    // Install a single extension so it's the only item at index 0.
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_sections_expanded = [true, true];
-    e.ext_sidebar_selected = 0; // First installed item.
     e.ext_sidebar_has_focus = true;
-    e.handle_ext_sidebar_key("d", false, None);
-    // Dialog should be open with the ext_remove tag.
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
     assert_eq!(e.dialog.as_ref().unwrap().tag, "ext_remove");
     assert!(e.pending_ext_remove.is_some());
@@ -14400,14 +14910,17 @@ fn test_ext_remove_dialog_cancel() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_sections_expanded = [true, true];
-    e.ext_sidebar_selected = 0;
-    e.handle_ext_sidebar_key("d", false, None);
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
-    // Press Escape to cancel.
     e.handle_key("Escape", None, false);
     assert!(e.dialog.is_none());
-    // Extension should still be installed.
     assert!(e.extension_state.is_installed("bash"));
 }
 
@@ -14416,15 +14929,87 @@ fn test_ext_remove_dialog_confirm_remove() {
     let mut e = Engine::new();
     e.ext_registry = Some(vec![mock_bash_manifest()]);
     e.extension_state.mark_installed_version("bash", "1.0.0");
-    e.ext_sidebar_sections_expanded = [true, true];
-    e.ext_sidebar_selected = 0;
-    e.handle_ext_sidebar_key("d", false, None);
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    e.dispatch_ext_sidebar_action_key("d");
     assert!(e.dialog.is_some());
-    // Press 'r' for "Remove".
     e.handle_key("", Some('r'), false);
     assert!(e.dialog.is_none());
-    // Extension should be removed.
     assert!(!e.extension_state.is_installed("bash"));
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_action_key_unfocus() {
+    let mut e = Engine::new();
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    let consumed = e.dispatch_ext_sidebar_action_key("q");
+    assert!(consumed);
+    assert!(!e.ext_sidebar_has_focus);
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_action_key_search() {
+    let mut e = Engine::new();
+    assert!(!e.ext_sidebar_input_active);
+    let consumed = e.dispatch_ext_sidebar_action_key("/");
+    assert!(consumed);
+    assert!(e.ext_sidebar_input_active);
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_action_key_remove() {
+    let mut e = Engine::new();
+    e.ext_registry = Some(vec![mock_bash_manifest()]);
+    e.extension_state.mark_installed_version("bash", "1.0.0");
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(0));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(0, Some(vec![0]));
+    let consumed = e.dispatch_ext_sidebar_action_key("d");
+    assert!(consumed);
+    assert!(e.dialog.is_some());
+    assert_eq!(e.dialog.as_ref().unwrap().tag, "ext_remove");
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_event_row_activated() {
+    let mut e = Engine::new();
+    let event = quadraui::SidebarEvent::RowActivated {
+        section: 0,
+        path: vec![0],
+    };
+    let consumed = e.dispatch_ext_sidebar_event(event);
+    assert!(consumed);
+}
+
+#[test]
+fn test_ext_sidebar_system_dispatch_event_ignored() {
+    let mut e = Engine::new();
+    let consumed = e.dispatch_ext_sidebar_event(quadraui::SidebarEvent::Ignored);
+    assert!(!consumed);
+}
+
+#[test]
+fn test_ext_selected_from_sidebar_system() {
+    let mut e = Engine::new();
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(1));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(1, Some(vec![3]));
+    let (is_installed, idx) = e.ext_selected_from_sidebar_system();
+    assert!(!is_installed);
+    assert_eq!(idx, 3);
 }
 
 // ─── Spell checking ──────────────────────────────────────────────────
@@ -14904,6 +15489,90 @@ fn test_sc_hover_log_entry_generates_markdown() {
         md.contains("abc1234") || md.contains("hover popups"),
         "log hover should contain hash or message"
     );
+}
+
+// ─── SC SidebarSystem (#321) ────────────────────────────────────────────
+
+#[test]
+fn test_sc_sidebar_system_initialized_with_4_sections() {
+    let engine = Engine::new();
+    let sidebar = engine.sc_sidebar_system.borrow();
+    assert!(sidebar.is_section_visible(0));
+    assert!(sidebar.is_section_visible(1));
+    assert!(sidebar.is_section_visible(2));
+    assert!(sidebar.is_section_visible(3));
+}
+
+#[test]
+fn test_sc_unified_dispatch_escape_unfocuses() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    let result = engine.dispatch_sc_sidebar_key_unified("Escape", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Unfocused));
+    assert!(!engine.sc_has_focus);
+}
+
+#[test]
+fn test_sc_unified_dispatch_q_unfocuses() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    let result = engine.dispatch_sc_sidebar_key_unified("q", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Unfocused));
+    assert!(!engine.sc_has_focus);
+}
+
+#[test]
+fn test_sc_unified_dispatch_commit_input_toggle() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    assert!(!engine.sc_commit_input_active);
+    let result = engine.dispatch_sc_sidebar_key_unified("c", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(engine.sc_commit_input_active);
+    let result = engine.dispatch_sc_sidebar_key_unified("Escape", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(!engine.sc_commit_input_active);
+}
+
+#[test]
+fn test_sc_unified_dispatch_help_toggle() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    let result = engine.dispatch_sc_sidebar_key_unified("?", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(engine.sc_help_open);
+    let result = engine.dispatch_sc_sidebar_key_unified("x", false, None);
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    assert!(!engine.sc_help_open);
+}
+
+#[test]
+fn test_sc_unified_dispatch_branch_picker() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    engine.dispatch_sc_sidebar_key_unified("b", false, None);
+    assert!(engine.sc_branch_picker_open);
+    engine.dispatch_sc_sidebar_key_unified("Escape", false, None);
+    assert!(!engine.sc_branch_picker_open);
+}
+
+#[test]
+fn test_sc_unified_dispatch_stage_all() {
+    let mut engine = make_sc_engine_with_files();
+    engine.sc_has_focus = true;
+    // "S" should reach dispatch_sc_action_key → sc_stage_all
+    let result = engine.dispatch_sc_sidebar_key_unified("S", false, Some('S'));
+    assert!(matches!(result, source_control::ScKeyResult::Consumed));
+    // sc_stage_all calls git which won't work in test env, but the key
+    // should at least be consumed (not ignored). Verify it wasn't treated
+    // as a navigation key by checking the SidebarSystem state didn't change.
+}
+
+#[test]
+fn test_sc_action_key_uppercase_s() {
+    let mut engine = make_sc_engine_with_files();
+    let consumed = engine.dispatch_sc_action_key("S");
+    assert!(consumed, "S should be consumed by dispatch_sc_action_key");
 }
 
 #[test]
@@ -16723,6 +17392,79 @@ fn test_tab_scroll_offset_pulls_back_when_room() {
 }
 
 #[test]
+fn test_post_draw_apply_widths_reports_changes() {
+    let mut engine = Engine::new();
+    let group_id = engine.active_group;
+
+    // First call with a fresh width must report change (tab_bar_width
+    // defaults to usize::MAX, so any reported value differs).
+    let changed = engine.post_draw_apply_widths(&[(group_id, 80)]);
+    assert!(
+        changed,
+        "first apply with new width should report change so backend redraws"
+    );
+
+    // Second call with the same width is idempotent — must report no change
+    // so backends don't trigger redraw loops every frame.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 80)]);
+    assert!(
+        !changed,
+        "no-op apply must report no change to avoid redraw loops"
+    );
+
+    // Different width reports change.
+    let changed = engine.post_draw_apply_widths(&[(group_id, 60)]);
+    assert!(changed, "width change must be reported");
+}
+
+#[test]
+fn test_post_draw_apply_widths_detects_scroll_change() {
+    // Even when widths are unchanged, if ensure_active_tab_visible would
+    // recompute scroll_offset (e.g. because the active tab moved), the
+    // method must report change. Otherwise GTK's "queue redraw if changed"
+    // check would miss the corrected offset.
+    let mut engine = Engine::new();
+    let group_id = engine.active_group;
+
+    // Set width to fit only ~4 tabs (each "[No Name]" is ~18 cols).
+    engine.post_draw_apply_widths(&[(group_id, 72)]);
+
+    // Open 6 tabs. The last new_tab() call sets active=5 and runs
+    // ensure_active_tab_visible internally, which will set a non-zero
+    // scroll_offset.
+    for _ in 0..5 {
+        engine.new_tab(None);
+    }
+    let scroll_after_open = engine
+        .editor_groups
+        .get(&group_id)
+        .unwrap()
+        .tab_scroll_offset;
+    assert!(
+        scroll_after_open > 0,
+        "test setup: 6 tabs in a 4-tab-wide bar should have non-zero scroll"
+    );
+
+    // Manually move active back to tab 0 without calling ensure. Now the
+    // engine state is "stale" — ensure should pull scroll_offset back to 0.
+    engine.editor_groups.get_mut(&group_id).unwrap().active_tab = 0;
+    let changed = engine.post_draw_apply_widths(&[(group_id, 72)]);
+    assert!(
+        changed,
+        "scroll_offset change (from ensure) must be reported even when width is unchanged"
+    );
+    assert_eq!(
+        engine
+            .editor_groups
+            .get(&group_id)
+            .unwrap()
+            .tab_scroll_offset,
+        0,
+        "after ensure with active=0, scroll_offset should pull back to 0"
+    );
+}
+
+#[test]
 fn test_new_tab_visible_in_small_group() {
     let mut engine = Engine::new();
 
@@ -17398,15 +18140,13 @@ fn test_breadcrumb_click_directory_opens_file_picker() {
 }
 
 #[test]
-fn test_breadcrumb_click_file_opens_symbol_picker() {
+fn test_breadcrumb_click_file_opens_sibling_files() {
     let mut e = engine_with_text("hello");
     let file = std::env::temp_dir().join("vimcode_test_bc_file.rs");
     std::fs::write(&file, "fn foo() {}").unwrap();
-    // Clicking a file segment should open the @ symbol picker
     e.breadcrumb_click(false, Some(&file));
     assert!(e.picker_open, "breadcrumb file click should open picker");
-    assert_eq!(e.picker_source, PickerSource::CommandCenter);
-    assert_eq!(e.picker_query, "@");
+    assert_eq!(e.picker_source, PickerSource::Files);
     let _ = std::fs::remove_file(&file);
 }
 
@@ -17593,6 +18333,214 @@ fn test_breadcrumb_enter_on_path_opens_file_picker() {
 }
 
 #[test]
+fn test_scoped_filter_top_level_does_not_flatten_subtree() {
+    // #465 follow-up: when the user clicks the outermost symbol segment
+    // (parent_scope = None) the picker should show only the sibling
+    // top-level items, NOT recurse into their children. Pre-fix the picker
+    // showed every nested symbol in the file because `build_symbol_tree_items`
+    // recursively walked `children` on each filtered item.
+    use crate::core::lsp::{SymbolInfo, SymbolKind};
+    let mut e = engine_with_text("hello");
+    // Simulate state right after clicking the impl block segment at the top
+    // of the symbol breadcrumb chain: parent_scope is None (no enclosing
+    // symbol) so the filter is top-level only.
+    e.breadcrumb_scoped_parent = Some(None);
+    e.breadcrumb_scoped_parent_line = None;
+    // A file with two impl blocks, each with two methods (4 nested + 2
+    // top-level = 6 symbols total).
+    let symbols = vec![
+        SymbolInfo {
+            name: "impl Alpha".to_string(),
+            kind: SymbolKind::Class,
+            detail: None,
+            container: None,
+            path: None,
+            line: 10,
+            character: 0,
+            children: vec![
+                SymbolInfo {
+                    name: "a1".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Alpha".to_string()),
+                    path: None,
+                    line: 11,
+                    character: 0,
+                    children: Vec::new(),
+                },
+                SymbolInfo {
+                    name: "a2".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Alpha".to_string()),
+                    path: None,
+                    line: 15,
+                    character: 0,
+                    children: Vec::new(),
+                },
+            ],
+        },
+        SymbolInfo {
+            name: "impl Beta".to_string(),
+            kind: SymbolKind::Class,
+            detail: None,
+            container: None,
+            path: None,
+            line: 50,
+            character: 0,
+            children: vec![
+                SymbolInfo {
+                    name: "b1".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Beta".to_string()),
+                    path: None,
+                    line: 51,
+                    character: 0,
+                    children: Vec::new(),
+                },
+                SymbolInfo {
+                    name: "b2".to_string(),
+                    kind: SymbolKind::Method,
+                    detail: None,
+                    container: Some("impl Beta".to_string()),
+                    path: None,
+                    line: 55,
+                    character: 0,
+                    children: Vec::new(),
+                },
+            ],
+        },
+    ];
+    e.picker_populate_document_symbols(symbols);
+    let names: Vec<&str> = e
+        .picker_all_items
+        .iter()
+        .map(|i| i.display.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("impl Alpha")),
+        "expected impl Alpha at top level, got: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("impl Beta")),
+        "expected impl Beta at top level, got: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains(" a1") || n.contains(" b1")),
+        "nested methods should be hidden in scoped top-level view, got: {names:?}"
+    );
+}
+
+#[test]
+fn test_scoped_filter_hierarchical_impl_block_name_mismatch() {
+    // #465 follow-up: tree-sitter names an `impl X for Y` block as just `Y`,
+    // while rust-analyzer's hierarchical DocumentSymbol names the same block
+    // as `impl X for Y` and sets that on children's `container`. The fix is
+    // to use the parent's *line number* (which both agree on) to find the
+    // parent in the LSP tree, then return its children directly.
+    use crate::core::lsp::{SymbolInfo, SymbolKind};
+    let mut e = engine_with_text("hello");
+    // Simulate state right after clicking `adjust_ratio_at_index_impl` in the
+    // breadcrumb. Tree-sitter gave us:
+    //   - parent_scope = "VsplitLayout" (the impl's type)
+    //   - parent_line  = 600 (the impl_item's start row)
+    e.breadcrumb_scoped_parent = Some(Some("VsplitLayout".to_string()));
+    e.breadcrumb_scoped_parent_line = Some(600);
+
+    // Rust-analyzer's hierarchical response for the same code. Note the
+    // parent's name uses LSP's convention, not tree-sitter's.
+    let symbols = vec![SymbolInfo {
+        name: "impl WindowGroupLayout for VsplitLayout".to_string(),
+        kind: SymbolKind::Class,
+        detail: None,
+        container: None,
+        path: None,
+        line: 600,
+        character: 0,
+        children: vec![
+            SymbolInfo {
+                name: "adjust_ratio_at_index_impl".to_string(),
+                kind: SymbolKind::Method,
+                detail: None,
+                container: Some("impl WindowGroupLayout for VsplitLayout".to_string()),
+                path: None,
+                line: 601,
+                character: 0,
+                children: Vec::new(),
+            },
+            SymbolInfo {
+                name: "other_method".to_string(),
+                kind: SymbolKind::Method,
+                detail: None,
+                container: Some("impl WindowGroupLayout for VsplitLayout".to_string()),
+                path: None,
+                line: 650,
+                character: 0,
+                children: Vec::new(),
+            },
+        ],
+    }];
+    e.picker_populate_document_symbols(symbols);
+    // Pre-fix: name-based filter `container == "VsplitLayout"` matched zero
+    // items because rust-analyzer's container is the full `impl X for Y` form.
+    // Post-fix: line-based lookup finds the impl block at line 600 and uses
+    // its children (the two methods) as the sibling list.
+    let names: Vec<&str> = e
+        .picker_all_items
+        .iter()
+        .map(|i| i.display.as_str())
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|n| n.contains("adjust_ratio_at_index_impl")),
+        "expected adjust_ratio_at_index_impl in sibling list, got: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.contains("other_method")),
+        "expected other_method in sibling list, got: {names:?}"
+    );
+}
+
+#[test]
+fn test_breadcrumb_open_scoped_preserves_parent_through_open_picker() {
+    // #465: open_picker resets breadcrumb_scoped_parent as part of its
+    // state-clear pass. Setting the scope BEFORE calling open_picker meant
+    // the filter was wiped before the async LSP response could read it,
+    // and the picker showed all symbols (or empty if rust-analyzer's
+    // DocumentSymbol response had no `container` field set on items).
+    // The fix moves the assignment after open_picker so the filter
+    // survives into picker_populate_document_symbols.
+    let mut e = engine_with_text("hello");
+    e.breadcrumb_segments = vec![
+        BreadcrumbSegmentInfo {
+            label: "Engine".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(10),
+            parent_scope: None,
+        },
+        BreadcrumbSegmentInfo {
+            label: "handle_key".to_string(),
+            is_symbol: true,
+            path_prefix: None,
+            symbol_line: Some(20),
+            parent_scope: Some("Engine".to_string()),
+        },
+    ];
+    e.breadcrumb_selected = 1; // on "handle_key"
+    e.breadcrumb_open_scoped();
+    assert!(e.picker_open, "scoped picker should open");
+    assert_eq!(e.picker_query, "@");
+    assert_eq!(
+        e.breadcrumb_scoped_parent,
+        Some(Some("Engine".to_string())),
+        "scoped parent must survive open_picker so the async LSP response can filter siblings"
+    );
+}
+
+#[test]
 fn test_scoped_symbol_filtering() {
     let mut e = engine_with_text("hello");
     // Set the scoped parent filter to "Engine"
@@ -17757,80 +18705,50 @@ fn test_symbol_tree_sorted_by_kind_then_name() {
 }
 
 #[test]
-fn test_symbol_tree_top_level_expanded_by_default() {
-    let mut e = engine_with_text("hello");
+fn test_symbol_tree_parent_is_jumpable_not_expandable() {
+    // #262: parents (functions, structs with nested methods) must jump to
+    // their definition line on Enter/click rather than just toggling
+    // expand. We achieve that by marking every symbol-tree row
+    // non-expandable so the click/Enter dispatch always falls through to
+    // picker_confirm. Children are still emitted flat at increasing
+    // depth, so the indent still shows the hierarchy.
+    //
+    // Buffer needs at least Engine's line (10) so set_cursor_for_window
+    // doesn't clamp.
+    let mut e = engine_with_text(&"line\n".repeat(20));
     let symbols = make_hierarchical_symbols();
     e.open_picker(PickerSource::CommandCenter);
     e.picker_query = "@".to_string();
     e.picker_populate_document_symbols(symbols);
 
-    // Top-level items should be expanded
+    // Every row is non-expandable — both parents (Config, Engine) and
+    // leaves (load, handle_key, new, main) — so the
+    // `if in_tree_mode && picker_toggle_expand() { ... }` gate in the
+    // Enter handler and both backends' click handlers always falls
+    // through to picker_confirm.
     for item in &e.picker_all_items {
-        if item.depth == 0 && item.expandable {
-            assert!(item.expanded, "{} should be expanded", item.filter_text);
-        }
+        assert!(
+            !item.expandable,
+            "{} should not be expandable (would block jump on parent symbols)",
+            item.filter_text
+        );
     }
-    // All items should be visible since top-level is expanded
+
+    // All children are always visible (no fold-state hiding any row).
     assert_eq!(e.picker_items.len(), 6);
-}
 
-#[test]
-fn test_symbol_tree_collapse_hides_children() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Select "Engine" (index 2 in visible items: Config, load, Engine, ...)
-    e.picker_selected = 2; // Engine
+    // picker_toggle_expand returns false → backends fall through to confirm.
+    e.picker_selected = 2; // Engine (a parent)
     assert_eq!(e.picker_items[2].filter_text, "Engine");
-
-    // Toggle collapse
-    let toggled = e.picker_toggle_expand();
-    assert!(toggled, "Engine should be toggleable");
-
-    // Engine's children (handle_key, new) should be hidden
-    let visible_names: Vec<&str> = e
-        .picker_items
-        .iter()
-        .map(|i| i.filter_text.as_str())
-        .collect();
     assert!(
-        !visible_names.contains(&"handle_key"),
-        "handle_key should be hidden after collapse"
+        !e.picker_toggle_expand(),
+        "parent symbol must not toggle — that's the bug being fixed"
     );
-    assert!(
-        !visible_names.contains(&"new"),
-        "new should be hidden after collapse"
-    );
-    // Config + load + Engine + main = 4
-    assert_eq!(e.picker_items.len(), 4);
-}
 
-#[test]
-fn test_symbol_tree_expand_shows_children() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Collapse Engine first
-    e.picker_selected = 2;
-    e.picker_toggle_expand();
-    assert_eq!(e.picker_items.len(), 4);
-
-    // Re-expand Engine
-    // After collapse, Engine is still at index 2
-    e.picker_selected = 2;
-    let toggled = e.picker_toggle_expand();
-    assert!(toggled);
-    assert_eq!(
-        e.picker_items.len(),
-        6,
-        "All items visible again after re-expand"
-    );
+    // Confirm on the parent jumps to the parent's line (10), not a child's.
+    let action = e.picker_confirm();
+    assert!(matches!(action, EngineAction::None));
+    assert_eq!(e.view().cursor.line, 10, "should jump to Engine's line");
 }
 
 #[test]
@@ -17854,31 +18772,6 @@ fn test_symbol_tree_filter_flattens() {
 }
 
 #[test]
-fn test_symbol_tree_enter_on_expandable_toggles() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Select Config (expandable, at index 0)
-    e.picker_selected = 0;
-    assert_eq!(e.picker_items[0].filter_text, "Config");
-    assert!(e.picker_items[0].expandable);
-
-    // Press Enter — should toggle expand, not confirm
-    let action = e.handle_picker_key("Return", None, false);
-    assert!(
-        e.picker_open,
-        "Picker should stay open after toggling expand"
-    );
-    assert!(
-        matches!(action, EngineAction::None),
-        "Should return None, not navigate"
-    );
-}
-
-#[test]
 fn test_symbol_tree_enter_on_leaf_confirms() {
     let mut e = engine_with_text("line0\nline1\nline2\nline3\n");
     let symbols = make_hierarchical_symbols();
@@ -17894,57 +18787,6 @@ fn test_symbol_tree_enter_on_leaf_confirms() {
     // Press Enter — should confirm (close picker)
     let _action = e.handle_picker_key("Return", None, false);
     assert!(!e.picker_open, "Picker should close after confirming leaf");
-}
-
-#[test]
-fn test_symbol_tree_right_expands_left_collapses() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Collapse Config first
-    e.picker_selected = 0;
-    e.picker_toggle_expand();
-    assert_eq!(e.picker_items.len(), 5); // Config(collapsed), Engine, handle_key, new, main
-
-    // Right arrow on collapsed Config should expand
-    e.picker_selected = 0;
-    e.handle_picker_key("Right", None, false);
-    assert_eq!(e.picker_items.len(), 6); // All visible again
-
-    // Left arrow on expanded Config should collapse
-    e.picker_selected = 0;
-    e.handle_picker_key("Left", None, false);
-    assert_eq!(e.picker_items.len(), 5);
-}
-
-#[test]
-fn test_symbol_tree_expandable_flag() {
-    let mut e = engine_with_text("hello");
-    let symbols = make_hierarchical_symbols();
-    e.open_picker(PickerSource::CommandCenter);
-    e.picker_query = "@".to_string();
-    e.picker_populate_document_symbols(symbols);
-
-    // Structs with children should be expandable
-    let config = &e.picker_all_items[0];
-    assert_eq!(config.filter_text, "Config");
-    assert!(config.expandable);
-
-    let engine = &e.picker_all_items[2];
-    assert_eq!(engine.filter_text, "Engine");
-    assert!(engine.expandable);
-
-    // Leaf items should not be expandable
-    let load = &e.picker_all_items[1];
-    assert_eq!(load.filter_text, "load");
-    assert!(!load.expandable);
-
-    let main_fn = &e.picker_all_items[5];
-    assert_eq!(main_fn.filter_text, "main");
-    assert!(!main_fn.expandable);
 }
 
 #[test]
@@ -18039,7 +18881,11 @@ fn test_symbol_tree_from_flat_container_field() {
         .iter()
         .find(|i| i.filter_text == "Engine")
         .expect("Should have Engine");
-    assert!(engine_item.expandable, "Engine should be expandable");
+    // #262: symbol-tree rows are never expandable — see
+    // test_symbol_tree_parent_is_jumpable_not_expandable. The hierarchy
+    // is still reconstructed and shown via `depth`; only the toggleable
+    // fold state is gone.
+    assert!(!engine_item.expandable, "Engine row must not be expandable");
     assert_eq!(engine_item.depth, 0);
 
     // Methods should be at depth 1
@@ -18099,7 +18945,13 @@ fn test_symbol_tree_synthetic_container() {
         .iter()
         .find(|i| i.filter_text == "ImplBlock")
         .expect("Should create synthetic ImplBlock parent");
-    assert!(parent.expandable, "Synthetic parent should be expandable");
+    // #262: synthetic parents are also non-expandable (no row is). What
+    // matters is that the synthetic parent shows up at depth 0 with its
+    // methods at depth 1, preserving the visible hierarchy.
+    assert!(
+        !parent.expandable,
+        "Synthetic parent row must not be expandable"
+    );
     assert_eq!(parent.depth, 0);
 
     // Children should be at depth 1
@@ -18118,7 +18970,7 @@ fn test_editor_action_menu_opens() {
     let mut e = Engine::new();
     e.buffer_mut().insert(0, "hello\n");
     let gid = e.active_group;
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1.0);
     assert!(e.context_menu.is_some());
     let cm = e.context_menu.as_ref().unwrap();
     assert!(matches!(
@@ -18139,7 +18991,7 @@ fn test_editor_action_menu_close_others_disabled_with_one_tab() {
     let mut e = Engine::new();
     e.buffer_mut().insert(0, "hello\n");
     let gid = e.active_group;
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1.0);
     let cm = e.context_menu.as_ref().unwrap();
     // "Close Others" disabled with only 1 tab.
     let close_others = cm
@@ -18159,7 +19011,7 @@ fn test_editor_action_menu_toggle_wrap() {
     e.buffer_mut().insert(0, "hello\n");
     let gid = e.active_group;
     assert!(!e.settings.wrap);
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1.0);
     // Select "toggle_wrap" and confirm.
     if let Some(ref mut cm) = e.context_menu {
         if let Some(idx) = cm.items.iter().position(|i| i.action == "toggle_wrap") {
@@ -18179,7 +19031,7 @@ fn test_editor_action_menu_close_all() {
     e.new_tab(None);
     assert!(e.active_group().tabs.len() >= 2);
     let gid = e.active_group;
-    e.open_editor_action_menu(gid, 0, 0);
+    e.open_editor_action_menu(gid, 0, 0, 1.0);
     if let Some(ref mut cm) = e.context_menu {
         if let Some(idx) = cm.items.iter().position(|i| i.action == "close_all") {
             cm.selected = idx;
@@ -18372,8 +19224,10 @@ fn test_status_action_toggle_menu_bar() {
 #[test]
 fn test_status_action_toggle_sidebar_returns_engine_action() {
     let mut e = Engine::new();
+    let was_visible = e.app_shell.sidebar_visible();
     let result = e.handle_status_action(&StatusAction::ToggleSidebar);
-    assert_eq!(result, Some(EngineAction::ToggleSidebar));
+    assert_eq!(result, None);
+    assert_ne!(e.app_shell.sidebar_visible(), was_visible);
 }
 
 #[test]
@@ -18387,6 +19241,88 @@ fn test_status_action_existing_actions_return_none() {
     assert!(e
         .handle_status_action(&StatusAction::ChangeEncoding)
         .is_none());
+}
+
+// ── PanelChromeDesc tests ───────────────────────────────────────────────
+
+#[test]
+fn test_panel_chrome_typical_tui_maximize() {
+    // TUI with a 40-row terminal, no menu / qf / dbg / wm, per-window
+    // status on (so status_cmd_rows=1, tab_bar_rows=1 since breadcrumbs
+    // collapse behind panel), panel_chrome_rows=2 (bottom-tabs + toolbar).
+    let d = super::PanelChromeDesc {
+        viewport_rows: 40,
+        menu_rows: 0,
+        quickfix_rows: 0,
+        debug_toolbar_rows: 0,
+        wildmenu_rows: 0,
+        tab_bar_rows: 1,
+        separated_status_rows: 0,
+        status_cmd_rows: 1,
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    };
+    // 40 - (1 + 1 + 2) = 36
+    assert_eq!(d.max_panel_content_rows(), 36);
+}
+
+#[test]
+fn test_panel_chrome_full_tui_chrome() {
+    // All chrome on: menu, qf(6), dbg, wm, tab bar, global status+cmd (2),
+    // separated status, panel internal chrome (2).
+    let d = super::PanelChromeDesc {
+        viewport_rows: 50,
+        menu_rows: 1,
+        quickfix_rows: 6,
+        debug_toolbar_rows: 1,
+        wildmenu_rows: 1,
+        tab_bar_rows: 1,
+        separated_status_rows: 1,
+        status_cmd_rows: 2,
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    };
+    // 50 - (1+6+1+1+1+1+2+2) = 50 - 15 = 35
+    assert_eq!(d.max_panel_content_rows(), 35);
+}
+
+#[test]
+fn test_panel_chrome_clamps_to_min_content_rows() {
+    // Viewport too small; result should floor at min_content_rows.
+    let d = super::PanelChromeDesc {
+        viewport_rows: 3,
+        menu_rows: 0,
+        quickfix_rows: 0,
+        debug_toolbar_rows: 0,
+        wildmenu_rows: 0,
+        tab_bar_rows: 1,
+        separated_status_rows: 0,
+        status_cmd_rows: 2,
+        panel_chrome_rows: 2,
+        min_content_rows: 5,
+    };
+    // 3 - 5 = underflow → saturating_sub gives 0 → max(5) = 5
+    assert_eq!(d.max_panel_content_rows(), 5);
+}
+
+#[test]
+fn test_panel_chrome_zero_min_content_clamps_to_one() {
+    let d = super::PanelChromeDesc {
+        viewport_rows: 2,
+        panel_chrome_rows: 2,
+        status_cmd_rows: 2,
+        min_content_rows: 0,
+        ..Default::default()
+    };
+    // 2 - 4 underflows → 0, then max(min_content_rows.max(1)) = 1
+    assert_eq!(d.max_panel_content_rows(), 1);
+}
+
+#[test]
+fn test_panel_chrome_default_is_zero_plus_floor_one() {
+    let d = super::PanelChromeDesc::default();
+    // Everything zero → saturating_sub gives 0 → .max(min_content_rows.max(1)) = 1
+    assert_eq!(d.max_panel_content_rows(), 1);
 }
 
 // ── Notification system tests ───────────────────────────────────────────
@@ -26203,6 +27139,85 @@ fn test_tab_bar_handle_click_close_dirty_tab_returns_true() {
     assert_eq!(engine.active_group().tabs.len(), 2);
 }
 
+// --- Explorer reveal on tab switch (#232) ---
+
+fn explorer_selected_file(engine: &Engine) -> Option<std::path::PathBuf> {
+    let tree = engine.explorer_tree.borrow();
+    let path = tree.selected_path()?;
+    let idx = path[0] as usize;
+    engine.explorer_rows.get(idx).map(|r| r.path.clone())
+}
+
+#[test]
+fn test_goto_tab_reveals_file_in_explorer() {
+    let dir = std::env::temp_dir().join("vimcode_test_goto_tab_reveal");
+    let sub = dir.join("subdir");
+    let _ = std::fs::create_dir_all(&sub);
+    let file_a = dir.join("a.txt");
+    let file_b = sub.join("b.txt");
+    std::fs::write(&file_a, "aaa").unwrap();
+    std::fs::write(&file_b, "bbb").unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.explorer_rebuild_rows();
+
+    engine.open_file_in_tab(&file_a);
+    engine.open_file_in_tab(&file_b);
+    assert_eq!(engine.active_group().active_tab, 2);
+
+    engine.goto_tab(1);
+    assert_eq!(explorer_selected_file(&engine), Some(file_a.clone()));
+
+    engine.goto_tab(2);
+    assert!(engine.explorer_expanded.contains(&sub));
+    assert_eq!(explorer_selected_file(&engine), Some(file_b.clone()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_handle_tab_bar_click_reveals_file_in_explorer() {
+    let dir = std::env::temp_dir().join("vimcode_test_tab_bar_click_reveal");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_a = dir.join("a.txt");
+    let file_b = dir.join("b.txt");
+    std::fs::write(&file_a, "aaa").unwrap();
+    std::fs::write(&file_b, "bbb").unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.explorer_rebuild_rows();
+
+    engine.open_file_in_tab(&file_a);
+    engine.open_file_in_tab(&file_b);
+
+    let group_id = engine.active_group;
+    engine.handle_tab_bar_click(group_id, TabBarClickTarget::Tab(1));
+    assert_eq!(explorer_selected_file(&engine), Some(file_a.clone()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_open_file_in_tab_reveals_file_in_explorer() {
+    let dir = std::env::temp_dir().join("vimcode_test_open_file_reveal");
+    let sub = dir.join("deep");
+    let _ = std::fs::create_dir_all(&sub);
+    let file = sub.join("nested.txt");
+    std::fs::write(&file, "content").unwrap();
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    engine.explorer_rebuild_rows();
+
+    engine.open_file_in_tab(&file);
+    assert!(engine.explorer_expanded.contains(&sub));
+    assert_eq!(explorer_selected_file(&engine), Some(file.clone()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // --- Ctrl-]: tag jump (LSP go-to-definition) ---
 
 #[test]
@@ -26394,4 +27409,108 @@ fn test_dialog_click_button() {
         resolve_dialog_click(&buttons, &layout, 30, 12, &fmt),
         DialogClickResult::InsideDialog
     );
+}
+
+// ─── Bare-URL hover link tests ────────────────────────────────────────────────
+
+#[test]
+fn test_bare_url_detected_as_link_url_span() {
+    // A plain paragraph containing a bare https URL should produce a LinkUrl span
+    // whose byte range extracts to the exact URL text.
+    let r = crate::core::markdown::render_markdown("See https://example.com for details.");
+    let url_texts: Vec<String> = r
+        .spans
+        .iter()
+        .enumerate()
+        .flat_map(|(li, line_spans)| {
+            line_spans
+                .iter()
+                .filter(|s| s.style == crate::core::markdown::MdStyle::LinkUrl)
+                .map(move |s| (li, s.start_byte, s.end_byte))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(li, start, end)| r.lines.get(li).map(|line| line[start..end].to_string()))
+        .collect();
+    assert!(
+        url_texts.contains(&"https://example.com".to_string()),
+        "expected LinkUrl span for bare URL, got: {:?}",
+        url_texts
+    );
+}
+
+#[test]
+fn test_bare_url_trailing_punctuation_stripped() {
+    // Trailing periods, commas, and closing parentheses must be stripped.
+    let r = crate::core::markdown::render_markdown(
+        "Visit https://example.com. Also https://other.org, and (https://third.io).",
+    );
+    // Collect (line_idx, start, end) for all LinkUrl spans, then extract text.
+    let url_texts: Vec<String> = r
+        .spans
+        .iter()
+        .enumerate()
+        .flat_map(|(li, line_spans)| {
+            line_spans
+                .iter()
+                .filter(|s| s.style == crate::core::markdown::MdStyle::LinkUrl)
+                .map(move |s| (li, s.start_byte, s.end_byte))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(li, start, end)| r.lines.get(li).map(|line| line[start..end].to_string()))
+        .collect();
+    assert!(
+        url_texts.contains(&"https://example.com".to_string()),
+        "trailing period not stripped; got: {:?}",
+        url_texts
+    );
+    assert!(
+        url_texts.contains(&"https://other.org".to_string()),
+        "trailing comma not stripped; got: {:?}",
+        url_texts
+    );
+    assert!(
+        url_texts.contains(&"https://third.io".to_string()),
+        "trailing paren+period not stripped; got: {:?}",
+        url_texts
+    );
+}
+
+#[test]
+fn test_bare_url_registers_click_region() {
+    // A hover popup with a bare URL should produce a clickable link entry.
+    let mut e = engine_with_text("hello\n");
+    e.show_panel_hover("ext_panel", "i", 0, "See https://rust-lang.org for more.");
+    let ph = e.panel_hover.as_ref().unwrap();
+    let found = ph
+        .links
+        .iter()
+        .any(|(_, _, _, url)| url == "https://rust-lang.org");
+    assert!(
+        found,
+        "expected click region for bare URL, links: {:?}",
+        ph.links
+    );
+}
+
+#[test]
+fn test_existing_markdown_link_behavior_unchanged() {
+    // Standard [label](url) markdown links must still produce a click region on
+    // the label span AND the URL display span (now both are clickable).
+    let mut e = engine_with_text("hello\n");
+    e.show_panel_hover("ext_panel", "i", 0, "[click here](https://example.com)");
+    let ph = e.panel_hover.as_ref().unwrap();
+    // At minimum the label-based click region must exist.
+    let label_click = ph
+        .links
+        .iter()
+        .any(|(_, _, _, url)| url == "https://example.com");
+    assert!(
+        label_click,
+        "expected click region for markdown link label, links: {:?}",
+        ph.links
+    );
+    // All registered URLs must pass is_safe_url.
+    for link in &ph.links {
+        assert!(is_safe_url(&link.3), "unsafe URL in links: {}", link.3);
+    }
 }

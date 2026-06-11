@@ -14,11 +14,10 @@
 
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;
-use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, SearchDirection};
+use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
-pub use crate::core::settings::{SettingDef, SettingType, SETTING_DEFS};
 use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection};
@@ -428,6 +427,8 @@ pub struct GroupTabBar {
         crate::core::engine::TabBarHitRegion,
         crate::core::engine::TabBarClickTarget,
     )>,
+    /// Pre-built quadraui `TabBar` primitive — backends draw this directly.
+    pub bar: quadraui::TabBar,
 }
 
 // ── Tab bar hit region constants (char-cell units) ──────────────────────────
@@ -451,6 +452,14 @@ const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
 /// `[tab0][tab1]...[tabN]  [diff_toolbar?] [split_btns?] [action_btn]`
 ///
 /// All positions are in char-cell columns relative to the tab bar left edge.
+///
+/// Per D6: layout math lives in `quadraui::TabBar::layout()`. This
+/// function builds the TabBar primitive, asks it for a layout, and
+/// converts the layout's `hit_regions` into the engine's legacy
+/// `(TabBarHitRegion, TabBarClickTarget)` shape. Until TUI / GTK /
+/// Win-GUI migrate to consume `TabBarLayout` directly, this shim
+/// is the bridge — but the layout math itself has only one
+/// source of truth now.
 pub fn compute_tab_bar_hit_regions(
     tabs: &[TabInfo],
     tab_scroll_offset: usize,
@@ -464,102 +473,83 @@ pub fn compute_tab_bar_hit_regions(
 )> {
     use crate::core::engine::{TabBarClickTarget, TabBarHitRegion};
 
-    let mut regions = Vec::new();
-
-    // ── Right-side buttons (from right edge inward) ─────────────
-
-    // Action menu button at far right
-    let action_start = bar_width.saturating_sub(TAB_ACTION_BTN_COLS);
-    regions.push((
-        TabBarHitRegion {
-            col: action_start,
-            width: TAB_ACTION_BTN_COLS,
-        },
-        TabBarClickTarget::ActionMenu,
-    ));
-
-    // Split buttons (left of action menu)
-    let split_cols = if has_split_buttons {
-        TAB_SPLIT_BOTH_COLS
+    // Synthesise a DiffToolbarData shaped to match diff_label_cols so
+    // build_tab_bar_primitive emits the right segments. The primitive's
+    // diff segments are fixed 3-cell widths each, so we just need a
+    // label whose .chars().count() + 1 (for the leading space) equals
+    // diff_label_cols.
+    let synth_diff = if has_diff_toolbar {
+        let label = if diff_label_cols > 1 {
+            // Space padding so the resulting segment width matches.
+            Some(" ".repeat((diff_label_cols - 1) as usize))
+        } else {
+            None
+        };
+        Some(DiffToolbarData {
+            change_label: label,
+            total_changes: 1,
+            unchanged_hidden: false,
+        })
     } else {
-        0
+        None
     };
-    let split_end = action_start;
-    let split_start = split_end.saturating_sub(split_cols);
-    if has_split_buttons {
-        regions.push((
-            TabBarHitRegion {
-                col: split_start,
-                width: TAB_SPLIT_BTN_COLS,
-            },
-            TabBarClickTarget::SplitRight,
-        ));
-        regions.push((
-            TabBarHitRegion {
-                col: split_start + TAB_SPLIT_BTN_COLS,
-                width: TAB_SPLIT_BTN_COLS,
-            },
-            TabBarClickTarget::SplitDown,
-        ));
-    }
 
-    // Diff toolbar (left of split buttons)
-    if has_diff_toolbar {
-        let diff_total = DIFF_TOOLBAR_BTN_COLS + diff_label_cols;
-        let diff_end = split_start;
-        let diff_start = diff_end.saturating_sub(diff_total);
-        let btn_start = diff_start + diff_label_cols;
-        regions.push((
-            TabBarHitRegion {
-                col: btn_start,
-                width: DIFF_BTN_COLS,
-            },
-            TabBarClickTarget::DiffPrev,
-        ));
-        regions.push((
-            TabBarHitRegion {
-                col: btn_start + DIFF_BTN_COLS,
-                width: DIFF_BTN_COLS,
-            },
-            TabBarClickTarget::DiffNext,
-        ));
-        regions.push((
-            TabBarHitRegion {
-                col: btn_start + DIFF_BTN_COLS * 2,
-                width: DIFF_BTN_COLS,
-            },
-            TabBarClickTarget::DiffToggle,
-        ));
-    }
+    let primitive = build_tab_bar_primitive(
+        tabs,
+        has_split_buttons,
+        synth_diff.as_ref(),
+        tab_scroll_offset,
+        None,
+    );
 
-    // ── Tab slots (from left edge) ─────────────────────────────
+    // Per-tab width: name chars + TAB_CLOSE_COLS for the close-and-sep glyph.
+    // Close hit region is the trailing 2 cells (matches legacy behaviour:
+    // clicks on × or the trailing separator count as close).
+    let tab_widths: Vec<usize> = tabs
+        .iter()
+        .map(|t| t.name.chars().count() + TAB_CLOSE_COLS as usize)
+        .collect();
 
-    let mut x: u16 = 0;
-    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
-        let name_width = tab.name.chars().count() as u16;
-        let tab_width = name_width + TAB_CLOSE_COLS;
-        if x + tab_width > bar_width {
-            break; // Overflow — remaining tabs are hidden
+    let layout = primitive.layout(
+        bar_width as f32,
+        1.0,
+        0.0, // scroll arrows disabled — matches existing TUI behaviour
+        |i| quadraui::TabMeasure::new(tab_widths[i] as f32, TAB_CLOSE_COLS as f32),
+        |i| {
+            // TabBarSegment.width_cells is pre-computed by build_tab_bar_primitive
+            // in legacy char-cell units, which is exactly what we want here.
+            quadraui::SegmentMeasure::new(primitive.right_segments[i].width_cells as f32)
+        },
+    );
+
+    // Convert layout hit regions → legacy (TabBarHitRegion, TabBarClickTarget).
+    // Order preserved from the layout: close regions before tab bodies,
+    // and segments (which are disjoint from tab regions) appended at the end.
+    let mut regions = Vec::new();
+    for (rect, hit) in &layout.hit_regions {
+        let col = rect.x.round() as u16;
+        let width = rect.width.round() as u16;
+        let target = match hit {
+            quadraui::TabBarHit::Tab(i) => Some(TabBarClickTarget::Tab(*i)),
+            quadraui::TabBarHit::TabClose(i) => Some(TabBarClickTarget::CloseTab(*i)),
+            quadraui::TabBarHit::RightSegment(id) => match id.as_str() {
+                "tab:split_right" => Some(TabBarClickTarget::SplitRight),
+                "tab:split_down" => Some(TabBarClickTarget::SplitDown),
+                "tab:diff_prev" => Some(TabBarClickTarget::DiffPrev),
+                "tab:diff_next" => Some(TabBarClickTarget::DiffNext),
+                "tab:diff_toggle" => Some(TabBarClickTarget::DiffToggle),
+                "tab:action_menu" => Some(TabBarClickTarget::ActionMenu),
+                _ => None,
+            },
+            // Scroll arrows / Empty don't exist in the legacy enum — skipped.
+            quadraui::TabBarHit::ScrollLeft
+            | quadraui::TabBarHit::ScrollRight
+            | quadraui::TabBarHit::Empty => None,
+        };
+        if let Some(t) = target {
+            regions.push((TabBarHitRegion { col, width }, t));
         }
-        // Tab body (click to switch)
-        regions.push((
-            TabBarHitRegion {
-                col: x,
-                width: name_width,
-            },
-            TabBarClickTarget::Tab(i),
-        ));
-        // Close button
-        regions.push((
-            TabBarHitRegion {
-                col: x + name_width,
-                width: TAB_CLOSE_COLS,
-            },
-            TabBarClickTarget::CloseTab(i),
-        ));
-        x += tab_width;
     }
-
     regions
 }
 
@@ -596,11 +586,137 @@ pub struct BreadcrumbSegment {
 }
 
 /// Breadcrumb bar data for one editor group.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BreadcrumbBar {
     pub group_id: GroupId,
     pub segments: Vec<BreadcrumbSegment>,
     pub bounds: WindowRect,
+    /// Pre-built quadraui `StatusBar` primitive — backends draw this directly.
+    pub bar: quadraui::StatusBar,
+    /// Cached layout from `Backend::draw_status_bar` — set at draw time,
+    /// read by `resolve_breadcrumb_click` at click time.
+    pub draw_layout: std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
+}
+
+/// Convert a slice of `BreadcrumbSegment` plus the focus state into a
+/// `quadraui::StatusBar` whose left segments alternate clickable
+/// labels with non-clickable `" › "` separators. The leading 1-cell
+/// pad matches the legacy renderer.
+///
+/// Each clickable label segment carries `action_id = "bc:N"` where N
+/// is the engine-side segment index — paired with
+/// [`breadcrumb_action_index`] for click resolution. The last segment
+/// uses `breadcrumb_active_fg`; other segments use `breadcrumb_fg`.
+/// When `focus_active && i == focus_selected`, the focused segment
+/// inverts (bg = `breadcrumb_active_fg`, fg = `breadcrumb_bg`) — same
+/// visual as the legacy renderer.
+pub fn breadcrumbs_to_quadraui_status_bar(
+    segments: &[BreadcrumbSegment],
+    theme: &Theme,
+    focus_active: bool,
+    focus_selected: usize,
+) -> quadraui::StatusBar {
+    let bg = to_quadraui_color(theme.breadcrumb_bg);
+    let normal_fg = to_quadraui_color(theme.breadcrumb_fg);
+    let active_fg = to_quadraui_color(theme.breadcrumb_active_fg);
+
+    let mut left: Vec<quadraui::StatusBarSegment> = Vec::new();
+
+    // 1-cell leading pad so the first label doesn't touch the left edge.
+    left.push(quadraui::StatusBarSegment {
+        text: " ".to_string(),
+        fg: normal_fg,
+        bg,
+        bold: false,
+        action_id: None,
+    });
+
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            left.push(quadraui::StatusBarSegment {
+                text: " \u{203A} ".to_string(),
+                fg: normal_fg,
+                bg,
+                bold: false,
+                action_id: None,
+            });
+        }
+        let is_focused = focus_active && i == focus_selected;
+        let (fg, seg_bg) = if is_focused {
+            (bg, active_fg)
+        } else if seg.is_last {
+            (active_fg, bg)
+        } else {
+            (normal_fg, bg)
+        };
+        left.push(quadraui::StatusBarSegment {
+            text: seg.label.clone(),
+            fg,
+            bg: seg_bg,
+            bold: false,
+            action_id: Some(quadraui::WidgetId::new(format!("bc:{i}"))),
+        });
+    }
+
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("breadcrumbs"),
+        left_segments: left,
+        right_segments: Vec::new(),
+    }
+}
+
+/// Resolve a `WidgetId` produced by `breadcrumbs_to_quadraui_status_bar`
+/// back to a `BreadcrumbSegment` index. Returns `None` if the id
+/// doesn't match the `bc:N` pattern.
+pub fn breadcrumb_action_index(id: &quadraui::WidgetId) -> Option<usize> {
+    id.as_str().strip_prefix("bc:")?.parse().ok()
+}
+
+/// Result of resolving a breadcrumb click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreadcrumbClickResult {
+    /// A clickable segment was hit — carries the segment index.
+    Hit(usize),
+    /// Click landed on a breadcrumb bar but not on a segment.
+    OnBar,
+    /// Click was not on any breadcrumb bar.
+    Miss,
+}
+
+/// Resolve a breadcrumb click at `(x, y)` across all editor groups.
+///
+/// Iterates each group's `BreadcrumbBar`, checks bounds, then delegates to
+/// the cached `StatusBarLayout::hit_test()` for segment resolution.
+///
+/// Both backends call this — zero per-backend breadcrumb click code.
+pub fn resolve_breadcrumb_click(
+    breadcrumbs: &[BreadcrumbBar],
+    x: f64,
+    y: f64,
+    line_height: f64,
+) -> BreadcrumbClickResult {
+    for bc in breadcrumbs {
+        if bc.segments.is_empty() {
+            continue;
+        }
+        let bx = bc.bounds.x;
+        let by = bc.bounds.y;
+        let bw = bc.bounds.width;
+        if y >= by && y < by + line_height && x >= bx && x < bx + bw {
+            let local_x = (x - bx) as f32;
+            let local_y = (y - by) as f32;
+            let guard = bc.draw_layout.borrow();
+            if let Some(ref layout) = *guard {
+                if let quadraui::StatusBarHit::Segment(ref id) = layout.hit_test(local_x, local_y) {
+                    if let Some(idx) = breadcrumb_action_index(id) {
+                        return BreadcrumbClickResult::Hit(idx);
+                    }
+                }
+            }
+            return BreadcrumbClickResult::OnBar;
+        }
+    }
+    BreadcrumbClickResult::Miss
 }
 
 /// Present when the editor area is split into two or more independent groups.
@@ -669,6 +785,11 @@ pub struct RenderedWindow {
     /// Width of the line-number gutter in *character cells* (0 = no gutter).
     /// GTK backend multiplies by `char_width` to get pixels.
     pub gutter_char_width: usize,
+    /// Exact number of text columns visible (rect width minus gutter minus
+    /// scrollbar, divided by char_width). Backends should feed this back
+    /// to `Engine::set_viewport_for_window` so `ensure_cursor_visible`
+    /// uses accurate geometry.
+    pub text_viewport_cols: usize,
     /// Whether this is the focused window.
     pub is_active: bool,
     /// Whether to render with the slightly-different active-window background
@@ -728,6 +849,50 @@ pub struct WildmenuData {
     pub selected: Option<usize>,
 }
 
+/// Convert wildmenu data to a quadraui `StatusBar` for shared rendering.
+pub fn wildmenu_to_status_bar(wm: &WildmenuData, theme: &Theme) -> quadraui::StatusBar {
+    let fg = quadraui::Color::rgb(
+        theme.wildmenu_fg.r,
+        theme.wildmenu_fg.g,
+        theme.wildmenu_fg.b,
+    );
+    let bg = quadraui::Color::rgb(
+        theme.wildmenu_bg.r,
+        theme.wildmenu_bg.g,
+        theme.wildmenu_bg.b,
+    );
+    let sel_fg = quadraui::Color::rgb(
+        theme.wildmenu_sel_fg.r,
+        theme.wildmenu_sel_fg.g,
+        theme.wildmenu_sel_fg.b,
+    );
+    let sel_bg = quadraui::Color::rgb(
+        theme.wildmenu_sel_bg.r,
+        theme.wildmenu_sel_bg.g,
+        theme.wildmenu_sel_bg.b,
+    );
+    let segments = wm
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let is_sel = wm.selected == Some(i);
+            quadraui::StatusBarSegment {
+                text: format!(" {} ", item),
+                fg: if is_sel { sel_fg } else { fg },
+                bg: if is_sel { sel_bg } else { bg },
+                bold: is_sel,
+                action_id: None,
+            }
+        })
+        .collect();
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("wildmenu"),
+        left_segments: segments,
+        right_segments: vec![],
+    }
+}
+
 // ─── CompletionMenu ────────────────────────────────────────────────────────────
 
 /// Data needed to render the word-completion popup in insert mode.
@@ -741,7 +906,80 @@ pub struct CompletionMenu {
     pub max_width: usize,
 }
 
+/// Convert a render-side `CompletionMenu` into a `quadraui::Completions`
+/// for backend rasterisation via the D6 layout pipeline.
+///
+/// vimcode's completion menu is string-only at this stage — no LSP
+/// `CompletionKind` metadata — so every item ships as
+/// `CompletionKind::Text`. A richer adapter lands when LSP
+/// `CompletionItemKind` threads through the engine.
+pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadraui::Completions {
+    let items = menu
+        .candidates
+        .iter()
+        .map(|c| quadraui::CompletionItem {
+            label: quadraui::StyledText::plain(c.clone()),
+            detail: None,
+            documentation: None,
+            kind: quadraui::CompletionKind::Text,
+            icon: None,
+        })
+        .collect();
+    quadraui::Completions {
+        id: quadraui::WidgetId::new("completions"),
+        items,
+        selected_idx: menu.selected_idx,
+        scroll_offset: 0,
+        has_focus: true,
+    }
+}
+
 // ─── HoverPopup ──────────────────────────────────────────────────────────────
+
+/// Convert an engine `HoverPopup` + on-screen anchor cell into a fully
+/// resolved `quadraui::Tooltip` and its `TooltipLayout`.
+///
+/// `anchor_x` / `anchor_y` are the screen cell at the requested symbol
+/// (cursor position, already resolved for scroll + gutter). The popup's
+/// width is sized to the longest text line + 4 cells of padding /
+/// border, and the height is the line count clamped to 20.
+///
+/// Placement is `Top` with fallback `Bottom` via the Tooltip primitive's
+/// own viewport-fit logic. The anchor rectangle is given
+/// `width = popup_width` so the primitive's horizontal-centering math
+/// aligns the popup's left edge with the cursor cell (as the legacy
+/// hover popup did). `margin=0` matches the legacy 0-cell gap above /
+/// 0-cell gap below the cursor line.
+pub fn hover_popup_to_quadraui_tooltip(
+    hover: &HoverPopup,
+    anchor_x: u16,
+    anchor_y: u16,
+    viewport: quadraui::Rect,
+) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
+    let text_lines: Vec<&str> = hover.text.lines().take(20).collect();
+    let num_lines = text_lines.len().max(1) as f32;
+    let max_len = text_lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(10);
+    // +4: 1 left border + 1 left pad + 1 right pad + 1 right border.
+    let width = ((max_len + 4) as f32).max(12.0);
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp_hover"),
+        text: hover.text.clone(),
+        styled_lines: None,
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
+    };
+    // anchor.width = popup width so the primitive's center-on-anchor x
+    // math collapses to left-align with the cursor cell.
+    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
+    let measure = quadraui::TooltipMeasure::new(width, num_lines);
+    let layout = tooltip.layout(anchor, viewport, measure, 0.0);
+    (tooltip, layout)
+}
 
 /// Data needed to render the LSP hover popup.
 #[derive(Debug, Clone)]
@@ -780,6 +1018,197 @@ pub struct EditorHoverPopupData {
     pub selection: Option<(usize, usize, usize, usize)>,
 }
 
+/// Maximum number of editor hover popup rows shown at once. Both the
+/// TUI and GTK rasterisers obey this cap (longer content scrolls).
+pub const EDITOR_HOVER_MAX_ROWS: usize = 20;
+
+/// Geometry + drag-math inputs for a popup's scrollbar, captured by
+/// the renderer so click/drag handlers don't have to recompute the
+/// layout. Used by both backends for #215. Native units: cells (TUI)
+/// or pixels (GTK) — matches whatever `RichTextPopupLayout` was built
+/// with.
+#[derive(Debug, Clone, Copy)]
+pub struct PopupScrollbarHit {
+    pub track: quadraui::Rect,
+    pub thumb: quadraui::Rect,
+    /// Number of content rows fitting in the viewport.
+    pub visible_rows: usize,
+    /// Total number of content rows in the popup.
+    pub total: usize,
+}
+
+/// Convert an `EditorHoverPopupData` into a `quadraui::RichTextPopup`
+/// for the D6 layout pipeline. Markdown style spans + tree-sitter code
+/// highlights collapse into per-character `StyledSpan`s in
+/// `quadraui::StyledText`; selection, focus, scroll, and link state
+/// transfer 1:1.
+pub fn editor_hover_to_quadraui_rich_text(
+    eh: &EditorHoverPopupData,
+    theme: &Theme,
+) -> quadraui::RichTextPopup {
+    let mut q_lines: Vec<quadraui::StyledText> = Vec::with_capacity(eh.rendered.lines.len());
+    let mut line_scales: Vec<f32> = Vec::with_capacity(eh.rendered.lines.len());
+    for (line_idx, line_text) in eh.rendered.lines.iter().enumerate() {
+        let md_spans = eh.rendered.spans.get(line_idx);
+        let code_hl = eh.rendered.code_highlights.get(line_idx);
+        q_lines.push(hover_line_to_styled_text(
+            line_text,
+            md_spans.map(|v| v.as_slice()).unwrap_or(&[]),
+            code_hl.map(|v| v.as_slice()).unwrap_or(&[]),
+            theme,
+        ));
+        // Heading rows render at a larger font scale (matches the
+        // legacy `font_scale` on the render-side StyledSpan).
+        let heading_level = md_spans
+            .and_then(|spans| {
+                spans.iter().find_map(|s| match s.style {
+                    crate::core::markdown::MdStyle::Heading(n) => Some(n),
+                    _ => None,
+                })
+            })
+            .unwrap_or(0);
+        let scale = match heading_level {
+            1 => 1.4,
+            2 => 1.2,
+            3..=6 => 1.1,
+            _ => 1.0,
+        };
+        line_scales.push(scale);
+    }
+
+    let q_links: Vec<quadraui::RichTextLink> = eh
+        .links
+        .iter()
+        .map(|(line, s, e, url)| quadraui::RichTextLink {
+            line: *line,
+            start_byte: *s,
+            end_byte: *e,
+            url: url.clone(),
+        })
+        .collect();
+
+    let q_selection = eh
+        .selection
+        .map(|(sl, sc, el, ec)| quadraui::TextSelection {
+            start_line: sl,
+            start_col: sc,
+            end_line: el,
+            end_col: ec,
+        });
+
+    quadraui::RichTextPopup {
+        id: quadraui::WidgetId::new("editor_hover"),
+        lines: q_lines,
+        line_text: eh.rendered.lines.clone(),
+        line_scales,
+        scroll_top: eh.scroll_top,
+        max_visible_rows: EDITOR_HOVER_MAX_ROWS,
+        has_focus: eh.has_focus,
+        selection: q_selection,
+        links: q_links,
+        focused_link: eh.focused_link,
+        placement: quadraui::PopupPlacement::Above,
+        padding: 0.0,
+        fg: Some(to_quadraui_color(theme.hover_fg)),
+        bg: Some(to_quadraui_color(theme.hover_bg)),
+    }
+}
+
+/// Flatten one rendered hover line (text + markdown spans + tree-sitter
+/// code highlights) into a `quadraui::StyledText` whose spans correspond
+/// to contiguous runs sharing fg/bold/italic.
+fn hover_line_to_styled_text(
+    line_text: &str,
+    md_spans: &[crate::core::markdown::MdSpan],
+    code_highlights: &[crate::core::markdown::MdCodeHighlight],
+    theme: &Theme,
+) -> quadraui::StyledText {
+    use crate::core::markdown::MdStyle;
+    if line_text.is_empty() {
+        return quadraui::StyledText::default();
+    }
+
+    let default_fg = to_quadraui_color(theme.hover_fg);
+    let h1_fg = to_quadraui_color(theme.md_heading1);
+    let h2_fg = to_quadraui_color(theme.md_heading2);
+    let h3_fg = to_quadraui_color(theme.md_heading3);
+    let code_fg = to_quadraui_color(theme.md_code);
+    let link_fg = to_quadraui_color(theme.md_link);
+
+    // Style at byte position. Code highlights take priority on lines
+    // that have any (matching the TUI rasteriser's behaviour).
+    let style_at = |byte_pos: usize| -> (quadraui::Color, bool, bool) {
+        if !code_highlights.is_empty() {
+            for h in code_highlights {
+                if byte_pos >= h.start_byte && byte_pos < h.end_byte {
+                    return (to_quadraui_color(theme.scope_color(&h.scope)), false, false);
+                }
+            }
+            return (code_fg, false, false);
+        }
+        for span in md_spans {
+            if byte_pos >= span.start_byte && byte_pos < span.end_byte {
+                return match span.style {
+                    MdStyle::Heading(1) => (h1_fg, true, false),
+                    MdStyle::Heading(2) => (h2_fg, true, false),
+                    MdStyle::Heading(_) => (h3_fg, true, false),
+                    MdStyle::Bold => (default_fg, true, false),
+                    MdStyle::Italic => (default_fg, false, true),
+                    MdStyle::BoldItalic => (default_fg, true, true),
+                    MdStyle::Code | MdStyle::CodeBlock => (code_fg, false, false),
+                    MdStyle::Link | MdStyle::LinkUrl => (link_fg, false, false),
+                    MdStyle::BlockQuote => (h3_fg, false, true),
+                    MdStyle::ListBullet => (h1_fg, true, false),
+                    MdStyle::HorizontalRule | MdStyle::Image => (link_fg, false, true),
+                };
+            }
+        }
+        (default_fg, false, false)
+    };
+
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    let mut byte_pos: usize = 0;
+    let mut current_text = String::new();
+    let mut current_style: Option<(quadraui::Color, bool, bool)> = None;
+
+    for ch in line_text.chars() {
+        let s = style_at(byte_pos);
+        match current_style {
+            Some(prev) if prev == s => {
+                current_text.push(ch);
+            }
+            _ => {
+                if !current_text.is_empty() {
+                    let st = current_style.unwrap();
+                    spans.push(quadraui::StyledSpan {
+                        text: std::mem::take(&mut current_text),
+                        fg: Some(st.0),
+                        bg: None,
+                        bold: st.1,
+                        italic: st.2,
+                        underline: false,
+                    });
+                }
+                current_text.push(ch);
+                current_style = Some(s);
+            }
+        }
+        byte_pos += ch.len_utf8();
+    }
+    if !current_text.is_empty() {
+        let st = current_style.unwrap_or((default_fg, false, false));
+        spans.push(quadraui::StyledSpan {
+            text: current_text,
+            fg: Some(st.0),
+            bg: None,
+            bold: st.1,
+            italic: st.2,
+            underline: false,
+        });
+    }
+    quadraui::StyledText { spans }
+}
+
 // ─── SignatureHelp ────────────────────────────────────────────────────────────
 
 /// Data needed to render the signature help popup (shown above cursor in insert mode).
@@ -795,6 +1224,81 @@ pub struct SignatureHelp {
     pub anchor_line: usize,
     /// Buffer column of the opening `(`.
     pub anchor_col: usize,
+}
+
+/// Convert a `SignatureHelp` + on-screen anchor cell into a fully
+/// resolved `quadraui::Tooltip` and its `TooltipLayout`.
+///
+/// The label is rendered as a single-line styled tooltip: text before
+/// and after the active parameter use the theme hover-fg; the active
+/// parameter is highlighted in the theme keyword colour.
+///
+/// Placement is `Top` with fallback `Bottom`. The anchor rectangle is
+/// given `width = popup_width` so the primitive's horizontal-centering
+/// math aligns the popup's left edge with the cursor cell (matching
+/// legacy behavior).
+pub fn signature_help_to_quadraui_tooltip(
+    sig: &SignatureHelp,
+    anchor_x: u16,
+    anchor_y: u16,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
+    let label = &sig.label;
+    // Display adds a leading + trailing space inside the border, so
+    // `display_len` is `label_chars + 2`.
+    let label_chars = label.chars().count();
+    let display_len = label_chars + 2;
+    // +2 for the two side borders.
+    let width = ((display_len + 2) as f32).max(12.0);
+
+    // Build styled spans. The label's active parameter (if any) is
+    // highlighted in theme.keyword. Offsets in `sig.params` are byte
+    // offsets into `label` — convert to char-based splits.
+    let fg = to_q_color(theme.hover_fg);
+    let kw = to_q_color(theme.keyword);
+
+    let active_byte_range: Option<(usize, usize)> = sig
+        .active_param
+        .and_then(|idx| sig.params.get(idx).copied());
+
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    // Leading space inside the border.
+    spans.push(quadraui::StyledSpan::with_fg(" ", fg));
+    match active_byte_range {
+        Some((start, end)) if start < end && end <= label.len() => {
+            let pre = &label[..start];
+            let active = &label[start..end];
+            let post = &label[end..];
+            if !pre.is_empty() {
+                spans.push(quadraui::StyledSpan::with_fg(pre, fg));
+            }
+            spans.push(quadraui::StyledSpan::with_fg(active, kw));
+            if !post.is_empty() {
+                spans.push(quadraui::StyledSpan::with_fg(post, fg));
+            }
+        }
+        _ => {
+            spans.push(quadraui::StyledSpan::with_fg(label, fg));
+        }
+    }
+    // Trailing space inside the border.
+    spans.push(quadraui::StyledSpan::with_fg(" ", fg));
+
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp_signature_help"),
+        text: String::new(),
+        styled_lines: Some(vec![quadraui::StyledText { spans }]),
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
+    };
+    // anchor.width = popup width so centering math left-aligns popup
+    // with the cursor cell.
+    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
+    let measure = quadraui::TooltipMeasure::new(width, 1.0);
+    let layout = tooltip.layout(anchor, viewport, measure, 0.0);
+    (tooltip, layout)
 }
 
 // ─── PickerPanel (unified) ─────────────────────────────────────────────────
@@ -838,6 +1342,82 @@ pub struct PickerPanel {
     pub preview_scroll: usize,
 }
 
+// ─── PickerGeometry ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct PickerSizing {
+    pub min_w: (f32, f32),
+    pub min_h: (f32, f32),
+    pub left_pane_ratio: f32,
+    pub header_h: f32,
+    pub line_h: f32,
+}
+
+pub const TUI_PICKER_SIZING: PickerSizing = PickerSizing {
+    min_w: (55.0, 60.0),
+    min_h: (16.0, 18.0),
+    left_pane_ratio: 0.35,
+    header_h: 4.0,
+    line_h: 1.0,
+};
+
+pub fn gtk_picker_sizing(line_height: f32) -> PickerSizing {
+    PickerSizing {
+        min_w: (500.0, 600.0),
+        min_h: (350.0, 400.0),
+        left_pane_ratio: 0.40,
+        header_h: 2.0 * line_height + 2.0,
+        line_h: line_height,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PickerGeometry {
+    pub popup_x: f32,
+    pub popup_y: f32,
+    pub popup_w: f32,
+    pub popup_h: f32,
+    pub left_pane_w: f32,
+    pub visible_rows: usize,
+}
+
+impl PickerGeometry {
+    pub fn compute(
+        viewport_w: f32,
+        viewport_h: f32,
+        has_preview: bool,
+        sizing: &PickerSizing,
+    ) -> Self {
+        let popup_w = if has_preview {
+            (viewport_w * 0.8).max(sizing.min_w.1)
+        } else {
+            (viewport_w * 0.55).max(sizing.min_w.0)
+        };
+        let popup_h = if has_preview {
+            (viewport_h * 0.65).max(sizing.min_h.1)
+        } else {
+            (viewport_h * 0.60).max(sizing.min_h.0)
+        };
+        let popup_x = (viewport_w - popup_w) / 2.0;
+        let popup_y = (viewport_h - popup_h) / 2.0;
+        let left_pane_w = if has_preview {
+            popup_w * sizing.left_pane_ratio
+        } else {
+            0.0
+        };
+        let results_h = (popup_h - sizing.header_h).max(0.0);
+        let visible_rows = (results_h / sizing.line_h) as usize;
+        PickerGeometry {
+            popup_x,
+            popup_y,
+            popup_w,
+            popup_h,
+            left_pane_w,
+            visible_rows,
+        }
+    }
+}
+
 // ─── TabSwitcherPanel ─────────────────────────────────────────────────────
 
 /// Data needed to render the tab switcher popup (Ctrl+Tab MRU list).
@@ -847,6 +1427,62 @@ pub struct TabSwitcherPanel {
     pub items: Vec<(String, String, bool)>,
     /// Index of the currently highlighted item.
     pub selected_idx: usize,
+}
+
+/// Convert a `TabSwitcherPanel` into a bordered `quadraui::ListView`.
+///
+/// Each item carries the filename (with a trailing `●` when dirty)
+/// and uses the full path as the right-aligned `detail`. The list is
+/// bordered with the title `" Open Tabs "` overlayed on the top
+/// border. `scroll_offset` is set so the selected item is always
+/// visible inside `max_visible` rows.
+pub fn tab_switcher_to_quadraui_list_view(
+    ts: &TabSwitcherPanel,
+    max_visible: usize,
+) -> quadraui::ListView {
+    use quadraui::{ListItem, ListView, StyledText, WidgetId};
+
+    let items: Vec<ListItem> = ts
+        .items
+        .iter()
+        .map(|(name, path, dirty)| {
+            let label = if *dirty {
+                format!("{} ●", name)
+            } else {
+                name.clone()
+            };
+            ListItem {
+                text: StyledText::plain(label),
+                icon: None,
+                detail: if path.is_empty() {
+                    None
+                } else {
+                    Some(StyledText::plain(path.clone()))
+                },
+                decoration: quadraui::Decoration::Normal,
+            }
+        })
+        .collect();
+
+    // Scroll so the selected item is on screen. Window is `max_visible`
+    // items tall; scroll forward by enough to keep selected_idx in view.
+    let scroll_offset = if ts.selected_idx >= max_visible {
+        ts.selected_idx + 1 - max_visible
+    } else {
+        0
+    };
+
+    ListView {
+        id: WidgetId::new("tab_switcher"),
+        title: Some(StyledText::plain("Open Tabs")),
+        items,
+        selected_idx: ts.selected_idx,
+        scroll_offset,
+        has_focus: true,
+        bordered: true,
+        h_scroll: 0,
+        max_content_width: None,
+    }
 }
 
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
@@ -864,14 +1500,13 @@ pub struct QuickfixPanel {
     pub has_focus: bool,
 }
 
-/// A single item rendered in the debug sidebar.
+/// A single item rendered in the debug sidebar. Used by win-gui;
+/// TUI/GTK use `SidebarSystem` with `TreeRow` directly via
+/// `populate_dap_sidebar_system()`.
 #[derive(Debug, Clone)]
 pub struct DebugSidebarItem {
-    /// Pre-formatted display text.
     pub text: String,
-    /// Indentation level (0 = top-level, 1 = one indent, …).
     pub indent: u8,
-    /// Whether this item is currently selected (cursor highlight).
     pub is_selected: bool,
 }
 
@@ -941,6 +1576,10 @@ pub struct SourceControlData {
     pub branch_picker: Option<BranchPickerData>,
     /// SC help dialog visible.
     pub help_open: bool,
+    /// Y coordinate (in native units) where the sections area begins —
+    /// the top of `SidebarPanelLayout.content_bounds` from the last paint
+    /// (#509). TUI: terminal rows. GTK: pixels. `None` until first paint.
+    pub sc_sections_start_y: Option<f32>,
 }
 
 /// Data for the branch picker / create popup in the SC panel.
@@ -994,6 +1633,9 @@ pub struct ExtSidebarData {
     pub input_active: bool,
     /// True while a background registry fetch is in-flight.
     pub fetching: bool,
+    /// Vertical scroll offset of the panel content in main-axis units
+    /// (cells / pixels). Drives `MultiSectionView::panel_scroll` (#293).
+    pub panel_scroll: f32,
 }
 
 // ─── ExtPanelData (extension-provided sidebar panels) ────────────────────────
@@ -1073,33 +1715,19 @@ pub struct AiPanelData {
 /// Always present in `ScreenLayout`; each section may be empty.
 #[derive(Debug, Clone)]
 pub struct DebugSidebarData {
-    /// True when a DAP session is active.
     pub session_active: bool,
-    /// True when the debuggee is paused (breakpoint hit, step completed, etc.).
     pub stopped: bool,
-    /// Variables section items (flat tree with ▶/▼ prefixes).
     pub variables: Vec<DebugSidebarItem>,
-    /// Watch section items (expression = value).
     pub watch: Vec<DebugSidebarItem>,
-    /// Call Stack section items.
     pub frames: Vec<DebugSidebarItem>,
-    /// Breakpoints section items (always populated from dap_breakpoints).
     pub breakpoints: Vec<DebugSidebarItem>,
-    /// Which section is currently focused.
     pub active_section: DebugSidebarSection,
-    /// Selected item index within the active section.
     pub sidebar_selected: usize,
-    /// Whether the debug sidebar panel has keyboard focus.
     pub has_focus: bool,
-    /// Name of the selected launch configuration, or `None` if no configs loaded.
     pub launch_config_name: Option<String>,
-    /// Debug output lines for the Debug Output bottom tab.
     pub debug_output_lines: Vec<String>,
-    /// Most-recent expression evaluation result, or `None`.
     pub eval_result: Option<String>,
-    /// Per-section scroll offset (items to skip from top) for [Variables, Watch, CallStack, Breakpoints].
     pub scroll_offsets: [usize; 4],
-    /// Per-section allocated content heights in rows (excluding section header).
     pub section_heights: [u16; 4],
 }
 
@@ -1179,6 +1807,100 @@ pub struct TerminalPanel {
     pub split_left_cols: u16,
     /// Which pane has keyboard focus in split view: 0 = left, 1 = right.
     pub split_focus: u8,
+    /// Whether the panel is currently maximized (fills editor area).
+    /// Backends can render a different icon glyph based on this.
+    pub maximized: bool,
+}
+
+/// Terminal scrollbar thumb position as fractions of track height.
+/// Both backends use this for painting and `SurfaceScrollbar` registration.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalScrollbarGeom {
+    pub thumb_top_frac: f64,
+    pub thumb_height_frac: f64,
+    pub total_items: usize,
+    pub visible_items: usize,
+}
+
+/// Returns `None` when there's no scrollback (thumb fills entire track).
+pub fn terminal_scrollbar_geometry(
+    panel: &TerminalPanel,
+    visible_rows: usize,
+) -> Option<TerminalScrollbarGeom> {
+    if panel.scrollback_rows == 0 {
+        return None;
+    }
+    let total = panel.scrollback_rows + visible_rows;
+    let thumb_frac = (visible_rows as f64 / total as f64).max(0.01);
+    let max_off = panel.scrollback_rows as f64;
+    let frac = if panel.scroll_offset == 0 {
+        1.0
+    } else {
+        1.0 - (panel.scroll_offset as f64 / max_off).min(1.0)
+    };
+    let thumb_top_frac = frac * (1.0 - thumb_frac);
+    Some(TerminalScrollbarGeom {
+        thumb_top_frac,
+        thumb_height_frac: thumb_frac,
+        total_items: total,
+        visible_items: visible_rows,
+    })
+}
+
+/// Pre-built terminal primitives ready for `Backend::draw_terminal`.
+/// Both backends call `build_terminal_draw_data` and then just do the
+/// backend-specific drawing (clear background, enter frame scope, divider).
+pub struct TerminalDrawData {
+    pub single: Option<quadraui::Terminal>,
+    pub left: Option<quadraui::Terminal>,
+    pub right: Option<quadraui::Terminal>,
+    pub split: Option<quadraui::TerminalSplitLayout>,
+}
+
+pub fn build_terminal_draw_data(
+    panel: &TerminalPanel,
+    area: quadraui::Rect,
+    cell_width: f32,
+    cell_height: f32,
+    visible_rows: usize,
+    sb_width: Option<u16>,
+) -> TerminalDrawData {
+    let sb = Some(quadraui::TerminalScrollbar {
+        total_lines: panel.scrollback_rows + visible_rows,
+        visible_lines: visible_rows,
+        scroll_offset: panel.scroll_offset,
+        inverted: true,
+        width: sb_width,
+    });
+    if let Some(ref left_rows) = panel.split_left_rows {
+        let sb_px = sb_width.unwrap_or(0) as f32;
+        let split = quadraui::TerminalSplitLayout::new(
+            area,
+            panel.split_left_cols as usize,
+            cell_width,
+            cell_height,
+            sb_px,
+        );
+        let left =
+            terminal_cells_to_quadraui(left_rows, quadraui::WidgetId::new("terminal:left"), None);
+        let right =
+            terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:right"), sb);
+        TerminalDrawData {
+            single: None,
+            left: Some(left),
+            right: Some(right),
+            split: Some(split),
+        }
+    } else {
+        let term =
+            terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:pane"), sb);
+        TerminalDrawData {
+            single: Some(term),
+            left: None,
+            right: None,
+            split: None,
+        }
+    }
 }
 
 // ─── Menu bar / debug toolbar ─────────────────────────────────────────────────
@@ -1200,30 +1922,6 @@ pub struct MenuItemData {
     pub enabled: bool,
     /// If true, render as a horizontal divider line instead of a regular item.
     pub separator: bool,
-}
-
-/// Data for the visible menu bar strip and optional open dropdown.
-#[derive(Debug)]
-pub struct MenuBarData {
-    /// Index (into `MENU_STRUCTURE`) of the currently open dropdown, or `None`.
-    pub open_menu_idx: Option<usize>,
-    /// Items in the currently open submenu (empty when no dropdown open).
-    pub open_items: Vec<MenuItemData>,
-    /// Approximate terminal column where the open menu header starts (for TUI anchor).
-    pub open_menu_col: u16,
-    /// Index into `open_items` of the keyboard-highlighted row, or `None`.
-    pub highlighted_item_idx: Option<usize>,
-    /// Title string shown to the right of menu labels (e.g. "VimCode — engine.rs").
-    pub title: String,
-    /// When true the backend should render its own window control buttons (─ ☐ ✕).
-    /// Set to true by the GTK backend which uses `set_decorated(false)`.
-    pub show_window_controls: bool,
-    /// When true, use `vscode_shortcut` instead of `shortcut` for menu items.
-    pub is_vscode_mode: bool,
-    /// Whether the back navigation arrow is enabled (history available).
-    pub nav_back_enabled: bool,
-    /// Whether the forward navigation arrow is enabled (history available).
-    pub nav_forward_enabled: bool,
 }
 
 /// One button in the debug toolbar strip.
@@ -1248,6 +1946,211 @@ pub struct DebugToolbarData {
     pub buttons: Vec<DebugButton>,
     /// True when a DAP session is active; drives future enabled/greyed-out state.
     pub session_active: bool,
+}
+
+/// Build the debug action-button toolbar as a `quadraui::Toolbar` (#510).
+/// Button ids come from [`crate::core::engine::DEBUG_BUTTON_IDS`] so
+/// click dispatch can map the hit-test result back to a button index and
+/// action string. A `ToolbarButton::Separator` is inserted between the
+/// Restart (index 3) and Step Over (index 4) buttons.
+///
+/// `enabled` state follows the per-button DAP rules:
+/// - Continue / Step Over / Step Into / Step Out: `dap_session_active && dap_stopped_thread.is_some()`
+/// - Pause: `dap_session_active && dap_stopped_thread.is_none()`
+/// - Stop / Restart: `dap_session_active`
+///
+/// Both backends call this and hand the result to `Backend::draw_toolbar`.
+pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
+    use crate::core::engine::DEBUG_BUTTON_IDS;
+    use crate::icons;
+    use quadraui::{Toolbar, ToolbarButton, WidgetId};
+
+    let session = engine.dap_session_active;
+    let stopped = engine.dap_stopped_thread.is_some();
+
+    let action = |idx: usize, label: &str, icon: &str, key_hint: Option<&str>, enabled: bool| {
+        ToolbarButton::Action {
+            id: WidgetId::new(DEBUG_BUTTON_IDS[idx]),
+            label: label.to_string(),
+            icon: Some(icon.to_string()),
+            key_hint: key_hint.map(|s| s.to_string()),
+            enabled,
+            is_active: false,
+            tooltip: String::new(),
+        }
+    };
+
+    Toolbar {
+        id: WidgetId::new("debug:toolbar"),
+        bg: None,
+        buttons: vec![
+            // 0: Continue — enabled when session active and stopped
+            action(
+                0,
+                "Continue",
+                icons::DBG_CONTINUE.fallback,
+                Some("F5"),
+                session && stopped,
+            ),
+            // 1: Pause — enabled when session active and running (not stopped)
+            action(
+                1,
+                "Pause",
+                icons::DBG_PAUSE.fallback,
+                Some("F6"),
+                session && !stopped,
+            ),
+            // 2: Stop — enabled when session active
+            action(2, "Stop", icons::DBG_STOP.fallback, Some("⇧F5"), session),
+            // 3: Restart — enabled when session active
+            action(
+                3,
+                "Restart",
+                icons::DBG_RESTART.fallback,
+                Some("^⇧F5"),
+                session,
+            ),
+            // Separator between restart and step controls
+            ToolbarButton::Separator,
+            // 4: Step Over — enabled when session active and stopped
+            action(
+                4,
+                "Step Over",
+                icons::DBG_STEP_OVER.fallback,
+                Some("F10"),
+                session && stopped,
+            ),
+            // 5: Step Into — enabled when session active and stopped
+            action(
+                5,
+                "Step Into",
+                icons::DBG_RESTART.fallback,
+                Some("F11"),
+                session && stopped,
+            ),
+            // 6: Step Out — enabled when session active and stopped
+            action(
+                6,
+                "Step Out",
+                icons::DBG_STEP_OUT.fallback,
+                Some("⇧F11"),
+                session && stopped,
+            ),
+        ],
+    }
+}
+
+/// Draw the debug action-button toolbar through backend `b` and cache its
+/// layout on `engine` for click/hover dispatch (#510). Both backends call
+/// this inside their frame scope; the only per-backend input is `rect`
+/// (cell units for TUI, pixels for GTK). Mouse hover → `debug_button_hovered`,
+/// visual press → `debug_button_pressed`, both read from the engine.
+pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: quadraui::Rect) {
+    use crate::core::engine::Engine;
+    let bar = debug_toolbar(engine);
+    let hovered = engine
+        .debug_button_hovered
+        .and_then(Engine::debug_button_id);
+    let pressed = engine
+        .debug_button_pressed
+        .and_then(Engine::debug_button_id);
+    let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
+    engine.debug_toolbar_layout.replace(Some(layout));
+}
+
+/// Build two `StatusBar` rows for the debug sidebar chrome:
+/// row 0 = title ("DEBUG | config_name"), row 1 = action button (Continue/Stop/Start).
+pub fn debug_sidebar_chrome_to_status_bars(
+    sidebar: &DebugSidebarData,
+    theme: &Theme,
+) -> (quadraui::StatusBar, quadraui::StatusBar) {
+    let bg = to_quadraui_color(theme.status_bg);
+    let fg = to_quadraui_color(theme.status_fg);
+    let green = to_quadraui_color(theme.git_added);
+    let red = to_quadraui_color(theme.diagnostic_error);
+
+    let cfg_name = sidebar.launch_config_name.as_deref().unwrap_or("no config");
+    let title = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("debug_sidebar_title"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: format!("  {} DEBUG  |  {cfg_name}", icons::DEBUG.s()),
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    };
+
+    let action_id = Some(quadraui::WidgetId::new("debug_sidebar:action"));
+    let (icon, label, icon_fg) = if sidebar.session_active && sidebar.stopped {
+        (icons::DBG_PLAY.s(), "  Continue", green)
+    } else if sidebar.session_active {
+        (icons::DBG_STOP_ALT.s(), "  Stop", red)
+    } else {
+        (icons::DBG_PLAY.s(), "  Start Debugging", green)
+    };
+    let action = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("debug_sidebar_action"),
+        left_segments: vec![
+            quadraui::StatusBarSegment {
+                text: icon.to_string(),
+                fg: icon_fg,
+                bg,
+                bold: false,
+                action_id: action_id.clone(),
+            },
+            quadraui::StatusBarSegment {
+                text: label.to_string(),
+                fg,
+                bg,
+                bold: false,
+                action_id,
+            },
+        ],
+        right_segments: Vec::new(),
+    };
+
+    (title, action)
+}
+
+/// Returns `true` if `id` matches the debug sidebar action button.
+pub fn is_debug_sidebar_action(id: &quadraui::WidgetId) -> bool {
+    id.as_str() == "debug_sidebar:action"
+}
+
+/// Build a `TextDisplay` for the debug output panel.
+pub fn debug_output_to_text_display(
+    output_lines: &[String],
+    scroll_offset: usize,
+    auto_scroll: bool,
+) -> quadraui::TextDisplay {
+    let lines: Vec<quadraui::TextDisplayLine> = output_lines
+        .iter()
+        .map(|line| quadraui::TextDisplayLine {
+            spans: vec![quadraui::StyledSpan {
+                text: format!("  {line}"),
+                fg: None,
+                bg: None,
+                bold: false,
+                italic: false,
+                underline: false,
+            }],
+            decoration: quadraui::Decoration::Normal,
+            timestamp: None,
+        })
+        .collect();
+
+    quadraui::TextDisplay {
+        id: quadraui::WidgetId::new("debug_output"),
+        lines,
+        scroll_offset,
+        auto_scroll,
+        max_lines: 0,
+        has_focus: false,
+        title: None,
+        show_scrollbar: true,
+    }
 }
 
 // ─── Static menu structure ────────────────────────────────────────────────────
@@ -1756,6 +2659,43 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
     ),
 ];
 
+/// Build `Vec<MenuDef>` from `MENU_STRUCTURE` for `quadraui::MenuSystem`.
+/// `is_vscode_mode` selects which shortcut variant to display.
+pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
+    MENU_STRUCTURE
+        .iter()
+        .map(|(name, _alt, items)| quadraui::MenuDef {
+            id: quadraui::WidgetId::new(*name),
+            label: format!("&{name}"),
+            disabled: false,
+            items: items
+                .iter()
+                .map(|item| {
+                    if item.separator {
+                        return quadraui::ContextMenuItem::default();
+                    }
+                    let shortcut = if is_vscode_mode && !item.vscode_shortcut.is_empty() {
+                        item.vscode_shortcut
+                    } else {
+                        item.shortcut
+                    };
+                    quadraui::ContextMenuItem {
+                        id: Some(quadraui::WidgetId::new(item.action)),
+                        label: quadraui::StyledText::plain(item.label.to_string()),
+                        detail: if shortcut.is_empty() {
+                            None
+                        } else {
+                            Some(quadraui::StyledText::plain(shortcut.to_string()))
+                        },
+                        disabled: !item.enabled,
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 /// Static debug toolbar button definitions.
 /// Icons use the Unicode fallback glyphs (▶ ⏸ ⏹ ↻ etc.) which render
 /// correctly in both TUI (any font) and GTK (no Nerd Font subset needed).
@@ -1960,6 +2900,10 @@ pub enum UiAction {
     /// Click terminal close (×) button.
     /// Must call: `engine.terminal_close_active_tab()`
     TerminalCloseButton,
+    /// Click terminal maximize (□) button.
+    /// Must call: `engine.toggle_terminal_maximize(target_rows)`
+    /// followed by `engine.terminal_resize(cols, engine.session.terminal_panel_rows)`.
+    TerminalMaximizeButton,
     /// Click in split terminal pane → switch focus.
     /// Must set: `engine.terminal_active = 0 or 1`
     TerminalSplitPaneClick,
@@ -2004,6 +2948,7 @@ pub fn all_required_ui_actions() -> Vec<UiAction> {
         UiAction::TerminalSplitButton,
         UiAction::TerminalAddButton,
         UiAction::TerminalCloseButton,
+        UiAction::TerminalMaximizeButton,
         UiAction::TerminalSplitPaneClick,
         UiAction::ActivityBarClick,
         UiAction::ActivityBarSettingsClick,
@@ -2052,6 +2997,8 @@ pub fn collect_ui_actions_tui() -> Vec<UiAction> {
         UiAction::TerminalAddButton,
         // mouse.rs — terminal_close_active_tab
         UiAction::TerminalCloseButton,
+        // mouse.rs — toggle_terminal_maximize button on toolbar
+        UiAction::TerminalMaximizeButton,
         // mouse.rs:1650 — terminal split pane click
         UiAction::TerminalSplitPaneClick,
         // panels.rs — activity bar icon click
@@ -2104,6 +3051,8 @@ pub fn collect_ui_actions_wingui() -> Vec<UiAction> {
         UiAction::TerminalAddButton,
         // mod.rs — terminal_close_active_tab
         UiAction::TerminalCloseButton,
+        // mod.rs — toggle_terminal_maximize button on toolbar
+        UiAction::TerminalMaximizeButton,
         // mod.rs — terminal_active = 0/1
         UiAction::TerminalSplitPaneClick,
         // mod.rs — sidebar panel toggle
@@ -2122,13 +3071,9 @@ pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
     let mut elems = Vec::new();
 
     // Menu bar
-    if layout.menu_bar.is_some() {
+    if layout.menu_bar_visible {
         elems.push(UiElement::MenuBar);
-        if layout
-            .menu_bar
-            .as_ref()
-            .is_some_and(|m| m.open_menu_idx.is_some())
-        {
+        if layout.menu_dropdown_open {
             elems.push(UiElement::MenuDropdown);
         }
     }
@@ -2256,7 +3201,7 @@ pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
     let mut elems = Vec::new();
 
     // draw_frame(): menu bar
-    if layout.menu_bar.is_some() {
+    if layout.menu_bar_visible {
         elems.push(UiElement::MenuBar);
     }
 
@@ -2388,11 +3333,7 @@ pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
     }
 
     // on_paint(): menu dropdown (rendered after sidebar for z-order)
-    if layout
-        .menu_bar
-        .as_ref()
-        .is_some_and(|m| m.open_menu_idx.is_some())
-    {
+    if layout.menu_dropdown_open {
         elems.push(UiElement::MenuDropdown);
     }
 
@@ -2419,7 +3360,7 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
     let mut elems = Vec::new();
 
     // Menu bar
-    if layout.menu_bar.is_some() {
+    if layout.menu_bar_visible {
         elems.push(UiElement::MenuBar);
     }
 
@@ -2565,11 +3506,7 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
     }
 
     // Menu dropdown (rendered last for z-order)
-    if layout
-        .menu_bar
-        .as_ref()
-        .is_some_and(|m| m.open_menu_idx.is_some())
-    {
+    if layout.menu_dropdown_open {
         elems.push(UiElement::MenuDropdown);
     }
 
@@ -2585,10 +3522,8 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
 pub struct ScreenLayout {
     pub tab_bar: Vec<TabInfo>,
     pub windows: Vec<RenderedWindow>,
-    pub status_left: String,
-    pub status_right: String,
-    /// Byte range within `status_left` where the git branch name appears (for click detection).
-    pub status_branch_range: Option<(usize, usize)>,
+    /// Global status bar (when per-window status lines are disabled).
+    pub global_status_bar: Option<quadraui::StatusBar>,
     pub command: CommandLineData,
     /// Wildmenu bar (Tab completion in command mode), or `None` when inactive.
     pub wildmenu: Option<WildmenuData>,
@@ -2604,7 +3539,8 @@ pub struct ScreenLayout {
     /// Signature help popup (shown in insert mode after `(` or `,`), or `None`.
     pub signature_help: Option<SignatureHelp>,
     /// Menu bar strip data, or `None` when the bar is hidden.
-    pub menu_bar: Option<MenuBarData>,
+    pub menu_bar_visible: bool,
+    pub menu_dropdown_open: bool,
     /// Debug toolbar strip data, or `None` when hidden and no active session.
     pub debug_toolbar: Option<DebugToolbarData>,
     /// Debug sidebar data — always present (sections may be empty).
@@ -2644,10 +3580,14 @@ pub struct ScreenLayout {
     pub tab_tooltip: Option<String>,
     /// Tab scroll offset for the single-group tab bar.
     pub tab_scroll_offset: usize,
-    /// When `status_line_above_terminal` is active AND the terminal panel is open,
+    /// Pre-built quadraui `TabBar` primitive for the single-group tab bar.
+    pub tab_bar_primitive: quadraui::TabBar,
+    /// When `status_line_above_terminal` is OFF and the terminal panel is open,
     /// this carries the active window's status line to render as a dedicated row
     /// above the terminal panel. When `Some`, per-window `status_line` fields on
     /// individual `RenderedWindow`s are `None`.
+    /// (Setting name is historical — the UI labels it "Status Line Inside Window";
+    /// `true` keeps the bar inside each editor window, `false` extracts it.)
     pub separated_status_line: Option<WindowStatusLine>,
 }
 
@@ -2658,6 +3598,11 @@ pub struct ContextMenuPanel {
     pub selected_idx: usize,
     pub screen_col: u16,
     pub screen_row: u16,
+    /// Trigger element height in line_height units (f32; supports
+    /// sub-cell rows like GTK's 1.6× tab row). 0.0 = no trigger →
+    /// render at click coords (AnchorPoint). Non-zero opts into
+    /// `ContextMenuPlacement::Below` (#434).
+    pub trigger_height: f32,
 }
 
 /// A single rendered context menu item.
@@ -2667,6 +3612,77 @@ pub struct ContextMenuRenderItem {
     pub shortcut: String,
     pub separator_after: bool,
     pub enabled: bool,
+}
+
+/// Convert a render-side `ContextMenuPanel` into a `quadraui::ContextMenu`
+/// for D6 rasterisation. `separator_after` on an item becomes a separator
+/// row (`id: None`) inserted immediately after that item in the
+/// quadraui items list. Item ids are synthesised as `context:N` where
+/// N is the original engine-side item index.
+///
+/// `selected_idx` is translated from engine-index (0..panel.items.len())
+/// to quadraui-index (which includes separator rows) so the selection
+/// highlight lines up visually when separators appear before the
+/// selected item.
+pub fn context_menu_panel_to_quadraui_context_menu(
+    panel: &ContextMenuPanel,
+) -> quadraui::ContextMenu {
+    let mut items: Vec<quadraui::ContextMenuItem> = Vec::new();
+    // engine_to_quadraui[engine_idx] = quadraui index of the same item.
+    let mut engine_to_quadraui: Vec<usize> = Vec::with_capacity(panel.items.len());
+    for (i, item) in panel.items.iter().enumerate() {
+        engine_to_quadraui.push(items.len());
+        items.push(quadraui::ContextMenuItem {
+            id: Some(quadraui::WidgetId::new(format!("context:{i}"))),
+            label: quadraui::StyledText::plain(item.label.clone()),
+            detail: if item.shortcut.is_empty() {
+                None
+            } else {
+                Some(quadraui::StyledText::plain(item.shortcut.clone()))
+            },
+            disabled: !item.enabled,
+            ..Default::default()
+        });
+        if item.separator_after {
+            items.push(quadraui::ContextMenuItem::default());
+        }
+    }
+    let selected_idx = engine_to_quadraui
+        .get(panel.selected_idx)
+        .copied()
+        .unwrap_or(0);
+    let placement = if panel.trigger_height > 0.0 {
+        quadraui::ContextMenuPlacement::Below
+    } else {
+        quadraui::ContextMenuPlacement::AnchorPoint
+    };
+    quadraui::ContextMenu {
+        id: quadraui::WidgetId::new("context_menu"),
+        items,
+        selected_idx,
+        bg: None,
+        placement,
+    }
+}
+
+/// Convert the menu-bar dropdown state into a `quadraui::ContextMenu`.
+/// Build a `quadraui::CommandCenter` descriptor from engine state.
+pub fn build_command_center_view(
+    nav_back_enabled: bool,
+    nav_forward_enabled: bool,
+    title: &str,
+) -> quadraui::CommandCenter {
+    let search_label = if title.is_empty() {
+        String::new()
+    } else {
+        format!("\u{1f50d} {title}")
+    };
+    quadraui::CommandCenter {
+        id: quadraui::WidgetId::new("command-center"),
+        back_enabled: nav_back_enabled,
+        forward_enabled: nav_forward_enabled,
+        search_label,
+    }
 }
 
 /// A modal dialog displayed over the editor.
@@ -2682,6 +3698,51 @@ pub struct DialogPanel {
     pub vertical_buttons: bool,
 }
 
+/// Convert a render-side `DialogPanel` into a `quadraui::Dialog` for
+/// backend rasterisation via the D6 layout pipeline.
+///
+/// Button ids are synthesised from their index (`"dialog:btn:N"`)
+/// since `DialogPanel.buttons` doesn't carry engine-side ids —
+/// backends dispatch clicks by index via
+/// `Engine::dialog_click_button(idx)`. The `is_selected` flag on each
+/// button maps to `is_default` on the quadraui button, used by
+/// backends to style the primary / focused button.
+pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog {
+    let buttons: Vec<quadraui::DialogButton> = panel
+        .buttons
+        .iter()
+        .enumerate()
+        .map(|(i, (label, is_selected))| quadraui::DialogButton {
+            id: quadraui::WidgetId::new(format!("dialog:btn:{i}")),
+            label: label.clone(),
+            is_default: *is_selected,
+            is_cancel: false,
+            tint: None,
+        })
+        .collect();
+    quadraui::Dialog {
+        id: quadraui::WidgetId::new("dialog"),
+        title: quadraui::StyledText::plain(panel.title.clone()),
+        // Body is multi-line — join with newlines. Backends split on
+        // `\n` when rendering.
+        body: panel
+            .body
+            .iter()
+            .map(|l| quadraui::StyledText::plain(l.clone()))
+            .collect(),
+        buttons,
+        severity: None,
+        vertical_buttons: panel.vertical_buttons,
+        input: panel.input.as_ref().map(|inp| {
+            quadraui::DialogInput::TextInput(quadraui::DialogTextInput {
+                value: inp.display.clone(),
+                placeholder: String::new(),
+                cursor: None,
+            })
+        }),
+    }
+}
+
 /// Render data for a dialog text input field.
 #[derive(Debug, Clone)]
 pub struct DialogInputPanel {
@@ -2690,44 +3751,15 @@ pub struct DialogInputPanel {
 }
 
 // Re-export hit-test types and functions from engine so backends can use `render::*`.
-pub use crate::core::engine::{
-    compute_find_replace_hit_regions, FindReplaceClickTarget, FrHitRegion, FR_PANEL_WIDTH,
-};
+// The find/replace types live in `quadraui::primitives::find_replace`
+// after #271; engine re-exports keep the legacy paths working.
+pub use crate::core::engine::{compute_find_replace_hit_regions, FR_PANEL_WIDTH};
 
-/// The inline find/replace overlay displayed at the top-right of the active editor group.
-#[derive(Debug, Clone)]
-pub struct FindReplacePanel {
-    /// Current query text in the find field.
-    pub query: String,
-    /// Current replacement text (only shown when `show_replace` is true).
-    pub replacement: String,
-    /// Whether the replace row is visible.
-    pub show_replace: bool,
-    /// Which field has focus: 0 = find, 1 = replace.
-    pub focus: u8,
-    /// Cursor position within the focused field (char offset).
-    pub cursor: usize,
-    /// Selection anchor in the focused field. When Some, text between anchor and cursor is selected.
-    pub sel_anchor: Option<usize>,
-    /// "N of M" match count display, or "No results" / empty.
-    pub match_info: String,
-    /// Toggle button states (find row).
-    pub case_sensitive: bool,
-    pub whole_word: bool,
-    pub use_regex: bool,
-    /// Toggle button states (replace row).
-    pub preserve_case: bool,
-    /// Find in selection mode.
-    pub in_selection: bool,
-    /// Bounding rect of the active editor group (pixel coords for GTK/Win-GUI,
-    /// approximate for TUI). The overlay positions itself at the top-right of this rect.
-    pub group_bounds: WindowRect,
-    /// Panel width in char cells (used by backends for positioning).
-    pub panel_width: u16,
-    /// Hit regions for click handling, in char-cell units relative to the panel
-    /// content corner (inside borders). Computed once in `build_screen_layout()`.
-    pub hit_regions: Vec<(FrHitRegion, FindReplaceClickTarget)>,
-}
+/// The inline find/replace overlay displayed at the top-right of the
+/// active editor group. Lifted to [`quadraui::FindReplacePanel`] in
+/// #271; this alias preserves the legacy `render::FindReplacePanel`
+/// path so existing call sites compile unchanged.
+pub type FindReplacePanel = quadraui::FindReplacePanel;
 
 /// Format a button label with the hotkey character bracketed.
 /// e.g., `format_button_label("Recover", 'r')` → `"[R]ecover"`.
@@ -2760,6 +3792,78 @@ pub struct DiffPeekPopup {
     pub anchor_line: usize,
     /// Raw diff hunk lines (with +/-/space prefix) to display.
     pub hunk_lines: Vec<String>,
+}
+
+/// Convert a `DiffPeekPopup` into a multi-line `quadraui::Tooltip`.
+///
+/// Each diff hunk line becomes one styled row inside `styled_lines`,
+/// with per-prefix colouring: `+` lines use `theme.git_added`, `-`
+/// lines use `theme.git_deleted`, context lines use `theme.hover_fg`.
+/// A trailing action-bar row (`"[s] Stage  [r] Revert  [q] Close"`)
+/// is appended in the default fg.
+///
+/// Layout: width sized to the longest line + padding, capped at 30
+/// rows total (action bar included). Placement `Top` with fallback
+/// `Bottom`. Anchor width set to popup width so the centering math
+/// left-aligns with the cursor cell — matches the legacy popup.
+pub fn diff_peek_to_quadraui_tooltip(
+    peek: &DiffPeekPopup,
+    anchor_x: u16,
+    anchor_y: u16,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
+    let fg = to_q_color(theme.hover_fg);
+    let added = to_q_color(theme.git_added);
+    let deleted = to_q_color(theme.git_deleted);
+
+    // Cap at 29 hunk rows so the action bar (1 row) fits inside the
+    // legacy 30-line ceiling.
+    let visible: Vec<&String> = peek.hunk_lines.iter().take(29).collect();
+    let max_len = visible.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let action_text = "[s] Stage  [r] Revert  [q] Close";
+    let max_len = max_len.max(action_text.chars().count());
+    // +4 = 1 left border + 1 left pad + 1 right pad + 1 right border.
+    let width = ((max_len + 4) as f32).max(20.0);
+
+    let mut styled_lines: Vec<quadraui::StyledText> = Vec::with_capacity(visible.len() + 1);
+    for hline in &visible {
+        let line_fg = if hline.starts_with('+') {
+            added
+        } else if hline.starts_with('-') {
+            deleted
+        } else {
+            fg
+        };
+        styled_lines.push(quadraui::StyledText {
+            spans: vec![quadraui::StyledSpan::with_fg(hline.as_str(), line_fg)],
+        });
+    }
+    // Action bar row in default fg.
+    styled_lines.push(quadraui::StyledText {
+        spans: vec![quadraui::StyledSpan::with_fg(action_text, fg)],
+    });
+
+    let height = styled_lines.len() as f32;
+
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("diff_peek"),
+        text: String::new(),
+        styled_lines: Some(styled_lines),
+        // Legacy diff peek always rendered below the anchor line —
+        // mirror that with placement=Bottom (with primitive fallback
+        // to Top when there's no room below).
+        placement: quadraui::TooltipPlacement::Bottom,
+        bg: None,
+        fg: None,
+    };
+    // anchor.width = popup width so the centering math left-aligns
+    // the popup with the cursor cell (matches legacy + hover popup
+    // + sig help adapters).
+    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
+    let measure = quadraui::TooltipMeasure::new(width, height);
+    let layout = tooltip.layout(anchor, viewport, measure, 0.0);
+    (tooltip, layout)
 }
 
 // ─── Theme ────────────────────────────────────────────────────────────────────
@@ -4435,7 +5539,7 @@ pub fn build_screen_layout(
     let per_window_status = engine.settings.window_status_line;
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     // When status_line_above_terminal is OFF and the terminal is open, extract the
-    // active window's status into a separated bar rendered below the terminal.
+    // active window's status into a separated bar rendered above the terminal.
     // When the setting is ON (default), per-window status bars stay inside each
     // window — they're naturally above the terminal by being part of the editor area.
     let separate_status =
@@ -4465,6 +5569,10 @@ pub fn build_screen_layout(
                     engine, theme, *window_id, is_active,
                 ));
             }
+            engine
+                .paint_viewport_cols
+                .borrow_mut()
+                .insert(*window_id, rw.text_viewport_cols);
             rw
         })
         .collect();
@@ -4480,10 +5588,10 @@ pub fn build_screen_layout(
         None
     };
 
-    let (status_left, status_right, status_branch_range) = if per_window_status {
-        (String::new(), String::new(), None)
+    let global_status_bar = if per_window_status {
+        None
     } else {
-        build_status_line(engine)
+        Some(build_global_status_bar(engine, theme))
     };
     let command = build_command_line(engine);
 
@@ -4555,49 +5663,8 @@ pub fn build_screen_layout(
             anchor_col: engine.view().cursor.col,
         });
 
-    let menu_bar = engine.menu_bar_visible.then(|| {
-        let open_items = if let Some(midx) = engine.menu_open_idx {
-            if let Some((_, _, items)) = MENU_STRUCTURE.get(midx) {
-                items.to_vec()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        // Compute approximate column position of the active menu header for dropdown anchor.
-        let open_menu_col: u16 = if let Some(midx) = engine.menu_open_idx {
-            // Hamburger (3) + spaces between labels: each label ~5-8 chars
-            let mut col: u16 = 3; // hamburger icon width
-            for i in 0..midx {
-                if let Some((name, _, _)) = MENU_STRUCTURE.get(i) {
-                    col += name.len() as u16 + 2; // label + 2 spaces
-                }
-            }
-            col
-        } else {
-            0
-        };
-        // Use workspace directory name (not active file) so the centered
-        // search box stays fixed when switching tabs (like VSCode Command Center).
-        let title = engine
-            .cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "VimCode".to_string());
-        MenuBarData {
-            open_menu_idx: engine.menu_open_idx,
-            open_items,
-            open_menu_col,
-            highlighted_item_idx: engine.menu_highlighted_item,
-            title,
-            show_window_controls: false, // GTK backend overrides this
-            is_vscode_mode: engine.is_vscode_mode(),
-            nav_back_enabled: engine.tab_nav_can_go_back(),
-            nav_forward_enabled: engine.tab_nav_can_go_forward(),
-        }
-    });
+    let menu_bar_visible = engine.menu_bar_visible;
+    let menu_dropdown_open = engine.menu_system.borrow().is_open();
 
     let debug_toolbar = engine.debug_toolbar_visible.then(|| DebugToolbarData {
         buttons: DEBUG_BUTTONS.to_vec(),
@@ -4948,6 +6015,18 @@ pub fn build_screen_layout(
                     diff_label_cols,
                     has_split,
                 );
+                let accent = if is_active {
+                    Some(to_quadraui_color(theme.tab_active_accent))
+                } else {
+                    None
+                };
+                let bar = build_tab_bar_primitive(
+                    &tabs,
+                    has_split,
+                    diff_toolbar.as_ref(),
+                    tab_scroll_offset,
+                    accent,
+                );
                 GroupTabBar {
                     group_id: gid,
                     tabs,
@@ -4955,6 +6034,7 @@ pub fn build_screen_layout(
                     diff_toolbar,
                     tab_scroll_offset,
                     hit_regions,
+                    bar,
                 }
             })
             .collect();
@@ -5016,11 +6096,22 @@ pub fn build_screen_layout(
                     min_y = 0.0;
                     max_x = 0.0;
                 }
-                let bounds = WindowRect::new(min_x, min_y, max_x - min_x, line_height);
+                // Place bounds at the actual breadcrumb row (one line_height
+                // above the window content top).
+                let bc_y = (min_y - line_height).max(0.0);
+                let bounds = WindowRect::new(min_x, bc_y, max_x - min_x, line_height);
+                let bar = breadcrumbs_to_quadraui_status_bar(
+                    &segments,
+                    theme,
+                    engine.breadcrumb_focus,
+                    engine.breadcrumb_selected,
+                );
                 BreadcrumbBar {
                     group_id: gid,
                     segments,
                     bounds,
+                    bar,
+                    draw_layout: std::cell::RefCell::new(None),
                 }
             })
             .collect()
@@ -5043,12 +6134,23 @@ pub fn build_screen_layout(
         None
     };
 
+    let tab_scroll_offset_single = engine
+        .editor_groups
+        .get(&engine.active_group)
+        .map(|g| g.tab_scroll_offset)
+        .unwrap_or(0);
+    let tab_bar_primitive = build_tab_bar_primitive(
+        &tab_bar,
+        true,
+        diff_toolbar.as_ref(),
+        tab_scroll_offset_single,
+        Some(to_quadraui_color(theme.tab_active_accent)),
+    );
+
     ScreenLayout {
         tab_bar,
         windows,
-        status_left,
-        status_right,
-        status_branch_range,
+        global_status_bar,
         command,
         wildmenu,
         active_window_id,
@@ -5057,7 +6159,8 @@ pub fn build_screen_layout(
         quickfix,
         bottom_tabs,
         signature_help,
-        menu_bar,
+        menu_bar_visible,
+        menu_dropdown_open,
         debug_toolbar,
         debug_sidebar,
         source_control,
@@ -5163,6 +6266,7 @@ pub fn build_screen_layout(
             selected_idx: cm.selected,
             screen_col: cm.screen_x,
             screen_row: cm.screen_y,
+            trigger_height: cm.trigger_height,
         }),
         find_replace: if engine.find_replace_open {
             let match_info = if engine.search_matches.is_empty() {
@@ -5213,6 +6317,13 @@ pub fn build_screen_layout(
                 engine.find_replace_show_replace,
                 &match_info,
             );
+            // Convert vimcode's f64 WindowRect to quadraui::Rect (f32).
+            let qr = quadraui::Rect::new(
+                active_group_bounds.x as f32,
+                active_group_bounds.y as f32,
+                active_group_bounds.width as f32,
+                active_group_bounds.height as f32,
+            );
             Some(FindReplacePanel {
                 query: engine.find_replace_query.clone(),
                 replacement: engine.find_replace_replacement.clone(),
@@ -5226,19 +6337,18 @@ pub fn build_screen_layout(
                 use_regex: engine.find_replace_options.use_regex,
                 preserve_case: engine.find_replace_options.preserve_case,
                 in_selection: engine.find_replace_options.in_selection,
-                group_bounds: active_group_bounds,
+                group_bounds: qr,
                 panel_width: panel_w,
+                replace_one_glyph: crate::icons::FIND_REPLACE.s().to_string(),
+                replace_all_glyph: crate::icons::FIND_REPLACE_ALL.s().to_string(),
                 hit_regions,
             })
         } else {
             None
         },
         tab_tooltip: engine.tab_hover_tooltip.clone(),
-        tab_scroll_offset: engine
-            .editor_groups
-            .get(&engine.active_group)
-            .map(|g| g.tab_scroll_offset)
-            .unwrap_or(0),
+        tab_scroll_offset: tab_scroll_offset_single,
+        tab_bar_primitive,
         separated_status_line,
     }
 }
@@ -5339,7 +6449,1771 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
             None
         },
         help_open: engine.sc_help_open,
+        sc_sections_start_y: engine
+            .sc_panel_layout
+            .borrow()
+            .as_ref()
+            .map(|l| l.content_bounds.y),
     })
+}
+
+/// Convert vimcode's internal `Color` to quadraui's `Color`. Alpha is fully opaque.
+fn to_q_color(c: Color) -> quadraui::Color {
+    quadraui::Color::rgb(c.r, c.g, c.b)
+}
+
+/// Adapt a `SourceControlData` (vimcode's internal representation) into a
+/// generic `quadraui::TreeView` that backends can render through the shared
+/// tree-primitive drawing path.
+///
+/// Scope: covers the four expandable sections only — Staged, Changes,
+/// Worktrees, and Recent Commits. The header row, commit input, and action
+/// button row remain the responsibility of the existing SC panel code;
+/// they will migrate in later A.x stages when their primitives land.
+///
+/// Row order mirrors `render_source_control()` in the TUI so `sc.selected`
+/// (a flat row index within the sections area) maps one-to-one onto the
+/// returned `TreeView.rows`.
+/// Build the Source Control action-button row as a `quadraui::Toolbar`
+/// (#505). Commit carries its label + `(c)` key hint and is disabled while
+/// the commit message is empty; Push/Pull/Sync are icon-only. Button ids
+/// come from [`crate::core::engine::SC_BUTTON_IDS`] so click dispatch can
+/// map the hit-test result back to a button index. Both backends call this
+/// and hand the result to `Backend::draw_toolbar`.
+pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
+    use crate::core::engine::SC_BUTTON_IDS;
+    use crate::icons;
+    use quadraui::{Toolbar, ToolbarButton, WidgetId};
+
+    let action = |idx: usize, label: &str, icon: &str, key_hint: Option<&str>, enabled: bool| {
+        ToolbarButton::Action {
+            id: WidgetId::new(SC_BUTTON_IDS[idx]),
+            label: label.to_string(),
+            icon: Some(icon.to_string()),
+            key_hint: key_hint.map(|s| s.to_string()),
+            enabled,
+            is_active: false,
+            tooltip: String::new(),
+        }
+    };
+
+    let commit_enabled = !sc.commit_message.trim().is_empty();
+    Toolbar {
+        id: WidgetId::new("sc:buttons"),
+        bg: None,
+        buttons: vec![
+            action(
+                0,
+                "Commit",
+                icons::GIT_COMMIT.s(),
+                Some("c"),
+                commit_enabled,
+            ),
+            action(1, "", icons::GIT_PUSH.s(), None, true),
+            action(2, "", icons::GIT_PULL.s(), None, true),
+            action(3, "", icons::GIT_SYNC.s(), None, true),
+        ],
+    }
+}
+
+/// Build the SC `SidebarPanel` — a `quadraui::SidebarPanel` wrapping the
+/// action-button toolbar as its header slot (#509). `toolbar_height: None`
+/// defers to each backend's idiomatic default (1 cell TUI, `line_height` GTK).
+pub fn sc_sidebar_panel(sc: &SourceControlData) -> quadraui::SidebarPanel {
+    use quadraui::{SidebarPanel, WidgetId};
+    SidebarPanel {
+        id: WidgetId::new("sc:panel"),
+        toolbar: Some(sc_button_toolbar(sc)),
+        toolbar_height: None,
+    }
+}
+
+/// Draw the SC bottom slab (toolbar + sections) through backend `b` and
+/// cache the full `SidebarPanelLayout` on `engine` for click/hover dispatch
+/// (#509). `rect` covers the "bottom slab" — from just below the commit input
+/// to the bottom of the panel. Both backends call this inside their frame
+/// scope; section rendering then reads `content_bounds` from the cached
+/// layout. Keyboard focus → pressed_id, mouse hover → hovered_id.
+pub fn draw_sc_sidebar_panel(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    sc: &SourceControlData,
+    rect: quadraui::Rect,
+) {
+    let panel = sc_sidebar_panel(sc);
+    let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
+    let pressed = sc.button_focused.and_then(Engine::sc_button_id);
+    let layout = b.draw_sidebar_panel(rect, &panel, hovered.as_ref(), pressed.as_ref());
+    engine.sc_panel_layout.replace(Some(layout));
+}
+
+pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> quadraui::TreeView {
+    use quadraui::{
+        Badge, Decoration, SelectionMode, StyledSpan, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let mut rows: Vec<TreeRow> = Vec::new();
+
+    let add_fg = to_q_color(theme.git_added);
+    let del_fg = to_q_color(theme.git_deleted);
+    let mod_fg = to_q_color(theme.git_modified);
+    let dim_fg = to_q_color(theme.status_inactive_fg);
+    let show_worktrees = sc.worktrees.len() > 1;
+
+    // Section order: 0=Staged, 1=Changes, 2=Worktrees (conditional), 3=Log.
+    // Matches `render_source_control()` in tui_main/panels.rs.
+    // Labels include Nerd Font glyphs; backends that don't have the icon font
+    // will still show the text portion.
+    let sections: [(u16, &str, usize); 4] = [
+        (0, "\u{f055} STAGED CHANGES", sc.staged.len()),
+        (1, "\u{f02b} CHANGES", sc.unstaged.len()),
+        (2, "\u{e702} WORKTREES", sc.worktrees.len()),
+        (3, "\u{f417} RECENT COMMITS", sc.log.len()),
+    ];
+
+    for (sec_idx, label, count) in sections {
+        if sec_idx == 2 && !show_worktrees {
+            continue;
+        }
+        let is_expanded = sc.sections_expanded[sec_idx as usize];
+
+        // Section header row (branch in tree terms).
+        let badge = if count > 0 {
+            Some(Badge::plain(format!("({})", count)))
+        } else {
+            None
+        };
+        rows.push(TreeRow {
+            path: vec![sec_idx],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(label),
+            badge,
+            is_expanded: Some(is_expanded),
+            decoration: Decoration::Header,
+            edit: None,
+        });
+
+        if !is_expanded {
+            continue;
+        }
+
+        match sec_idx {
+            0 | 1 => {
+                // NOTE: no "(no changes)" placeholder row — adding one would
+                // shift the flat row count away from
+                // `engine.sc_flat_to_section_idx`, which breaks the
+                // `sc.selected` → `selected_path` mapping and causes Tab /
+                // Enter / staging to act on the wrong section.
+                let items = if sec_idx == 0 {
+                    &sc.staged
+                } else {
+                    &sc.unstaged
+                };
+                for (i, fi) in items.iter().enumerate() {
+                    let status_color = match fi.status_char {
+                        'A' => add_fg,
+                        'D' => del_fg,
+                        _ => mod_fg,
+                    };
+                    rows.push(TreeRow {
+                        path: vec![sec_idx, i as u16],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText {
+                            spans: vec![
+                                StyledSpan::with_fg(fi.status_char.to_string(), status_color),
+                                StyledSpan::plain(format!(" {}", fi.path)),
+                            ],
+                        },
+                        badge: None,
+                        is_expanded: None,
+                        decoration: Decoration::Normal,
+                        edit: None,
+                    });
+                }
+            }
+            2 => {
+                for (i, wt) in sc.worktrees.iter().enumerate() {
+                    let check = if wt.is_current { "\u{2713} " } else { "  " };
+                    let main_marker = if wt.is_main { " [main]" } else { "" };
+                    let text = format!("{}{} {}{}", check, wt.branch, wt.path, main_marker);
+                    rows.push(TreeRow {
+                        path: vec![sec_idx, i as u16],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText::plain(text),
+                        badge: None,
+                        is_expanded: None,
+                        decoration: Decoration::Normal,
+                        edit: None,
+                    });
+                }
+            }
+            3 => {
+                for (i, entry) in sc.log.iter().enumerate() {
+                    rows.push(TreeRow {
+                        path: vec![sec_idx, i as u16],
+                        indent: 1,
+                        icon: None,
+                        text: StyledText {
+                            spans: vec![
+                                StyledSpan::with_fg(entry.hash.clone(), dim_fg),
+                                StyledSpan::plain(format!(" {}", entry.message)),
+                            ],
+                        },
+                        badge: None,
+                        is_expanded: None,
+                        decoration: Decoration::Muted,
+                        edit: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Map flat `sc.selected` → `selected_path`. When selected is out of range
+    // (e.g. sections collapsed), we fall back to no selection.
+    let selected_path = rows.get(sc.selected).map(|r| r.path.clone());
+
+    TreeView {
+        id: WidgetId::new("sc-tree"),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: 0,
+        style: TreeStyle::default(),
+        has_focus: sc.has_focus,
+    }
+}
+
+/// Populate the `SidebarSystem` on `engine.dap_sidebar_system` with
+/// current row data for all 4 debug sidebar sections. Call once per
+/// frame before `sidebar_system.render()` or `.handle()`.
+pub fn populate_dap_sidebar_system(engine: &Engine) {
+    let session_active = engine.dap_session_active;
+
+    // ── Variables section ──
+    let var_rows = build_dap_var_rows(engine, session_active);
+    // ── Watch section ──
+    let watch_rows = build_dap_watch_rows(engine, session_active);
+    // ── Call Stack section ──
+    let stack_rows = build_dap_stack_rows(engine, session_active);
+    // ── Breakpoints section ──
+    let bp_rows = build_dap_bp_rows(engine, session_active);
+
+    let mut sidebar = engine.dap_sidebar_system.borrow_mut();
+    sidebar.set_has_focus(engine.dap_sidebar_has_focus);
+    if engine.dap_sidebar_has_focus && sidebar.active_section().is_none() {
+        sidebar.set_active_section(Some(0));
+    }
+    sidebar.set_rows(0, var_rows);
+    sidebar.set_rows(1, watch_rows);
+    sidebar.set_rows(2, stack_rows);
+    sidebar.set_rows(3, bp_rows);
+}
+
+pub fn populate_ext_sidebar_system(engine: &Engine) {
+    engine.populate_ext_sidebar_system();
+}
+
+/// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
+/// row data for all 4 SC sections. Call once per frame before
+/// `sidebar_system.render()` or `.handle_cached()`.
+pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
+    use quadraui::{Decoration, StyledSpan, StyledText, TreeRow};
+
+    let add_fg = to_q_color(theme.git_added);
+    let del_fg = to_q_color(theme.git_deleted);
+    let mod_fg = to_q_color(theme.git_modified);
+    let dim_fg = to_q_color(theme.status_inactive_fg);
+
+    let staged: Vec<_> = engine
+        .sc_file_statuses
+        .iter()
+        .filter(|f| f.staged.is_some())
+        .collect();
+    let unstaged: Vec<_> = engine
+        .sc_file_statuses
+        .iter()
+        .filter(|f| f.unstaged.is_some())
+        .collect();
+    let show_worktrees = engine.sc_worktrees.len() > 1;
+
+    let file_row = |i: usize, f: &crate::core::git::FileStatus, is_staged: bool| {
+        let kind = if is_staged { f.staged } else { f.unstaged };
+        let ch = kind.map(|k| k.label()).unwrap_or('?');
+        let color = match ch {
+            'A' => add_fg,
+            'D' => del_fg,
+            _ => mod_fg,
+        };
+        TreeRow {
+            path: vec![i as u16],
+            indent: 0,
+            icon: None,
+            text: StyledText {
+                spans: vec![
+                    StyledSpan::with_fg(ch.to_string(), color),
+                    StyledSpan::plain(format!(" {}", f.path)),
+                ],
+            },
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Normal,
+            edit: None,
+        }
+    };
+
+    let staged_rows: Vec<TreeRow> = staged
+        .iter()
+        .enumerate()
+        .map(|(i, f)| file_row(i, f, true))
+        .collect();
+
+    let unstaged_rows: Vec<TreeRow> = unstaged
+        .iter()
+        .enumerate()
+        .map(|(i, f)| file_row(i, f, false))
+        .collect();
+
+    let worktree_rows: Vec<TreeRow> = engine
+        .sc_worktrees
+        .iter()
+        .enumerate()
+        .map(|(i, wt)| {
+            let check = if wt.is_current { "\u{2713} " } else { "  " };
+            let branch = wt.branch.as_deref().unwrap_or("HEAD");
+            let main_marker = if wt.is_main { " [main]" } else { "" };
+            let text = format!("{}{} {}{}", check, branch, wt.path.display(), main_marker);
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(text),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            }
+        })
+        .collect();
+
+    let log_rows: Vec<TreeRow> = engine
+        .sc_log
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| TreeRow {
+            path: vec![i as u16],
+            indent: 0,
+            icon: None,
+            text: StyledText {
+                spans: vec![
+                    StyledSpan::with_fg(entry.hash.clone(), dim_fg),
+                    StyledSpan::plain(format!(" {}", entry.message)),
+                ],
+            },
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Muted,
+            edit: None,
+        })
+        .collect();
+
+    let mut sidebar = engine.sc_sidebar_system.borrow_mut();
+    sidebar.set_has_focus(engine.sc_has_focus);
+    if engine.sc_has_focus && sidebar.active_section().is_none() {
+        sidebar.set_active_section(Some(0));
+    }
+
+    let badge = |n: usize| {
+        if n > 0 {
+            Some(StyledText::plain(format!("({})", n)))
+        } else {
+            None
+        }
+    };
+    sidebar.set_section_badge(0, badge(staged.len()));
+    sidebar.set_section_badge(1, badge(unstaged.len()));
+    sidebar.set_section_badge(2, badge(engine.sc_worktrees.len()));
+    sidebar.set_section_badge(3, badge(engine.sc_log.len()));
+    sidebar.set_section_visible(2, show_worktrees);
+
+    sidebar.set_rows(0, staged_rows);
+    sidebar.set_rows(1, unstaged_rows);
+    sidebar.set_rows(2, worktree_rows);
+    sidebar.set_rows(3, log_rows);
+}
+
+/// Populate the Search panel's `SidebarSystem` with current form + tree
+/// data. Section 0 is the Form (query/replace/toggles/buttons/status);
+/// Section 1 is the TreeView (results grouped by file). Call once per
+/// frame before `sidebar.render()`.
+pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
+    use quadraui::primitives::form::{ButtonRowItem, FieldKind, ToggleGroupItem};
+    use quadraui::{Badge, Decoration, Form, FormField, StyledSpan, StyledText, TreeRow, WidgetId};
+
+    let opts = &engine.project_search_options;
+    let results = &engine.project_search_results;
+
+    // ── Section 0: Form (search chrome) ─────────────────────────────────
+    let form_focus = engine.search_panel_form_focus.borrow();
+    let query_focused = form_focus.as_deref() == Some("search:query");
+    let replace_focused = form_focus.as_deref() == Some("search:replace");
+
+    let form = Form {
+        id: WidgetId::new("search-form"),
+        fields: vec![
+            FormField {
+                id: WidgetId::new("search:query"),
+                label: StyledText::default(),
+                kind: FieldKind::TextInput {
+                    value: engine.project_search_query.clone(),
+                    placeholder: "Search…".to_string(),
+                    cursor: if query_focused {
+                        Some(engine.search_query_caret.get())
+                    } else {
+                        None
+                    },
+                    selection_anchor: None,
+                },
+                hint: StyledText::default(),
+                disabled: false,
+                validation: None,
+            },
+            FormField {
+                id: WidgetId::new("search:replace"),
+                label: StyledText::default(),
+                kind: FieldKind::TextInput {
+                    value: engine.project_replace_text.clone(),
+                    placeholder: "Replace…".to_string(),
+                    cursor: if replace_focused {
+                        Some(engine.replace_text_caret.get())
+                    } else {
+                        None
+                    },
+                    selection_anchor: None,
+                },
+                hint: StyledText::default(),
+                disabled: false,
+                validation: None,
+            },
+            FormField {
+                id: WidgetId::new("search:toggles"),
+                label: StyledText::default(),
+                kind: FieldKind::ToggleGroup {
+                    toggles: vec![
+                        ToggleGroupItem {
+                            id: WidgetId::new("search:case"),
+                            label: "Aa".to_string(),
+                            value: opts.case_sensitive,
+                        },
+                        ToggleGroupItem {
+                            id: WidgetId::new("search:word"),
+                            label: "Ab|".to_string(),
+                            value: opts.whole_word,
+                        },
+                        ToggleGroupItem {
+                            id: WidgetId::new("search:regex"),
+                            label: ".*".to_string(),
+                            value: opts.use_regex,
+                        },
+                    ],
+                },
+                hint: StyledText::default(),
+                disabled: false,
+                validation: None,
+            },
+            FormField {
+                id: WidgetId::new("search:buttons"),
+                label: StyledText::default(),
+                kind: FieldKind::ButtonRow {
+                    buttons: vec![
+                        ButtonRowItem {
+                            id: WidgetId::new("search:find_next"),
+                            label: "Find".to_string(),
+                            disabled: engine.project_search_query.is_empty(),
+                            icon: None,
+                        },
+                        ButtonRowItem {
+                            id: WidgetId::new("search:replace_next"),
+                            label: "Repl".to_string(),
+                            disabled: results.is_empty(),
+                            icon: None,
+                        },
+                        ButtonRowItem {
+                            id: WidgetId::new("search:replace_all"),
+                            label: "All".to_string(),
+                            disabled: results.is_empty(),
+                            icon: None,
+                        },
+                    ],
+                },
+                hint: StyledText::default(),
+                disabled: false,
+                validation: None,
+            },
+            FormField {
+                id: WidgetId::new("search:status"),
+                label: StyledText::default(),
+                kind: FieldKind::ReadOnly {
+                    value: StyledText::plain(if results.is_empty() {
+                        if engine.project_search_query.is_empty() {
+                            "Type to search, Enter to run".to_string()
+                        } else if engine.project_search_status.is_empty() {
+                            String::new()
+                        } else {
+                            engine.project_search_status.clone()
+                        }
+                    } else {
+                        engine.project_search_status.clone()
+                    }),
+                },
+                hint: StyledText::default(),
+                disabled: false,
+                validation: None,
+            },
+        ],
+        focused_field: form_focus.as_deref().map(WidgetId::new),
+        scroll_offset: 0,
+        has_focus: query_focused || replace_focused,
+    };
+
+    // ── Section 1: TreeView (results grouped by file) ───────────────────
+    let collapsed = engine.search_collapsed_files.borrow();
+    let mut tree_rows: Vec<TreeRow> = Vec::new();
+    let mut file_idx: usize = 0;
+    let mut last_file: Option<&std::path::Path> = None;
+    let mut match_within_file: usize = 0;
+    let mut file_match_count: usize = 0;
+
+    for m in results.iter() {
+        if last_file != Some(m.file.as_path()) {
+            if let Some(prev_header) = tree_rows.iter_mut().rev().find(|r| r.path.len() == 1) {
+                prev_header.badge = Some(Badge::plain(format!("({})", file_match_count)));
+            }
+            if last_file.is_some() {
+                file_idx += 1;
+            }
+            last_file = Some(m.file.as_path());
+            match_within_file = 0;
+            file_match_count = 0;
+
+            let expanded = !collapsed.contains(&file_idx);
+            let rel = m.file.strip_prefix(root).unwrap_or(&m.file);
+            tree_rows.push(TreeRow {
+                path: vec![file_idx as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText {
+                    spans: vec![StyledSpan::plain(rel.display().to_string())],
+                },
+                badge: None,
+                is_expanded: Some(expanded),
+                decoration: Decoration::Header,
+                edit: None,
+            });
+        }
+
+        let expanded = !collapsed.contains(&file_idx);
+        if expanded {
+            let line_prefix = format!("{:>4}: ", m.line + 1);
+            tree_rows.push(TreeRow {
+                path: vec![file_idx as u16, match_within_file as u16],
+                indent: 1,
+                icon: None,
+                text: StyledText {
+                    spans: vec![
+                        StyledSpan {
+                            text: line_prefix,
+                            fg: Some(quadraui::Color::rgb(100, 100, 100)),
+                            bg: None,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                        },
+                        StyledSpan::plain(m.line_text.trim().to_string()),
+                    ],
+                },
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            });
+        }
+        match_within_file += 1;
+        file_match_count += 1;
+    }
+    if let Some(prev_header) = tree_rows.iter_mut().rev().find(|r| r.path.len() == 1) {
+        prev_header.badge = Some(Badge::plain(format!("({})", file_match_count)));
+    }
+
+    let mut sidebar = engine.search_sidebar_system.borrow_mut();
+    sidebar.set_has_focus(engine.search_has_focus);
+    sidebar.set_form(0, form);
+    sidebar.set_rows(1, tree_rows);
+
+    if engine.search_has_focus && sidebar.active_section().is_none() {
+        sidebar.set_active_section(Some(0));
+    }
+}
+
+/// Populate the `TreeController` on `engine.explorer_tree` with current
+/// row data. Call once per frame before `tree_controller.render()` or
+/// `.handle()`.
+pub fn populate_explorer_tree_controller(engine: &Engine, theme: &Theme) {
+    let mut tree = engine.explorer_tree.borrow_mut();
+    tree.set_has_focus(engine.explorer_has_focus);
+    let tree_rows = build_explorer_tree_rows(&engine.explorer_rows, engine, theme);
+    tree.set_rows(tree_rows);
+}
+
+fn build_explorer_tree_rows(
+    rows: &[ExplorerRow],
+    engine: &Engine,
+    theme: &Theme,
+) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Badge, Decoration, Icon as QIcon, StyledText, TreeRow};
+
+    let (git_statuses, diag_counts) = engine.explorer_indicators();
+    let err_fg = to_quadraui_color(theme.diagnostic_error);
+    let warn_fg = to_quadraui_color(theme.diagnostic_warning);
+
+    let mut out: Vec<TreeRow> = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        let canon = row.path.canonicalize().unwrap_or_else(|_| row.path.clone());
+
+        let diag = diag_counts.get(&canon).copied();
+        let git_label = git_statuses.get(&canon).copied();
+
+        let decoration = match diag {
+            Some((e, _)) if e > 0 => Decoration::Error,
+            Some((_, w)) if w > 0 => Decoration::Warning,
+            _ if git_label.is_some() => Decoration::Modified,
+            _ => Decoration::Normal,
+        };
+
+        let badge = if let Some((errors, warnings)) = diag {
+            if errors > 0 {
+                Some(Badge::colored(
+                    if errors > 9 {
+                        "9+".to_string()
+                    } else {
+                        errors.to_string()
+                    },
+                    err_fg,
+                ))
+            } else if warnings > 0 {
+                Some(Badge::colored(
+                    if warnings > 9 {
+                        "9+".to_string()
+                    } else {
+                        warnings.to_string()
+                    },
+                    warn_fg,
+                ))
+            } else {
+                git_label.map(|label| Badge::plain(label.to_string()))
+            }
+        } else {
+            git_label.map(|label| Badge::plain(label.to_string()))
+        };
+
+        let icon = if row.is_dir {
+            Some(QIcon::new(
+                icons::FOLDER.nerd.to_string(),
+                icons::FOLDER.fallback.to_string(),
+            ))
+        } else {
+            let ext = row.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let glyph = icons::file_icon(ext).to_string();
+            Some(QIcon::new(glyph, ".".to_string()))
+        };
+
+        out.push(TreeRow {
+            path: vec![row_idx as u16],
+            indent: row.depth as u16,
+            icon,
+            text: StyledText::plain(&row.name),
+            badge,
+            is_expanded: if row.is_dir {
+                Some(row.is_expanded)
+            } else {
+                None
+            },
+            decoration,
+            edit: None,
+        });
+    }
+    out
+}
+
+fn empty_placeholder_row(session_active: bool) -> quadraui::TreeRow {
+    use quadraui::{Decoration, StyledText, TreeRow};
+    let hint = if session_active {
+        "(empty)"
+    } else {
+        "(not running)"
+    };
+    TreeRow {
+        path: vec![u16::MAX],
+        indent: 0,
+        icon: None,
+        text: StyledText::plain(hint.to_string()),
+        badge: None,
+        is_expanded: None,
+        decoration: Decoration::Muted,
+        edit: None,
+    }
+}
+
+fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    let mut rows: Vec<TreeRow> = Vec::new();
+    let mut flat_idx: u16 = 0;
+
+    fn push_var_tree(
+        rows: &mut Vec<TreeRow>,
+        vars: &[crate::core::dap::DapVariable],
+        depth: u16,
+        flat_idx: &mut u16,
+        expanded: &std::collections::HashSet<u64>,
+        children_map: &std::collections::HashMap<u64, Vec<crate::core::dap::DapVariable>>,
+    ) {
+        for v in vars {
+            let prefix = if v.var_ref > 0 {
+                if expanded.contains(&v.var_ref) {
+                    icons::EXPAND_DOWN.nerd
+                } else {
+                    icons::COLLAPSE_RIGHT.nerd
+                }
+            } else {
+                "  "
+            };
+            let text = if v.value.is_empty() {
+                format!("{}{}", prefix, v.name)
+            } else {
+                format!("{}{} = {}", prefix, v.name, v.value)
+            };
+            rows.push(TreeRow {
+                path: vec![*flat_idx],
+                indent: depth,
+                icon: None,
+                text: StyledText::plain(text),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            });
+            *flat_idx += 1;
+            if v.var_ref > 0 && expanded.contains(&v.var_ref) {
+                if let Some(child_vars) = children_map.get(&v.var_ref) {
+                    push_var_tree(
+                        rows,
+                        child_vars,
+                        depth + 1,
+                        flat_idx,
+                        expanded,
+                        children_map,
+                    );
+                }
+            }
+        }
+    }
+
+    if engine.dap_primary_scope_ref > 0 {
+        let expanded = engine
+            .dap_expanded_vars
+            .contains(&engine.dap_primary_scope_ref);
+        let prefix = if expanded {
+            icons::EXPAND_DOWN.nerd
+        } else {
+            icons::COLLAPSE_RIGHT.nerd
+        };
+        rows.push(TreeRow {
+            path: vec![flat_idx],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(format!("{prefix}{}", engine.dap_primary_scope_name)),
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Normal,
+            edit: None,
+        });
+        flat_idx += 1;
+        if expanded {
+            push_var_tree(
+                &mut rows,
+                &engine.dap_variables,
+                1,
+                &mut flat_idx,
+                &engine.dap_expanded_vars,
+                &engine.dap_child_variables,
+            );
+        }
+    } else {
+        push_var_tree(
+            &mut rows,
+            &engine.dap_variables,
+            0,
+            &mut flat_idx,
+            &engine.dap_expanded_vars,
+            &engine.dap_child_variables,
+        );
+    }
+
+    for (scope_name, var_ref) in &engine.dap_scope_groups {
+        let expanded = engine.dap_expanded_vars.contains(var_ref);
+        let prefix = if expanded {
+            icons::EXPAND_DOWN.nerd
+        } else {
+            icons::COLLAPSE_RIGHT.nerd
+        };
+        rows.push(TreeRow {
+            path: vec![flat_idx],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(format!("{prefix}{scope_name}")),
+            badge: None,
+            is_expanded: None,
+            decoration: Decoration::Normal,
+            edit: None,
+        });
+        flat_idx += 1;
+        if expanded {
+            if let Some(child_vars) = engine.dap_child_variables.get(var_ref) {
+                push_var_tree(
+                    &mut rows,
+                    child_vars,
+                    1,
+                    &mut flat_idx,
+                    &engine.dap_expanded_vars,
+                    &engine.dap_child_variables,
+                );
+            }
+        }
+    }
+
+    if rows.is_empty() {
+        vec![empty_placeholder_row(session_active)]
+    } else {
+        rows
+    }
+}
+
+fn build_dap_watch_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    if engine.dap_watch_expressions.is_empty() {
+        return vec![empty_placeholder_row(session_active)];
+    }
+
+    engine
+        .dap_watch_expressions
+        .iter()
+        .zip(engine.dap_watch_values.iter())
+        .enumerate()
+        .map(|(i, (expr, val))| {
+            let val_str = val.as_deref().unwrap_or(if session_active {
+                "\u{2026}" // …
+            } else {
+                "(not running)"
+            });
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(format!("{expr} = {val_str}")),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            }
+        })
+        .collect()
+}
+
+fn build_dap_stack_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    if engine.dap_stack_frames.is_empty() {
+        return vec![empty_placeholder_row(session_active)];
+    }
+
+    engine
+        .dap_stack_frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let src = f
+                .source
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("?");
+            let prefix = if i == engine.dap_active_frame {
+                icons::COLLAPSE_RIGHT.nerd
+            } else {
+                "  "
+            };
+            TreeRow {
+                path: vec![i as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(format!("{}{} ({}:{})", prefix, f.name, src, f.line)),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            }
+        })
+        .collect()
+}
+
+fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
+    use quadraui::{Decoration, StyledText, TreeRow};
+
+    let mut sorted_bp: Vec<_> = engine.dap_breakpoints.iter().collect();
+    sorted_bp.sort_by_key(|(path, _)| path.as_str());
+
+    let mut rows = Vec::new();
+    let mut flat_idx: u16 = 0;
+    for (path, bps) in &sorted_bp {
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+        for bp in *bps {
+            let suffix = if let Some(cond) = &bp.condition {
+                format!(" [if {cond}]")
+            } else if let Some(hc) = &bp.hit_condition {
+                format!(" [hits {hc}]")
+            } else if let Some(msg) = &bp.log_message {
+                format!(" [log: {msg}]")
+            } else {
+                String::new()
+            };
+            let symbol = if bp.condition.is_some() || bp.hit_condition.is_some() {
+                "\u{25c6}" // ◆ conditional
+            } else {
+                icons::DBG_BREAKPOINTS.nerd
+            };
+            rows.push(TreeRow {
+                path: vec![flat_idx],
+                indent: 0,
+                icon: None,
+                text: StyledText::plain(format!("{} {}:{}{}", symbol, file_name, bp.line, suffix)),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Normal,
+                edit: None,
+            });
+            flat_idx += 1;
+        }
+    }
+
+    if rows.is_empty() {
+        vec![empty_placeholder_row(session_active)]
+    } else {
+        rows
+    }
+}
+
+/// Adapt one section of the debug sidebar (`Variables` / `Watch` /
+/// `Call Stack` / `Breakpoints`) into a `quadraui::TreeView` for the
+/// shared `draw_tree` primitive (#281).
+///
+/// Adapt the engine-side `ExtSidebarData` into a `quadraui::TreeView`
+/// for the shared `draw_tree` primitive (#280).
+///
+/// Tree shape:
+/// - Path `[0]` — "INSTALLED (n)" header (`Decoration::Header`, badge
+///   carries the count).
+/// - Path `[0, i]` — installed item `i` (icon = filled circle / nerd-font
+///   `\u{f4d0}`; badge `[d]remove` or `[u]update` shown only on the
+///   selected row; trailing `\u{2191}` (`↑`) on the label when an
+///   update is available).
+/// - Path `[1]` — "AVAILABLE (m)" header.
+/// - Path `[1, i]` — available item `i` (hollow circle icon; badge
+///   `[i]install` on selected row only).
+/// - Empty-state placeholders (`(none installed)`, `(all installed)`,
+///   `Fetching registry…`) appear as `Decoration::Muted` rows that are
+///   intentionally not in the selection mapping.
+///
+/// `selected: usize` in `ExtSidebarData` is a flat index across items
+/// (installed first, then available). This maps to `selected_path`
+/// = `[0, selected]` while `selected < installed_count` else
+/// `[1, selected - installed_count]`.
+pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
+    use quadraui::{
+        Badge, Decoration, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView, WidgetId,
+    };
+
+    let mut rows: Vec<TreeRow> = Vec::new();
+
+    let installed_count = ext.items_installed.len();
+    let available_count = ext.items_available.len();
+
+    // Map flat selected → (section, item_idx) for badge gating.
+    let (sel_section, sel_item) = if ext.selected < installed_count {
+        (0u16, ext.selected)
+    } else {
+        (1u16, ext.selected.saturating_sub(installed_count))
+    };
+
+    // ── Section 0: INSTALLED ─────────────────────────────────────────────────
+    rows.push(TreeRow {
+        path: vec![0],
+        indent: 0,
+        icon: None,
+        text: StyledText::plain(format!("INSTALLED ({})", installed_count)),
+        badge: None,
+        is_expanded: Some(ext.sections_expanded[0]),
+        decoration: Decoration::Header,
+        edit: None,
+    });
+
+    if ext.sections_expanded[0] {
+        if installed_count == 0 {
+            rows.push(TreeRow {
+                path: vec![0, u16::MAX],
+                indent: 1,
+                icon: None,
+                text: StyledText::plain("(none installed)".to_string()),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Muted,
+                edit: None,
+            });
+        } else {
+            for (i, item) in ext.items_installed.iter().enumerate() {
+                let is_sel = ext.has_focus && sel_section == 0 && sel_item == i;
+                let label = if item.update_available {
+                    format!("\u{25cf} {} \u{2191}", item.display_name)
+                } else {
+                    format!("\u{25cf} {}", item.display_name)
+                };
+                let badge = if is_sel {
+                    let hint = if item.update_available {
+                        "[u]update"
+                    } else {
+                        "[d]remove"
+                    };
+                    Some(Badge::plain(hint.to_string()))
+                } else {
+                    None
+                };
+                rows.push(TreeRow {
+                    path: vec![0, i as u16],
+                    indent: 1,
+                    icon: None,
+                    text: StyledText::plain(label),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                });
+            }
+        }
+    }
+
+    // ── Section 1: AVAILABLE ─────────────────────────────────────────────────
+    rows.push(TreeRow {
+        path: vec![1],
+        indent: 0,
+        icon: None,
+        text: StyledText::plain(format!("AVAILABLE ({})", available_count)),
+        badge: None,
+        is_expanded: Some(ext.sections_expanded[1]),
+        decoration: Decoration::Header,
+        edit: None,
+    });
+
+    if ext.sections_expanded[1] {
+        if available_count == 0 {
+            let msg = if ext.fetching {
+                "Fetching registry\u{2026}"
+            } else {
+                "(all installed)"
+            };
+            rows.push(TreeRow {
+                path: vec![1, u16::MAX],
+                indent: 1,
+                icon: None,
+                text: StyledText::plain(msg.to_string()),
+                badge: None,
+                is_expanded: None,
+                decoration: Decoration::Muted,
+                edit: None,
+            });
+        } else {
+            for (i, item) in ext.items_available.iter().enumerate() {
+                let is_sel = ext.has_focus && sel_section == 1 && sel_item == i;
+                let badge = if is_sel {
+                    Some(Badge::plain("[i]install".to_string()))
+                } else {
+                    None
+                };
+                rows.push(TreeRow {
+                    path: vec![1, i as u16],
+                    indent: 1,
+                    icon: None,
+                    text: StyledText::plain(format!("\u{25cb} {}", item.display_name)),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                });
+            }
+        }
+    }
+
+    // Compute the selected_path matching the flat `ext.selected`. Skip
+    // when the selection points outside the visible items (e.g. all
+    // sections collapsed).
+    let selected_path = if ext.has_focus {
+        if sel_section == 0 && sel_item < installed_count && ext.sections_expanded[0] {
+            Some(vec![0u16, sel_item as u16])
+        } else if sel_section == 1 && sel_item < available_count && ext.sections_expanded[1] {
+            Some(vec![1u16, sel_item as u16])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    TreeView {
+        id: WidgetId::new("ext-sidebar-tree"),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: 0,
+        style: TreeStyle::default(),
+        has_focus: ext.has_focus,
+    }
+}
+
+/// Adapt the engine-side `ExtPanelData` (extension-provided sidebar
+/// panel) into a `quadraui::TreeView` for rendering via the shared
+/// `draw_tree` primitive (#476).
+///
+/// Tree shape:
+/// - Path `[s]` — section `s` header (`Decoration::Header`, chevron
+///   reflects `section.expanded`).
+/// - Path `[s, i]` — visible item `i` in section `s`. `indent` mirrors
+///   `ExtPanelItem.indent + 1` so children of section headers start at
+///   indent 1 (matching the legacy renderer). Tree-expandable items
+///   carry `is_expanded: Some(item.expanded)` so the primitive draws
+///   the chevron; non-expandable items leave `is_expanded` as `None`.
+///
+/// `ExtPanelStyle` maps to `Decoration` as:
+/// - `Header → Decoration::Header`
+/// - `Dim → Decoration::Muted`
+/// - `Normal → Decoration::Normal`
+/// - `Accent → Decoration::Normal` with the row text wrapped in a
+///   `StyledSpan` coloured by `theme.keyword` (no first-class accent
+///   decoration on the primitive).
+///
+/// Badges and action labels are concatenated into a single
+/// right-aligned `Badge`, matching the legacy `[badge] ⟨action⟩ hint`
+/// hint format. Separator rows (`item.is_separator`) become a single
+/// `Decoration::Muted` row with a `─` glyph; the primitive doesn't
+/// have a first-class separator decoration so this is a visual
+/// approximation rather than a full-width rule.
+///
+/// `panel.selected` is a flat row index across visible rows (section
+/// headers count, items in collapsed sections do not). The matching
+/// `selected_path` is computed by walking the same flat enumeration
+/// while emitting rows.
+///
+/// Tree-item expansion state (`engine.ext_panel_tree_expanded`) is
+/// expected to have already been resolved into `item.expanded` by
+/// `build_ext_panel_data` before this function is called.
+pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::TreeView {
+    use crate::core::plugin::ExtPanelStyle;
+    use quadraui::{
+        Badge, Decoration, SelectionMode, StyledSpan, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let accent_color = to_quadraui_color(theme.keyword);
+    let mut rows: Vec<TreeRow> = Vec::new();
+    let mut selected_path: Option<Vec<u16>> = None;
+    let mut flat_idx = 0usize;
+
+    for (s, section) in panel.sections.iter().enumerate() {
+        if panel.has_focus && flat_idx == panel.selected {
+            selected_path = Some(vec![s as u16]);
+        }
+        rows.push(TreeRow {
+            path: vec![s as u16],
+            indent: 0,
+            icon: None,
+            text: StyledText::plain(section.name.clone()),
+            badge: None,
+            is_expanded: Some(section.expanded),
+            decoration: Decoration::Header,
+            edit: None,
+        });
+        flat_idx += 1;
+
+        if !section.expanded {
+            continue;
+        }
+
+        for (i, item) in section.items.iter().enumerate() {
+            let row_path = vec![s as u16, i as u16];
+            if panel.has_focus && flat_idx == panel.selected {
+                selected_path = Some(row_path.clone());
+            }
+
+            if item.is_separator {
+                rows.push(TreeRow {
+                    path: row_path,
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain("\u{2500}".to_string()),
+                    badge: None,
+                    is_expanded: None,
+                    decoration: Decoration::Muted,
+                    edit: None,
+                });
+                flat_idx += 1;
+                continue;
+            }
+
+            let (decoration, text) = match item.style {
+                ExtPanelStyle::Header => (Decoration::Header, StyledText::plain(item.text.clone())),
+                ExtPanelStyle::Dim => (Decoration::Muted, StyledText::plain(item.text.clone())),
+                ExtPanelStyle::Accent => (
+                    Decoration::Normal,
+                    StyledText {
+                        spans: vec![StyledSpan::with_fg(item.text.clone(), accent_color)],
+                    },
+                ),
+                ExtPanelStyle::Normal => (Decoration::Normal, StyledText::plain(item.text.clone())),
+            };
+
+            let mut parts: Vec<String> = Vec::new();
+            for badge in &item.badges {
+                parts.push(format!("[{}]", badge.text));
+            }
+            for action in &item.actions {
+                parts.push(format!("\u{27e8}{}\u{27e9}", action.label));
+            }
+            if !item.hint.is_empty() {
+                parts.push(item.hint.clone());
+            }
+            let badge = if parts.is_empty() {
+                None
+            } else {
+                Some(Badge::plain(parts.join(" ")))
+            };
+
+            let icon = if item.icon.is_empty() {
+                None
+            } else {
+                Some(quadraui::Icon::new(item.icon.clone(), item.icon.clone()))
+            };
+
+            let is_expanded = if item.expandable {
+                Some(item.expanded)
+            } else {
+                None
+            };
+
+            rows.push(TreeRow {
+                path: row_path,
+                indent: item.indent as u16 + 1,
+                icon,
+                text,
+                badge,
+                is_expanded,
+                decoration,
+                edit: None,
+            });
+            flat_idx += 1;
+        }
+    }
+
+    TreeView {
+        id: WidgetId::new("ext-panel-tree"),
+        rows,
+        selection_mode: SelectionMode::Single,
+        selected_path,
+        scroll_offset: panel.scroll_top,
+        style: TreeStyle::default(),
+        has_focus: panel.has_focus,
+    }
+}
+
+/// Adapt the engine-side `ExtSidebarData` into a `quadraui::MultiSectionView`
+/// (#293).
+///
+/// Two sections — `"installed"` and `"available"` — each carries its own
+/// `TreeView` body of item rows only (the section title is rendered as
+/// the section header, not as a tree-row). Both sections size as
+/// `EqualShare` and scroll independently (`ScrollMode::PerSection`).
+///
+/// Selection mapping: `ExtSidebarData.selected` is a flat index across
+/// installed-then-available items. Within a section, each TreeView's
+/// `selected_path` is `vec![item_idx as u16]` for that section's items.
+///
+/// Empty-state rows (`(none installed)` / `(all installed)` /
+/// `Fetching registry…`) appear as `Decoration::Muted` rows in the
+/// section's tree, intentionally not in the selection mapping.
+pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::MultiSectionView {
+    use quadraui::{
+        Badge, Decoration, EmptyBody, MsvAxis, MultiSectionView, ScrollMode, Section, SectionBody,
+        SectionHeader, SectionSize, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
+        WidgetId,
+    };
+
+    let installed_count = ext.items_installed.len();
+    let available_count = ext.items_available.len();
+
+    let (sel_section, sel_item) = if ext.selected < installed_count {
+        (0u16, ext.selected)
+    } else {
+        (1u16, ext.selected.saturating_sub(installed_count))
+    };
+
+    // ── Build INSTALLED tree ─────────────────────────────────────────
+    let installed_rows: Vec<TreeRow> = if installed_count == 0 {
+        Vec::new()
+    } else {
+        ext.items_installed
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let is_sel = ext.has_focus && sel_section == 0 && sel_item == i;
+                let label = if item.update_available {
+                    format!("\u{25cf} {} \u{2191}", item.display_name)
+                } else {
+                    format!("\u{25cf} {}", item.display_name)
+                };
+                let badge = if is_sel {
+                    let hint = if item.update_available {
+                        "[u]update"
+                    } else {
+                        "[d]remove"
+                    };
+                    Some(Badge::plain(hint.to_string()))
+                } else {
+                    None
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(label),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                }
+            })
+            .collect()
+    };
+
+    let installed_selected_path = if ext.has_focus && sel_section == 0 && sel_item < installed_count
+    {
+        Some(vec![sel_item as u16])
+    } else {
+        None
+    };
+
+    let installed_body = if installed_rows.is_empty() {
+        SectionBody::Empty(EmptyBody {
+            icon: None,
+            text: StyledText::plain("(none installed)".to_string()),
+            hint: None,
+            action: None,
+        })
+    } else {
+        SectionBody::Tree(TreeView {
+            id: WidgetId::new("ext-sidebar-installed-tree"),
+            rows: installed_rows,
+            selection_mode: SelectionMode::Single,
+            selected_path: installed_selected_path,
+            scroll_offset: 0,
+            style: TreeStyle::default(),
+            has_focus: ext.has_focus && sel_section == 0,
+        })
+    };
+
+    // ── Build AVAILABLE tree ─────────────────────────────────────────
+    let available_rows: Vec<TreeRow> = if available_count == 0 {
+        Vec::new()
+    } else {
+        ext.items_available
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let is_sel = ext.has_focus && sel_section == 1 && sel_item == i;
+                let badge = if is_sel {
+                    Some(Badge::plain("[i]install".to_string()))
+                } else {
+                    None
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(format!("\u{25cb} {}", item.display_name)),
+                    badge,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                }
+            })
+            .collect()
+    };
+
+    let available_selected_path = if ext.has_focus && sel_section == 1 && sel_item < available_count
+    {
+        Some(vec![sel_item as u16])
+    } else {
+        None
+    };
+
+    let available_body = if available_rows.is_empty() {
+        let msg = if ext.fetching {
+            "Fetching registry\u{2026}"
+        } else {
+            "(all installed)"
+        };
+        SectionBody::Empty(EmptyBody {
+            icon: None,
+            text: StyledText::plain(msg.to_string()),
+            hint: None,
+            action: None,
+        })
+    } else {
+        SectionBody::Tree(TreeView {
+            id: WidgetId::new("ext-sidebar-available-tree"),
+            rows: available_rows,
+            selection_mode: SelectionMode::Single,
+            selected_path: available_selected_path,
+            scroll_offset: 0,
+            style: TreeStyle::default(),
+            has_focus: ext.has_focus && sel_section == 1,
+        })
+    };
+
+    let installed_section = Section {
+        id: "installed".to_string(),
+        header: SectionHeader {
+            icon: None,
+            title: StyledText::plain("INSTALLED".to_string()),
+            badge: Some(StyledText::plain(format!("({installed_count})"))),
+            actions: Vec::new(),
+            show_chevron: true,
+        },
+        body: installed_body,
+        aux: None,
+        size: SectionSize::EqualShare,
+        collapsed: !ext.sections_expanded[0],
+        min_size: None,
+        max_size: None,
+    };
+
+    let available_section = Section {
+        id: "available".to_string(),
+        header: SectionHeader {
+            icon: None,
+            title: StyledText::plain("AVAILABLE".to_string()),
+            badge: Some(StyledText::plain(format!("({available_count})"))),
+            actions: Vec::new(),
+            show_chevron: true,
+        },
+        body: available_body,
+        aux: None,
+        size: SectionSize::EqualShare,
+        collapsed: !ext.sections_expanded[1],
+        min_size: None,
+        max_size: None,
+    };
+
+    MultiSectionView {
+        id: WidgetId::new("ext-sidebar-msv"),
+        sections: vec![installed_section, available_section],
+        active_section: Some(sel_section as usize),
+        axis: MsvAxis::Vertical,
+        allow_resize: false,
+        allow_collapse: true,
+        // WholePanel mode: sections size to their own content height
+        // and stack at deterministic positions. The panel scrolls as a
+        // unit when total content exceeds the visible body area (matches
+        // VSCode Extensions panel UX: INSTALLED grows with item count,
+        // AVAILABLE flows below it). Critical for click hit-testing —
+        // section boundaries don't depend on the bounds.height the
+        // backend passes, so paint and click see the same layout
+        // regardless of which area each measures.
+        scroll_mode: ScrollMode::WholePanel,
+        has_focus: ext.has_focus,
+        panel_scroll: ext.panel_scroll,
+    }
+}
+
+pub use crate::core::engine::ExplorerRow;
+
+/// Adapt a flat explorer row list into a `quadraui::TreeView` for the
+/// shared `draw_tree` primitive. Each backend drives its own flat-row
+/// model (GTK via `ExplorerState`, Win-GUI via `WinSidebar`) and calls
+/// this adapter on every draw.
+///
+/// Overlays per-row git status letters and LSP diagnostic counts via
+/// `engine.explorer_indicators()` — the cached indicator map keyed by
+/// canonical path. Directories get a folder glyph; files get the
+/// extension-based icon from `icons::file_icon`.
+/// Adapt the picker panel's `PickerPanel` render data into a generic
+/// `quadraui::Palette` for rendering through the shared primitive.
+///
+/// Phase A.4 scope: flat-list palettes only. Returns `None` when the
+/// caller should fall through to the legacy renderer:
+/// - `preview.is_some()` — file / symbol picker with right-side preview pane
+/// - any item has `depth > 0` or `expandable` — tree-structured picker
+///
+/// When `Some(Palette)` is returned, the backend can render the full
+/// modal via `quadraui_tui::draw_palette` (TUI) or `quadraui_gtk::draw_palette`
+/// (GTK, when A.4b ships).
+pub fn picker_panel_to_palette(picker: &PickerPanel) -> quadraui::Palette {
+    use quadraui::{Palette, PaletteItem, PalettePreview, StyledText, WidgetId};
+
+    let items: Vec<PaletteItem> = picker
+        .items
+        .iter()
+        .map(|it| PaletteItem {
+            text: StyledText::plain(&it.display),
+            detail: it.detail.as_deref().map(StyledText::plain),
+            icon: None,
+            match_positions: it.match_positions.clone(),
+            depth: it.depth,
+            expandable: it.expandable,
+            expanded: it.expanded,
+        })
+        .collect();
+
+    let preview = picker.preview.as_ref().map(|lines| {
+        let highlight_line = lines.iter().position(|&(_, _, hl)| hl);
+        PalettePreview {
+            lines: lines
+                .iter()
+                .map(|(line_num, text, _)| StyledText::plain(format!("{line_num:4}: {text}")))
+                .collect(),
+            title: None,
+            scroll_offset: picker.preview_scroll,
+            highlight_line,
+        }
+    });
+
+    Palette {
+        id: WidgetId::new("picker"),
+        title: picker.title.clone(),
+        query: picker.query.clone(),
+        query_cursor: picker.query.len(),
+        items,
+        selected_idx: picker.selected_idx,
+        scroll_offset: picker.scroll_top,
+        total_count: picker.total_count,
+        has_focus: true,
+        show_query: true,
+        create_label: None,
+        preview,
+    }
+}
+
+/// Convert `Engine`'s settings state into a generic `quadraui::Form`
+/// for rendering through either `quadraui_tui::draw_form` (A.3b) or
+/// `quadraui_gtk::draw_form` (A.3c). Backend-agnostic; reads only
+/// engine fields.
+///
+/// Scope: covers the scrollable field list. Callers still handle the
+/// panel header / search input / scrollbar themselves, and fall back
+/// to a legacy inline renderer when `settings_editing.is_some()` or
+/// `ext_settings_editing.is_some()` because the `Form` primitive does
+/// not yet render an editable `TextInput` for inline-edit mode (the
+/// cursor-aware primitive support landed in A.3d but the adapter has
+/// not been upgraded to emit `TextInput` for active-edit fields —
+/// tracked as a future refinement).
+///
+/// Field type mapping:
+/// - `CoreCategory` / `ExtCategory` → `FieldKind::Label` (collapsible header)
+/// - `CoreSetting` with `Bool` → `FieldKind::Toggle`
+/// - `CoreSetting` with any other type → `FieldKind::ReadOnly`
+///   (enum cycling / numeric / string values still work — keys are
+///   handled by `engine.handle_settings_key()`; the adapter just shows
+///   the current value)
+/// - `ExtSetting` mapped analogously via the manifest's declared type.
+pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
+    use crate::core::engine::SettingsRow;
+    use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
+    use quadraui::{FieldKind, Form, FormField, StyledText, WidgetId};
+
+    let flat = engine.settings_flat_list();
+    let cats = setting_categories();
+
+    let mut fields: Vec<FormField> = Vec::with_capacity(flat.len());
+    for row in &flat {
+        let field = match row {
+            SettingsRow::CoreCategory(cat_idx) => {
+                let collapsed = *cat_idx < engine.settings_collapsed.len()
+                    && engine.settings_collapsed[*cat_idx];
+                let arrow = if collapsed { "▶ " } else { "▼ " };
+                let cat_name = cats.get(*cat_idx).copied().unwrap_or("?");
+                FormField {
+                    id: WidgetId::new(format!("cat-{}", cat_idx)),
+                    label: StyledText::plain(format!("{}{}", arrow, cat_name)),
+                    kind: FieldKind::Label,
+                    hint: StyledText::default(),
+                    disabled: false,
+                    validation: None,
+                }
+            }
+            SettingsRow::ExtCategory(name) => {
+                let collapsed = engine
+                    .ext_settings_collapsed
+                    .get(name)
+                    .copied()
+                    .unwrap_or(false);
+                let arrow = if collapsed { "▶ " } else { "▼ " };
+                let display = engine
+                    .ext_available_manifests()
+                    .into_iter()
+                    .find(|m| &m.name == name)
+                    .map(|m| m.display_name.clone())
+                    .unwrap_or_else(|| name.clone());
+                FormField {
+                    id: WidgetId::new(format!("ext-cat-{}", name)),
+                    label: StyledText::plain(format!("{}{}", arrow, display)),
+                    kind: FieldKind::Label,
+                    hint: StyledText::default(),
+                    disabled: false,
+                    validation: None,
+                }
+            }
+            SettingsRow::CoreSetting(idx) => {
+                let def = &SETTING_DEFS[*idx];
+                let value_str = engine.settings.get_value_str(def.key);
+                let kind = match def.setting_type {
+                    SettingType::Bool => FieldKind::Toggle {
+                        value: value_str == "true",
+                    },
+                    _ => FieldKind::ReadOnly {
+                        value: StyledText::plain(value_str),
+                    },
+                };
+                FormField {
+                    id: WidgetId::new(format!("setting-{}", idx)),
+                    label: StyledText::plain(def.label),
+                    kind,
+                    hint: StyledText::default(),
+                    disabled: false,
+                    validation: None,
+                }
+            }
+            SettingsRow::ExtSetting(ext_name, key) => {
+                let def_opt = engine.find_ext_setting_def(ext_name, key);
+                let value_str = engine.get_ext_setting(ext_name, key);
+                let (label_str, kind) = if let Some(d) = def_opt {
+                    let label = if d.label.is_empty() {
+                        key.clone()
+                    } else {
+                        d.label.clone()
+                    };
+                    let kind = if d.r#type == "bool" {
+                        FieldKind::Toggle {
+                            value: value_str == "true",
+                        }
+                    } else {
+                        FieldKind::ReadOnly {
+                            value: StyledText::plain(value_str),
+                        }
+                    };
+                    (label, kind)
+                } else {
+                    (
+                        key.clone(),
+                        FieldKind::ReadOnly {
+                            value: StyledText::plain(value_str),
+                        },
+                    )
+                };
+                FormField {
+                    id: WidgetId::new(format!("ext-setting-{}-{}", ext_name, key)),
+                    label: StyledText::plain(label_str),
+                    kind,
+                    hint: StyledText::default(),
+                    disabled: false,
+                    validation: None,
+                }
+            }
+        };
+        fields.push(field);
+    }
+
+    let focused_field = fields.get(engine.settings_selected).map(|f| f.id.clone());
+
+    Form {
+        id: WidgetId::new("settings"),
+        fields,
+        focused_field,
+        scroll_offset: engine.settings_scroll_top,
+        has_focus: engine.settings_has_focus,
+    }
+}
+
+/// Populate the engine's `settings_form_controller` with current form
+/// data and scroll state. Call before `FormController::render()` or
+/// `FormController::handle()`.
+pub fn populate_settings_form_controller(engine: &Engine) {
+    let form = settings_to_form(engine);
+    let mut fc = engine.settings_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.settings_scroll_top);
+    fc.set_has_focus(engine.settings_has_focus);
+}
+
+/// Adapt the quickfix panel data into a generic `quadraui::ListView`.
+///
+/// The quickfix panel is a simple flat list of pre-formatted strings
+/// with a header. `ListView` maps one-to-one. No decoration per row
+/// because the input strings don't carry severity info; future
+/// enhancement: parse severity from the text or extend
+/// `QuickfixPanel` to carry `Decoration`.
+pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
+    use quadraui::{ListItem, ListView, StyledText, WidgetId};
+
+    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
+    let title_text = format!(" QUICKFIX ({} items){}", qf.total_items, focus_mark);
+
+    let items: Vec<ListItem> = qf
+        .items
+        .iter()
+        .map(|s| ListItem {
+            text: StyledText::plain(s),
+            icon: None,
+            detail: None,
+            decoration: quadraui::Decoration::Normal,
+        })
+        .collect();
+
+    ListView {
+        id: WidgetId::new("quickfix"),
+        title: Some(StyledText::plain(title_text)),
+        items,
+        selected_idx: qf.selected_idx,
+        scroll_offset: 0, // set by caller from local scroll_top
+        has_focus: qf.has_focus,
+        bordered: false,
+        h_scroll: 0,
+        max_content_width: None,
+    }
 }
 
 fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
@@ -5399,6 +8273,7 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
         query: engine.ext_sidebar_query.clone(),
         input_active: engine.ext_sidebar_input_active,
         fetching: engine.ext_registry_fetching,
+        panel_scroll: engine.ext_sidebar_panel_scroll,
     })
 }
 
@@ -5422,7 +8297,22 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
             let visible_indices = engine.ext_panel_visible_indices(panel_name, &all_items);
             let items: Vec<_> = visible_indices
                 .into_iter()
-                .filter_map(|idx| all_items.get(idx).cloned())
+                .filter_map(|idx| {
+                    all_items.get(idx).cloned().map(|mut item| {
+                        // Resolve user-toggled tree expansion state into the
+                        // item so `ext_panel_to_tree_view` doesn't need engine
+                        // access. The engine map is the source of truth once
+                        // the user has toggled; `item.expanded` is the plugin
+                        // default otherwise.
+                        if item.expandable {
+                            let key = (panel_name.clone(), item.id.clone());
+                            if let Some(&v) = engine.ext_panel_tree_expanded.get(&key) {
+                                item.expanded = v;
+                            }
+                        }
+                        item
+                    })
+                })
                 .collect();
             ExtPanelSectionData {
                 name: name.clone(),
@@ -5762,6 +8652,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
                 left_pane.cols
             },
             split_focus: engine.terminal_active as u8,
+            maximized: engine.terminal_maximized,
         });
     }
 
@@ -5788,6 +8679,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
         split_left_rows: None,
         split_left_cols: 0,
         split_focus: 0,
+        maximized: engine.terminal_maximized,
     })
 }
 
@@ -6097,6 +8989,7 @@ fn build_rendered_window(
         scroll_left: 0,
         total_lines: 0,
         gutter_char_width: 0,
+        text_viewport_cols: 0,
         is_active,
         show_active_bg: false,
         has_git_diff: false,
@@ -6270,16 +9163,44 @@ fn build_rendered_window(
 
     // When aligned diff data exists, iterate through the aligned sequence
     // so padding lines appear at the correct visual positions.
+    //
+    // `view.aligned_top` (set by `sync_scroll_binds`) wins when present:
+    // it pins the starting aligned index so both panes of a scroll-bound
+    // pair land on exactly the same row. Without it we fall back to a
+    // seek-from-`scroll_top` heuristic, then back up over any leading
+    // padding so a hunk's filler rows render at the top of the viewport
+    // when scroll_top lands just past them (#166).
     let mut aligned_idx: usize = if let Some(aligned) = diff_aligned {
-        // Find the aligned entry corresponding to scroll_top.
-        aligned
-            .iter()
-            .position(|e| e.source_line.is_some_and(|sl| sl >= scroll_top))
-            .unwrap_or(0)
+        if let Some(top) = view.aligned_top {
+            top.min(aligned.len())
+        } else {
+            let seek_idx = aligned
+                .iter()
+                .position(|e| e.source_line.is_some_and(|sl| sl >= scroll_top))
+                .unwrap_or(0);
+            let mut k = seek_idx;
+            while k > 0 && aligned[k - 1].source_line.is_none() {
+                k -= 1;
+            }
+            k
+        }
     } else {
         0
     };
-    let mut line_idx = scroll_top;
+    // When `aligned_top` pins the start at a padding entry, advance
+    // `line_idx` to the next real source line so the buffer-line-driven
+    // outer loop emits padding for the leading None entries before
+    // emitting that real line. Falls back to `scroll_top` when there is
+    // no aligned data (the non-diff path) or no Some entry remains
+    // (trailing-padding edge case).
+    let mut line_idx = if let Some(aligned) = diff_aligned {
+        aligned[aligned_idx..]
+            .iter()
+            .find_map(|e| e.source_line)
+            .unwrap_or(scroll_top)
+    } else {
+        scroll_top
+    };
     while lines.len() < visible_lines && line_idx < total_lines {
         // Skip hidden lines (fold bodies).
         if view.is_line_hidden(line_idx) {
@@ -6943,6 +9864,7 @@ fn build_rendered_window(
         scroll_left: view.scroll_left,
         total_lines,
         gutter_char_width,
+        text_viewport_cols: render_viewport_cols,
         is_active,
         show_active_bg: is_active && multi_window,
         has_git_diff: has_git,
@@ -7742,6 +10664,130 @@ fn build_status_line(engine: &Engine) -> (String, String, Option<(usize, usize)>
     (left, right, branch_range)
 }
 
+/// Build a quadraui `StatusBar` for the global (bottom-of-screen) status bar.
+pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::StatusBar {
+    let (left, right, _branch_range) = build_status_line(engine);
+    let fg = quadraui::Color::rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
+    let bg = quadraui::Color::rgb(theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("status:global"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: left,
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![quadraui::StatusBarSegment {
+            text: right,
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+    }
+}
+
+/// Build a `quadraui::ToastStack` from `engine.toasts` for the
+/// bottom-right corner. Backends call `quadraui::*::draw_toast_stack`
+/// with the result. Returns None when there are no toasts so callers
+/// can skip the draw entirely.
+pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
+    if engine.toasts.is_empty() {
+        return None;
+    }
+    Some(quadraui::ToastStack {
+        id: quadraui::WidgetId::new("toasts"),
+        corner: quadraui::ToastCorner::BottomRight,
+        toasts: engine
+            .toasts
+            .iter()
+            .map(|t| quadraui::ToastItem {
+                id: quadraui::WidgetId::new(format!("toast-{}", t.id)),
+                title: t.title.clone(),
+                body: t.body.clone(),
+                severity: t.severity,
+                action: None,
+                accent: None,
+            })
+            .collect(),
+    })
+}
+
+/// Format the LSP status segment text when the server is still
+/// indexing (#221). Renders `name • Indexing: 319/320` when the
+/// server is publishing `$/progress`; falls back to the dimmed
+/// `name… ` placeholder when no progress data is available.
+///
+/// Width discipline: progress notifications fire many times per second
+/// with varying message lengths. If the segment width fluctuates,
+/// `StatusBar::layout`'s priority-drop kicks in and lower-priority
+/// segments flash in/out — visually glitchy. The formatter keeps the
+/// segment width stable and ≤ ~28 cells by preferring fixed-width
+/// detail (percentage, then `X/Y` if the message starts with one) and
+/// otherwise dropping the message in favour of `stage…`.
+pub fn format_lsp_progress_segment(
+    label: &str,
+    progress: Option<&crate::core::lsp_manager::LspProgress>,
+) -> String {
+    let Some(progress) = progress else {
+        return format!("{label}… ");
+    };
+    let stage = if progress.title.is_empty() {
+        "working"
+    } else {
+        progress.title.as_str()
+    };
+    let detail = compact_progress_detail(progress.message.as_deref(), progress.percentage);
+    if detail.is_empty() {
+        format!("{label} • {stage}… ")
+    } else {
+        format!("{label} • {stage}: {detail} ")
+    }
+}
+
+/// Pick a compact, fixed-width-ish detail string from the progress
+/// fields. Preference order:
+///   1. `percentage` — always at most 4 chars (`100%`).
+///   2. Leading `X/Y` of the message (rust-analyzer's path-laden
+///      messages like `"34/285: /home/john/…"` collapse to `34/285`).
+///   3. Empty — caller renders `stage…` instead. Skipping verbose
+///      free-text messages keeps the segment from flapping width on
+///      every `$/progress` report.
+fn compact_progress_detail(message: Option<&str>, percentage: Option<u32>) -> String {
+    if let Some(pct) = percentage {
+        return format!("{pct}%");
+    }
+    if let Some(msg) = message {
+        if let Some(prefix) = extract_xy_prefix(msg) {
+            return prefix.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Extract a leading `digit+/digit+` prefix from a message, e.g.
+/// `"34/285"` from `"34/285: /home/john/…"` or `"34/285"`. Returns
+/// None when the message doesn't start with that shape.
+fn extract_xy_prefix(msg: &str) -> Option<&str> {
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i == bytes.len() || bytes[i] != b'/' {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == i + 1 {
+        return None;
+    }
+    Some(&msg[..j])
+}
+
 /// Build a per-window status line for a given window.
 /// Active windows get a rich, colorful bar; inactive windows get dimmed minimal info.
 pub fn build_window_status_line(
@@ -7870,78 +10916,30 @@ pub fn build_window_status_line(
         let lsp_status = window
             .map(|w| engine.lsp_status_for_buffer(w.buffer_id))
             .unwrap_or(crate::core::lsp_manager::LspStatus::None);
+        // #221: when indexing is in flight, format `name • Indexing: 319/320`
+        // from the latest $/progress snapshot. Falls back to the plain
+        // `name…` placeholder when the server isn't reporting progress.
+        let lsp_progress = window.and_then(|w| engine.lsp_progress_for_buffer(w.buffer_id));
 
-        // Right side: LSP  filetype  indent  utf-8  LF/CRLF  Ln:Col
+        // Right side — ordered least-important → most-important (left → right
+        // when right-aligned). Narrow bars drop from the front of this list,
+        // so cursor position (highest priority) stays at the right edge.
+        // See issue #159 for priority rationale.
+        //
+        // Drop order (least → most important):
+        //   notification · menu toggle · panel toggle · sidebar toggle ·
+        //   utf-8 · line ending · indent · filetype · LSP · cursor pos
         let mut right = Vec::new();
-        {
-            use crate::core::lsp_manager::LspStatus;
-            let (lsp_text, lsp_fg) = match &lsp_status {
-                LspStatus::Running(name) => (Some(format!("{} ", name)), bar_fg),
-                LspStatus::Initializing(name) => {
-                    let label = if name.is_empty() { "LSP" } else { name };
-                    (Some(format!("{}… ", label)), theme.status_inactive_fg)
-                }
-                LspStatus::Installing => (Some("LSP↓ ".to_string()), theme.status_inactive_fg),
-                LspStatus::Crashed => (Some("LSP✗ ".to_string()), theme.status_mode_replace_bg),
-                LspStatus::None => (None, bar_fg),
-            };
-            if let Some(text) = lsp_text {
-                right.push(StatusSegment {
-                    text,
-                    fg: lsp_fg,
-                    bg: bar_bg,
-                    bold: false,
-                    action: Some(StatusAction::LspInfo),
-                });
-            }
-        }
-        if !filetype.is_empty() {
-            right.push(StatusSegment {
-                text: format!("{} ", filetype),
-                fg: bar_fg,
-                bg: bar_bg,
-                bold: false,
-                action: Some(StatusAction::ChangeLanguage),
-            });
-        }
-        right.push(StatusSegment {
-            text: indent_text.clone(),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ChangeIndentation),
-        });
-        right.push(StatusSegment {
-            text: "utf-8 ".to_string(),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ChangeEncoding),
-        });
-        right.push(StatusSegment {
-            text: format!("{} ", line_ending_str),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ChangeLineEnding),
-        });
-        if let Some(c) = cursor {
-            right.push(StatusSegment {
-                text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
-                fg: bar_fg,
-                bg: bar_bg,
-                bold: false,
-                action: Some(StatusAction::GoToLine),
-            });
-        }
 
-        // Notification indicator — spinner for in-progress, bell for done
-        if !engine.notifications.is_empty() {
+        // Build each segment optionally; push at the end in priority order.
+        // (Segments whose data is absent simply stay None and aren't pushed.)
+
+        // Notification — spinner for in-progress, bell for done
+        let notification_seg = if !engine.notifications.is_empty() {
             let nf = crate::icons::nerd_fonts_enabled();
             let has_active = engine.has_active_notifications();
             let has_done = engine.has_done_notifications();
             let (icon, fg_color) = if has_active {
-                // Spinner icon for in-progress operations
                 let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
                 let elapsed = engine
                     .notifications
@@ -7952,16 +10950,14 @@ pub fn build_window_status_line(
                     .map(|t| t.elapsed().as_millis() as usize / 100)
                     .unwrap_or(0);
                 let frame = frames[elapsed % frames.len()];
-                (format!("{frame}"), theme.function) // use function color (blue-ish) for spinner
+                (format!("{frame}"), theme.function)
             } else if has_done {
-                // Bell icon for completed notifications
                 let bell: &str = if nf { "󰂞" } else { "*" };
-                (bell.to_string(), theme.string_lit) // use string color (green-ish) for done
+                (bell.to_string(), theme.string_lit)
             } else {
                 (String::new(), bar_fg)
             };
             if !icon.is_empty() {
-                // Show the most recent notification message (truncated)
                 let msg = engine
                     .notifications
                     .last()
@@ -7978,17 +10974,21 @@ pub fn build_window_status_line(
                 } else {
                     None
                 };
-                right.push(StatusSegment {
+                Some(StatusSegment {
                     text: format!(" {icon} {msg} "),
                     fg: fg_color,
                     bg: bar_bg,
                     bold: false,
                     action,
-                });
+                })
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        // Layout toggle buttons — dim when inactive, normal when active
+        // Layout toggle buttons
         let toggle_fg = |active: bool| {
             if active {
                 bar_fg
@@ -7996,36 +10996,122 @@ pub fn build_window_status_line(
                 theme.status_inactive_fg
             }
         };
-
         let nf = crate::icons::nerd_fonts_enabled();
 
-        let sidebar_active = engine.session.explorer_visible;
-        right.push(StatusSegment {
-            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
-            fg: toggle_fg(sidebar_active),
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::ToggleSidebar),
-        });
-
-        let panel_active = engine.terminal_open || engine.bottom_panel_open;
-        right.push(StatusSegment {
-            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
-            fg: toggle_fg(panel_active),
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::TogglePanel),
-        });
-
-        if engine.menu_bar_toggleable {
-            let menu_active = engine.menu_bar_visible;
-            right.push(StatusSegment {
+        let menu_toggle_seg = if engine.menu_bar_toggleable {
+            Some(StatusSegment {
                 text: if nf { " 󰍜 " } else { " [M] " }.to_string(),
-                fg: toggle_fg(menu_active),
+                fg: toggle_fg(engine.menu_bar_visible),
                 bg: bar_bg,
                 bold: false,
                 action: Some(StatusAction::ToggleMenuBar),
-            });
+            })
+        } else {
+            None
+        };
+
+        let panel_toggle_seg = StatusSegment {
+            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
+            fg: toggle_fg(engine.terminal_open || engine.bottom_panel_open),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::TogglePanel),
+        };
+
+        let sidebar_toggle_seg = StatusSegment {
+            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
+            fg: toggle_fg(engine.session.explorer_visible),
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ToggleSidebar),
+        };
+
+        let encoding_seg = StatusSegment {
+            text: "utf-8 ".to_string(),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeEncoding),
+        };
+
+        let line_ending_seg = StatusSegment {
+            text: format!("{} ", line_ending_str),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeLineEnding),
+        };
+
+        let indent_seg = StatusSegment {
+            text: indent_text.clone(),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ChangeIndentation),
+        };
+
+        let filetype_seg = if !filetype.is_empty() {
+            Some(StatusSegment {
+                text: format!("{} ", filetype),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::ChangeLanguage),
+            })
+        } else {
+            None
+        };
+
+        let lsp_seg = {
+            use crate::core::lsp_manager::LspStatus;
+            let (lsp_text, lsp_fg) = match &lsp_status {
+                LspStatus::Running(name) => (Some(format!("{} ", name)), bar_fg),
+                LspStatus::Initializing(name) => {
+                    let label = if name.is_empty() { "LSP" } else { name };
+                    let text = format_lsp_progress_segment(label, lsp_progress.as_ref());
+                    (Some(text), theme.status_inactive_fg)
+                }
+                LspStatus::Installing => (Some("LSP↓ ".to_string()), theme.status_inactive_fg),
+                LspStatus::Crashed => (Some("LSP✗ ".to_string()), theme.status_mode_replace_bg),
+                LspStatus::None => (None, bar_fg),
+            };
+            lsp_text.map(|text| StatusSegment {
+                text,
+                fg: lsp_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::LspInfo),
+            })
+        };
+
+        let cursor_seg = cursor.map(|c| StatusSegment {
+            text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
+            fg: bar_fg,
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::GoToLine),
+        });
+
+        // Push in priority order: least-important first.
+        if let Some(s) = notification_seg {
+            right.push(s);
+        }
+        if let Some(s) = menu_toggle_seg {
+            right.push(s);
+        }
+        right.push(panel_toggle_seg);
+        right.push(sidebar_toggle_seg);
+        right.push(encoding_seg);
+        right.push(line_ending_seg);
+        right.push(indent_seg);
+        if let Some(s) = filetype_seg {
+            right.push(s);
+        }
+        if let Some(s) = lsp_seg {
+            right.push(s);
+        }
+        if let Some(s) = cursor_seg {
+            right.push(s);
         }
 
         WindowStatusLine {
@@ -8113,6 +11199,661 @@ pub fn resolve_status_bar_click(
         }
     }
     None
+}
+
+// ─── quadraui::Terminal adapter (A.7) ────────────────────────────────────────
+
+/// Convert a vimcode `TerminalCell` row grid into a `quadraui::Terminal`
+/// snapshot. Used by both TUI (`render_terminal_pane_cells`) and GTK
+/// (`draw_terminal_cells`) so the per-cell rendering path is shared.
+///
+/// The conversion is a 1:1 mapping — render-side cells already carry the
+/// overlay flags (selected, is_cursor, is_find_match, is_find_active) the
+/// primitive expects.
+pub fn terminal_cells_to_quadraui(
+    rows: &[Vec<TerminalCell>],
+    id: quadraui::WidgetId,
+    scrollbar: Option<quadraui::TerminalScrollbar>,
+) -> quadraui::Terminal {
+    let cells = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| quadraui::TerminalCell {
+                    ch: c.ch,
+                    fg: quadraui::Color::rgb(c.fg.0, c.fg.1, c.fg.2),
+                    bg: quadraui::Color::rgb(c.bg.0, c.bg.1, c.bg.2),
+                    bold: c.bold,
+                    italic: c.italic,
+                    underline: c.underline,
+                    selected: c.selected,
+                    is_cursor: c.is_cursor,
+                    is_find_match: c.is_find_match,
+                    is_find_active: c.is_find_active,
+                })
+                .collect()
+        })
+        .collect();
+    quadraui::Terminal {
+        id,
+        cells,
+        scrollbar,
+    }
+}
+
+// ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────
+
+/// Build a `quadraui::TabBar` primitive from the render-level tab args.
+/// Shared by TUI and GTK backends — the primitive is layout-agnostic;
+/// backends interpret it against their own measurement / drawing models.
+///
+/// Right-side segment order (mirrors the pre-migration layout):
+/// `[diff label?] [diff prev] [diff next] [diff fold?] [split right] [split down] [action menu]`
+///
+/// `active_accent` carries the active-tab accent colour only when the group
+/// is focused. TUI interprets as underline; GTK as 2px top bar.
+/// `width_cells` on each segment is a TUI hint; GTK measures with Pango.
+pub fn build_tab_bar_primitive(
+    tabs: &[TabInfo],
+    show_split_btns: bool,
+    diff_toolbar: Option<&DiffToolbarData>,
+    tab_scroll_offset: usize,
+    active_accent: Option<quadraui::Color>,
+) -> quadraui::TabBar {
+    let tab_items: Vec<quadraui::TabItem> = tabs
+        .iter()
+        .map(|t| quadraui::TabItem {
+            label: t.name.clone(),
+            is_active: t.active,
+            is_dirty: t.dirty,
+            is_preview: t.preview,
+            is_closable: true,
+        })
+        .collect();
+
+    let mut right: Vec<quadraui::TabBarSegment> = Vec::new();
+
+    // Build a 3-cell tab-bar button segment from an `Icon`. When nerd
+    // fonts are enabled, the icon glyph is rendered as a 2-cell wide
+    // glyph (` <wide>`); otherwise the fallback ASCII char takes 1
+    // cell, padded with spaces (` <c> `). Either way `width_cells = 3`
+    // matches the rasteriser's per-cell stride so layout positions
+    // line up with what gets painted.
+    fn tab_btn_segment(
+        icon: &crate::icons::Icon,
+        id: &str,
+        is_active: bool,
+    ) -> quadraui::TabBarSegment {
+        let text = if crate::icons::nerd_fonts_enabled() {
+            format!(" {}", icon.s())
+        } else {
+            format!(" {} ", icon.s())
+        };
+        quadraui::TabBarSegment {
+            text,
+            width_cells: 3,
+            id: Some(quadraui::WidgetId::new(id)),
+            is_active,
+        }
+    }
+
+    if let Some(dt) = diff_toolbar {
+        if let Some(label) = &dt.change_label {
+            let text = format!(" {label}");
+            let width = text.chars().count() as u16;
+            right.push(quadraui::TabBarSegment {
+                text,
+                width_cells: width,
+                id: None,
+                is_active: false,
+            });
+        }
+        right.push(tab_btn_segment(
+            &crate::icons::DIFF_PREV,
+            "tab:diff_prev",
+            false,
+        ));
+        right.push(tab_btn_segment(
+            &crate::icons::DIFF_NEXT,
+            "tab:diff_next",
+            false,
+        ));
+        right.push(tab_btn_segment(
+            &crate::icons::DIFF_FOLD,
+            "tab:diff_toggle",
+            dt.unchanged_hidden,
+        ));
+    }
+
+    if show_split_btns {
+        right.push(tab_btn_segment(
+            &crate::icons::SPLIT_RIGHT,
+            "tab:split_right",
+            false,
+        ));
+        right.push(tab_btn_segment(
+            &crate::icons::SPLIT_DOWN,
+            "tab:split_down",
+            false,
+        ));
+    }
+
+    right.push(quadraui::TabBarSegment {
+        // Action menu uses U+22EF (HORIZONTAL ELLIPSIS) which is a
+        // standard Unicode glyph, not a Nerd Font codepoint.
+        text: " \u{22EF} ".to_string(),
+        width_cells: 3,
+        id: Some(quadraui::WidgetId::new("tab:action_menu")),
+        is_active: false,
+    });
+
+    quadraui::TabBar {
+        id: quadraui::WidgetId::new("tabs:group"),
+        tabs: tab_items,
+        scroll_offset: tab_scroll_offset,
+        right_segments: right,
+        active_accent,
+        show_tab_close: true,
+        compact: false,
+    }
+}
+
+/// Build a `quadraui::TabBar` for the bottom panel tab switcher
+/// (Terminal / Debug Output). The close button (×) is a right segment.
+/// Tabs with `close_width: 0.0` suppress per-tab close glyphs.
+pub fn build_bottom_panel_tab_bar(
+    active: &BottomPanelKind,
+    has_terminal: bool,
+    has_debug_output: bool,
+) -> quadraui::TabBar {
+    let mut tabs = Vec::new();
+    if has_terminal {
+        tabs.push(quadraui::TabItem {
+            label: "Terminal".to_string(),
+            is_active: *active == BottomPanelKind::Terminal,
+            is_dirty: false,
+            is_preview: false,
+            is_closable: true,
+        });
+    }
+    if has_debug_output {
+        tabs.push(quadraui::TabItem {
+            label: "Debug Output".to_string(),
+            is_active: *active == BottomPanelKind::DebugOutput,
+            is_dirty: false,
+            is_preview: false,
+            is_closable: true,
+        });
+    }
+
+    let close_seg = quadraui::TabBarSegment {
+        text: " \u{00d7} ".to_string(),
+        width_cells: 3,
+        id: Some(quadraui::WidgetId::new("bottom_tab:close")),
+        is_active: false,
+    };
+
+    quadraui::TabBar {
+        id: quadraui::WidgetId::new("tabs:bottom_panel"),
+        tabs,
+        scroll_offset: 0,
+        right_segments: vec![close_seg],
+        active_accent: None,
+        show_tab_close: false,
+        compact: true,
+    }
+}
+
+// ─── Terminal toolbar adapter (#305) ─────────────────────────────────────────
+
+/// Nerd-font icons for the terminal toolbar segments.
+const NF_TERM_CLOSE: &str = "󰅖";
+const NF_TERM_SPLIT: &str = "󰤼";
+const NF_TERM_MAXIMIZE: &str = "󰊗";
+const NF_TERM_UNMAXIMIZE: &str = "󰊓";
+
+/// The terminal toolbar is either a find bar or a tab strip.
+pub enum TerminalToolbar {
+    FindBar(quadraui::StatusBar),
+    TabStrip(quadraui::TabBar),
+}
+
+/// Build a `TerminalToolbar` from the current terminal panel state.
+pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalToolbar {
+    if panel.find_active {
+        let fg = to_quadraui_color(theme.status_fg);
+        let bg = to_quadraui_color(theme.status_bg);
+
+        let match_info = if panel.find_match_count == 0 {
+            if panel.find_query.is_empty() {
+                String::new()
+            } else {
+                " (no matches)".to_string()
+            }
+        } else {
+            format!(
+                " ({}/{})",
+                panel.find_selected_idx + 1,
+                panel.find_match_count
+            )
+        };
+        let find_text = format!(" FIND: {}█{}", panel.find_query, match_info);
+
+        TerminalToolbar::FindBar(quadraui::StatusBar {
+            id: quadraui::WidgetId::new("term_toolbar"),
+            left_segments: vec![quadraui::StatusBarSegment {
+                text: find_text,
+                fg,
+                bg,
+                bold: false,
+                action_id: None,
+            }],
+            right_segments: vec![quadraui::StatusBarSegment {
+                text: format!(" {} ", NF_TERM_CLOSE),
+                fg,
+                bg,
+                bold: false,
+                action_id: Some(quadraui::WidgetId::new("term_toolbar:find_close")),
+            }],
+        })
+    } else {
+        let mut tabs: Vec<quadraui::TabItem> = (0..panel.tab_count)
+            .map(|i| quadraui::TabItem {
+                label: format!("[{}]", i + 1),
+                is_active: i == panel.active_tab,
+                is_dirty: false,
+                is_preview: false,
+                is_closable: true,
+            })
+            .collect();
+
+        if tabs.is_empty() {
+            tabs.push(quadraui::TabItem {
+                label: "TERMINAL".to_string(),
+                is_active: false,
+                is_dirty: false,
+                is_preview: false,
+                is_closable: true,
+            });
+        }
+
+        let maxicon = if panel.maximized {
+            NF_TERM_UNMAXIMIZE
+        } else {
+            NF_TERM_MAXIMIZE
+        };
+
+        let right = vec![
+            quadraui::TabBarSegment {
+                text: "+ ".to_string(),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:add")),
+                is_active: false,
+            },
+            quadraui::TabBarSegment {
+                text: format!("{} ", NF_TERM_SPLIT),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:split")),
+                is_active: false,
+            },
+            quadraui::TabBarSegment {
+                text: format!("{} ", maxicon),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:maximize")),
+                is_active: false,
+            },
+            quadraui::TabBarSegment {
+                text: format!("{} ", NF_TERM_CLOSE),
+                width_cells: 2,
+                id: Some(quadraui::WidgetId::new("term_toolbar:close")),
+                is_active: false,
+            },
+        ];
+
+        TerminalToolbar::TabStrip(quadraui::TabBar {
+            id: quadraui::WidgetId::new("term_toolbar"),
+            tabs,
+            scroll_offset: 0,
+            right_segments: right,
+            active_accent: None,
+            show_tab_close: false,
+            compact: true,
+        })
+    }
+}
+
+/// Convert a vimcode `Color` into a `quadraui::Color`. Used by GTK to pass
+/// the theme accent colour into `build_tab_bar_primitive`.
+pub fn to_quadraui_color(c: Color) -> quadraui::Color {
+    quadraui::Color::rgb(c.r, c.g, c.b)
+}
+
+/// Build the backend-agnostic `quadraui::Theme` from vimcode's rich
+/// `render::Theme`. Shared by both TUI and GTK backends — every
+/// `draw_*` delegate and `Backend::set_current_theme` call site uses
+/// this single source of truth.
+pub fn to_quadraui_theme(theme: &Theme) -> quadraui::Theme {
+    let chrome = to_quadraui_theme_chrome(theme);
+    to_quadraui_theme_editor(theme, chrome)
+}
+
+fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
+    let q = to_quadraui_color;
+    quadraui::Theme {
+        background: q(theme.background),
+        foreground: q(theme.foreground),
+        tab_bar_bg: q(theme.tab_bar_bg),
+        tab_active_bg: q(theme.tab_active_bg),
+        tab_active_fg: q(theme.tab_active_fg),
+        tab_inactive_fg: q(theme.tab_inactive_fg),
+        tab_preview_active_fg: q(theme.tab_preview_active_fg),
+        tab_preview_inactive_fg: q(theme.tab_preview_inactive_fg),
+        separator: q(theme.separator),
+        surface_bg: q(theme.fuzzy_bg),
+        surface_fg: q(theme.fuzzy_fg),
+        selected_bg: q(theme.fuzzy_selected_bg),
+        border_fg: q(theme.fuzzy_border),
+        title_fg: q(theme.fuzzy_title_fg),
+        header_bg: q(theme.status_bg),
+        header_fg: q(theme.status_fg),
+        muted_fg: q(theme.line_number_fg),
+        error_fg: q(theme.diagnostic_error),
+        warning_fg: q(theme.diagnostic_warning),
+        query_fg: q(theme.fuzzy_query_fg),
+        match_fg: q(theme.fuzzy_match_fg),
+        accent_fg: q(theme.cursor),
+        hover_bg: q(theme.hover_bg),
+        hover_fg: q(theme.hover_fg),
+        hover_border: q(theme.hover_border),
+        input_bg: q(theme.completion_bg),
+        inactive_fg: q(theme.status_inactive_fg),
+        selection_bg: q(theme.selection),
+        link_fg: q(theme.md_link),
+        completion_bg: q(theme.completion_bg),
+        completion_fg: q(theme.completion_fg),
+        completion_border: q(theme.completion_border),
+        completion_selected_bg: q(theme.completion_selected_bg),
+        accent_bg: q(theme.tab_active_accent),
+        scrollbar_track: q(theme.separator),
+        scrollbar_thumb: q(theme.scrollbar_thumb),
+        ..quadraui::Theme::default()
+    }
+}
+
+fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui::Theme {
+    let q = to_quadraui_color;
+    quadraui::Theme {
+        editor_active_background: q(theme.active_background),
+        cursorline_bg: q(theme.cursorline_bg),
+        dap_stopped_bg: q(theme.dap_stopped_bg),
+        colorcolumn_bg: q(theme.colorcolumn_bg),
+        diff_added_bg: q(theme.diff_added_bg),
+        diff_removed_bg: q(theme.diff_removed_bg),
+        diff_padding_bg: q(theme.diff_padding_bg),
+        line_number_fg: q(theme.line_number_fg),
+        line_number_active_fg: q(theme.line_number_active_fg),
+        diagnostic_error: q(theme.diagnostic_error),
+        diagnostic_warning: q(theme.diagnostic_warning),
+        diagnostic_info: q(theme.diagnostic_info),
+        diagnostic_hint: q(theme.diagnostic_hint),
+        git_added: q(theme.git_added),
+        git_modified: q(theme.git_modified),
+        git_deleted: q(theme.git_deleted),
+        lightbulb: q(theme.lightbulb),
+        spell_error: q(theme.spell_error),
+        cursor: q(theme.cursor),
+        cursor_normal_alpha: theme.cursor_normal_alpha as f32,
+        selection: q(theme.selection),
+        selection_alpha: theme.selection_alpha as f32,
+        yank_highlight_bg: q(theme.yank_highlight_bg),
+        yank_highlight_alpha: theme.yank_highlight_alpha as f32,
+        bracket_match_bg: q(theme.bracket_match_bg),
+        indent_guide_fg: q(theme.indent_guide_fg),
+        indent_guide_active_fg: q(theme.indent_guide_active_fg),
+        annotation_fg: q(theme.annotation_fg),
+        ghost_text_fg: q(theme.ghost_text_fg),
+        ..chrome
+    }
+}
+
+// ─── quadraui::Editor adapter (#276 Stage 1C) ────────────────────────────────
+//
+// Convert a vimcode `RenderedWindow` (engine-side IR) into a
+// `quadraui::Editor` for the lifted TUI / GTK rasterisers. Field-for-
+// field mapping; the engine builder remains unchanged (`RenderedWindow`
+// is still consumed by mouse hit-testing in `tui_main/mouse.rs` and
+// `gtk/click.rs`, which is why we adapt at the boundary rather than
+// retargeting the builder).
+
+/// Build a [`quadraui::Editor`] from a [`RenderedWindow`]. The
+/// per-window status line is **not** included — the caller paints
+/// it after calling `draw_editor` (status-line lift was Session 241).
+pub fn to_q_editor(rw: &RenderedWindow) -> quadraui::Editor {
+    quadraui::Editor {
+        id: quadraui::WidgetId::new(format!("editor:{}", rw.window_id.0)),
+        rect: quadraui::Rect::new(
+            rw.rect.x as f32,
+            rw.rect.y as f32,
+            rw.rect.width as f32,
+            rw.rect.height as f32,
+        ),
+        lines: rw.lines.iter().map(to_q_editor_line).collect(),
+        cursor: rw.cursor.map(|(pos, shape)| quadraui::EditorCursor {
+            pos: to_q_cursor_pos(pos),
+            shape: to_q_cursor_shape(shape),
+        }),
+        extra_cursors: rw
+            .extra_cursors
+            .iter()
+            .copied()
+            .map(to_q_cursor_pos)
+            .collect(),
+        selection: rw.selection.as_ref().map(to_q_selection),
+        extra_selections: rw.extra_selections.iter().map(to_q_selection).collect(),
+        yank_highlight: rw.yank_highlight.as_ref().map(to_q_selection),
+        scroll_top: rw.scroll_top,
+        scroll_left: rw.scroll_left,
+        total_lines: rw.total_lines,
+        max_col: rw.max_col,
+        gutter_char_width: rw.gutter_char_width,
+        is_active: rw.is_active,
+        show_active_bg: rw.show_active_bg,
+        has_git_diff: rw.has_git_diff,
+        has_breakpoints: rw.has_breakpoints,
+        diagnostic_gutter: rw
+            .diagnostic_gutter
+            .iter()
+            .map(|(&l, &s)| (l, to_q_severity(s)))
+            .collect(),
+        code_action_lines: rw.code_action_lines.iter().copied().collect(),
+        bracket_match_positions: rw.bracket_match_positions.clone(),
+        active_indent_col: rw.active_indent_col,
+        tabstop: rw.tabstop,
+        cursorline: rw.cursorline,
+        lightbulb_glyph: crate::icons::LIGHTBULB.c(),
+    }
+}
+
+fn to_q_editor_line(rl: &RenderedLine) -> quadraui::EditorLine {
+    quadraui::EditorLine {
+        raw_text: rl.raw_text.clone(),
+        gutter_text: rl.gutter_text.clone(),
+        spans: rl.spans.iter().map(to_q_styled_span).collect(),
+        line_idx: rl.line_idx,
+        is_current_line: rl.is_current_line,
+        is_fold_header: rl.is_fold_header,
+        folded_line_count: rl.folded_line_count,
+        git_diff: rl.git_diff.map(to_q_git_status),
+        diff_status: rl.diff_status.map(to_q_diff_line),
+        diagnostics: rl.diagnostics.iter().map(to_q_diagnostic_mark).collect(),
+        spell_errors: rl.spell_errors.iter().map(to_q_spell_mark).collect(),
+        is_breakpoint: rl.is_breakpoint,
+        is_conditional_bp: rl.is_conditional_bp,
+        is_dap_current: rl.is_dap_current,
+        is_wrap_continuation: rl.is_wrap_continuation,
+        segment_col_offset: rl.segment_col_offset,
+        annotation: rl.annotation.clone(),
+        ghost_suffix: rl.ghost_suffix.clone(),
+        is_ghost_continuation: rl.is_ghost_continuation,
+        indent_guides: rl.indent_guides.clone(),
+        colorcolumns: rl.colorcolumns.clone(),
+    }
+}
+
+fn to_q_styled_span(span: &StyledSpan) -> quadraui::EditorStyledSpan {
+    quadraui::EditorStyledSpan {
+        start_byte: span.start_byte,
+        end_byte: span.end_byte,
+        style: quadraui::EditorStyle {
+            fg: to_quadraui_color(span.style.fg),
+            bg: span.style.bg.map(to_quadraui_color),
+            bold: span.style.bold,
+            italic: span.style.italic,
+            font_scale: span.style.font_scale as f32,
+        },
+    }
+}
+
+fn to_q_cursor_pos(pos: CursorPos) -> quadraui::EditorCursorPos {
+    quadraui::EditorCursorPos {
+        view_line: pos.view_line,
+        col: pos.col,
+    }
+}
+
+fn to_q_cursor_shape(shape: CursorShape) -> quadraui::EditorCursorShape {
+    match shape {
+        CursorShape::Block => quadraui::EditorCursorShape::Block,
+        CursorShape::Bar => quadraui::EditorCursorShape::Bar,
+        CursorShape::Underline => quadraui::EditorCursorShape::Underline,
+    }
+}
+
+fn to_q_selection(sel: &SelectionRange) -> quadraui::EditorSelection {
+    quadraui::EditorSelection {
+        kind: match sel.kind {
+            SelectionKind::Char => quadraui::EditorSelectionKind::Char,
+            SelectionKind::Line => quadraui::EditorSelectionKind::Line,
+            SelectionKind::Block => quadraui::EditorSelectionKind::Block,
+        },
+        start_line: sel.start_line,
+        start_col: sel.start_col,
+        end_line: sel.end_line,
+        end_col: sel.end_col,
+    }
+}
+
+fn to_q_severity(s: crate::core::lsp::DiagnosticSeverity) -> quadraui::DiagnosticSeverity {
+    use crate::core::lsp::DiagnosticSeverity as V;
+    match s {
+        V::Error => quadraui::DiagnosticSeverity::Error,
+        V::Warning => quadraui::DiagnosticSeverity::Warning,
+        V::Information => quadraui::DiagnosticSeverity::Information,
+        V::Hint => quadraui::DiagnosticSeverity::Hint,
+    }
+}
+
+fn to_q_git_status(s: GitLineStatus) -> quadraui::GitLineStatus {
+    match s {
+        GitLineStatus::Added => quadraui::GitLineStatus::Added,
+        GitLineStatus::Modified => quadraui::GitLineStatus::Modified,
+        GitLineStatus::Deleted => quadraui::GitLineStatus::Deleted,
+    }
+}
+
+fn to_q_diff_line(d: DiffLine) -> quadraui::DiffLine {
+    match d {
+        DiffLine::Same => quadraui::DiffLine::Same,
+        DiffLine::Added => quadraui::DiffLine::Added,
+        DiffLine::Removed => quadraui::DiffLine::Removed,
+        DiffLine::Padding => quadraui::DiffLine::Padding,
+    }
+}
+
+fn to_q_diagnostic_mark(dm: &DiagnosticMark) -> quadraui::DiagnosticMark {
+    quadraui::DiagnosticMark {
+        start_col: dm.start_col,
+        end_col: dm.end_col,
+        severity: to_q_severity(dm.severity),
+        message: dm.message.clone(),
+    }
+}
+
+fn to_q_spell_mark(sm: &SpellMark) -> quadraui::SpellMark {
+    quadraui::SpellMark {
+        start_col: sm.start_col,
+        end_col: sm.end_col,
+    }
+}
+
+// ─── quadraui::StatusBar adapter (A.6a) ──────────────────────────────────────
+
+/// String id encoding a `StatusAction`. Paired with [`status_action_from_id`].
+/// Used to adapt vimcode's engine-side `StatusAction` enum to quadraui's
+/// type-erased `WidgetId`-keyed segment actions.
+pub fn status_action_id(action: &StatusAction) -> &'static str {
+    match action {
+        StatusAction::GoToLine => "status:goto_line",
+        StatusAction::ChangeLanguage => "status:change_language",
+        StatusAction::ChangeIndentation => "status:change_indentation",
+        StatusAction::ChangeLineEnding => "status:change_line_ending",
+        StatusAction::ChangeEncoding => "status:change_encoding",
+        StatusAction::SwitchBranch => "status:switch_branch",
+        StatusAction::LspInfo => "status:lsp_info",
+        StatusAction::ToggleSidebar => "status:toggle_sidebar",
+        StatusAction::TogglePanel => "status:toggle_panel",
+        StatusAction::ToggleMenuBar => "status:toggle_menu_bar",
+        StatusAction::DismissNotifications => "status:dismiss_notifications",
+    }
+}
+
+/// Inverse of [`status_action_id`]: decode a `WidgetId` string back into a
+/// `StatusAction`. Returns `None` for unknown ids (plugin-emitted, future, etc.).
+pub fn status_action_from_id(id: &str) -> Option<StatusAction> {
+    match id {
+        "status:goto_line" => Some(StatusAction::GoToLine),
+        "status:change_language" => Some(StatusAction::ChangeLanguage),
+        "status:change_indentation" => Some(StatusAction::ChangeIndentation),
+        "status:change_line_ending" => Some(StatusAction::ChangeLineEnding),
+        "status:change_encoding" => Some(StatusAction::ChangeEncoding),
+        "status:switch_branch" => Some(StatusAction::SwitchBranch),
+        "status:lsp_info" => Some(StatusAction::LspInfo),
+        "status:toggle_sidebar" => Some(StatusAction::ToggleSidebar),
+        "status:toggle_panel" => Some(StatusAction::TogglePanel),
+        "status:toggle_menu_bar" => Some(StatusAction::ToggleMenuBar),
+        "status:dismiss_notifications" => Some(StatusAction::DismissNotifications),
+        _ => None,
+    }
+}
+
+/// Convert a `WindowStatusLine` (built by `build_window_status_line`) into a
+/// `quadraui::StatusBar` primitive. Engine-owned `StatusAction` enums are
+/// flattened to opaque `WidgetId` strings so the primitive is
+/// engine-agnostic (plugin invariants §10).
+///
+/// `id` identifies the bar (useful if multiple status bars are rendered, e.g.
+/// per-window). Callers can use e.g. `WidgetId::new("status:w0")`.
+pub fn window_status_line_to_status_bar(
+    status: &WindowStatusLine,
+    id: quadraui::WidgetId,
+) -> quadraui::StatusBar {
+    fn to_seg(s: &StatusSegment) -> quadraui::StatusBarSegment {
+        quadraui::StatusBarSegment {
+            text: s.text.clone(),
+            fg: quadraui::Color::rgb(s.fg.r, s.fg.g, s.fg.b),
+            bg: quadraui::Color::rgb(s.bg.r, s.bg.g, s.bg.b),
+            bold: s.bold,
+            action_id: s
+                .action
+                .as_ref()
+                .map(|a| quadraui::WidgetId::new(status_action_id(a))),
+        }
+    }
+    quadraui::StatusBar {
+        id,
+        left_segments: status.left_segments.iter().map(to_seg).collect(),
+        right_segments: status.right_segments.iter().map(to_seg).collect(),
+    }
 }
 
 fn build_command_line(engine: &Engine) -> CommandLineData {
@@ -8208,6 +11949,426 @@ pub enum ClickTarget {
     None,
 }
 
+// ─── Shared screen-level hit-test (#344) ─────────────────────────────────────
+
+/// Top-level screen zone identified by a coordinate hit-test.
+///
+/// Coordinates are in the "editor content bounds" frame — both backends
+/// subtract their chrome (sidebar, menu bar, terminal panel, status bar)
+/// before calling [`screen_zone_hit_test`].
+#[derive(Debug)]
+pub enum ScreenZone {
+    /// Point is in a group's tab bar area.
+    TabBar {
+        group_id: GroupId,
+        local_x: f64,
+        bar_width: f64,
+    },
+    /// Point is on a breadcrumb bar.
+    Breadcrumb {
+        index: usize,
+        local_x: f64,
+        bar_width: f64,
+    },
+    /// Point is on a group divider.
+    GroupDivider { split_index: usize },
+    /// Point is in an editor window.
+    Window {
+        window_id: WindowId,
+        window_idx: usize,
+        rel_x: f64,
+        rel_y: f64,
+    },
+    /// Point is outside all editor zones.
+    None,
+}
+
+/// Sub-zone within an editor window.
+#[derive(Debug)]
+pub enum WindowZone {
+    /// Per-window status bar.
+    StatusBar { local_x: f64, bar_width: f64 },
+    /// Gutter area (breakpoint, git diff, fold indicator columns).
+    Gutter {
+        view_row: usize,
+        gutter_col: usize,
+        line_idx: usize,
+    },
+    /// Vertical scrollbar column.
+    VerticalScrollbar { view_row: usize },
+    /// Horizontal scrollbar row.
+    HorizontalScrollbar { local_x: f64 },
+    /// Text area (editable content).
+    TextArea {
+        view_row: usize,
+        buf_line: usize,
+        seg_col_offset: usize,
+        text_rel_x: f64,
+    },
+}
+
+/// Action to take on a gutter click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GutterAction {
+    ToggleBreakpoint(usize),
+    DiffPeek(usize),
+    DiagnosticHover(usize),
+    CodeAction(usize),
+    ToggleFold(usize),
+}
+
+/// Determine which top-level screen zone a point falls in.
+///
+/// `x` and `y` are in the editor content-bounds coordinate system.
+/// `tab_bar_height` is the height of a tab bar row (in the same unit).
+/// `single_tab_hidden` should be `true` when `hide_single_tab` is active and
+/// there is only one tab — the tab bar row is not rendered and the window rect
+/// extends upward to reclaim the space.
+/// `active_group` is the engine's current active group ID — used as the group
+/// ID for single-group tab bar hits (the ScreenLayout doesn't carry it).
+/// Both backends subtract their own chrome before calling this.
+pub fn screen_zone_hit_test(
+    layout: &ScreenLayout,
+    x: f64,
+    y: f64,
+    tab_bar_height: f64,
+    single_tab_hidden: bool,
+    active_group: GroupId,
+) -> ScreenZone {
+    // 1. Tab bars — check before windows because tab bars sit just above
+    //    the window content area within the same group bounds.
+    if let Some(ref split) = layout.editor_group_split {
+        for gtb in &split.group_tab_bars {
+            let b = &gtb.bounds;
+            let tab_y = b.y - tab_bar_height;
+            if y >= tab_y && y < tab_y + tab_bar_height && x >= b.x && x < b.x + b.width {
+                return ScreenZone::TabBar {
+                    group_id: gtb.group_id,
+                    local_x: x - b.x,
+                    bar_width: b.width,
+                };
+            }
+        }
+    } else if !single_tab_hidden && y >= 0.0 && y < tab_bar_height && !layout.tab_bar.is_empty() {
+        let bar_width = layout
+            .windows
+            .first()
+            .map(|w| w.rect.x + w.rect.width)
+            .unwrap_or(0.0);
+        return ScreenZone::TabBar {
+            group_id: active_group,
+            local_x: x,
+            bar_width,
+        };
+    }
+
+    // 2. Breadcrumbs — sit within the tab-bar area, below the tab row.
+    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
+        let b = &bc.bounds;
+        if x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height {
+            return ScreenZone::Breadcrumb {
+                index: i,
+                local_x: x - b.x,
+                bar_width: b.width,
+            };
+        }
+    }
+
+    // 3. Group dividers.
+    if let Some(ref split) = layout.editor_group_split {
+        for div in &split.dividers {
+            let hit = match div.direction {
+                SplitDirection::Vertical => {
+                    let div_x = div.position;
+                    (x - div_x).abs() < 0.5
+                        && y >= div.cross_start
+                        && y < div.cross_start + div.cross_size
+                }
+                SplitDirection::Horizontal => {
+                    let div_y = div.position;
+                    (y - div_y).abs() < 0.5
+                        && x >= div.cross_start
+                        && x < div.cross_start + div.cross_size
+                }
+            };
+            if hit {
+                return ScreenZone::GroupDivider {
+                    split_index: div.split_index,
+                };
+            }
+        }
+    }
+
+    // 4. Windows.
+    for (i, rw) in layout.windows.iter().enumerate() {
+        let r = &rw.rect;
+        if x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height {
+            return ScreenZone::Window {
+                window_id: rw.window_id,
+                window_idx: i,
+                rel_x: x - r.x,
+                rel_y: y - r.y,
+            };
+        }
+    }
+
+    ScreenZone::None
+}
+
+/// Find which window contains a point and return its index.
+///
+/// Coordinates are in the same frame as `screen_zone_hit_test` — editor
+/// content bounds, after subtracting sidebar/menu/terminal chrome.
+pub fn find_window_at(layout: &ScreenLayout, x: f64, y: f64) -> Option<usize> {
+    layout.windows.iter().position(|rw| {
+        let r = &rw.rect;
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    })
+}
+
+/// Resolve a view-row + relative column to `(buf_line, text_col)` using
+/// the pre-computed `RenderedLine` data.
+pub fn resolve_text_position(
+    rw: &RenderedWindow,
+    view_row: usize,
+    text_rel_col: usize,
+) -> (usize, usize) {
+    let rl = rw.lines.get(view_row);
+    let buf_line = rl.map(|l| l.line_idx).unwrap_or(rw.scroll_top + view_row);
+    let seg_offset = rl.map(|l| l.segment_col_offset).unwrap_or(0);
+    let text_col = text_rel_col + rw.scroll_left + seg_offset;
+    (buf_line, text_col)
+}
+
+/// Determine which sub-zone of a window a point falls in.
+///
+/// `rel_x` and `rel_y` are relative to the window's top-left corner.
+/// `line_height` and `char_width` are in the same coordinate unit as the rect
+/// (pixels for GTK, 1.0 for TUI).
+pub fn window_zone_hit_test(
+    rw: &RenderedWindow,
+    rel_x: f64,
+    rel_y: f64,
+    line_height: f64,
+    char_width: f64,
+) -> WindowZone {
+    let has_status = rw.status_line.is_some();
+    let status_h = if has_status { line_height } else { 0.0 };
+    let content_h = rw.rect.height - status_h;
+    let viewport_lines = (content_h / line_height).floor() as usize;
+
+    // 1. Per-window status bar (bottom row of window).
+    if has_status && rel_y >= content_h {
+        return WindowZone::StatusBar {
+            local_x: rel_x,
+            bar_width: rw.rect.width,
+        };
+    }
+
+    let view_row = (rel_y / line_height).floor() as usize;
+
+    let gutter_w = rw.gutter_char_width as f64 * char_width;
+    let has_v_sb = rw.total_lines > viewport_lines;
+    let sb_w = if has_v_sb { char_width } else { 0.0 };
+    let viewport_cols = if char_width > 0.0 {
+        ((rw.rect.width - sb_w) / char_width).floor() as usize
+    } else {
+        1
+    }
+    .saturating_sub(rw.gutter_char_width)
+    .max(1);
+    let has_h_sb = rw.max_col > viewport_cols && viewport_lines > 1;
+
+    // 2. Vertical scrollbar (rightmost column).
+    if has_v_sb && rel_x >= rw.rect.width - sb_w {
+        return WindowZone::VerticalScrollbar { view_row };
+    }
+
+    // 3. Horizontal scrollbar (bottom content row, above status bar).
+    let h_sb_y = content_h - line_height;
+    if has_h_sb && rel_y >= h_sb_y && rel_y < content_h {
+        return WindowZone::HorizontalScrollbar {
+            local_x: rel_x - gutter_w,
+        };
+    }
+
+    // Resolve view row to buffer line via cached RenderedLine data.
+    let (line_idx, seg_col_offset) = rw
+        .lines
+        .get(view_row)
+        .map(|rl| (rl.line_idx, rl.segment_col_offset))
+        .unwrap_or((rw.scroll_top + view_row, 0));
+
+    // 4. Gutter.
+    if gutter_w > 0.0 && rel_x < gutter_w {
+        let gutter_col = if char_width > 0.0 {
+            (rel_x / char_width).floor() as usize
+        } else {
+            0
+        };
+        return WindowZone::Gutter {
+            view_row,
+            gutter_col,
+            line_idx,
+        };
+    }
+
+    // 5. Text area.
+    let text_rel_x = rel_x - gutter_w;
+    WindowZone::TextArea {
+        view_row,
+        buf_line: line_idx,
+        seg_col_offset,
+        text_rel_x,
+    }
+}
+
+/// Resolve a gutter click to an action based on column and line data.
+pub fn resolve_gutter_action(
+    rw: &RenderedWindow,
+    line_idx: usize,
+    gutter_col: usize,
+) -> Option<GutterAction> {
+    let bp_offset: usize = if rw.has_breakpoints { 1 } else { 0 };
+    let git_col = if rw.has_git_diff {
+        bp_offset
+    } else {
+        usize::MAX
+    };
+
+    if rw.has_breakpoints && gutter_col == 0 {
+        Some(GutterAction::ToggleBreakpoint(line_idx))
+    } else if gutter_col == git_col {
+        Some(GutterAction::DiffPeek(line_idx))
+    } else if rw.diagnostic_gutter.contains_key(&line_idx) {
+        Some(GutterAction::DiagnosticHover(line_idx))
+    } else if rw.code_action_lines.contains(&line_idx) {
+        Some(GutterAction::CodeAction(line_idx))
+    } else {
+        Some(GutterAction::ToggleFold(line_idx))
+    }
+}
+
+/// Computed editor chrome layout — all heights in native units (pixels for
+/// GTK/macOS, rows for TUI with `line_height = 1.0`).
+#[derive(Debug, Clone, Copy)]
+pub struct EditorLayout {
+    pub tab_bar_h: f64,
+    pub editor_top: f64,
+    pub editor_bottom: f64,
+    pub debug_toolbar_h: f64,
+    pub quickfix_h: f64,
+    pub terminal_h: f64,
+    pub terminal_content_rows: u16,
+    pub terminal_max_target_rows: u16,
+    pub separated_status_h: f64,
+    pub wildmenu_h: f64,
+    pub status_bar_h: f64,
+    pub command_line_h: f64,
+}
+
+/// One-shot layout computation used by all backends to derive editor window
+/// rects and chrome positions. Reads engine state directly so callers don't
+/// need to replicate the arithmetic.
+///
+/// * `total_height` — available viewport height (DA pixels for GTK, screen
+///   rows as f64 for TUI).
+/// * `line_height` — font line height (pixels for GTK, 1.0 for TUI).
+/// * `menu_in_viewport` — `true` for TUI (menu bar is a content row),
+///   `false` for GTK (menu bar is outside the DrawingArea).
+pub fn compute_editor_layout(
+    engine: &Engine,
+    total_height: f64,
+    line_height: f64,
+    menu_in_viewport: bool,
+) -> EditorLayout {
+    let lh = line_height;
+    let per_window = engine.settings.window_status_line;
+    let bp_open = engine.terminal_open || engine.bottom_panel_open;
+
+    let menu_h = if menu_in_viewport && engine.menu_bar_visible {
+        lh
+    } else {
+        0.0
+    };
+    let tab_bar_h = if engine.terminal_maximized {
+        0.0
+    } else {
+        tab_bar_height_px(lh, engine.settings.breadcrumbs)
+    };
+    let debug_toolbar_h = debug_toolbar_height_px(lh, engine.debug_toolbar_visible);
+    let quickfix_h = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6.0 * lh
+    } else {
+        0.0
+    };
+    let has_separated = per_window && !engine.settings.status_line_above_terminal && bp_open;
+    let separated_status_h = separated_status_height_px(lh, has_separated);
+    let wildmenu_h = if engine.wildmenu_items.is_empty() {
+        0.0
+    } else {
+        lh
+    };
+    let status_bar_h = status_bar_height_px(lh, per_window, !engine.wildmenu_items.is_empty());
+    let command_line_h = lh;
+
+    let (terminal_h, terminal_content_rows, terminal_max_target_rows) = if bp_open {
+        let viewport_rows = (total_height / lh).floor() as u16;
+        let chrome = PanelChromeDesc {
+            viewport_rows,
+            menu_rows: if menu_in_viewport && engine.menu_bar_visible {
+                1
+            } else {
+                0
+            },
+            quickfix_rows: if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+                6
+            } else {
+                0
+            },
+            debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
+            wildmenu_rows: if engine.wildmenu_items.is_empty() {
+                0
+            } else {
+                1
+            },
+            tab_bar_rows: if menu_in_viewport { 1 } else { 2 },
+            separated_status_rows: if has_separated { 1 } else { 0 },
+            status_cmd_rows: if per_window { 1 } else { 2 },
+            panel_chrome_rows: 2,
+            min_content_rows: 5,
+        };
+        let target = chrome.max_panel_content_rows();
+        let rows = engine.effective_terminal_panel_rows(target);
+        ((rows as f64 + 2.0) * lh, rows, target)
+    } else {
+        (0.0, 0, 0)
+    };
+
+    let editor_top = menu_h;
+    let editor_bottom = total_height
+        - status_bar_h
+        - debug_toolbar_h
+        - quickfix_h
+        - terminal_h
+        - separated_status_h;
+
+    EditorLayout {
+        tab_bar_h,
+        editor_top,
+        editor_bottom,
+        debug_toolbar_h,
+        quickfix_h,
+        terminal_h,
+        terminal_content_rows,
+        terminal_max_target_rows,
+        separated_status_h,
+        wildmenu_h,
+        status_bar_h,
+        command_line_h,
+    }
+}
+
 /// Compute the tab bar row height in pixels (the row containing tab labels).
 /// Used by GTK and Win-GUI backends.
 pub fn tab_row_height_px(line_height: f64) -> f64 {
@@ -8273,26 +12434,224 @@ pub fn separated_status_height_px(line_height: f64, has_separated: bool) -> f64 
     }
 }
 
-/// Compute the Y coordinate of the editor bottom edge (below which status/terminal/etc live).
-#[allow(clippy::too_many_arguments)]
-pub fn editor_bottom_px(
-    total_height: f64,
-    line_height: f64,
-    per_window_status_line: bool,
-    has_wildmenu: bool,
-    quickfix_open: bool,
-    quickfix_item_count: usize,
-    panel_open: bool,
-    panel_rows: usize,
-    debug_toolbar_visible: bool,
-    has_separated_status: bool,
-) -> f64 {
-    total_height
-        - status_bar_height_px(line_height, per_window_status_line, has_wildmenu)
-        - quickfix_height_px(line_height, quickfix_open, quickfix_item_count)
-        - terminal_panel_height_px(line_height, panel_open, panel_rows)
-        - debug_toolbar_height_px(line_height, debug_toolbar_visible)
-        - separated_status_height_px(line_height, has_separated_status)
+// ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
+
+pub struct TabDropGroup {
+    pub group_id: GroupId,
+    pub rect: quadraui::DropGroupRect,
+    pub tab_scroll_offset: usize,
+}
+
+pub struct TabDropOverlay {
+    pub highlight: Option<quadraui::Rect>,
+    pub insertion_bar: Option<quadraui::Rect>,
+    pub ghost_position: (f32, f32),
+}
+
+/// Lightweight group-bounds descriptor for [`build_tab_drop_groups`].
+pub struct DropGroupBounds {
+    pub group_id: GroupId,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub content_height: f32,
+    pub tab_scroll_offset: usize,
+}
+
+/// Build `TabDropGroup`s from a set of group bounds.
+///
+/// `tab_bar_height` is in the same units as the bounds (cells for TUI,
+/// pixels for GTK/Win-GUI). Each group's bounds describe the
+/// **content area** — the function prepends `tab_bar_height` above.
+///
+/// `tab_slots_map` maps `GroupId.0` → visible tab slot positions in
+/// the same coordinate system as the bounds.
+pub fn build_tab_drop_groups(
+    group_bounds: &[DropGroupBounds],
+    engine: &crate::core::engine::Engine,
+    tab_bar_height: f32,
+    tab_slots_map: &std::collections::HashMap<usize, Vec<(f32, f32)>>,
+) -> (Vec<TabDropGroup>, f32) {
+    let mut groups = Vec::new();
+    let breadcrumbs = engine.settings.breadcrumbs;
+
+    for gb in group_bounds {
+        let hidden = engine.is_tab_bar_hidden(gb.group_id);
+        let eff_tbh = if hidden {
+            if breadcrumbs {
+                tab_bar_height / 2.0
+            } else {
+                0.0
+            }
+        } else {
+            tab_bar_height
+        };
+        let tab_slots = if hidden {
+            Vec::new()
+        } else {
+            tab_slots_map
+                .get(&gb.group_id.0)
+                .cloned()
+                .unwrap_or_default()
+        };
+        groups.push(TabDropGroup {
+            group_id: gb.group_id,
+            rect: quadraui::DropGroupRect {
+                bounds: quadraui::Rect::new(
+                    gb.x,
+                    gb.y - eff_tbh,
+                    gb.width,
+                    eff_tbh + gb.content_height,
+                ),
+                tab_slots,
+            },
+            tab_scroll_offset: gb.tab_scroll_offset,
+        });
+    }
+
+    let effective_tbh = if groups.iter().any(|g| engine.is_tab_bar_hidden(g.group_id)) {
+        0.0
+    } else {
+        tab_bar_height
+    };
+    (groups, effective_tbh)
+}
+
+/// Build [`DropGroupBounds`] from a `ScreenLayout`, applying an
+/// editor-area offset. Both TUI and GTK call this when the
+/// `ScreenLayout` is available (draw path, or TUI's cached layout).
+pub fn screen_to_drop_group_bounds(
+    screen: &ScreenLayout,
+    engine: &crate::core::engine::Engine,
+    editor_origin: (f32, f32),
+    editor_size: (f32, f32),
+) -> Vec<DropGroupBounds> {
+    if let Some(ref split) = screen.editor_group_split {
+        split
+            .group_tab_bars
+            .iter()
+            .map(|gtb| DropGroupBounds {
+                group_id: gtb.group_id,
+                x: editor_origin.0 + gtb.bounds.x as f32,
+                y: editor_origin.1 + gtb.bounds.y as f32,
+                width: gtb.bounds.width as f32,
+                content_height: gtb.bounds.height as f32,
+                tab_scroll_offset: gtb.tab_scroll_offset,
+            })
+            .collect()
+    } else {
+        vec![DropGroupBounds {
+            group_id: engine.active_group,
+            x: editor_origin.0,
+            y: editor_origin.1,
+            width: editor_size.0,
+            content_height: editor_size.1,
+            tab_scroll_offset: screen.tab_scroll_offset,
+        }]
+    }
+}
+
+pub fn compute_tab_drop_zone(
+    cursor_x: f32,
+    cursor_y: f32,
+    groups: &[TabDropGroup],
+    tab_bar_height: f32,
+) -> crate::core::window::DropZone {
+    use crate::core::window::DropZone;
+
+    let rects: Vec<quadraui::DropGroupRect> = groups.iter().map(|g| g.rect.clone()).collect();
+    match quadraui::compute_drop_zone(cursor_x, cursor_y, &rects, tab_bar_height) {
+        Some(qz) => {
+            let g = &groups[qz.group_idx];
+            match qz.kind {
+                quadraui::DropZoneKind::Center => DropZone::Center(g.group_id),
+                quadraui::DropZoneKind::Split(edge) => {
+                    let (dir, new_first) = match edge {
+                        quadraui::DropEdge::Left => (SplitDirection::Vertical, true),
+                        quadraui::DropEdge::Right => (SplitDirection::Vertical, false),
+                        quadraui::DropEdge::Top => (SplitDirection::Horizontal, true),
+                        quadraui::DropEdge::Bottom => (SplitDirection::Horizontal, false),
+                    };
+                    DropZone::Split(g.group_id, dir, new_first)
+                }
+                quadraui::DropZoneKind::TabReorder(idx) => {
+                    DropZone::TabReorder(g.group_id, g.tab_scroll_offset + idx)
+                }
+            }
+        }
+        None => DropZone::None,
+    }
+}
+
+pub fn compute_tab_drop_overlay(
+    drop_zone: &crate::core::window::DropZone,
+    groups: &[TabDropGroup],
+    cursor: (f32, f32),
+    tab_bar_height: f32,
+    bar_thickness: f32,
+    ghost_offset: f32,
+) -> Option<TabDropOverlay> {
+    use crate::core::window::DropZone;
+
+    let ghost_position = (cursor.0 + ghost_offset, cursor.1);
+
+    match drop_zone {
+        DropZone::None => None,
+        DropZone::Center(gid) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            Some(TabDropOverlay {
+                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, b.height)),
+                insertion_bar: None,
+                ghost_position,
+            })
+        }
+        DropZone::Split(gid, dir, new_first) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            let h = match (dir, new_first) {
+                (SplitDirection::Vertical, true) => {
+                    quadraui::Rect::new(b.x, b.y, b.width / 2.0, b.height)
+                }
+                (SplitDirection::Vertical, false) => {
+                    quadraui::Rect::new(b.x + b.width / 2.0, b.y, b.width / 2.0, b.height)
+                }
+                (SplitDirection::Horizontal, true) => {
+                    quadraui::Rect::new(b.x, b.y, b.width, b.height / 2.0)
+                }
+                (SplitDirection::Horizontal, false) => {
+                    quadraui::Rect::new(b.x, b.y + b.height / 2.0, b.width, b.height / 2.0)
+                }
+            };
+            Some(TabDropOverlay {
+                highlight: Some(h),
+                insertion_bar: None,
+                ghost_position,
+            })
+        }
+        DropZone::TabReorder(gid, abs_idx) => {
+            let g = groups.iter().find(|g| g.group_id == *gid)?;
+            let b = &g.rect.bounds;
+            let vis_idx = abs_idx.saturating_sub(g.tab_scroll_offset);
+            let bar_x = if vis_idx < g.rect.tab_slots.len() {
+                g.rect.tab_slots[vis_idx].0
+            } else if let Some(last) = g.rect.tab_slots.last() {
+                last.1
+            } else {
+                b.x
+            };
+            Some(TabDropOverlay {
+                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, tab_bar_height)),
+                insertion_bar: Some(quadraui::Rect::new(
+                    bar_x - bar_thickness / 2.0,
+                    b.y,
+                    bar_thickness,
+                    tab_bar_height,
+                )),
+                ghost_position,
+            })
+        }
+    }
 }
 
 /// Compute the scrollbar-to-scroll-top mapping from a click position.
@@ -8398,6 +12757,526 @@ pub fn matches_key_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_sc_data() -> SourceControlData {
+        SourceControlData {
+            branch: "main".into(),
+            ahead: 0,
+            behind: 0,
+            staged: vec![],
+            unstaged: vec![],
+            worktrees: vec![],
+            log: vec![],
+            sections_expanded: [true; 4],
+            selected: 0,
+            has_focus: false,
+            commit_message: String::new(),
+            commit_cursor: 0,
+            commit_input_active: false,
+            button_focused: None,
+            button_hovered: None,
+            branch_picker: None,
+            help_open: false,
+            sc_sections_start_y: None,
+        }
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_ids_and_shape() {
+        use crate::core::engine::SC_BUTTON_IDS;
+        use quadraui::ToolbarButton;
+
+        let sc = empty_sc_data();
+        let bar = sc_button_toolbar(&sc);
+        assert_eq!(bar.buttons.len(), 4);
+
+        // Ids appear in button-index order and match the shared constant.
+        for (i, btn) in bar.buttons.iter().enumerate() {
+            match btn {
+                ToolbarButton::Action { id, label, .. } => {
+                    assert_eq!(id.as_str(), SC_BUTTON_IDS[i]);
+                    // Commit carries a label; Push/Pull/Sync are icon-only.
+                    if i == 0 {
+                        assert_eq!(label, "Commit");
+                    } else {
+                        assert!(label.is_empty());
+                    }
+                }
+                other => panic!("expected Action, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_commit_enabled_tracks_message() {
+        use quadraui::ToolbarButton;
+
+        let commit_enabled = |sc: &SourceControlData| match &sc_button_toolbar(sc).buttons[0] {
+            ToolbarButton::Action { enabled, .. } => *enabled,
+            _ => panic!("commit button missing"),
+        };
+
+        let mut sc = empty_sc_data();
+        assert!(!commit_enabled(&sc), "empty message → Commit disabled");
+
+        sc.commit_message = "   ".into();
+        assert!(!commit_enabled(&sc), "whitespace-only message → disabled");
+
+        sc.commit_message = "feat: x".into();
+        assert!(commit_enabled(&sc), "non-empty message → Commit enabled");
+    }
+
+    #[test]
+    fn test_sc_button_id_index_round_trip() {
+        use crate::core::engine::Engine;
+        for idx in 0..4 {
+            let id = Engine::sc_button_id(idx).expect("id for valid index");
+            assert_eq!(Engine::sc_button_index(&id), Some(idx));
+        }
+        assert!(Engine::sc_button_id(4).is_none());
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_hit_test_resolves_index() {
+        use crate::core::engine::Engine;
+        use quadraui::ToolbarHit;
+
+        // Lay the toolbar out the way the TUI backend does, then prove a
+        // click inside each button's bounds maps back to its index.
+        let sc = empty_sc_data();
+        let bar = sc_button_toolbar(&sc);
+        let area = ratatui::layout::Rect::new(0, 5, 60, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+
+        // Push is button index 1 and is enabled (icon-only).
+        let push = &layout.visible_items[1];
+        let hit = layout.hit_test(push.bounds.x + 0.5, push.bounds.y);
+        match hit {
+            ToolbarHit::Button(id) => assert_eq!(Engine::sc_button_index(&id), Some(1)),
+            other => panic!("expected Button hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sc_button_toolbar_disabled_commit_not_clickable() {
+        use quadraui::ToolbarHit;
+
+        // Empty message → Commit disabled → its slot hit-tests as Empty.
+        let sc = empty_sc_data();
+        let bar = sc_button_toolbar(&sc);
+        let area = ratatui::layout::Rect::new(0, 0, 60, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+        let commit = &layout.visible_items[0];
+        assert!(!commit.clickable, "disabled Commit must not be clickable");
+        assert_eq!(
+            layout.hit_test(commit.bounds.x + 0.5, commit.bounds.y),
+            ToolbarHit::Empty
+        );
+    }
+
+    // ─── SC SidebarPanel tests (#509) ────────────────────────────────────────
+
+    #[test]
+    fn test_sc_sidebar_panel_toolbar_slot_reserved_at_top() {
+        use quadraui::{primitives::toolbar::ToolbarItemMeasure, SidebarPanelMeasure};
+
+        let sc = empty_sc_data();
+        let panel = sc_sidebar_panel(&sc);
+        // TUI default: toolbar_height = 1 cell, item_width = 8 cells.
+        let area = quadraui::Rect::new(0.0, 5.0, 60.0, 20.0);
+        let measure = SidebarPanelMeasure::new(1.0, 8.0);
+        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+
+        // Toolbar slot is reserved at the top.
+        let tb = layout.toolbar_bounds.expect("toolbar slot reserved");
+        assert_eq!(tb.y, 5.0, "toolbar slot starts at panel top");
+        assert_eq!(tb.height, 1.0, "TUI default toolbar height = 1 cell");
+        // Content starts immediately below toolbar slot (no padding — option a).
+        assert_eq!(
+            layout.content_bounds.y, 6.0,
+            "content starts at toolbar_y + 1"
+        );
+        assert_eq!(
+            layout.content_bounds.height, 19.0,
+            "content height = panel_height - 1"
+        );
+    }
+
+    #[test]
+    fn test_sc_sidebar_panel_hit_test_resolves_toolbar_button_and_content() {
+        use crate::core::engine::Engine;
+        use quadraui::{
+            primitives::toolbar::ToolbarItemMeasure, SidebarPanelHit, SidebarPanelMeasure,
+        };
+
+        let mut sc = empty_sc_data();
+        sc.commit_message = "feat: fix".into(); // non-empty → Commit enabled
+        let panel = sc_sidebar_panel(&sc);
+        let area = quadraui::Rect::new(0.0, 0.0, 60.0, 10.0);
+        let measure = SidebarPanelMeasure::new(1.0, 8.0);
+        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+
+        // A hit in the toolbar slot (y=0, which is the toolbar row) on a button.
+        let hit = layout.hit_test(0.5, 0.0);
+        match hit {
+            SidebarPanelHit::ToolbarButton(id) => {
+                assert_eq!(
+                    Engine::sc_button_index(&id),
+                    Some(0),
+                    "first button = Commit"
+                );
+            }
+            other => panic!("expected ToolbarButton hit, got {other:?}"),
+        }
+
+        // A hit in the content area (y=2, content starts at y=1) returns content-local coords.
+        let hit = layout.hit_test(5.0, 2.0);
+        match hit {
+            SidebarPanelHit::Content { x, y } => {
+                assert_eq!(x, 5.0);
+                assert_eq!(y, 1.0, "content-local y = abs_y - content_bounds.y = 2-1");
+            }
+            other => panic!("expected Content hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sc_sidebar_panel_content_bounds_height() {
+        use quadraui::{primitives::toolbar::ToolbarItemMeasure, SidebarPanelMeasure};
+
+        let sc = empty_sc_data();
+        let panel = sc_sidebar_panel(&sc);
+        // Simulate a 15-row panel starting at y=3 (e.g. after 3 header/commit rows).
+        let area = quadraui::Rect::new(0.0, 3.0, 40.0, 15.0);
+        let measure = SidebarPanelMeasure::new(1.0, 8.0);
+        let layout = panel.layout(area, measure, |_| ToolbarItemMeasure::new(8.0));
+
+        assert_eq!(
+            layout.content_bounds.height, 14.0,
+            "content = panel_height(15) - toolbar_slot(1)"
+        );
+        assert_eq!(layout.content_bounds.y, 4.0, "content starts at y=3+1=4");
+    }
+
+    // ─── Debug toolbar tests (#510) ──────────────────────────────────────────
+
+    /// Helper: return an engine with DAP session state as specified.
+    fn engine_with_dap(session_active: bool, stopped_thread: Option<u64>) -> Engine {
+        let mut e = Engine::new();
+        e.debug_toolbar_visible = true;
+        e.dap_session_active = session_active;
+        e.dap_stopped_thread = stopped_thread;
+        e
+    }
+
+    #[test]
+    fn debug_toolbar_button_ids_round_trip() {
+        use crate::core::engine::{Engine, DEBUG_BUTTON_IDS};
+        use quadraui::ToolbarButton;
+
+        let engine = engine_with_dap(true, Some(1u64));
+        let bar = debug_toolbar(&engine);
+
+        // 8 entries: 7 action buttons + 1 separator after index 3.
+        assert_eq!(bar.buttons.len(), 8);
+
+        let mut action_idx = 0usize;
+        for btn in &bar.buttons {
+            match btn {
+                ToolbarButton::Action { id, .. } => {
+                    // id matches DEBUG_BUTTON_IDS[action_idx]
+                    assert_eq!(
+                        id.as_str(),
+                        DEBUG_BUTTON_IDS[action_idx],
+                        "button {action_idx} id mismatch"
+                    );
+                    // round-trip: id → index → same action_idx
+                    let idx = Engine::debug_button_index(id).expect("index for valid id");
+                    assert_eq!(idx, action_idx);
+                    action_idx += 1;
+                }
+                ToolbarButton::Separator => {
+                    // separator sits between button 3 (Restart) and button 4 (Step Over)
+                    assert_eq!(action_idx, 4, "separator must come after index 3");
+                }
+                ToolbarButton::Label { .. } => {
+                    panic!("unexpected Label variant in debug toolbar");
+                }
+            }
+        }
+        assert_eq!(action_idx, 7, "expected 7 action buttons");
+    }
+
+    #[test]
+    fn debug_toolbar_disabled_when_no_session() {
+        use quadraui::ToolbarButton;
+
+        let engine = engine_with_dap(false, None);
+        let bar = debug_toolbar(&engine);
+        for btn in &bar.buttons {
+            if let ToolbarButton::Action { enabled, label, .. } = btn {
+                assert!(
+                    !enabled,
+                    "button '{label}' should be disabled with no session"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn debug_toolbar_steps_disabled_while_running() {
+        use quadraui::ToolbarButton;
+
+        // Session active, not stopped (running).
+        let engine = engine_with_dap(true, None);
+        let bar = debug_toolbar(&engine);
+
+        let get_enabled = |label: &str| {
+            bar.buttons.iter().find_map(|b| {
+                if let ToolbarButton::Action {
+                    enabled, label: l, ..
+                } = b
+                {
+                    if l == label {
+                        return Some(*enabled);
+                    }
+                }
+                None
+            })
+        };
+
+        // Running → Continue/Step* disabled, Pause enabled, Stop/Restart enabled.
+        assert_eq!(get_enabled("Continue"), Some(false));
+        assert_eq!(get_enabled("Step Over"), Some(false));
+        assert_eq!(get_enabled("Step Into"), Some(false));
+        assert_eq!(get_enabled("Step Out"), Some(false));
+        assert_eq!(get_enabled("Pause"), Some(true));
+        assert_eq!(get_enabled("Stop"), Some(true));
+        assert_eq!(get_enabled("Restart"), Some(true));
+    }
+
+    #[test]
+    fn debug_toolbar_steps_enabled_when_stopped() {
+        use quadraui::ToolbarButton;
+
+        // Session active, stopped at thread 1.
+        let engine = engine_with_dap(true, Some(1u64));
+        let bar = debug_toolbar(&engine);
+
+        let get_enabled = |label: &str| {
+            bar.buttons.iter().find_map(|b| {
+                if let ToolbarButton::Action {
+                    enabled, label: l, ..
+                } = b
+                {
+                    if l == label {
+                        return Some(*enabled);
+                    }
+                }
+                None
+            })
+        };
+
+        // Stopped → Continue/Step* enabled, Pause disabled, Stop/Restart enabled.
+        assert_eq!(get_enabled("Continue"), Some(true));
+        assert_eq!(get_enabled("Step Over"), Some(true));
+        assert_eq!(get_enabled("Step Into"), Some(true));
+        assert_eq!(get_enabled("Step Out"), Some(true));
+        assert_eq!(get_enabled("Pause"), Some(false));
+        assert_eq!(get_enabled("Stop"), Some(true));
+        assert_eq!(get_enabled("Restart"), Some(true));
+    }
+
+    #[test]
+    fn debug_toolbar_hit_test_resolves_each_button() {
+        use crate::core::engine::Engine;
+        use quadraui::ToolbarHit;
+
+        let engine = engine_with_dap(true, Some(1u64));
+        let bar = debug_toolbar(&engine);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+
+        // Hit-test each visible_item that is clickable and assert that it
+        // resolves back to its expected DEBUG_BUTTON_IDS entry.
+        for item in &layout.visible_items {
+            if !item.clickable {
+                continue;
+            }
+            let hit = layout.hit_test(item.bounds.x + 0.5, item.bounds.y);
+            match hit {
+                ToolbarHit::Button(ref id) => {
+                    let idx = Engine::debug_button_index(id)
+                        .unwrap_or_else(|| panic!("unknown id {:?}", id.as_str()));
+                    assert!(idx < 7, "index {idx} out of range");
+                }
+                ToolbarHit::Empty => {
+                    panic!(
+                        "clickable item hit_test returned Empty at {:?}",
+                        item.bounds
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn debug_toolbar_disabled_button_not_clickable() {
+        use quadraui::ToolbarHit;
+
+        // No session → all buttons disabled.
+        let engine = engine_with_dap(false, None);
+        let bar = debug_toolbar(&engine);
+        let area = ratatui::layout::Rect::new(0, 0, 80, 1);
+        let layout = quadraui::tui::tui_toolbar_layout(&bar, area);
+
+        // Every visible_item must be not clickable and hit_test must return Empty.
+        for item in &layout.visible_items {
+            assert!(
+                !item.clickable,
+                "disabled button at {:?} should not be clickable",
+                item.bounds
+            );
+            assert_eq!(
+                layout.hit_test(item.bounds.x + 0.5, item.bounds.y),
+                ToolbarHit::Empty,
+                "disabled button hit_test should return Empty"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ext_panel_to_tree_view_shape() {
+        use crate::core::plugin::{ExtPanelAction, ExtPanelBadge, ExtPanelItem, ExtPanelStyle};
+        use quadraui::Decoration;
+
+        let mut item_a = ExtPanelItem {
+            text: "Item A".into(),
+            id: "a".into(),
+            indent: 0,
+            style: ExtPanelStyle::Normal,
+            expandable: true,
+            expanded: true,
+            badges: vec![ExtPanelBadge {
+                text: "main".into(),
+                color: "green".into(),
+            }],
+            actions: vec![ExtPanelAction {
+                label: "Stage".into(),
+                key: "s".into(),
+            }],
+            hint: "h".into(),
+            ..Default::default()
+        };
+        item_a.icon = "\u{f04b}".into();
+
+        let item_b_child = ExtPanelItem {
+            text: "Child".into(),
+            id: "a_child".into(),
+            indent: 1,
+            parent_id: "a".into(),
+            style: ExtPanelStyle::Accent,
+            ..Default::default()
+        };
+
+        let item_c_dim = ExtPanelItem {
+            text: "Dim".into(),
+            id: "c".into(),
+            style: ExtPanelStyle::Dim,
+            ..Default::default()
+        };
+
+        let item_sep = ExtPanelItem {
+            is_separator: true,
+            ..Default::default()
+        };
+
+        let panel = ExtPanelData {
+            name: "my_ext".into(),
+            title: "MY EXT".into(),
+            sections: vec![
+                ExtPanelSectionData {
+                    name: "Open".into(),
+                    items: vec![item_a, item_b_child, item_sep, item_c_dim],
+                    expanded: true,
+                },
+                ExtPanelSectionData {
+                    name: "Closed".into(),
+                    items: vec![ExtPanelItem {
+                        text: "Hidden".into(),
+                        ..Default::default()
+                    }],
+                    expanded: false,
+                },
+            ],
+            // Select the second visible item (`Child`, flat idx 2: header=0, item_a=1, child=2).
+            selected: 2,
+            has_focus: true,
+            scroll_top: 0,
+            input_text: String::new(),
+            input_active: false,
+            help_open: false,
+            help_bindings: vec![],
+        };
+
+        let theme = Theme::onedark();
+        let tv = ext_panel_to_tree_view(&panel, &theme);
+
+        // Expect rows: [0]=Open header, [0,0]=Item A, [0,1]=Child, [0,2]=separator,
+        // [0,3]=Dim, [1]=Closed header (collapsed → no children).
+        assert_eq!(tv.rows.len(), 6, "rows: {:?}", tv.rows.len());
+        assert_eq!(tv.rows[0].path, vec![0]);
+        assert_eq!(tv.rows[0].decoration, Decoration::Header);
+        assert_eq!(tv.rows[0].is_expanded, Some(true));
+        assert_eq!(tv.rows[1].path, vec![0, 0]);
+        assert_eq!(tv.rows[1].indent, 1);
+        assert_eq!(tv.rows[1].is_expanded, Some(true)); // expandable item
+        assert!(
+            tv.rows[1].badge.is_some(),
+            "badges + action + hint combined"
+        );
+        assert!(tv.rows[1].icon.is_some(), "icon converted");
+        assert_eq!(tv.rows[2].path, vec![0, 1]);
+        assert_eq!(tv.rows[2].indent, 2); // indent 1 + 1
+        assert_eq!(tv.rows[2].is_expanded, None); // not expandable
+                                                  // Separator is muted line glyph.
+        assert_eq!(tv.rows[3].decoration, Decoration::Muted);
+        assert_eq!(tv.rows[3].text.spans[0].text, "\u{2500}");
+        // Dim item maps to Muted.
+        assert_eq!(tv.rows[4].decoration, Decoration::Muted);
+        // Collapsed section: header only, no children.
+        assert_eq!(tv.rows[5].path, vec![1]);
+        assert_eq!(tv.rows[5].is_expanded, Some(false));
+
+        // Selection: flat idx 2 = Child → path [0, 1].
+        assert_eq!(tv.selected_path, Some(vec![0, 1]));
+        assert_eq!(tv.scroll_offset, 0);
+        assert!(tv.has_focus);
+    }
+
+    #[test]
+    fn test_ext_panel_to_tree_view_no_focus_no_selection() {
+        let panel = ExtPanelData {
+            name: "x".into(),
+            title: "X".into(),
+            sections: vec![ExtPanelSectionData {
+                name: "S".into(),
+                items: vec![],
+                expanded: true,
+            }],
+            selected: 0,
+            has_focus: false,
+            scroll_top: 5,
+            input_text: String::new(),
+            input_active: false,
+            help_open: false,
+            help_bindings: vec![],
+        };
+        let tv = ext_panel_to_tree_view(&panel, &Theme::onedark());
+        assert_eq!(tv.selected_path, None);
+        assert_eq!(tv.scroll_offset, 5);
+        assert!(!tv.has_focus);
+    }
 
     #[test]
     fn test_try_from_hex() {
@@ -8716,9 +13595,8 @@ mod tests {
             "lines should contain the buffer's actual lines"
         );
 
-        // Global status bar should be empty
-        assert!(layout.status_left.is_empty());
-        assert!(layout.status_right.is_empty());
+        // Global status bar should be None when per-window is on
+        assert!(layout.global_status_bar.is_none());
     }
 
     #[test]
@@ -8739,7 +13617,7 @@ mod tests {
         assert!(layout.windows[0].status_line.is_none());
 
         // Global status bar should be populated
-        assert!(!layout.status_left.is_empty());
+        assert!(layout.global_status_bar.is_some());
     }
 
     #[test]
@@ -8848,6 +13726,131 @@ mod tests {
         assert_eq!(LineEnding::detect(""), LineEnding::LF);
     }
 
+    // ─── #221: LSP progress segment formatter ───────────────────────
+    #[test]
+    fn test_lsp_progress_segment_no_progress() {
+        // Pre-#221 behaviour: no progress data → dimmed `name… `.
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", None),
+            "rust-analyzer… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_prefers_percentage() {
+        // VSCode-style with percentage available: detail is the
+        // fixed-width `42%`, not the verbose message string.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Indexing".to_string(),
+            message: Some("319/320".to_string()),
+            percentage: Some(99),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Indexing: 99% "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_falls_back_to_percentage() {
+        // No message string → use percentage as detail.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Indexing".to_string(),
+            message: None,
+            percentage: Some(42),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Indexing: 42% "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_title_only() {
+        // begin with just a title and nothing else: show stage with `…`.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Fetching".to_string(),
+            message: None,
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Fetching… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_extracts_xy_count_from_path_message() {
+        // rust-analyzer's "Roots Scanned" messages embed the full path
+        // (e.g. "34/285: /home/john/.cargo/registry/…"). When no
+        // percentage is provided, surface the leading `34/285` so the
+        // user still sees concrete progress without the path noise.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Roots Scanned".to_string(),
+            message: Some(
+                "34/285: /home/john/.cargo/registry/src/index.crates.io-1949cf8c/gio-0.18.4"
+                    .to_string(),
+            ),
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Roots Scanned: 34/285 "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_drops_unbounded_message() {
+        // Free-text messages without a percentage or X/Y prefix
+        // (e.g. "cargo metadata: Blocking …") would balloon the segment
+        // width and trigger fit-or-drop flicker — we drop the message
+        // text and fall back to `stage…`.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Fetching".to_string(),
+            message: Some(
+                "cargo metadata: Blocking waiting for file lock on package cache".to_string(),
+            ),
+            percentage: None,
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • Fetching… "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_empty_title_uses_working() {
+        // Defensive: some servers begin without a title — show "working"
+        // rather than a blank stage label.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: String::new(),
+            message: None,
+            percentage: Some(50),
+        };
+        assert_eq!(
+            format_lsp_progress_segment("rust-analyzer", Some(&progress)),
+            "rust-analyzer • working: 50% "
+        );
+    }
+
+    #[test]
+    fn test_lsp_progress_segment_width_bound() {
+        // Width discipline: the formatted segment must stay ≤ 32 cells
+        // for the longest plausible title + percentage combo, to prevent
+        // the status bar's priority-drop from flapping during streaming
+        // $/progress reports.
+        let progress = crate::core::lsp_manager::LspProgress {
+            title: "Building compile-time-deps".to_string(),
+            message: None,
+            percentage: Some(100),
+        };
+        let s = format_lsp_progress_segment("rust-analyzer", Some(&progress));
+        // Width covers `rust-analyzer • Building compile-time-deps: 100% ` ≈ 51 chars.
+        // Longest realistic title in rust-analyzer's vocabulary —
+        // shorter labels (e.g. "Indexing", "Fetching") stay well under.
+        assert!(s.chars().count() < 60, "segment too long: {s:?}");
+    }
+
     #[test]
     fn test_lsp_status_no_manager() {
         use crate::core::engine::Engine;
@@ -8894,21 +13897,22 @@ mod tests {
     }
 
     #[test]
-    fn test_editor_bottom_px() {
-        let lh = 20.0;
-        let total = 800.0;
-        let eb = editor_bottom_px(total, lh, true, false, false, 0, false, 0, false, false);
-        assert_eq!(eb, total - lh); // only status bar (1 row)
+    fn test_compute_editor_layout_basic() {
+        let engine = crate::core::engine::tests::engine_with_text("hello\nworld\n");
+        let layout = compute_editor_layout(&engine, 800.0, 20.0, false);
+        // per_window_status_line defaults to true → status bar = 1 cmd line (20px)
+        assert_eq!(layout.status_bar_h, 20.0);
+        assert!(layout.editor_bottom > 700.0);
+        assert!(layout.editor_bottom < 800.0);
     }
 
     #[test]
-    fn test_editor_bottom_px_with_separated_status() {
-        let lh = 20.0;
-        let total = 800.0;
-        // With separated status, editor bottom is 1 extra row lower
-        let without = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, false);
-        let with = editor_bottom_px(total, lh, true, false, false, 0, true, 10, false, true);
-        assert_eq!(without - with, lh);
+    fn test_compute_editor_layout_tui_units() {
+        let engine = crate::core::engine::tests::engine_with_text("hello\n");
+        let layout = compute_editor_layout(&engine, 24.0, 1.0, true);
+        // TUI: line_height=1.0, total=24 rows, menu not visible
+        assert!(layout.editor_bottom > 20.0);
+        assert!(layout.editor_bottom <= 24.0);
     }
 
     #[test]
@@ -9343,7 +14347,7 @@ mod tests {
         let mut e = test_engine("hello\n");
         e.menu_bar_visible = true;
         let layout = render_engine(&e, 80.0, 24.0);
-        assert!(layout.menu_bar.is_some(), "menu bar should be visible");
+        assert!(layout.menu_bar_visible, "menu bar should be visible");
 
         let expected = collect_expected_ui_elements(&layout);
         for (name, collector) in [
@@ -9429,88 +14433,6 @@ mod tests {
         assert!(
             tui_only.is_empty() && wingui_only.is_empty(),
             "Action parity mismatch:\n  TUI-only: {tui_only:?}\n  Win-GUI-only: {wingui_only:?}"
-        );
-    }
-
-    /// Phase 2c source-code verification: grep the Win-GUI source for the
-    /// engine method calls required by each [`UiAction`]. This catches cases
-    /// where a hand-curated list claims an action is handled but the actual
-    /// engine call is missing from the source code.
-    #[test]
-    fn test_wingui_source_contains_required_calls() {
-        // Read both Win-GUI source files (use CARGO_MANIFEST_DIR for stable path)
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let mod_path = std::path::Path::new(manifest_dir).join("src/win_gui/mod.rs");
-        let draw_path = std::path::Path::new(manifest_dir).join("src/win_gui/draw.rs");
-        let mod_src = std::fs::read_to_string(&mod_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", mod_path.display()));
-        let draw_src = std::fs::read_to_string(&draw_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", draw_path.display()));
-        let src = format!("{mod_src}\n{draw_src}");
-
-        // Map each UiAction to the engine method call(s) that MUST appear in
-        // the source.  Draw-order actions check draw function call order
-        // instead of engine methods.
-        let checks: Vec<(UiAction, &[&str])> = vec![
-            (UiAction::ExplorerSingleClickFile, &["open_file_preview"]),
-            (UiAction::ExplorerDoubleClickFile, &["open_file_in_tab"]),
-            (UiAction::ExplorerEnterOnFile, &["open_file_in_tab"]),
-            (
-                UiAction::ExplorerRightClick,
-                &["open_explorer_context_menu"],
-            ),
-            (UiAction::ContextMenuClickInside, &["context_menu_confirm"]),
-            (UiAction::ContextMenuClickOutside, &["close_context_menu"]),
-            (UiAction::TabClick, &["goto_tab"]),
-            (UiAction::TabCloseClick, &["close_tab"]),
-            (UiAction::TabRightClick, &["open_tab_context_menu"]),
-            (UiAction::TabDragDrop, &["tab_drag_begin", "tab_drag_drop"]),
-            (UiAction::EditorRightClick, &["open_editor_context_menu"]),
-            (UiAction::EditorDoubleClick, &["mouse_double_click"]),
-            // EditorScroll: scroll_down_visible/scroll_up_visible or
-            // set_scroll_top_for_window — any is fine
-            (UiAction::EditorScroll, &["scroll_down_visible"]),
-            (UiAction::EditorHoverClick, &["editor_hover_focus"]),
-            (UiAction::EditorHoverDismiss, &["dismiss_editor_hover"]),
-            (UiAction::EditorHoverScroll, &["editor_hover_scroll"]),
-            (UiAction::DebugToolbarButtonClick, &["execute_command"]),
-            (UiAction::TerminalSplitButton, &["terminal_toggle_split"]),
-            (UiAction::TerminalAddButton, &["terminal_new_tab"]),
-            (
-                UiAction::TerminalCloseButton,
-                &["terminal_close_active_tab"],
-            ),
-            (UiAction::TerminalSplitPaneClick, &["terminal_active"]),
-            // Activity bar: check for panel toggle dispatch
-            (UiAction::ActivityBarClick, &["active_panel"]),
-            (UiAction::ActivityBarSettingsClick, &["Settings"]),
-            // Draw order: verify draw sequence in on_paint / draw_frame
-            (
-                UiAction::DrawOrderContextMenuAboveSidebar,
-                &["draw_context_menu", "draw_sidebar"],
-            ),
-            (UiAction::DrawOrderDialogOnTop, &["draw_dialog"]),
-            (
-                UiAction::DrawOrderMenuDropdownAboveSidebar,
-                &["draw_menu_dropdown"],
-            ),
-        ];
-
-        let mut missing = Vec::new();
-        for (action, required_calls) in &checks {
-            for call in *required_calls {
-                if !src.contains(call) {
-                    missing.push(format!(
-                        "{action:?} requires `{call}` — not found in Win-GUI source"
-                    ));
-                }
-            }
-        }
-
-        assert!(
-            missing.is_empty(),
-            "Win-GUI source missing required engine calls:\n  {}",
-            missing.join("\n  ")
         );
     }
 
@@ -10035,5 +14957,370 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Tooltip adapter tests (hover popup + signature help) ───────────────
+
+    #[test]
+    fn test_hover_popup_to_tooltip_plain_multiline() {
+        let hover = HoverPopup {
+            text: "fn foo() -> i32\nReturns the answer.".to_string(),
+            anchor_line: 5,
+            anchor_col: 10,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, layout) = hover_popup_to_quadraui_tooltip(&hover, 30, 20, viewport);
+
+        // Plain multi-line path: styled_lines is None, text carries newlines.
+        assert!(tooltip.styled_lines.is_none());
+        assert!(tooltip.text.contains('\n'));
+        // Placement preferred Top — layout resolves to Top because there's
+        // room (anchor_y=20, height=2 → fits above).
+        assert_eq!(layout.resolved_placement, quadraui::ResolvedPlacement::Top);
+        // Popup is positioned above the cursor line.
+        assert!(layout.bounds.y < 20.0);
+    }
+
+    #[test]
+    fn test_signature_help_to_tooltip_highlights_active_param() {
+        let theme = Theme::onedark();
+        // Label: "fn from(s: &str) -> String"
+        //         0    5   9       18
+        // Params: param 0 is "s: &str" starting at byte 8 (after "fn from(").
+        let sig = SignatureHelp {
+            label: "fn from(s: &str) -> String".to_string(),
+            params: vec![(8, 15)], // byte offsets of "s: &str"
+            active_param: Some(0),
+            anchor_line: 3,
+            anchor_col: 20,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, layout) = signature_help_to_quadraui_tooltip(&sig, 40, 15, viewport, &theme);
+
+        // Styled path is active.
+        let lines = tooltip.styled_lines.as_ref().expect("styled spans");
+        assert_eq!(lines.len(), 1);
+        let styled = &lines[0];
+        // 5 spans: leading " ", pre, active, post, trailing " ".
+        assert_eq!(styled.spans.len(), 5);
+        assert_eq!(styled.spans[0].text, " ");
+        assert_eq!(styled.spans[1].text, "fn from(");
+        assert_eq!(styled.spans[2].text, "s: &str");
+        assert_eq!(styled.spans[3].text, ") -> String");
+        assert_eq!(styled.spans[4].text, " ");
+
+        // Active span uses theme keyword colour; surrounding spans use hover_fg.
+        let kw = to_q_color(theme.keyword);
+        let fg = to_q_color(theme.hover_fg);
+        assert_eq!(styled.spans[2].fg, Some(kw));
+        assert_eq!(styled.spans[1].fg, Some(fg));
+        assert_eq!(styled.spans[3].fg, Some(fg));
+
+        // Single-line height; width sized to label + padding + borders.
+        assert_eq!(layout.bounds.height, 1.0);
+        assert!(layout.bounds.width >= 26.0);
+    }
+
+    #[test]
+    fn test_signature_help_to_tooltip_no_active_param() {
+        let theme = Theme::onedark();
+        let sig = SignatureHelp {
+            label: "fn noop()".to_string(),
+            params: Vec::new(),
+            active_param: None,
+            anchor_line: 0,
+            anchor_col: 0,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
+
+        let lines = tooltip.styled_lines.as_ref().expect("styled spans");
+        assert_eq!(lines.len(), 1);
+        let styled = &lines[0];
+        // Without active param: leading " ", full label as one span, trailing " ".
+        assert_eq!(styled.spans.len(), 3);
+        assert_eq!(styled.spans[1].text, "fn noop()");
+        // Everything uses hover_fg (no keyword highlight).
+        let fg = to_q_color(theme.hover_fg);
+        assert_eq!(styled.spans[1].fg, Some(fg));
+    }
+
+    // ── editor_hover_to_quadraui_rich_text adapter tests (#488) ──────────────
+
+    /// Build a minimal `EditorHoverPopupData` with a known link on line 0 so
+    /// we can verify that `editor_hover_to_quadraui_rich_text` maps it into
+    /// `RichTextPopup.links` with the correct byte offsets.  These offsets are
+    /// exactly what the GTK `link_widths` closure indexes into via
+    /// `pango_layout.index_to_pos(start_byte)` — wrong offsets would shift the
+    /// hit-rect even if the Pango measurement itself is accurate (#488).
+    #[test]
+    fn test_editor_hover_to_quadraui_rich_text_link_offsets() {
+        use crate::core::markdown::{MdRendered, MdSpan, MdStyle};
+
+        let line = "See https://example.com for details";
+        // byte offsets of "https://example.com": starts at 4, ends at 23
+        let link_start = 4usize;
+        let link_end = 23usize;
+        assert_eq!(&line[link_start..link_end], "https://example.com");
+
+        let rendered = MdRendered {
+            lines: vec![line.to_string()],
+            spans: vec![vec![MdSpan {
+                start_byte: link_start,
+                end_byte: link_end,
+                style: MdStyle::LinkUrl,
+            }]],
+            code_highlights: vec![vec![]],
+        };
+        let eh = EditorHoverPopupData {
+            rendered,
+            links: vec![(0, link_start, link_end, "https://example.com".to_string())],
+            anchor_line: 0,
+            anchor_col: 0,
+            scroll_top: 0,
+            focused_link: None,
+            has_focus: false,
+            popup_width: 40,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        };
+        let theme = Theme::onedark();
+        let popup = editor_hover_to_quadraui_rich_text(&eh, &theme);
+
+        // Exactly one link.
+        assert_eq!(popup.links.len(), 1, "one link expected");
+        let link = &popup.links[0];
+        // Byte offsets must survive the conversion unchanged.
+        assert_eq!(link.line, 0);
+        assert_eq!(link.start_byte, link_start,
+            "start_byte mismatch — GTK index_to_pos would compute wrong x0");
+        assert_eq!(link.end_byte, link_end,
+            "end_byte mismatch — GTK index_to_pos would compute wrong x1");
+        assert_eq!(link.url, "https://example.com");
+        // line_text[0] must equal the raw line so index_to_pos byte indices are valid.
+        assert_eq!(popup.line_text.get(0).map(String::as_str), Some(line),
+            "line_text must carry the raw text unchanged");
+        // Sanity: the byte range must index valid UTF-8 within line_text.
+        let raw = &popup.line_text[0];
+        assert_eq!(&raw[link.start_byte..link.end_byte], "https://example.com");
+    }
+
+    /// Multi-link hover: two URLs on different lines.  Verifies that lines and
+    /// link indices stay in sync after the adapter — an off-by-one in `links`
+    /// would cause the GTK closure to measure the wrong line or wrong span.
+    #[test]
+    fn test_editor_hover_to_quadraui_rich_text_multi_link() {
+        use crate::core::markdown::{MdRendered, MdSpan, MdStyle};
+
+        let line0 = "Docs: https://docs.rs/foo";
+        let line1 = "Also see https://crates.io/crates/foo";
+        // "https://docs.rs/foo" starts at 6, ends at 25
+        // "https://crates.io/crates/foo" starts at 9, ends at 37
+        let (s0, e0) = (6, 25);
+        let (s1, e1) = (9, 37);
+        assert_eq!(&line0[s0..e0], "https://docs.rs/foo");
+        assert_eq!(&line1[s1..e1], "https://crates.io/crates/foo");
+
+        let rendered = MdRendered {
+            lines: vec![line0.to_string(), line1.to_string()],
+            spans: vec![
+                vec![MdSpan { start_byte: s0, end_byte: e0, style: MdStyle::LinkUrl }],
+                vec![MdSpan { start_byte: s1, end_byte: e1, style: MdStyle::LinkUrl }],
+            ],
+            code_highlights: vec![vec![], vec![]],
+        };
+        let eh = EditorHoverPopupData {
+            rendered,
+            links: vec![
+                (0, s0, e0, "https://docs.rs/foo".to_string()),
+                (1, s1, e1, "https://crates.io/crates/foo".to_string()),
+            ],
+            anchor_line: 0,
+            anchor_col: 0,
+            scroll_top: 0,
+            focused_link: None,
+            has_focus: false,
+            popup_width: 40,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        };
+        let theme = Theme::onedark();
+        let popup = editor_hover_to_quadraui_rich_text(&eh, &theme);
+
+        assert_eq!(popup.links.len(), 2);
+        assert_eq!(popup.links[0].line, 0);
+        assert_eq!(popup.links[0].start_byte, s0);
+        assert_eq!(popup.links[0].end_byte, e0);
+        assert_eq!(popup.links[1].line, 1);
+        assert_eq!(popup.links[1].start_byte, s1);
+        assert_eq!(popup.links[1].end_byte, e1);
+        // line_text must be in sync with link offsets.
+        assert_eq!(&popup.line_text[0][s0..e0], "https://docs.rs/foo");
+        assert_eq!(&popup.line_text[1][s1..e1], "https://crates.io/crates/foo");
+    }
+
+    #[test]
+    fn test_tab_switcher_to_list_view_dirty_and_scroll() {
+        let ts = TabSwitcherPanel {
+            items: vec![
+                ("main.rs".to_string(), "/src/main.rs".to_string(), false),
+                ("lib.rs".to_string(), "/src/lib.rs".to_string(), true),
+                (
+                    "keys.rs".to_string(),
+                    "/src/core/keys.rs".to_string(),
+                    false,
+                ),
+                ("tests.rs".to_string(), "/src/tests.rs".to_string(), false),
+                ("todo.md".to_string(), "".to_string(), false),
+            ],
+            selected_idx: 4,
+        };
+        let list = tab_switcher_to_quadraui_list_view(&ts, 3);
+
+        // Bordered modal with title overlay.
+        assert!(list.bordered);
+        assert!(list.title.is_some());
+        // 5 items, all present.
+        assert_eq!(list.items.len(), 5);
+        // Dirty marker appended to filename label (rendered as text,
+        // not detail — matches legacy behavior).
+        let lib_text: String = list.items[1]
+            .text
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(lib_text.contains("●"));
+        let main_text: String = list.items[0]
+            .text
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(!main_text.contains("●"));
+        // Paths appear as detail (right-aligned dimmed in the rasteriser).
+        assert!(list.items[0].detail.is_some());
+        // Empty path → no detail (avoids rendering a lone trailing space).
+        assert!(list.items[4].detail.is_none());
+        // Scroll so selected (idx=4) is visible inside max_visible=3:
+        // offset = 4 + 1 - 3 = 2.
+        assert_eq!(list.scroll_offset, 2);
+        assert_eq!(list.selected_idx, 4);
+    }
+
+    #[test]
+    fn test_diff_peek_to_tooltip_per_line_colors_and_action_bar() {
+        let theme = Theme::onedark();
+        let peek = DiffPeekPopup {
+            anchor_line: 5,
+            hunk_lines: vec![
+                " let x = 1;".to_string(),
+                "-old line".to_string(),
+                "+new line".to_string(),
+            ],
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, layout) = diff_peek_to_quadraui_tooltip(&peek, 30, 10, viewport, &theme);
+
+        // Multi-line styled path active.
+        let lines = tooltip.styled_lines.as_ref().expect("styled_lines");
+        // 3 hunk lines + 1 action bar = 4 rows.
+        assert_eq!(lines.len(), 4);
+
+        let added = to_q_color(theme.git_added);
+        let deleted = to_q_color(theme.git_deleted);
+        let fg = to_q_color(theme.hover_fg);
+
+        // Context line: hover_fg.
+        assert_eq!(lines[0].spans[0].fg, Some(fg));
+        // Deleted line: git_deleted.
+        assert_eq!(lines[1].spans[0].fg, Some(deleted));
+        // Added line: git_added.
+        assert_eq!(lines[2].spans[0].fg, Some(added));
+        // Action bar: default fg, contains hotkey labels.
+        let action: String = lines[3].spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(action.contains("[s] Stage"));
+        assert!(action.contains("[r] Revert"));
+        assert!(action.contains("[q] Close"));
+        assert_eq!(lines[3].spans[0].fg, Some(fg));
+
+        // Placement: prefers Bottom (legacy diff peek always rendered below).
+        // Anchor at y=10 with viewport height 50 → fits below → Bottom resolved.
+        assert_eq!(
+            layout.resolved_placement,
+            quadraui::ResolvedPlacement::Bottom
+        );
+        assert!(layout.bounds.y > 10.0);
+        // Multi-row height (4 rows).
+        assert_eq!(layout.bounds.height, 4.0);
+    }
+
+    #[test]
+    fn test_signature_help_active_param_out_of_range_falls_back() {
+        let theme = Theme::onedark();
+        // active_param index points past end of params list — adapter falls
+        // back to no-highlight path.
+        let sig = SignatureHelp {
+            label: "fn foo(x: i32)".to_string(),
+            params: vec![(7, 13)],
+            active_param: Some(5), // out of range
+            anchor_line: 0,
+            anchor_col: 0,
+        };
+        let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
+        let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
+        let lines = tooltip.styled_lines.as_ref().expect("styled spans");
+        assert_eq!(lines.len(), 1);
+        let styled = &lines[0];
+        // Fallback: 3 spans (leading-pad, whole-label, trailing-pad).
+        assert_eq!(styled.spans.len(), 3);
+        assert_eq!(styled.spans[1].text, "fn foo(x: i32)");
+    }
+
+    #[test]
+    fn test_breadcrumb_bounds_do_not_overlap_first_line() {
+        use crate::core::engine::Engine;
+        use crate::core::window::{GroupId, WindowRect};
+
+        let mut engine = Engine::new();
+        engine.settings.breadcrumbs = true;
+        engine.buffer_mut().insert(0, "line 1\nline 2\nline 3\n");
+
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let tbh = tab_bar_height_px(line_height, true);
+        let wid = engine.active_window_id();
+        let rects = vec![(wid, WindowRect::new(0.0, tbh, 800.0, 600.0 - tbh))];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+
+        assert!(!layout.breadcrumbs.is_empty());
+        let bc = &layout.breadcrumbs[0];
+        // Breadcrumb bounds must sit ABOVE the window content, not overlap it.
+        let window_top = layout.windows[0].rect.y;
+        assert!(
+            bc.bounds.y + bc.bounds.height <= window_top,
+            "breadcrumb bottom ({}) must not exceed window top ({})",
+            bc.bounds.y + bc.bounds.height,
+            window_top,
+        );
+
+        // Clicking at the window top (line 1) must return Window, not Breadcrumb.
+        let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
+        let zone = screen_zone_hit_test(
+            &layout,
+            100.0,
+            window_top,
+            tbh,
+            single_tab_hidden,
+            engine.active_group,
+        );
+        assert!(
+            matches!(zone, ScreenZone::Window { .. }),
+            "click at window_top should hit Window zone, got {:?}",
+            zone,
+        );
     }
 }

@@ -358,7 +358,12 @@ pub fn revert_hunk(dir: &Path, file_header: &str, hunk: &Hunk) -> Result<(), Str
         patch.push_str(line);
         patch.push('\n');
     }
-    run_git_stdin(dir, &["apply", "--reverse", "-"], &patch).map(|_| ())
+    // `--index` applies the reverse patch to BOTH the working tree
+    // and the index, so reverting a previously-staged hunk discards
+    // it everywhere instead of leaving the staged copy behind. If
+    // the hunk wasn't staged, --index degrades gracefully (the
+    // index simply matches working tree before + after).
+    run_git_stdin(dir, &["apply", "--reverse", "--index", "-"], &patch).map(|_| ())
 }
 
 // ─── Commit / push ────────────────────────────────────────────────────────────

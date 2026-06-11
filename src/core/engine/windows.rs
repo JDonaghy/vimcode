@@ -21,10 +21,28 @@ impl Engine {
 
     /// Split the active window in the given direction.
     pub fn split_window(&mut self, direction: SplitDirection, file_path: Option<&Path>) {
+        // Respect splitbelow / splitright. new_first=true means the new
+        // window goes first (top / left).
+        let new_first = match direction {
+            SplitDirection::Horizontal => !self.settings.splitbelow,
+            SplitDirection::Vertical => !self.settings.splitright,
+        };
+        self.split_window_with_new_first(direction, file_path, new_first);
+    }
+
+    /// Split the active window with an explicit `new_first` placement,
+    /// ignoring splitbelow/splitright. Used by UI actions like
+    /// "Open to the Side" whose label commits to a specific side
+    /// regardless of the user's vim defaults.
+    pub fn split_window_with_new_first(
+        &mut self,
+        direction: SplitDirection,
+        file_path: Option<&Path>,
+        new_first: bool,
+    ) {
         let current_buffer_id = self.active_buffer_id();
         let current_window_id = self.active_window_id();
 
-        // Determine which buffer the new window should show
         let new_buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
                 Ok(id) => {
@@ -38,27 +56,18 @@ impl Engine {
                 }
             }
         } else {
-            // Same buffer as current window
             current_buffer_id
         };
 
-        // Create new window
         let new_window_id = self.new_window_id();
         let mut new_window = Window::new(new_window_id, new_buffer_id);
 
-        // Copy view state if same buffer
         if new_buffer_id == current_buffer_id {
             new_window.view = self.active_window().view.clone();
         }
 
         self.windows.insert(new_window_id, new_window);
 
-        // Update layout — respect splitbelow / splitright settings.
-        // new_first=true means the *new* window goes first (top / left).
-        let new_first = match direction {
-            SplitDirection::Horizontal => !self.settings.splitbelow,
-            SplitDirection::Vertical => !self.settings.splitright,
-        };
         let tab = self.active_tab_mut();
         tab.layout
             .split_at(current_window_id, direction, new_window_id, new_first);
@@ -107,7 +116,7 @@ impl Engine {
             if a == window_id || b == window_id {
                 self.clear_diff_labels(a, b);
                 self.diff_results.clear();
-                self.diff_aligned.clear();
+                self.clear_all_diff_alignment();
                 self.diff_unchanged_hidden = false;
                 // Close the partner diff window + clean up scratch buffers.
                 let partner = if a == window_id { b } else { a };
@@ -184,7 +193,7 @@ impl Engine {
                     self.clear_diff_labels(a, b);
                     self.diff_window_pair = None;
                     self.diff_results.clear();
-                    self.diff_aligned.clear();
+                    self.clear_all_diff_alignment();
                 }
             }
         }
@@ -363,7 +372,7 @@ impl Engine {
                     self.clear_diff_labels(a, b);
                     self.diff_window_pair = None;
                     self.diff_results.clear();
-                    self.diff_aligned.clear();
+                    self.clear_all_diff_alignment();
                 }
             }
         }
@@ -691,11 +700,18 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
+            trigger_height: 0.0,
         });
     }
 
     /// Open the editor action menu ("..." button) for a tab bar group.
-    pub fn open_editor_action_menu(&mut self, group_id: GroupId, x: u16, y: u16) {
+    pub fn open_editor_action_menu(
+        &mut self,
+        group_id: GroupId,
+        x: u16,
+        y: u16,
+        trigger_height: f32,
+    ) {
         let group = match self.editor_groups.get(&group_id) {
             Some(g) => g,
             None => return,
@@ -775,6 +791,7 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
+            trigger_height,
         });
     }
 
@@ -957,6 +974,7 @@ impl Engine {
             selected: 0,
             screen_x: x,
             screen_y: y,
+            trigger_height: 0.0,
         });
     }
 
@@ -1041,6 +1059,7 @@ impl Engine {
             selected,
             screen_x: x,
             screen_y: y,
+            trigger_height: 0.0,
         });
     }
 
@@ -1208,12 +1227,14 @@ impl Engine {
                     }
                     "open_side" => {
                         self.open_editor_group(crate::core::window::SplitDirection::Vertical);
-                        // Replace the cloned buffer with the target file.
-                        let path_str = path.display().to_string();
-                        self.execute_command(&format!("e {path_str}"));
+                        let _ = self.open_file_with_mode(path, OpenMode::Permanent);
                     }
                     "open_side_vsplit" => {
-                        self.split_window(SplitDirection::Vertical, None);
+                        // "Open to the Side" always places the target on the
+                        // right, regardless of splitright (#226). Split first
+                        // with new_first=false, then load the target file into
+                        // the new (right, now-active) window.
+                        self.split_window_with_new_first(SplitDirection::Vertical, None, false);
                         let _ = self.open_file_with_mode(path, OpenMode::Permanent);
                     }
                     // new_file, new_folder, rename, delete are handled by the UI backend
@@ -1282,7 +1303,7 @@ impl Engine {
                 }
                 "open_side_vsplit" => {
                     if let Some(path) = self.file_path().map(|p| p.to_path_buf()) {
-                        self.split_window(SplitDirection::Vertical, None);
+                        self.split_window_with_new_first(SplitDirection::Vertical, None, false);
                         let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
                     }
                 }
@@ -1478,6 +1499,7 @@ impl Engine {
                 self.tab_mru_touch(); // update MRU but skip nav push (navigating=true)
                 self.lsp_ensure_active_buffer();
                 self.ensure_active_tab_visible();
+                self.explorer_reveal_active_file();
                 self.tab_nav_navigating = false;
                 return;
             }
@@ -1563,6 +1585,10 @@ impl Engine {
 
     /// Open the tab switcher popup, pre-selecting the second MRU entry.
     pub fn open_tab_switcher(&mut self) {
+        // Opening a modal dismisses passive overlays (LSP hover) so
+        // they don't render behind it (#247).
+        self.dismiss_editor_hover();
+
         // Build a clean MRU list: only include entries that still exist
         self.tab_mru.retain(|&(g, idx)| {
             self.editor_groups
@@ -1591,6 +1617,34 @@ impl Engine {
         self.tab_switcher_selected = 1; // Start on the second item (previous tab)
     }
 
+    /// Open the tab switcher if not already open, then cycle the selection.
+    /// `forward`: true = next (Alt+t, Ctrl+Tab), false = previous (Shift+Tab).
+    pub fn tab_switcher_cycle(&mut self, forward: bool) {
+        if !self.tab_switcher_open {
+            self.open_tab_switcher();
+            if !forward && self.tab_switcher_open {
+                let len = self.tab_mru.len();
+                if len > 0 {
+                    self.tab_switcher_selected = len - 1;
+                }
+            }
+            return;
+        }
+        let len = self.tab_mru.len();
+        if len == 0 {
+            return;
+        }
+        if forward {
+            self.tab_switcher_selected = (self.tab_switcher_selected + 1) % len;
+        } else {
+            self.tab_switcher_selected = if self.tab_switcher_selected == 0 {
+                len - 1
+            } else {
+                self.tab_switcher_selected - 1
+            };
+        }
+    }
+
     /// Confirm the tab switcher selection and close the popup.
     pub fn tab_switcher_confirm(&mut self) {
         if !self.tab_switcher_open {
@@ -1610,6 +1664,20 @@ impl Engine {
             }
         }
         self.tab_switcher_open = false;
+    }
+
+    /// Set `active_group` to the group that owns the given window.
+    pub fn activate_group_for_window(&mut self, window_id: WindowId) {
+        for (&gid, group) in &self.editor_groups {
+            if group
+                .tabs
+                .iter()
+                .any(|t| t.window_ids().contains(&window_id))
+            {
+                self.active_group = gid;
+                return;
+            }
+        }
     }
 
     /// Handle a click on a tab bar hit region.
@@ -1694,6 +1762,7 @@ impl Engine {
             self.tab_nav_push();
             self.lsp_ensure_active_buffer();
             self.ensure_active_tab_visible();
+            self.explorer_reveal_active_file();
         }
     }
 
@@ -1800,6 +1869,73 @@ impl Engine {
             self.ensure_active_tab_visible();
         }
         self.active_group = saved;
+    }
+
+    /// Write a backend-computed `tab_scroll_offset` for `group_id`. Returns
+    /// `true` if the value actually changed — backend uses this to decide
+    /// whether to re-paint (pass 2) so the corrected offset reaches the
+    /// screen.
+    ///
+    /// Use this when the backend's per-tab measurement differs from
+    /// `tab_display_width` (which is char-cell based and tuned for TUI).
+    /// GTK / Win-GUI / macOS have pixel-based padding that doesn't map to
+    /// char units, so they compute their own offset via
+    /// `quadraui::TabBar::fit_active_scroll_offset` and write it here.
+    pub fn set_tab_scroll_offset(&mut self, group_id: GroupId, offset: usize) -> bool {
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if g.tab_scroll_offset != offset {
+                g.tab_scroll_offset = offset;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Apply per-group tab bar widths (in char-cells) measured by the most
+    /// recent draw, then re-check that every group's active tab is on-screen.
+    /// Returns `true` iff any width or any `tab_scroll_offset` actually
+    /// changed — when true, the calling backend should trigger one more
+    /// draw cycle so the corrected scroll offset reaches the screen.
+    ///
+    /// **This is the single contract every UI backend must call after each
+    /// completed paint** to maintain the "active tab visible" invariant.
+    /// Skipping it after a draw is a bug — the active tab may land off-screen
+    /// after layout changes (window resize, sidebar toggle, new file open)
+    /// and stay there until something else triggers a draw.
+    ///
+    /// Where each backend calls it:
+    /// - **TUI** (`tui_main/mod.rs`): inline after `terminal.draw(...)`.
+    /// - **Win-GUI** (`win_gui/mod.rs`): inline after `EndDraw`.
+    /// - **GTK** (`gtk/mod.rs`): inside the `set_draw_func` closure after
+    ///   the immutable engine borrow is dropped. If the call returns true,
+    ///   schedule one more draw via `glib::idle_add_local_once(|| da.queue_draw())`
+    ///   — that's the GTK equivalent of TUI/Win-GUI re-running the paint
+    ///   loop, deferred by one idle tick because GTK's borrow rules don't
+    ///   allow a synchronous re-render from inside a draw callback.
+    ///
+    /// The width/scroll change-tracking lets backends avoid an unconditional
+    /// extra paint per frame; the feedback loop converges in ≤2 frames
+    /// because the second draw measures the same width and reports no change.
+    pub fn post_draw_apply_widths(&mut self, widths: &[(GroupId, usize)]) -> bool {
+        let mut changed = false;
+        for &(gid, width) in widths {
+            let before = self.editor_groups.get(&gid).map(|g| g.tab_bar_width);
+            self.set_tab_visible_count(gid, width);
+            if before != self.editor_groups.get(&gid).map(|g| g.tab_bar_width) {
+                changed = true;
+            }
+        }
+        let scrolls_before: std::collections::HashMap<GroupId, usize> = self
+            .editor_groups
+            .iter()
+            .map(|(&gid, g)| (gid, g.tab_scroll_offset))
+            .collect();
+        self.ensure_all_groups_tabs_visible();
+        let scroll_changed = self
+            .editor_groups
+            .iter()
+            .any(|(gid, g)| scrolls_before.get(gid) != Some(&g.tab_scroll_offset));
+        changed || scroll_changed
     }
 
     // =======================================================================
@@ -2135,6 +2271,7 @@ impl Engine {
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
+            self.explorer_reveal_path(path);
             return;
         }
 
@@ -2158,6 +2295,7 @@ impl Engine {
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
+            self.explorer_reveal_path(path);
             return;
         }
 
@@ -2186,6 +2324,7 @@ impl Engine {
             self.message = format!("\"{}\"", path.display());
         }
         self.lsp_did_open(buffer_id);
+        self.explorer_reveal_path(path);
 
         // Swap file check: detect stale swaps and offer recovery.
         self.swap_check_on_open(buffer_id);
@@ -2230,6 +2369,7 @@ impl Engine {
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
+            self.explorer_reveal_path(path);
             return;
         }
 
@@ -2288,6 +2428,7 @@ impl Engine {
         self.refresh_git_diff(buffer_id);
         self.message = format!("\"{}\"", path.display());
         self.lsp_did_open(buffer_id);
+        self.explorer_reveal_path(path);
     }
 
     // =======================================================================
@@ -2454,6 +2595,7 @@ impl Engine {
         // New tree format takes priority if present.
         if let Some(ref tree_layout) = ws_session.group_layout {
             self.restore_session_from_tree(tree_layout, &ws_session.active_file);
+            self.explorer_reveal_active_file();
             return;
         }
 
@@ -2580,6 +2722,7 @@ impl Engine {
 
         // Check all restored buffers for stale swap files.
         self.swap_check_all_buffers();
+        self.explorer_reveal_active_file();
     }
 
     /// Restore session from the recursive tree format.

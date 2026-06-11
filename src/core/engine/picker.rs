@@ -79,6 +79,11 @@ impl Engine {
 
     /// Open the unified picker with a given source.
     pub fn open_picker(&mut self, source: PickerSource) {
+        // Opening a picker is a "user is now focused on this modal"
+        // event — dismiss any passive overlays (LSP hover) so they
+        // don't render behind the picker (#247).
+        self.dismiss_editor_hover();
+
         self.picker_query.clear();
         self.picker_selected = 0;
         self.picker_scroll_top = 0;
@@ -86,6 +91,7 @@ impl Engine {
         self.picker_items.clear();
         self.picker_preview = None;
         self.breadcrumb_scoped_parent = None;
+        self.breadcrumb_scoped_parent_line = None;
         self.picker_history_index = None;
         self.picker_history_typing_buffer.clear();
 
@@ -131,6 +137,10 @@ impl Engine {
                 self.picker_title = "Select Line Ending Sequence".to_string();
                 self.picker_populate_line_endings();
             }
+            PickerSource::RecentWorkspaces => {
+                self.picker_title = "Open Recent Workspace".to_string();
+                self.picker_populate_recent_workspaces();
+            }
             _ => {
                 self.picker_title = format!("{:?}", source);
             }
@@ -158,28 +168,21 @@ impl Engine {
             self.picker_filter();
             self.picker_load_preview();
         } else if let Some(path) = path_prefix {
-            if path.is_dir() {
-                // Directory segment: open file picker filtered to that directory
-                self.open_picker(PickerSource::Files);
-                let rel = path
-                    .strip_prefix(&self.cwd)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
-                self.picker_query = if rel.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}/", rel)
-                };
-                self.picker_filter();
-                self.picker_load_preview();
+            // Path segment: show peers (sibling entries in the parent directory).
+            let parent = path.parent().unwrap_or(path);
+            self.open_picker(PickerSource::Files);
+            let rel = parent
+                .strip_prefix(&self.cwd)
+                .unwrap_or(parent)
+                .to_string_lossy()
+                .to_string();
+            self.picker_query = if rel.is_empty() {
+                String::new()
             } else {
-                // File segment (the last path component): open symbol picker
-                self.open_picker(PickerSource::CommandCenter);
-                self.picker_query = "@".to_string();
-                self.picker_filter();
-                self.picker_load_preview();
-            }
+                format!("{}/", rel)
+            };
+            self.picker_filter();
+            self.picker_load_preview();
         }
     }
 
@@ -218,6 +221,7 @@ impl Engine {
         self.picker_scroll_top = 0;
         self.picker_preview = None;
         self.breadcrumb_scoped_parent = None;
+        self.breadcrumb_scoped_parent_line = None;
     }
 
     /// Rebuild the cached breadcrumb segments from the active group's state.
@@ -280,6 +284,14 @@ impl Engine {
 
     /// Open a scoped picker for the currently selected breadcrumb segment.
     /// Path segments open the file picker for that directory.
+    /// Handle a breadcrumb segment click from either backend.
+    /// Rebuilds segments, selects the clicked index, and opens scoped.
+    pub fn handle_breadcrumb_click(&mut self, idx: usize) {
+        self.rebuild_breadcrumb_segments();
+        self.breadcrumb_selected = idx;
+        self.breadcrumb_open_scoped();
+    }
+
     /// Symbol segments open the `@` symbol picker filtered to siblings
     /// within the parent scope.
     pub(crate) fn breadcrumb_open_scoped(&mut self) {
@@ -296,8 +308,28 @@ impl Engine {
         // Symbol segment: show siblings at the same level.
         // Filter to symbols whose container matches this segment's parent,
         // matching VSCode behavior (clicking a function shows sibling functions).
-        self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
+        //
+        // #465: `open_picker` resets the scope filter as part of its state-clear
+        // pass, so both assignments happen AFTER the open call — otherwise the
+        // filter is wiped before the async LSP response can read it.
+        //
+        // The parent's *line* is recorded alongside its name because tree-sitter
+        // and LSP disagree on naming for impl blocks: tree-sitter's name is the
+        // type being implemented (e.g. `VsplitLayout`), while rust-analyzer's
+        // hierarchical `DocumentSymbol` names the impl block fully (e.g. `impl
+        // WindowGroupLayout for VsplitLayout`) and sets that on children's
+        // `container`. The line uniquely identifies the parent in either form
+        // without depending on name-string compatibility.
+        let parent_line = self
+            .breadcrumb_segments
+            .iter()
+            .take(self.breadcrumb_selected)
+            .rev()
+            .find(|s| s.is_symbol)
+            .and_then(|s| s.symbol_line);
         self.open_picker(PickerSource::CommandCenter);
+        self.breadcrumb_scoped_parent = Some(seg.parent_scope.clone());
+        self.breadcrumb_scoped_parent_line = parent_line;
         self.picker_query = "@".to_string();
         self.picker_filter();
         self.picker_load_preview();
@@ -682,6 +714,38 @@ impl Engine {
             .collect();
     }
 
+    /// Populate the picker with recent workspace paths from the session.
+    /// Most-recent first (the session stores them oldest-first). #274.
+    fn picker_populate_recent_workspaces(&mut self) {
+        let current = self.workspace_root.clone();
+        self.picker_all_items = self
+            .session
+            .recent_workspaces
+            .iter()
+            .rev()
+            .map(|path| {
+                let display = path.display().to_string();
+                let detail = if current.as_ref() == Some(path) {
+                    Some("● current".to_string())
+                } else {
+                    None
+                };
+                PickerItem {
+                    display: display.clone(),
+                    filter_text: display,
+                    detail,
+                    action: PickerAction::OpenWorkspace(path.clone()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
     /// Filter picker_all_items by the current query and populate picker_items.
     /// For live sources (Grep), runs a search instead of fuzzy-filtering.
     /// For CommandCenter, delegates to prefix-aware routing.
@@ -1024,8 +1088,41 @@ impl Engine {
     /// When a filter query is active, the tree is flattened for fuzzy matching.
     pub(crate) fn picker_populate_document_symbols(&mut self, symbols: Vec<lsp::SymbolInfo>) {
         // Apply scoped parent filter if set (from breadcrumb navigation).
+        //
+        // Two filter keys can be set by `breadcrumb_open_scoped`:
+        //  * `breadcrumb_scoped_parent_line` — start line of the parent scope
+        //    in the buffer. Primary key. Set when the click came via the
+        //    breadcrumb bar (where each segment has a line).
+        //  * `breadcrumb_scoped_parent` — parent name. Fallback for callers
+        //    that don't have a line (and the existing test surface).
+        //
+        // Line-based lookup wins when available because tree-sitter and LSP
+        // disagree on naming for impl blocks (#465): tree-sitter returns just
+        // the implemented type (`VsplitLayout`), while rust-analyzer names the
+        // impl `impl WindowGroupLayout for VsplitLayout`. Lines are unique and
+        // language-server-agnostic.
         let scoped = self.breadcrumb_scoped_parent.take();
-        let filtered: Vec<lsp::SymbolInfo> = if let Some(ref parent_filter) = scoped {
+        let scoped_line = self.breadcrumb_scoped_parent_line.take();
+        let is_scoped = scoped.is_some();
+        let mut filtered: Vec<lsp::SymbolInfo> = if let Some(parent_line) = scoped_line {
+            // Walk the hierarchical tree to find the parent symbol at the given
+            // line, then use its children as the sibling list. Falls through to
+            // name-based filtering if no such symbol is found (defensive).
+            match Self::find_symbol_at_line(&symbols, parent_line) {
+                Some(parent) if !parent.children.is_empty() => parent.children.clone(),
+                Some(parent) => {
+                    // Flat SymbolInformation case: parent has no children, so
+                    // siblings have to be identified via the `container` field
+                    // using the parent's own LSP name (not tree-sitter's).
+                    let parent_name = parent.name.clone();
+                    symbols
+                        .into_iter()
+                        .filter(|s| s.container.as_deref() == Some(parent_name.as_str()))
+                        .collect()
+                }
+                None => symbols, // parent not in LSP response — best-effort: show all
+            }
+        } else if let Some(ref parent_filter) = scoped {
             symbols
                 .into_iter()
                 .filter(|sym| sym.container.as_deref() == parent_filter.as_deref())
@@ -1033,6 +1130,17 @@ impl Engine {
         } else {
             symbols
         };
+        // In scoped mode the picker shows ONE level (the siblings of the
+        // clicked segment). Strip nested children so `build_symbol_tree_items`
+        // doesn't recurse and flatten the whole subtree below each sibling —
+        // before this, clicking a top-level `impl` segment expanded every
+        // impl's methods inline and the picker showed all ~92 symbols in the
+        // file instead of just the sibling impls/structs/free functions.
+        if is_scoped {
+            for sym in &mut filtered {
+                sym.children.clear();
+            }
+        }
         let path = self.active_buffer_path().unwrap_or_default();
 
         // Check if the symbols already have hierarchy (DocumentSymbol format)
@@ -1090,6 +1198,26 @@ impl Engine {
         self.picker_scroll_top = 0;
         self.picker_update_scroll();
         self.picker_load_preview();
+    }
+
+    /// Recursively walk a hierarchical document-symbol tree and return the
+    /// first symbol whose start line matches `target_line`. Used by the
+    /// breadcrumb scope filter to locate the clicked-on parent by line —
+    /// language-server-agnostic, unlike name matching which breaks for impl
+    /// blocks where tree-sitter and LSP disagree on naming (#465).
+    fn find_symbol_at_line(
+        symbols: &[lsp::SymbolInfo],
+        target_line: usize,
+    ) -> Option<&lsp::SymbolInfo> {
+        for sym in symbols {
+            if sym.line as usize == target_line {
+                return Some(sym);
+            }
+            if let Some(found) = Self::find_symbol_at_line(&sym.children, target_line) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     /// Reconstruct a tree from a flat symbol list using the `container` field.
@@ -1180,6 +1308,12 @@ impl Engine {
                 sym.line as usize,
                 sym.character as usize,
             );
+            // #262: symbol items are never expandable. Every row is a
+            // jumpable destination (GotoSymbol). Children are emitted
+            // flat at increasing depth so the indent still shows the
+            // hierarchy, but Enter / click always jumps via picker_confirm
+            // instead of taking the toggle-expand branch keyed off
+            // `expandable`. VSCode breadcrumb picker has the same shape.
             out.push(PickerItem {
                 filter_text: sym.name.clone(),
                 display,
@@ -1189,8 +1323,8 @@ impl Engine {
                 score: 0,
                 match_positions: Vec::new(),
                 depth,
-                expandable: has_children,
-                expanded: depth == 0, // Top-level items start expanded
+                expandable: false,
+                expanded: true,
             });
             if has_children {
                 Self::build_symbol_tree_items(&sym.children, path, depth + 1, out);
@@ -1607,6 +1741,24 @@ impl Engine {
         }
     }
 
+    /// Scroll the picker selection by `delta` rows (positive = down).
+    /// `visible_rows` is the number of visible result rows in the popup.
+    pub fn picker_scroll(&mut self, delta: isize, visible_rows: usize) {
+        let max = self.picker_items.len().saturating_sub(1);
+        if delta > 0 {
+            self.picker_selected = (self.picker_selected + delta as usize).min(max);
+        } else {
+            self.picker_selected = self.picker_selected.saturating_sub((-delta) as usize);
+        }
+        if self.picker_selected >= self.picker_scroll_top + visible_rows {
+            self.picker_scroll_top = self.picker_selected + 1 - visible_rows;
+        }
+        if self.picker_selected < self.picker_scroll_top {
+            self.picker_scroll_top = self.picker_selected;
+        }
+        self.picker_load_preview();
+    }
+
     /// Load preview context for the currently selected picker item.
     pub(crate) fn picker_load_preview(&mut self) {
         self.picker_preview = None;
@@ -1695,7 +1847,13 @@ impl Engine {
                         EngineAction::None
                     }
                     "goto_line" => {
-                        self.message = "Use :N to go to line N".to_string();
+                        // #193: open Command mode so the user can type a
+                        // line number directly. Previously printed a
+                        // status message suggesting `:N` — unhelpful as
+                        // a first-class palette action.
+                        self.mode = Mode::Command;
+                        self.command_buffer.clear();
+                        self.command_cursor = 0;
                         EngineAction::None
                     }
                     "undo" => {
@@ -1709,7 +1867,14 @@ impl Engine {
                         EngineAction::None
                     }
                     "substitute" => {
-                        self.message = "Use :%s/old/new/g for find & replace".to_string();
+                        // #193: open the find/replace overlay directly
+                        // (same as the Ctrl+H binding) rather than
+                        // printing a tip about :%s/...
+                        self.open_find_replace();
+                        // Ensure the replace row is visible so "Find and
+                        // Replace" actually lands on a replace-capable UI
+                        // and not just the find-only overlay.
+                        self.find_replace_show_replace = true;
                         EngineAction::None
                     }
                     "jump_back" => {
@@ -1814,6 +1979,21 @@ impl Engine {
                     state.set_line_ending(new);
                 }
                 self.message = format!("Line endings: {}", new.as_str());
+                EngineAction::None
+            }
+            PickerAction::OpenWorkspace(path) => {
+                // #274: recent-workspaces picker confirm. Switch workspace,
+                // focus the explorer (so the active file's row renders with
+                // the focused selection bg — surfaces visibly in GTK whose
+                // inactive_selected_bg is too close to surface_bg to read),
+                // re-reveal the active file (open_file_in_tab already did
+                // it once but explorer_needs_refresh triggers a backend
+                // rebuild that can desync the row idx), then signal the
+                // backends to refresh.
+                self.open_folder(&path);
+                self.explorer_has_focus = true;
+                self.explorer_reveal_active_file();
+                self.explorer_needs_refresh = true;
                 EngineAction::None
             }
             PickerAction::JumpToMark(_mark) => {
@@ -2117,9 +2297,18 @@ impl Engine {
         }
     }
 
-    /// Adjust scroll_top so the selected item is visible (assuming ~20 visible rows).
+    /// Adjust scroll_top so the selected item is visible.
+    ///
+    /// The engine doesn't know the actual renderer row count, so this uses
+    /// a conservative heuristic. Renderers are the authoritative source of
+    /// truth: `quadraui_tui::draw_palette` and `quadraui_gtk::draw_palette`
+    /// both clamp `scroll_offset` at render time to guarantee the selected
+    /// item is always visible regardless of the engine's estimate.
     fn picker_update_scroll(&mut self) {
-        let visible = 20usize; // approximate; render layer will clip
+        // Small enough that narrow terminals don't leave the selection
+        // off-screen via the engine's scroll state. Renderer clamp catches
+        // the rest.
+        let visible = 8usize;
         if self.picker_selected < self.picker_scroll_top {
             self.picker_scroll_top = self.picker_selected;
         } else if self.picker_selected >= self.picker_scroll_top + visible {
@@ -2193,7 +2382,11 @@ impl Engine {
                 self.quickfix_items = results;
                 self.quickfix_selected = 0;
                 self.quickfix_open = true;
-                self.quickfix_has_focus = false;
+                // Focus the panel so j/k/Enter drive the result list
+                // immediately — matches VimCode's other "open panel"
+                // commands (:copen) and the UX convention users expect
+                // after an interactive search.
+                self.quickfix_has_focus = n > 0;
                 self.message = format!("{} match{}", n, if n == 1 { "" } else { "es" });
             }
             Err(e) => {

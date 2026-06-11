@@ -389,6 +389,18 @@ impl Engine {
         self.message = format!("DAP: starting {} debug session\u{2026}", config.name);
     }
 
+    /// Handle the debug sidebar action button click (play/stop/debug).
+    /// Both backends call this — zero per-backend dispatch logic.
+    pub fn handle_dap_sidebar_action_click(&mut self) {
+        if self.dap_session_active && self.dap_stopped_thread.is_some() {
+            self.dap_continue();
+        } else if self.dap_session_active {
+            self.execute_command("stop");
+        } else {
+            self.execute_command("debug");
+        }
+    }
+
     /// Continue execution of the stopped thread.
     pub fn dap_continue(&mut self) {
         let tid = self.dap_stopped_thread.unwrap_or(0);
@@ -438,6 +450,12 @@ impl Engine {
         self.dap_pre_launch_done = false;
         self.dap_deferred_lang = None;
         self.dap_sidebar_scroll = [0; 4];
+        {
+            let mut sidebar = self.dap_sidebar_system.borrow_mut();
+            for i in 0..4 {
+                sidebar.set_rows(i, Vec::new());
+            }
+        }
         self.message = "DAP: session stopped".to_string();
     }
 
@@ -535,113 +553,14 @@ impl Engine {
         self.message = "DAP: no active session".to_string();
     }
 
-    /// Compute the number of visible items in the currently active debug sidebar section.
-    pub fn dap_sidebar_section_len(&self) -> usize {
-        self.dap_sidebar_section_item_count(self.dap_sidebar_section)
-    }
-
-    /// Compute the number of items in a specific debug sidebar section.
-    pub fn dap_sidebar_section_item_count(&self, section: DebugSidebarSection) -> usize {
-        match section {
-            DebugSidebarSection::Variables => self.dap_var_flat_count(),
-            DebugSidebarSection::Watch => self.dap_watch_expressions.len(),
-            DebugSidebarSection::CallStack => self.dap_stack_frames.len(),
-            DebugSidebarSection::Breakpoints => {
-                self.dap_breakpoints.values().map(|v| v.len()).sum()
-            }
+    /// Map a section index (0–3) back to a `DebugSidebarSection` variant.
+    pub fn dap_sidebar_section_from_index(idx: usize) -> DebugSidebarSection {
+        match idx {
+            0 => DebugSidebarSection::Variables,
+            1 => DebugSidebarSection::Watch,
+            2 => DebugSidebarSection::CallStack,
+            _ => DebugSidebarSection::Breakpoints,
         }
-    }
-
-    /// Map a `DebugSidebarSection` variant to its index (0–3).
-    pub fn dap_sidebar_section_index(section: DebugSidebarSection) -> usize {
-        match section {
-            DebugSidebarSection::Variables => 0,
-            DebugSidebarSection::Watch => 1,
-            DebugSidebarSection::CallStack => 2,
-            DebugSidebarSection::Breakpoints => 3,
-        }
-    }
-
-    /// Adjust the scroll offset for the active section so that the selected item is visible.
-    pub fn dap_sidebar_ensure_visible(&mut self) {
-        let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
-        let height = self.dap_sidebar_section_heights[idx] as usize;
-        if height == 0 {
-            return; // not yet laid out
-        }
-        let scroll = &mut self.dap_sidebar_scroll[idx];
-        let sel = self.dap_sidebar_selected;
-        if sel < *scroll {
-            *scroll = sel;
-        }
-        if sel >= *scroll + height {
-            *scroll = sel - height + 1;
-        }
-    }
-
-    /// Resize adjacent debug sidebar sections by `delta` rows.
-    /// Shrinks `section_idx` and grows `section_idx + 1` (or vice versa for negative delta).
-    /// Clamps each section to a minimum of 1 row and keeps the total constant.
-    #[allow(dead_code)]
-    pub fn dap_sidebar_resize_section(&mut self, section_idx: usize, delta: i16) {
-        if section_idx >= 3 {
-            return; // no next section to trade rows with
-        }
-        let a = self.dap_sidebar_section_heights[section_idx] as i16;
-        let b = self.dap_sidebar_section_heights[section_idx + 1] as i16;
-        let new_a = (a + delta).max(1).min(a + b - 1);
-        let new_b = a + b - new_a;
-        self.dap_sidebar_section_heights[section_idx] = new_a as u16;
-        self.dap_sidebar_section_heights[section_idx + 1] = new_b as u16;
-    }
-
-    /// Count total items in the flat variable tree (including scope headers,
-    /// expanded children, and additional scope groups).
-    pub(crate) fn dap_var_flat_count(&self) -> usize {
-        let mut count = 0;
-        // Primary scope header (e.g. "Locals") if we have scope info.
-        if self.dap_primary_scope_ref > 0 {
-            count += 1; // header row
-            if self.dap_expanded_vars.contains(&self.dap_primary_scope_ref) {
-                for v in &self.dap_variables {
-                    count += 1;
-                    if v.var_ref > 0 && self.dap_expanded_vars.contains(&v.var_ref) {
-                        count += self.dap_var_subtree_count(v.var_ref);
-                    }
-                }
-            }
-        } else {
-            // No scope info (e.g. tests): show variables at root level.
-            for v in &self.dap_variables {
-                count += 1;
-                if v.var_ref > 0 && self.dap_expanded_vars.contains(&v.var_ref) {
-                    count += self.dap_var_subtree_count(v.var_ref);
-                }
-            }
-        }
-        // Additional scope groups (e.g. "Statics", "Registers").
-        for &(_, var_ref) in &self.dap_scope_groups {
-            count += 1; // group header row
-            if self.dap_expanded_vars.contains(&var_ref) {
-                count += self.dap_var_subtree_count(var_ref);
-            }
-        }
-        count
-    }
-
-    /// Recursively count children in an expanded variable subtree.
-    fn dap_var_subtree_count(&self, var_ref: u64) -> usize {
-        let children = match self.dap_child_variables.get(&var_ref) {
-            Some(c) => c,
-            None => return 0,
-        };
-        let mut count = children.len();
-        for child in children {
-            if child.var_ref > 0 && self.dap_expanded_vars.contains(&child.var_ref) {
-                count += self.dap_var_subtree_count(child.var_ref);
-            }
-        }
-        count
     }
 
     /// Find the DapVariable at the given flat index in the Variables section.
@@ -737,159 +656,138 @@ impl Engine {
         None
     }
 
-    /// Handle a key press directed at the debug sidebar.
-    /// j/k or Up/Down navigate within the active section; Tab switches sections;
-    /// Enter/Space expand/collapse variables, navigate call stack, jump to breakpoint;
-    /// x/d delete watch expressions or breakpoints; q/Escape unfocus.
-    pub fn handle_debug_sidebar_key(&mut self, key_name: &str, _ctrl: bool) -> EngineAction {
-        let section_len = self.dap_sidebar_section_len();
-        match key_name {
-            "Escape" | "q" => {
-                self.dap_sidebar_has_focus = false;
-            }
-            "Down" | "j" => {
-                if section_len > 0 {
-                    self.dap_sidebar_selected =
-                        (self.dap_sidebar_selected + 1).min(section_len - 1);
-                }
-                self.dap_sidebar_ensure_visible();
-            }
-            "Up" | "k" => {
-                self.dap_sidebar_selected = self.dap_sidebar_selected.saturating_sub(1);
-                self.dap_sidebar_ensure_visible();
-            }
-            "Home" | "g" => {
-                // Go to top of section (gg in vim).
-                self.dap_sidebar_selected = 0;
-                self.dap_sidebar_ensure_visible();
-            }
-            "End" | "G" => {
-                // Go to bottom of section.
-                if section_len > 0 {
-                    self.dap_sidebar_selected = section_len - 1;
-                }
-                self.dap_sidebar_ensure_visible();
-            }
-            "PageDown" => {
-                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
-                let page = (self.dap_sidebar_section_heights[idx] as usize).max(1);
-                if section_len > 0 {
-                    self.dap_sidebar_selected =
-                        (self.dap_sidebar_selected + page).min(section_len - 1);
-                }
-                self.dap_sidebar_ensure_visible();
-            }
-            "PageUp" => {
-                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
-                let page = (self.dap_sidebar_section_heights[idx] as usize).max(1);
-                self.dap_sidebar_selected = self.dap_sidebar_selected.saturating_sub(page);
-                self.dap_sidebar_ensure_visible();
-            }
-            "ScrollDown" => {
-                // Scroll the active section down by 3 lines (mouse wheel).
-                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
-                let height = self.dap_sidebar_section_heights[idx] as usize;
-                let max_scroll = section_len.saturating_sub(height);
-                self.dap_sidebar_scroll[idx] = (self.dap_sidebar_scroll[idx] + 3).min(max_scroll);
-            }
-            "ScrollUp" => {
-                // Scroll the active section up by 3 lines (mouse wheel).
-                let idx = Self::dap_sidebar_section_index(self.dap_sidebar_section);
-                self.dap_sidebar_scroll[idx] = self.dap_sidebar_scroll[idx].saturating_sub(3);
-            }
-            "Tab" => {
-                self.dap_sidebar_section = match self.dap_sidebar_section {
-                    DebugSidebarSection::Variables => DebugSidebarSection::Watch,
-                    DebugSidebarSection::Watch => DebugSidebarSection::CallStack,
-                    DebugSidebarSection::CallStack => DebugSidebarSection::Breakpoints,
-                    DebugSidebarSection::Breakpoints => DebugSidebarSection::Variables,
-                };
-                self.dap_sidebar_selected = 0;
-            }
-            "Return" | "Enter" | " " => {
-                let sel = self.dap_sidebar_selected;
-                match self.dap_sidebar_section {
-                    DebugSidebarSection::Variables => {
-                        // Expand/collapse the variable at the selected flat index.
-                        if let Some(var_ref) = self.dap_var_ref_at_flat_index(sel) {
-                            if var_ref > 0 {
-                                self.dap_toggle_expand_var(var_ref);
-                            }
-                        }
+    /// Dispatch a row activation from `SidebarSystem` (Enter or click).
+    /// Maps the flat row index back to the engine action (expand variable,
+    /// navigate stack frame, jump to breakpoint).
+    pub fn dispatch_dap_sidebar_row_activated(&mut self, section: usize, path: &[u16]) {
+        let flat_idx = path.first().copied().unwrap_or(u16::MAX) as usize;
+        if flat_idx == u16::MAX as usize {
+            return;
+        }
+        match Self::dap_sidebar_section_from_index(section) {
+            DebugSidebarSection::Variables => {
+                if let Some(var_ref) = self.dap_var_ref_at_flat_index(flat_idx) {
+                    if var_ref > 0 {
+                        self.dap_toggle_expand_var(var_ref);
                     }
-                    DebugSidebarSection::CallStack => {
-                        // Select a call-stack frame and navigate to its source.
-                        self.dap_select_frame(sel);
-                        // Open the source file at the frame's line.
-                        if let Some(frame) = self.dap_stack_frames.get(sel).cloned() {
-                            if let Some(src) = &frame.source {
-                                let src_path = PathBuf::from(src);
-                                self.open_file_in_tab(&src_path);
-                                let target_line = (frame.line as usize).saturating_sub(1);
-                                self.view_mut().cursor.line = target_line;
-                                self.view_mut().cursor.col = 0;
-                                self.scroll_cursor_center();
-                            }
-                        }
-                    }
-                    DebugSidebarSection::Breakpoints => {
-                        // Jump to the breakpoint's file and line.
-                        if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(sel) {
-                            let line = self
-                                .dap_breakpoints
-                                .get(&path)
-                                .and_then(|bps| bps.get(bp_idx))
-                                .map(|bp| bp.line);
-                            if let Some(line) = line {
-                                let bp_path = PathBuf::from(&path);
-                                self.open_file_in_tab(&bp_path);
-                                let target_line = (line as usize).saturating_sub(1);
-                                self.view_mut().cursor.line = target_line;
-                                self.view_mut().cursor.col = 0;
-                                self.scroll_cursor_center();
-                            }
-                        }
-                    }
-                    DebugSidebarSection::Watch => {}
                 }
             }
-            "x" | "d" => {
-                let sel = self.dap_sidebar_selected;
-                match self.dap_sidebar_section {
-                    DebugSidebarSection::Watch => {
-                        // Remove the selected watch expression.
-                        if sel < self.dap_watch_expressions.len() {
-                            self.dap_remove_watch(sel);
-                            let new_len = self.dap_watch_expressions.len();
-                            if self.dap_sidebar_selected >= new_len && new_len > 0 {
-                                self.dap_sidebar_selected = new_len - 1;
-                            }
-                        }
+            DebugSidebarSection::CallStack => {
+                self.dap_select_frame(flat_idx);
+                if let Some(frame) = self.dap_stack_frames.get(flat_idx).cloned() {
+                    if let Some(src) = &frame.source {
+                        let src_path = PathBuf::from(src);
+                        self.open_file_in_tab(&src_path);
+                        let target_line = (frame.line as usize).saturating_sub(1);
+                        self.view_mut().cursor.line = target_line;
+                        self.view_mut().cursor.col = 0;
+                        self.scroll_cursor_center();
                     }
-                    DebugSidebarSection::Breakpoints => {
-                        // Remove the selected breakpoint.
-                        if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(sel) {
-                            if let Some(bps) = self.dap_breakpoints.get_mut(&path) {
-                                if bp_idx < bps.len() {
-                                    let line = bps[bp_idx].line;
-                                    bps.remove(bp_idx);
-                                    self.message = format!("Breakpoint removed: line {line}");
-                                    self.dap_send_breakpoints_for_file(&path);
-                                    let new_len = self.dap_sidebar_section_len();
-                                    if self.dap_sidebar_selected >= new_len && new_len > 0 {
-                                        self.dap_sidebar_selected = new_len - 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
                 }
-                self.dap_sidebar_ensure_visible();
+            }
+            DebugSidebarSection::Breakpoints => {
+                if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(flat_idx) {
+                    let line = self
+                        .dap_breakpoints
+                        .get(&path)
+                        .and_then(|bps| bps.get(bp_idx))
+                        .map(|bp| bp.line);
+                    if let Some(line) = line {
+                        let bp_path = PathBuf::from(&path);
+                        self.open_file_in_tab(&bp_path);
+                        let target_line = (line as usize).saturating_sub(1);
+                        self.view_mut().cursor.line = target_line;
+                        self.view_mut().cursor.col = 0;
+                        self.scroll_cursor_center();
+                    }
+                }
+            }
+            DebugSidebarSection::Watch => {}
+        }
+    }
+
+    /// Dispatch a delete action (x/d) from SidebarSystem. Reads the
+    /// currently selected row from the sidebar system and deletes the
+    /// watch expression or breakpoint at that index.
+    pub fn dispatch_dap_sidebar_delete(&mut self) {
+        let section = self
+            .dap_sidebar_system
+            .borrow()
+            .active_section()
+            .unwrap_or(0);
+        let flat_idx = self
+            .dap_sidebar_system
+            .borrow()
+            .selected_path(section)
+            .and_then(|p| p.first().copied())
+            .unwrap_or(u16::MAX) as usize;
+        if flat_idx == u16::MAX as usize {
+            return;
+        }
+        match Self::dap_sidebar_section_from_index(section) {
+            DebugSidebarSection::Watch if flat_idx < self.dap_watch_expressions.len() => {
+                self.dap_remove_watch(flat_idx);
+            }
+            DebugSidebarSection::Breakpoints => {
+                if let Some((path, bp_idx)) = self.dap_bp_at_flat_index(flat_idx) {
+                    if let Some(bps) = self.dap_breakpoints.get_mut(&path) {
+                        if bp_idx < bps.len() {
+                            let line = bps[bp_idx].line;
+                            bps.remove(bp_idx);
+                            self.message = format!("Breakpoint removed: line {line}");
+                            self.dap_send_breakpoints_for_file(&path);
+                        }
+                    }
+                }
             }
             _ => {}
         }
-        EngineAction::None
+    }
+
+    /// Process a `SidebarEvent` from the `SidebarSystem` and take the
+    /// appropriate engine action. Returns `true` if the event was
+    /// consumed (caller should redraw), `false` if `Ignored` (caller
+    /// should fall through to action-key dispatch).
+    pub fn dispatch_dap_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { section, ref path }
+            | quadraui::SidebarEvent::RowSelected { section, ref path } => {
+                self.dispatch_dap_sidebar_row_activated(section, path);
+                true
+            }
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.dap_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
+                true
+            }
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true,
+        }
+    }
+
+    /// Handle action keys that `SidebarSystem` didn't consume
+    /// (returned `Ignored`). Shared between TUI and GTK backends.
+    /// Returns `true` if the sidebar lost focus (q/Esc/h).
+    pub fn dispatch_dap_sidebar_action_key(&mut self, key_name: &str) -> bool {
+        match key_name {
+            "Escape" | "q" => {
+                self.dap_sidebar_has_focus = false;
+                true
+            }
+            "h" | "Left" => {
+                self.dap_sidebar_has_focus = false;
+                self.activity_bar_focus_in_at(3);
+                true
+            }
+            "x" | "d" => {
+                self.dispatch_dap_sidebar_delete();
+                false
+            }
+            // F5/F9/F10/F11 handled globally in handle_key() before
+            // the dap_sidebar_has_focus guard.
+            _ => false,
+        }
     }
 
     /// Step over (next).
@@ -1076,11 +974,20 @@ impl Engine {
                         .push(format!("[dap] event: Stopped reason={reason}"));
                     self.dap_stopped_thread = Some(thread_id);
                     self.message = format!("DAP: stopped ({reason})");
-                    // Clear previous frame/variable state before populating new ones.
+                    // #212: var_refs are server-assigned per-stop; many
+                    // adapters (lldb-dap, codelldb) recycle them between
+                    // stops. Without clearing the expand state + child
+                    // cache here, a recycled var_ref makes a NEW variable
+                    // inherit the OLD variable's expand state and render
+                    // its stale children. Mirror the Continued path —
+                    // both events invalidate the same set of caches.
                     self.dap_stack_frames.clear();
                     self.dap_variables.clear();
                     self.dap_primary_scope_name.clear();
                     self.dap_primary_scope_ref = 0;
+                    self.dap_child_variables.clear();
+                    self.dap_expanded_vars.clear();
+                    self.dap_pending_vars_ref = 0;
                     // Request stack trace so we can highlight the current line.
                     if let Some(mgr) = &mut self.dap_manager {
                         if let Some(server) = &mut mgr.server {
@@ -1098,6 +1005,7 @@ impl Engine {
                     self.dap_primary_scope_ref = 0;
                     self.dap_child_variables.clear();
                     self.dap_expanded_vars.clear();
+                    self.dap_pending_vars_ref = 0;
                     self.dap_active_frame = 0;
                     self.dap_watch_values = vec![None; self.dap_watch_expressions.len()];
                     redraw = true;
@@ -1537,5 +1445,70 @@ impl Engine {
             self.mode = Mode::Normal;
         }
         let _ = self.settings.save();
+    }
+
+    /// Handle a scroll event on the debug output panel.
+    /// `delta_y`: positive = scroll down (toward newer), negative = scroll up (toward older).
+    /// Uses forward-indexed convention (TextDisplay's model).
+    pub fn handle_debug_output_scroll(&mut self, delta_y: f32) {
+        let step = (delta_y.abs() * 3.0).ceil() as usize;
+        let total = self.dap_output_lines.len();
+        if delta_y > 0.0 {
+            self.debug_output_scroll += step;
+            if self.debug_output_scroll >= total.saturating_sub(1) {
+                self.debug_output_auto_scroll = true;
+            }
+        } else {
+            self.debug_output_scroll = self.debug_output_scroll.saturating_sub(step);
+            self.debug_output_auto_scroll = false;
+        }
+    }
+}
+
+/// Stable `quadraui::WidgetId` strings for the debug toolbar buttons,
+/// in `DEBUG_BUTTONS` index order: 0=Continue, 1=Pause, 2=Stop, 3=Restart,
+/// 4=StepOver, 5=StepInto, 6=StepOut. Note: index 4 corresponds to
+/// `DEBUG_BUTTONS[4]` (Step Over) — a `ToolbarButton::Separator` is
+/// inserted between indices 3 and 4 in the built `Toolbar`, so
+/// `DEBUG_BUTTON_IDS` has exactly 7 entries (one per action, not counting
+/// the separator). Shared by `render::debug_toolbar` and the click/hover
+/// hit-test so the id↔index mapping has a single source of truth (#510).
+pub const DEBUG_BUTTON_IDS: [&str; 7] = [
+    "dbg:continue",
+    "dbg:pause",
+    "dbg:stop",
+    "dbg:restart",
+    "dbg:stepover",
+    "dbg:stepin",
+    "dbg:stepout",
+];
+
+impl Engine {
+    // ── Debug toolbar UI helpers ───────────────────────────────────────────────
+
+    /// Stable `quadraui::WidgetId` for debug button `idx`
+    /// (0=Continue … 6=StepOut), or `None` if out of range.
+    pub fn debug_button_id(idx: usize) -> Option<quadraui::WidgetId> {
+        DEBUG_BUTTON_IDS
+            .get(idx)
+            .map(|s| quadraui::WidgetId::new(*s))
+    }
+
+    /// Inverse of [`Self::debug_button_id`] — map a toolbar `WidgetId` back
+    /// to its button index (0–6).
+    pub fn debug_button_index(id: &quadraui::WidgetId) -> Option<usize> {
+        DEBUG_BUTTON_IDS.iter().position(|s| *s == id.as_str())
+    }
+
+    /// Resolve which debug button (if any) sits under absolute point `(x, y)`,
+    /// using the `quadraui::Toolbar` layout cached at paint time (#510).
+    /// Returns `None` for clicks in the bar's empty gutter, off the bar,
+    /// or over a disabled button.
+    pub fn debug_button_hit(&self, x: f32, y: f32) -> Option<usize> {
+        let layout = self.debug_toolbar_layout.borrow();
+        match layout.as_ref()?.hit_test(x, y) {
+            quadraui::ToolbarHit::Button(id) => Self::debug_button_index(&id),
+            quadraui::ToolbarHit::Empty => None,
+        }
     }
 }

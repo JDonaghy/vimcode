@@ -2,19 +2,19 @@
 source: src/tui_main/render_impl.rs
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜  1: [No Name] ×                     ⋯  1: [No Name] ×               󰤲   ⋯
-                                        │
-   left pane content                   ││left pane content
-                                       ││
-                                       ││
-                                       ││
-                                       ││
-                                        ││
-                                        ││
-                                        ││
-                                        ││
-                                        ││
-                                        ││
-                                        ││
-    [No Name]                Ln 1, Col 1││paces: 4 utf-8 LF  Ln 1, Col 1  󰘖  󰆍
-  Editor split
+ 󰍜   1: [No Name] ×                     ⋯  1: [No Name] ×               󰤲    ⋯
+▎                                        │
+    left pane content                   ││left pane content
+                                        ││
+                                        ││
+                                        ││
+                                        ││
+                                         ││
+                                         ││
+                                         ││
+                                         ││
+                                         ││
+                                         ││
+                                         ││
+     [No Name]                Ln 1, Col 1││NORMAL  [No Name]        Ln 1, Col 1
+   Editor split

@@ -195,7 +195,34 @@ impl Engine {
     /// Returns (git_statuses, diag_counts) where:
     /// - git_statuses: canonical path → git status char (M, A, D, R, ?)
     /// - diag_counts: canonical path → (error_lines, warning_lines) deduplicated by line number
+    ///
+    /// Result is cached in `explorer_indicators_cache`; call
+    /// `invalidate_explorer_indicators()` after mutating
+    /// `sc_file_statuses` or `lsp_diagnostics` so the next call
+    /// recomputes. Caching matters because this function canonicalises
+    /// every file-status path (a syscall each) and scans every
+    /// diagnostic — on a workspace with thousands of untracked files
+    /// the uncached version was costing seconds per explorer draw
+    /// (see #153).
     pub fn explorer_indicators(
+        &self,
+    ) -> (HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>) {
+        if let Some(ref cached) = *self.explorer_indicators_cache.borrow() {
+            return cached.clone();
+        }
+        let result = self.compute_explorer_indicators();
+        *self.explorer_indicators_cache.borrow_mut() = Some(result.clone());
+        result
+    }
+
+    /// Invalidate the cached explorer indicators so the next call
+    /// recomputes. Call this after any change to `sc_file_statuses` or
+    /// `lsp_diagnostics`.
+    pub fn invalidate_explorer_indicators(&self) {
+        *self.explorer_indicators_cache.borrow_mut() = None;
+    }
+
+    fn compute_explorer_indicators(
         &self,
     ) -> (HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>) {
         use crate::core::lsp::DiagnosticSeverity;
@@ -371,6 +398,70 @@ impl Engine {
         self.view_mut().scroll_top = new_top;
     }
 
+    /// Scroll the active window's viewport and adjust the cursor to stay
+    /// visible, respecting `scrolloff`. Positive `delta` = down.
+    pub fn scroll_viewport_with_cursor(&mut self, delta: isize, count: usize) {
+        let lines = self.buffer().len_lines().saturating_sub(1);
+        if delta > 0 {
+            self.scroll_down_visible(count);
+        } else {
+            self.scroll_up_visible(count);
+        }
+        let scrolloff = self.settings.scrolloff;
+        let vp = self.effective_viewport_lines().max(1);
+        let cur = self.view().cursor.line;
+        let new_top = self.view().scroll_top;
+        if cur < new_top + scrolloff {
+            self.view_mut().cursor.line = (new_top + scrolloff).min(lines);
+            self.clamp_cursor_col();
+        } else if cur >= new_top + vp.saturating_sub(scrolloff) {
+            self.view_mut().cursor.line = (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
+            self.clamp_cursor_col();
+        }
+    }
+
+    /// Scroll a specific window's viewport and adjust its cursor to stay
+    /// visible, respecting `scrolloff`. Positive `delta` = down.
+    pub fn scroll_viewport_with_cursor_for_window(
+        &mut self,
+        window_id: WindowId,
+        delta: isize,
+        count: usize,
+    ) {
+        if delta > 0 {
+            self.scroll_down_visible_for_window(window_id, count);
+        } else {
+            self.scroll_up_visible_for_window(window_id, count);
+        }
+        let scrolloff = self.settings.scrolloff;
+        let Some(window) = self.windows.get(&window_id) else {
+            return;
+        };
+        let buf_id = window.buffer_id;
+        let Some(bs) = self.buffer_manager.get(buf_id) else {
+            return;
+        };
+        let lines = bs.buffer.len_lines().saturating_sub(1);
+        let vp = window.view.viewport_lines.max(1);
+        let cur = window.view.cursor.line;
+        let top = window.view.scroll_top;
+        let new_line = if cur < top + scrolloff {
+            Some((top + scrolloff).min(lines))
+        } else if cur >= top + vp.saturating_sub(scrolloff) {
+            Some((top + vp.saturating_sub(scrolloff + 1)).min(lines))
+        } else {
+            None
+        };
+        if let Some(line) = new_line {
+            let max_col = bs.buffer.line_len_chars(line).saturating_sub(1);
+            let window = self.windows.get_mut(&window_id).unwrap();
+            window.view.cursor.line = line;
+            if window.view.cursor.col > max_col {
+                window.view.cursor.col = max_col;
+            }
+        }
+    }
+
     /// Scroll a specific window down by `count` visible lines (fold-aware).
     pub fn scroll_down_visible_for_window(&mut self, window_id: WindowId, count: usize) {
         if let Some(window) = self.windows.get(&window_id) {
@@ -478,6 +569,7 @@ impl Engine {
             || self.ai_has_focus
             || self.settings_has_focus
             || self.ext_panel_has_focus
+            || self.activity_bar_focused
     }
 
     /// Clear all sidebar panel focus flags at once.
@@ -490,5 +582,24 @@ impl Engine {
         self.ai_has_focus = false;
         self.settings_has_focus = false;
         self.ext_panel_has_focus = false;
+    }
+
+    /// Returns true if any user-focused modal popup is currently open
+    /// (palette, tab switcher, context menu, dialog, find/replace,
+    /// completion). The passive LSP hover popup is NOT counted —
+    /// it's an informational overlay, not a modal the user is
+    /// interacting with.
+    ///
+    /// Single source of truth for backends that need to gate
+    /// behaviour on modal state — e.g. GTK suppresses the LSP hover
+    /// trigger and hides native scrollbar widgets when this returns
+    /// true.
+    pub fn is_blocking_modal_open(&self) -> bool {
+        self.picker_open
+            || self.tab_switcher_open
+            || self.context_menu.is_some()
+            || self.dialog.is_some()
+            || self.find_replace_open
+            || self.completion_idx.is_some()
     }
 }

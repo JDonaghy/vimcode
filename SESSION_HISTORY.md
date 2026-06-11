@@ -1,7 +1,2686 @@
 # VimCode Session History
 
 Detailed per-session implementation notes archived from PROJECT_STATE.md.
-All sessions through 280 archived here. Recent work summary in PROJECT_STATE.md.
+All sessions through 389 archived here.
+
+---
+**Session 389 (May 19) — Coordinator-driven 3-agent sprint, 10 PRs merged, 13 issues closed:**
+
+Second coordinator session: 3 machines (Desktop A, Server, Quadraui agent), board-tracked with issue-comment briefings. Rolled back one platform-neutrality violation (PR #496) and re-routed through quadraui properly.
+
+**vimcode closed (7):**
+- **#447** (PR #495) — GTK AppShell intermediate step. Dropped GTK-local `sidebar_visible`/`active_panel_id` copies, routes through `engine.app_shell` directly. +94/-70. Full `run_with_shell()` migration filed as #493 (blocked on quadraui stages 3+4).
+- **#475** (PR #492) — TUI sidebar key dedup. Extracted `tui_key_to_engine_name()` helper, collapsed 3 inline match blocks (Extensions/Settings/Debug). +39/-33.
+- **#467** (PR #498) — Completion popup filtering fix. Three-part engine-side fix: word chars no longer dismiss popup, prefix extension narrows candidates instead of replacing, LSP response merges into existing list. +133/-9. 2 regression tests.
+- **#483** + **#485** (PR #501) — TUI ext panel filter + wheel routing. Added `ext_panel_filter_matches()` for search filtering, guarded wheel events on `ext_panel_showing` to prevent explorer scroll from eating ext panel wheel events. +73/-7. Bonus: SidebarSystem `HeaderActivated` toggle fix across all 4 sidebar dispatchers.
+- **#465** (PR #502) — Breadcrumb symbol picker fix. Three compounding bugs: assignment order (scope filter wiped by `open_picker`), name-vs-line parent matching (tree-sitter vs rust-analyzer impl block naming), subtree flattening (scoped view recursed into children). Line-based `find_symbol_at_line()` for language-server-agnostic parent lookup. +302/-2. 3 regression tests.
+
+**quadraui closed (5):**
+- **#206** (PR #220) — `is_nerd_wide()` → `unicode-width` crate. PUA fallback for Nerd Font Supplement range added after smoke test.
+- **#209** (PR #228) — GTK context menu rounded-rect border. Extracted `rounded_rect_path` to shared `pub(crate)` helper in `gtk/mod.rs`. +19/-15.
+- **#227** (PR #229) — `Backend::draw_drop_overlay()`. TUI: tinted background + `│` insertion bar. GTK: rgba semi-transparent fill + 2px solid bar. +118/-0.
+- **#230** (PR #231) — GTK rich_text_popup link hit-rects via `index_to_pos`. Moved Pango measurement inside the rasteriser (not the consumer). Fixes hover link click accuracy for proportional fonts. +74/-22. Unblocks vimcode #488.
+- **#222** (PR #232) — Standalone `TextInput` primitive. Multi-line, cursor, auto-scroll, placeholder, hit regions. TUI + GTK rasterisers. 13 unit tests. +1106/-0. Unblocks vimcode #480 (commit input chunk).
+
+**Platform-neutrality enforcement:** PR #496 (59 lines of Pango code in `src/gtk/draw.rs` for hover link measurement) was rolled back. Quadraui #230 filed to move the measurement inside the rasteriser. Fixed properly via quadraui PR #231.
+
+**Pipeline issues filed (7):** quadraui #221–#227 for missing primitives blocking TUI convergence. #221 (Form cursor) and #226 (draw_scrollbar) discovered to already be implemented — closed. #227 shipped this session. Remaining: #223 (ButtonBar), #224 (Palette dual-mode), #225 (Dialog table).
+
+**Unblocked:** vimcode #479 (Settings FormController), #480 (partially — TextInput landed), #481 (scrollbar + drop overlay), #488 (hover links).
+
+**Follow-ups filed:** vimcode #493 (full GTK run_with_shell migration), #497 (bare URL auto-link detection), #499 (git_insights header toggle remaining cases), #500 (search panel scrollbar drag).
+
+---
+**Session 388 (May 18) — Coordinator-driven 5-agent sprint across 3 repos:**
+
+First full coordinator session: 5 agents across 3 machines, 15 issues closed, 11 PRs reviewed and merged. Coordinator role operated manually via Claude Code (not the coord tool) with issue-comment briefings and board tracking.
+
+**vimcode closed (4):**
+- **#446** + **#460** — draw wiring complete (all chunks landed, parent + residual closed)
+- **#469** (PR #487) — Rich text popup migration. Last popup surface routed through `ScreenLayout::draw()`. Original revert was due to pre-existing GTK scrollbar z-order bug (#486), not the migration itself.
+- **#474** — TUI dedup audit. Server agent audited `src/tui_main/` and filed 7 vimcode issues (#475–#481) + 1 quadraui issue (#218). ~1,440 lines of TUI-specific code identified for removal.
+- **#476** (PR #482) — Extension Panel → TreeView. New `render::ext_panel_to_tree_view()` builder. −252 lines from `panels.rs`.
+
+**quadraui closed (1):**
+- **#217** (PR #219) — AppShell gaps blocking vimcode#447. Stage 1: single-DA model locked in (zone routing via `AppShell::compute_layout` + `FrameHitMap`). Stage 2: four chrome slots added to `AppShellLayout` (title_bar, bottom_panel, command_line, status_bar) with `ShellConfig` builders. Bottom panel resize drag with min/max clamping. `full_chrome_demo` example on both backends. 12 new tests. Unblocks vimcode #447.
+
+**claude-coordinator closed (8):**
+- **#44** (PR #45) — Reconcile branch backfill fix. Two-pass approach, queries each machine once.
+- **#9** (PR #46) — Web dashboard. Single-file HTML, Starlette backend, AI chat via `claude -p`, mobile-optimized.
+- **#10** (PR #47) — SSE event source. `EventSource` pub/sub with ring buffer for `Last-Event-ID` reconnect. `stream_assignment_log` for live worker output.
+- **#11** (PR #48) — Approval flow + diff preview. Per-proposal approve/reject, briefing edit, diff via `gh pr diff`, XSS fix.
+- **#13** (PR #50) — Error handling. `ConcurrencyConfig`, rate limit detection (429 → RATE_LIMITED), `dispatch_with_retry` with exponential backoff, staggered dispatch.
+- **#15** (PR #49) — Adversarial code review. Auto-dispatches fresh `claude -p` reviewer on worker completion. `REVIEWER_SYSTEM_PROMPT`, `pick_reviewer_machine` (4-tier preference), CLAUDE.md + checklist briefing. Reviews-of-reviews blocked.
+- **#16** (PR #51) — Smoke test orchestration. Capability-based machine selection, `coord test` CLI, `capability_rules` config, auto-queue hook in reconcile.
+- **#53** (PR #55) — Issue claim detection. `find_work_claim` (board check + remote branch check), `has_active_followup` dedupe for review/smoke. Prevents duplicate dispatch.
+
+**Filed (vimcode):** #475–#481 (TUI convergence backlog), #486 (GTK scrollbar z-order)
+**Filed (quadraui):** #218 (ChatPanelView primitive)
+**Filed (claude-coordinator):** #53 (claim detection — subsequently closed same session)
+
+**Key architectural decisions:**
+- Single-DA model locked in for quadraui GTK runner (#217 Stage 1). `AppLogic::AreaId` retained as compatibility seam but always `()`.
+- TUI convergence backlog established: ready-now (#475, #476), small-gap (#477, #478), blocked-on-quadraui (#479, #480, #481).
+- claude-coordinator trust gap identified: dashboard + AI chat pane addresses the "completely in the dark" problem from first automated dispatch.
+
+**In-flight at session end:**
+- Desktop A: #447 (GTK widget tree → AppShell) — queued, unblocked
+- Server: #475 (TUI sidebar key translation) — queued, briefed
+- Desktop B: #18 (worker handoff) — PR #54 merged
+
+---
+**Session 387 (May 18) — #446 migration complete + first automated dispatch:**
+
+Final chunk of the ScreenLayout::draw() migration landed. claude-coordinator's first real autonomous dispatch succeeded (dellserver fixed #453). Coordinator tool gaps identified through real usage.
+
+**Closed:**
+- **#462** (PR #472) Chunk C: editor viewport, terminal (single + split × 3 sites), horizontal scrollbars, find/replace overlay, palette popup — all routed through `ScreenLayout::draw()`. `draw_window` and `draw_h_scrollbars` gained `backend` parameter. Backend trait's `draw_editor` resolves FontMetrics internally from frame-scope pango context. User smoke-tested all 5 surfaces.
+- **#453** (PR #473) Horizontal scroll `zh`/`zl`/`zH`/`zL` fix. Root cause: `handle_key` calls `ensure_cursor_visible()` after every keypress, which snapped `scroll_left` back to track the cursor, undoing the scroll. Added `clamp_cursor_to_horizontal_viewport()` that pulls cursor onto viewport after scroll commands. Matches Vim's documented behavior. **This was the first successful autonomous dispatch via claude-coordinator** — dellserver agent found a real engine bug (not just stale tests), fixed it, pushed the branch.
+
+**Filed:**
+- **#471** — typing in right pane of split terminal causes text to disappear (pre-existing, surfaced during #462 smoke)
+
+**#446 status:** Effectively complete. All 4 chunks (A/B/C/D) landed — every GTK surface except rich text popup (#469) routes through `ScreenLayout::draw()`.
+
+**claude-coordinator shakedown:** First real dispatch cycle exposed 5 gaps: (1) worker had no `--allowedTools`/`--permission-mode` flags → silently failed (fixed); (2) `close_merged_issues` hook fired on worker completion, not PR merge → auto-closed #206 without verifying work (hook disabled); (3) worker committed to develop instead of a feature branch → prompt strengthened; (4) reconcile didn't capture branch name from agent `/status` → `coord merge` broken (filed #44); (5) `coord status` shows "busy" but no progress details. The tool dispatches but the last mile (review, test, merge) still needs a human coordinator.
+
+---
+**Sessions 385–386 (May 17–18) — Multi-agent coordinated sprint + ScreenLayout migration + claude-coordinator MVP:**
+
+Two PRs landed on develop; one big migration parked waiting on quadraui infrastructure. 1989 lib tests passing (+14).
+
+**Closed**
+
+- **#226** (PR #457) Right-click "Open to the Side" was actually two bugs in one. (1) `open_side` called `execute_command("e {path}")` which returns `EngineAction::OpenFile(path)` — but the action was *discarded*, so the new editor group ended up with a clone of the prior tab instead of the target file. Also broken for paths containing spaces (the `:e` form tokenises on whitespace). Replaced with a direct `open_file_with_mode(path, OpenMode::Permanent)` call after `open_editor_group`. (2) `open_side_vsplit` routed through `split_window`, which derives `new_first` from `settings.splitright`. With vim's default `splitright=false`, the target landed on the LEFT — but the menu label commits to "to the side" semantics regardless of the user's split-direction setting. Extracted `split_window`'s body into `split_window_with_new_first(direction, file_path, new_first)`; public `split_window` delegates with the splitright-derived value; both `open_side_vsplit` handlers (explorer + editor context) now call the explicit variant with `new_first=false`. Three tests added: `test_open_side_from_context_menu` strengthened (asserts target lands in active group), `test_open_side_path_with_spaces` (regression for `:e` tokenisation), `test_explorer_open_side_vsplit_target_on_right_regardless_of_splitright` (loops both `splitright` values, asserts target's `x > original's x` via `calculate_group_window_rects`).
+- **#221** (PR #455 by parallel agent — merged today) Surface LSP `$/progress` notifications in the per-window status bar as `rust-analyzer • Indexing: 99%` while indexing, falling back to dimmed `rust-analyzer…` otherwise. Replaced `pending_work: HashSet<String>` with `progress_data: Vec<(token, LspProgress)>` carrying title/message/percentage per token, preserved begin-order so `current_progress` returns the most-recently-started phase. Added parsing for `"report"` notifications (previously dropped) → new `WorkProgressReport` event routed through `panels.rs`. Width discipline (the trickiest part): rust-analyzer streams reports several times per second with varying free-text — picking `percentage` > `X/Y` prefix > drop-message keeps the segment width stable so `StatusBar::layout`'s priority-drop doesn't flap LF/indent/filetype in/out. +18 tests across `core::lsp`, `core::lsp_manager`, and `render::tests`.
+- **#436** (4 commits cherry-picked into develop in two batches by parallel agents) rust-analyzer install/probe path: use `rustup` on Linux/macOS (matched the Windows path), probe `~/.cargo/bin` rustup proxies cross-platform, skip rustup proxies during `ext_remove_tools` (so uninstall doesn't try to remove rustup-managed binaries), surface `LspServer::start` errors instead of returning silent `None`.
+
+**Filed during session**
+
+- **quadraui#210** — `Surface::StatusBar`/`TabBar`/`ActivityBar` in `ScreenLayout::draw()` discard the layout/hits return values from `Backend::draw_X`. Blocks vimcode#446 (the GTK draw → `ScreenLayout` migration). Proposed adding `status_bar_layout()` / `tab_bar_layout()` / `activity_bar_layout()` to the `Backend` trait, consistent with existing `msv_layout` / `tree_layout` / `form_layout` / `text_display_layout` / `menu_bar_layout` patterns. Open at session end.
+
+**Parked**
+
+- **#446** GTK draw → `quadraui::ScreenLayout::draw()` migration (5-surface scope: status bars, tab bars, activity bar). Branch `issue-446-screen-layout-draw` pushed empty as the parking spot. Investigation surfaced quadraui#210 above — without those `_layout()` methods, migrating tab_bar / activity_bar silently breaks tab close clicks, activity row clicks, and breadcrumb hit-tests because vimcode's click dispatch consumes `TabBarHits` / `Vec<ActivityBarRowHit>` / `StatusBarLayout`. Issue commented; resume once quadraui#210 ships.
+
+**Other notes**
+
+- Develop reached `dc6417d`. Branches `issue-446-screen-layout-draw` and `issue-456-tui-ctx-menu-dismiss` (latter by parallel agent — TUI right-click menu doesn't dismiss on first click, regression from #451) open on origin at session end.
+- During the #457 smoke test, the user reported "newly opened file in left pane" which was traced to `open_side_vsplit` respecting `splitright`. The path-traversal test (`debug_open_side_actual_rects`) ruled out `open_side` first — the engine state was correct for that path; the visible bug was in the *other* menu item.
+
+Landmark 2-day session: first use of a dedicated coordinator agent managing 3 machines (Desktop A / Desktop B / Server) working in parallel across vimcode, quadraui, and a new claude-coordinator project. 25+ vimcode issues closed, quadraui layout parity fixes shipped, and the claude-coordinator tool went from concept to working MVP with its first real automated dispatch.
+
+**Vimcode issues closed (coordinated across machines):**
+
+- **#422** Ctrl+Space full completion with empty prefix (Server)
+- **#287** Ctrl-P in completion popup cycles instead of opening picker (Server, PR #440)
+- **#390** TUI cursor color — closed, fixed by quadraui#177 (Server)
+- **#318** TUI Alt keybinding clashes with menu bar (Server)
+- **#429** Terminal panel click dedup — selection + pane focus (Server)
+- **#262** Breadcrumb dropdown parent symbols jumpable (Server)
+- **#208** Gutter diagnostics stale after git discard (Server)
+- **#222** Syntax highlighting stale after external edits (Server)
+- **#230** LSP indicator transitions to Running on empty response (Server)
+- **#438** Test build broken — render.rs engine_with rename (Server)
+- **#439** Stale insta snapshots hermetic fix (Server)
+- **#436** Extension install: rust-analyzer via rustup on all platforms (Server)
+- **#221** LSP $/progress in status bar — `name • Indexing: 319/320` (Server, PR #455)
+- **#453** Horizontal scroll test failures (Server)
+- **#435** GTK context menu keyboard focus (Desktop A)
+- **#434** GTK action menu placement Below trigger (Desktop A)
+- **#225** GTK tab switcher bordered list (Desktop A)
+- **#274** Replace native gtk4::Dialog — Open Recent via engine picker (Desktop A)
+- **#444** TUI split terminal drag-select pane-relative coords (Desktop A)
+- **#451** TUI explorer right-click + Alacritty Up(Right) quirk (Desktop A)
+- **#452** TUI group divider drag — 3 sub-bugs (Desktop A)
+- **#226** Open to the Side opens target on the right (Desktop A, PR #457)
+- **#456** TUI ctx menu dismiss after clicking entry (Server, PR #458)
+
+**ScreenLayout::draw() migration (#446):**
+
+- Chunk A (#460): Global status bar — scaffolding commit, `QScreenLayout` alias pattern established (PR #464)
+- Chunk B (#461): Tab bars, breadcrumbs, per-window status bars, debug toolbar — hit-test surfaces via post-paint `b.X_layout()` (PR #466). Required 3 quadraui fixes: #211 (rasteriser consumes layout), #213 (scroll offset parity), #215 (frame-scope pango layout)
+- Chunk D (#463): 7 popup surfaces — tooltips, completion, dialog, context menus (PR #470). Pre-computed layouts made this straightforward.
+- Chunk C (#462): In progress — editor viewport, scrollbars, terminal. Last chunk.
+- Filed follow-ups: #465 (breadcrumb symbol picker empty), #467 (completion fuzzy matching), #468 (hover Go to Definition), #469 (rich text popup hit-test)
+
+**quadraui issues shipped:**
+
+- **#210** Backend trait `status_bar_layout` / `tab_bar_layout` / `activity_bar_layout` methods
+- **#211** GTK rasterisers consume layout for paint (tab_bar, activity_bar)
+- **#213** `tab_bar_layout` computes `correct_scroll_offset`
+- **#215** Layout methods use frame-scope pango layout (same font as rasteriser)
+
+**claude-coordinator project created (https://github.com/JDonaghy/claude-coordinator):**
+
+New tool for multi-agent orchestration across machines and repos. MVP milestone completed in one day:
+- #1 CLI scaffold + coordinator.yml config
+- #2 Agent server — HTTP dispatcher spawning `claude -p`
+- #3 Coordinator brain — `coord plan` / `coord approve` via `claude -p`
+- #4 E2E integration tests
+- #5 Tailscale networking — parallel health checks, cross-machine dispatch
+- #6 Multi-repo dependency tracking (DAG, blocked detection)
+- #7 GitHub issue comments as message bus
+- #8 Board state persistence + `coord resume`
+- #17 Merge sequencing — auto-rebase via PR queue
+- #19 Stale dependency detection + auto-pull
+- #22 Session lifecycle hooks
+- #24 Worker progress streaming (STATUS/STUCK signals)
+- #25 Auto-split large issues
+- #35 `coord test` — pull branch locally for smoke testing
+
+First real dispatch: dellserver assigned quadraui#206 via `coord approve`. Agent server running on 2 machines (elitebook + precision), dellserver online.
+
+**Key architectural decisions documented:**
+- `docs/COORDINATOR.md` — coordinator role protocol for vimcode
+- Coordinator owns all GitHub communication; agent servers don't touch `gh`
+- Workers use `claude -p --bare --permission-mode dontAsk` (no interactive prompts)
+- GitHub issue comments for briefings/status; stream-json stdout for machine monitoring
+- Static deny-list for dangerous commands (Phase 1); Agent SDK `beforeToolUse` deferred (separate billing)
+
+---
+**Session 384 (May 17) — GTK / TUI bug-fix sweep, 9 issues closed:**
+
+GTK-focused continuation on the local Alacritty + KGX dev box while another agent ran TUI on a server. Closed 9 issues across both backends; filed 4 follow-ups (3 of which were closed in-session). 1975 lib tests passing.
+
+**Closed**
+
+- **#435** GTK engine-drawn ctx menu keys (j/k/Esc/Enter) were dead until clicking inside the menu. Two bugs: (1) trigger right-click on a sibling DA (sidebar / ext panel) left focus there, so the editor DA's key controller never fired — added an end-of-`update()` `grab_focus()` gated on `engine.context_menu.is_some()`; (2) `draw_context_menu_popup` ran its own mouse-hover hit-test on every redraw and stomped `selected_idx` back to the cursor-pointed item, hiding keyboard nav with the cursor stationary over the menu. Motion handler in `mod.rs:3744` already owns hover → selected; the draw-time override was redundant + actively wrong.
+- **#434** Action menu opened at the row of the `…` button overlapping the tab bar (regression from PR #427). Threaded `trigger_height: f32` (line_height units) through `ContextMenuState` + `ContextMenuPanel` + the adapter so the engine knows the trigger element's height. Set `ContextMenuPlacement::Below` in the adapter when `trigger_height > 0`; both backends switched from `.layout()` to `.layout_at()` with an anchor `Rect`. GTK click handler passes `tab_row_height_px / line_height` (≈1.6) so the menu sits flush against the button bottom (no sub-cell gap). TUI drops its `row + 1` hack and passes height=1.0. Auto-flip to Above on viewport overflow is handled by quadraui's `layout_at`.
+- **#440** Smoke-tested only (PR by another agent). GTK Ctrl-P in completion popup. Confirmed `j`/`k`/Tab/Enter all cycle/accept candidates without the global accelerator stealing focus. Merged by user from UI.
+- **#274** Engine-driven dialogs + Open Recent Workspace migration. Two parts: (1) `prompt_for_name` in `src/gtk/mod.rs:9536` was dead code (`#[allow(dead_code)]`, zero call sites — explorer CRUD already uses inline `TreeController` editing); deleted along with the 3 orphaned `Msg` variants (`PromptRenameFile/NewFile/NewFolder`). (2) `OpenRecentDialog` migrated from native `gtk4::Dialog` (GTK) + `FolderPickerState::new_recent` (TUI) to a new `PickerSource::RecentWorkspaces`. Engine populates items from `session.recent_workspaces` (most-recent first), `PickerAction::OpenWorkspace(PathBuf)` → `picker_confirm` calls `open_folder` + sets `explorer_needs_refresh`. Also fixed two follow-up bugs surfaced during smoke: (a) `open_folder` left stale `explorer_expanded` paths from the previous workspace so the new tree showed only the collapsed root — clear + insert the new canonical root; (b) the active file's row wasn't highlighted in GTK after switching workspaces because `theme.inactive_selected_bg` is visually indistinguishable from `surface_bg` — set `explorer_has_focus = true` in the picker_confirm arm so the row renders with the focused selection bg, AND re-call `explorer_reveal_active_file` to pin selection after the backend's rebuild step. `OpenFileDialog` (system file picker) stays native per the issue body.
+- **#225** GTK tab switcher migration to `quadraui::gtk::draw_list` with rounded chrome. Vimcode side was effectively done in PR #162 (April) — the adapter set `bordered: true` and `b.draw_list` already routes through `quadraui::gtk::draw_list`. The missing piece was the GTK rasteriser itself, which shipped in quadraui `2d21169` the day before. Two follow-up quadraui issues found during smoke (rounded corners not visible because the popup bg fill ignored the rounded path, and items overlapped the title overlay) were filed as quadraui#207 and #208 and both closed by upstream (`ad31838`) before this session ended. Vimcode-side added one defensive commit: `draw_tab_switcher_popup_list` switches the pango layout to `UI_FONT` for the popup and explicitly calls `b.set_current_theme()` / `b.set_current_line_height()` instead of inheriting from an earlier scope (matches `draw_picker_popup` / `draw_tab_bar`).
+- **#426** (+ closes **#395**) GTK explorer ctx menu — final native `PopoverMenu` migration. The explorer DA has its own coordinate system, so anchoring on the editor DA puts the menu at the wrong screen position; rendering on the explorer DA clips at the narrow sidebar's right edge. Two cuts before the right answer: (1) Option C — render on the explorer DA itself — turned out to clip the right side; (2) Option B — window-level overlay — works. Added a new `ctx_menu_overlay_da` field on `App`, a window-level `gtk4::DrawingArea` added to `widgets.window_overlay`, that paints the engine ctx menu when `target` is `ExplorerFile/Dir`. Right-click handler translates explorer-DA-local (x, y) to window coords via `compute_point(overlay_widget)`, then divides by UI-font metrics for the engine cell storage. Two new `Msg` variants (`ExplorerCtxMenuClick` / `ExplorerCtxMenuMotion`) carry the overlay DA's own gesture events. Keyboard nav stays on the explorer DA (focus is there at right-click time); each j/k arm queues a redraw of the overlay. `#435`'s end-of-update editor-DA `grab_focus` gated off for Explorer* targets so it doesn't steal focus from the explorer DA. Deletes `show_explorer_context_menu` (~185 lines), `build_gio_menu_from_engine_items`, `swap_ctx_popover`, `menu_row_count`, and the `active_ctx_popover` field — none of them have other callers now. Filed quadraui#209 (ctx menu rounded corners — same shape as ListView fix).
+- **#444** TUI right-pane terminal drag-select extended to wrong column. Click used pane-relative coords from `TerminalSplitLayout::hit_test`; drag used editor-relative (`col - editor_left`), so right-pane drag overshot by `left_pane_cols`. Drag handler now looks up the cached `terminal_split_layout` and picks the active pane's left edge (`sl.right.x` for right pane, `sl.left.x` for left) as the column origin. Non-split terminal still falls back to `editor_left`.
+- **#452** TUI editor-group divider drag broke after the recent ScreenLayout caching work. Three bugs in one issue: (a) hit-test used `div.position.round() as u16` while the renderer used plain `as u16` (truncate), so on odd-width content (e.g. 81 cols, ratio 0.5 → 40.5) the visible divider at col 40 was hit-tested at 41 and missed; (b) for horizontal splits, the visual divider IS the second group's tab-bar row, and the tab-bar hit-test returned unconditionally even when `resolve_tab_bar_click` returned None on empty space — fall through to the divider hit-test when no tab/button hit; (c) when breadcrumbs are on the tab-bar block is 2 rows tall but the divider hit-test only matched 1 row — accept clicks on either row of the block. The tab row mostly has tabs + buttons that catch clicks first; breadcrumb row is the reliably-empty drag handle.
+- **#451** TUI explorer right-click did nothing on Alacritty. Two-stage diagnosis. Diagnostic logging at the `Event::Mouse` arm revealed Alacritty + crossterm 0.28.1 only emits `Up(MouseButton::Right)` for a right-click — no preceding `Down(Right)`. Handler at `mouse.rs:1330` was gated on `Down(Right)` only, so the click was silently dropped. Matched both `Down(Right) | Up(Right)` (matches GUI toolkit convention of opening on release). After that, j/k still moved the explorer instead of the menu — `key event:` diagnostic showed `ctx_menu=true explorer_focus=true` simultaneously, and the existing ctx-menu key intercept at `mod.rs:2760` lived OUTSIDE the `if sidebar.has_focus` gate at line 1848 that routes all keys to `dispatch_explorer_key`. Added a second intercept inside the sidebar-focused block (top of file, before any panel-specific gates). Translates `KeyCode` to the engine's string convention and calls `handle_context_menu_key` directly. Also relaxed the right-click handler's `active_panel_is(PANEL_EXPLORER)` gate to also fire when `!explorer_rows.is_empty()` (explorer is rendered) — previously every sidebar right-click on a non-explorer panel silently consumed the click. Cleanup commit dropped the diagnostic spam.
+
+**Filed during session**
+
+- **vimcode#438** — render.rs test build broken (engine_with rename + tests module visibility). Closed by parallel agent the same day.
+- **vimcode#439** — 6 stale insta snapshots in `tui_main::render_impl::tests`. Closed by parallel agent.
+- **vimcode#451** — TUI explorer right-click (the bug I tracked above). Closed in-session.
+- **quadraui#209** — GTK `draw_context_menu` uses square `cr.rectangle` stroke; should match ListView rounded chrome. Sibling to the closed quadraui#207. Open at session end.
+
+**Other notes**
+
+- Filed **vimcode#452** about TUI tab-group resize regression while smoke-testing #444, then immediately picked it up and closed it in the same session (above).
+- During #225 smoke test, found that quadraui's GTK `draw_list` bordered support shipped that same day (`2d21169`) — pulled and the visible chrome appeared, exposing the two quadraui-side rendering bugs (#207, #208) which a quadraui-side agent fixed before this session ended.
+- Multi-machine workflow validation: I rebased `issue-225-tab-switcher-draw-list`, `issue-274-engine-driven-dialogs`, `issue-426-explorer-ctx-menu`, `issue-444-tui-terminal-drag-pane-coords`, `issue-451-tui-explorer-rightclick`, and `issue-452-tui-group-divider-drag` onto develop multiple times each as the parallel agent landed `#287`, `#318`, `#222`, `#208`, `#212`, `#438`, `#439`, `#450` ahead of mine. All FF-merged cleanly after rebase.
+
+---
+**Session 383 (May 17) — TUI-focused bug-fix sprint, 11 issues closed:**
+
+Long parallel-agent session running TUI-only on a remote server. Other agents landed #225, #274, #426, #434, #435, #452 concurrently — rebased onto each new develop tip as they appeared. My branch closed 11 issues + filed 5 follow-ups. 1975 lib tests passing.
+
+**Closed**
+
+- **#287** GTK Ctrl-P in completion popup → opened picker. Added `Engine::insert_completion_intercepts_key(key, ctrl)` (single source of truth for which keys insert-mode completion consumes). GTK keypress handler consults it before dispatching the panel accelerator, so Ctrl-P cycles candidates instead of opening fuzzy finder when the popup is active.
+- **#318** TUI Alt+menu_letter clashed with menu bar. Two-part: (1) `tui_main/mod.rs` shows the bar when Alt+menu_letter arrives via `MenuBar::find_alt_target` so the existing intercept catches the same event; (2) rebound default panel keys off menu letters — `pk_focus_explorer: <A-e> → <C-S-e>`, `pk_focus_search: <A-f> → <C-S-f>`, `pk_live_grep: <C-S-f> → <C-S-g>` (VSCode parity for the first two).
+- **#429** Terminal pane click duplicated across backends. New `Engine::handle_terminal_pane_click(col, row)` does the focus + scroll-reset + selection. TUI consumes it in the non-split fallback; `handle_terminal_split_click`'s LeftPane/RightPane arms delegate after setting `terminal_active`.
+- **#262** Breadcrumb dropdown parent symbols weren't jumpable. `build_symbol_tree_items` now marks every symbol-tree row `expandable = false`. The Enter / click gate falls through to `picker_confirm`, which jumps via the existing `GotoSymbol` action. Children stay visible at increasing depth — only the fold-state UI is gone (acceptable trade per the issue body's option 1).
+- **#222** Syntax highlighting stale after external edits. Tree-sitter was always correct; the leftover coloring was cached `BufferState.semantic_tokens` overriding tree-sitter for Rust. All three reload paths (`check_file_changes`, `reload_file_from_disk`, `:edit!`) now insert into `lsp_dirty_buffers` so `lsp_flush_changes` clears tokens, sends `notify_did_change`, and re-requests `semanticTokens/full`.
+- **#230** Indicator stuck on `name…` when server returned zero tokens. Replaced `semantic_tokens.is_empty()` gate with explicit `BufferState.semantic_tokens_received: bool`, set true on any response (even empty). Worked correctly for files that genuinely have no tokens, but turned out to flip bright too early on cold rust-analyzer indexing — which led directly to #450.
+- **#208** Diagnostic gutter markers stale after git discard. `lsp_diagnostics` is keyed by canonical absolute path (URI-derived in handler); `lsp_flush_changes` and `lsp_did_close` were removing by `state.file_path` which is the user's original (often relative) path. Mismatch made remove a silent no-op. Switched to `state.canonical_path` (with `file_path` fallback) — same convention the render side already uses (`render.rs:8743`).
+- **#212** TUI debug panel "only `args` expandable" — DAP variable state leaked across stops. `DapEvent::Continued` cleared `dap_child_variables` + `dap_expanded_vars` + `dap_pending_vars_ref`; `DapEvent::Stopped` forgot them. Recycled var_refs from lldb-dap inherited the prior variable's expand state. Mirrored Continued's cleanup. ALSO surfaced a brutal install chain: `:DapInstall rust` → "Use `:ExtInstall cpp` instead" (the `||` clause in execute.rs:240 matched any extension with the same adapter binary — both `cpp` and `rust` ship codelldb, alphabetical wins). Then `:DapInstall rust` → "Use :ExtInstall rust" → `:ExtInstall rust` → "Extension rust installed, run :DapInstall rust to set up codelldb" → infinite loop (lsp_ops.rs:296 read `manifest.dap.install` directly, which is empty for codelldb because its install command is hardcoded in `dap_manager::install_cmd_for_adapter` for the multi-step build). Three commits to make the chain "just work".
+- **#438** Test compile broken on develop. `render.rs:12856` called `crate::core::engine::tests::engine_with(...)` which neither exists (named `engine_with_text`) nor was reachable (private `mod tests`). Fixed: `pub(crate) mod tests` + `pub(crate) fn engine_with_text` + fix the two call sites.
+- **#439** 6 stale snapshots after #438 unblocked. Root cause: `Engine::new()` reads `git::current_branch(cwd)`, so snapshots captured the contributor's branch name (`issue-385-appshell-side` was in the committed fixture). `test_engine` now clears `git_branch = None` and `sc_ahead = sc_behind = 0` for hermetic snapshots. Re-captured all 6. Added `.snap.new` to `.gitignore`.
+- **#450** LSP indicator misalignment with actual server readiness. The semantic-tokens-received gate from #230 went bright on rust-analyzer's first empty response — way before indexing actually completed. Replaced with the LSP-protocol native signal: `$/progress` notifications. Added `LspEvent::WorkProgressBegin/End`, parser for the notification shape, `LspManager.pending_work` HashMap + 3s cooldown for inter-phase smoothing, `is_indexing(server_id)` helper, gate replaced in `lsp_status_for_buffer`. After landing, indicator stayed bright through cold indexing — diagnosed via toast spam (see below) that no events were arriving. **Root cause: `capabilities.window.workDoneProgress = true` was missing from the initialize handshake**, without which rust-analyzer / gopls / pyright silently never emit progress. One-field addition to init_params and the entire chain worked. Branch ended up with 8 commits including the toast infrastructure described below.
+- **#390** TUI cursor color reverts to white after mouse-wheel scroll. Closed — quadraui#177 (`e3650cf`) fixed it upstream; vimcode is a thin delegator to `quadraui::tui::draw_editor` and the fix flows through automatically.
+
+**New shared primitive — toast notifications**
+
+Built on #450 in three layers, all shared across backends:
+
+- **Engine** (`mod.rs`): `EngineToast { id, title, body, severity, created_at }`, `Engine.toasts: Vec<EngineToast>`, `push_toast(title, body, severity)`, `prune_toasts()` called from `poll_idle` (auto-dismiss after `TOAST_LIFETIME = 5s`), `handle_toast_hit(ToastHit)` for click dispatch, `dismiss_toast_by_widget(WidgetId)` for the × close.
+- **Render adapter** (`render.rs::build_toast_stack`): converts engine queue to `quadraui::ToastStack` keyed BottomRight; returns None when empty so callers can skip the draw.
+- **TUI wiring** (`tui_main/render_impl.rs::draw_frame` + `tui_main/mouse.rs`): calls `quadraui::tui::draw_toast_stack` last (so they sit on top), caches `ToastStackLayout` to `engine.toast_layout`; left-mouse-down checks `layout.hit_test(x, y)` → `handle_toast_hit` before any underlying handler. GTK wiring tracked in **#454** — exact same pattern, ~15 lines.
+- **`:Toast <text>` command** in `execute.rs` for manual smoke testing of the render path independent of LSP events. Critical diagnostic during #450 — it's what proved the render was sound and the missing piece was the LSP capability declaration.
+
+**Filed**
+
+- **#436** Extension installer UX — Linux/macOS auto-install runs `cargo install rust-analyzer` (10 min silent compile) instead of `rustup component add` (instant); "No LSP Servers running" message doesn't tell the user what to do; rustup 1.29.0 doesn't always create proxy shim in `~/.cargo/bin/`.
+- **#444** TUI right-split terminal drag selects wrong column. Pre-existing bug: click uses pane-relative col (via quadraui hit_test), drag uses editor-relative col (`col.saturating_sub(editor_left)` at `tui_main/mouse.rs:1029`). Mismatch makes right-pane selection look like "the rest of the line." Not caused by #429; surfaced when smoke-testing it.
+- **#453** 6 `tests/z_commands.rs` failures (horizontal scroll). Preexisting, exposed when #438 unblocked the test runner. Plain assertion mismatches, not snapshot diffs.
+- **#454** GTK toast wiring. Engine + adapter + click dispatcher are shared and ready; just needs ~15 lines of `gtk/draw.rs` + `gtk/mod.rs` to call `quadraui::gtk::draw_toast_stack` and run `hit_test`.
+- **quadraui#206** Replace hardcoded `is_nerd_wide()` predicate in `tui/tab_bar.rs` with the `unicode-width` crate. Filed during #265 investigation (which is the consumer-side report).
+
+**Environment notes**
+
+- Stale `~/src/quadraui` checkout caused the initial build break this session (same hazard as Session 382); pull fixed it. CLAUDE.md already has the note.
+- This server needed `rust-analyzer` + `codelldb` installed from scratch. `rustup component add rust-analyzer` doesn't create the `~/.cargo/bin/rust-analyzer` proxy shim on rustup 1.29.0 — manual `ln -s rustup ~/.cargo/bin/rust-analyzer` works. codelldb came via vimcode's auto-install once `:DapInstall rust` was actually working after the routing fix in #212.
+
+---
+**Session 382 (May 17) — Ctrl+Space completion with empty prefix (#422 / PR #437):**
+
+Small focused engine fix. `trigger_auto_completion()` in `motions.rs:3236` bailed when the cursor prefix was empty, so manual Ctrl+Space at a blank position produced nothing. Renamed to `trigger_completion(manual: bool)` and updated all 7 call sites — 2 Ctrl+Space handlers in `keys.rs:4635/4640` pass `true`, the 5 typing/backspace/paste/vscode-binding sites pass `false`. Auto path retains the empty-prefix early-return so typing doesn't drown the user in every nearby word. Manual path with empty prefix skips the buffer-word scan (which would match every nearby word with `"".starts_with("")`) and anchors `completion_start_col` to the cursor so the arriving LSP response populates the popup at the right position. The response handler at `panels.rs:865` was already empty-prefix-friendly (`text.starts_with("")` always true). +2 lib tests covering both branches. 1965 lib tests passing.
+
+**Drive-by CLAUDE.md addition — stale quadraui as first build-break suspect:** Develop wouldn't compile when I started — errors about `TerminalSplitHit::LeftPane { col, row }` / `RightPane { col, row }` / `Scrollbar` not being found in the enum. Turned out the user's `~/src/quadraui` checkout was behind the API vimcode was written against. Vimcode pins quadraui via path dep to a sibling checkout with no version pin (`Cargo.toml:48`), so any stale `~/src/quadraui` silently misrepresents the API surface and the error looks like a vimcode bug. Added a Session Start Protocol section telling agents to `cd ~/src/quadraui && git pull` before debugging `quadraui::*` build errors on the vimcode side. Committed as `24cdcee` directly to develop per the doc-only workflow.
+
+**Filed #436** — extension installer UX. Two-part bug: (1) on Linux/macOS the bundled `rust` extension's auto-installer runs `cargo install rust-analyzer` (a ~10-minute silent source compile) instead of `rustup component add rust-analyzer` (~30s binary download). The Windows fixup at `extensions.rs:142` should be lifted cross-platform. (2) "No LSP Servers running" is the only feedback when the binary isn't on PATH — the status indicator should say "Installing rust-analyzer…", "Install failed: <reason>", or "rust-analyzer not found. Run: rustup component add rust-analyzer" so the user knows what to do.
+
+**Sidequest — missing rustup proxy shim:** After `rustup component add rust-analyzer` succeeded, `rust-analyzer` was still "command not found". `rustup which` showed the binary at `~/.rustup/toolchains/stable-…/bin/rust-analyzer`, but `~/.cargo/bin/` was missing the proxy symlink (`cargo`, `rustc`, `clippy-driver`, etc. all had symlinks to `rustup`; `rust-analyzer` didn't). Fixed with `ln -s rustup ~/.cargo/bin/rust-analyzer`. Likely a rustup 1.29.0 quirk where component-add doesn't always create the shim — probably worth noting in the #436 fix that PATH visibility should be verified, not just package presence.
+
+**Cleanup:** #422 closed + unassigned; branch deleted local + remote. Also closed lingering #395 (the action menu migration from Session 381) and deleted its branch since PR #427 already merged.
+
+---
+**Session 381 (May 16) — Action menu engine-drawn migration landed (#395 / PR #427):**
+
+Took over PR #427 from another agent that had run on a server and couldn't smoke-test locally. PR migrates the editor tab bar `…` action menu from native `gtk4::PopoverMenu` to the engine-drawn quadraui `ContextMenu` path; also removes ~497 lines of dead `show_action_menu_popover` + `handle_tab_right_click` + `handle_editor_right_click` code (the latter two were already replaced by `Msg::TabRightClick` / `Msg::EditorRightClick` in earlier PRs but left behind under `#[allow(dead_code)]`).
+
+**Environment setup (cold-start machine):** No rust toolchain, no GTK4 dev libraries, no clipboard tooling. Installed `rustup` (1.95.0 stable), `libgtk-4-dev` + `libglib2.0-dev` + `libcairo2-dev` + `libpango1.0-dev` + `libgraphene-1.0-dev` + `build-essential`, and (later, for smoke testing) `xclip` — without xclip, copypasta_ext falls back to its `x11_fork` path which contends with GTK's X11 event loop and writes intermittently fail (`copy_path` worked by coincidence, `copy_relative_path` did not).
+
+**Drive-by build fix — PR #432 (merged):** Develop wouldn't compile because `8a53307` (in PR #424 / issue-418) had accidentally removed the `..Default::default()` lines that `a516f76` added to `src/render.rs::context_menu_panel_to_quadraui_context_menu` + `build_menu_defs` after quadraui `daed293` added three new optional fields to `ContextMenuItem` (`checked`, `key_equivalent`, `submenu`). Re-applied the 4-line fix on its own branch `fix-context-menu-item-defaults` per CLAUDE.md workflow (small standalone PR > squashing into #427).
+
+**Rebase + land:** PR #427 rebased cleanly onto fresh develop. One conflict in `SUMMARIES/gtk_mod.md` (line-count header) — resolved by updating to the post-rebase actual: 10,256 lines (develop's issue-418 work added ~84 lines, the PR removes ~507). Force-pushed with `--force-with-lease`. Smoke tested all menu surfaces, then merged.
+
+**Regressions discovered + filed (don't block #427's merge, all are follow-ups):**
+
+- **quadraui#205** — GTK `draw_context_menu` rasteriser draws selection background over both top and bottom border edges. Selection fill at `(row_x + 1.0, row_y, row_w - 2.0, row_h)` has horizontal insets but no vertical inset — first-row-selected obscures top border, last-row-selected obscures bottom. Suggested fix: stroke border in a Pass 3 after rows.
+- **vimcode#434** — Action menu opens AT the `…` button row (overlapping the tab bar), not below it. `click.rs:324-329` derives `(col, row)` from the click pixel position; quadraui defaults to `AnchorPoint` placement which puts the menu's top-left at the anchor. Proper fix: use `ContextMenuPlacement::Below` with the button's bounds via `layout_at`; quick hack is `row + 1` in click.rs.
+- **vimcode#435** — Context menu keyboard nav (j/k/Down/Up/Enter/Esc) dead until the user clicks inside the menu. Handler at `src/gtk/mod.rs:5138+` is correct but lives on the editor DA's key controller, which doesn't have keyboard focus until clicked. Same class as #273 (dialog focus). Suggested fix: call `grab_focus()` on the editor DA when `engine.context_menu` becomes `Some`. TUI is unaffected (single central key loop).
+
+**Outcome:** #427 merged (`e87d853`). #395 stays open until #426 (explorer right-click migration — split out of #395 because explorer's separate DA has its own coord system, needs cross-DA coord handling) lands. Lib tests 1963 passing throughout.
+
+---
+**Session 380 (May 16) — Hit-test dedup sweep + GTK audit + quadraui runtime epics:**
+
+Massive dedup session — 7 PRs landed, 8 issues closed, 12 new issues filed (6 quadraui, 6 vimcode).
+
+**PR #414** — SidebarPanel enum removal (#408/#409). Rebased onto develop, resolved 3 merge conflicts preserving both string-based panel ID refactor and develop's borrow-safety/ext-panel/focus-guard fixes.
+
+**PR #419** — Clipboard dedup (#417). Found and fixed RefCell double-borrow crash in `TerminalCopySelection` handler (Rust 2021 temporary lifetime: `if let Some(text) = borrow_mut()...` keeps RefMut alive for entire block).
+
+**PR #423** — Completion popup click-to-pick (#288). Both backends cache `CompletionsLayout` from render, use `hit_test()` for click dispatch. New `Engine::handle_completion_click(CompletionsHit) -> bool`. GTK ModalStack push/pop/dispatch removed from completion click path. Net -22 lines.
+
+**PR #425** — Context menu hit_test migration (#210). Both backends cache `ContextMenuLayout` from render, replace hand-rolled row math with `hit_test()`. New `context_menu_hit_to_idx()` helper. GTK click handler reads cache instead of rebuilding layout (~35 lines removed). `resolve_context_menu_click()` gated to `#[cfg(test)]`. Net -49 lines.
+
+**PR #424** — Terminal panel cached geometry (#418). Took over from another agent. `BottomPanelGeometry` with explicit `toolbar_y`/`content_y`/`content_row_h` offsets. Fixed GTK terminal button hit zones, TerminalCopySelection crash, ContextMenuItem compile errors. `resolve_bottom_panel_zone()` shared by both backends.
+
+**PR #431** — TUI terminal split width fix (#428). New `terminal_panel_cols()` helper computes actual editor column width (excluding sidebar + activity bar), matching GTK's `terminal_cols()`. Fixed divider hit-test using panel-relative columns. Applied to all 5 `terminal_cols` call sites.
+
+**PR #433** — TerminalSplitLayout::hit_test() (#430). First consumption of a quadraui feature (quadraui#196) shipped by another agent. Both backends cache `TerminalSplitLayout`, use `hit_test()` for divider detection, pane focus, and selection. New `Engine::handle_terminal_split_click(TerminalSplitHit)`. Fixed sb_width unit mismatch (was multiplied by cell_width, creating 51px gap in GTK).
+
+**GTK backend audit:** Reviewed all 10 files in `src/gtk/`. 4 files are vestigial re-exports (delete-ready). `click.rs` eliminated by quadraui#197/#198. `draw.rs` eliminated by quadraui#199/#200/#201. `mod.rs` (10,759 lines) eliminated by quadraui#202 (AppShell epic). Filed 6 quadraui issues: #197 (EditorLayout::hit_test), #198 (TabBarLayout::hit_test), #199 (draw_frame), #200 (SidebarSystem GTK rasteriser), #201 (CommandLine primitive), #202 (GTK runtime epic with 6 stages).
+
+**Strategic shift:** Filed parallel runtime epics for all three backends — quadraui#202 (GTK), #203 (TUI), #204 (macOS). The end-state: `quadraui::{gtk,tui,macos}::run(engine)` owns the widget tree, event loop, draw pipeline, and click dispatch. Consumer apps write ~20 lines per backend. Updated quadraui CLAUDE.md with vimcode reference consumer table mapping each epic stage to the working prototype code.
+
+**Filed:** vimcode #420 (completion viewport overflow), #421 (completion detail pane), #422 (Ctrl+Space trigger), #428 (TUI split — closed), #429 (terminal click dedup), #430 (split hit_test — closed). quadraui #196-#204.
+
+---
+**Session 379 (May 16) — PR maintenance + clipboard dedup landing (#414, #419):**
+
+Rebased and merged two open PRs.
+
+**PR #414 — SidebarPanel enum removal (#408, #409):** Branch `issue-408-409-sidebar-panel-cleanup` had merge conflicts against develop after Session 378 commits. Rebased onto develop, resolved 3 conflicts in `src/gtk/mod.rs`: (1) plugin panel reveal — kept develop's separate-binding borrow-safety pattern + `ext_panel_has_focus`/`ext_panel_active` engine fields, combined with PR's `active_panel_id` string; (2) `sync_sidebar_from_engine` — kept develop's ext-panel-active bypass logic, converted to string IDs; (3) `sync_sidebar_widgets` focus grab — kept PR's lookup-table approach, added develop's `sidebar_has_focus()` guard. Force-pushed, merged. Issues #408/#409 already auto-closed.
+
+**PR #419 — clipboard dedup (#417):** Branch `issue-417-clipboard-dedup` rebased cleanly. Smoke test revealed RefCell double-borrow crash in `TerminalCopySelection` handler — `if let Some(text) = self.engine.borrow_mut().terminal_copy_selection()` kept `RefMut` alive for entire block (Rust 2021 temporary lifetime), then `self.engine.borrow()` for `clipboard_write` panicked. Fixed by extracting to `let text = ...` binding. Merged. Closed #417.
+
+---
+**Session 378 (May 15) — macOS readiness dedup sweep (#416, #389, #386):**
+
+Continuation of Session 377. Three more issues landed, plus the Session 377 docs commit.
+
+**#416 fix (e6aa82b):** GTK sidebar sync steals keyboard focus on startup. `sync_sidebar_widgets()` unconditionally called `grab_focus()` on the active panel DA whenever sidebar visible. First poll tick (~50ms) triggered `sync_sidebar_from_engine()` → `explorer_da.grab_focus()`, overriding the deferred `drawing_area.grab_focus()`. Fixed by guarding with `engine.sidebar_has_focus()` — on startup no focus flags are set, so panel DAs don't steal focus. One-line change.
+
+**#389 fix (aa9b186):** Extension registry fetch error suppressed on startup. When background fetch fails (network race), fall back silently to cache loaded at engine init instead of showing "Registry fetch failed — try again later". Error only shown on fresh install with no prior cache. Removed "Fetching extension registries..." status message (noisy for automatic background operation).
+
+**#386 refactor (3853133):** Extract `render::compute_editor_layout()`. New `EditorLayout` struct + `compute_editor_layout(engine, total_height, line_height, menu_in_viewport)` function in `render.rs`. Computes all chrome heights (tab bar, quickfix, terminal, debug toolbar, status bar, separated status, wildmenu) via `PanelChromeDesc`. GTK: removed `gtk_editor_bottom()` body (~40 lines), `gtk_terminal_target_maximize_rows()` (~40 lines). TUI: `terminal_target_maximize_rows_tui` + `effective_terminal_panel_rows_tui` reduced to one-line wrappers. Removed unused `editor_bottom_px()`. Terminal click handlers kept pixel-exact maximize snapping (#418 filed for cached hit region migration). `terminal_content_rows` + `terminal_max_target_rows` fields on struct for callers needing row counts.
+
+**Filed:** #417 (clipboard read/write dedup across backends), #418 (terminal click handlers → cached hit regions).
+
+**macOS readiness audit:** Conducted full per-backend code audit. Remaining dedup targets: #417 (clipboard), #418 (terminal hits), #395 (native PopoverMenu → quadraui), #274 (native dialogs → quadraui). Inherently per-backend: event controller setup, key translation, draw closures, native file dialogs, clipboard provider init.
+
+---
+**Session 377 (May 15) — Explorer scrollbar migration + clipboard dedup (#413, #415, #381):**
+
+Three commits landed on develop, net ~160 lines removed across 5 files.
+
+**#413 fix (eccf986):** RefCell double-borrow crash in GTK poll tick + ExtPanel sidebar flickering. Rust 2021 temporary lifetime fix: extracted `borrow_mut().take()` out of `if let`. `ext_panel_focus_pending` handler now sets `engine.ext_panel_active` / `ext_panel_has_focus` and calls `sync_sidebar_widgets()`. `sync_sidebar_from_engine()` checks `ext_panel_active` before defaulting to Explorer.
+
+**#415 scrollbar migration (d564ad3):** Explorer scrollbar fully owned by quadraui `TreeController` (quadraui#193). GTK: `wire_da_events` on explorer DA → `ExplorerUiEvent` → `TreeController.handle()`. Removed manual Cairo scrollbar drawing (~25 lines), `GestureDrag` scrollbar handler (~120 lines), `explorer_scrollbar_rect` field, `explorer_jump_scroll()`, scrollbar hit-test in click handler. `set_scrollbar_width(Some(8.0))` in GTK draw func. TUI: removed manual `SurfaceScrollbar` geometry computation (~30 lines). Routes MouseDown/DoubleClick/MouseMoved/MouseUp through `TreeController.handle()` with `explorer_sb_dragging` flag. Default scrollbar width (line_height=1.0) correct for TUI. New engine method `handle_explorer_mouse_event()` — single-click toggles dirs / previews files. TUI editor-area click now clears `explorer_has_focus` (missing from focus-clear block). Scrollbar clicks don't steal keyboard focus (GTK: `grab_focus()` on drawing_area after `ScrollChanged`; TUI: only sets `explorer_has_focus` for row clicks). Filed quadraui#193 during earlier investigation, closed after quadraui shipped `set_scrollbar_width` + `set_show_scrollbar`.
+
+**#381 clipboard dedup (ff8cf6a):** Clipboard-before-paste wiring deduplicated. Two new engine methods: `needs_clipboard_for_paste(key, unicode, ctrl) -> bool` (pure query) and `prepare_paste_clipboard(clipboard_text)` (loads registers, handles VSCode mode). GTK: ~35 lines → 3-line call. TUI: removed `intercept_paste_key` function (~37 lines), replaced VSCode Ctrl+V block + call site.
+
+**Filed:** #416 (GTK extension install prompts steal keyboard focus on startup — pre-existing, confirmed on develop).
+
+---
+**Session 376 (May 15) — AppShell sidebar: GTK migration + full follow-up sweep (#385, #408–#411):**
+
+Completed the sidebar state centralization started in Session 375. GTK backend migrated, then all follow-up dedup issues landed in the same session.
+
+**Landed PRs:**
+- #407: GTK sidebar migration — `Msg::SwitchPanel` collapsed from ~160 to ~30 lines. New `sync_sidebar_from_engine()` + `sync_sidebar_widgets()`. Removed `dap_wants_sidebar`/`window_nav_overflow` consumption from GTK poll loop. `EngineAction::ToggleSidebar` handled by engine internally.
+- #412: `Engine::should_autohide_sidebar()` (#411) + removed `activity_bar_active_panel` RefCell mirror (#410). Activity bar draw callback reads from `engine.app_shell` directly. Eliminated triple-nested `Rc<RefCell<Option<Rc<RefCell<SidebarPanel>>>>>`.
+- #414: Removed `SidebarPanel` enum (#408) + panel-ID lookup table (#409). `active_panel_id: String` replaces `active_panel: SidebarPanel`. `#[watch]` expressions use string constants. `sync_sidebar_widgets()` uses lookup-table arrays. `Msg::SwitchPanel(String)` carries panel ID. Extension panels use `"ext:"` prefix.
+
+**Filed:**
+- #406: GTK Ctrl-W h/l in sidebar panels doesn't navigate to editor (pre-existing, not a regression)
+- #413: GTK RefCell double-borrow crash during drag-end in poll tick (pre-existing)
+
+**Net across both sessions (375+376): ~234 lines removed.** `TuiPanel` + `SidebarPanel` enums eliminated. All sidebar state centralized in the engine via `quadraui::AppShell` + `engine::sidebar`.
+
+**Remaining:** quadraui#187 integration (dynamic panel registration for extension panels) would let ext panels route through `toggle_sidebar_panel()` too.
+
+---
+**Session 375 (May 15) — AppShell sidebar: engine owns sidebar state, TUI migrated (#385):**
+
+See Session 376 for the combined summary. TUI-specific details:
+
+**New file:** `src/core/engine/sidebar.rs` — `toggle_sidebar_panel()`, `focus_sidebar_panel()`, `handle_nav_overflow()`, `toggle_sidebar()`, `process_pending_sidebar()`, `active_panel_is()`, `should_autohide_sidebar()`. Panel ID constants: `PANEL_EXPLORER` through `PANEL_SETTINGS`.
+
+**TUI migration:** Removed `TuiPanel` enum, `TuiSidebar.visible`/`active_panel`, `sync_sidebar_focus()`. Activity bar + panel rendering dispatch uses engine panel IDs.
+
+---
+**Session 374 (May 15) — Picker dedup: 3 PRs, ~520 lines removed:**
+
+**Landed PRs:**
+- #400: Fix picker scroll `visible_rows` hardcoded to 20 (#391) — `engine.picker_scroll(3, 20)` replaced with actual computed `visible_rows` from terminal geometry in both ScrollDown and ScrollUp handlers.
+- #403: Extract `PickerGeometry` + `PickerSizing` into `render.rs` (#401) — single source of truth for picker popup bounds (sizing, centering, visible_rows, left pane split). Both backends + all mouse handlers call `PickerGeometry::compute()` with backend-specific `PickerSizing` constants. Eliminates the class of bug where one of 5 geometry copies drifts out of sync.
+- #404: Migrate ALL pickers to `quadraui::Palette` (#402) — `picker_panel_to_palette()` now handles preview panes + tree items (was returning `None` for these). Removes ~520 lines of legacy per-backend rendering (title/query rows, item prefix, match highlighting, scrollbar, preview pane) from `render_impl.rs` and `draw.rs`. Fixed scrollbar mouse handlers: column alignment (`list_w - 1` not `popup_w - 2`), `effective_offset` clamping (matches rasteriser's selection-anchored scroll), f32→u16 rounding (`.round()` not truncation), thumb-drag vs track-page-scroll separation, GTK RefCell double-borrow crash (drag handler called `compute_picker_popup_bounds` while engine mutably borrowed).
+
+**Filed:**
+- quadraui#177: TUI cursor color — block cursor uses fg/bg swap instead of `theme.cursor` (#390 root cause)
+- quadraui#178: `PaletteLayout` scrollbar hit-region geometry (closed — landed by quadraui agent)
+- quadraui#180: GTK palette scrollbar too narrow (6px)
+- vimcode#401: `PickerGeometry` extraction (closed)
+- vimcode#402: Full picker migration to Palette primitive (closed)
+
+**Key architectural changes:**
+- `render::PickerGeometry` struct + `PickerSizing` config — replaces 5 independent geometry computations
+- `render::TUI_PICKER_SIZING` / `render::gtk_picker_sizing(line_height)` — backend-specific constants
+- `picker_panel_to_palette()` signature changed: `Option<Palette>` → `Palette` (always succeeds)
+- `PalettePreview` conversion: `Vec<(usize, String, bool)>` → `PalettePreview { lines, scroll_offset, highlight_line }`
+- TUI/GTK `render_picker_popup` / `draw_picker_popup` collapsed to thin geometry + `draw_palette` delegation
+
+---
+**Session 373 (May 14) — Backend dedup batch: 7 issues addressed, ~580 lines removed:**
+
+**Landed PRs:**
+- #392: `Engine::execute_terminal_toolbar_action(action, ctx)` (#383) — both backends' ~30-line match dispatch → one engine method. `StartResize` stays backend-local.
+- #393: `Engine::check_settings_reload()` (#376) — engine owns `settings_mtime` + `settings_save_revision`. TUI ~23 lines + GTK ~20 lines → 1 call each.
+- #396: `Engine::route_paste(text)` (#375) — paste routing (terminal/picker/search/SC/ext/AI/mode-based) moved to engine. TUI ~108 lines + GTK ~30 lines removed. Fixed GTK missing paste for picker/SC/ext/AI contexts. Removed unused `load_clipboard_register`. Fixed SC commit paste to insert at cursor position.
+- #397: TUI quit/close-tab confirms use engine dialog system (#377) — migrated TUI from local `quit_confirm`/`close_tab_confirm` flags + custom key/mouse/render handlers (~460 lines) to engine's `show_dialog`/`handle_dialog_key`/`process_dialog_result`. Added `Engine::show_quit_confirm()`/`show_close_tab_confirm()` convenience methods. Fixed dialog button overflow (capped `button_width` to fit dialog). Fixed `close_tab_confirm` save/discard to use `execute_command("quit"/"quit!")` so last-tab case exits app.
+- #398: SC button hover uses `Engine::sc_button_hit_test` (#388) — TUI + GTK hover handlers replaced inline `commit_w/icon_w` formula with existing engine method. -16 lines.
+- #399: TUI mouse uses shared `find_window_at` + `window_zone_hit_test` (#387) — added `render::find_window_at()` + `resolve_text_position()`. Migrated 3 TUI mouse sites (drag, scroll-dispatch, hover) from inline window walks. Main click handler (site 4) left for future restructure.
+
+**Closed without merge:**
+- #379: `handle_context_menu_key` — discovered GTK context menu key handling is dead code. GTK uses native `PopoverMenu` widgets, opens engine `context_menu` only to clone items then immediately closes it. Engine's `handle_context_menu_key` never reached on GTK.
+
+**Filed:**
+- #395: Migrate GTK native PopoverMenu context menus to quadraui ContextMenu primitive (vimcode-side task, quadraui rasteriser already exists)
+- quadraui#175: Originally filed as quadraui gap, closed — quadraui ContextMenu GTK rasteriser is fully implemented, issue is vimcode migration
+
+---
+**Session 372 (May 14) — Continued backend dedup: trivial extractions + quadraui compat + tab switcher migration:**
+
+**Trivial engine extractions (4 issues):**
+- #384: `Engine::select_all_occurrences()` — wraps vscode/vim mode check. Both backends reduced to one call.
+- #378: `Engine::activate_group_for_window(wid)` — iterates editor_groups to find owning group. Replaced GTK click.rs loop.
+- #380: `Engine::picker_scroll(delta, visible_rows)` — selection movement + scroll clamping + preview load. Replaced identical arithmetic in both backends.
+- #382: `Engine::scroll_viewport_with_cursor(delta, count)` + `scroll_viewport_with_cursor_for_window(wid, delta, count)` — scrolls viewport and clamps cursor to stay visible respecting scrolloff. Fixed pre-existing TUI bug where cursor went off-screen during mouse-wheel scroll (main dispatch_scroll path had no cursor adjustment). Uses `effective_viewport_lines()` for robust viewport size.
+
+**Quadraui API compat:** Adapted to quadraui changes — `ButtonRowItem.icon`, `Palette { show_query, create_label, preview }`, `Dialog.body: Vec<StyledText>`. All additive with serde defaults.
+
+**#374: `Engine::tab_switcher_cycle(forward)`** — both backends duplicated open-if-needed + cycling arithmetic for Ctrl+Tab, Ctrl+Shift+Tab, Alt+t (3 entry points each). Extracted into one engine method. Net -43 lines.
+
+**GTK tab switcher popup → quadraui `ListView`:** Replaced ~85 lines of bespoke Cairo rendering (background, border, title, scroll, selection highlight, name + path) with `Backend::draw_list` using the same `tab_switcher_to_quadraui_list_view` adapter the TUI already uses. Both backends now render identically through the shared primitive.
+
+**Bugs filed:** #389 (extension registry fetch failure), #390 (TUI cursor color after scroll), #391 (TUI picker selection disappears scrolling down — pre-existing, hardcoded `visible_rows = 20`).
+
+**Total session:** +138/-320, net -182 lines removed from backends.
+
+---
+**Session 371 (May 14) — Backend dedup audit + Engine::poll_idle() (#373):**
+
+**Backend dedup audit:** Systematic audit of TUI (~14k lines across mod.rs, mouse.rs, panels.rs, render_impl.rs) and GTK (~17k lines across mod.rs, click.rs, draw.rs) backends. Cross-referenced findings to identify duplicated logic. Produced a prioritized 4-tier extraction plan:
+
+- **Tier 1 (engine methods):** 13 issues filed (#373–#385) — `poll_idle`, `tab_switcher_cycle`, `handle_quit_confirm`, `handle_context_menu_key`, `picker_scroll`, `scroll_with_cursor_follow`, `select_all_occurrences`, `route_paste`, `check_settings_reload`, `activate_group_for_window`, clipboard-before-paste dedup, `execute_terminal_toolbar_action`, sidebar state ownership. Estimated ~500 lines removable per backend.
+- **Tier 2 (render helpers):** 3 issues filed (#386–#388) — `compute_editor_layout()`, `resolve_window_at_point()`, shared SC button layout.
+- **Tier 3 (quadraui primitives):** 6 issues filed (quadraui#161–#166) — two-pane picker preview, tab switcher popup, SC commit input + buttons, branch picker, multi-line dialog body, folder picker.
+- **Tier 4 (architectural):** quadraui#167 — `AppShell` compose widget (activity bar + sidebar panel container). Prerequisite for vimcode#385 (sidebar state ownership).
+
+**#373 — Engine::poll_idle():** Consolidated 20+ `poll_*/tick_*` calls from both backends into `Engine::poll_idle() -> bool`. Moved 2-second `check_file_changes` timer into engine (`idle_last_file_check` field). Removed `last_file_check` from both backends. Backend-specific follow-ups (format-save-quit, terminal commands, sidebar gating) remain as thin post-`poll_idle()` checks. Net -181 lines (71 added, 252 removed).
+
+**#389 filed:** Extension registry fetch fails on startup ("Registry fetch failed — try again later").
+
+---
+**Session 370 (May 14) — #232 fixed: explorer reveal on tab switch + Engine::startup() extraction:**
+
+**#232 — Explorer tree highlights file on tab switch:** Root cause: `explorer_reveal_path` was called from 7 per-backend locations (4 TUI, 3 GTK) but never from the engine. The tab-click path was broken — folder expanded but file not highlighted. Fix: added `explorer_reveal_active_file()` helper in `explorer_ops.rs`, wired into `goto_tab()`, `tab_nav_switch_to()`, `open_file_in_tab()` (3 exit paths), `open_file_preview()` (2 exit paths), `open_file_with_mode()` (2 exit paths), and `restore_session_files()` (both tree and flat paths). Removed 7 redundant backend calls. Also removed TUI-only `explorer_rebuild_rows()` after session restore that was wiping the selection set by the reveal. `explorer_reveal_path` now also expands the root dir (defensive no-op in normal use).
+
+**quadraui#159 — Unfocused tree selection highlight:** Filed and consumed. The quadraui `draw_tree` code gated selection highlight on `tree.has_focus` — when clicking a tab, the explorer doesn't have focus so the selection was invisible. quadraui#159 added dimmed/inactive selection rendering when `!has_focus && selected_path` is set.
+
+**Engine::startup() extraction:** Both TUI and GTK had identical `plugin_init()` + `ext_refresh()` + CLI-or-session-restore sequences (~20 lines each). Extracted into `Engine::startup(file_path: Option<&Path>)`. Each backend now calls one method.
+
+**3 new tests:** `test_goto_tab_reveals_file_in_explorer`, `test_handle_tab_bar_click_reveals_file_in_explorer`, `test_open_file_in_tab_reveals_file_in_explorer`. Tests use `explorer_selected_file()` helper that reads `TreeController.selected_path` directly (avoids needing render-frame population of `TreeController.rows`).
+
+**Files changed:** `explorer_ops.rs` (+7), `mod.rs` (+17), `windows.rs` (+9), `buffers.rs` (+2), `tests.rs` (+79), `gtk/mod.rs` (-55), `tui_main/mod.rs` (-30), `tui_main/mouse.rs` (-7). Net +118/-88.
+
+---
+**Session 369 (May 13–14) — Bug fixes, platform audit, theme dedup, FormController migration:**
+
+**Theme dedup (-123 lines):** Moved `q_theme_chrome()` + `q_theme_editor()` from both `tui_main/quadraui_tui.rs` and `gtk/quadraui_gtk.rs` into `render::to_quadraui_theme()`. Both backends now delegate to this single function.
+
+**#292 — F5/F9/F10/F11 from any panel and mode (PR #371):** Three layers fixed: (1) GTK toolkit intercepted F10 as "activate-menubar" — added window-level capture controller. (2) GTK `handle_key_press` sidebar routing consumed F-keys — added early intercept. (3) Engine `dap_sidebar_has_focus` guard blocked F-keys — exempted F5/F9/F10/F11. Moved F-key handling to `engine.handle_key()` before mode dispatch. Both TUI and GTK now route through this single handler, removing duplicate from `dispatch_dap_sidebar_action_key()`. Also fixed pre-existing F5 bug (sidebar handler always called "debug" instead of "continue").
+
+**#255 — Settings scrollbar via FormController (PR #372):** Migrated settings panel to `quadraui::FormController` (quadraui#155). Both backends use `render_and_cache()` for form+scrollbar rendering and `handle_cached()` (quadraui#157) for scroll wheel, track-click, and thumb-drag — zero per-backend scrollbar code. Removed manual scrollbar drawing, `ScrollSurface` registration, and `dispatch_click`/`dispatch_drag` wiring. Net -20 lines.
+
+**Verified and closed (already working):** #253 (GTK completion popup), #243 (GTK debug sidebar scrollbar drag), #245 (inverted scrollbar thumb-grab).
+
+**Platform audit:** Thorough inventory of TUI (~12k lines) and GTK (~17k lines) backends. Found minimal dead code, one dedup opportunity (theme conversion, fixed), and noted future quadraui lift candidates (scrollbar_grab_offset, directory picker, char_col_to_visual).
+
+---
+**Session 368 (May 13) — Adopt quadraui#77/#78/#79 (#328) + close stale milestone issues:**
+
+**#328 — Adopt quadraui#77/#78/#79:** `explorer_scroll()` delegates to `TreeController::scroll_by()` (quadraui#77). Removed TUI scroll-delta negation workaround in DAP sidebar; fixed SC and search sidebar scroll sign to match quadraui's positive-y = up convention (quadraui#79). Routed TUI explorer double-click through `TreeController::handle()` → `RowActivated` using quadraui#147 `DoubleClick` synthesis. Added `DoubleClick → MouseDown` fallback shim in mod.rs for legacy crossterm handlers (editor word-select, extension panel, etc.). Filed quadraui#147 for TUI DoubleClick synthesis, confirmed landed same session. Net -20 lines (first commit) + net +24 lines (second commit, DoubleClick routing). Files: `explorer_ops.rs`, `tui_main/mod.rs`, `tui_main/mouse.rs`.
+
+**#295, #314, #315, #331 verified and closed:** MSV scrollbar drag-to-scroll (TUI + GTK), search panel scrollbar click/drag, and GTK debug toolbar hover/press all confirmed working during smoke tests — likely fixed by earlier `SidebarSystem`/`dispatch_scroll` migrations. All vimcode-side milestone work now complete; remaining milestone issues are quadraui-side infrastructure.
+
+---
+**Session 367 (May 12) — Tab bar + breadcrumb render wrapper dedup (#347):**
+
+PR #365: Pre-built `quadraui::TabBar` and `quadraui::StatusBar` primitives in `ScreenLayout`. Added `bar` field to `GroupTabBar` and `BreadcrumbBar`, `tab_bar_primitive` to `ScreenLayout`. All built in `build_screen_layout()`. Backend wrappers (`render_tab_bar`, `draw_tab_bar`, `draw_breadcrumb_bar`) simplified to take pre-built primitives instead of raw data + adapter params. Unified `show_split_btns` cross-backend divergence (TUI had `is_active`, GTK had `is_active || is_in_diff_view()` — now shared via render.rs). Net -61 lines. Filed #366: pre-existing GTK bug — breadcrumb clicks broken on non-first editor group in multi-group layout.
+
+---
+**Session 366 (May 12) — Three bug-fix issues resolved:**
+
+PR #364 shipped three fixes. **#362 (first-line click):** `BreadcrumbBar.bounds.y` in `ScreenLayout` was set to window content top (`min_y`) instead of actual breadcrumb row (`min_y - line_height`). `screen_zone_hit_test` returned `ScreenZone::Breadcrumb` for clicks at `y = window_top`, which `pixel_to_click_target` mapped to `ClickTarget::None` — silently swallowing the click. Fixed bounds computation in `build_screen_layout` to `(min_y - line_height).max(0.0)`; removed compensating `- line_height` in GTK `draw.rs`, `.saturating_sub(1)` in TUI `render_impl.rs`, and `- 1` in TUI `mouse.rs`. Added regression test `test_breadcrumb_bounds_do_not_overlap_first_line`. **#359 (nowsl click):** `tab_close_hit_test` and `tab_tooltip_hit_test` hardcoded `status_bar_height = line_height * 2.0`, ignoring `window_status_line` setting. Replaced with `gtk_editor_bottom()`. Smoke-confirmed gutter/text clicks work with `:set nowsl`. **#360 (wildmenu Tab):** Investigated exhaustively — all 24 wildmenu tests pass. Live debugging with `eprintln!` showed Tab arriving with `mode=Normal` — user was pressing Enter after `:set ` (executing the command and exiting command mode) then pressing Tab. Closed as not-a-bug. Also closed shipped #343 (h-scrollbar DragTarget::ScrollbarX from Session 365).
+
+---
+**Session 365 (May 11–12) — Six milestone items + horizontal scroll fix:**
+
+Shipped #352, #351, #343, #349, #348, #361. Net ~-300 lines of per-backend code.
+
+**PR #357 — Pango click-to-column (#352):** Replaced approximate `text_rel_x / char_width` in GTK click handler with Pango's `xy_to_index`, matching the paint code's glyph positioning. Ignored `trailing` for Vim cursor semantics (click anywhere within a glyph selects that character). Deleted `gtk_text_column` function. Added `editor_pango_layout()` helper on GTK App. Updated all 6 click/double-click/drag call sites.
+
+**PR #358 — Shared terminal key dispatch (#351):** Added `Engine::handle_terminal_key(&mut self, key_name, unicode, ctrl, shift, alt) -> TerminalKeyAction` and `TerminalKeyAction` enum (`SendToPty(Vec<u8>)`, `CopySelection`, `PasteClipboard`, `Handled`, `Ignore`). Added shared `key_to_pty_bytes()` in `terminal_ops.rs`. Deleted per-backend `gtk_key_to_pty_bytes` (65 lines) and `translate_key_to_pty` (45 lines). Both backends now call the engine method and execute only clipboard I/O. Behavioral gain: Ctrl+Shift+C copy and PageUp/PageDown scrollback now work in both backends.
+
+**#343 — H-scrollbar DragTarget::ScrollbarX:** Replaced bespoke `HScrollDragState` struct (~50 lines) with quadraui's `DragTarget::ScrollbarX` via `dispatch_mouse_drag`. Bespoke hit-test/drag-begin block (~65 lines) deleted from GTK mouse handler. Added `ScrollOffsetChanged` handler for `editor:h_sb:*` widget IDs. Updated all `SurfaceScrollbar` registrations with `axis: ScrollAxis::Vertical` field (quadraui#136 API). H-scrollbar range issue traced to `viewport_cols` approximation (#361) and quadraui Pango measurement (#138, closed as vimcode-side).
+
+**#349 — Global status bar adapter:** Added `build_global_status_bar()` in render.rs — wraps left/right strings into `quadraui::StatusBar`. Replaced `ScreenLayout.status_left/status_right/status_branch_range` with `global_status_bar: Option<StatusBar>`. Both backends draw via existing `draw_status_bar` path. Deleted `draw_status_line` (GTK, 40 lines) and `render_status_line` (TUI, 50 lines).
+
+**#348 — Wildmenu adapter:** Added `wildmenu_to_status_bar()` — maps each wildmenu item to a `StatusBarSegment` with selected/unselected colors. Deleted `draw_wildmenu` (GTK, 48 lines) and `render_wildmenu` (TUI, 62 lines).
+
+**PR #363 — Horizontal scroll + exact viewport_cols (#361):** Root cause: `ensure_cursor_visible` never adjusted `scroll_left` (horizontal), and `viewport_cols` was approximate (resize handler used `approximate_char_width` with hardcoded gutter estimate). Fix: (1) Added horizontal scroll logic to `ensure_cursor_visible` — adjusts `scroll_left` when cursor is outside `[scroll_left, scroll_left + viewport_cols)`. (2) Added `text_viewport_cols` field to `RenderedWindow` — exact visible text columns from paint-time geometry. (3) Added `paint_viewport_cols: RefCell<HashMap<WindowId, usize>>` on Engine — populated by `build_screen_layout`, read by `ensure_cursor_visible`. (4) Replaced `approximate_char_width()` with Pango `layout.pixel_size()` at 7 GTK call sites (draw.rs + 6 in mod.rs) so `char_width` matches actual glyph positioning.
+
+**Issues filed:** #359 (clicks broken with `nowsl`), #360 (wildmenu Tab cycling), #362 (first-line click in GTK). **quadraui issues filed:** #133 (wrap selection rendering — fixed), #134 (thumb_length API — fixed), #136 (h-scroll surface — shipped).
+
+---
+**Session 364 (May 11) — Shared screen-level hit-test (#344, PR #356):**
+
+Extracted zone detection + gutter action resolution into shared functions in `render.rs` so both GTK and TUI backends use one source of truth for screen-level hit-testing. Three shared functions: `screen_zone_hit_test` (identifies tab bar, breadcrumb, divider, or window zones from ScreenLayout geometry), `window_zone_hit_test` (identifies status bar, gutter, scrollbar, or text area sub-zones within a RenderedWindow), `resolve_gutter_action` (maps gutter column + line to breakpoint/git/diagnostic/code-action/fold actions using RenderedWindow data). Added `cached_screen_layout: Rc<RefCell<Option<ScreenLayout>>>` to GTK `App` struct — `draw_editor` moves the ScreenLayout into cache at end of frame (O(1), no clone). Click handlers read cached geometry instead of recomputing from engine state via `gtk_editor_bottom`/`calculate_group_window_rects`, eliminating the root cause of zone-boundary disagreement bugs between paint and click. Refactored GTK `pixel_to_click_target` to delegate zone detection to shared functions; extracted `tab_bar_inner_hit_test` helper for Pango-specific tab slot resolution. Refactored TUI gutter handler to use `resolve_gutter_action`. Tab bar inner hit-testing (Pango pixel slots) and buffer position column computation (tab-expansion walk) stay per-backend. Fixed panic from hardcoded `GroupId(0)` in single-group tab bar hit — now uses actual engine `active_group`. Net +247 lines. `render.rs` ~13,632 lines (was ~12,000). `src/gtk/click.rs` ~509 lines (was ~546).
+
+---
+**Session 363 (May 11) — Tab drop-zone dedup (#345) + Win-GUI removal (#355):**
+
+**PR #354** (tab drop-zone computation + overlay into render.rs, #345): Replaced 3 bespoke per-backend drop-zone implementations with shared functions in render.rs backed by `quadraui::compute_drop_zone()`. Added `TabDropGroup`, `DropGroupBounds`, `TabDropOverlay` types. `build_tab_drop_groups()` handles group iteration, hidden-tab-bar logic, and effective tab_bar_height — called by both TUI and GTK (and formerly Win-GUI). `compute_tab_drop_overlay()` centralises highlight rect, insertion bar, and ghost position geometry. `screen_to_drop_group_bounds()` derives group bounds from ScreenLayout for backends that have it cached. Each backend now provides only: (1) a `tab_slots_map` with backend-specific tab measurements, (2) ~15 lines of final paint code. Fixed pre-existing GTK bug where tab reorder indices ignored scroll offset. Added insertion-bar rendering to GTK tab drag (previously only TUI and Win-GUI drew one). Net -112 lines.
+
+**PR #355** (remove Win-GUI backend): Deleted `src/win_gui/` (4 files, 11,572 lines), `src/win_gui_bin.rs` (36 lines), `win-gui` feature flag, `windows` crate dependency (21 Win32 feature gates), and all `#[cfg(feature = "win-gui")]` blocks scattered across 9 core engine files (~1,000 lines of win-gui-only methods including `handle_debug_sidebar_key`, `handle_ext_sidebar_key`, 5 vscode menu methods, 8 dap_ops methods, `sc_open_selected_async`, 3 render.rs adapter functions, 16 win-gui-only tests, and the `UiAction` parity verification test). Updated CLAUDE.md: backend count THREE → TWO, removed win-gui build/test/clippy instructions. Rationale: zero users, broken build (windows-future dep), every milestone PR carried untested Win-GUI overhead, and the backend will be replaced wholesale (~200-line thin wrapper) when the quadraui Win backend ships (quadraui#19–#31). Net -13,093 lines.
+
+---
+**Session 362 (May 10–11) — Backend deduplication audit + terminal rendering collapse (#346/#350/#353):**
+
+Audited all duplicate code across TUI and GTK backends. Filed 4 quadraui issues (#121 tab drag-and-drop, #122 palette preview/tree, #123 terminal split-pane layout, #124 inverted scrollbar) and 7 vimcode issues (#343–#349) in the Cross-Platform UI Crate milestone for systematic deduplication.
+
+**PR #350** (quadraui#121–#124 integration + shared terminal scrollbar geometry): Consumed 4 new quadraui primitives by adding required struct fields (inverted, preview, depth/expandable/expanded, width) across all construction sites. Extracted `render::terminal_scrollbar_geometry()` — shared formula for terminal scrollbar thumb position, replacing duplicate inline math in both backends. Migrated GTK terminal panel from bespoke `terminal_sb_dragging` state machine to quadraui's shared `dispatch_scroll`/`dispatch_click`/`dispatch_mouse_drag` — fixed GTK terminal scroll wheel (was going to editor) and track-click (was not working). Removed dead `current_drag_max_scroll()` helper (quadraui `inverted: true` handles the ratio flip). Fixed GTK `dispatch_mouse_drag` silently dropping `debug_output` scroll events. Net -115 lines bespoke code removed.
+
+**PR #353** (terminal rendering collapse via quadraui#123/#129/#131): Replaced bespoke terminal renderers in both backends with quadraui's `Backend::draw_terminal` (cells + themed scrollbar) + `TerminalSplitLayout` (split-pane geometry). Extracted `render::build_terminal_draw_data()` so both backends share one function for Terminal primitive construction (scrollbar, split layout, cell conversion). Deleted: GTK `draw_terminal_panel` (109 lines), GTK `draw_terminal_cells` wrapper (24 lines), TUI `render_terminal_panel` body (90 lines), TUI `render_terminal_pane_cells` (24 lines), TUI `draw_terminal_row` (42 lines). Terminal scrollbar now uses quadraui's themed `Scrollbar` primitive with `inverted: true` and configurable width. Fixed: GTK dispatch_click consuming all terminal clicks (blocking text selection/focus), missing `set_current_char_width`/`set_current_line_height` on GTK backend (wrong glyph spacing). Net -205 lines. Filed #351 (shared terminal key dispatch) and #352 (GTK click offset near line end).
+
+quadraui issues resolved: #121, #122, #123, #124, #129, #131. Issues filed: #343–#353.
+
+---
+**Session 361 (May 10) — #312 visual selection prepopulates search query + quadraui#53 integration:**
+
+Implemented #312: `search_set_focus(true)` in `src/core/engine/search.rs` now checks if the engine is in Visual/VisualLine/VisualBlock mode. If so, extracts selection text via `get_visual_selection_text()`, takes the first line (for multiline selections), sets `project_search_query` + `search_query_caret`, clears visual mode (`mode = Normal`, `visual_anchor = None`). 3 new unit tests: single-line visual, multiline first-line-only, no-selection preserves existing query. Also fixed quadraui#53 API breakage: `FormField` gained a `validation: Option<ValidationState>` field — added `validation: None` to all 9 constructors in `src/render.rs`. Migrated integration tests from `handle_ext_sidebar_key` (gated behind `#[cfg(feature = "win-gui")]` since Session 358) to `dispatch_ext_sidebar_key_unified`: 25 call sites in `tests/extensions.rs`, 1 in `tests/markdown_preview.rs`. Added `ext_sidebar_setup` test helper that initializes `ext_sidebar_body_rect`, calls `set_backend_info` with `MsvLayoutMetrics`, populates the SidebarSystem, sets focus/active-section/selected-path. Rewrote 8 tests that asserted against dead `ext_sidebar_selected` field to use `ext_selected_from_sidebar_system()` and SidebarSystem's `active_section()`/`is_collapsed()` APIs. All 2048 tests passing (1960 lib + 88 integration). Path A landed to `develop`.
+
+---
+**Session 360 (May 9–10) — Search panel → SidebarSystem (#323/#333/#334, PR #342):**
+
+Migrated search panel from hand-rolled MSV to 2-section `SidebarSystem` (Form + Tree), following the SC sidebar pattern from Session 359. Filed and resolved 6 quadraui prerequisite issues: #105 (Form section support in SidebarSystem), #107 (Form click event semantics), #109 (GTK empty TextInput cursor), #110 (tree header click precision), #112 (ToggleGroup/ButtonRow per-item click), #116 (Form hit region drift from rendered positions). **#323** (core migration): Added `search_sidebar_system: Rc<RefCell<SidebarSystem>>` with 2 sections (`SidebarSectionDef::form("chrome", "SEARCH")` + `SidebarSectionDef::new("results", "RESULTS")`), `search_sidebar_body_rect: Cell<Rect>`, `search_collapsed_files: RefCell<HashSet<usize>>`. `populate_search_sidebar_system(engine, root)` in render.rs builds Form (query/replace TextInputs, ToggleGroup, ButtonRow, status) for section 0 and TreeRows (file-grouped results with expand/collapse) for section 1. Unified `dispatch_search_sidebar_key_unified(key, ctrl, alt, unicode) -> SearchKeyResult` — single entry point for all 3 backends. `dispatch_search_sidebar_event()` handles `RowActivated`/`RowSelected`/`FormEvent` (FocusChanged/ToggleChanged/ButtonClicked). `handle_search_sidebar_ui_event()` for mouse/scroll. `search_selected_result_idx()` derives flat index from SidebarSystem selection. `search_set_focus(bool)` deduplicates 6 activation sites across TUI/GTK/Win-GUI. `search_switch_to_results()` deduplicates poll_project_search result-mode switch. Removed engine fields: `project_search_selected`, `search_file_expanded`, `search_panel_msv_layout`. Removed `build_search_panel_msv()` + `result_idx_to_tree_path()` from render.rs. Toggles auto-rerun search when results exist. 4 new tests. **#333** (TUI duplicate focus): Removed `TuiSidebar::search_input_mode`, `replace_input_focused`, `search_scroll_top` — engine's `search_panel_form_focus` is single source of truth. **#334** (cross-backend behavior): Printable char in results mode re-enters form input on all backends via unified dispatch. **GTK fixes**: Added `alt: bool` to `Msg::KeyPress` (all 7 senders updated). Added `search_has_focus` routing in `handle_key_press` (was missing — keys only came through DA's EventControllerKey without ctrl/alt). `wire_da_events` replaces manual GestureClick for scroll/drag/click. `ISO_Left_Tab` → `BackTab` mapping. `search_has_focus = true` in `SwitchPanel`/`ToggleFocusSearch` (was missing). `ClipboardPasteToInput` handles search panel paste. `poll_project_search` switches to results mode. **TUI fixes**: `set_backend_info` for search sidebar. Scroll wheel + drag + mouseup routed through SidebarSystem. **Win-GUI**: Migrated to unified dispatch. Net -120 lines across 12 files.
+
+---
+**Session 359 (May 8) — Source Control panel → SidebarSystem (#321/#339/#340):**
+
+Three-issue migration of the SC panel from hand-rolled state management to `quadraui::SidebarSystem`, following the Extensions sidebar pattern from Session 358. Filed quadraui#103 for section visibility + header badges (prerequisite — SC has conditional WORKTREES section + item-count badges). **#321** (engine + render, Path A): Added `sc_sidebar_system: Rc<RefCell<SidebarSystem>>` with 4 sections (Staged Changes, Changes, Worktrees, Recent Commits), WholePanel scroll, Selection nav, collapsible. `populate_sc_sidebar_system(engine, theme)` in render.rs builds TreeRows with git status colors + section badges via `set_section_badge`/`set_section_visible`. Unified `dispatch_sc_sidebar_key_unified()` + `ScKeyResult` enum — single entry point for both backends. `dispatch_sc_sidebar_event()` handles `RowActivated`/`RowSelected`. `dispatch_sc_action_key()` for domain keys (s/S/d/D/c/C/p/P/f/r/b/B/?). `sc_activate_row()` opens files/worktrees/log. `handle_sc_sidebar_ui_event()` for mouse/scroll. `sc_selected_from_sidebar_system()` replaces `sc_flat_to_section_idx(sc_selected)`. 8 new tests. `ScKeyResult` re-exported from engine module. **#339** (TUI, Path A): Section rendering replaced with `SidebarSystem.render()`. 80-line manual key mapping replaced with `dispatch_sc_sidebar_key_unified()`. Flat-index scroll/click replaced with `handle_sc_sidebar_ui_event()`. Fixed: `set_backend_info` missing (handle_cached silently returned Ignored), Shift+key with Kitty keyboard enhancement (Char('s')+SHIFT → resolve to 'S'). `sc_stage_all` error now surfaced in status bar (was `let _ =`). Net -40 lines. **#340** (GTK + dedup, PR #341): GTK rendering, `Msg::ScKey` handler, `Msg::KeyPress` SC branch, and 60-line click accumulator walk all replaced. `wire_da_events` wired for scroll/scrollbar drag. GDK `question`/`slash` key name mapping added to `map_gtk_key_with_unicode`. Cross-backend dedup: `Engine::sc_set_focus(bool)` keeps `sc_has_focus` + SidebarSystem in sync (replaces 10+ manual dual-set sites). `Engine::sc_button_hit_test()` shares button layout math. `sc_open_selected_async` gated behind `#[cfg(feature = "win-gui")]`. Net -200 lines GTK. quadraui#103 filed and resolved (section visibility + header badges).
+
+---
+**Session 358 (May 8) — Extensions sidebar → SidebarSystem (#336/#337/#338):**
+
+Three-issue migration of the extensions sidebar from hand-rolled state management to `quadraui::SidebarSystem`. **#336** (engine + render): Added `ext_sidebar_system: Rc<RefCell<SidebarSystem>>` with WholePanel scroll, Selection nav, vim keys. `populate_ext_sidebar_system()` builds TreeRows. `dispatch_ext_sidebar_event()` + `dispatch_ext_sidebar_action_key()` for domain actions. `ext_selected_from_sidebar_system()` reads selection from SidebarSystem. 5 new tests. +280 lines. **#337** (TUI): Replaced bespoke MSV render, ~90-line click hit-testing, and scroll handling with `SidebarSystem.render()` and `.handle()`. Fixed scroll direction (removed delta negation), `RowSelected` clears search input, `ext_open_selected_readme` reads from SidebarSystem. Net -73 lines. **#338** (GTK + cleanup, 4 commits): (1) GTK backend wired to SidebarSystem render/handle. (2) Unified key dispatch via `dispatch_ext_sidebar_key_unified()` + `ExtSidebarKeyResult` — both TUI and GTK call one engine method, no per-backend key mapping. (3) `handle_cached()` (quadraui#99, backend-free SidebarSystem event handling via cached layout metrics) enables all nav/mouse/scroll dispatch from shared engine code. `set_backend_info()` called at TUI init and GTK font change. (4) `wire_da_events` (quadraui#101) replaces ~30 lines of manual GTK signal handler wiring with one 3-line call. Removed dead fields `ext_sidebar_body_height`/`ext_sidebar_max_panel_scroll`. Gated `handle_ext_sidebar_key`/`ext_flat_item_count`/`ext_selected_to_section` behind `#[cfg(win-gui)]`. Updated 3 existing tests + `ext_remove` in `lsp_ops.rs` to use SidebarSystem. Also closed #322 (superseded) and #326 (duplicate). quadraui issues filed and resolved: #93 (WholePanel scroll), #95 (scrollbar click/drag fix), #97 (has_focus getter), #99 (handle_cached), #101 (wire_da_events).
+
+---
+**Session 357 (May 7-8) — #329 GTK exit coredump + #311 search panel cursor movement:**
+
+**#329** (Path A, `fddd573`): Coredump when closing the GTK window via the close button. Original hypothesis was `process::exit(0)` running inside a GTK signal emission chain, but the real root cause was a RefCell double-borrow: `reveal_path_in_explorer()` called `self.engine.borrow_mut()` while the engine was already borrowed elsewhere. This panicked through the extern "C" `clicked_trampoline`, killing the Relm4 runtime, which made the subsequent `sender.input(Msg::WindowClose)` panic (dead channel) → abort. Three-part fix in `src/gtk/mod.rs`: (1) `reveal_path_in_explorer` and the 100ms tab-switcher timer callback now use `try_borrow_mut()` — silently no-op if the engine is already borrowed, (2) `save_session_and_exit` changed from `-> !` to `-> ()` with `process::exit(0)` deferred via `gtk4::glib::idle_add_local_once` (same for `exit(1)` in `QuitWithError`), (3) added `return` after `save_session_and_exit()` in the `ShowQuitConfirm` handler to prevent falling through to `show_dialog()` when there are no unsaved changes. Repro: create new file, delete it, exit → crash. +22/-10 lines, 1 file.
+
+**#311** (PR #335, merged): Search panel query/replace inputs gained Left/Right/Home/End cursor movement, mid-string insert/delete, and Delete key support. Consolidated ~100 lines of duplicated key dispatch from GTK and TUI into a single `Engine::handle_search_input_key()` method in `search.rs` returning `SearchInputAction` enum (`Consumed/StartSearch/StartReplace/Unfocused/Ignored`). Five engine helper methods: `search_input_insert_char`, `search_input_backspace`, `search_input_delete`, `search_input_move_caret`, `search_input_paste`. GTK `SearchPanelKey` handler shrunk from ~50 lines to 5. TUI handler delegates to engine and syncs local focus flags (`search_input_mode`/`replace_input_focused`) from `search_panel_form_focus` after each call. TUI `render_search_panel` no longer resets carets to `text.len()` at paint time — just clamps. Fixed TUI results-mode "char re-enters input mode" path to use `search_input_insert_char` instead of `.push()`. 9 new tests. Filed #333 (TUI focus state dedup) and #334 (results-mode behavior unification). +324/-115 lines, 6 files.
+
+---
+**Session 356 (May 7) — #306 StatusBar hover/press for debug toolbar (PR #332):**
+
+quadraui's `Backend::draw_status_bar` gained `hovered_id: Option<&WidgetId>` and `pressed_id: Option<&WidgetId>` params. When a clickable segment's `action_id` matches `hovered_id`, its background is lightened; when it matches `pressed_id`, its background is darkened. All 11 `draw_status_bar` call sites across GTK (5) and TUI (6) updated. Non-toolbar call sites pass `None, None`. GTK: `debug_toolbar_hovered_id`/`debug_toolbar_pressed_id` as `Rc<RefCell<Option<WidgetId>>>` on the model; hover detection in 20Hz poll (hit-testing cached `debug_toolbar_hit_regions`); pressed set on click, cleared on mouse-up; threaded through draw closure → `draw_editor` → `draw_debug_toolbar`. TUI: initially mirrored GTK pattern with per-backend mouse routing (~80 lines), but `MouseEventKind::Moved` events on the toolbar row were consumed by earlier handlers in the 1400-line `handle_mouse` match block before reaching our code. Debugged extensively with checkpoint logs — events reached the match block but not the `_ => {}` wildcard arm. Filed quadraui#91 requesting shared `StatusBarInteraction` compose helper. quadraui delivered `StatusBarInteraction` struct (~40 lines): stores hit regions, processes `UiEvent`s via `handle()`, exposes `hovered_id()`/`pressed_id()`, returns `StatusBarAction::{Clicked,Redraw,Ignored}`. TUI refactored to use it: ~15-line `UiEvent` intercept in the main event loop replaces all per-backend mouse routing. Filed #331 to migrate GTK to `StatusBarInteraction` when GTK's `UiEvent` pipeline becomes active (currently events are produced but discarded). Worked in a git worktree off `develop` to avoid interfering with parallel #324 work.
+
+---
+**Session 355 (May 7) — #324 Explorer panel → TreeController (PR #330):**
+
+Full migration of the explorer file tree from duplicated per-backend state (TUI `TuiSidebar` + GTK `ExplorerState`) to a single `quadraui::TreeController` on the engine. Net -798 lines. New file `src/core/engine/explorer_ops.rs` (~355 lines) owns all explorer logic: `explorer_rebuild_rows()`, `explorer_toggle_dir()`, `explorer_reveal_path()`, `explorer_activate_selected()`, `explorer_scroll()`, `dispatch_explorer_key()`, `dispatch_explorer_crud()`, `dispatch_explorer_edit_key()`. `ExplorerKeyResult` enum tells backends what to do (Consumed/Unfocused/FocusToolbar/Ignored). TreeController inline editing via `start_editing(path, text, cursor, selection_anchor, placeholder)` for rename (stem pre-selected) and new-file/folder (placeholder text). `EditConfirmed`/`EditCancelled` events handle filesystem ops. Context menu CRUD unified through `dispatch_explorer_crud`. Deleted: GTK `ExplorerState` + `build_explorer_rows` + `collect_rows` (~190 lines), `draw_explorer_panel` (~80 lines), `handle_explorer_da_key` nav+CRUD (~170 lines), click/scroll helpers (~120 lines), dialog handlers (~60 lines), TUI legacy inline-edit renderer (~370 lines), TUI old rename/new-entry key intercepts (~30 lines). GTK key routing: `Msg::KeyPress` is authoritative (DA focus unreliable), dialog check in `handle_explorer_da_key` routes to `engine.handle_key()` when dialog active. `explorer_to_tree_view()` gated behind `#[cfg(feature = "win-gui")]`. `explorer_rebuild_rows()` called at `Engine::new()` for initial population. Fixed pre-existing `draw_status_bar` 4-arg API break in GTK. Filed: #328 (adopt quadraui#77/#78/#79), #329 (GTK exit coredump), quadraui#83 (inline tree editing — landed as #84), quadraui#86 (context menu — landed as #87), quadraui#89 (selection highlight rendering).
+
+---
+**Session 354 (May 6) — #319 MenuSystem migration complete:**
+
+Menu bar + dropdown fully migrated to `quadraui::MenuSystem` on both TUI and GTK. 681 net lines removed. `MenuSystem` on engine as `Rc<RefCell<MenuSystem>>`. `render::build_menu_defs(is_vscode_mode)` converts `MENU_STRUCTURE` to `Vec<MenuDef>`. `menu_system.render(backend, bar_rect)` draws bar + dropdown. `menu_system.handle(&ui_event, backend, bar_rect)` processes all keyboard/mouse events. `MenuEvent::Activated(id)` → `engine.dispatch_menu_action(id.as_str())`. GTK overlay uses `quadraui::gtk::MenuOverlay` helper (30 lines replacing 141). Removed: `MenuBarData`, `MenuKeyResult`, `handle_menu_key()`, `open_menu()`, `close_menu()`, `menu_move_selection()`, `menu_activate_highlighted()`, `menu_dropdown_to_quadraui_context_menu()`, `build_menu_bar_view()`, `draw_menu_bar()`, `draw_menu_dropdown()`, `Msg::OpenMenu/CloseMenu/MenuActivateItem/MenuHighlight`. Old fields gated behind `#[cfg(feature = "win-gui")]`.
+
+---
+**Session 353 (May 5-6) — #307 complete, #246 closed, #319 attempted + reverted:**
+
+#307 Batches 2-5 shipped: debug sidebar (4 ScrollSurface entries + dispatch_click), terminal scrollback, editor viewport, editor hover popup all migrated to dispatch_scroll/dispatch_click. Shared `Engine::handle_dap_sidebar_scroll()` + `dap_sidebar_visible_rows()`. Unified step rounding `.ceil()` → `.round()`. #242 closed (TUI debug sidebar scrollbar click). #246 closed (TUI panel scrollbar colors unified to theme.scrollbar_thumb/track). #308 item 3 shipped (TUI menu hover-to-switch). Filed #315-#319. #319 Step 1 landed (shared `Engine::handle_menu_key()` + `MenuKeyResult` + engine fields; quadraui#61 `ContextMenu::move_selection/first_selectable`). #319 Steps 2-4 attempted 3x with per-backend GTK overlay code — wrong position, wrong font, broken arrow keys, gap above dropdown — all caused by forked TUI vs GTK code paths violating platform-neutrality rule. Reverted. CLAUDE.md updated with concrete negative example. Plan revised in `.claude/plans/lucky-launching-brook.md`: one shared `render::build_menu_dropdown()` function, 3 lines backend wiring each.
+
+> **Format note:** Sessions 282–339 below were archived in their
+> original verbose multi-paragraph format (as maintained in
+> PROJECT_STATE during the A.x / Phase 4 / Phase B / Phase C waves).
+> Sessions 280 and earlier use the one-paragraph compact format.
+
+---
+**Session 352 — #307 Batch 1 scroll dispatch + CLAUDE.md split:**
+
+#307 Batch 1 (`0be798e`): migrated explorer, ext_panel, settings, search, ext_sidebar to `dispatch_scroll`/`dispatch_click`. Registered `ScrollSurface` entries at paint time. Removed ~95 lines bespoke wheel scroll + ~90 lines bespoke scrollbar click/drag. Fixed stale picker modal blocking dispatch_scroll. Fixed explorer scrollbar thumb color mismatch. Wired `search_scroll_top` into MSV TreeView `scroll_offset`. Body click fix (`aa133fa`): gated sidebar `dispatch_click` `MouseDown` on `drag_state.is_active()`. CLAUDE.md split (`80d97ff`): 314→90 lines (71% reduction), moved architecture, quadraui guide, patterns, and doc maintenance into `docs/` conditional files. Filed #314 for MSV scrollbar click/drag.
+
+---
+**Session 351 — All bespoke paint surfaces eliminated:**
+
+Final three bespoke surfaces migrated. #301 menu bar → `quadraui::MenuBar` (PR #309, `5baadcc`). #310 command center (nav arrows + search box) → `quadraui::CommandCenter` (`b5fdd7d`), eliminating ~242 lines per-backend. #302 search panel → `quadraui::MSV + Form + TreeView` (ending `de625bb`), TUI ~407 lines bespoke → zero, GTK ~226 lines native widgets → DrawingArea. Replace All gained confirmation dialog. quadraui gained ToggleGroup + ButtonRow (quadraui#52), full-width Form fields (quadraui#54), GTK Pango-based form_layout (quadraui#56). Also fixed #290 (TUI extension panel search drops keys) and #291 (arrow key navigation in extension panel search). Milestone focus shifted to consolidation (#307 scroll dispatch) and polish.
+
+---
+**Session 350 — #305 terminal toolbar shipped:**
+
+Terminal toolbar migrated to quadraui primitives. Find mode uses `quadraui::StatusBar`, tab strip mode uses `quadraui::TabBar` with `compact: true`. Click dispatch through shared `Engine::resolve_terminal_toolbar_click()` — both backends read cached hit data instead of bespoke coordinate math. ~145 lines of bespoke TUI paint and ~100 lines of bespoke GTK paint replaced. Two quadraui improvements landed: rect-height-aware tab bar (quadraui#49) and compact mode (quadraui#50). CLAUDE.md gained no-cross-repo-edits rule. GTK terminal scroll confirmed as pre-existing gap (tracked by #307). Commit `08dd916`.
+
+---
+**Session 349 — #304 bottom panel tabs shipped:**
+
+Bottom panel tabs (Terminal / Debug Output switcher) migrated to `quadraui::TabBar`. Both backends paint through `render::build_bottom_panel_tab_bar()` → `Backend::draw_tab_bar()`. Click dispatch via shared `Engine::handle_bottom_tab_bar_click()`. quadraui gained `TabBar.show_tab_close: bool` to suppress per-tab close buttons. All quadraui prereqs for remaining surfaces resolved (quadraui#6 MenuBar, quadraui#7 SearchPanel both CLOSED). Commit `5d7fa09`.
+
+---
+**Session 339 — #259 Phase B.5c stages 1–7 shipped:**
+
+Closed the trait-coverage gap that B.5b surfaced. Six trait-method
+redesigns + two rasteriser lifts + new trait methods for the
+trait-less primitives, landed Path-A in seven discrete commits.
+
+| Stage | Commit | What |
+|-------|--------|------|
+| B5c.1 | `985b087` | `Backend::draw_status_bar(rect, bar) -> Vec<StatusBarHitRegion>`. Drops `&StatusBarLayout` (each backend computes layout internally). TUI rasteriser returns hit regions for trait parity. |
+| B5c.2 | `b3eeadf` … `e32cc8a` | `Backend::draw_tab_bar(rect, bar, hovered_close) -> TabBarHits`. `TabBarHits` lifted to primitives so the trait can name it without feature gates. Adds `close_bounds` to hits so GTK close-hover hit-test consumes rasteriser positions instead of `chars × char_width`. TUI mouse single-group + right-click migrated to `bar.layout(...).hit_test()`. Icon glyphs in `build_tab_bar_primitive` now route through `Icon::c()` (was hardcoded). |
+| B5c.3 | `92722cc` | `Backend::draw_text_display(rect, td)`. Drops `&TextDisplayLayout` (rasterisers manage line layout internally). |
+| B5c.4 | `57f3d21` | TUI explorer / settings / source-control panel render helpers route tree/form draws through `Backend::draw_tree` / `draw_form` via `enter_frame_scope`. In-tree `quadraui_tui::draw_tree` / `draw_form` shims removed. |
+| B5c.5 | `7558220` | Lifted `quadraui_gtk::draw_activity_bar` + `draw_terminal_cells` into `quadraui::gtk::*` (with `quadraui::Theme`). New `ActivityBarRowHit` primitive. New theme fields `inactive_fg` + `selection_bg`. New `Color::lighten`. `GtkBackend::draw_activity_bar` + `draw_terminal` no longer `unimplemented!()`. |
+| B5c.6 | `a4e6c9f` | `Backend::draw_tooltip` + `Backend::draw_context_menu`. The other 4 of the original 6 trait-less primitives deferred (see below). |
+| B5c.7 | this stage | Parity sweep — full test/clippy run across feature combos. `quadraui` 231/231; vimcode `--no-default-features` clean; kubeui builds clean. |
+
+**Trait coverage state (post-B.5c):**
+
+| Primitive | TUI | GTK | Notes |
+|---|---|---|---|
+| `tree`, `list`, `form`, `palette` | ✅ | ✅ | from B.5b |
+| `status_bar` | ✅ | ✅ | hit regions returned (B5c.1) |
+| `tab_bar` | ✅ | ✅ | `TabBarHits` returned, includes close_bounds (B5c.2) |
+| `text_display` | ✅ | ✅ | layout-internal (B5c.3) |
+| `activity_bar` | ⚠️ stub | ✅ | TUI inline; #266 covers TUI lift |
+| `terminal` | ⚠️ stub | ✅ | TUI inline; GTK only consumer today |
+| `tooltip` | ✅ | ✅ | (B5c.6) |
+| `context_menu` | ✅ | ✅ | hit regions returned (B5c.6) |
+| `dialog` | ❌ | ❌ | dual-Pango-layout blocker — #267 |
+| `rich_text_popup`, `completions`, `find_replace` | ❌ | ❌ | rasterisers still in vimcode shims — #266 |
+
+**Smoke-test followups filed during B5c:**
+- #262 — breadcrumb dropdown: parent symbols expandable but not jumpable.
+- #263 — TUI breakpoint red dot missing in gutter (pre-existing).
+- #264 — Settings panel renders broken when sidebar narrow.
+- #265 — TUI nerd-font wide-glyph predicate disagrees with terminal — clicks land off-target.
+- #266 — Lift `rich_text_popup` / `completions` / `find_replace` into `quadraui::{tui,gtk}::*`.
+- #267 — `Backend::draw_dialog` needs dual-Pango-layout handling.
+
+**What's next:** B.5d (#260 — TUI vs GTK setup-code audit), then B.5e
+(#261 — runner crates), then B.6 Win-GUI rebuild on quadraui.
+
+---
+
+**Session 332 (cont.) — #223 TextDisplay rasteriser pilot + kubeui YAML pane adoption:**
+
+Tenth lift, sequenced after the per-primitive arc wrapped. This one
+proves out the **kubeui-core view-builder pattern** end-to-end: the
+YAML-key/value parsing logic moves into `kubeui_core::build_yaml_view`,
+both kubeui binaries shrink to a bespoke title row + delegated body,
+and the next external app gets the same machinery for free.
+
+**What shipped:**
+
+- `quadraui/src/tui/text_display.rs` —
+  `pub fn quadraui::tui::draw_text_display(buf, area, display, theme)`.
+  Generic per-line styled-text rasteriser; respects per-line
+  `decoration` (`Error`/`Warning`/`Muted`) and per-span `fg`/`bg`
+  overrides; optional `timestamp` prefix in `muted_fg`. 4 unit tests
+  cover top-to-bottom paint, span fg override, auto-scroll pinning
+  to bottom, zero-size guard.
+- `quadraui/src/gtk/text_display.rs` —
+  `pub fn quadraui::gtk::draw_text_display(cr, layout, x, y, w, h, display, theme, line_height)`.
+  Mirrors the visual contract.
+- `kubeui-core::build_yaml_view(state) -> TextDisplay` —
+  YAML-key/value parsing extracted from both kubeui binaries into
+  the shared core. Each line becomes a `TextDisplayLine` with two
+  styled spans (`key:` in blue + value in default fg) or a single
+  plain span when no `:` is present.
+- No new `quadraui::Theme` fields needed.
+
+**Adoption:**
+
+- `kubeui/src/main.rs::draw_yaml` collapses to ~25 lines: bespoke
+  title row (focus-dependent " YAML" / " YAML  ◀ j/k") + 1-line
+  delegate to `quadraui::tui::draw_text_display` for the body.
+  YAML-pane-specific `bg = (16, 18, 24)` preserved via a one-off
+  `quadraui::Theme { background: bg, ..theme() }` override.
+- `kubeui-gtk/src/main.rs::draw_yaml` collapses similarly. ~95 lines
+  removed from kubeui binaries combined; +56 lines in kubeui-core.
+  Net: shared logic moves where it belongs, binaries shrink to
+  paint glue.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+223/223 (4 new text_display tests on top of 219); kubeui (TUI + GTK)
+build clean; clippy clean across the workspace.
+
+**What's next:** kubeui's picker → `Palette` adoption is the
+remaining same-shape lift (the picker has its own ListView shape
+today; restructuring to use `Palette` is a kubeui-core view-builder
+change). After that the kubeui binaries are at the irreducible
+event-loop floor (~150-200 lines each) — further reduction needs
+the Phase B `Backend` trait.
+
+---
+
+**Session 332 (cont.) — #223 ContextMenu rasteriser pilot — ARC COMPLETE:**
+
+Ninth and final primitive in the per-primitive arc for #223. Vimcode
+uses `ContextMenu` for right-click menus (file explorer, tab action
+menu) and the menu-bar dropdowns (File / Edit / View / etc.).
+
+**What shipped:**
+
+- `quadraui/src/tui/context_menu.rs` —
+  `pub fn quadraui::tui::draw_context_menu(buf, menu, layout, theme)`.
+  Box-bordered popup, selected item rendered inverted (fg/bg swap),
+  separator as horizontal `─` dashes, disabled items dimmed,
+  shortcut text right-aligned. 4 unit tests.
+- `quadraui/src/gtk/context_menu.rs` —
+  `pub fn quadraui::gtk::draw_context_menu(cr, layout, menu, menu_layout, line_height, theme) -> Vec<(f64, f64, f64, f64, WidgetId)>`.
+  Returns the per-clickable-item hit-rectangles + their `WidgetId`s
+  so the caller's click handler can resolve mouse events without
+  re-running layout. No new theme fields.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_context_menu` collapses to a
+  delegation. ~115 lines removed.
+- `src/gtk/quadraui_gtk.rs::draw_context_menu` collapses to a
+  delegation. ~110 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+219/219 (4 new context_menu tests on top of 215); clippy clean.
+
+---
+
+## #223 ARC COMPLETE — what landed today (Session 332)
+
+**9 pilots in one session**, plus 1 pre-existing layout-regression fix:
+
+| # | Primitive | Net lines | Theme fields added |
+|---|-----------|-----------|---------------------|
+| 1 | StatusBar | -169 | `background`, `foreground` (initial set) |
+| 2 | TabBar    | -371 | 7 tab fields + `separator` |
+| 2½ | (TabBar layout fix) | n/a | — (regression fix in primitive) |
+| 3 | ListView  | -249 | 10 modal/list fields |
+| 4 | TreeView  | -279 | (no new fields) |
+| 5 | Palette   | -467 | `query_fg`, `match_fg` |
+| 6 | Form      | -506 | `accent_fg` |
+| 7 | Tooltip   | -52  | `hover_bg`, `hover_fg`, `hover_border` |
+| 8 | Dialog    | -182 | `input_bg` |
+| 9 | ContextMenu | -188 | (no new fields) |
+
+**Total: 24 fields on `quadraui::Theme`. ~2,400 net lines removed
+from vimcode + kubeui.** Public rasterisers in
+`quadraui::{tui,gtk}::draw_*` behind `tui` / `gtk` feature gates.
+
+**Cross-app payoff:** kubeui adopted ListView; remaining primitives
+are vimcode-only consumers today but the rasterisers are ready for
+external apps (Postman / SQL client / k8s dashboard / etc.) the
+moment they need them.
+
+**Issues filed during smoke-testing the arc** (all pre-existing or
+out-of-scope, none introduced by the pilots):
+
+- #225 — GTK tab switcher: rounded corners + bordered ListView support
+- #226 — Right-click "Open to the Side" v-splits current tab
+- #227 — GTK palette font flicker on first open
+- #228 — GTK editor hover: heading bg incomplete
+- #229 — GTK editor hover: scrollbar leak (right-edge specific)
+- #230 — LSP "rust-analyzer..." indicator stuck
+- #231 — TUI rename: tree row stale tinting after dialog closes
+- #232 — Tab-click no longer highlights tree row (TUI + GTK)
+- #233 — GTK Dialog square corners (cross-backend visual divergence)
+
+**What's next** — the per-primitive arc for #223 is done. Focus
+shifts to:
+- Cleanup of `quadraui::Theme` field names (some are still vimcode-flavoured: `tab_*`, `hover_*`).
+- File the GTK font flicker fix (#227) by setting editor monospace explicitly in vimcode wrappers.
+- The smoke-test follow-up issues above.
+- Optionally: kubeui adoption of more primitives (Palette / Tooltip / Dialog) if those use cases appear.
+
+---
+
+**Session 332 (cont.) — #223 Dialog rasteriser pilot:**
+
+Eighth primitive lifted. Vimcode uses `Dialog` for the quit-confirm,
+close-tab-confirm, and rename-input prompts.
+
+**What shipped:**
+
+- `quadraui/src/tui/dialog.rs` —
+  `pub fn quadraui::tui::draw_dialog(buf, dialog, layout, theme)`.
+  Rounded `╭─╮ ╰─╯` border + title overlay + body text + optional
+  input field + button row. 4 unit tests cover: corner glyphs,
+  default button uses `selected_bg`, input field gets `input_bg`
+  when present, zero-size guard.
+- `quadraui/src/gtk/dialog.rs` —
+  `pub fn quadraui::gtk::draw_dialog(cr, body_layout, ui_layout, dialog, dialog_layout, line_height, theme) -> Vec<(f64, f64, f64, f64)>`.
+  Returns the per-button hit-rectangles so vimcode's click handler
+  keeps working unchanged.
+- `quadraui::Theme` adds 1 field: `input_bg` (background of the
+  embedded text input — distinct from `surface_bg` so the input
+  reads as a separate sub-region).
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_dialog` collapses to a
+  delegation. Vimcode-private `title_as_plain` helper deleted with
+  it. ~125 lines removed.
+- `src/gtk/quadraui_gtk.rs::draw_dialog` collapses to a delegation.
+  Vimcode-private `styled_text_plain` helper deleted with it (was
+  shared with the now-lifted dialog). ~120 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+215/215 (4 new dialog tests on top of 211); clippy clean across all
+crate × feature combinations.
+
+**What's next:** **ContextMenu** — last primitive in the per-primitive
+arc for #223. Vimcode uses it for right-click menus and the menu-bar
+dropdowns.
+
+---
+
+**Session 332 (cont.) — #223 Tooltip rasteriser pilot:**
+
+Seventh primitive lifted. Vimcode uses `Tooltip` for **three** popup
+surfaces: LSP hover popup, signature help, and inline diff peek
+(the last two via the `styled_lines: Some(...)` multi-line styled
+path).
+
+**What shipped:**
+
+- `quadraui/src/tui/tooltip.rs` —
+  `pub fn quadraui::tui::draw_tooltip(buf, tooltip, layout, theme)`.
+  Side-bar borders only (no top/bottom) — matches the visual style
+  of all three vimcode tooltip consumers. 4 unit tests.
+- `quadraui/src/gtk/tooltip.rs` —
+  `pub fn quadraui::gtk::draw_tooltip(cr, layout, tooltip, tooltip_layout, line_height, padding_x, theme)`.
+  Cairo rectangle (background fill + 1 px stroke border) + Pango
+  text rendering with per-span `fg` overrides on the styled path.
+- `quadraui::Theme` adds 3 fields: `hover_bg`, `hover_fg`,
+  `hover_border`. Distinct from the modal-surface fields
+  (`surface_bg` / `surface_fg`) so apps can tint tooltip popups
+  differently from modal lists.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_tooltip` collapses to a
+  delegation. ~70 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_tooltip` collapses to a
+  delegation. ~85 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+211/211 (4 new tooltip tests on top of 207); full
+`cargo test --no-default-features` green; clippy clean across all
+crate × feature combinations.
+
+**What's next:** **Dialog**. Vimcode uses it for confirmation popups
+(quit / close-tab / generic). Then **ContextMenu** wraps the
+primitive arc for #223.
+
+---
+
+**Session 332 (cont.) — #223 Form rasteriser pilot:**
+
+Sixth primitive lifted. Vimcode uses `Form` for the TUI settings
+panel (the GTK settings panel still uses native widgets — its
+`draw_form` was already `#[allow(dead_code)]` pre-pilot, lifted
+anyway because the next GTK refresh will need it).
+
+**What shipped:**
+
+- `quadraui/src/tui/form.rs` —
+  `pub fn quadraui::tui::draw_form(buf, area, form, theme)`. Uniform
+  1-cell-per-row measurer. Handles all 7 `FieldKind` variants:
+  Label / Toggle / TextInput / Button / ReadOnly / Slider /
+  ColorPicker / Dropdown.
+- `quadraui/src/gtk/form.rs` —
+  `pub fn quadraui::gtk::draw_form(cr, layout, x, y, w, h, form, theme, line_height)`.
+  Per-row height `(line_height * 1.4).round()`. Slider /
+  ColorPicker / Dropdown not yet rendered (matching pre-lift
+  parity — GTK consumer doesn't exist).
+- `quadraui::Theme` adds 1 field: `accent_fg` (active-state visual
+  cue: toggle "[x]" when on, slider filled cells, button frame when
+  focused). Mapped from vimcode's `theme.cursor`.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_form` collapses to a
+  delegation. ~290 lines of vimcode-private rasterisation removed.
+  The vimcode-private `draw_styled_text` helper is now also dead
+  code (form was its last consumer); deleted.
+- `src/gtk/quadraui_gtk.rs::draw_form` collapses to a delegation.
+  ~240 lines removed.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+207/207 (4 new form tests on top of 203); full
+`cargo test --no-default-features` green; clippy clean across
+all crate × feature combinations.
+
+**What's next:** **Tooltip**. Vimcode uses it for LSP hover popups,
+signature help, and the diff peek popup. Then Dialog → ContextMenu.
+
+---
+
+**Session 332 (cont.) — #223 Palette rasteriser pilot:**
+
+Fifth primitive lifted. Palette is the vimcode command palette + folder
+picker (TUI + GTK). Most visually rich of the lifts so far: bordered
+modal with title bar, query-input row with cursor block, separator,
+scrollable item list with per-character fuzzy-match highlighting, and
+a thumb scrollbar.
+
+**What shipped:**
+
+- `quadraui/src/tui/palette.rs` —
+  `pub fn quadraui::tui::draw_palette(buf, area, palette, theme, nerd_fonts_enabled)`.
+  4 unit tests cover: corner glyphs, query+prompt row layout,
+  match_positions painting in `match_fg`, too-small-area no-op.
+- `quadraui/src/gtk/palette.rs` —
+  `pub fn quadraui::gtk::draw_palette(cr, layout, x, y, w, h, palette, theme, line_height, nerd_fonts_enabled)`.
+  Cairo + Pango with per-character `AttrColor` foreground spans for
+  match highlighting.
+- `quadraui::Theme` adds 2 fields: `query_fg` (query text + cursor
+  block fg, distinct from `surface_fg`) and `match_fg` (highlight
+  colour for fuzzy-match positions).
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_palette` collapses to a
+  delegation. ~250 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_palette` collapses to a delegation.
+  ~280 lines removed.
+
+**Kubeui not adopted yet.** kubeui has its own picker but it builds
+a `ListView` (not a `Palette`); migrating kubeui to Palette would
+require restructuring the kubeui-core picker view-builder to emit
+the richer `Palette` shape (with query + total_count + match
+positions). Reasonable follow-up; the rasterisers are ready when
+kubeui wants them.
+
+**Quality:** `cargo test -p quadraui --features tui --features gtk`
+203/203 (4 new palette tests on top of 199); full
+`cargo test --no-default-features` green; clippy clean across all
+combinations.
+
+**What's next:** **Form**. Vimcode's settings panel (TUI; GTK still
+on native widgets but the rasteriser exists for the eventual GTK
+DrawingArea migration). Then Tooltip → Dialog → ContextMenu.
+
+---
+
+**Session 332 (cont.) — #223 TreeView rasteriser pilot:**
+
+Fourth primitive lifted following the StatusBar / TabBar / ListView
+template. TreeView is the most complex of the four because GTK has
+**variable per-row heights** (header rows 1× line_height, leaves
+1.4×) that the rasteriser supplies via the primitive's measurement
+closure — the primitive itself doesn't know about font metrics.
+
+**What shipped:**
+
+- `quadraui/src/tui/tree.rs` —
+  `pub fn quadraui::tui::draw_tree(buf, area, tree, theme, nerd_fonts_enabled)`.
+  Uniform 1-cell-per-row measurer (TUI rows are always 1 cell tall).
+  Reuses `draw_styled_text` lifted in pilot 3. 4 unit tests cover
+  paint output with branch chevron + indented leaves, selected row
+  uses `selected_bg`, header row uses `header_bg`, zero-size guard.
+- `quadraui/src/gtk/tree.rs` —
+  `pub fn quadraui::gtk::draw_tree(cr, layout, x, y, w, h, tree, theme, line_height, nerd_fonts_enabled)`.
+  Per-row heights split at the measurer: `Decoration::Header` rows
+  get `line_height`, others get `(line_height * 1.4).round()`.
+  Vimcode's GTK click handlers walk the layout's per-row bounds
+  (already correct from `TreeViewLayout.visible_rows`) — no click
+  drift expected from the lift.
+- No new `quadraui::Theme` fields needed. The TreeView rasterisers
+  consume the same set ListView added (`header_bg`, `selected_bg`,
+  `muted_fg`).
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_tree` collapses to a 1-line
+  delegation. ~135 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_tree` collapses to a 12-line
+  delegation. ~180 lines of GTK-private rasterisation removed.
+- Kubeui doesn't have a tree today; its `theme()` adapters
+  populated the relevant Theme fields back in the ListView pilot,
+  so adding a kubeui tree later means data + handlers, no
+  rasteriser code.
+
+**Quality:** `cargo test -p quadraui --features tui` 199/199 (4 new
+tui::tree tests); full `cargo test --no-default-features` green;
+clippy clean across vimcode (default + no-default-features) and
+quadraui (`tui` + `gtk`).
+
+**What's next:** **Palette**. Vimcode uses it for the command
+palette and folder picker; kubeui has its own picker that's a
+likely adoption candidate (it's a bordered modal with query +
+items, exactly Palette's shape). After Palette: Form → Tooltip →
+Dialog → ContextMenu.
+
+---
+
+**Session 332 (cont.) — #223 ListView rasteriser pilot:**
+
+Third primitive lifted following the StatusBar + TabBar pattern. This
+one is the first that hits **kubeui head-on**: kubeui (TUI) and
+kubeui-gtk both have their own `draw_list` for the resource list,
+and both adopt `quadraui::{tui,gtk}::draw_list` in this commit —
+proving the cross-app reuse story end-to-end.
+
+**What shipped:**
+
+- `quadraui/src/tui/list.rs` —
+  `pub fn quadraui::tui::draw_list(buf, area, list, theme, nerd_fonts_enabled)`.
+  5 unit tests cover: paint output with selection marker, selection
+  marker suppressed when unfocused, bordered corner glyphs, error
+  decoration → `error_fg`, zero-size guard.
+- `quadraui/src/gtk/list.rs` —
+  `pub fn quadraui::gtk::draw_list(cr, layout, x, y, w, h, list, theme, line_height, nerd_fonts_enabled)`.
+  Mirrors the TUI rasteriser's visual contract; bordered mode is
+  not yet honoured (no GTK consumer needs it today, deferred as a
+  follow-up).
+- `quadraui::Theme` extends with 10 list-relevant fields:
+  `surface_bg / surface_fg / selected_bg / border_fg / title_fg /
+  header_bg / header_fg / muted_fg / error_fg / warning_fg`. Each
+  has a sensible dark-palette default; vimcode populates from
+  `render::Theme` (mapping `fuzzy_*`, `status_*`, `line_number_fg`,
+  `diagnostic_*`); kubeui populates the subset it cares about and
+  spreads `..Theme::default()` for the rest.
+- `quadraui::tui::draw_styled_text` — generic helper for painting a
+  `StyledText` with optional decoration override. Lifted from
+  vimcode's TUI rasteriser; will be reused by future migrations
+  (form / palette / tooltip).
+
+**Adoption (vimcode + kubeui at the same time):**
+
+- `src/tui_main/quadraui_tui.rs::draw_list` collapses to a
+  delegation. ~200 lines of vimcode-private rasterisation removed.
+- `src/gtk/quadraui_gtk.rs::draw_list` collapses to a delegation.
+  ~170 lines removed.
+- `kubeui/src/main.rs::draw_list` collapses to a 1-liner. ~60
+  lines of duplicate rasterisation removed; private `put_styled`
+  helper deleted.
+- `kubeui-gtk/src/main.rs::draw_list` collapses to a 1-liner.
+  ~50 lines of duplicate rasterisation removed; private
+  `draw_styled_text` + `measure_styled` helpers deleted.
+- Both kubeui binaries now have a richer `theme()` helper that
+  populates the relevant new Theme fields (selected_bg,
+  surface_bg, etc.).
+
+**Net diff impact:** kubeui crates lose more lines than vimcode
+because they had less of the rasteriser code already factored —
+exactly the ~25% sharing-delta the kubeui spike measured. Each
+primitive lift moves the percentage closer to the 90% target.
+
+**Quality:** `cargo test -p quadraui --features tui` 195/195 (5
+new tui::list tests on top of 190); full
+`cargo test --no-default-features` green; clippy clean across all
+four crates × both feature combinations.
+
+**What's next:** **TreeView**. vimcode uses it for the file
+explorer + git source-control panel; kubeui doesn't have one
+today but plausibly grows one (e.g. resource-by-namespace
+hierarchy). Tree migration is the most complex of the remaining
+lifts because per-row heights vary on GTK (header rows 1× line
+height, leaves 1.4×). After TreeView: Palette → Form → Tooltip →
+Dialog → ContextMenu.
+
+---
+
+**Session 332 (cont.) — #223 TabBar rasteriser pilot + a pre-existing
+layout-regression fix:**
+
+After the StatusBar pilot landed (`develop` `1bed461`), TabBar followed
+the same shape on a second branch. Smoke-testing the branch surfaced
+a pre-existing `quadraui::TabBar::layout` regression — captured as
+the third bullet below.
+
+**What shipped:**
+
+- `quadraui/src/tui/tab_bar.rs` — `pub fn quadraui::tui::draw_tab_bar(buf, area, bar, layout, theme) -> usize`
+  with `pub const TAB_CLOSE_CHAR: char = '×'`. Self-contained: lifted
+  `set_cell_wide` + `set_cell_styled` + `is_nerd_wide` from vimcode's
+  `tui_main/mod.rs`. 4 unit tests cover paint output, return-value
+  contract, segment reservation, zero-size guard.
+- `quadraui/src/gtk/tab_bar.rs` — `pub fn quadraui::gtk::draw_tab_bar(...) -> TabBarHits`.
+  Returns a generic per-tab + per-right-segment bounds list; vimcode's
+  wrapper reshapes those into its app-specific `TabBarHitInfo`
+  (diff-toolbar / split / action-menu groupings keyed by WidgetId
+  strings — those stay vimcode-side, not in quadraui).
+- `quadraui::Theme` extended with 7 tab fields:
+  `tab_bar_bg / tab_active_bg / tab_active_fg / tab_inactive_fg /
+  tab_preview_active_fg / tab_preview_inactive_fg / separator`. Each
+  has a sane dark-palette default; vimcode populates from
+  `render::Theme`, kubeui appends `..Theme::default()` (no tab bar
+  there yet).
+- **Layout regression fix in `quadraui::TabBar::layout`:** when
+  `scroll_arrow_width <= 0.0` (TUI's contract — TUI doesn't paint
+  scroll arrows because the engine already drives scroll via
+  `Engine::ensure_active_tab_visible`), the layout used to collapse
+  `resolved_scroll_offset` to `0` and clip from index 0 — silently
+  dropping newly-opened tabs at the right edge. Now honours
+  `bar.scroll_offset` (clamped to a valid index). Two regression tests
+  added in `quadraui/src/lib.rs`. The bug pre-dated this session
+  (introduced during Phase B.4 D6 migration) and would have continued
+  hurting users — surfaced only because TabBar smoke-test exercised
+  multi-file open in a narrow terminal.
+
+**Adoption:**
+
+- `src/tui_main/quadraui_tui.rs::draw_tab_bar` collapses to a 1-line
+  delegation. The vimcode-private `set_cell_wide` and `TAB_CLOSE_CHAR`
+  constant are deleted (helpers moved into quadraui).
+- `src/gtk/quadraui_gtk.rs::draw_tab_bar` collapses to ~50 lines
+  (mostly the WidgetId-based reshape from generic `TabBarHits` →
+  vimcode's `TabBarHitInfo`).
+- Kubeui binaries unchanged for TabBar (no tab bar in kubeui yet);
+  their `theme()` helpers gained `..Default::default()` to cover the
+  new Theme fields.
+
+**Diff:** -371 net lines on adoption sites; ~470 lines added in
+quadraui (the new public rasteriser modules + tests). Quality:
+`cargo test -p quadraui --features tui` 190/190 (4 new TUI tab_bar
++ 2 regression for the layout fix); full `cargo test --no-default-features`
+green; clippy clean across vimcode (default + no-default), quadraui
+(`tui` + `gtk`), kubeui, kubeui-gtk.
+
+**What's next:** **ListView** is the natural follow-up. Both backends
+already consume `ListViewLayout` per Phase B.4. After ListView:
+TreeView → Palette → Form → Tooltip → Dialog → ContextMenu. Same
+per-primitive shape established by these two pilots.
+
+---
+
+**Session 332 — #223 StatusBar rasteriser pilot landed (lift TUI + GTK rasterisers into quadraui):**
+
+The kubeui validation spike (Session 331-end) measured 65% code sharing between vimcode-the-editor and kubeui-the-app, with ~90% achievable if rasterisers move from vimcode-private into the public quadraui crate. This session landed the StatusBar pilot — the smallest possible end-to-end proof of the lift.
+
+**What shipped:**
+
+- `quadraui/src/theme.rs` — minimal backend-agnostic `Theme { background, foreground }`. Apps with rich theme systems (vimcode's `render::Theme`, kubeui's hardcoded palette) build one at the rasteriser call site. Field set grows as more primitives migrate.
+- `quadraui/src/tui/{mod,status_bar}.rs` — `pub fn quadraui::tui::draw_status_bar(buf, area, bar, layout, theme)`. Self-contained: includes `set_cell` + `ratatui_color` helpers (lifted from vimcode's `src/tui_main/mod.rs`). 4 unit tests cover paint order, empty-bar fallback, bold modifier, zero-size guard.
+- `quadraui/src/gtk/{mod,status_bar}.rs` — `pub fn quadraui::gtk::draw_status_bar(cr, layout, x, y, w, line_height, bar, theme) -> Vec<StatusBarHitRegion>`. Self-contained: includes `cairo_rgb` + `set_source` helpers; computes `StatusBarLayout` internally with Pango pixel measurement (16 px min gap).
+- `quadraui/Cargo.toml` — new feature gates: `tui = ["dep:ratatui"]`, `gtk = ["dep:gtk4", "dep:pangocairo"]`. The legacy `gtk-example` now depends on `gtk`. Feature gates keep the data layer dep-free (apps that consume `Theme` / `StatusBar` etc. without painting don't pay for ratatui or gtk4).
+
+**Adoption (vimcode + kubeui in the same diff):**
+
+- `src/tui_main/quadraui_tui.rs::draw_status_bar` and `src/gtk/quadraui_gtk.rs::draw_status_bar` collapse to ~10-line wrappers that build a `quadraui::Theme` from `render::Theme` (via `to_quadraui_color`) and delegate. Caller signatures unchanged — three call sites in `src/tui_main/render_impl.rs` and three in `src/gtk/draw.rs` continue to work.
+- `kubeui/src/main.rs` and `kubeui-gtk/src/main.rs` drop their private `draw_status_bar` (~25 + ~50 lines respectively) and call `quadraui::tui::draw_status_bar` / `quadraui::gtk::draw_status_bar` directly. Theme adapter is a tiny `fn theme() -> quadraui::Theme` returning the kubeui palette.
+
+**Behavioural delta:** kubeui's old hardcoded gray-fill becomes "first segment's bg" (per the public rasteriser's contract). Visual is identical because `kubeui-core::build_status_bar` sets every segment's bg to the same gray. Vimcode behaviour is unchanged — its private rasteriser already used the same fill rule.
+
+**Diff:** -169 net lines (108 added, 266 removed from vimcode + kubeui; 4 new files in quadraui). Kept `src/gtk/quadraui_gtk.rs::vc_to_cairo` / `qc_to_cairo` because 60+ other GTK draw functions still use them — those helpers move into quadraui as more primitives migrate.
+
+**Quality checks:** `cargo test --no-default-features` passes; `cargo test -p quadraui --features tui` 184/184 (4 new); `cargo clippy -- -D warnings` clean across vimcode (default + no-default-features), quadraui (`tui` + `gtk`), kubeui, kubeui-gtk.
+
+**What's next** — same per-primitive arc, with TabBar as the natural follow-up: both backends already consume `TabBarLayout` per Phase B.4, both already use the same right-segment width-fit logic, lift is mostly mechanical. After TabBar: ListView → TreeView → Palette → Form → Tooltip → Dialog → ContextMenu. Each migration is a per-primitive commit; vimcode + kubeui both adopt at the same time.
+
+**Friction surfaced for #224 (companion follow-up):** the `gtk` feature gate adds a 3-minute first build (gtk4 / pango / cairo deps) for anyone who didn't have them cached. Not a blocker, but worth noting — apps that consume only the data layer should default to `default-features = false` once we expose one.
+
+---
+
+**Session 331 — Phase B.5 GTK chrome catch-up (umbrella #205 closed, 7/8 slices landed, 8 issues filed, 1 crash fixed):**
+
+Moved GTK chrome from ~65% → ~85% on quadraui primitives. Each
+slice was its own branch, smoke-tested in GTK, then Path-A landed.
+The wave's defining feature: every smoke test surfaced one or more
+pre-existing or freshly-uncovered bugs that the migration had to
+either fix in scope or file for follow-up — making the migration's
+end state honest about what's left.
+
+**Slices landed (chronological):**
+
+1. `e1e76cd` — slice 1 — \`draw_hover_popup\` → \`Tooltip\`. New
+   \`quadraui_gtk::draw_tooltip\` rasteriser (reused by slices 2 + 3).
+2. `aaa9a3c` — slice 2 — \`draw_signature_popup\` →
+   \`Tooltip{styled_lines}\` (highlighted active param via per-span fg).
+   Live-test gated on **#180 fix** because signature help didn't
+   render server data.
+3. `ead8b56` — fix(lsp) **#180**: flush dirty buffers in
+   \`lsp_request_signature_help\` so server has the post-\`(\`-keystroke
+   buffer state when computing the cursor position. Same #189-style
+   pattern.
+4. `e6650fa` — slice 3 — \`draw_diff_peek_popup\` →
+   \`Tooltip{styled_lines}\` (per-line +/- colouring + action bar).
+5. `7768a25` — slice 5 — \`draw_dialog_popup\` → \`Dialog\`. New
+   \`quadraui_gtk::draw_dialog\` rasteriser. Returns the same
+   button-rect Vec the legacy click handler consumed.
+6. `7ce0f5d` — slice 6 — \`draw_context_menu_popup\` +
+   \`draw_menu_dropdown\` → \`ContextMenu\`. Closes **#181**. Also fixes
+   shared \`menu_dropdown_to_quadraui_context_menu\` adapter to use
+   \`usize::MAX\` sentinel instead of \`unwrap_or(0)\` — affected both
+   backends.
+7. `caf62a8` — slice 8 — \`draw_breadcrumb_bar\` +
+   \`draw_debug_toolbar\` → \`StatusBar\`. GTK debug toolbar buttons
+   are clickable for the first time (legacy code only painted, no hit
+   zones).
+8. `6bd2039` — fix **#213**: \`Tooltip::layout\` clamped with
+   \`viewport.width - vw\` as max — panicked when \`vw > viewport.width\`
+   (long LSP hover content in narrow editor). Pin to viewport edge
+   instead. Two regression tests in \`quadraui/src/lib.rs\`.
+
+**Slice 4 (editor hover popup) deferred** to **#214** — needs a new
+\`RichTextPopup\` primitive (markdown + tree-sitter syntax highlighting
+in fenced code blocks + text selection + scroll + clickable links).
+Building it correctly is its own focused wave; piecemeal-migrating
+the existing renderer would split responsibility. Honest scope call.
+
+**Issues filed during the wave** (all independent of #205, all live
+for follow-up):
+
+- #181 — closed (slice 6 fix)
+- #200 — TUI ext-panel scrollbar not drawn
+- #207 — GTK Shift-key in dialog activates default button
+- #208 — Stale gutter diagnostics after \`git checkout\` revert
+- #209 — Native-look styling for Dialog primitive
+- **#210 — Motion handlers should use primitive's hit_test, not
+  hand-rolled row math.** This is the structural class that caused
+  multiple slice-6/8 bugs and the #211 debug-sidebar bug. Worth
+  prioritising — it eliminates a whole class of "row positions
+  drift between rasteriser and click handler" bugs.
+- #211 — GTK debug variable tree click off-by-2
+- #212 — TUI debug variables non-expandable after step
+- #213 — closed (\`6bd2039\`)
+- #214 — RichTextPopup primitive (deferred slice 4)
+
+**Cross-backend wins worth noting:**
+
+- The shared adapter sentinel fix in slice 6 affects both backends
+  from one diff in \`render.rs\`.
+- The Tooltip clamp fix in #213 lives entirely in
+  \`quadraui/src/primitives/tooltip.rs\` — both backends benefit
+  immediately.
+- Five of the seven landed slices use the **same**
+  \`quadraui_gtk::draw_tooltip\` / \`draw_dialog\` /
+  \`draw_context_menu\` / \`draw_status_bar\` rasterisers as their
+  TUI counterparts use \`quadraui_tui::draw_*\`. Bug fixes in those
+  rasterisers go to one place; both backends pick them up.
+
+---
+
+**Session 330 (cont.) — GTK explorer scrollbar migrated to `dispatch_mouse_drag` (closes #204 + #199):**
+
+- `3e5d7d3` — fix(gtk): explorer scrollbar uses
+  `quadraui::dispatch_mouse_drag`. Replaces the hand-rolled `dy / sb_h
+  * max_scroll` math (which had the same off-by-thumb-length bug `cb84f82`
+  fixed in TUI) with the shared dispatcher. Also resolves the
+  click-on-track jump-scroll gap (#199) by doing the jump inline in
+  `connect_drag_begin` rather than relying on the click handler — GTK
+  was suppressing the click handler once the drag gesture claimed the
+  sequence, so the jump never fired. Drops the now-unused
+  `explorer_scrollbar_drag_from: Rc<Cell<Option<usize>>>` cell.
+- Picker / sidebar / explorer scrollbars now share one math
+  implementation in `quadraui::dispatch.rs`. Adding a new scrollbar
+  surface (debug sidebar, Win-GUI any of the above) is "hold a
+  `DragState`, call `dispatch_mouse_drag`, match
+  `UiEvent::ScrollOffsetChanged` on widget id" — no new geometry math.
+- **Deferred**: GTK ext-panel scrollbar drag has the same shape but is
+  doubly dead — the scrollbar isn't actually drawn (#200) and scroll
+  state isn't applied to rendering. Migrating the dead handler in
+  isolation would be a no-op for users; bundled with #200's render fix
+  in a follow-up.
+
+---
+
+**Session 330 — Smoke-test sweep of Session 329 backlog (6 commits landed via Path A, 3 issues filed):**
+
+Branch-per-issue workflow: each fix on its own local branch, full
+`fmt + clippy -D warnings + test --no-default-features` gate before
+commit, smoke-tested in TUI + GTK as applicable, then ff-merged to
+develop and pushed. Five Session-329-filed issues closed; one new
+issue (#201) filed and fixed in the same session because it blocked
+verification of #174.
+
+**Landed fixes (chronological order on develop):**
+
+1. `cb84f82` — **TUI sidebar scrollbar pilot** (no issue#).
+   Migrates explorer + ext-panel scrollbar drag onto
+   `quadraui::DragState` + `dispatch_mouse_drag`. Adds `thumb_length`
+   adjustment to the dispatcher's pixel-to-rows math so the thumb
+   tracks 1:1 with mouse motion. Adds new generic
+   `UiEvent::ScrollOffsetChanged { widget, new_offset }` (replaces
+   per-primitive `PaletteEvent::ScrollOffsetChanged`).
+2. `9334686` — fix(gtk): settings panel **section headers toggle on
+   single-click** (#188). Setting rows still need double-click to
+   avoid surprise edits.
+3. `4142561` — fix(lsp): **`…` pending indicator restored** until
+   semantic tokens arrive (#195). Entirely shared-code fix:
+   `LspManager::language_supports_semantic_tokens` + downgrade in
+   `Engine::lsp_status_for_buffer`. Both backends pick it up via the
+   already-shared status-bar adapter — zero per-backend changes.
+4. `9a2271a` — fix(settings): **"Status Line Above Terminal" relabel**
+   to "Status Line Inside Window" (#173). Cheapest of the four options
+   on the issue: no key change, no settings.json migration, just label
+   + description text on the SettingDef.
+5. `a8cb6ee` — fix(settings): **`:set` accepts snake_case names**
+   shown in the Settings panel (#174). Snake_case→packed-name
+   fallback in `set_bool_option`, `set_value_option`, `query_option`
+   — backwards-compatible. Includes new unit test.
+6. `7f9af22` — fix(gtk,tui): **`:set` output no longer overwritten
+   by "Settings reloaded"** (#201). Process-global `SAVE_REVISION`
+   atomic in `Settings`; both watchers (TUI mtime poll, GTK GIO
+   `FileMonitor`) consult the revision counter to tell self-saves
+   from external edits. Replaced GTK's per-instance
+   `settings_self_save: bool` flag (which only caught the Settings
+   panel path, not `:set` from the command line). Also skips disk
+   save on query-form `:set foo?`.
+
+**Issues filed during the sweep:**
+
+- #201 — `:set` message clobber (filed + closed in-session).
+- #202 — Settings descriptions never rendered. The `description`
+  field on `SettingDef` exists but no backend's `draw_form` reads
+  `FormField.hint`. Real fix needs adapter (1 line) + Form layout
+  reservation + per-backend hint-row rendering. Out of scope for #173.
+- #203 — TUI crash on terminal resize: indent guide bounds check
+  uses window-area instead of frame-area (`render_impl.rs:2097`).
+  Pre-existing — surfaced during #cb84f82 smoke test, not caused by
+  it. Crash is recoverable (panic hook flushes swap files).
+- #204 — GTK explorer scrollbar should migrate to
+  `dispatch_mouse_drag` (cross-references #199, #200). User noticed
+  the same drag-feel bug after the TUI pilot fixed it. The math
+  fix exists in `dispatch_mouse_drag` already; the migration is
+  re-plumbing the GTK gesture handler to use shared `DragState`
+  instead of its own private `explorer_scrollbar_drag_from` cell.
+
+**Cross-backend wins worth noting:**
+
+- The #195 LSP indicator fix is the cleanest example of B.4's payoff
+  yet — one core change in `lsp_ops.rs`, both backends correct
+  immediately, *zero* per-backend code touched. The status-bar
+  adapter that renders `name…` in dim colour was already shared.
+- The #201 watcher-clobber fix uses the shared `SAVE_REVISION` atomic
+  so both the TUI poll and the GTK GIO monitor consult one source of
+  truth. The watching *mechanism* stays per-backend (necessarily —
+  GIO vs poll vs Win-GUI's future `ReadDirectoryChangesW`), but the
+  *suppress decision* is now shared.
+
+---
+
+**Session 329 — Phase B.4 arc extends into event routing (8 substantive commits + 1 fix + 1 doc + 5 issues filed):**
+
+Session 328 landed every major TUI overlay on quadraui *rendering*
+primitives. Session 329 opens the second half of B.4 — the *event*
+half — and proves it works. Eight substantive commits land on
+develop. Order intentional: GTK catches up on D6 rendering first so
+two backends share primitive consumption; then event routing builds
+on top of shared contracts.
+
+**GTK rendering — 4 D6 migrations (proves primitive set works across
+coordinate systems — char cells on TUI, pixels + Pango on GTK):**
+
+1. `31ebdc4` — `draw_status_bar` consumes `StatusBarLayout`. Pilot
+   commit for the GTK D6 migration wave; replaces hand-rolled
+   left-accumulate + right-fit loop with a single `bar.layout()` call.
+2. `b0215e2` — `draw_list` consumes `ListViewLayout`. Scroll
+   clamping + title-row handling now live in the primitive.
+3. `89d54ae` — `draw_tree` consumes `TreeViewLayout`. Per-row
+   heights (header `line_height` vs items `line_height * 1.4`)
+   supplied via the measurement closure.
+4. `8ccea7e` — `draw_palette` consumes `PaletteLayout`. Shallow-
+   clones the palette locally to inject the effective scroll offset
+   without mutating caller state.
+
+**Cross-backend event routing — 4 commits (the infrastructure that
+actually earns "cross-platform without knowing GTK"):**
+
+5. `a02eff9` — **B.4 event-routing pilot**. New `quadraui::ModalStack`
+   + `dispatch_mouse_down` free function. Fixes #192 (GTK palette
+   click-drag leaked to editor). Infrastructure: `Backend::modal_stack_mut()`
+   trait method (additive); `ModalEntry { id, bounds }`; `push / pop /
+   top / hit_test / iter_top_down`. 7 unit tests in `modal_stack.rs`
+   + 5 in `dispatch.rs`.
+6. `0f3e0d0` — `DragState` + `dispatch_mouse_drag` + `dispatch_mouse_up`.
+   `DragTarget::ScrollbarY` carries track geometry + visible/total
+   row counts; dispatcher does linear-interpolation math. Fixes
+   #190 (GTK palette scrollbar was painted but not draggable). 6
+   new unit tests. New `PaletteEvent::ScrollOffsetChanged { new_offset }`
+   variant.
+7. `b169ca4` — **TUI palette scrollbar drag migrated** onto the
+   same `DragState` + `dispatch_mouse_drag` code GTK uses. This is
+   the payoff commit — one quadraui code path now drives both
+   backends' scroll math, not two parallel implementations. Legacy
+   `dragging_picker_sb: Option<SidebarScrollDrag>` removed.
+8. `bad14f0` — **TUI picker modal dismiss migrated** onto
+   `ModalStack` + `dispatch_mouse_down`. Both GTK and TUI now
+   arbitrate click-inside-modal vs click-outside-to-close through
+   the same dispatcher. Completes the picker-surface
+   cross-backend story.
+
+**Pre-existing fixes surfaced during smoke testing:**
+
+- `6f26ec7` — TUI source control panel click off-by-one (#184, closed).
+  After the SC TreeView migration the renderer stopped emitting a
+  "(no changes)" placeholder row for empty expanded sections; the
+  click handler was still passing `empty_section_hint: true` and
+  every row after an expanded-but-empty section was off by +1.
+
+**Docs:**
+
+- `729c988` — `quadraui/docs/TUI_CONSUMER_TOUR.md` (Session 328
+  wrap-up). Reading guide walking through five progressive examples
+  from simplest D6 primitive (Tooltip + hover popup) through the
+  `hit_regions` escape-hatch pattern (find/replace). Intended as
+  orientation for Phase B.5+ (GTK / Win-GUI / macOS rewrites).
+
+**Issues filed during smoke testing (pre-existing bugs, not
+regressions):**
+
+- #185 — Quickfix jump scrolls cursor under the quickfix panel
+  (engine `ensure_cursor_visible` doesn't subtract qf_height).
+- #186 — Explorer diagnostic-count badges show count but lack red
+  coloring (severity fg not set in adapter).
+- #187 — GTK git panel text-clipping / chevron-overlap on Recent
+  Commits (likely `source_control_to_tree_view` indent / leaf
+  math).
+- #188 — Settings panel needs double-click to expand sections
+  (pre-existing; handler guards on n_press>=2).
+- #189 — Git panel discard leaves editor view showing stale diff
+  state (buffer not reloaded after `git checkout`).
+- #191 — GTK palette scrollwheel scrolls 1 row per event (GTK event
+  controller flags, no quadraui change needed).
+- #192 — **Closed** by `a02eff9`.
+- #193 — Palette entries like "Find and Replace" show status-message
+  placeholders instead of invoking the action.
+- #194 — Status-bar messages aren't mouse-selectable (GTK) / have
+  offset-by-sidebar-width selection bug (TUI).
+
+**Quadraui API additions during the arc:**
+
+- `ModalStack`, `ModalEntry` (new module `modal_stack.rs`)
+- `DragState`, `DragTarget` (additions to `dispatch.rs`)
+- `dispatch_mouse_down`, `dispatch_mouse_drag`, `dispatch_mouse_up`
+- `PaletteEvent::ScrollOffsetChanged { new_offset: usize }`
+- `Backend::modal_stack_mut()` trait method (additive)
+
+**Architectural framing:** the user's north-star question driving
+this session — "can a developer write a cross-platform app on
+quadraui without knowing GTK / Cocoa / crossterm?" — is now
+genuinely answered "yes, for the picker surface." The proof: the
+four event-routing commits ship a loop where identical `quadraui::
+dispatch_*` calls service two coordinate systems (char cells on TUI,
+pixels on GTK) with zero backend-specific logic in the dispatcher
+itself. Adding a third backend (Win-GUI, macOS) means holding a
+`ModalStack` + `DragState`, routing raw events through the
+dispatcher, and matching on the returned `UiEvent`s. No new math,
+no new precedence logic.
+
+**What's next:** generalize the pattern off of the picker. Each of
+these is a per-surface commit that reuses the same infrastructure
+with zero quadraui changes:
+
+- Tab switcher modal (TUI + GTK) — new modal shape (centered list,
+  no scrollbar), proves `ModalStack` extends beyond the picker.
+- Sidebar scrollbars (explorer, SC, debug, settings) — each migrates
+  from its own `SidebarScrollDrag` Option to a `DragState::ScrollbarY`.
+- Dialogs (quit confirm, close-tab confirm, etc.) — backdrop dismiss
+  via a new `ModalDismissed(WidgetId)` variant (currently
+  `PaletteEvent::Closed` is the universal dismiss event; generalize
+  when the second modal type arrives).
+
+The alternative sequence is to close out issue backlog (#185–#194)
+before expanding the event-routing surface. Either order works;
+depends on whether daily-driver quality or architectural completion
+is the higher priority.
+
+---
+
+**Session 328 — B.4 chrome migration substantially complete (22 commits on develop):**
+
+Every major TUI chrome popup / strip now renders through a quadraui
+primitive or — for find/replace specifically — through shared
+cross-backend hit-region data. Each migration shipped as a focused
+commit, smoke-tested in TUI, and Path-A landed (ff-merge + push
+develop) after `cargo fmt` + `cargo clippy --no-default-features
+-- -D warnings` + full test suite green. No test regressions
+across the arc.
+
+**Migrations landed (in chronological order):**
+
+1. **Dialog** rendering migrated to `DialogLayout` (`83974fe`).
+   Includes optional `DialogInput` extension (commit `9f24313`).
+2. **Completion popup** consumes `CompletionsLayout` (`afa14d9`).
+3. **Close-tab confirm overlay** → Dialog primitive
+   (`71a0d02` + `19b08ca` click intercept + `fade4e7` `:quit`/`:quit!`
+   semantics + `34e4a24` Tab/arrow nav).
+4. **Context menu** (tab action menu) → `ContextMenuLayout` (`9a52fd7`).
+5. **Quit-confirm overlay** → Dialog (`93fbd4b`).
+6. **LSP hover popup** → Tooltip (`0dbbf70`).
+7. **Signature help popup** → Tooltip with `styled_lines` extension
+   (`e6048d8` + `38a79fc` adapter unit tests + `signatureHelp`
+   client-capability fix in LSP init params).
+8. **Tab switcher popup** → bordered `ListView` (new `bordered: bool`
+   field on ListView; `85841d2`).
+9. **Folder picker modal** → `Palette` (`4e470f8` + `eae455c`
+   `:OpenRecent` ex-command dispatch fix).
+10. **Menu dropdown** → `ContextMenu` (`c6c0718`).
+11. **Debug toolbar** → `StatusBar` with `bar.resolve_click` for hit
+    testing (`f84c3c2` + `408a326` local-col fix + `de8d7e2`
+    toolbar-row math fix).
+12. **Breadcrumb bar** → `StatusBar` with `bar.resolve_click` for
+    hit testing (`553b207`).
+13. **Diff peek popup** → multi-line styled Tooltip (rename Tooltip
+    `styled` → `styled_lines: Option<Vec<StyledText>>`; `e4ae90e` +
+    `1c6af39` `revert_hunk` `--index` fix so reverting a staged hunk
+    also unstages it).
+14. **Find/replace overlay** → consolidated TUI rasteriser that walks
+    `panel.hit_regions` instead of re-deriving column math
+    (`4eacaa0`). No new quadraui primitive (find/replace doesn't fit
+    Form / Dialog / StatusBar / Palette cleanly, and a speculative
+    `Toolbar` primitive isn't justified yet — no second consumer).
+
+**Quadraui API extensions during the arc:**
+- `ListView.bordered: bool` (#[serde(default)]) for modal-style
+  bordered lists; layout insets items by 1 cell on each side and
+  reserves rows 0 + N-1 for ╭─╮ ╰─╯ borders. Title (when present)
+  overlays the top border.
+- `Tooltip.styled` (`Option<StyledText>`, single-line) renamed to
+  `Tooltip.styled_lines` (`Option<Vec<StyledText>>`, multi-line)
+  for consumers that need per-row styled spans (signature help,
+  diff peek). Single-line consumers wrap their styled line in a
+  1-element vec.
+- New `Tooltip` field `styled_lines` documented as multi-line styled
+  override; rasteriser dispatches text → styled_lines → plain text.
+
+**Engine bugs surfaced during smoke testing (fixed in same branch):**
+- `revert_hunk` ran `git apply --reverse` against the working tree
+  only, leaving any staged copy of the hunk in the index. Fixed
+  with `--index` flag.
+- `:OpenRecent` ex command silently fell through — handler was
+  present in menu-click path but missing from command-execution
+  dispatch in `mod.rs:3741`.
+- Debug toolbar `toolbar_row` math wrongly subtracted `qf_rows +
+  strip_rows` (rows above the toolbar, not below); never matched
+  when terminal/debug panel was open. Recomputed from below using
+  actual layout chunks.
+- Debug toolbar click hit-test passed absolute screen col + full
+  terminal width to `bar.resolve_click()`; the bar starts at
+  `editor_left` so absolute clicks resolved past the last segment.
+  Fixed by converting to bar-local space.
+
+**Follow-up issues filed (out-of-scope for the migration arc):**
+- #180 — LSP signature help popup never shows data (engine-side
+  data pipeline bug; render path is unit-tested correct).
+- #181 — Menu dropdown items don't highlight on mouse hover
+  (pre-existing TUI mouse-event-handling gap).
+- #182 — Debug toolbar icons render as wrong/missing glyphs in
+  some terminals (suggested fallback char improvements in
+  `src/icons.rs`).
+- #183 — Debug toolbar visibility tied to active DAP session;
+  proposes a "always show" setting + menu entry.
+- #184 — Source control panel: clicking a row highlights the row
+  ABOVE the clicked row (off-by-one in TUI mouse handler;
+  GTK already uses accumulator walk per Session 197).
+
+**Out of scope for B.4 chrome (deferred):**
+- **Tab drag overlay** — three-piece visual (drop-zone highlight
+  + insertion bar + ghost label). Doesn't fit any primitive
+  cleanly and a future backend will paint each piece its own way
+  (different drag conventions per platform). Migration would gain
+  nothing real and constrain future backends.
+- **Menu bar row** (labels strip + nav arrows + search box) —
+  composite chrome. MenuBar primitive only covers the labels
+  strip; the rest is bespoke. Revisit when a fuller composite
+  primitive lands or when the GTK rewrite forces the issue.
+- **Picker popup with preview pane / tree-indented variants** —
+  flat-list pickers already migrated to Palette; the preview
+  variant needs preview-pane support added to Palette first.
+
+**Net result:** Phase B.4 chrome arc landed 22 commits on develop
+covering ~10 substantive migrations + ~6 fixes. Tests still green
+end-to-end. Click resolution for the toolbar / breadcrumb /
+find-replace overlays now derives from the same data structure as
+paint, eliminating the entire "paint and hit-test drift apart" bug
+class on those surfaces. Pattern is established for future GTK /
+Win-GUI / macOS rewrites: each primitive's rasteriser lives in
+`{backend}_quadraui.rs`; engine-side adapter functions in
+`render.rs` build the primitive; backend-specific call site
+threads the area + theme. No engine logic changed except for the
+4 fixes listed above.
+
+**What's next:** Phase B.4 chrome can be considered substantially
+done; the remaining TUI work is the editor viewport itself (which
+the chrome-only scope explicitly defers — see Session 327 for the
+scope decision). Phase B.5 (GTK rewrite) is the natural next wave;
+or revisit the deferred picker preview pane / menu bar / tab drag
+items first if their lack is felt during day-to-day use.
+
+---
+
+**Session 327 — B.3 readiness gate CLEAR (all primitives on D6):**
+
+Huge session. Starting point: D7 focus model had just been resolved;
+readiness gate still needed all 9 existing primitives to gain
+`layout()` + `hit_test()`, plus ~14 new primitives for B.3.
+
+**Existing primitives — all 9 gained `layout()` + `hit_test()`:**
+
+1. `TabBar::layout()` + `TabBarLayout::hit_test()` (`0517e54`).
+   Reference implementation for the D6 shape. Closed #179
+   structurally. 14 unit tests including fractional pixel-unit
+   layout (proves TUI/native unit agnosticism).
+2. `compute_tab_bar_hit_regions` delegates to `TabBar::layout()`
+   (`ebe0eec`). First real-world consumer of D6.
+3. `quadraui_tui::draw_tab_bar` consumes `TabBarLayout` (`713f071`).
+4. `StatusBar::layout()` (`d9cfa34`).
+5. `quadraui_tui::draw_status_bar` + hit-test consume layout
+   (`f263765`).
+6. `TreeView::layout()` (`7613316`).
+7. `ListView::layout()` (`7a09749`).
+8. `ActivityBar::layout()` (`914c6f9`).
+9. `Palette::layout()` (`65622fb`).
+10. `Form::layout()` (`130285e`).
+11. `TextDisplay::layout()` with auto-scroll support (`c10dad0`).
+12. `Terminal::layout()` (cell grid, unique shape) (`fe7870f`).
+
+**New B.3 primitives (shipped):**
+
+- `Toast` + `ToastStack` (#141) (`ccb515f`). Corner-stacked
+  notifications with severity + optional action + dismiss.
+- `Spinner` + `ProgressBar` (#142) (`7ac858b`). Activity indicators
+  with indeterminate/determinate modes + optional cancel.
+- `Tooltip` (`0e9f817`). Anchor-relative with auto-flip placement.
+- `ContextMenu` (`bd29340`). Right-click popup with separators + disabled items.
+- `Completions` (`01d4fd8`). LSP-style autocomplete popup with 24-variant
+  CompletionKind enum, below/above cursor placement.
+- `Dialog` (`5e49853`). Title + body + buttons (horizontal or vertical).
+- `Panel` (`53ed010`). Chrome (title + actions) + app-drawn content_bounds.
+- `Split` (`2a86305`). Two-pane draggable divider with min-size clamping.
+- `Modal` (`9cd4eb4`). Backdrop + centered content (Dialog is specialised).
+- `MenuBar` (`67668d1`). Top-level menu strip with `&`-marker
+  Alt-activation.
+- **Form field extensions** (#143) (`da58baa`): `Slider`, `ColorPicker`,
+  `Dropdown` as new `FieldKind` variants with TUI rendering.
+
+**Intentionally skipped:** `Tabs` (redundant with `TabBar` + app
+content switching), `Stack` (redundant with app render order),
+`Palette` TUI consumer migration (custom chrome doesn't map cleanly;
+design-first required rather than mechanical).
+
+**TUI consumer migrations completed (6 of 9):**
+- ✅ TabBar, StatusBar, TreeView, ListView, ActivityBar, Form
+- ⏸ Palette (chrome-heavy, design pass needed)
+- ➖ TextDisplay, Terminal (no TUI consumer yet)
+
+**Design doc updates:**
+- Closed #141, #142, #143 via `gh issue close`.
+- PLAN.md readiness gate marked "CLEAR for Phase B.4 (TUI rewrite)."
+- §5 migration strategy updated with B.4–B.8 sequencing.
+
+**Aggregate:** 25+ commits landed today. Tests: 5291 → 5406 (+115).
+Zero test regressions throughout. Every commit was Path-A landed
+(ff-merge + push develop) after clippy-clean + full-suite-green.
+
+**What's next:** Phase B.4 **chrome-only** (user-picked scope on
+2026-04-23 end of session). Editor viewport rendering stays on the
+existing `render::build_rendered_window` path. Chrome gets migrated
+primitive-by-primitive:
+
+**Dialog migration** — primitive extended with input field
+(`9f24313`), ready for adapter work. Still needed: write
+`quadraui_tui::draw_dialog` + replace `render_dialog_popup` in
+`src/tui_main/render_impl.rs:2352` + replace the parallel
+hit-test logic in `src/tui_main/mouse.rs:252`. Per-feature mapping:
+vimcode's engine-side `DialogButton { label, hotkey, action }` →
+quadraui's `DialogButton { id, label, is_default, is_cancel, tint }`;
+`hotkey` maps to Accelerator or is handled by backend.
+
+**Remaining substantive migrations** (each ~3–5 commits):
+- Dialog (in flight)
+- Context menu (vimcode's `open_editor_action_menu` → quadraui
+  `ContextMenu`)
+- Menu bar dropdown (`MENU_STRUCTURE` → quadraui `MenuBar` +
+  `ContextMenu` composition)
+- Completions popup (vimcode's `completion_display_only` flow →
+  quadraui `Completions`)
+- Palette (custom chrome, warrants design discussion first)
+
+**New TUI chrome not yet in vimcode** (additions rather than
+rewrites): Toast, Tooltip, Spinner, ProgressBar — wire up when a
+consumer needs them (e.g. git panel progress indicator #59 → Spinner).
+
+**Backend trait impl deferred.** Scaffolding attempted early this
+session but backed out due to API-friction; the trait currently
+takes `(rect, &primitive)` which doesn't quite match the practical
+`(primitive, layout, frame)` pattern the existing draw functions use.
+Resolving this lands alongside the event-loop rewrite; chrome-only
+B.4 doesn't require it.
+
+**Session 325 — D7 focus model resolved + §5 migration strategy inverted:**
+
+1. **`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §6.4 marked
+   RESOLVED**, pointing to §9 D7 for the five sub-decisions.
+2. **D7 marked RESOLVED** with all five recommendations accepted
+   as-drafted:
+   - D7a (transitions): **A** — click + Tab + programmatic, all
+     funnelled through `set_focus(id)`.
+   - D7b (destruction fallback): **B+C hybrid** — app-designated
+     default, else null; next input re-establishes.
+   - D7c (focusable declaration): **C** — property of the
+     primitive type (`TextInput`/`ListView`/`TreeView` always
+     focusable; `Toast`/`Tooltip`/`StatusBar` never; `Dialog`
+     when modal).
+   - D7d (modal interaction): **A** — backend-owned focus stack;
+     push on modal open, pop on close.
+   - D7e (native focus bridging): **C** — native focus at the
+     top-level surface; simulate widget focus within.
+   User explicitly noted iteration is expected on edge cases —
+   the top-level shape is what's being committed to, not the
+   fine-grained semantics. Marked authoritative with iteration
+   allowance.
+3. **§5 "Migration" entirely rewritten** for the backend-by-
+   backend rewrite strategy (user flagged the "Non-negotiable:
+   this must not break vimcode" language as obsolete). New
+   structure: B.1 ✅ + B.2 ✅ + B.3 (ready-state quadraui) + B.4
+   (TUI rewrite) + B.5 (GTK rewrite) + B.6 (Win-GUI rewrite) +
+   B.7 (macOS native) + B.8 (Postman validation). Phase B.3
+   builds every primitive with `layout()`; nothing in vimcode
+   gets rewritten until B.3 ends. During B.4, GTK and Win-GUI
+   are broken; no external users to worry about.
+4. **"All decisions resolved" footer updated** — D1–D7 all
+   green; next code work enumerated (TabBar::layout first, then
+   Backend trait reshape, then focus-model surface, then layout
+   primitives, then remaining primitives).
+5. **PLAN.md updated** — D7 added to resolved list; §6.4 removed
+   from open questions; readiness gate marks all design axes ✅.
+6. **What this unblocks.** Phase B.3 code work starts next
+   session. First move: `quadraui/src/tab_bar.rs` grows a
+   `layout(viewport, measure) -> TabBarLayout` method + a
+   `TabBarLayout::hit_test()` — reference implementation for
+   the D6 Layout-returning shape, also closes #179.
+
+---
+
+**Session 324 — north-star goal + quadraui readiness gate:**
+
+Documented the strategic inversion: coexistence rule dropped,
+backend-by-backend rewrite adopted, TUI → GTK → Win-GUI → macOS
+order. PLAN.md gains the north-star goal statement, backend-
+state-going-in summary (TUI best, GTK/Win-GUI bug-ridden from
+the coexistence-era band-aid cycle), readiness-gate checklist,
+and backend rewrite order. Commit `47ab97d`.
+
+---
+
+**Session 323 — §6.2 resolved (Decision D6) + onboarding hooks:**
+
+1. **`quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §6.2 marked
+   RESOLVED A** (primitives return fully-resolved `Layout`;
+   backends rasterise verbatim). Earlier proposal (single global
+   `quadraui::layout::compute` pass) is superseded — layout is
+   per-primitive.
+2. **§9 gains Decision D6** with the three options considered
+   (A: per-primitive `layout()`; B: behavioural primitives like
+   `ScrollableTabBar`; C: required-field augmentation), why A
+   won (D-001 cuts against B; C doesn't actually force backends;
+   A makes wrong rendering loud, not silently wrong on platform N),
+   and what lands (`TabBar::layout()` + `TabBarLayout::hit_test()`
+   closes #179; `StatusBar::layout()` migration; trait reshape
+   to `draw_*(&Layout)`; ~−100 LOC per backend on existing
+   primitives).
+3. **`PLAN.md` gains an "Architectural focus" header** at the
+   top — names the active wave, lists resolved decisions
+   (D1–D6), open questions (§6.3 / §6.4 / §6.5 / §6.6), and the
+   ordered reading list for new sessions touching `quadraui/`.
+   Solves the gap that produced today's "are you aware of the
+   morning's decisions?" question.
+4. **`CLAUDE.md` session-start protocol gains a quadraui step**
+   — when the work touches `quadraui/`, also read
+   `quadraui/docs/DECISIONS.md` and `BACKEND_TRAIT_PROPOSAL.md`
+   §9. Justification: "ignoring them produces bandaid fixes that
+   recur in the next backend."
+5. **Doc-only commit, straight to develop** per CLAUDE.md
+   workflow. No code changes; no smoke test required.
+6. **What this enables.** Phase B.3 (layout primitives — `Panel`,
+   `Split`, `Tabs`, `Stack`, `MenuBar`, `Modal`, `Dialog`) is
+   unblocked. #178 / #179 land as part of B.3 — `TabBar::layout()`
+   becomes the reference impl for the new shape. Existing
+   primitives gain `layout()` incrementally as their backends
+   are touched.
+
+---
+
+**Session 322 (cont.) — A.6d-win v2a attempted, reverted, blocked on #178:**
+
+1. **Migration attempt** (branch `quadraui-phase-a6d-tab-bar-win-v2`,
+   commit `1c052c0`): routed Win-GUI's diff toolbar through
+   `quadraui::TabBar.right_segments`, deleted the bespoke
+   `draw_diff_toolbar_in_tab_bar`, replaced the cached-button-positions
+   pipeline with `quadraui_win::compute_diff_toolbar_positions`.
+   Originally meant to close #177 (1-cell hit zones).
+2. **Regression discovered during smoke test**: the prev/next arrow
+   glyphs render as `?` in Win-GUI. Root cause: `build_tab_bar_primitive`
+   uses Material Design Icon PUA codepoints (`U+F0143` ↑, `U+F0140` ↓,
+   `U+F0233` ≡); pre-migration code hardcoded BMP fallbacks (`U+2191`,
+   `U+2193`, `U+2261`) which Consolas can render. Win-GUI's mono
+   DirectWrite path has no font fallback configured — GTK only "works"
+   because Pango falls back to Symbols Nerd Font automatically.
+3. **Reverted, branch discarded** — never merged to develop. #177 stays
+   open. Filed #178 for the Nerd Font cross-backend design issue and
+   #179 for the related tab-bar-overflow parity gap (both backends drop
+   tabs silently when bar is too narrow).
+4. **Lesson** (broader than this stage): the quadraui crate's promise
+   is "test in one backend, ship everywhere" — but primitives that
+   emit codepoints implicitly assume a Nerd-Font-capable rendering
+   layer that not every backend provides. Future right-segment
+   migrations should wait for #178's design conversation before
+   reattempting v2.
+
+**Session 322 (cont.) — Phase A.6d-win v1 Win-GUI tab bar (tabs only):**
+
+1. **`quadraui_win::draw_tab_bar` rasteriser** (`src/win_gui/quadraui_win.rs:+110`).
+   Renders the tabs portion of a `quadraui::TabBar` primitive — per-tab
+   background fill, dirty (●) / close (×) glyph, top accent strip on the
+   active tab in focused groups, vertical separator. Italic preview tabs
+   not supported (Win-GUI text path is single-format); preview tabs render
+   with a dimmer foreground colour, matching pre-migration behaviour.
+2. **Two wrappers refactored.** `draw_tab_bar` (single-group) and
+   `draw_group_tab_bar` (per-group split) in `src/win_gui/draw.rs` now
+   build the primitive via `render::build_tab_bar_primitive` (with no
+   diff toolbar / no split buttons / scroll_offset = 0 for v1) and call
+   the rasteriser. The legacy `draw_tabs` method (~80 lines) deleted.
+3. **`draw_ui_text` and `measure_ui_text` exposed as `pub(super)`** so
+   the rasteriser can render the proportional UI font (Segoe UI) for
+   tab labels, matching the pre-migration look.
+4. **Tab dimensions match exactly** (`TAB_PAD_PX = 12`) so the existing
+   `state.tab_slots` click-cache populated in `cache_layout` stays valid
+   bit-for-bit. Tab clicks and dirty-or-close glyph clicks unchanged.
+5. **v2 scope deferred** (separate PR): right-segments stream
+   (diff toolbar / split buttons / action menu unified into
+   `bar.right_segments`), `fit_active_scroll_offset` for proper tab
+   scrolling, close-button hover state, `TabBarHitInfo` return value to
+   replace the parallel cache pipeline. ~250 LOC.
+6. **Three smoke-test paper-cuts surfaced, filed as separate issues:**
+   #176 (cmd window flashes briefly on file open — full audit attached;
+   no obvious missing `CREATE_NO_WINDOW`), #177 (diff toolbar prev/next/
+   fold buttons have a 1-cell hit zone but render with 3-cell visual
+   stride — one-line fix specified; will be obviated by v2's
+   right-segments unification), and a vague z-order issue noted but not
+   filed pending specifics from user.
+
+**Session 322 — Phase A.6b-win Win-GUI status bar via quadraui:**
+
+1. **`quadraui_win::draw_status_bar` rasteriser** (`src/win_gui/quadraui_win.rs:+95`).
+   Direct2D / DirectWrite counterpart to `quadraui_gtk::draw_status_bar`:
+   per-segment background fills, left-segments-from-left + right-segments-
+   right-aligned layout, `quadraui::StatusBar::fit_right_start_chars` policy
+   so low-priority right segments drop cleanly when the bar is too narrow
+   (#159 fix; previously they overflowed past the right edge).
+2. **Two call sites refactored.** Per-window status bar inside
+   `draw_editor_window` (`src/win_gui/draw.rs:696`, ~40 LOC of bespoke
+   segment-fill code deleted) and `draw_separated_status_line`
+   (`src/win_gui/draw.rs:920`, ~30 LOC deleted) both build the primitive
+   via `render::window_status_line_to_status_bar` and call the new
+   rasteriser. The global bottom bar (`draw_status_bar`, plain text only,
+   only fires when per-window mode is OFF) was left as-is — no parity gap.
+3. **Hit-test stays in lockstep.** `win_status_segment_hit_test`
+   (`src/win_gui/mod.rs:6597`) now applies the same
+   `fit_right_start_chars(width, MIN_GAP_CHARS=2)` so clicks on a dropped
+   right segment cannot fire. Same primitive + same policy on both sides
+   (rasteriser + hit-test) keeps them aligned without a cached zone map.
+4. **Bold attribute deferred.** Win-GUI's text path uses a single non-bold
+   `IDWriteTextFormat`; supporting bold needs a second format and would
+   make the hit-test diverge from the rasteriser (proportional vs char-
+   count widths). Pre-A.6b code didn't honour bold either. Documented in
+   the rasteriser doc comment.
+5. **Pre-existing clippy unblock** (separate commit `ce1f500`): six
+   `collapsible_match` warnings introduced by the Rust 1.95.0 toolchain
+   bump in `dap_ops.rs`, `ext_panel.rs`, `keys.rs`, `motions.rs`,
+   `vscode.rs`, `lsp.rs`. Mechanical `cargo clippy --fix`. Was blocking
+   the A.6b-win quality gate.
+6. **Two settings paper-cuts surfaced during smoke test, filed as
+   separate issues:** #173 (`status_line_above_terminal` label is
+   inverted from its behaviour — `true` keeps bars *inside* windows, not
+   above the terminal) and #174 (`:set window_status_line` rejected
+   because the ex command only accepts vim-style `:set wsl`). Both
+   pre-existing, neither blocks A.6b-win.
+
+**Session 321 — Phase B.2 terminal-maximize accelerator migration:**
+
+1. **Engine-owned accelerator registry.** New `src/core/engine/mod.rs`
+   types + methods: `RegisteredAccelerator { acc, parsed }`,
+   `UiEventContext { terminal_cols, terminal_max_rows }`, and on
+   `Engine`: `accelerators: Vec<RegisteredAccelerator>` field;
+   `register_accelerator`, `unregister_accelerator`,
+   `match_accelerator`, `handle_ui_event`,
+   `register_default_accelerators`. Re-exports
+   `quadraui::{Accelerator, AcceleratorId, AcceleratorScope,
+   KeyBinding, UiEvent}`. `Engine::new()` registers
+   `"terminal.toggle_maximize"` from
+   `settings.panel_keys.toggle_terminal_maximize`.
+2. **Departs from §11 Q3.** The "backend owns the event loop" shape
+   was more invasive than one accelerator justified (~400 LOC of
+   back-translation for keys not yet migrated). Final shape:
+   engine owns the registry; backends call
+   `engine.match_accelerator(...)` synchronously from existing
+   key handlers. Same B.1 types exercised; zero event-loop
+   disruption. Backend-owned events can land in B.4 when
+   accelerator count grows.
+3. **Six sites migrated.** `src/tui_main/mod.rs:2888` (terminal-panel
+   early-intercept) and `:3586` (EngineAction arm). `src/gtk/mod.rs:
+   1386` (EventControllerKey closure) and `:7219`
+   (`Msg::ToggleTerminalMaximize` handler). `src/win_gui/mod.rs:1832`
+   (WndProc cascade) and `:4586` + `:6178` (EngineAction handlers).
+   Each `matches_*_key(&pk.toggle_terminal_maximize, ...)` + per-
+   backend flip+resize sequence collapses to
+   `engine.match_accelerator(...)` + `engine.handle_ui_event(...)`.
+4. **`EngineAction::ToggleTerminalMaximize` kept.** The ex command
+   `:TerminalMaximize` and toolbar click still return this action;
+   their handlers just route through `engine.handle_ui_event` now.
+   Full collapse is B.4 work.
+5. **10 new integration tests** in `tests/accelerator_registry.rs`:
+   default registration, match positive/negative, case
+   insensitivity, toggle + idempotent re-toggle,
+   unknown-accelerator no-op, re-register-same-id-replaces,
+   unregister-removes, non-Global-scope filtering. Workspace total
+   5295 → 5305.
+6. **`src/lib.rs` re-exports `quadraui`** so integration tests and
+   future downstream consumers pin to the version vimcode is built
+   against.
+7. **§11 updated** with "B.2 implementation notes" subsection
+   documenting the engine-owned vs backend-owned choice + rationale.
+   PLAN.md stage table marks B.2 Done.
+8. **Quality gates all pass.** `cargo fmt`, `cargo clippy
+   --no-default-features -- -D warnings`, `cargo clippy -- -D
+   warnings` (GTK), full `cargo test --workspace
+   --no-default-features` 5305/0/19. Win-GUI syntax manually
+   reviewed (cargo check --features win-gui fails on Linux due to
+   pre-existing `windows-future-0.2.1` incompat; user must verify
+   Windows build).
+9. **Net diff:** +339 / –74 across 6 files. Payoff materialises at
+   accelerator #2: each new binding adds ~1 line per backend.
+10. **Awaiting smoke test.** Verify: Ctrl+Shift+T still toggles
+    terminal maximize in TUI (kitty / modern alacritty without tmux,
+    since tmux strips Shift bit per §11 spike findings) and GTK.
+    `:TerminalMaximize` ex command still works. Toolbar maximize/
+    unmaximize button still works.
+11. **Path B landing.** Branch `quadraui-phase-b2-maximize-pilot`
+    off develop; PR expected after smoke test.
+
+---
+
+**Session 319 — Phase B.1 Backend trait scaffolding (#169 blocker):**
+
+1. **Pure additive quadraui types.** Three new files — `quadraui/src/event.rs`, `quadraui/src/accelerator.rs`, `quadraui/src/backend.rs` — plus re-exports in `lib.rs`. No vimcode runtime changes; no migration. The abstractions coexist with existing per-backend dispatch as designed in `BACKEND_TRAIT_PROPOSAL.md` §5 Phase B.1.
+2. **`UiEvent` enum (~60 variants/fields).** Backend-neutral event data covering input (`Accelerator`, `KeyPressed`, `CharTyped`), mouse (`MouseDown/Up/Moved/Entered/Left/DoubleClick/Scroll`), window (`WindowResized/Close/Focused/DpiChanged`), files (`FilesDropped/ClipboardPaste`), primitive-specific events re-wrapped (`Tree`, `List`, `Form`, `Palette`, `TabBar`, `StatusBar`, `ActivityBar`, `Terminal`, `TextDisplay`), and `BackendNative` escape hatch. All `Debug + Clone + PartialEq + Serialize + Deserialize` per §2 invariants. Supporting types: `Key`/`NamedKey`, `MouseButton`, `ButtonMask`, `Point`, `Rect`, `ScrollDelta`, `Viewport`, `BackendNativeEvent`.
+3. **`Accelerator` + `KeyBinding` + dual-format parser.** 13 universal bindings (`Save`, `Copy`, `Undo`, `Find`, ...) that render platform-appropriately, plus `KeyBinding::Literal(String)` that accepts **both** vim-style (`<C-S-t>`) and plus-style (`Ctrl+Shift+T`) input — first character dispatches. `AcceleratorScope` variants for `Global`/`Widget`/`Mode`. `Platform` enum and `render_accelerator`/`render_binding` helpers produce `⌘⇧T` on macOS, `Ctrl+Shift+T` elsewhere.
+4. **`Backend` trait + `PlatformServices` trait.** Frame lifecycle (`begin_frame`/`end_frame`), event polling (`poll_events`/`wait_events`), accelerator registration (`register_accelerator`/`unregister_accelerator`), services access, and **9 per-primitive draw methods** (`draw_tree`/`draw_list`/`draw_form`/.../`draw_text_display`) per Decision 2 (B). No `AnyPrimitive` enum. `Clipboard` sub-trait, `FileDialogOptions`, `Notification` support types.
+5. **22 new lib tests in `accelerator.rs`** covering both parser formats, modifier aliases (`Cmd`/`Command`/`Super`/`Win`/`Meta`), case-insensitivity, rejection cases, render platform-parity, serde round-trip. Quadraui test count: 24 → 46. Workspace total: 5273 → 5295.
+6. **Documentation updates.** `PLAN.md` stage table gains Phase B.1 (Done) + B.2/B.3/B.4/B.5 rows; `PROJECT_STATE.md` session note.
+7. **Quality gates all pass.** `cargo fmt` clean; `cargo clippy --workspace --no-default-features -- -D warnings` clean; `cargo test --workspace --no-default-features` 5295/0/19.
+8. **What this PR does NOT do.** Zero vimcode runtime change. No existing code migrated. No behaviour change for users. Pure additive — the new types sit unused until Phase B.2 (terminal maximize pilot migration) lands.
+9. **Path B landing.** Branch `quadraui-phase-b1-backend-trait` off develop; merged via PR #170 at `06dec4a` on 2026-04-22.
+10. **Next session — sketch before code.** Phase B.2 (terminal-maximize pilot migration) needs 5 design questions answered in `BACKEND_TRAIT_PROPOSAL.md` §11 **before** touching code. See `PLAN.md` §"Phase B.2 starting notes" for the full list (TuiBackend struct shape, event translation algorithm, main-loop integration, GTK event ownership, Win-GUI message-pump hookup), realistic scope (~+250/-75 LOC, not the aspirational -60), and workflow reminders.
+
+---
+
+**Session 318 — Closing the "where does app logic go?" gap:**
+
+1. **User feedback after #34:** the terminal maximize wave landed
+   logic across 10 files with 61 references to the maximize helpers —
+   most of it duplicated plumbing across three backends (target-rows
+   math, keybinding intercept, resize handler, hit-test). User asked
+   whether it's too ambitious to expect a cross-platform UI crate to
+   abstract more of this away. Answer: it's the stated vision, but a
+   Phase A / Phase B roadmap gap. Addressed via docs + one shared
+   helper; larger abstractions (layout primitives, `Backend` trait)
+   stay parked for Phase B.
+2. **New doc `quadraui/docs/APP_ARCHITECTURE.md`** (~220 lines) —
+   sibling to `UI_CRATE_DESIGN.md` (vision) and
+   `docs/NATIVE_GUI_LESSONS.md` (backend implementer). Audience is
+   the app developer. Covers: the layer cake
+   (Engine → render adapter → primitive → backend draw), a
+   "where does each kind of thing go?" table, a full worked example
+   tracing the 11-commit maximize ship through every layer, six
+   rules-of-thumb distilled from maximize + earlier lessons, and an
+   11-question checklist for new features. Links back to `PLAN.md`
+   lessons and the reference commits (`5bcb1bd`, `1d7141a`, `507d63a`).
+3. **New shared helper `PanelChromeDesc`** in `src/core/engine/mod.rs`
+   (near `EngineAction`): row-unit struct with fields for
+   `viewport_rows`, `menu_rows`, `quickfix_rows`, `debug_toolbar_rows`,
+   `wildmenu_rows`, `tab_bar_rows`, `separated_status_rows`,
+   `status_cmd_rows`, `panel_chrome_rows`, `min_content_rows`, and a
+   single method `max_panel_content_rows()` that does the
+   saturating-subtract + clamp. Backends fill the struct in their
+   own native units (TUI cell count; GTK `da_height / line_height`;
+   Win-GUI `client_height_px / line_height`). Five lib-tests cover
+   typical TUI, full chrome, min-floor clamp, zero-min clamp, and
+   default construction (`test_panel_chrome_*`).
+4. **Backend rewiring:**
+   - `tui_main::terminal_target_maximize_rows_tui` shrinks to a
+     `PanelChromeDesc { … }.max_panel_content_rows()` call.
+   - `gtk::gtk_terminal_target_maximize_rows` does the same; the
+     `1.6 * line_height` tab row rounds up to 2 row-units (≤0.4 lh
+     slack, absorbed by the subsequent clamp).
+   - `win_gui::win_gui_terminal_target_maximize_rows` is new (extracted
+     from three inline `total_rows.saturating_sub(3).max(5)` copies at
+     the keyboard, action-dispatch, and toolbar-click sites). ~20 lines
+     of duplicated arithmetic deleted across the three backends.
+5. **PLAN.md "Lessons learned"** gains three entries:
+   - "Render-time effective values beat mutation-at-toggle-time" (rule
+     + `5bcb1bd` commit reference).
+   - "Mouse hit-tests mirror draw-time geometry" (rule + `1d7141a` +
+     `507d63a` commit references).
+   - "Chrome arithmetic belongs in the engine, not in each backend"
+     (rule + `PanelChromeDesc` reference).
+6. **Quality gates all pass.** `cargo fmt` clean; `cargo clippy
+   --no-default-features -- -D warnings` clean; `cargo clippy
+   -- -D warnings` (GTK) clean; full workspace test 5273/0/19. All
+   six `tests/terminal_maximize.rs` integration tests continue to
+   pass unchanged — the refactor is strictly internal.
+7. **Net diff:** ~+340 / –85 across 6 files. Biggest add:
+   `APP_ARCHITECTURE.md` (new). Struct + method: ~100 lines in
+   `engine/mod.rs`. Tests: ~75 lines. Backend rewiring is net
+   negative (deletes arithmetic; adds struct-literal + call).
+8. **Path B landing.** Branch `followup-chrome-helper` off develop;
+   quality-gated and awaiting smoke test — no runtime behaviour
+   changes but the maximize path is on the refactored code now.
+
+---
+
+**Session 317 — Terminal maximize (closes #34):**
+
+1. **New Engine state:** `terminal_maximized: bool` + `terminal_saved_rows: u16` on Engine (transient — not persisted in `SessionState`). Initialised to false/0 in `Engine::new()`.
+2. **New method `Engine::toggle_terminal_maximize(target_rows: u16)`** in `src/core/engine/terminal_ops.rs`: on maximize saves `session.terminal_panel_rows` into `terminal_saved_rows`, grows the panel to `target_rows` (floor 5, only grows — never shrinks below current), opens the terminal if closed, grabs focus. On un-maximize restores the saved rows. The backend is responsible for computing `target_rows` from its own viewport geometry.
+3. **Auto-restore on close:** `close_terminal()` now clears `terminal_maximized` and restores `terminal_saved_rows` if maximize was active. Prevents a "stuck maximized" state after reopening the panel.
+4. **New ex command** `:TerminalMaximize` / `:TerminalMax` returns new `EngineAction::ToggleTerminalMaximize`. Backends compute viewport rows + forward the action to `toggle_terminal_maximize`.
+5. **New panel keybinding** `panel_keys.toggle_terminal_maximize` (default `<C-S-t>`, VSCode parity with "Maximize Panel Size"). Added to `Settings::PanelKeys` with `pk_toggle_terminal_maximize()` default. Three backends all bind it: TUI (main event loop, `matches_tui_key`), GTK (`Msg::ToggleTerminalMaximize` routed via `matches_gtk_key`), Win-GUI (inline `ctrl && shift && key.key_name == "t"` check in the Win32 keyboard dispatcher).
+6. **Viewport computation:** each backend computes target rows as `total_rows.saturating_sub(chrome).max(5)` where chrome reserves space for status + cmd + panel tab-bar + header. TUI uses the crossterm `terminal.size()`; GTK uses the DrawingArea height + `cached_line_height` via new `App::terminal_target_maximize_rows()`; Win-GUI uses `GetClientRect` + `state.line_height`.
+7. **PTY resize:** every maximize/unmaximize path calls `engine.terminal_resize(cols, new_rows)` (or `terminal_new_tab` if no pane exists) so the shell receives SIGWINCH and reflows.
+8. **6 new integration tests** in `tests/terminal_maximize.rs` cover: flag set + rows grown; unmaximize restores saved rows; target below saved keeps saved (monotone grow); close while maximized restores; ex command returns the correct `EngineAction`; minimum floor of 5 rows. Total workspace tests 5263 (vimcode 5239 + quadraui 24); baseline at branch-off was 5257.
+9. **Docs:** README "Integrated Terminal" section gained Ctrl-Shift-T + `:TerminalMaximize` bullets, plus a command-mode table row. Win-GUI caveat noted (binding works; the standalone fallback action handler may paint one frame behind the key-path handler because it lacks direct `GetClientRect` access).
+10. **Quality gates all pass:** `cargo fmt`, `cargo clippy --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --no-default-features`. Win-GUI code paths follow existing backend patterns; `cargo build --features win-gui` isn't buildable on Linux (`windows-future` crate incompat, pre-existing) so smoke-test on a Windows machine.
+11. **Toolbar button added (follow-up commit).** `TerminalPanel.maximized: bool` on render.rs; new `󰊗` (maximize) / `󰊓` (unmaximize) Nerd Font icons drawn between the split and close buttons in all three backends. Click handlers: TUI `src/tui_main/mouse.rs` header-row hit test, GTK `src/gtk/mod.rs` terminal panel click branch (new `max_x` rect), Win-GUI `src/win_gui/mod.rs` toolbar click routing. ASCII fallback icons: `]` / `[` for Win-GUI when Nerd Fonts disabled. Split/add/close button positions all shifted 2 cols leftward to make room. New `UiAction::TerminalMaximizeButton` variant registered in `all_required_ui_actions()` + TUI + Win-GUI collect lists; parity tests still pass.
+12. **Path B landing.** Branch `issue-34-terminal-maximize` off develop; PR expected after smoke test.
+
+---
+
+**Session 316 — Documentation: status-bar notifications (closes #156); diff-view alignment bug filed (#166):**
+
+1. **README.md — new "Status-bar notifications" subsection** under the status-line area (just before the "Font" bullet). Documents the spinner-vs-bell indicator: animated Braille spinner (`⠋⠙⠹…`) in function color while in-progress, `󰂞` (Nerd Font) / `*` (ASCII) in string-literal color when done. Covers the three real triggers currently wired up — LSP/DAP server install, project-wide search, project-wide replace — with their actual in-progress and done messages. Calls out the 5-second auto-dismiss and click-to-dismiss behaviour. Notes that the spinner is not clickable (informational only).
+2. **Accuracy check:** the issue body listed `GitOperation`, `LspIndexing`, `ExtensionInstall` as triggers, but `grep` shows those `NotificationKind` variants are defined in the enum yet **never passed to `notify()`** in live code (only `LspInstall`, `ProjectSearch`, `ProjectReplace` are). Doc only describes what's real.
+3. **Issue #166 filed — side-by-side diff pane drift past the first hunk.** Root-cause analysis: `Engine::sync_scroll_binds()` (`src/core/engine/search.rs:277`) maps active→partner through `diff_aligned`, but then stores the partner's scroll as a **buffer line** rather than an **aligned-row index**. When the partner's aligned entry at the mapped index is a padding row, the fallback walks forward to the next real `source_line`, so the partner skips past padding the active keeps emitting. Every hunk compounds the drift. Fix sketches included: (1) treat `scroll_top` as an aligned-row index for diff-pair windows, (2) back `target_idx` up to the start of a padding run before translating to a buffer line, (3) render-side fallback that lands on the first aligned entry (padding) when multiple match a given `source_line`.
+4. **Path A (docs-only)** — README.md + PROJECT_STATE.md committed directly to `develop` per the CLAUDE.md documentation-only-change rule.
+5. **#34 (terminal maximize) is next** — Path B (branch + PR). Will land separately.
+
+---
+
+**Session 315 — Phase A.2c: Win-GUI explorer migration:**
+
+1. **Last required Win-GUI quadraui stage done.** A.2c completes the
+   originally-required platform-specific stages (A.1b/A.1c/A.2b/A.2c).
+   Optional A.6*/A.7 Win-GUI parity stages remain queued under
+   "Win-GUI parity scope" in PLAN.md but are not blockers for the
+   wave.
+2. **Shared adapter promoted to `render.rs`.** `ExplorerRow` and
+   `explorer_to_tree_view()` move out of `src/gtk/explorer.rs` into
+   `src/render.rs` so both GTK and Win-GUI can call the same builder.
+   The adapter takes `(rows: &[ExplorerRow], scroll_top, selected,
+   has_focus, engine)` — backend-neutral. GTK's `ExplorerState` now
+   wraps the shared `render::ExplorerRow`; `src/gtk/explorer.rs`
+   retains the state type + tree-walk helpers but re-exports the
+   adapter's row shape.
+3. **Win-GUI bespoke explorer render deleted.** `src/win_gui/draw.rs::
+   draw_explorer_panel` shrinks from ~75 lines of hand-rolled per-row
+   Cairo-style drawing (indent math, expand-arrow glyphs, file-color
+   fg pick) down to a ~20-line wrapper: draw the "EXPLORER" header,
+   call `render::explorer_to_tree_view`, delegate to
+   `quadraui_win::draw_tree` (introduced in A.1c).
+4. **Parity boost as a side-effect.** The shared adapter pulls in git
+   status letters + LSP diagnostic badges per row (via
+   `engine.explorer_indicators()`) — things the old Win-GUI explorer
+   didn't display. The primitive's uniform `line_height` rows keep
+   the flat-row click-hit math `(row - 1)` intact; no changes needed
+   in `src/win_gui/mod.rs`.
+5. **EXPLORER header kept outside the primitive.** Same pattern as
+   A.1c's SC panel: the panel header is a bespoke row above the tree,
+   and the tree starts at `top + line_height` with full remaining
+   height. Lets the click-hit math "subtract 1 for the header" stay
+   unchanged from pre-migration.
+6. **`WinSidebar.rows` type changes.** Local `ExplorerRow` deleted in
+   `src/win_gui/mod.rs`; replaced with `use crate::render::
+   ExplorerRow;`. `build_rows()` + `collect_explorer_rows()` still
+   live locally (they construct the shared type).
+7. **Quality gates all pass.** `cargo fmt` clean; `cargo clippy
+   --no-default-features -- -D warnings` clean; `cargo clippy
+   --features win-gui --no-default-features` shows only the 10
+   pre-existing `collapsible_match` warnings that Session 314 already
+   noted. Full `cargo test --workspace --no-default-features`:
+   5235/0/19 (identical to Session 314 baseline). `cargo build --bin
+   vimcode-win --features win-gui --no-default-features` succeeds.
+8. **Net diff:** ~+145 / –115 across 5 files. `src/render.rs` gains
+   ~110 lines (the new `ExplorerRow` type + adapter). `src/gtk/
+   explorer.rs` shrinks ~90 lines (local adapter removed, replaced
+   by a re-export + pointer comment). `src/gtk/mod.rs` call-site
+   updates to the new signature. `src/win_gui/mod.rs` swaps the
+   struct def for a `use`. `src/win_gui/draw.rs` shrinks on
+   `draw_explorer_panel`.
+9. **Awaiting smoke test on Windows.** Verify: EXPLORER header still
+   renders at the top of the panel with foreground text. Tree rows
+   show folder/file icons per extension (Nerd Font when available,
+   fallback "." otherwise). Git-modified files show an `M`/`A`/`D`/
+   `?` badge on the right edge; files with LSP errors show a red
+   count badge; warnings show a yellow count badge. Selected row
+   gets the `fuzzy_selected_bg` fill — same as the SC panel rows.
+   j/k/space/Enter navigation + click + double-click behaviour
+   unchanged (click math in `src/win_gui/mod.rs` is untouched).
+   Right-click context menu still fires on file / folder rows.
+
+---
+
+**Session 314 — Phase A.1c: Win-GUI `draw_tree` + SC panel migration (commit `25e94f8`):**
+
+1. **First primitive-driven rendering in the Win-GUI backend.** A.1c
+   was the last required Windows stage tracked in PLAN; A.2c (Win-GUI
+   explorer) is the only Win-GUI required stage still open. Optional
+   A.6/A.7 Win-GUI parity stages remain queued under "Win-GUI parity
+   scope" in PLAN.md.
+2. **New `src/win_gui/quadraui_win.rs`** — Direct2D/DirectWrite
+   counterpart to `quadraui_tui::draw_tree` (TUI) and
+   `quadraui_gtk::draw_tree` (GTK). ~195 lines. Renders tree bg,
+   per-row bg (header / muted / selection / default), indent +
+   chevron for branches, optional icon, text spans with per-span fg,
+   right-aligned badge with reserve width, span truncation to badge
+   edge.
+3. **Win-GUI SC panel sections loop deleted** — `draw.rs::draw_git_panel`
+   shrank by ~160 lines (the 4-section staged/unstaged/worktrees/log
+   render loop). Replaced with
+   `render::source_control_to_tree_view(sc, self.theme)` +
+   `quadraui_win::draw_tree(self, panel_x, top+ry, panel_w,
+   sections_h, &sc_tree)`. `add_color`/`del_color`/`mod_color` theme
+   bindings dropped from `draw_git_panel` — they're now encoded in
+   the adapter via `theme.git_added/deleted/modified`.
+4. **Row-height decision: uniform `line_height` (Win-GUI)**, not the
+   `line_height` / `1.4 * line_height` split GTK uses. Preserves the
+   pre-migration Win-GUI monospace cadence so the click-hit math in
+   `src/win_gui/mod.rs` (mouse-y / lh → flat row index) works
+   without modification. Recorded as a lesson in PLAN.md: different
+   backends can make different pixel-level decisions; the primitive
+   only constrains data, not layout.
+5. **`DrawContext` helper visibility.** Three private methods
+   (`draw_text`, `mono_text_width`, `solid_brush`) promoted to
+   `pub(super)` so the sibling `quadraui_win` module can reach them.
+   Matches how GTK's `quadraui_gtk` accesses `super::*`.
+6. **Scrollbar kept.** Total content height computed from
+   `sc_tree.rows.len() * lh` + commit rows + button row, so the
+   existing "thumb-without-offset" scrollbar indicator still draws
+   at the right size.
+7. **Quality gates all pass** — `cargo fmt` clean, `cargo clippy
+   --no-default-features -- -D warnings` clean (no warnings from
+   A.1c code), `cargo test --workspace --no-default-features`
+   5235/0/19 (identical to develop baseline), `cargo build --bin
+   vimcode-win --features win-gui --no-default-features` succeeds.
+8. **Known pre-existing issue not touched.** `cargo clippy --features
+   win-gui --no-default-features -- -D warnings` has 10 pre-existing
+   `collapsible_match` errors on develop (in `core/engine/vscode.rs`,
+   `core/lsp.rs`, `win_gui/mod.rs:2170` and others). Unrelated to
+   A.1c; should be filed as a separate housekeeping issue if desired.
+9. **Net diff:** +213 / –178 lines across 3 files (`win_gui/mod.rs`
+   adds the `pub mod quadraui_win` line; `win_gui/draw.rs` loses the
+   section render loop + the 3 unused theme bindings; new
+   `win_gui/quadraui_win.rs` at 196 lines).
+10. **Awaiting smoke test on Windows.** Verify the four sections
+    (STAGED CHANGES / CHANGES / WORKTREES if >1 / RECENT COMMITS)
+    render with expand chevrons, item-count badges, status-bg
+    styling on header rows. j/k moves selection across flat rows
+    with inverted bg highlight. Enter/Tab/s on files still
+    stages/unstages — click-hit math is unchanged because row height
+    stays at lh. Muted decoration on log entries renders in dim_fg.
+    Branch picker popup overlay unaffected.
+
+---
+
+**Session 312 — Phase A.8: `TextDisplay` primitive scaffolding (A.9 deferred):**
+
+1. **Strategic decision: A.9 deferred indefinitely.** A.9 (`TextEditor` + `BufferView` adapter) would be a mechanical refactor of vimcode's editor surface through quadraui — zero functional benefit to vimcode users, ~thousands of lines, highest regression risk. The primitive only matters for downstream apps that want to embed a code-editor widget (SQL client #46, k8s dashboard #145, Postman clone #147). Until those apps materialise, A.9 is technical debt with no near-term payoff. PLAN.md stage table marks it Deferred.
+2. **A.8 scope kept small.** No vimcode consumer of `TextDisplay` exists yet — AI chat streaming, project search results, find-replace results, etc. all work fine on existing scratch-buffer / List-primitive plumbing. A.8 ships scaffolding-only: primitive types + serde + 3 lib tests, no backend draw functions and no migration. First consumer (k8s pod-log viewer per #144, or LSP trace tail) drives the backend work as A.8b/A.8c.
+3. **New primitive `quadraui::primitives::text_display`** — `TextDisplay { id, lines, scroll_offset, auto_scroll, max_lines, has_focus }`, `TextDisplayLine { spans, decoration, timestamp }`, `TextDisplayEvent` (`Scrolled` / `AutoScrollToggled` / `Copied` / `KeyPressed`).
+4. **Streaming-friendly API on the primitive itself:** `TextDisplay::new(id)` constructor + `append_line(line)` + `clear()` + `set_max_lines(n)` helpers. `max_lines = 0` means unbounded; positive cap evicts oldest lines via `Vec::drain(..)` when exceeded, with `scroll_offset` adjusted so the visible region stays anchored. Supports the 10k-lines/sec target from #144 — the primitive's append is `Vec::push` + bounded eviction; cost is amortised `O(1)`. Whether the backends can render that fast is the actual benchmark question; deferred to when a backend exists.
+5. **3 new quadraui lib tests** — `append_line` + cap eviction + clear + scroll-offset adjustment, serde round-trip on the full primitive (with mixed decorations + timestamps + spans), `TextDisplayEvent` variants.
+6. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --workspace --no-default-features` (5249/0/19, vimcode 5225 unchanged, quadraui 21→24), `cargo build` both configurations.
+7. **Net diff:** +250 / –5 lines across 4 files. New `quadraui/src/primitives/text_display.rs` is ~115 lines including doc comments. Vimcode source untouched.
+8. **Quadraui v1 status.** With A.8 scaffolded, the crate now has 9 primitives: Tree, Form, Palette, List, StatusBar, TabBar, ActivityBar, Terminal, TextDisplay. Only `TextEditor` (A.9, deferred) is missing from the design doc's v1 list. The crate is "extracted enough" for vimcode; further work waits for downstream-app demand.
+
+---
+
+**Session 311 — Phase A.7: `Terminal` primitive + TUI + GTK cell migration:**
+
+1. **New primitive `quadraui::primitives::terminal`** — `Terminal { id, cells: Vec<Vec<TerminalCell>> }`, `TerminalCell { ch, fg, bg, bold, italic, underline, selected, is_cursor, is_find_match, is_find_active }`, `TerminalEvent` (`KeyPressed` / `SelectStart` / `SelectExtend` / `SelectEnd` / `Scroll`). The cell layout mirrors `render::TerminalCell` 1:1 so the adapter is a tight inner loop, not a structural transform.
+2. **Scope kept narrow.** Only the **per-cell rendering** (the meat of terminal output) goes through the primitive in this stage. Terminal tabs (`TERMINAL` / `DEBUG CONSOLE`), the close/split/new-tab toolbar buttons, and scrollbar drawing remain on bespoke per-backend code. Migrating those is queued as A.7b if useful — they're more about backend-specific chrome (tooltips, hover) than reusable UI primitives.
+3. **Adapter `render::terminal_cells_to_quadraui`** in `src/render.rs` — converts `&[Vec<render::TerminalCell>]` → `quadraui::Terminal` once per terminal per frame. Used by both backends.
+4. **TUI: build-once dispatch.** `render_terminal_panel` now constructs the `quadraui::Terminal` primitive once before the row loop (separately for the split-pane left/right cases), then `render_terminal_pane_cells` becomes a thin per-row dispatcher into `quadraui_tui::draw_terminal_row(buf, &cells_row, …)`. Avoids N allocations per frame for an N-row terminal.
+5. **GTK: thin wrapper.** `src/gtk/draw.rs::draw_terminal_cells` reduces to ~25 lines that build the primitive and delegate to `quadraui_gtk::draw_terminal_cells`. Cell paint (per-cell bg + fg + Pango attrs) lives in the quadraui module.
+6. **Performance characteristic.** A typical terminal pane is ~30 rows × ~120 cols = ~3,600 cells. Per-frame `quadraui::Terminal` allocation copies ~150 KB of `TerminalCell` data — well within a single 16ms frame budget on modern CPUs (memcpy clocks at GB/s). If profiling later shows this is hot, the adapter can be reworked to construct lazily / cache between frames; for now the simple owned-data path matches the plugin invariants without measurable overhead.
+7. **Wide-glyph behaviour preserved.** Both backends call the same per-cell loop they did before; nothing in this migration changes how `set_cell_wide` / Pango width measurement is invoked. The primitive layer doesn't introduce its own width logic.
+8. **2 new quadraui lib tests** — serde round-trip on `Terminal` (with cursor + selection + find overlays) and `TerminalEvent` variants.
+9. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; clippy::duplicated_attributes flagged a stray `#[allow]` left over during scaffolding — removed), full `cargo test --workspace --no-default-features` (5246/0/19, vimcode 5225 unchanged, quadraui 19→21), `cargo build` both configurations.
+10. **Net diff:** +320 / –180 lines across 6 files. `src/gtk/draw.rs::draw_terminal_cells` shrinks ~80 lines; `src/tui_main/panels.rs::render_terminal_pane_cells` shrinks ~40 lines plus a small refactor at the call site to build the primitive once. Quadraui gains a 75-line primitive module + a ~95-line GTK draw function + a ~50-line TUI draw function.
+11. **Awaiting smoke test.** TUI + GTK terminal output should render identically — characters, fg/bg, bold/italic/underline attributes, cursor (inverted bg/fg), mouse selection (theme selection bg), find matches (orange / amber). Test with `:terminal` then run a colourful command (e.g. `ls --color=auto`, `htop`, `bat src/render.rs`) and verify rendering matches pre-migration. Selection drag, scrollback (Ctrl+PageUp / Ctrl+PageDown), find-in-terminal (Ctrl+F) all should work since they don't go through this code path.
+
+---
+
+**Session 310 — Phase A.6f: GTK ActivityBar native→DrawingArea migration (A.6 complete):**
+
+1. **Atomic switchover.** The view! macro's `activity_bar` `gtk4::Box` with 7 fixed `gtk4::Button` widgets + inline `Separator` spacer is now a single `gtk4::DrawingArea { set_width_request: 48, set_has_tooltip: true, set_can_focus: true }`. Follows the A.2b-2 + A.3c-2 pattern.
+2. **New `quadraui_gtk::draw_activity_bar`** — Cairo + Pango renderer that consumes a `quadraui::ActivityBar` + extra `hovered_idx` param. Returns `Vec<ActivityBarHit>` in DA-local pixel coordinates for the caller's click + hover + tooltip pipeline. Geometry: 48 px per row (matches the pre-migration `set_height_request: 48`), icons centred in each row at 20 px Nerd Font size (matches the `.activity-button` CSS), 2 px left-edge accent bar for active rows, subtle hover-bg tint.
+3. **Dynamic extension button injection block deleted** (~35 lines). Extension panel icons now flow through the same primitive + draw path as the fixed panels; adding an extension panel just appears as a new `ActivityItem` the next time the DA redraws. Simpler than the old `insert_child_after` bookkeeping.
+4. **GTK-specific adapter `build_gtk_activity_bar_primitive`** in `src/gtk/mod.rs`. Builds the primitive from `Engine.ext_panels` + the current `SidebarPanel`. Tooltips populated (unlike TUI which leaves them empty): "Explorer (Ctrl+Shift+E)", "Search (Ctrl+Shift+F)", etc. GTK has no keyboard-focused highlight (native widgets manage tab nav), so all `is_keyboard_selected` are false.
+5. **`activity_id_to_panel` decoder** — `WidgetId::as_str()` → `SidebarPanel`, including `"activity:ext:<name>"` → `SidebarPanel::ExtPanel(name)`. Click handler dispatches via this decoder to `Msg::SwitchPanel`, keeping the engine-side dispatch path unchanged.
+6. **Interaction wiring**: `GestureClick` resolves rows via the stored `activity_bar_hits` vec. `EventControllerMotion` updates a hover `Rc<Cell<Option<usize>>>` and calls `queue_draw` when the hovered row changes (also on `leave`). `connect_query_tooltip` fires the native GTK tooltip popover using per-row `tooltip` strings. `Msg::SwitchPanel` handler now mirrors the active panel into a shared `Rc<RefCell<SidebarPanel>>` the draw callback reads without borrowing `&self`, and queues a redraw.
+7. **Lessons learned (added to PLAN.md):** for atomic switchover of native widget chains to DrawingArea, the pattern is (a) shared interaction state lives in `Rc<RefCell<_>>` / `Rc<Cell<_>>` so draw callbacks don't borrow `&self`, (b) per-frame interaction state (hover row, active selection mirror) gets written synchronously from the interaction handler that changes it, paired with a `queue_draw`, (c) deferred poll-tick dispatch should be avoided for anything affecting visual state (cf. #158's pre-existing tab-scroll lag).
+8. **All A.6 stages now complete.** Quadraui primitives shipped: Tree (A.1b), Form (A.3c/A.3c-2), Palette (A.4b), List (A.5b), StatusBar (A.6b), TabBar (A.6d), ActivityBar (A.6f). All Linux GTK migrations done. Windows (A.1c / A.2c) remain for a machine with that toolchain.
+9. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; `clippy::explicit_counter_loop` flagged a manual row-index counter I'd written — simplified to `.enumerate()`), full `cargo test --workspace --no-default-features` (5244/0/19, unchanged from A.6e), `cargo build` both configurations.
+10. **Net diff:** +380 / –160 lines across 4 files. `src/gtk/mod.rs` shrinks by ~100 lines (native button chain + dynamic injection deleted; imperative DA setup added); `src/gtk/quadraui_gtk.rs` grows by ~160 (`draw_activity_bar` + `ActivityBarHit`).
+11. **Awaiting smoke test.** GTK activity bar should render identically: 7 fixed icons (hamburger was TUI-only — the GTK version had no hamburger row, stays that way), dynamic extension panel icons in the middle, settings pinned bottom. Hover a row → subtle tint + native tooltip popover after dwell. Click any icon → panel switches + active-accent bar appears on the left edge of that row. Opening a new extension panel → its icon appears on the next redraw.
+
+---
+
+**Session 309 — Phase A.6e: `ActivityBar` primitive + TUI migration:**
+
+1. **Scope decision.** A.6 was originally planned with A.6e as a combined TUI + GTK slice. Looking at the GTK activity bar (a `gtk4::Box` with 7 native `gtk4::Button` widgets plus dynamic extension panels added via `insert_child_after`), migrating to a primitive-backed DrawingArea would be another A.2b-2-scale atomic rewrite (click + hover + tooltip + focus + dynamic rebuild). Extended the split pattern: A.6e is TUI-only; GTK lands as A.6f.
+2. **New primitive `quadraui::primitives::activity_bar`** — `ActivityBar { id, top_items, bottom_items, active_accent, selection_bg }`; `ActivityItem { id, icon, tooltip, is_active, is_keyboard_selected }`; `ActivityBarEvent` with `ItemClicked` + `KeyPressed`. Top items render from the top downward; bottom items pin to the bottom and win if the area is too small to fit both.
+3. **TUI `quadraui_tui::draw_activity_bar`** — one row per item, icon at `area.x + 1` (leaving the left column for the `▎` accent bar when active). Active-without-keyboard-selection gets the accent; keyboard-selected gets a full-row selection-bg fill that takes precedence over the accent. Matches the previous bespoke renderer exactly.
+4. **Tooltip field added but unused by TUI.** TUI has no hover UI at the character-cell level; the field is carried for the A.6f GTK migration where `set_tooltip_text` on each row will consume it.
+5. **`build_activity_bar_primitive` in `src/tui_main/panels.rs`** — builds the declarative state from `TuiSidebar` + `Engine` + theme. Preserves the existing keyboard-selection index mapping (0 = hamburger, 1-6 = fixed panels, 7 = settings, 8+ = dynamically-registered extension panels) so `toolbar_selected` bookkeeping in `mod.rs` is unchanged. Click resolution stays on the existing row-arithmetic path.
+6. **`TuiPanel` enum branch list made explicit.** The adapter's `match panel` has arms for all 6 real panels plus a `_` fallback. Rust's exhaustiveness check will flag new TuiPanel variants that need an icon + tooltip in the adapter.
+7. **2 new quadraui lib tests** — serde round-trip on `ActivityBar` (top + bottom items, accent + selection bg), `ActivityBarEvent` variants.
+8. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; clippy::needless_borrows flagged a `&format!(…)` → `format!(…)` simplification), full `cargo test --workspace --no-default-features` (5244/0/19, vimcode 5225 unchanged, quadraui 17→19), `cargo build` both configurations.
+9. **Net diff:** +260 / –100 lines across 5 files. `src/tui_main/panels.rs::render_activity_bar` shrinks from ~110 lines to ~10 plus a ~90-line adapter helper (most of the bulk is the `ActivityItem` construction for each of the 8 fixed + N dynamic rows).
+10. **Awaiting smoke test.** TUI activity bar should render identically: hamburger at top, Explorer/Search/Debug/Git/Extensions/AI rows, extension panel icons below, settings pinned at bottom, `▎` accent on active item, selection-bg fill on keyboard-focused item, no hover affordance (TUI doesn't track per-cell mouse hover).
+
+---
+
+**Session 308 — Phase A.6d: GTK `draw_tab_bar` migration:**
+
+1. **Shared adapter promoted to `render.rs`** — `build_tab_bar_primitive` (previously TUI-local) moved to `src/render.rs` so both backends use the same primitive construction. Accepts `Option<quadraui::Color>` for the accent; each backend converts its own colour type up-front. TUI's ratatui→quadraui conversion happens in `render_tab_bar`; GTK's uses the new `render::to_quadraui_color` helper on its `render::Color` theme field.
+2. **New `quadraui_gtk::draw_tab_bar`** — Cairo+Pango renderer that consumes a `quadraui::TabBar` + an extra GTK-only per-frame `hovered_close_tab: Option<usize>`. Preserves all GTK visual details: 1.6× line_height tab row, sans-serif UI font (separate from editor monospace), italic-on-preview font, 2px top accent bar on active tab, rounded hover background behind close button, ● vs × close glyph.
+3. **New `TabBarHitInfo` struct** replacing the bespoke 5-tuple return type. Same data (per-tab slots, diff button rects, split info, action menu rect, available char columns) but named fields. GTK `draw.rs::draw_tab_bar` wrapper flattens it back to the legacy `TabBarDrawResult` tuple so the click-dispatch path (`src/gtk/click.rs`, `src/gtk/mod.rs`) stays untouched.
+4. **Rendering-vs-interaction split pattern.** The primitive is pure declarative state (tabs + their visual flags + right segments + accent). GTK's `draw_tab_bar` accepts per-frame interaction state (`hovered_close_tab`) as an extra parameter alongside the primitive. Captured in PLAN.md "Lessons learned" for future primitives that need hover / drag / focus overlays.
+5. **Right-segment dispatch by `WidgetId`.** The GTK renderer walks `bar.right_segments` and classifies clickable segments by their `id.as_str()` (`"tab:diff_prev"`, `"tab:split_right"`, etc.) so it can populate the legacy per-button hit-region tuple without re-duplicating the layout logic. Same WidgetId→enum mapping pattern as A.6a's `status_action_from_id`.
+6. **GTK `draw_tab_bar` wrapper reduced to ~40 lines.** The 350-line Cairo+Pango routine (tab measurement, per-tab paint, hover affordance, right-button layout) is gone. The wrapper adapts colour, builds the primitive, delegates, unpacks `TabBarHitInfo` into the legacy tuple.
+7. **All Linux GTK tab-bar / status-bar / primitive migrations are now done.** Primitives shipped: Tree (A.1b), Form (A.3c/A.3c-2), Palette (A.4b), List (A.5b), StatusBar (A.6b), TabBar (A.6d). Remaining quadraui work on Linux: ActivityBar (A.6e), Terminal (A.7), TextDisplay (A.8), TextEditor (A.9).
+8. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK; `clippy::if_same_then_else` flagged a pre-existing `if A { foreground } else if B { foreground }` branch I'd preserved from the old code — simplified to `if A || B`), full `cargo test --workspace --no-default-features` (5242/0/19, unchanged), `cargo build` both configurations.
+9. **Net diff:** +480 / –430 lines across 4 files. `src/gtk/draw.rs` shrinks ~300 lines (the tab-bar renderer extracted out); `src/gtk/quadraui_gtk.rs` grows by ~340. `src/render.rs` gains the shared ~85-line adapter; `src/tui_main/render_impl.rs` shrinks by ~85 lines (now just calls the shared adapter).
+10. **Awaiting smoke test.** GTK tab bar should render identically — tab padding (14px outer + 10px inner gap), 2px top accent on active tab, italic preview, hover rounded bg on close, dirty dot ● / close ×, split+diff+action right buttons, correct hit regions so clicks still dispatch through the unchanged `src/gtk/click.rs` path.
+
+---
+
+**Session 307 — Phase A.6c: `TabBar` primitive + TUI migration:**
+
+1. **New primitive `quadraui::primitives::tab_bar`** — declarative `TabBar { id, tabs, scroll_offset, right_segments, active_accent }`; `TabItem { label, is_active, is_dirty, is_preview }`; `TabBarSegment { text, width_cells, id: Option<WidgetId>, is_active }`; `TabBarEvent` with `TabActivated`, `TabClosed`, `ButtonClicked`, `KeyPressed`.
+2. **Rendering-only migration.** Unlike `StatusBar` (A.6a), which routed clicks through the primitive via `WidgetId` encoding, `TabBar` keeps the click path on vimcode's engine-side `TabBarClickTarget` enum because it has parameterised actions (`Tab(usize)`, `CloseTab(usize)`). The primitive's events + IDs exist for future plugin-declared tab bars (§10 invariants) but vimcode's click resolution still goes through the cached `GroupTabBar.hit_regions`.
+3. **TUI `quadraui_tui::draw_tab_bar`** — renders a `TabBar` into a ratatui `Buffer`, returns available tab-content width. Preserves every visual detail of the old `render_tab_bar`: dirty dot `●` vs close `×`, underline-accent on the filename portion only (chars after the last `": "`), italic for preview tabs, bold+underline for active. Right segments support mixed labels (diff "2 of 5") and clickable icon buttons. Nerd Font wide glyphs (`F0932`/`F0143`/`F0140`/`F0233`) use `set_cell_wide`; other PUA glyphs (`F0D7` for split-down) use regular `set_cell` to match pre-migration per-cell output.
+4. **TUI `render_tab_bar` reduced to a 12-line wrapper.** Builds the primitive via a new `build_tab_bar_primitive` helper (local to `render_impl.rs`), delegates to `draw_tab_bar`. External signature unchanged — all callers and the tab-bar scroll-offset bookkeeping are untouched.
+5. **Wide-glyph heuristic lesson.** First draft used a broad "PUA = wide" check that failed 6 snapshot tests: `SPLIT_DOWN` at `\u{f0d7}` is PUA but renders as 1 cell in practice. Narrowed the heuristic to an explicit allowlist of the 4 wide glyphs vimcode actually uses. Future wide-glyph additions must be added to `is_nerd_wide`. Recorded the lesson in PLAN.md.
+6. **2 new quadraui lib tests** — serde round-trip on `TabBar` (with tabs, right segments of mixed clickable/label, active accent), and `TabBarEvent` variants.
+7. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --workspace --no-default-features` (5242/0/19; vimcode 5225 unchanged, quadraui 15 → 17), `cargo build` (both default + `--no-default-features`).
+8. **Net diff:** +300 / –170 lines across 5 files.
+9. **Awaiting smoke test.** TUI tab bar should render identically — close/dirty indicators, prefix-vs-filename underline split, italic-on-preview, split/diff/action right-side buttons with correct wide-glyph handling. All tab/close/split/diff/action clicks still dispatch via the unchanged engine-level path.
+
+---
+
+**Session 306 — Phase A.6b: GTK `draw_status_bar` migration:**
+
+1. **New `quadraui_gtk::draw_status_bar`** in `src/gtk/quadraui_gtk.rs` — Cairo + Pango counterpart to the TUI renderer shipped in A.6a. Same contract: background fill from first segment's `bg`, left segments accumulate from `x`, right segments right-aligned inside `width`, per-segment bold via `pango::Weight::Bold`. Returns `Vec<StatusBarHitRegion>` in bar-local coordinates so the caller can populate the per-window click map.
+2. **GTK `draw_window_status_bar` reduced to ~20 lines.** The 100-line Cairo+Pango routine (segment measure / fill / stroke / weight-attrs, duplicated for left and right halves) is gone. The wrapper now adapts `WindowStatusLine → quadraui::StatusBar` via the A.6a adapter, calls `quadraui_gtk::draw_status_bar`, and decodes the returned `WidgetId`s back to `StatusAction` for the existing per-window `status_segment_map`. Click dispatch in `src/gtk/click.rs` is unchanged.
+3. **Hit-region float→u16 conversion** in the GTK backend uses a saturating clamp — GTK bars render in pixels (typically up to ~2500 px wide at 4K), well within `u16::MAX = 65535`. The TUI variant uses character cells; both fit. A later stage may widen `StatusBarHitRegion::col` / `width` to `u32` if HiDPI bars ever approach the limit.
+4. **All Linux GTK primitives are now migrated through quadraui** — Tree (A.1b), Form (A.3c/A.3c-2), Palette (A.4b), List (A.5b), StatusBar (A.6b). The GTK backend's primitive-independent rendering surface shrinks another ~80 lines; what's left in `src/gtk/draw.rs` is editor / popup / sidebar-chrome rendering.
+5. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), full `cargo test --workspace --no-default-features` (5240/0/19, unchanged), `cargo build` (both default + `--no-default-features`).
+6. **Net diff:** +140 / –99 lines across 4 files. `src/gtk/quadraui_gtk.rs` grows with `draw_status_bar`; `src/gtk/draw.rs` shrinks where the inline routine used to live.
+7. **Awaiting smoke test.** GTK per-window status line should render identically to before: same colours, widths, bold weights, right-alignment of the right half, clickable segments, separated-status-line row above the terminal panel. Focus specifically on the narrow-window edge case flagged during A.6a smoke testing (#157 if filed) — behaviour there is unchanged by this migration but worth confirming the primitive doesn't make it worse.
+
+---
+
+**Session 305 — Phase A.6a: `StatusBar` primitive + TUI per-window status line migration:**
+
+1. **Scope decision.** PLAN.md had A.6 as a single "StatusBar / TabBar / ActivityBar finish" stage. Split into five sub-phases (A.6a–A.6e) matching the A.4/A.4b and A.5/A.5b cadence, so each primitive + backend migration is an independent smoke-testable slice rather than a large three-primitive diff.
+2. **New primitive `quadraui::primitives::status_bar`** — `StatusBar { id, left_segments, right_segments }`, `StatusBarSegment { text, fg, bg, bold, action_id: Option<WidgetId> }`, `StatusBarHitRegion`, `StatusBarEvent { SegmentClicked, KeyPressed }`. `StatusBar::hit_regions(bar_width)` + `resolve_click(col, bar_width)` live on the primitive for backend-neutral click resolution.
+3. **Engine-agnostic action encoding.** Per plugin invariant §10 ("primitives don't borrow app state"), quadraui can't see vimcode's `StatusAction` enum. Added `render::status_action_id(&StatusAction) -> &'static str` + `status_action_from_id(&str) -> Option<StatusAction>` so the adapter encodes engine enum → opaque `WidgetId` string (`"status:goto_line"`, etc.) and the click handler decodes back. Similar pattern will apply to TabBar and ActivityBar.
+4. **New adapter `render::window_status_line_to_status_bar()`** — converts the existing `WindowStatusLine` (built by `build_window_status_line`, Session 241–243) into a `quadraui::StatusBar`, flattening `StatusAction` to `WidgetId` via the encoder.
+5. **TUI `quadraui_tui::draw_status_bar`** — renders `StatusBar` into a ratatui `Buffer` with the same pixel-for-pixel behaviour as the old `render_window_status_line`: background fill from first segment's `bg`, left segments from left edge, right segments right-aligned, per-segment bold attribute. Both the old global status bar and per-window status bars now flow through this function.
+6. **TUI `render_window_status_line` reduced to 12 lines** — builds the primitive via the adapter and delegates to `draw_status_bar`. The previous ~60-line Cairo-like closure-based implementation is gone.
+7. **TUI click path `status_segment_hit_test` migrated** — now builds the primitive, calls `StatusBar::resolve_click`, decodes the returned `WidgetId` via `status_action_from_id`. External signature preserved (`WindowStatusLine` in, `Option<StatusAction>` out) so the ~20 callsites in `mouse.rs` are untouched.
+8. **GTK not yet migrated.** GTK still uses its own Pango-based `draw_window_status_bar` with `WindowStatusLine` directly. Tracked as A.6b.
+9. **2 new quadraui lib tests** — serde round-trip on `StatusBar` with interactive segments, and `hit_regions` + `resolve_click` on a mixed-side bar. Existing vimcode test count unchanged (5225) — the migration is a refactor with no behavioural change in any integration test.
+10. **Quality gates all pass** — `cargo fmt`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo clippy -- -D warnings` (GTK), `cargo test --workspace --no-default-features` (5240/0/19, vimcode 5225 unchanged + quadraui 15 including 2 new), `cargo build` (both default + `--no-default-features`).
+11. **Net diff:** +296 / –52 lines across 8 files. `src/tui_main/render_impl.rs` shrinks by ~47 lines as the inline renderer becomes a delegation.
+12. **Awaiting smoke test.** TUI per-window status line should render identically and all clickable segments (mode / filename / cursor / language / indent / line ending / encoding / branch / LSP / toggles / notifications) must still open their existing pickers.
+
+---
+
+**Session 304 — Fix #154: startup tree-sitter parse on large files:**
+
+1. **Root cause.** `BufferState::update_syntax` unconditionally called
+   `Syntax::parse(&text)` at file-open time. On 100k+-line generated
+   files (Cargo.lock, logs) this blocked the main thread for 5–10s
+   during session restore. Discovered while investigating #153 (idle
+   CPU); the startup spike was independent of the idle loops.
+2. **New setting `syntax_max_lines` (default 20_000)** — matches
+   VSCode's tokenization cutoff. Buffers over the threshold render
+   as plain text. `BufferState::update_syntax` now short-circuits
+   before `syn.parse()` when `buffer.content.len_lines() > limit`;
+   `self.syntax` stays installed so raising the limit and calling
+   `update_syntax` again re-enables highlighting without reopening.
+3. **Threshold source** — module-level `AtomicUsize SYNTAX_MAX_LINES`
+   in `buffer_manager.rs` (mirrors `session::suppress_disk_saves`
+   `AtomicBool` pattern). Seeded by `Engine::new` from settings and
+   resynced by `Settings::set_value_str` whenever the value changes
+   via `:set` or the settings-panel form. Avoids threading `max_lines`
+   through 20+ `update_syntax` callsites.
+4. **Re-parse on setting change.** `execute_command` (for `:set`) and
+   `ext_panel.rs` settings-form `Return` handler both call
+   `update_syntax()` after writing the new value, so toggling the
+   limit takes effect immediately on the active buffer.
+5. **Testability.** `update_syntax` split into a pure
+   `update_syntax_with_limit(max_lines)` plus a facade that reads the
+   atomic. The gate-logic test uses `_with_limit` directly to avoid
+   racing on the process-wide atomic with parallel `Engine::new`
+   calls in other tests. Atomic-sync path is covered implicitly by
+   every test that opens a file via `Engine`.
+6. **Tests.** 1 new lib test in `buffer_manager::tests` covering:
+   small buffer → highlights populate, huge buffer at low threshold
+   → parse skipped + highlights empty + syntax still installed,
+   raising threshold → re-parse re-enables highlighting.
+7. **Quality gates all pass** — `cargo fmt` (my files clean; pre-existing
+   `spell.rs` diff on develop unchanged), `cargo clippy -- -D warnings`
+   (default + `--no-default-features`), full `cargo test --no-default-features`
+   (5225 / 0 / 19 vs. baseline 5223), `cargo build` (default +
+   `--no-default-features`). **Net diff:** +136 / –1 lines across 5
+   files (buffer_manager, execute, ext_panel, engine/mod, settings).
+8. **Awaiting smoke test.** Repro from #154: open vimcode on a saved
+   session that includes a 100k+-line file (e.g. a big workspace's
+   Cargo.lock). Expect instant startup. `:set syntax_max_lines?`
+   confirms the threshold; `:set syntax_max_lines=500000` re-enables
+   highlighting on the same buffer.
+
+---
+
+**Session 303 — Phase A.2b-2: GTK explorer atomic switchover (native `gtk4::TreeView` → `DrawingArea`):**
+
+1. **The `view!` macro block** for `explorer_panel` now holds a single
+   `#[name = "explorer_da"]` `gtk4::DrawingArea` instead of a
+   `ScrolledWindow` + `TreeView` with its inline 60-line
+   `EventControllerKey`. Mirrors the A.3c-2 settings-panel shape.
+2. **App struct** — removed `tree_store`, `tree_has_focus`,
+   `file_tree_view`, `name_cell`; added `explorer_sidebar_da_ref` and
+   `explorer_state: Rc<RefCell<ExplorerState>>`.
+3. **Imperative DA setup** (after the settings-DA block in `init`):
+   draw callback calling `draw_explorer_panel` with the adapter
+   `explorer::explorer_to_tree_view`, `GestureClick` left (single →
+   preview, double → open / toggle dir), `GestureClick` right (opens
+   context menu at click coords), `EventControllerKey` (routes to
+   `Msg::ExplorerKey`), and `EventControllerScroll` (wheel scroll).
+4. **All 14 right-click context-menu actions** preserved — new_file,
+   new_folder, rename, delete, copy_path, copy_relative_path, reveal,
+   select_for_diff, diff_with_selected, open_side, open_side_vsplit,
+   open_terminal, find_in_folder. Extracted into a dedicated
+   `show_explorer_context_menu()` helper on `App`.
+5. **Rename / new-file / new-folder inline editing deferred** — those
+   three actions now route through `Msg::PromptRenameFile`,
+   `Msg::PromptNewFile`, `Msg::PromptNewFolder`, each opening a simple
+   modal `gtk4::Dialog` with a `gtk4::Entry` (pre-selected stem for
+   rename, empty entry for new-file/folder). Inline text-cursor
+   rendering inside `draw_tree` rows is left for a follow-up session
+   once the `Form`/`TextInput` primitive ergonomics for row-embedded
+   input are proven.
+6. **Drag-and-drop** — the 100-line `DragSource` / `DropTarget` block
+   was removed; tracked as follow-up [#149](https://github.com/JDonaghy/vimcode/issues/149).
+7. **`SidebarPanel::Explorer` added to the `Msg::SwitchPanel`
+   `grab_focus` block** — per the A.3c-2 lesson, the activity-bar
+   `gtk4::Button` keeps focus after click; without this, keyboard
+   input silently goes nowhere.
+8. **App methods added**: `reveal_path_in_explorer` (replaces
+   `highlight_file_in_tree` callsites), `refresh_explorer`,
+   `explorer_viewport_rows`, `explorer_row_at`, `explorer_move_selection`,
+   `queue_explorer_draw`, `handle_explorer_da_key`,
+   `handle_explorer_da_click`, `handle_explorer_da_right_click`,
+   `show_explorer_context_menu`, `prompt_for_name`.
+9. **Deleted `src/gtk/tree.rs`** (503 lines). `validate_name` moved to
+   `src/gtk/util.rs`; all other helpers (`build_file_tree_*`,
+   `tree_row_expanded`, `update_tree_indicators`,
+   `selected_parent_dir_from_app`, `selected_file_path_from_app`,
+   `highlight_file_in_tree`, `find_tree_iter_for_path`,
+   `remove_new_entry_rows`, `TREE_DUMMY_PATH`) removed.
+10. **`start_inline_new_entry` replaced by `prompt_for_name`** — a
+    generic modal-dialog helper reused by all three rename/new-entry
+    prompts.
+11. **`update_tree_indicators` periodic refresh removed** — the DA
+    pulls indicators from `engine.explorer_indicators()` via the
+    adapter on every draw, so the 1 Hz tick just calls `queue_draw()`.
+12. **Quality gates all pass** — `cargo fmt`, `cargo clippy -- -D warnings`
+    (default + `--no-default-features`), full
+    `cargo test --no-default-features` (5223 / 0 / 19, same as
+    baseline), `cargo build` (default + `--no-default-features`).
+    **Net diff:** +936 / –1513 lines across 5 files (-577 net).
+    `src/gtk/mod.rs` shrinks from 10,161 → 10,070; `src/gtk/tree.rs`
+    (503 lines) deleted.
+13. **Known scope gaps (deferred):**
+    - Inline rename / new-entry editing inside `draw_tree` rows
+      (follow-up issue to file after smoke-test).
+    - Drag-and-drop (#149).
+    - Context-menu as a `quadraui` primitive (not yet specced).
+14. **Smoke-tested and shipped.** Two rounds of smoke-test fixes
+    landed as `c57f594` (click row offset, `j`/`k`/`h`/`l` nav,
+    trackpad scroll) and `26ed4e9` (scrollbar drag, folder
+    single-click toggle, sidebar-resize hit zone, Ctrl-W h
+    highlight). File-preview-on-single-click retested and working.
+    Issue #152 closed.
+
+---
+
+**Session 303 — Phase A.2b-1: GTK explorer scaffolding landed (inert):**
+
+1. **Scope decision.** The full A.2b migration (native `gtk4::TreeView`
+   → `DrawingArea` + `quadraui_gtk::draw_tree`) is a ~1500-line diff
+   across the `view!` macro, the App struct, ~50 scattered `Msg`
+   handlers that reference `file_tree_view` / `tree_store` / `name_cell`,
+   plus a 310-line right-click context-menu rewrite. Rather than land
+   that atomically, the work was split into two sub-phases (recorded
+   in `PLAN.md`) so the new draw pipeline can be validated before the
+   destructive switchover.
+2. **New `src/gtk/explorer.rs`** — module with:
+   - `ExplorerRow { depth, name, path, is_dir, is_expanded }`
+   - `ExplorerState { rows, expanded, selected, scroll_top }` with
+     `new`, `rebuild`, `toggle_dir`, `ensure_visible`, `reveal_path`.
+   - `build_explorer_rows(root, expanded, show_hidden, case_insensitive)`
+     + `explorer_to_tree_view(state, has_focus, engine)` adapter.
+   - Intentionally duplicates the TUI's `ExplorerRow` / `collect_rows`
+     shape; unifying the two into `render.rs` is a future session.
+3. **New `draw_explorer_panel` in `src/gtk/draw.rs`** — calls
+   `quadraui_gtk::draw_tree` and overlays a Cairo scrollbar using the
+   same 8px-wide pattern as `draw_settings_panel` (A.3c-2). Row height
+   (`line_height * 1.4`) is kept in sync with `draw_tree` so the
+   visible-row count used by the scrollbar matches the rendered layout.
+4. **Sub-phase 1 is inert** — both additions are `#[allow(dead_code)]`;
+   the file tree still renders via the native `gtk4::TreeView`.
+   Sub-phase 2 flips the wiring and deletes the dead widget code.
+5. **All quality gates pass** — `cargo fmt`, `cargo clippy` (default +
+   `--no-default-features`), full `cargo test --no-default-features`
+   (5223 / 0 / 19, same as baseline), `cargo build` (default + `--no-default-features`).
+   **Net diff:** +319 / –0 lines (explorer.rs new, plus draw.rs +
+   mod.rs additions). Zero behavioural change.
+
+---
+
+**Session 302 — Phase A.3c-2 shipped (GTK settings panel → DrawingArea + draw_form):**
+
+1. **GTK settings sidebar migrated** from a native widget tree
+   (`Switch`/`SpinButton`/`Entry`/`DropDown`/`Button` rows inside a
+   `ScrolledWindow`) to a single `DrawingArea` that calls
+   `quadraui_gtk::draw_form` (which has existed since A.3c). The panel
+   is now visually consistent with the TUI A.3b version and gains
+   in-place rendering of inline-edit cursor + bracketed value overlay.
+2. **New `draw_settings_panel` in `src/gtk/draw.rs`** — header bar +
+   search row (with cursor when active) + form body (via the
+   primitive) + scrollbar column + `Open settings.json` footer row.
+   Geometry contract documented in the doc comment so the click
+   handler in `App::handle_settings_msg` mirrors row positions.
+3. **New `App::handle_settings_msg` in `src/gtk/mod.rs`** — handles
+   `Msg::SettingsKey` / `SettingsClick` / `SettingsScroll`. Click
+   geometry: header → no-op, search → activate input, scrollbar track
+   → jump-scroll, body row → select (double-click toggles bools or
+   opens inline-edit for Integer/StringVal), footer → open
+   `settings.json` in a new tab. Mouse wheel scrolls 3 rows per notch.
+4. **Focus routing (the bug that surfaced during smoke test)** — the
+   activity-bar `gtk4::Button` keeps focus after click, so neither the
+   editor DA's key controller (capture phase, attached to the editor
+   DA) nor the new settings DA's controller fired for `j`/`k`/`/`.
+   Fixed by adding `SidebarPanel::Settings` to the per-panel
+   `grab_focus` block in `Msg::SwitchPanel` *and* calling
+   `da.grab_focus()` inside the click handler. The same pattern
+   already existed for SC / Extensions / Debug / AI — captured in
+   PLAN.md "Lessons learned" so future panels don't miss it.
+5. **Removed the dead `build_settings_form` / `build_setting_row`
+   from `src/gtk/util.rs`** (–206 lines). Removed the
+   `settings_list_box` / `settings_sections` `App` fields and the
+   panel-rebuild block on `SwitchPanel(Settings)` (DrawingArea is
+   stateless). Re-exports of `SettingDef`/`SettingType`/`SETTING_DEFS`
+   from `src/render.rs` removed (no longer needed).
+6. **`SettingType::Integer { min, max }` annotated `#[allow(dead_code)]`**
+   with a comment explaining the values are kept for future
+   range-aware Form widgets (Slider per #143). Currently no backend
+   reads them now that GTK no longer renders a `SpinButton`.
+7. **All quality gates pass** — `cargo fmt`, `cargo clippy`
+   (default and `--no-default-features`), full
+   `cargo test --no-default-features` (5223 / 0 / 19, same as
+   baseline), `cargo build`. **Net diff:** +513 / –302 lines across
+   5 files; `src/gtk/util.rs` shrinks from 482 → 276 lines.
+8. **Next up:** Phase A.2b (GTK explorer native `gtk4::TreeView` →
+   `DrawingArea` + `quadraui_gtk::draw_tree`) is the only remaining
+   large GTK migration on Linux. A.1c / A.2c need Windows.
+
+---
+
+**Session 301 — Fix #151: TUI palette scrollbar now draggable:**
+
+1. **Mouse-drag on the TUI palette scrollbar thumb (and track-click jump)
+   now scrolls the result list** — surfaced while smoke-testing A.4b
+   (c8f2d91). The scrollbar drawn by both `quadraui_tui::draw_palette`
+   (flat palettes) and the legacy preview-pane renderer
+   (`render_picker_popup`) was render-only.
+2. **`dragging_picker_sb: Option<SidebarScrollDrag>`** added to the TUI
+   event loop and threaded into `handle_mouse`. Hit-test on mouse-down
+   (col == popup_x + popup_w - 2, within the results-row band) both
+   jump-scrolls to that row *and* starts a drag; mouse-drag updates
+   `engine.picker_scroll_top` via the standard ratio; mouse-up clears
+   the drag. Matches the existing `dragging_settings_sb` pattern.
+3. **Only the TUI scope of #151 is addressed here.** The GTK palette has
+   the same unwired scrollbar but is explicitly called out in the issue
+   as a follow-up (GTK `draw_palette` lacks hit regions).
+4. **No new tests** — scrollbar drag is pure TUI interaction that would
+   need a ratatui/crossterm harness that doesn't exist in this repo.
+   All existing 5223 tests pass; fmt + clippy (default + no-default-features)
+   + cargo build all clean.
+
+---
+
+**Session 300 — Phase A.4b shipped + quickfix fixes around A.5b:**
+
+1. **`quadraui_gtk::draw_palette`** added as the Cairo/Pango counterpart to
+   A.4's TUI renderer. Bordered popup (Cairo stroke instead of box
+   chars), title `Title  N/M`, query row with cursor block, separator,
+   scrollable item rows with Pango per-character fuzzy-match
+   highlighting, right-aligned detail, optional scrollbar.
+2. **GTK picker migrated** — `draw_picker_popup` early-branches through
+   `render::picker_panel_to_palette()` + `draw_palette` for flat pickers
+   (command palette, buffer switcher, mark jumper, git-branch picker,
+   diagnostic list). Preview / tree pickers (open-file, symbols) keep
+   the legacy Cairo renderer, matching the TUI fall-through.
+3. **A.5b smoke-test fallout handled on the way:** clearing quickfix
+   focus on editor click (GTK + TUI), focusing the quickfix panel on
+   `:grep` and `gr` (closes #150), and fixing TUI j/k/q key dispatch
+   (engine intercept now normalises `key_name=""` + `unicode=Some(c)`
+   to a single char string so handler `match` arms work across both
+   backends). 2 new lib tests.
+4. **Test count 5219 → 5223** from focus/normalisation tests added in
+   A.5b follow-ups. All quality gates pass (fmt, clippy on both
+   builds, full test suite, cargo build).
+5. **Next up:** A.3c-2 (settings native→DrawingArea) and A.2b
+   (explorer native→DrawingArea) remain as the larger architectural
+   migrations on Linux.
+
+---
+
+**Session 299 — Phase A.5b shipped (GTK `draw_list` + quickfix migration):**
+
+1. **`quadraui_gtk::draw_list`** added as the Cairo/Pango counterpart to
+   A.5's TUI renderer. Optional title header in status-bar styling,
+   flat rows at `line_height`-per-row, `▶ ` selection prefix, optional
+   icon + detail, decoration-aware fg colour (Error/Warning/Muted/Header).
+2. **GTK quickfix migrated** (`draw_quickfix_panel` in `src/gtk/draw.rs`)
+   from an inline Cairo loop to a thin wrapper around
+   `render::quickfix_to_list_view()` (the adapter already existed from
+   A.5) + `draw_list`. Keeps scroll-to-selection behaviour. Net delta
+   -38 lines of GTK rendering code.
+3. **`quadraui/docs/DECISIONS.md`** — new running decision log
+   for primitive-distinctness calls. D-001 records the retroactive
+   rationale for `ListView` being separate from `TreeView`; D-002
+   recommends the same call for `DataTable` #140. Establishes the
+   principle *"one primitive per UX concept, not per algebraic
+   reduction"*.
+4. **Test count unchanged at 5219** — pure refactor, no new tests. All
+   quality gates pass (fmt, clippy on both no-default-features and
+   default GTK build, full test suite, cargo build).
+5. **Next up:** A.4b (GTK `draw_palette`) remains the smallest unblocked
+   GTK stage. A.3c-2 (settings native→DrawingArea) and A.2b (explorer
+   native→DrawingArea) are the bigger architectural migrations still
+   queued on Linux.
+
+---
+
+**Session 297 (continued) — Phase A.0 + A.1a shipped after the release:**
+
+1. **Codified branch-first workflow in CLAUDE.md** — all changes go through a local branch off `develop`; no direct commits to `develop`. After local commit, user chooses either Path A (fast-forward merge + push) or Path B (push branch + open PR).
+2. **Tightened the test-gate in CLAUDE.md** — pre-release must run full `cargo test --no-default-features`, not just `--lib`. The `--lib` shortcut missed the 2 integration test regressions that broke CI on the v0.10.0 merge (#114 follow-up, landed as `83d93b3`).
+3. **Phase A.0 shipped** (`36ccad3`) — added `quadraui/` workspace member + `vimcode` path dep. Placeholder lib.rs, no primitives. Zero functional change.
+4. **Phase A.1a shipped** (`bac137e`) — first real primitive migration:
+   - Defined `quadraui::types` (Color, Icon, StyledText, WidgetId, Modifiers, TreePath, SelectionMode, Decoration, Badge, TreeStyle) and `quadraui::primitives::tree` (TreeView, TreeRow, TreeEvent). All owned + serde-compatible per plugin invariants.
+   - Added `render::source_control_to_tree_view()` adapter (vimcode → quadraui).
+   - New `src/tui_main/quadraui_tui` module with `draw_tree()` rendering TreeView into a ratatui Buffer.
+   - TUI source-control panel's ~230-line section-rendering loop replaced with one `draw_tree()` call — no visible regression, smoke-tested.
+   - Full-gate passes: 5219 tests, 0 failed.
+5. **Added `PLAN.md`** — session-level coordination doc for in-flight multi-stage features. Captures current stage map, branch patterns, pickup instructions for A.1b (GTK) and A.1c (Win-GUI) on another machine, and the design invariants that must be preserved across all stages.
+
+**Next up:** Phase A.1b (GTK `draw_tree`) and A.1c (Win-GUI `draw_tree`) are independent and can be done in either order. See PLAN.md for branch names and per-platform setup.
+
+---
+
+**Session 297 — `quadraui` cross-platform UI crate design + v0.10.0 release:**
+
+1. **Design doc `quadraui/docs/UI_CRATE_DESIGN.md` finalised** — captures the full plan for extracting a `quadraui` crate supporting Windows (Direct2D), Linux (GTK4), macOS (Core Graphics, v1.x), and TUI (ratatui) backends. vimcode becomes the first test app; other keyboard-driven apps (SQL client, k8s dashboard) are the second-wave consumers that prove the abstraction.
+2. **13 design decisions resolved** in §7: retained-tree + events model, one `Backend` trait, `BufferView` adapter for `TextEditor` (text engine stays separate), a11y-ready data fields in v1 with platform wiring in v1.1, Option B workspace layout (`quadraui/` as workspace member from day 1), `quadraui` as working crate name (crates.io available), stage-by-stage PRs to develop instead of long-lived refactor branch, macOS ships in v1.x not blocking 1.0.
+3. **Plugin-friendly design invariants** documented in §10 — 6 properties (`WidgetId` owned not `&'static`, events dispatched as data not closures, serde-compatible structs, no global event handlers, ownership model) that must hold so Lua plugins can later declare quadraui primitive UIs without breaking API changes.
+4. **9 new GitHub issues filed** under new **"Cross-Platform UI Crate"** milestone: #139 TreeTable primitive, #140 DataTable (decide: standalone or TreeTable-with-depth-0), #141 Toast primitive, #142 Spinner+ProgressBar, #143 Form fields (Slider/ColorPicker/Dropdown), #144 live-append TextDisplay streaming, #145 k8s dashboard as Phase D validation app, #146 Lua plugin API extension for quadraui primitives, #147 bundled Postman-like HTTP client extension (depends on #146).
+5. **Release 0.10.0** cut from develop as a stable baseline before Phase A work begins — bumped `Cargo.toml` 0.9.0 → 0.10.0, regenerated `flatpak/cargo-sources.json` (635 crate entries). All quality gates pass: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test --no-default-features --lib` (1939 passed / 0 failed / 9 pre-existing ignored), `cargo build`.
+6. **Next step — Phase A.0 workspace scaffold**: single PR adding empty `quadraui/` workspace member + vimcode path dep. Then Phase A stages migrate panels one at a time (TreeView → SC panel, then explorer, then Form → settings, etc.).
+
+**Session 295 — Phase 5 (#26) begins: `g`-prefix coverage audit:**
+
+1. **Started Phase 5 `:help` coverage audit** — a new kind of conformance work that catches missing features rather than behavioural bugs. Scope: walk Vim's documentation section by section.
+2. **First slice: `g`-prefix normal-mode commands** — 58 commands total. ✅ 36 implemented, 🟡 2 partial, ❌ 14 not implemented, ⏭️ 6 intentionally skipped (Ex mode, Select mode, mouse tag nav, debug features, redundant with VimCode's status bar).
+3. **4 gap issues filed** for actionable missing features:
+   - **#120** `gF` — edit file + jump to line number (the \`:N\` suffix case)
+   - **#121** `g@` — user-definable operator via \`operatorfunc\` (enables plugin-defined operators)
+   - **#122** `g<Tab>` — jump to last-accessed tab
+   - **#123** Screen-line motions: \`g\$\`, \`g0\`, \`g^\`, \`g<End>\`, \`g<Home>\`
+4. **New `COVERAGE_PHASE5.md`** — living document tracking the Phase 5 audit by slice.
+
+**Session 294 — Fix #114: ex-command numeric line addresses are now 1-based:**
+
+1. **Fix #114 — `parse_line_address` now 1-based for bare numbers** — Matches Vim's convention throughout. `":3"` → index 2, `":0"` → index 0 (used by copy/move as "before line 1"). Relative addresses (`+N`, `-N`, `.`, `$`) unchanged — they were already correct.
+2. **Added `dest_is_zero` special case** to `execute_copy_command` (the single-line form) so `:copy 0` inserts at top, matching the existing range-version behaviour.
+3. **6 existing tests updated** to encode 1-based semantics (`:1,2co3`, `:1m3`, `:t3`, `:m3`, `:co2`, `:copy 2`); 4 new tests added covering 1-based specifically and the `:N m 0` / `:copy 0` special case.
+
+**Session 293 — Fix #116 visual block virtual-end append:**
+
+1. **Fix #116: `<C-v>jj$A<text>` now appends at each line's actual end** — Extended `visual_block_insert_info` tuple with a `virtual_end: bool` flag. When `$` is pressed in visual block mode (sets `visual_dollar = true`), `A` captures that flag and the Esc handler appends `<text>` at each selected line's own end instead of the captured column. Correctly clarified the ignored test's keystroke sequence — the virtual-end trigger is `<C-v>...$A`, not `$<C-v>...A`.
+
+**Session 292 — Phase 4 batch 16 (#25), 18 new conformance tests, #116 filed:**
+
+1. **Phase 4 batch 16: 18 new Neovim-verified tests** — Covering visual block `I` (insert prefix), visual block `A` (append suffix), `:noh` clears search highlights, `:r` on nonexistent file, `:retab` tab-to-spaces, lowercase marks (`ma` / `'a` / `` `a ``), `n` with no prior search, word motions at EOF/BOF, visual indent/dedent (`V>`, `V<`), `5rX` count-prefix replace, `dap` delete-around-paragraph, `.` repeat last change, `u`/`<C-r>` undo-redo, `:set tabstop?` query.
+2. **#116 filed** — Visual block started with `$<C-v>jjA` should virtual-append at each line's actual end (Vim behavior). VimCode uses the starting cursor column, so appending on a longer line inserts mid-word instead of at the end.
+
+**Session 291 — Fix #112: ranged/concat/bang ex-command forms, #114 filed:**
+
+1. **Fix #112 — Ranged `:copy`/`:move`, concat `:tN`/`:mN`/`:coN`, `:sort!`** — Added `execute_copy_range()` and `execute_move_range()` helpers with 1-based range semantics matching Vim. Extended `try_execute_ranged_command()` to dispatch `m`/`move`/`t`/`co`/`copy` keywords. Added `split_cmd_and_arg()` helper that matches a command name followed by a valid separator (digit/space/sign/`./$`). Accepted `:sort!` bang as reverse synonym.
+2. **#114 filed** — VimCode's `parse_line_address` treats numeric dest as 0-based, but Vim uses 1-based throughout. Fix requires auditing existing callers; scoped as a separate issue so this PR stays focused.
+3. **12 new unit tests** covering all new forms + regressions (`:0` still goes to line 0, `:sort r` still works).
+
+**Session 290 — Phase 4 batch 15 (#25), 23 new conformance tests, #112 filed:**
+
+1. **Phase 4 batch 15: 23 new Neovim-verified tests** — Covering `:copy`/`:move` (simple form), `:sort` (basic and reverse via `r` flag), `:sort u` unique, `gi` restart insert, `gv` reselect last visual, jump list (`<C-o>`/`<C-i>`), change list (`g;`), `:enew`, window move (`<C-w>H`), case operators (`gUw`, `guiw`, `g~w`), count+operator (`3dw`, `2cwXYZ`), text object edges (`daw` at word boundary, `das`), `:set number`/`nonumber`, `:pwd`.
+2. **#112 filed** — Collected deviations discovered during mining: ranged `:copy`/`:move` forms don't accept range prefixes; `:t<N>` / `:m<N>` / `:co<N>` concatenated forms not recognized; `:sort!` bang not parsed (users must use `:sort r` for reverse).
+
+**Session 289 — Phase 4 batch 14 (#25) + fixes for #109 and #110:**
+
+1. **Phase 4 batch 14: 25 new Neovim-verified tests** — Covering areas still uncovered: named registers (`"ayy`/`"ap`/`"Ayy`/`"add`), folding (`zf`/`zR`/`zd`), window splits (`<C-w>s/v/w/q/o`, `:split`, `:vsplit`), `:echo`, `:w` error case, word-end motions (`e`, `ge`), increment/decrement edge cases, search history, numeric `:N` and `:N,M` ranges.
+2. **Fix #109: Ctrl-A/Ctrl-X now parse hex (`0x..`) numbers correctly** — Added hex-prefix detection in `increment_number_at_cursor()` so cursor landing on or before the leading `0` of `0x09` now increments as hex → `0x0a` instead of decimal `1x09`. Also covers `-0x..`. 2 extra tests added (cursor-inside-hex, decrement).
+3. **Fix #110: Yank to named register no longer overwrites register 0** — Updated `set_yank_register()` to only update `"0` when the target is the unnamed register (`"`). Matches Vim's `:help registers` semantics.
+4. **Closed #60** housekeeping (PR #106 was already merged but issue wasn't auto-closed).
+
+**Session 288 — #107 git_branch_changed plugin event (follow-up to #60):**
+
+1. **Fire `git_branch_changed` plugin event** from `tick_git_branch()` when an external branch change is detected. Plugins (e.g. git-insights panel) can now subscribe via `vimcode.on("git_branch_changed", fn)` and refresh their UI instead of going stale.
+2. **No new Lua API surface** — plugins already have `vimcode.git.branch()` to re-query state on the event.
+3. **2 new unit tests**: plugin event fires on change, does NOT fire when branch unchanged (1815 → 1817 lib tests).
+4. **EXTENSIONS.md updated** with the new event.
+
+**Session 287 — Fix #60 Git branch status bar refresh:**
+
+1. **Fix #60: Status bar now detects external branch changes** — Added `tick_git_branch()` method on Engine that polls `git::current_branch()` at most once per 2 seconds and returns `true` if the branch changed. Wired into all three backends (GTK, TUI, Win-GUI) via their existing tick loops; a detected change triggers a redraw.
+2. **2 new unit tests** (rate-limit + change detection) — 1813 → 1815 lib tests.
+
+**Session 286 — Fix #101 Replace mode Esc cursor position:**
+
+1. **Fix #101: Replace mode cursor stepback on Esc** — `handle_replace_key` Esc handler in `src/core/engine/motions.rs` was missing the cursor-step-back that Insert mode already had. Added the same `col > 0 → col -= 1` logic. Also covers `gR` virtual replace.
+2. **2 previously-ignored tests now passing** (1811 → 1813 lib, 11 → 9 ignored).
+
+**Session 285 — Phase 4 batch 13 (#25), 25 new conformance tests, 0 new deviations:**
+
+1. **Phase 4 batch 13: 25 new Neovim-verified tests** — Covering substitute (`:s/`, `:%s/`, flags `g`/`i`, empty replacement, no-match), global (`:g/pat/d`, `:v/pat/d`), tab navigation (`:tabnew`, `gt` cycle), G-motions (`dG`, `dgg`, `yG`), bigword motions (`W`, `B`, `E`, `gE`), f/F with count, comma-reverse, `%` bracket matching, register `"1` (last delete), linewise paste (`yyp`, `yyP`).
+2. **All 25 tests pass on first run** — no new deviations discovered in these areas.
+
+**Session 284 — Phase 4 batch 12 (#25), 27 new conformance tests, 1 new deviation (#101):**
+
+1. **Phase 4 batch 12: 27 new Neovim-verified tests** — Covering areas previously under-tested: search (`/`, `?`, `n`, `N`, count prefix, wrap-around), scroll commands (`zz`, `<C-d>`, `<C-u>`, `<C-b>`), number increment/decrement (`<C-a>`, `<C-x>` with count and negatives), replace mode (`R`, `r<CR>`, `3rX`), case change (`gUU`, `guw`, `gUw`), and count+motion combos (`5l`, `3j`, `3dd`, `3yy+p`).
+2. **1 new deviation documented (#101)**: Replace mode cursor lands at col+1 after `<Esc>` instead of on the last replaced char (Vim behavior). Documented as 2 ignored tests.
+
+**Session 283 — Fix 3 Vim deviations (#97, #98, #99):**
+
+1. **Fix #97: Visual line J now joins selected lines** — Added `J` handler in visual mode operator dispatch. `VjjJ` correctly joins all selected lines.
+2. **Fix #98: :%join range now supported** — Added `%` range prefix handling in `execute_command()`. Also supports `%d` and `%y`.
+3. **Fix #99: Ctrl-U in insert mode respects insert point** — Added `insert_enter_col` field to track where insert mode was entered. Ctrl-U now deletes only back to that boundary instead of line start.
+4. **Closed #65** (already fixed in session 282, issue left open).
+5. **4 previously-ignored tests now passing** (1757 → 1761 lib tests).
+
+**Session 282 — Insert paste fix (#65), Phase 4 batches 10-11 (#25), 8 deviations fixed:**
+
+1. **Fix #65: Ctrl-V paste in insert mode added cumulative indentation** — `paste_in_insert_mode()` was applying auto-indent to each pasted line, causing a staircase effect. Fixed by suppressing auto-indent during paste (pasted text already has its own whitespace).
+2. **Phase 4 batches 10-11 (#25): 58 new Neovim-mined tests** — Mined from test_undo.vim, test_change.vim, test_put.vim, test_marks.vim, test_registers.vim, test_join.vim. Covering: undo/redo (5), put/paste (7), change operations (11), text objects (9), marks (4), registers (6), macros (2), join edge cases (5), insert mode keys (3), changelist navigation (2).
+3. **Fixed 8 Vim deviations**: Vc/Vjc visual line change ate trailing newline; r\<CR\> was a no-op; S didn't preserve indent; daw at end of line didn't consume leading whitespace; tick mark jump ('a) went to col 0 instead of first non-blank; feed_keys didn't drain macro playback queue; updated test_visual_line_change to correct Vim expectation.
+4. **3 new deviations documented** (ignored tests): visual J in line mode, :%join range not supported, Ctrl-U in insert deletes to line start instead of insert start.
+
+---
+
+
 
 **Session 280 — Fix 6 Vim deviations (#28-#33), Neovim conformance harness:**
 Fix #31 (2d2w count multiplication), #32 (<G send_keys parser), #30 (di</da< angle brackets), #29 (da"/da' trailing whitespace), #28 (d}/d{ paragraph boundary), #33 (c+Esc cursor). Neovim conformance test harness: 31 automated tests comparing VimCode vs Neovim headless.
@@ -1043,3 +3722,44 @@ Ctrl+F while terminal has focus opens inline find bar replacing tab strip; case-
 **Session 158:** VSCode Mode Gap Closure Phases 1–3 — Alt key routing (TUI+GTK encode Alt+key→`"Alt_Up"` etc.), line operations (move/duplicate/delete/insert line), multi-cursor (Ctrl+D progressive select + `vscode_select_all_occurrences()`, extra selections rendering, same-line char-index descending sort), indentation (Ctrl+]/[ multi-cursor aware), panel toggles (Ctrl+J/Ctrl+`→`EngineAction::OpenTerminal`, Ctrl+B sidebar, Ctrl+, settings), quick nav (Ctrl+G with `ensure_cursor_visible()`, Ctrl+P/Shift+P), Ctrl+K chord prefix, GTK terminal mouse off-by-one fix, bottom panel sans-serif UI font; 55 tests in `tests/vscode_mode.rs`. 2985 total.
 
 **Session 159:** Tree-sitter upgrade + TUI fixes, v0.3.2 — Upgraded tree-sitter from 0.20→0.24 with all grammar crates. Added YAML and HTML syntax highlighting (17 languages total). Fixed YAML key/value color distinction (query overlap). TUI tab rendering fix (expand literal tabs to spaces, visual-column positioning for cursor/ghost text/selections/brackets). TUI activity bar icons: off-white color + `▎` accent bar for active panel. C# query fixes for updated grammar. 2985 total.
+
+**Session 347 (May 1–2, 2026):** #166 diff-pane alignment + #296 Debug sidebar MSV migration + GTK rename catch-up. Three items landed via Path A on develop: (1) `b29a218` — diff panes no longer drift past the first hunk; `view.aligned_top: Option<usize>` pins both panes to one shared aligned-row index; `clear_all_diff_alignment()` helper; 2 regression tests. (2) `6d70dba` — GTK rename catch-up (`multi_section_view_layout` → `gtk_msv_layout`). (3) `285916b` — Debug sidebar migrated to `quadraui::MultiSectionView`; `render::debug_sidebar_to_multi_section_view` adapter (4 EqualShare sections, PerSection scroll); both TUI + GTK paint through `draw_multi_section_view`; click/scroll read cached `MultiSectionViewLayout` verbatim (never re-derive); fixed pre-existing TUI bug where debug-output panel click handler missing `col >= editor_left` intercepted sidebar clicks; net −139 LOC. Key lesson codified in CLAUDE.md "Paint↔click integration pattern": click never re-derives layout; paint caches it, click reads verbatim.
+
+**Sessions 340–344 (Apr 29–30):** Phase C completion + MSV primitive + quadraui extraction. Session 340: #266/#267/#270/#271 shipped (RichTextPopup, Dialog, GtkBackend runner, FindReplacePanel). Session 341: Phase C stages 2–4 (#277 Scrollbar, #278 settings chrome, #279 MessageList). Session 342: Phase C Stage 1 — `quadraui::Editor` primitive + dual rasterisers, net −1456 LOC vimcode-private paint. Session 343: TUI/GTK paint duplication arc closed (#283/#285/#286/#280/#281), Phase C umbrella #275 closed. Session 344: `MultiSectionView` primitive shipped (#293), first MSV consumer (Extensions sidebar).
+
+**Session 346 (Apr 30):** Harness-first course correction. Pivoted from failed #296 attempts (4 sessions / 8 commits on abandoned branch) to structural fix: #297 cell_quantum integer-snap, #298 TUI MSV round-trip harness, #299 TUI TreeView harness, #300 quadraui extracted to own repo at github.com/JDonaghy/quadraui. Migration prerequisites rule added to CLAUDE.md. 4 vimcode issues gained `blocked` label with cross-repo prereq links.
+
+**Session 348 (May 3, 2026):** #306 debug sidebar chrome → `StatusBar` (`368bbcb`); #303 debug output → `TextDisplay` with scrollbar (`70d4eef`), GTK gained scroll parity; `debug_output_scroll` moved from TUI local to engine field. Platform-neutrality rule codified in CLAUDE.md. quadraui #46 (TextDisplay scrollbar), #47 (dispatch_scroll), #48 (dispatch_click) built to unblock #303.
+
+**Session 349 (May 4, 2026):** #304 bottom panel tabs → `quadraui::TabBar` (`5d7fa09`). `render::build_bottom_panel_tab_bar()` adapter builds TabBar with `show_tab_close: false`; both TUI + GTK paint through `Backend::draw_tab_bar()`, click through `Engine::handle_bottom_tab_bar_click()`. quadraui gained `TabBar.show_tab_close: bool` field (`b9d62cd`) — suppresses per-tab close buttons in both backend rasterisers. All quadraui cross-repo prereqs (quadraui#2, #6, #7) confirmed CLOSED; vimcode #301 and #302 unblocked. Remaining bespoke surfaces: 3 (#301 menu bar, #302 search panel, #305 terminal toolbar).
+
+**Session 350 (May 4, 2026):** #305 terminal toolbar → `quadraui::StatusBar` (find mode) + `quadraui::TabBar` (tab strip mode) (`08dd916`). Both backends paint through `render::build_terminal_toolbar()`. Click dispatch via shared `Engine::resolve_terminal_toolbar_click()`. quadraui gained rect-height-aware tab bar (quadraui#49) and compact mode (quadraui#50). CLAUDE.md gained no-cross-repo-edits rule.
+
+**Session 351 (May 4–5, 2026): ALL BESPOKE PAINT SURFACES ELIMINATED.** Five issues shipped:
+- **#301** (PR #309, `5baadcc`) — Menu bar labels → `quadraui::MenuBar`. `render::build_menu_bar_view()` adapter. Click/hover via cached `MenuBarLayout::hit_test()`. Net -26 lines.
+- **#310** (`b5fdd7d`) — Command center (nav arrows + search box) → `quadraui::CommandCenter`. `render::build_command_center_view()` adapter. Net -155 lines. GTK window drag preserved (don't claim `Bar` hits). Filed quadraui#51 for the primitive.
+- **#302** (multiple commits → `de625bb`) — Search panel → `quadraui::MSV + Form + TreeView`. Two-section MSV: Section 0 = Form (query/replace TextInput, ToggleGroup, ButtonRow, ReadOnly status), Section 1 = TreeView (file-grouped results with Decoration::Header). `render::build_search_panel_msv()` adapter. Shared click dispatch: `handle_search_form_hit()` + `handle_search_tree_hit()`. GTK migrated from native widgets (Entry/ToggleButton/ListBox) to DrawingArea + same MSV pipeline. Replace All gained confirmation dialog. Engine gained `project_search_status`, `search_file_expanded`, `search_panel_form_focus` (RefCell), caret tracking (Cell). Key lesson: always use `backend.msv_layout()` / `backend.form_layout()` / `backend.tree_layout()` for click dispatch — never compute layout manually with guessed metrics. quadraui gained: ToggleGroup + ButtonRow (quadraui#52), full-width Form fields when label empty (quadraui#54), GTK Pango-based form_layout (quadraui#56), GTK Pango-based menu_bar_layout (quadraui#57). Net TUI -321 paint -86 click; GTK -226 native widgets.
+- **#290** (`0a8f46f`) — TUI extension panel search input no longer drops r/i/d/q// chars. Guard shortcut mappings with `!input_active` so they fall through to Char(ch) arm when typing.
+- **#291** (`924aa24`) — Arrow keys navigate extension panel results while search input active. Down/Up always map to "Down"/"Up" key names; engine handles them in input_active block. Enter opens selected result. GTK fixed by engine change alone.
+Follow-ups filed: #308 (menu bar keyboard/hover dispatch gaps), #311 (search panel arrow key cursor movement), #312 (Ctrl-Shift-F visual selection prepopulate). quadraui#53 (Form gaps: textarea, validation, password, segmented control) filed as backlog.
+
+### Session 353 (2026-05-06)
+
+- **#307 Batches 2-5** — All scrollable surfaces migrated to dispatch_scroll/dispatch_click. Removed ~200 lines bespoke scroll/click handlers.
+- **#242 closed** — TUI debug sidebar scrollbar click via dispatch_click.
+- **#246 closed** — TUI panel scrollbar colors unified to theme.scrollbar_thumb/track.
+- **#308 item 3** — TUI menu bar hover-to-switch via cached MenuBarLayout.
+- **#319 Step 1** — `Engine::handle_menu_key()` + `MenuKeyResult` landed. quadraui#61 (`ContextMenu::move_selection/first_selectable`) shipped.
+- **#319 Steps 2-4 reverted** — 3 attempts at per-backend GTK overlay code for menu dropdown, each with different bugs (wrong anchor, wrong font, broken arrow keys). All reverted. Root cause: forked code paths between TUI and GTK. CLAUDE.md updated with negative example.
+- **Issues filed:** #315-#319.
+
+### Session 354 (2026-05-06, continued)
+
+- **#319 MenuSystem migration** — Complete rewrite of menu bar + dropdown using `quadraui::MenuSystem` compose helper. 681 net lines removed (462 added, 1143 deleted across 9 files).
+  - quadraui shipped: `MenuSystem` (#62), `MenuSystem::menu_bar()` accessor, `MenuOverlay` helper, `draw_menu_bar` vertical centering fix, dropdown item padding.
+  - Engine: `MenuSystem` as `Rc<RefCell<MenuSystem>>` on Engine. `dispatch_menu_action()` replaces `menu_activate_item()`. Old fields gated behind `#[cfg(feature = "win-gui")]`.
+  - render.rs: `build_menu_defs(is_vscode_mode)` converts `MENU_STRUCTURE` to `Vec<MenuDef>`. Removed `MenuBarData`, `menu_dropdown_to_quadraui_context_menu()`, `build_menu_bar_view()`, `menu_dropdown_action_index()`.
+  - TUI: Single `MenuSystem::handle()` intercept in event loop replaces ~160 lines (keyboard + mouse handlers). `MenuSystem::render()` at end of frame for dropdown.
+  - GTK: `quadraui::gtk::MenuOverlay` helper (30 lines) replaces 141 lines of hand-rolled overlay DA code. Menu bar DA uses `backend.draw_menu_bar()` with `menu_system.menu_bar()`. Keyboard handler routes UiEvent through `MenuSystem::handle()`.
+  - Key lessons: (1) Never add per-backend code — use quadraui abstractions. (2) `GtkBackend` needs `set_pango_context()` + `begin_frame()` at init for `menu_bar_layout()` to work outside `enter_frame_scope`. (3) GTK `set_titlebar()` moves the menu bar above the overlay DA — `MenuOverlay` handles the negative-y coordinate transform. (4) `bar_rect.height` should be the full titlebar DA height so `draw_menu_bar` centres labels to match the command centre.
+  - Remaining: GTK dropdown item spacing slightly tight (quadraui rendering bug, tracked separately).

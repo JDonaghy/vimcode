@@ -68,6 +68,12 @@ impl Engine {
             return EngineAction::OpenTerminal;
         }
 
+        // Handle :TerminalMaximize / :TerminalMax — toggle maximize on the
+        // terminal panel. Backend supplies the available-row count.
+        if cmd == "TerminalMaximize" || cmd == "TerminalMax" {
+            return EngineAction::ToggleTerminalMaximize;
+        }
+
         // Handle workspace / folder commands (both user-typed names and menu action strings)
         if cmd == "OpenFolder" || cmd == "open_folder_dialog" {
             return EngineAction::OpenFolderDialog;
@@ -230,18 +236,29 @@ impl Engine {
             match crate::core::dap_manager::DapManager::adapter_for_language(lang_id) {
                 Some(info) => {
                     let adapter_name = info.name;
-                    // Look up matching extension by language_id
-                    let ext_name = self
-                        .ext_available_manifests()
-                        .into_iter()
-                        .find(|m| {
-                            m.language_ids.iter().any(|l| l == lang_id)
-                                || m.dap.adapter == adapter_name
-                        })
-                        .map(|m| m.name.clone());
+                    // Look up matching extension by language_id ONLY. The old
+                    // logic also matched on `m.dap.adapter == adapter_name`,
+                    // but multiple extensions can ship the same adapter
+                    // binary (codelldb is bundled by both `rust` and `cpp`),
+                    // so `:DapInstall rust` would route to whichever
+                    // extension was iterated first — usually `cpp`. That's a
+                    // bug — when the user types a language, the extension
+                    // claiming that language is the correct answer.
+                    let manifests = self.ext_available_manifests();
+                    let ext_name =
+                        crate::core::extensions::find_manifest_for_language_id(&manifests, lang_id)
+                            .map(|m| m.name.clone());
                     if let Some(name) = ext_name {
-                        self.message =
-                            format!("Use :ExtInstall {name} instead  (or open Extensions panel)");
+                        // Short-circuit the message-then-second-command chain:
+                        // the user said install, just install. Mirrors
+                        // `:ExtInstall <name>` exactly (including the
+                        // pending_terminal_command handoff for the install
+                        // command to run in a visible terminal pane).
+                        self.ext_install_from_registry(&name);
+                        if let Some(cmd) = self.pending_terminal_command.take() {
+                            return EngineAction::RunInTerminal(cmd);
+                        }
+                        return EngineAction::None;
                     } else {
                         // Fall back to direct adapter install
                         let dap_key = format!("dap:{adapter_name}");
@@ -285,6 +302,21 @@ impl Engine {
             } else {
                 self.message = "LSP manager not started".to_string();
             }
+            return EngineAction::None;
+        }
+
+        // :Toast <text> — push a test toast. Diagnostic for #450 toast
+        // wiring; verifies the render path independent of LSP events.
+        if let Some(body) = cmd.strip_prefix("Toast ").map(|s| s.trim()) {
+            self.push_toast("Test toast", body, quadraui::ToastSeverity::Info);
+            return EngineAction::None;
+        }
+        if cmd == "Toast" {
+            self.push_toast(
+                "Test toast",
+                "hello from :Toast",
+                quadraui::ToastSeverity::Info,
+            );
             return EngineAction::None;
         }
 
@@ -859,6 +891,10 @@ impl Engine {
                 Ok(()) => {
                     let name = state.display_name();
                     self.message = format!("\"{}\" reloaded", name);
+                    // #222: re-sync the buffer with the LSP server so
+                    // semantic_tokens (which override tree-sitter for
+                    // Rust) are refreshed against the new content.
+                    self.lsp_dirty_buffers.insert(buf_id, true);
                 }
                 Err(e) => {
                     self.message = format!("Error: {}", e);
@@ -1088,10 +1124,19 @@ impl Engine {
                 return EngineAction::None;
             }
 
+            let prev_syntax_max_lines = self.settings.syntax_max_lines;
+            // Queries (`:set foo?`) don't mutate, so skip the disk save —
+            // both to avoid the unnecessary I/O and so the TUI mtime watcher
+            // doesn't trigger and clobber the query's result message.
+            let is_query = trimmed.ends_with('?');
             match self.settings.parse_set_option(trimmed) {
                 Ok(msg) => {
-                    if let Err(e) = self.settings.save() {
-                        self.message = format!("Setting changed but failed to save: {e}");
+                    if !is_query {
+                        if let Err(e) = self.settings.save() {
+                            self.message = format!("Setting changed but failed to save: {e}");
+                        } else {
+                            self.message = msg;
+                        }
                     } else {
                         self.message = msg;
                     }
@@ -1104,6 +1149,14 @@ impl Engine {
             // Lazy-init spell checker when spell is enabled
             if self.settings.spell {
                 self.ensure_spell_checker();
+            }
+            // If the syntax-highlighting threshold changed, re-parse the
+            // active buffer so the new limit takes effect immediately.
+            // (The atomic was synced inside `set_value_str`; this picks up
+            // newly-enabled or newly-disabled highlighting on the visible
+            // buffer.)
+            if self.settings.syntax_max_lines != prev_syntax_max_lines {
+                self.update_syntax();
             }
             return EngineAction::None;
         }
@@ -1968,7 +2021,10 @@ impl Engine {
                 self.find_replace_show_replace = true;
                 EngineAction::None
             }
-            "sidebar" => EngineAction::ToggleSidebar,
+            "sidebar" => {
+                self.toggle_sidebar();
+                EngineAction::None
+            }
             "zoomin" => {
                 self.settings.font_size = (self.settings.font_size + 1).min(72);
                 let _ = self.settings.save();
@@ -3264,7 +3320,7 @@ impl Engine {
                 let _ = self.execute_command("LspInfo");
             }
             StatusAction::ToggleSidebar => {
-                return Some(EngineAction::ToggleSidebar);
+                self.toggle_sidebar();
             }
             StatusAction::TogglePanel => {
                 if self.terminal_panes.is_empty() {

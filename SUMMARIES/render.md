@@ -1,4 +1,4 @@
-# src/render.rs — ~9,762 lines
+# src/render.rs — ~14,155 lines
 
 Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLayout` consumed by both GTK and TUI backends. Contains all themes, render data structs, and the main layout builder.
 
@@ -60,6 +60,12 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 
 ## Key Functions
 - `build_screen_layout(engine, theme, rects, line_height, char_width)` — main layout builder (~3,300 lines)
+- `to_q_editor(rw)` — boundary adapter `&RenderedWindow → quadraui::Editor` (#276 Stage 1C). Plus `to_q_editor_line`, `to_q_styled_span`, `to_q_cursor_pos`, `to_q_cursor_shape`, `to_q_selection`, `to_q_severity`, `to_q_git_status`, `to_q_diff_line`, `to_q_diagnostic_mark`, `to_q_spell_mark` per-type converters.
+- `completion_menu_to_quadraui_completions(menu)` — adapter `&CompletionMenu → quadraui::Completions` for `Backend::draw_completions` (#266, GTK lift in #285).
+- `source_control_to_tree_view(sc, theme)` — adapter `&SourceControlData → quadraui::TreeView` (Phase A.1b). Sections via `Decoration::Header`.
+- `ext_sidebar_to_tree_view(ext)` — adapter `&ExtSidebarData → quadraui::TreeView` (#280). INSTALLED / AVAILABLE sections via `Decoration::Header`; install/remove hint as `Badge` on selected row.
+- `debug_sidebar_section_to_tree_view(items, scroll_offset, has_focus, session_active, section_id)` — adapter for one debug-sidebar section (#281). Each of the four sections (Variables / Watch / Call Stack / Breakpoints) gets its own `TreeView` instance — see `MultiSectionView` follow-up #293 for the architectural improvement that owns the multi-section walk inside quadraui itself.
+- `explorer_to_tree_view(rows, scroll_top, selected, has_focus)` — adapter for the file-tree explorer.
 - `format_button_label(label, hotkey)` — dialog button label formatter
 - `visual_rows_for_line(len, cols)` — wrapped line row count
 - `Theme::from_name(name)` — theme lookup by name
@@ -71,7 +77,7 @@ Platform-agnostic rendering abstraction. Transforms engine state into `ScreenLay
 - `tab_row_height_px(line_height)` — tab row height as ceil(line_height * 1.6)
 - `tab_bar_height_px(line_height, breadcrumbs)` — tab bar + optional breadcrumb row
 - `status_bar_height_px(line_height, per_window_status, has_wildmenu)` — global status bar height
-- `editor_bottom_px(total_height, ...)` — Y coordinate where editor area ends (accounts for all chrome)
+- `compute_editor_layout(engine, total_height, line_height, menu_in_viewport) -> EditorLayout` — one-shot chrome layout (#386). Returns tab_bar_h, editor_bottom, terminal_h, terminal_content_rows, terminal_max_target_rows, and all chrome heights. Both backends use this.
 - `scrollbar_click_to_scroll_top(click_pos, track_len, total_lines, viewport_lines)` — maps scrollbar click to scroll position
 - `display_col_to_buffer_col(line_text, x_offset, tabstop, scroll_left)` — tab-aware column conversion
 - `is_tab_close_click(col_in_tab, tab_width, close_cols)` — detects close button zone in tab

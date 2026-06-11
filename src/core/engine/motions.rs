@@ -1523,9 +1523,9 @@ impl Engine {
                     }
                 }
             }
-            'F' => {
+            'F'
                 // Find backward (inclusive): search left of cursor
-                if col > 0 {
+                if col > 0 => {
                     for i in (0..col).rev() {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
@@ -1534,7 +1534,6 @@ impl Engine {
                         }
                     }
                 }
-            }
             't' => {
                 // Till forward (exclusive): stop before target
                 for i in (col + 1)..line_len {
@@ -1547,9 +1546,9 @@ impl Engine {
                     }
                 }
             }
-            'T' => {
+            'T'
                 // Till backward (exclusive): stop after target
-                if col > 0 {
+                if col > 0 => {
                     for i in (0..col).rev() {
                         let ch = self.buffer().content.char(line_start + i);
                         if ch == target {
@@ -1558,7 +1557,6 @@ impl Engine {
                         }
                     }
                 }
-            }
             _ => {}
         }
         // Character not found - cursor doesn't move (Vim behavior)
@@ -3202,6 +3200,26 @@ impl Engine {
         self.view_mut().cursor.col = start + candidate.len();
     }
 
+    /// Handle a mouse click on the completion popup.
+    /// Returns `true` if the click was consumed (inside the popup).
+    pub fn handle_completion_click(&mut self, hit: quadraui::CompletionsHit) -> bool {
+        match hit {
+            quadraui::CompletionsHit::Item(idx) => {
+                self.apply_completion_candidate(idx);
+                self.dismiss_completion();
+                true
+            }
+            quadraui::CompletionsHit::Inert => {
+                self.dismiss_completion();
+                true
+            }
+            quadraui::CompletionsHit::Empty => {
+                self.dismiss_completion();
+                false
+            }
+        }
+    }
+
     /// Dismiss the completion popup and cancel any pending LSP completion request.
     /// This ensures that a late-arriving LSP response cannot re-show a popup
     /// after the user has already dismissed it (e.g. by pressing Escape or
@@ -3210,33 +3228,88 @@ impl Engine {
         self.completion_candidates.clear();
         self.completion_idx = None;
         self.completion_display_only = false;
+        self.completion_filter_prefix.clear();
         self.lsp_pending_completion = None;
     }
 
-    /// Trigger auto-popup completion based on current cursor prefix.
-    /// Called after each text change in Insert mode.
-    pub(crate) fn trigger_auto_completion(&mut self) {
+    /// Trigger completion popup based on current cursor prefix.
+    /// Called after each text change in Insert mode (`manual = false`) or
+    /// from an explicit user gesture like Ctrl+Space (`manual = true`).
+    ///
+    /// Empty-prefix behavior differs: auto triggers dismiss the popup (typing
+    /// shouldn't drown the user in every word in scope), while manual triggers
+    /// fall through to the LSP so the user sees all in-scope symbols (VSCode
+    /// parity).
+    ///
+    /// When the new prefix **extends** the previous one (`S` → `Sc`), existing
+    /// candidates are narrowed by `starts_with(new_prefix)` and merged with
+    /// new buffer-word hits, instead of being wholesale-replaced. This keeps
+    /// items the user already saw from disappearing when a fresh nearby-word
+    /// scan or LSP request happens to return a smaller set (#467).
+    pub(crate) fn trigger_completion(&mut self, manual: bool) {
         let (prefix, _) = self.completion_prefix_at_cursor();
-        if prefix.is_empty() {
+        if prefix.is_empty() && !manual {
             self.dismiss_completion();
             return;
         }
-        // Use a fast nearby-lines scan instead of scanning the entire buffer.
-        // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
-        let candidates = self.word_completions_nearby(&prefix);
-        if !candidates.is_empty() {
-            self.completion_start_col = self.view().cursor.col - prefix.chars().count();
-            self.completion_candidates = candidates;
-            self.completion_idx = Some(0);
-            self.completion_display_only = true;
-        } else {
-            // No buffer-word hits yet; clear popup but keep LSP pending
+        let prev_prefix = std::mem::take(&mut self.completion_filter_prefix);
+        let extends = !prev_prefix.is_empty() && prefix.starts_with(&prev_prefix);
+        if prefix.is_empty() {
+            // Manual trigger with no prefix: skip the buffer-word scan (it would
+            // match every word in the nearby radius) and rely on the LSP response.
+            self.completion_start_col = self.view().cursor.col;
             self.completion_candidates.clear();
             self.completion_idx = None;
             self.completion_display_only = false;
+        } else {
+            // Narrow existing candidates by the new prefix when it extends the
+            // previous one; otherwise start fresh.
+            if extends {
+                self.completion_candidates
+                    .retain(|c| c.starts_with(&prefix));
+            } else {
+                self.completion_candidates.clear();
+            }
+            // Use a fast nearby-lines scan instead of scanning the entire buffer.
+            // For a 15K-line file, full scan takes 270ms; nearby scan is ~1ms.
+            for word in self.word_completions_nearby(&prefix) {
+                if !self.completion_candidates.iter().any(|c| c == &word) {
+                    self.completion_candidates.push(word);
+                }
+            }
+            if !self.completion_candidates.is_empty() {
+                self.completion_start_col = self.view().cursor.col - prefix.chars().count();
+                self.completion_idx = Some(0);
+                self.completion_display_only = true;
+            } else {
+                self.completion_idx = None;
+                self.completion_display_only = false;
+            }
         }
+        self.completion_filter_prefix = prefix;
         // Async LSP source — response will update candidates if popup is still active
         self.lsp_request_completion();
+    }
+
+    /// True when an insert-mode keypress would be consumed by completion
+    /// handling — used by backends to suppress global accelerators that
+    /// would otherwise win the dispatch race (#287). Mirrors the gates in
+    /// `handle_insert_key`:
+    ///
+    /// - `Ctrl+N` / `Ctrl+P` — always (start or cycle word completion).
+    /// - `Tab` / `Down` / `Up` — only while a display-only popup is active.
+    pub fn insert_completion_intercepts_key(&self, key_name: &str, ctrl: bool) -> bool {
+        if self.mode != Mode::Insert {
+            return false;
+        }
+        if ctrl && (key_name == "n" || key_name == "p") {
+            return true;
+        }
+        let popup_active = self.completion_display_only && self.completion_idx.is_some();
+        if !popup_active {
+            return false;
+        }
+        !ctrl && (key_name == "Tab" || key_name == "Down" || key_name == "Up")
     }
 
     // ── Fold helpers ──────────────────────────────────────────────────────────
@@ -3609,14 +3682,52 @@ impl Engine {
     }
 
     /// zh — scroll view left by `count` columns.
+    ///
+    /// Decreases `scroll_left`, which exposes more of the line to the left of
+    /// the viewport (cursor's visible position shifts right). The cursor is
+    /// pulled onto the new viewport if the scroll has left it off-screen — if
+    /// we didn't do that, `ensure_cursor_visible` (called after every key in
+    /// `handle_key`) would snap `scroll_left` back to track the cursor and
+    /// effectively undo the scroll.
     pub(crate) fn scroll_left_by(&mut self, count: usize) {
         let sl = self.view().scroll_left;
-        self.view_mut().scroll_left = sl.saturating_sub(count);
+        let new_sl = sl.saturating_sub(count);
+        self.view_mut().scroll_left = new_sl;
+        self.clamp_cursor_to_horizontal_viewport(new_sl);
     }
 
     /// zl — scroll view right by `count` columns.
+    ///
+    /// Increases `scroll_left`, which exposes more of the line to the right of
+    /// the viewport. The cursor is pulled onto the new viewport so that
+    /// `ensure_cursor_visible` does not snap the scroll back (see
+    /// `scroll_left_by`).
     pub(crate) fn scroll_right_by(&mut self, count: usize) {
-        self.view_mut().scroll_left += count;
+        let new_sl = self.view().scroll_left + count;
+        self.view_mut().scroll_left = new_sl;
+        self.clamp_cursor_to_horizontal_viewport(new_sl);
+    }
+
+    /// Move the cursor's column onto the horizontal viewport at `scroll_left`.
+    ///
+    /// If `viewport_cols` is 0 (uninitialised), this is a no-op so that
+    /// headless / uninitialised engines still let scroll commands shift
+    /// `scroll_left` freely. Otherwise, the cursor column is clamped to
+    /// `[scroll_left, scroll_left + viewport_cols)`. This is the cursor
+    /// adjustment Vim performs for `zh`/`zl`/`zH`/`zL` when the scroll would
+    /// leave the cursor off-screen.
+    fn clamp_cursor_to_horizontal_viewport(&mut self, scroll_left: usize) {
+        let viewport_cols = self.view().viewport_cols;
+        if viewport_cols == 0 {
+            return;
+        }
+        let right_edge = scroll_left + viewport_cols;
+        let cursor_col = self.view().cursor.col;
+        if cursor_col < scroll_left {
+            self.view_mut().cursor.col = scroll_left;
+        } else if cursor_col >= right_edge {
+            self.view_mut().cursor.col = right_edge - 1;
+        }
     }
 
     /// zH — scroll half screen width left.

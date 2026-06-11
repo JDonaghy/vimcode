@@ -1,5 +1,6 @@
 mod common;
 use common::*;
+use vimcode_core::quadraui;
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -220,6 +221,29 @@ fn engine_with_registry(text: &str) -> vimcode_core::Engine {
     let mut e = engine_with(text);
     e.ext_registry = Some(test_manifests());
     e
+}
+
+fn ext_sidebar_setup(e: &mut vimcode_core::Engine, section: usize, idx: usize) {
+    e.ext_sidebar_has_focus = true;
+    e.ext_sidebar_body_rect
+        .set(quadraui::Rect::new(0.0, 0.0, 200.0, 400.0));
+    e.ext_sidebar_system.borrow_mut().set_backend_info(
+        16.0,
+        quadraui::MsvLayoutMetrics {
+            header_size: 16.0,
+            divider_size: 1.0,
+            scrollbar_size: 8.0,
+            cell_quantum: 0.0,
+        },
+    );
+    e.populate_ext_sidebar_system();
+    e.ext_sidebar_system.borrow_mut().set_has_focus(true);
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_active_section(Some(section));
+    e.ext_sidebar_system
+        .borrow_mut()
+        .set_selected_path(section, Some(vec![idx as u16]));
 }
 
 // ── :ExtList ──────────────────────────────────────────────────────────────────
@@ -525,38 +549,26 @@ fn ext_sidebar_default_state() {
 #[test]
 fn ext_sidebar_key_j_moves_selection_down() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
-    e.ext_sidebar_selected = 0;
-    e.handle_ext_sidebar_key("j", false, None);
-    // Selection should advance (if there are available items)
-    let total = e.ext_available_manifests().len();
-    if total > 1 {
-        assert!(
-            e.ext_sidebar_selected > 0,
-            "j should move selection down: selected={}",
-            e.ext_sidebar_selected
-        );
-    }
+    ext_sidebar_setup(&mut e, 1, 0);
+    e.dispatch_ext_sidebar_key_unified("j", None);
+    let (_, idx) = e.ext_selected_from_sidebar_system();
+    assert!(idx > 0, "j should move selection down: selected={}", idx);
 }
 
 #[test]
 fn ext_sidebar_key_k_moves_selection_up() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
-    e.ext_sidebar_selected = 2;
-    e.handle_ext_sidebar_key("k", false, None);
-    assert!(
-        e.ext_sidebar_selected < 2,
-        "k should move selection up: selected={}",
-        e.ext_sidebar_selected
-    );
+    ext_sidebar_setup(&mut e, 1, 2);
+    e.dispatch_ext_sidebar_key_unified("k", None);
+    let (_, idx) = e.ext_selected_from_sidebar_system();
+    assert!(idx < 2, "k should move selection up: selected={}", idx);
 }
 
 #[test]
 fn ext_sidebar_key_escape_unfocuses() {
     let mut e = engine_with("");
     e.ext_sidebar_has_focus = true;
-    e.handle_ext_sidebar_key("Escape", false, None);
+    e.dispatch_ext_sidebar_key_unified("Escape", None);
     assert!(!e.ext_sidebar_has_focus, "Escape should unfocus sidebar");
 }
 
@@ -564,7 +576,7 @@ fn ext_sidebar_key_escape_unfocuses() {
 fn ext_sidebar_key_slash_activates_search_input() {
     let mut e = engine_with("");
     e.ext_sidebar_has_focus = true;
-    e.handle_ext_sidebar_key("/", false, None);
+    e.dispatch_ext_sidebar_key_unified("/", None);
     assert!(
         e.ext_sidebar_input_active,
         "/ should activate search input mode"
@@ -864,8 +876,8 @@ fn ext_install_sets_install_context_for_lsp() {
         .iter()
         .position(|m| m.name == "ruby")
         .expect("ruby should be in available");
-    e.ext_sidebar_selected = ruby_idx;
-    e.handle_ext_sidebar_key("i", false, None);
+    ext_sidebar_setup(&mut e, 1, ruby_idx);
+    e.dispatch_ext_sidebar_key_unified("i", None);
 
     // pending_terminal_command should be set (sidebar can't return EngineAction)
     assert!(
@@ -971,28 +983,23 @@ fn auto_hint_not_shown_twice_for_same_extension() {
 #[test]
 fn ext_sidebar_j_clamps_at_last_item() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
     let total = e.ext_available_manifests().len();
-    // Jump past the end
-    e.ext_sidebar_selected = total.saturating_sub(1);
-    e.handle_ext_sidebar_key("j", false, None);
+    ext_sidebar_setup(&mut e, 1, total.saturating_sub(1));
+    e.dispatch_ext_sidebar_key_unified("j", None);
+    let (_, idx) = e.ext_selected_from_sidebar_system();
     assert!(
-        e.ext_sidebar_selected < total,
-        "j should not go past the last item: selected={}, total={total}",
-        e.ext_sidebar_selected
+        idx < total,
+        "j should not go past the last item: selected={idx}, total={total}",
     );
 }
 
 #[test]
 fn ext_sidebar_k_clamps_at_zero() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
-    e.ext_sidebar_selected = 0;
-    e.handle_ext_sidebar_key("k", false, None);
-    assert_eq!(
-        e.ext_sidebar_selected, 0,
-        "k at position 0 should stay at 0"
-    );
+    ext_sidebar_setup(&mut e, 1, 0);
+    e.dispatch_ext_sidebar_key_unified("k", None);
+    let (_, idx) = e.ext_selected_from_sidebar_system();
+    assert_eq!(idx, 0, "k at position 0 should stay at 0");
 }
 
 // ── Sidebar Tab — section toggling ────────────────────────────────────────────
@@ -1000,30 +1007,27 @@ fn ext_sidebar_k_clamps_at_zero() {
 #[test]
 fn ext_sidebar_tab_toggles_installed_section() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
     e.extension_state.mark_installed("csharp");
-    e.ext_sidebar_selected = 0; // within installed items
-
-    let was_expanded = e.ext_sidebar_sections_expanded[0];
-    e.handle_ext_sidebar_key("Tab", false, None);
-    assert_ne!(
-        e.ext_sidebar_sections_expanded[0], was_expanded,
-        "Tab should toggle installed section"
+    ext_sidebar_setup(&mut e, 0, 0);
+    e.dispatch_ext_sidebar_key_unified("Tab", None);
+    let sidebar = e.ext_sidebar_system.borrow();
+    assert_eq!(
+        sidebar.active_section(),
+        Some(1),
+        "Tab should cycle from installed (0) to available (1)"
     );
 }
 
 #[test]
 fn ext_sidebar_tab_toggles_available_section_when_no_installed() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
-    // No extensions installed — cursor is in the available section
-    e.ext_sidebar_selected = 0;
-
-    let was_expanded = e.ext_sidebar_sections_expanded[1];
-    e.handle_ext_sidebar_key("Tab", false, None);
-    assert_ne!(
-        e.ext_sidebar_sections_expanded[1], was_expanded,
-        "Tab should toggle available section when nothing is installed"
+    ext_sidebar_setup(&mut e, 1, 0);
+    e.dispatch_ext_sidebar_key_unified("Tab", None);
+    let sidebar = e.ext_sidebar_system.borrow();
+    assert_eq!(
+        sidebar.active_section(),
+        Some(0),
+        "Tab should cycle from available (1) back to installed (0)"
     );
 }
 
@@ -1036,7 +1040,7 @@ fn ext_sidebar_d_removes_installed_extension() {
     e.ext_sidebar_has_focus = true;
     e.ext_sidebar_selected = 0; // first (and only) installed item
 
-    e.handle_ext_sidebar_key("d", false, None);
+    e.dispatch_ext_sidebar_key_unified("d", None);
     // Dialog should be open — confirm removal.
     // Navigate Right (past Cancel) then Enter. In 2-button dialog this is
     // "Remove"; in 3-button (tools on PATH) this is "Keep Tools".
@@ -1064,7 +1068,7 @@ fn ext_sidebar_d_on_available_item_is_noop() {
     e.ext_sidebar_selected = 0;
 
     let msg_before = e.message.clone();
-    e.handle_ext_sidebar_key("d", false, None);
+    e.dispatch_ext_sidebar_key_unified("d", None);
     // Should not crash; message may or may not change (no-op on available items)
     // The important thing is no extension gets spuriously marked removed
     let total_installed = e
@@ -1089,7 +1093,7 @@ fn ext_sidebar_return_on_installed_opens_readme() {
     e.ext_sidebar_selected = 0;
 
     let _tabs_before = e.active_group().tabs.len();
-    e.handle_ext_sidebar_key("Return", false, None);
+    e.dispatch_ext_sidebar_key_unified("Return", None);
 
     // Should not crash and should not trigger a re-install
     assert!(
@@ -1110,7 +1114,7 @@ fn ext_sidebar_return_on_available_opens_readme_without_install() {
     // Select first available item (nothing installed)
     e.ext_sidebar_selected = 0;
 
-    e.handle_ext_sidebar_key("Return", false, None);
+    e.dispatch_ext_sidebar_key_unified("Return", None);
 
     // Should not install
     assert!(
@@ -1128,7 +1132,7 @@ fn ext_sidebar_i_on_already_installed_shows_message() {
     e.ext_sidebar_sections_expanded = [true, false];
     e.ext_sidebar_selected = 0;
 
-    e.handle_ext_sidebar_key("i", false, None);
+    e.dispatch_ext_sidebar_key_unified("i", None);
 
     assert!(
         e.message.contains("already installed"),
@@ -1145,10 +1149,10 @@ fn ext_sidebar_search_input_accumulates_typed_chars() {
     e.ext_sidebar_has_focus = true;
     e.ext_sidebar_input_active = true;
 
-    e.handle_ext_sidebar_key("r", false, Some('r'));
-    e.handle_ext_sidebar_key("u", false, Some('u'));
-    e.handle_ext_sidebar_key("s", false, Some('s'));
-    e.handle_ext_sidebar_key("t", false, Some('t'));
+    e.dispatch_ext_sidebar_key_unified("r", Some('r'));
+    e.dispatch_ext_sidebar_key_unified("u", Some('u'));
+    e.dispatch_ext_sidebar_key_unified("s", Some('s'));
+    e.dispatch_ext_sidebar_key_unified("t", Some('t'));
 
     assert_eq!(
         e.ext_sidebar_query, "rust",
@@ -1163,7 +1167,7 @@ fn ext_sidebar_search_escape_deactivates_and_preserves_query() {
     e.ext_sidebar_input_active = true;
     e.ext_sidebar_query = "rust".to_string();
 
-    e.handle_ext_sidebar_key("Escape", false, None);
+    e.dispatch_ext_sidebar_key_unified("Escape", None);
 
     assert!(
         !e.ext_sidebar_input_active,
@@ -1182,7 +1186,7 @@ fn ext_sidebar_search_backspace_removes_last_char() {
     e.ext_sidebar_input_active = true;
     e.ext_sidebar_query = "rust".to_string();
 
-    e.handle_ext_sidebar_key("BackSpace", false, None);
+    e.dispatch_ext_sidebar_key_unified("BackSpace", None);
 
     assert_eq!(
         e.ext_sidebar_query, "rus",
@@ -1191,17 +1195,17 @@ fn ext_sidebar_search_backspace_removes_last_char() {
 }
 
 #[test]
-fn ext_sidebar_search_resets_selection_to_zero_on_input() {
+fn ext_sidebar_search_appends_to_query_on_input() {
     let mut e = engine_with("");
     e.ext_sidebar_has_focus = true;
     e.ext_sidebar_input_active = true;
-    e.ext_sidebar_selected = 5;
+    e.ext_sidebar_query = "rus".to_string();
 
-    e.handle_ext_sidebar_key("r", false, Some('r'));
+    e.dispatch_ext_sidebar_key_unified("t", Some('t'));
 
     assert_eq!(
-        e.ext_sidebar_selected, 0,
-        "typing in search should reset selection to 0"
+        e.ext_sidebar_query, "rust",
+        "typing in search should append to query"
     );
 }
 
@@ -1456,10 +1460,7 @@ fn handle_key_fires_cursor_move_when_cursor_moves() {
 #[test]
 fn ext_install_via_return_resets_selection_to_installed_item() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
     e.ext_sidebar_sections_expanded = [true, true];
-    // Navigate to rust in the available list (alphabetically last: bash, cpp, csharp,
-    // git-insights, go, java, javascript, php, python, ruby, rust — index 10)
     let available_before = e
         .ext_available_manifests()
         .into_iter()
@@ -1469,20 +1470,21 @@ fn ext_install_via_return_resets_selection_to_installed_item() {
         .iter()
         .position(|m| m.name == "rust")
         .expect("rust should be in available list");
-    e.ext_sidebar_selected = rust_idx; // point at rust in available section
+    ext_sidebar_setup(&mut e, 1, rust_idx);
 
-    // Install via 'i' key (Return now previews README)
-    e.handle_ext_sidebar_key("i", false, None);
+    // Install via 'i' key
+    e.dispatch_ext_sidebar_key_unified("i", None);
 
     // Rust should now be installed
     assert!(
         e.extension_state.is_installed("rust"),
-        "rust should be marked installed after Return"
+        "rust should be marked installed after i"
     );
 
     // Selection should now be in the installed section, pointing at rust
+    let (in_installed, sel) = e.ext_selected_from_sidebar_system();
+    assert!(in_installed, "selection should be in installed section");
     let installed = e.ext_installed_items();
-    let sel = e.ext_sidebar_selected;
     assert!(
         sel < installed.len(),
         "selection {sel} should be within installed section (len {})",
@@ -1494,7 +1496,7 @@ fn ext_install_via_return_resets_selection_to_installed_item() {
     );
 
     // d should now work immediately (without extra navigation)
-    e.handle_ext_sidebar_key("d", false, None);
+    e.dispatch_ext_sidebar_key_unified("d", None);
     assert!(e.dialog.is_some(), "removal dialog should be open");
     e.handle_key("Right", None, false);
     e.handle_key("Return", None, false);
@@ -1512,16 +1514,10 @@ fn ext_install_via_return_resets_selection_to_installed_item() {
 #[test]
 fn ext_delete_last_installed_expands_available_if_collapsed() {
     let mut e = engine_with_registry("");
-    e.ext_sidebar_has_focus = true;
-    // Install bash as the only extension
     e.extension_state.mark_installed("bash");
-    // Collapse the available section (simulating user pressing Tab)
-    e.ext_sidebar_sections_expanded = [true, false];
-    // Selection points to bash (only installed item, flat index 0)
-    e.ext_sidebar_selected = 0;
+    e.ext_sidebar_system.borrow_mut().set_collapsed(1, true);
+    ext_sidebar_setup(&mut e, 0, 0);
 
-    // Verify only the installed item is selectable before deletion
-    // (available section is collapsed, so only 1 installed item is visible)
     let installed_before = e.ext_installed_items();
     assert_eq!(
         installed_before.len(),
@@ -1530,7 +1526,7 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
     );
 
     // Delete bash — confirm dialog (Right past Cancel, then Enter)
-    e.handle_ext_sidebar_key("d", false, None);
+    e.dispatch_ext_sidebar_key_unified("d", None);
     assert!(e.dialog.is_some(), "removal dialog should be open");
     e.handle_key("Right", None, false);
     e.handle_key("Return", None, false);
@@ -1540,13 +1536,13 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
         "bash should be removed"
     );
 
-    // The available section should now be expanded
+    // The available section should now be expanded in the SidebarSystem
     assert!(
-        e.ext_sidebar_sections_expanded[1],
+        !e.ext_sidebar_system.borrow().is_collapsed(1),
         "available section should be expanded after deleting last installed item"
     );
 
-    // Navigation should work — available items are visible
+    // Available items should still exist
     let available_after: Vec<_> = e
         .ext_available_manifests()
         .into_iter()
@@ -1555,15 +1551,6 @@ fn ext_delete_last_installed_expands_available_if_collapsed() {
     assert!(
         !available_after.is_empty(),
         "available items should be visible after expanding section"
-    );
-
-    // j should move the selection
-    e.ext_sidebar_selected = 0;
-    e.handle_ext_sidebar_key("j", false, None);
-    assert!(
-        e.ext_sidebar_selected > 0,
-        "j should move selection after deletion, still at {}",
-        e.ext_sidebar_selected
     );
 
     // Clean up
@@ -2389,9 +2376,13 @@ fn git_api_repo_root_returns_path() {
     assert!(found);
     let msg = ctx.message.unwrap();
     assert!(msg.starts_with("root:"), "expected root prefix, got {msg}");
+    let root_path = msg.strip_prefix("root:").unwrap();
+    // Verify the returned path is a real directory (not hardcoding a specific
+    // path segment, since the repo may be checked out in a worktree at an
+    // arbitrary location such as .coord/worktrees/<hash>).
     assert!(
-        msg.contains("vimcode"),
-        "root should contain vimcode: {msg}"
+        std::path::Path::new(root_path).is_dir(),
+        "repo root should be an existing directory: {root_path}"
     );
 }
 

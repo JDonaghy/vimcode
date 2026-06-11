@@ -28,90 +28,23 @@ impl Engine {
 
     // ── Menu bar ─────────────────────────────────────────────────────────────
 
-    /// Toggle the VSCode-style menu bar strip on/off; clears any open dropdown.
-    #[allow(dead_code)]
+    /// Toggle menu bar visibility. Does NOT close any open dropdown —
+    /// callers with backend access should call `menu_system.close()` when hiding.
     pub fn toggle_menu_bar(&mut self) {
         self.menu_bar_visible = !self.menu_bar_visible;
-        self.menu_open_idx = None;
     }
 
-    /// Open the dropdown for top-level menu at `idx` (e.g. 0=File, 1=Edit, …).
-    pub fn open_menu(&mut self, idx: usize) {
-        self.menu_open_idx = Some(idx);
-        self.menu_highlighted_item = None;
-    }
-
-    /// Close the currently open dropdown while keeping the bar visible.
-    pub fn close_menu(&mut self) {
-        self.menu_open_idx = None;
-    }
-
-    /// Activate the item at `item_idx` inside top-level menu `menu_idx`.
-    /// `action` is the command string to dispatch (looked up from the static menu table
-    /// in `render.rs` by the UI layer and passed in here).
-    /// Closes the dropdown and returns the `EngineAction` so the UI layer can handle
-    /// actions that require platform resources (e.g. `OpenTerminal` needs PTY size).
-    pub fn menu_activate_item(
-        &mut self,
-        menu_idx: usize,
-        item_idx: usize,
-        action: &str,
-    ) -> EngineAction {
-        let _ = (menu_idx, item_idx); // indices are for the UI; engine just dispatches
-                                      // Ensure Normal mode before executing menu actions so all Vim commands work.
-                                      // VSCode mode stays in Insert (its default editing state).
+    /// Dispatch a menu action by command string. Called when
+    /// `MenuEvent::Activated(id)` fires — `id.as_str()` is the action.
+    pub fn dispatch_menu_action(&mut self, action: &str) -> EngineAction {
         if !self.is_vscode_mode() {
             self.mode = Mode::Normal;
         }
-        let result = if !action.is_empty() {
-            self.execute_command(action)
-        } else {
+        if action.is_empty() {
             EngineAction::None
-        };
-        self.close_menu();
-        result
-    }
-
-    /// Move the keyboard highlight up or down within the open dropdown.
-    ///
-    /// `is_separator` is provided by the UI layer (derived from MENU_STRUCTURE) and indicates
-    /// which items are non-selectable separator lines. The cursor wraps around and skips
-    /// separators. `delta` is typically +1 (Down) or -1 (Up).
-    pub fn menu_move_selection(&mut self, delta: i32, is_separator: &[bool]) {
-        if self.menu_open_idx.is_none() {
-            return;
+        } else {
+            self.execute_command(action)
         }
-        let non_sep: Vec<usize> = (0..is_separator.len())
-            .filter(|&i| !is_separator[i])
-            .collect();
-        if non_sep.is_empty() {
-            return;
-        }
-        let cur_pos = self
-            .menu_highlighted_item
-            .and_then(|h| non_sep.iter().position(|&i| i == h));
-        let new_pos = match cur_pos {
-            None if delta >= 0 => 0,
-            None => non_sep.len() - 1,
-            Some(pos) => {
-                let len = non_sep.len() as i32;
-                ((pos as i32 + delta).rem_euclid(len)) as usize
-            }
-        };
-        self.menu_highlighted_item = Some(non_sep[new_pos]);
-    }
-
-    /// Activate the currently highlighted item (keyboard Enter).
-    ///
-    /// Returns `Some((menu_idx, item_idx))` if an item was highlighted and the menu was
-    /// closed. The caller must look up the action string from MENU_STRUCTURE and call
-    /// `menu_activate_item` to actually dispatch it.
-    /// Returns `None` if no menu is open or nothing is highlighted.
-    pub fn menu_activate_highlighted(&mut self) -> Option<(usize, usize)> {
-        let open_idx = self.menu_open_idx?;
-        let item_idx = self.menu_highlighted_item?;
-        self.close_menu();
-        Some((open_idx, item_idx))
     }
 
     // ── Selection helpers ────────────────────────────────────────────────────
@@ -127,11 +60,9 @@ impl Engine {
         match op {
             "Right" => self.move_right_insert(),
             "Left" => self.move_left(),
-            "Up" => {
-                if self.view().cursor.line > 0 {
-                    self.view_mut().cursor.line -= 1;
-                    self.clamp_cursor_col_insert();
-                }
+            "Up" if self.view().cursor.line > 0 => {
+                self.view_mut().cursor.line -= 1;
+                self.clamp_cursor_col_insert();
             }
             "Down" => {
                 let max_line = self.buffer().len_lines().saturating_sub(1);
@@ -1425,7 +1356,7 @@ impl Engine {
                             changed = true;
                         }
                         if changed {
-                            self.trigger_auto_completion();
+                            self.trigger_completion(false);
                         }
                     }
                 }
@@ -1639,7 +1570,7 @@ impl Engine {
                                 changed = true;
                             }
                         }
-                        self.trigger_auto_completion();
+                        self.trigger_completion(false);
                     }
                 }
             }

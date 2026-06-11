@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Bumped every time `Settings::save` writes to disk. Lets the TUI's
+/// settings.json mtime watcher distinguish self-saves (silent reload) from
+/// external edits (show "Settings reloaded" + apply).
+static SAVE_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current save revision. Watchers cache this and compare on
+/// each poll; an unchanged revision means any mtime bump came from outside.
+pub fn save_revision() -> u64 {
+    SAVE_REVISION.load(Ordering::Acquire)
+}
 
 /// Which editing paradigm the editor uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -48,6 +60,12 @@ pub struct Settings {
 
     #[serde(default = "default_font_size")]
     pub font_size: i32,
+
+    /// Font size for UI chrome (menus, sidebars, dialogs, hover popup body).
+    /// Independent of `font_size` (which controls editor text). Lower bound
+    /// is enforced at use to avoid layout breakage.
+    #[serde(default = "default_ui_font_size")]
+    pub ui_font_size: u8,
 
     /// Show file explorer sidebar on startup
     #[serde(default = "default_explorer_visible")]
@@ -299,10 +317,23 @@ pub struct Settings {
     /// "page_down" preserves traditional Vim Ctrl+F page-down behavior.
     #[serde(default = "default_ctrl_f_action")]
     pub ctrl_f_action: String,
+
+    /// Maximum buffer line count for tree-sitter syntax highlighting.
+    /// Files with more lines than this render as plain text. Default 20_000
+    /// matches VSCode's tokenization cutoff and prevents the initial parse
+    /// from blocking the main thread for seconds on generated files
+    /// (Cargo.lock, logs). Set to a very large value to re-enable
+    /// highlighting for huge files.
+    #[serde(default = "default_syntax_max_lines")]
+    pub syntax_max_lines: usize,
 }
 
 fn default_ctrl_f_action() -> String {
     "find".to_string()
+}
+
+fn default_syntax_max_lines() -> usize {
+    20_000
 }
 
 fn default_indent_guides() -> bool {
@@ -501,22 +532,28 @@ fn pk_toggle_sidebar() -> String {
     "<C-b>".to_string()
 }
 fn pk_focus_explorer() -> String {
-    "<A-e>".to_string()
+    // <A-e> moved off in #318 — clashed with menu bar Alt+E (Edit menu).
+    "<C-S-e>".to_string()
 }
 fn pk_focus_search() -> String {
-    "<A-f>".to_string()
+    // <A-f> moved off in #318 — clashed with menu bar Alt+F (File menu).
+    "<C-S-f>".to_string()
 }
 fn pk_fuzzy_finder() -> String {
     "<C-p>".to_string()
 }
 fn pk_live_grep() -> String {
-    "<C-S-f>".to_string()
+    // Moved off <C-S-f> in #318 to free that combo for focus_search.
+    "<C-S-g>".to_string()
 }
 fn pk_command_palette() -> String {
     "<C-S-p>".to_string()
 }
 fn pk_open_terminal() -> String {
     "<C-t>".to_string()
+}
+fn pk_toggle_terminal_maximize() -> String {
+    "<C-S-t>".to_string()
 }
 fn pk_add_cursor() -> String {
     "<A-d>".to_string()
@@ -536,16 +573,16 @@ pub struct PanelKeys {
     /// Toggle sidebar visibility. Default: `<C-b>`
     #[serde(default = "pk_toggle_sidebar")]
     pub toggle_sidebar: String,
-    /// Focus explorer (or return to editor if already focused). Default: `<A-e>`
+    /// Focus explorer (or return to editor if already focused). Default: `<C-S-e>`
     #[serde(default = "pk_focus_explorer")]
     pub focus_explorer: String,
-    /// Open search panel in sidebar. Default: `<A-f>`
+    /// Open search panel in sidebar. Default: `<C-S-f>`
     #[serde(default = "pk_focus_search")]
     pub focus_search: String,
     /// Open fuzzy file finder. Default: `<C-p>`
     #[serde(default = "pk_fuzzy_finder")]
     pub fuzzy_finder: String,
-    /// Open live grep modal. Default: `<C-S-f>`
+    /// Open live grep modal. Default: `<C-S-g>`
     #[serde(default = "pk_live_grep")]
     pub live_grep: String,
     /// Open command palette. Default: `<C-S-p>`
@@ -554,6 +591,9 @@ pub struct PanelKeys {
     /// Toggle integrated terminal panel. Default: `<C-t>`
     #[serde(default = "pk_open_terminal")]
     pub open_terminal: String,
+    /// Toggle terminal panel maximize (fill editor area). Default: `<C-S-t>`
+    #[serde(default = "pk_toggle_terminal_maximize")]
+    pub toggle_terminal_maximize: String,
     /// Add cursor at next match of word under cursor. Default: `<A-d>`
     #[serde(default = "pk_add_cursor")]
     pub add_cursor: String,
@@ -593,6 +633,7 @@ impl Default for PanelKeys {
             live_grep: pk_live_grep(),
             command_palette: pk_command_palette(),
             open_terminal: pk_open_terminal(),
+            toggle_terminal_maximize: pk_toggle_terminal_maximize(),
             add_cursor: pk_add_cursor(),
             select_all_matches: pk_select_all_matches(),
             split_editor_right: String::new(),
@@ -684,12 +725,17 @@ fn default_font_size() -> i32 {
     14
 }
 
+fn default_ui_font_size() -> u8 {
+    10
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             line_numbers: LineNumberMode::None,
             font_family: default_font_family(),
             font_size: default_font_size(),
+            ui_font_size: default_ui_font_size(),
             explorer_visible_on_startup: default_explorer_visible(),
             incremental_search: default_incremental_search(),
             auto_indent: default_auto_indent(),
@@ -745,6 +791,7 @@ impl Default for Settings {
             hover_delay: default_hover_delay(),
             use_nerd_fonts: default_use_nerd_fonts(),
             ctrl_f_action: default_ctrl_f_action(),
+            syntax_max_lines: default_syntax_max_lines(),
         }
     }
 }
@@ -1039,7 +1086,20 @@ impl Settings {
                 self.use_nerd_fonts = enable;
                 crate::icons::set_nerd_fonts(enable);
             }
-            _ => return Err(format!("Unknown option: {opt}")),
+            _ => {
+                // Settings panel shows snake_case keys (e.g. `window_status_line`)
+                // but `:set` historically uses vim-style packed names
+                // (`windowstatusline` / `wsl`). If the input contains an
+                // underscore, retry once with all underscores stripped so
+                // the user can paste the panel key directly.
+                if opt.contains('_') {
+                    let normalized = opt.replace('_', "");
+                    if normalized != opt {
+                        return self.set_bool_option(&normalized, enable);
+                    }
+                }
+                return Err(format!("Unknown option: {opt}"));
+            }
         }
         Ok(())
     }
@@ -1106,10 +1166,32 @@ impl Settings {
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.font_size = n.clamp(6, 72);
             }
+            "ui_font_size" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.ui_font_size = n.clamp(6, 32) as u8;
+            }
             "font_family" => {
                 self.font_family = value.to_string();
             }
-            _ => return Err(format!("Unknown option: {name}")),
+            "syntax_max_lines" | "syntaxmaxlines" => {
+                let n: usize = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.syntax_max_lines = n;
+                crate::core::buffer_manager::set_syntax_max_lines(n);
+            }
+            _ => {
+                // Snake_case → packed-name fallback (see `set_bool_option`).
+                if name.contains('_') {
+                    let normalized = name.replace('_', "");
+                    if normalized != name {
+                        return self.set_value_option(&normalized, value);
+                    }
+                }
+                return Err(format!("Unknown option: {name}"));
+            }
         }
         Ok(())
     }
@@ -1282,7 +1364,19 @@ impl Settings {
             } else {
                 "nonerdfonts".to_string()
             }),
-            _ => Err(format!("Unknown option: {opt}")),
+            "syntax_max_lines" | "syntaxmaxlines" => {
+                Ok(format!("syntax_max_lines={}", self.syntax_max_lines))
+            }
+            _ => {
+                // Snake_case → packed-name fallback (see `set_bool_option`).
+                if opt.contains('_') {
+                    let normalized = opt.replace('_', "");
+                    if normalized != opt {
+                        return self.query_option(&normalized);
+                    }
+                }
+                Err(format!("Unknown option: {opt}"))
+            }
         }
     }
 
@@ -1309,6 +1403,10 @@ impl Settings {
         let contents = serde_json::to_string_pretty(self)?;
         fs::write(&path, contents)?;
 
+        // Bump the save revision so the TUI mtime watcher knows this write
+        // came from us and can suppress its "Settings reloaded" message.
+        SAVE_REVISION.fetch_add(1, Ordering::AcqRel);
+
         Ok(())
     }
 
@@ -1324,6 +1422,7 @@ impl Settings {
             "colorscheme" => self.colorscheme.clone(),
             "font_family" => self.font_family.clone(),
             "font_size" => self.font_size.to_string(),
+            "ui_font_size" => self.ui_font_size.to_string(),
             "line_numbers" => match self.line_numbers {
                 LineNumberMode::None => "none".to_string(),
                 LineNumberMode::Absolute => "absolute".to_string(),
@@ -1380,6 +1479,7 @@ impl Settings {
             "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
             "ctrl_f_action" => self.ctrl_f_action.clone(),
             "extension_registries" => self.extension_registries.join(", "),
+            "syntax_max_lines" | "syntaxmaxlines" => self.syntax_max_lines.to_string(),
             _ => String::new(),
         }
     }
@@ -1395,6 +1495,12 @@ impl Settings {
                 self.font_size = value
                     .parse()
                     .map_err(|_| format!("Invalid font_size: {value}"))?;
+            }
+            "ui_font_size" => {
+                let n: u8 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid ui_font_size: {value}"))?;
+                self.ui_font_size = n;
             }
             "line_numbers" => {
                 self.line_numbers = match value {
@@ -1507,6 +1613,12 @@ impl Settings {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+            "syntax_max_lines" | "syntaxmaxlines" => {
+                self.syntax_max_lines = value
+                    .parse()
+                    .map_err(|_| format!("Invalid syntax_max_lines: {value}"))?;
+                crate::core::buffer_manager::set_syntax_max_lines(self.syntax_max_lines);
+            }
             _ => return Err(format!("Unknown setting key: {key}")),
         }
         Ok(())
@@ -1540,6 +1652,10 @@ impl Settings {
 #[derive(Debug, Clone)]
 pub enum SettingType {
     Bool,
+    /// `min`/`max` encode the valid range — kept for future range-aware
+    /// Form widgets (Slider, etc., per issue #143). Currently unread by
+    /// any backend now that GTK no longer renders a `SpinButton`.
+    #[allow(dead_code)]
     Integer {
         min: i32,
         max: i32,
@@ -1615,6 +1731,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Integer { min: 6, max: 48 },
     },
     SettingDef {
+        key: "ui_font_size",
+        label: "UI Font Size",
+        description: "Font size for menus, sidebars, dialogs, and hover popups",
+        category: "Appearance",
+        setting_type: SettingType::Integer { min: 6, max: 32 },
+    },
+    SettingDef {
         key: "use_nerd_fonts",
         label: "Nerd Font Icons",
         description: "Use Nerd Font glyphs for UI icons (disable for ASCII fallbacks)",
@@ -1644,8 +1767,8 @@ pub static SETTING_DEFS: &[SettingDef] = &[
     },
     SettingDef {
         key: "status_line_above_terminal",
-        label: "Status Line Above Terminal",
-        description: "Show the active window's status line as a dedicated row above the terminal panel",
+        label: "Status Line Inside Window",
+        description: "Keep each window's status line inside that window. When off and the terminal panel is open, a separated status row is shown above the terminal instead.",
         category: "Appearance",
         setting_type: SettingType::Bool,
     },
@@ -1735,6 +1858,16 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Integer {
             min: 100,
             max: 60000,
+        },
+    },
+    SettingDef {
+        key: "syntax_max_lines",
+        label: "Syntax Highlighting Line Limit",
+        description: "Skip tree-sitter highlighting for buffers over this many lines (plain text for huge generated files)",
+        category: "Editor",
+        setting_type: SettingType::Integer {
+            min: 0,
+            max: 1_000_000,
         },
     },
     SettingDef {
@@ -2205,6 +2338,43 @@ mod tests {
     }
 
     #[test]
+    fn test_set_accepts_snake_case_aliases() {
+        // The Settings panel displays snake_case keys, and the `:set` command
+        // historically used vim-style packed names. Underscored aliases must
+        // work so users can paste the panel key directly.
+        let mut s = Settings::default();
+
+        // Bool setting by its snake_case name.
+        s.parse_set_option("window_status_line").unwrap();
+        assert!(s.window_status_line);
+        s.parse_set_option("nowindow_status_line").unwrap();
+        assert!(!s.window_status_line);
+
+        // Query form with snake_case.
+        let msg = s.parse_set_option("window_status_line?").unwrap();
+        assert_eq!(msg, "nowindowstatusline");
+
+        // Toggle form with snake_case.
+        s.window_status_line = false;
+        s.parse_set_option("window_status_line!").unwrap();
+        assert!(s.window_status_line);
+
+        // #174 reproducer: :set status_line_above_terminal.
+        s.parse_set_option("status_line_above_terminal").unwrap();
+        assert!(s.status_line_above_terminal);
+        s.parse_set_option("nostatus_line_above_terminal").unwrap();
+        assert!(!s.status_line_above_terminal);
+
+        // Settings whose canonical arm is already underscored still work as
+        // exact matches (the fallback should not shadow them).
+        s.parse_set_option("font_size=18").unwrap();
+        assert_eq!(s.font_size, 18);
+
+        // Unknown keys with underscores still error.
+        assert!(s.parse_set_option("not_a_real_setting").is_err());
+    }
+
+    #[test]
     fn test_display_all() {
         let s = Settings::default();
         let display = s.display_all();
@@ -2400,10 +2570,10 @@ mod tests {
     fn test_panel_keys_defaults() {
         let pk = PanelKeys::default();
         assert_eq!(pk.toggle_sidebar, "<C-b>");
-        assert_eq!(pk.focus_explorer, "<A-e>");
-        assert_eq!(pk.focus_search, "<A-f>");
+        assert_eq!(pk.focus_explorer, "<C-S-e>");
+        assert_eq!(pk.focus_search, "<C-S-f>");
         assert_eq!(pk.fuzzy_finder, "<C-p>");
-        assert_eq!(pk.live_grep, "<C-S-f>");
+        assert_eq!(pk.live_grep, "<C-S-g>");
         assert_eq!(pk.command_palette, "<C-S-p>");
         assert_eq!(pk.add_cursor, "<A-d>");
         assert_eq!(pk.select_all_matches, "<C-S-l>");
@@ -2416,7 +2586,7 @@ mod tests {
         assert_eq!(pk.fuzzy_finder, "<C-A-p>");
         // Unspecified keep defaults
         assert_eq!(pk.toggle_sidebar, "<C-b>");
-        assert_eq!(pk.focus_explorer, "<A-e>");
+        assert_eq!(pk.focus_explorer, "<C-S-e>");
     }
 
     #[test]

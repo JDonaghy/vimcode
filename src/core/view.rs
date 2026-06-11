@@ -32,6 +32,17 @@ pub struct View {
     /// Closed fold regions for this window, sorted by `start`, non-overlapping.
     /// Folds are ephemeral (not persisted to session).
     pub folds: Vec<FoldRegion>,
+    /// In aligned-diff view, the aligned-row index this window's render
+    /// should start at. Set by `sync_scroll_binds`; cleared when the
+    /// window leaves aligned-diff mode (via `clear_diff_alignment`).
+    ///
+    /// Why: in aligned-diff mode, `scroll_top` (a buffer line) cannot
+    /// uniquely identify which padding row the user wants at the top of
+    /// the viewport — multiple aligned-row indices can map to the same
+    /// buffer line via the seek-then-backup-over-padding logic. Storing
+    /// the aligned index lets both panes start at exactly the same row,
+    /// eliminating the cumulative drift past hunks (#166).
+    pub aligned_top: Option<usize>,
 }
 
 impl View {
@@ -44,6 +55,7 @@ impl View {
             scroll_left: 0,
             viewport_cols: 80, // sensible default, overridden by UI
             folds: Vec::new(),
+            aligned_top: None,
         }
     }
 
@@ -136,6 +148,12 @@ impl View {
     }
 
     /// Ensure the cursor is visible within the viewport, adjusting scroll_top.
+    ///
+    /// Production code uses `Engine::ensure_cursor_visible` instead,
+    /// which accounts for bottom-chrome rows (quickfix, terminal,
+    /// etc.) that may have opened in the current tick. This method
+    /// stays on `View` for test ergonomics.
+    #[allow(dead_code)]
     pub fn ensure_cursor_visible(&mut self) {
         if self.cursor.line < self.scroll_top {
             self.scroll_top = self.cursor.line;

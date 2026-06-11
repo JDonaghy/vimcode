@@ -3,6 +3,10 @@
 pub mod core;
 pub mod icons;
 
+// Re-export quadraui so integration tests + downstream consumers pin to the
+// same version vimcode is built against.
+pub use quadraui;
+
 // Convenience re-exports so integration tests can write `use vimcode_core::Engine` etc.
 pub use core::buffer::Buffer;
 pub use core::cursor::Cursor;

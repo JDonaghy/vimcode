@@ -1,5 +1,12 @@
 use super::*;
 
+pub enum ExtSidebarKeyResult {
+    Consumed,
+    Unfocused,
+    /// h/Left from the Extensions panel moved focus to the activity bar.
+    FocusActivityBar,
+}
+
 impl Engine {
     // ─── Extension Panel helpers ────────────────────────────────────────────
 
@@ -37,7 +44,24 @@ impl Engine {
         }
     }
 
-    /// Count visible items in a section (accounting for collapsed tree nodes).
+    /// Whether an item passes the panel's search-input filter.
+    /// Returns true when there is no filter or when the item's text contains
+    /// the filter substring (case-insensitive). Plugins that subscribe to
+    /// `panel_input` and re-emit a filtered `set_items` still work — this is
+    /// a default fallback for panels whose plugins don't intercept.
+    pub(crate) fn ext_panel_filter_matches(
+        &self,
+        panel_name: &str,
+        item: &plugin::ExtPanelItem,
+    ) -> bool {
+        match self.ext_panel_input_text.get(panel_name) {
+            Some(s) if !s.is_empty() => item.text.to_lowercase().contains(&s.to_lowercase()),
+            _ => true,
+        }
+    }
+
+    /// Count visible items in a section (accounting for collapsed tree nodes
+    /// and the panel's search-input filter).
     pub(crate) fn ext_panel_visible_count(
         &self,
         panel_name: &str,
@@ -45,11 +69,15 @@ impl Engine {
     ) -> usize {
         items
             .iter()
-            .filter(|item| self.ext_panel_item_visible(panel_name, item, items))
+            .filter(|item| {
+                self.ext_panel_item_visible(panel_name, item, items)
+                    && self.ext_panel_filter_matches(panel_name, item)
+            })
             .count()
     }
 
-    /// Return the indices of visible items in a section.
+    /// Return the indices of visible items in a section (accounting for
+    /// collapsed tree nodes and the panel's search-input filter).
     pub fn ext_panel_visible_indices(
         &self,
         panel_name: &str,
@@ -58,7 +86,10 @@ impl Engine {
         items
             .iter()
             .enumerate()
-            .filter(|(_, item)| self.ext_panel_item_visible(panel_name, item, items))
+            .filter(|(_, item)| {
+                self.ext_panel_item_visible(panel_name, item, items)
+                    && self.ext_panel_filter_matches(panel_name, item)
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -540,6 +571,8 @@ impl Engine {
                 if let Some(text) = self.ext_panel_input_text.get_mut(&panel_name) {
                     text.pop();
                 }
+                self.ext_panel_selected = 0;
+                self.ext_panel_scroll_top = 0;
                 // Fire panel_input on every change for live filtering.
                 let text = self
                     .ext_panel_input_text
@@ -556,6 +589,8 @@ impl Engine {
                             .entry(panel_name.clone())
                             .or_default()
                             .push(ch);
+                        self.ext_panel_selected = 0;
+                        self.ext_panel_scroll_top = 0;
                         // Fire panel_input on every change for live filtering.
                         let text = self
                             .ext_panel_input_text
@@ -885,7 +920,7 @@ impl Engine {
         self.show_editor_hover_at(line, col, true, true);
     }
 
-    /// Check if any diagnostic touches the given line.
+    #[allow(dead_code)]
     pub fn has_diagnostic_on_line(&self, line: usize) -> bool {
         if let Some(path) = self.active_buffer_path() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
@@ -1384,6 +1419,22 @@ impl Engine {
         false
     }
 
+    /// Set the editor hover popup scroll offset directly (clamped to
+    /// valid range). Used by scrollbar drag / track-click handlers
+    /// in both backends — they translate a `UiEvent::ScrollOffsetChanged`
+    /// from `quadraui::dispatch_mouse_drag` into this call (#215).
+    pub fn editor_hover_set_scroll(&mut self, new_offset: usize) -> bool {
+        if let Some(hover) = &mut self.editor_hover {
+            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let clamped = new_offset.min(max_scroll);
+            if clamped != hover.scroll_top {
+                hover.scroll_top = clamped;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Give the editor hover popup keyboard focus (e.g. on click).
     pub fn editor_hover_focus(&mut self) {
         if self.editor_hover.is_some() {
@@ -1637,39 +1688,42 @@ impl Engine {
         }
     }
 
-    /// Handle keyboard input for the Extensions sidebar panel.
-    /// Returns `true` if the key was consumed.
-    pub fn handle_ext_sidebar_key(
-        &mut self,
-        key: &str,
-        _ctrl: bool,
-        unicode: Option<char>,
-    ) -> bool {
-        // Search input active — route printable chars to query
-        if self.ext_sidebar_input_active {
-            match key {
-                "Escape" => {
-                    self.ext_sidebar_input_active = false;
-                }
-                "BackSpace" => {
-                    self.ext_sidebar_query.pop();
-                    self.ext_sidebar_selected = 0;
-                }
-                _ => {
-                    if let Some(ch) = unicode {
-                        if !ch.is_control() {
-                            self.ext_sidebar_query.push(ch);
-                            self.ext_sidebar_selected = 0;
-                        }
-                    }
-                }
-            }
-            return true;
-        }
+    pub fn ext_selected_from_sidebar_system(&self) -> (bool, usize) {
+        let sidebar = self.ext_sidebar_system.borrow();
+        let section = sidebar.active_section().unwrap_or(0);
+        let idx = sidebar
+            .selected_path(section)
+            .and_then(|p| p.first().copied())
+            .unwrap_or(0) as usize;
+        (section == 0, idx)
+    }
 
+    pub fn dispatch_ext_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { .. } => {
+                self.ext_open_selected_readme();
+                true
+            }
+            quadraui::SidebarEvent::RowSelected { .. } => {
+                self.ext_sidebar_input_active = false;
+                true
+            }
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.ext_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
+                true
+            }
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true,
+        }
+    }
+
+    pub fn dispatch_ext_sidebar_action_key(&mut self, key: &str) -> bool {
         match key {
-            "q" | "Escape" => {
+            "Escape" | "q" => {
                 self.ext_sidebar_has_focus = false;
+                self.ext_sidebar_system.borrow_mut().set_has_focus(false);
                 true
             }
             "/" => {
@@ -1680,34 +1734,8 @@ impl Engine {
                 self.ext_refresh();
                 true
             }
-            "Tab" => {
-                // Toggle the section the cursor is in
-                let (in_installed, _) = self.ext_selected_to_section(self.ext_sidebar_selected);
-                if in_installed {
-                    self.ext_sidebar_sections_expanded[0] = !self.ext_sidebar_sections_expanded[0];
-                } else {
-                    self.ext_sidebar_sections_expanded[1] = !self.ext_sidebar_sections_expanded[1];
-                }
-                true
-            }
-            "j" | "Down" => {
-                let total = self.ext_flat_item_count();
-                if total > 0 {
-                    self.ext_sidebar_selected = (self.ext_sidebar_selected + 1).min(total - 1);
-                }
-                true
-            }
-            "k" | "Up" => {
-                self.ext_sidebar_selected = self.ext_sidebar_selected.saturating_sub(1);
-                true
-            }
-            "Return" => {
-                self.ext_open_selected_readme();
-                true
-            }
             "i" => {
-                // Install the selected extension
-                let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+                let (in_installed, idx) = self.ext_selected_from_sidebar_system();
                 if in_installed {
                     let installed = self.ext_installed_items();
                     if let Some(m) = installed.get(idx) {
@@ -1717,40 +1745,41 @@ impl Engine {
                     }
                 } else {
                     let available = self.ext_available_items();
-                    let avail_idx = idx;
-                    if avail_idx < available.len() {
-                        let base_url = self.resolve_registry_base_url(&available[avail_idx]);
-                        let name = available[avail_idx].name.clone();
-                        let display = if available[avail_idx].display_name.is_empty() {
+                    if idx < available.len() {
+                        let base_url = self.resolve_registry_base_url(&available[idx]);
+                        let name = available[idx].name.clone();
+                        let display = if available[idx].display_name.is_empty() {
                             name.clone()
                         } else {
-                            available[avail_idx].display_name.clone()
+                            available[idx].display_name.clone()
                         };
                         self.ext_install_from_registry(&name);
-                        // Try to open README after install
-                        let readme_path = paths::vimcode_config_dir()
+                        let readme_path = crate::core::paths::vimcode_config_dir()
                             .join("extensions")
                             .join(&name)
                             .join("README.md");
                         let content = std::fs::read_to_string(&readme_path)
                             .ok()
-                            .or_else(|| registry::fetch_readme(&base_url, &name));
+                            .or_else(|| crate::core::registry::fetch_readme(&base_url, &name));
                         if let Some(content) = content {
                             self.open_markdown_preview_in_tab(&content, &display);
                         }
-                        // Move cursor to the newly installed item.
-                        self.ext_sidebar_sections_expanded[0] = true;
+                        self.ext_sidebar_system.borrow_mut().set_collapsed(0, false);
                         let new_installed = self.ext_installed_items();
-                        self.ext_sidebar_selected = new_installed
-                            .iter()
-                            .position(|m| m.name == name)
-                            .unwrap_or(0);
+                        if let Some(pos) = new_installed.iter().position(|m| m.name == name) {
+                            self.ext_sidebar_system
+                                .borrow_mut()
+                                .set_active_section(Some(0));
+                            self.ext_sidebar_system
+                                .borrow_mut()
+                                .set_selected_path(0, Some(vec![pos as u16]));
+                        }
                     }
                 }
                 true
             }
             "d" => {
-                let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+                let (in_installed, idx) = self.ext_selected_from_sidebar_system();
                 if in_installed {
                     let installed = self.ext_installed_items();
                     if let Some(m) = installed.get(idx) {
@@ -1761,8 +1790,7 @@ impl Engine {
                 true
             }
             "u" => {
-                // Update the selected installed extension
-                let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+                let (in_installed, idx) = self.ext_selected_from_sidebar_system();
                 if in_installed {
                     let installed = self.ext_installed_items();
                     if let Some(m) = installed.get(idx) {
@@ -1776,8 +1804,200 @@ impl Engine {
                 }
                 true
             }
+            "Return" => {
+                self.ext_open_selected_readme();
+                true
+            }
             _ => false,
         }
+    }
+
+    pub fn populate_ext_sidebar_system(&self) {
+        use quadraui::{Decoration, StyledText, TreeRow};
+
+        let manifests = self.ext_available_manifests();
+        let q = self.ext_sidebar_query.to_lowercase();
+
+        let installed_rows: Vec<TreeRow> = manifests
+            .iter()
+            .filter(|m| self.extension_state.is_installed(&m.name))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_lowercase().contains(&q)
+                    || m.display_name.to_lowercase().contains(&q)
+            })
+            .enumerate()
+            .map(|(i, m)| {
+                let display = if m.display_name.is_empty() {
+                    &m.name
+                } else {
+                    &m.display_name
+                };
+                let has_update = self.ext_has_update(&m.name);
+                let label = if has_update {
+                    format!("\u{25cf} {} \u{2191}", display)
+                } else {
+                    format!("\u{25cf} {}", display)
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(label),
+                    badge: None,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                }
+            })
+            .collect();
+
+        let available_rows: Vec<TreeRow> = manifests
+            .iter()
+            .filter(|m| !self.extension_state.is_installed(&m.name))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_lowercase().contains(&q)
+                    || m.display_name.to_lowercase().contains(&q)
+            })
+            .enumerate()
+            .map(|(i, m)| {
+                let display = if m.display_name.is_empty() {
+                    &m.name
+                } else {
+                    &m.display_name
+                };
+                TreeRow {
+                    path: vec![i as u16],
+                    indent: 0,
+                    icon: None,
+                    text: StyledText::plain(format!("\u{25cb} {}", display)),
+                    badge: None,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                }
+            })
+            .collect();
+
+        let mut sidebar = self.ext_sidebar_system.borrow_mut();
+        sidebar.set_has_focus(self.ext_sidebar_has_focus);
+        if self.ext_sidebar_has_focus && sidebar.active_section().is_none() {
+            sidebar.set_active_section(Some(0));
+        }
+        sidebar.set_rows(0, installed_rows);
+        sidebar.set_rows(1, available_rows);
+    }
+
+    fn ext_sidebar_navigate(&mut self, key: quadraui::Key) {
+        self.populate_ext_sidebar_system();
+        let rect = self.ext_sidebar_body_rect.get();
+        let ev = quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        };
+        let sidebar_event = self
+            .ext_sidebar_system
+            .borrow_mut()
+            .handle_cached(&ev, rect);
+        self.dispatch_ext_sidebar_event(sidebar_event);
+    }
+
+    pub fn dispatch_ext_sidebar_key_unified(
+        &mut self,
+        key: &str,
+        unicode: Option<char>,
+    ) -> ExtSidebarKeyResult {
+        use quadraui::{Key, NamedKey};
+
+        if self.ext_sidebar_input_active {
+            match key {
+                "Escape" => {
+                    self.ext_sidebar_input_active = false;
+                    ExtSidebarKeyResult::Consumed
+                }
+                "BackSpace" => {
+                    self.ext_sidebar_query.pop();
+                    ExtSidebarKeyResult::Consumed
+                }
+                "Down" => {
+                    self.ext_sidebar_navigate(Key::Named(NamedKey::Down));
+                    ExtSidebarKeyResult::Consumed
+                }
+                "Up" => {
+                    self.ext_sidebar_navigate(Key::Named(NamedKey::Up));
+                    ExtSidebarKeyResult::Consumed
+                }
+                "Return" => {
+                    self.ext_open_selected_readme();
+                    ExtSidebarKeyResult::Consumed
+                }
+                _ => {
+                    if let Some(ch) = unicode {
+                        if !ch.is_control() {
+                            self.ext_sidebar_query.push(ch);
+                        }
+                    }
+                    ExtSidebarKeyResult::Consumed
+                }
+            }
+        } else {
+            match key {
+                "Escape" | "q" => {
+                    self.ext_sidebar_has_focus = false;
+                    self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                    ExtSidebarKeyResult::Unfocused
+                }
+                "h" | "Left" => {
+                    self.ext_sidebar_has_focus = false;
+                    self.ext_sidebar_system.borrow_mut().set_has_focus(false);
+                    self.activity_bar_focus_in_at(5);
+                    ExtSidebarKeyResult::FocusActivityBar
+                }
+                "/" => {
+                    self.ext_sidebar_input_active = true;
+                    ExtSidebarKeyResult::Consumed
+                }
+                "r" => {
+                    self.ext_refresh();
+                    ExtSidebarKeyResult::Consumed
+                }
+                "i" | "d" | "u" | "Return" => {
+                    self.dispatch_ext_sidebar_action_key(key);
+                    ExtSidebarKeyResult::Consumed
+                }
+                _ => {
+                    let nav_key = match key {
+                        "j" => Some(Key::Char('j')),
+                        "k" => Some(Key::Char('k')),
+                        "Down" => Some(Key::Named(NamedKey::Down)),
+                        "Up" => Some(Key::Named(NamedKey::Up)),
+                        "Tab" => Some(Key::Named(NamedKey::Tab)),
+                        "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+                        "Home" => Some(Key::Named(NamedKey::Home)),
+                        "End" => Some(Key::Named(NamedKey::End)),
+                        "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
+                        "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
+                        _ => None,
+                    };
+                    if let Some(k) = nav_key {
+                        self.ext_sidebar_navigate(k);
+                    }
+                    ExtSidebarKeyResult::Consumed
+                }
+            }
+        }
+    }
+
+    pub fn handle_ext_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
+        self.populate_ext_sidebar_system();
+        let rect = self.ext_sidebar_body_rect.get();
+        let sidebar_event = self
+            .ext_sidebar_system
+            .borrow_mut()
+            .handle_cached(&event, rect);
+        self.dispatch_ext_sidebar_event(sidebar_event)
     }
 
     /// Returns the filtered list of installed extension manifests.
@@ -1806,37 +2026,6 @@ impl Engine {
                     || m.display_name.to_lowercase().contains(&q)
             })
             .collect()
-    }
-
-    /// Total number of flat items in the sidebar (installed + available, respecting collapse).
-    pub(crate) fn ext_flat_item_count(&self) -> usize {
-        let installed = if self.ext_sidebar_sections_expanded[0] {
-            self.ext_installed_items().len()
-        } else {
-            0
-        };
-        let available = if self.ext_sidebar_sections_expanded[1] {
-            self.ext_available_items().len()
-        } else {
-            0
-        };
-        installed + available
-    }
-
-    /// Map the flat selected index to (section, index_within_section),
-    /// accounting for collapsed sections.
-    /// Returns `(true, idx)` for installed items, `(false, idx)` for available.
-    pub(crate) fn ext_selected_to_section(&self, sel: usize) -> (bool, usize) {
-        let installed_vis = if self.ext_sidebar_sections_expanded[0] {
-            self.ext_installed_items().len()
-        } else {
-            0
-        };
-        if sel < installed_vis {
-            (true, sel)
-        } else {
-            (false, sel - installed_vis)
-        }
     }
 
     // ── Settings sidebar panel ──────────────────────────────────────────────────
@@ -1998,7 +2187,7 @@ impl Engine {
     }
 
     /// Handle a key press while the settings panel has focus.
-    pub fn handle_settings_key(&mut self, key: &str, _ctrl: bool, unicode: Option<char>) {
+    pub fn handle_settings_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) {
         use crate::core::settings::{SettingType, SETTING_DEFS};
 
         // Search input active — route printable chars to query
@@ -2041,6 +2230,12 @@ impl Engine {
                     // Lazy-init spell checker when toggled on via text entry
                     if def.key == "spell" && self.settings.spell {
                         self.ensure_spell_checker();
+                    }
+                    // Re-parse the active buffer when the syntax threshold
+                    // changes via the form so newly-enabled highlighting
+                    // appears on the currently-open huge file.
+                    if def.key == "syntax_max_lines" {
+                        self.update_syntax();
                     }
                     self.settings_editing = None;
                     self.settings_edit_buf.clear();
@@ -2106,6 +2301,32 @@ impl Engine {
         let flat = self.settings_flat_list();
         let total = flat.len();
 
+        // h/Left: focus the activity bar when the selected setting is not an
+        // enum type (for enums, h/Left cycles the value backward instead).
+        if (key == "h" || key == "Left") && !ctrl {
+            use crate::core::settings::{SettingType, SETTING_DEFS};
+            let is_enum = if self.settings_selected < flat.len() {
+                match &flat[self.settings_selected] {
+                    SettingsRow::CoreSetting(idx) => matches!(
+                        SETTING_DEFS[*idx].setting_type,
+                        SettingType::Enum(_) | SettingType::DynamicEnum(_)
+                    ),
+                    SettingsRow::ExtSetting(ext_name, ext_key) => self
+                        .find_ext_setting_def(ext_name, ext_key)
+                        .is_some_and(|d| d.r#type == "enum"),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !is_enum {
+                self.settings_has_focus = false;
+                self.activity_bar_focus_in_at(7);
+                return;
+            }
+            // is_enum == true: fall through so the existing match arm cycles the value.
+        }
+
         match key {
             "q" | "Escape" => {
                 self.settings_has_focus = false;
@@ -2113,157 +2334,150 @@ impl Engine {
             "/" => {
                 self.settings_input_active = true;
             }
-            "j" | "Down" => {
-                if total > 0 {
-                    self.settings_selected = (self.settings_selected + 1).min(total - 1);
-                }
+            "j" | "Down" if total > 0 => {
+                self.settings_selected = (self.settings_selected + 1).min(total - 1);
             }
             "k" | "Up" => {
                 self.settings_selected = self.settings_selected.saturating_sub(1);
             }
-            "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left" => {
-                if self.settings_selected < total {
-                    match &flat[self.settings_selected] {
-                        SettingsRow::CoreCategory(cat_idx) => {
-                            let cat_idx = *cat_idx;
-                            if matches!(key, "Tab" | "Return" | "Space")
-                                && cat_idx < self.settings_collapsed.len()
-                            {
-                                self.settings_collapsed[cat_idx] =
-                                    !self.settings_collapsed[cat_idx];
-                            }
+            "Tab" | "Return" | "Space" | "l" | "Right" | "h" | "Left"
+                if self.settings_selected < total =>
+            {
+                match &flat[self.settings_selected] {
+                    SettingsRow::CoreCategory(cat_idx) => {
+                        let cat_idx = *cat_idx;
+                        if matches!(key, "Tab" | "Return" | "Space")
+                            && cat_idx < self.settings_collapsed.len()
+                        {
+                            self.settings_collapsed[cat_idx] = !self.settings_collapsed[cat_idx];
                         }
-                        SettingsRow::CoreSetting(idx) => {
-                            let idx = *idx;
-                            let def = &SETTING_DEFS[idx];
-                            match &def.setting_type {
-                                SettingType::Bool => {
-                                    if matches!(key, "Return" | "Space") {
-                                        let cur = self.settings.get_value_str(def.key);
-                                        let new_val = if cur == "true" { "false" } else { "true" };
-                                        if self.settings.set_value_str(def.key, new_val).is_ok() {
+                    }
+                    SettingsRow::CoreSetting(idx) => {
+                        let idx = *idx;
+                        let def = &SETTING_DEFS[idx];
+                        match &def.setting_type {
+                            SettingType::Bool => {
+                                if matches!(key, "Return" | "Space") {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    let new_val = if cur == "true" { "false" } else { "true" };
+                                    if self.settings.set_value_str(def.key, new_val).is_ok() {
+                                        let _ = self.settings.save();
+                                    }
+                                    // Lazy-init spell checker when toggled on
+                                    if def.key == "spell" && self.settings.spell {
+                                        self.ensure_spell_checker();
+                                    }
+                                }
+                            }
+                            SettingType::Enum(options) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) =
+                                        options.iter().position(|&o| o == cur.as_str())
+                                    {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, options[next])
+                                            .is_ok()
+                                        {
                                             let _ = self.settings.save();
                                         }
-                                        // Lazy-init spell checker when toggled on
-                                        if def.key == "spell" && self.settings.spell {
-                                            self.ensure_spell_checker();
+                                    }
+                                }
+                            }
+                            SettingType::DynamicEnum(options_fn) => {
+                                let forward = matches!(key, "Return" | "Space" | "l" | "Right");
+                                let backward = matches!(key, "h" | "Left");
+                                if forward || backward {
+                                    let options = options_fn();
+                                    let cur = self.settings.get_value_str(def.key);
+                                    if let Some(pos) = options.iter().position(|o| o == &cur) {
+                                        let next = if forward {
+                                            (pos + 1) % options.len()
+                                        } else {
+                                            (pos + options.len() - 1) % options.len()
+                                        };
+                                        if self
+                                            .settings
+                                            .set_value_str(def.key, &options[next])
+                                            .is_ok()
+                                        {
+                                            let _ = self.settings.save();
                                         }
                                     }
                                 }
-                                SettingType::Enum(options) => {
+                            }
+                            SettingType::Integer { .. } | SettingType::StringVal => {
+                                if matches!(key, "Return") {
+                                    self.settings_editing = Some(idx);
+                                    self.settings_edit_buf = self.settings.get_value_str(def.key);
+                                }
+                            }
+                            SettingType::BufferEditor => {
+                                if matches!(key, "Return" | "Space" | "l" | "Right") {
+                                    match def.key {
+                                        "keymaps" => self.open_keymaps_editor(),
+                                        "extension_registries" => self.open_registries_editor(),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SettingsRow::ExtCategory(name) => {
+                        if matches!(key, "Tab" | "Return" | "Space") {
+                            let collapsed = self
+                                .ext_settings_collapsed
+                                .entry(name.clone())
+                                .or_insert(false);
+                            *collapsed = !*collapsed;
+                        }
+                    }
+                    SettingsRow::ExtSetting(ext_name, ext_key) => {
+                        let ext_name = ext_name.clone();
+                        let ext_key = ext_key.clone();
+                        if let Some(def) = self.find_ext_setting_def(&ext_name, &ext_key) {
+                            match def.r#type.as_str() {
+                                "bool" => {
+                                    if matches!(key, "Return" | "Space") {
+                                        let cur = self.get_ext_setting(&ext_name, &ext_key);
+                                        let new_val = if cur == "true" { "false" } else { "true" };
+                                        self.set_ext_setting(&ext_name, &ext_key, new_val);
+                                    }
+                                }
+                                "enum" => {
                                     let forward = matches!(key, "Return" | "Space" | "l" | "Right");
                                     let backward = matches!(key, "h" | "Left");
-                                    if forward || backward {
-                                        let cur = self.settings.get_value_str(def.key);
+                                    if (forward || backward) && !def.options.is_empty() {
+                                        let cur = self.get_ext_setting(&ext_name, &ext_key);
                                         if let Some(pos) =
-                                            options.iter().position(|&o| o == cur.as_str())
+                                            def.options.iter().position(|o| o == &cur)
                                         {
                                             let next = if forward {
-                                                (pos + 1) % options.len()
+                                                (pos + 1) % def.options.len()
                                             } else {
-                                                (pos + options.len() - 1) % options.len()
+                                                (pos + def.options.len() - 1) % def.options.len()
                                             };
-                                            if self
-                                                .settings
-                                                .set_value_str(def.key, options[next])
-                                                .is_ok()
-                                            {
-                                                let _ = self.settings.save();
-                                            }
+                                            self.set_ext_setting(
+                                                &ext_name,
+                                                &ext_key,
+                                                &def.options[next],
+                                            );
                                         }
                                     }
                                 }
-                                SettingType::DynamicEnum(options_fn) => {
-                                    let forward = matches!(key, "Return" | "Space" | "l" | "Right");
-                                    let backward = matches!(key, "h" | "Left");
-                                    if forward || backward {
-                                        let options = options_fn();
-                                        let cur = self.settings.get_value_str(def.key);
-                                        if let Some(pos) = options.iter().position(|o| o == &cur) {
-                                            let next = if forward {
-                                                (pos + 1) % options.len()
-                                            } else {
-                                                (pos + options.len() - 1) % options.len()
-                                            };
-                                            if self
-                                                .settings
-                                                .set_value_str(def.key, &options[next])
-                                                .is_ok()
-                                            {
-                                                let _ = self.settings.save();
-                                            }
-                                        }
-                                    }
-                                }
-                                SettingType::Integer { .. } | SettingType::StringVal => {
+                                _ => {
                                     if matches!(key, "Return") {
-                                        self.settings_editing = Some(idx);
                                         self.settings_edit_buf =
-                                            self.settings.get_value_str(def.key);
-                                    }
-                                }
-                                SettingType::BufferEditor => {
-                                    if matches!(key, "Return" | "Space" | "l" | "Right") {
-                                        match def.key {
-                                            "keymaps" => self.open_keymaps_editor(),
-                                            "extension_registries" => self.open_registries_editor(),
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        SettingsRow::ExtCategory(name) => {
-                            if matches!(key, "Tab" | "Return" | "Space") {
-                                let collapsed = self
-                                    .ext_settings_collapsed
-                                    .entry(name.clone())
-                                    .or_insert(false);
-                                *collapsed = !*collapsed;
-                            }
-                        }
-                        SettingsRow::ExtSetting(ext_name, ext_key) => {
-                            let ext_name = ext_name.clone();
-                            let ext_key = ext_key.clone();
-                            if let Some(def) = self.find_ext_setting_def(&ext_name, &ext_key) {
-                                match def.r#type.as_str() {
-                                    "bool" => {
-                                        if matches!(key, "Return" | "Space") {
-                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
-                                            let new_val =
-                                                if cur == "true" { "false" } else { "true" };
-                                            self.set_ext_setting(&ext_name, &ext_key, new_val);
-                                        }
-                                    }
-                                    "enum" => {
-                                        let forward =
-                                            matches!(key, "Return" | "Space" | "l" | "Right");
-                                        let backward = matches!(key, "h" | "Left");
-                                        if (forward || backward) && !def.options.is_empty() {
-                                            let cur = self.get_ext_setting(&ext_name, &ext_key);
-                                            if let Some(pos) =
-                                                def.options.iter().position(|o| o == &cur)
-                                            {
-                                                let next = if forward {
-                                                    (pos + 1) % def.options.len()
-                                                } else {
-                                                    (pos + def.options.len() - 1)
-                                                        % def.options.len()
-                                                };
-                                                self.set_ext_setting(
-                                                    &ext_name,
-                                                    &ext_key,
-                                                    &def.options[next],
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        if matches!(key, "Return") {
-                                            self.settings_edit_buf =
-                                                self.get_ext_setting(&ext_name, &ext_key);
-                                            self.ext_settings_editing = Some((ext_name, ext_key));
-                                        }
+                                            self.get_ext_setting(&ext_name, &ext_key);
+                                        self.ext_settings_editing = Some((ext_name, ext_key));
                                     }
                                 }
                             }
@@ -2792,6 +3006,11 @@ impl Engine {
         match key {
             "q" | "Escape" => {
                 self.ai_has_focus = false;
+                true
+            }
+            "h" | "Left" if !ctrl => {
+                self.ai_has_focus = false;
+                self.activity_bar_focus_in_at(6);
                 true
             }
             "i" | "a" | "Return" => {

@@ -5,3 +5,5 @@ vim-index.txt
 .flatpak-builder/
 build-dir/
 target2/
+# insta's pending-review artifacts — `.snap` files are the source of truth.
+**/*.snap.new

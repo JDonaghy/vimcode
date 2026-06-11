@@ -35,6 +35,13 @@ use std::borrow::Cow;
 
 use super::{Cursor, Mode};
 
+// ─── Phase B.2: accelerator registry + UiEvent dispatch ──────────────────────
+// Engine owns the registered accelerators + the dispatch entry point. Backends
+// look up matches via [`Engine::match_accelerator`] in their existing key
+// handlers, then call [`Engine::handle_ui_event`] with viewport context.
+// See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11.
+pub use quadraui::{Accelerator, AcceleratorId, AcceleratorScope, KeyBinding, UiEvent};
+
 /// High bit marker for synthetic "Non-Public Members" group var_refs.
 /// Real DAP adapters use sequential integers that never set this bit.
 const SYNTHETIC_NON_PUBLIC_MASK: u64 = 0x8000_0000_0000_0000;
@@ -51,6 +58,10 @@ pub enum EngineAction {
     Error,
     /// Open the integrated terminal panel (UI layer provides correct cols/rows)
     OpenTerminal,
+    /// Toggle terminal panel maximize (fill editor area). UI layer provides the
+    /// total available rows; engine flips `terminal_maximized` + swaps
+    /// `session.terminal_panel_rows`.
+    ToggleTerminalMaximize,
     /// Run a command in a visible terminal pane (UI layer provides cols/rows).
     /// The string is the shell command to execute.
     RunInTerminal(String),
@@ -70,6 +81,116 @@ pub enum EngineAction {
     QuitWithError,
     /// Open a URL in the default browser (validated as safe by the engine).
     OpenUrl(String),
+}
+
+/// One entry in the engine's accelerator registry. Caches the parsed form of
+/// `acc.binding` so [`Engine::match_accelerator`] can do a tight comparison
+/// without re-parsing per keypress.
+#[derive(Debug)]
+pub struct RegisteredAccelerator {
+    pub acc: Accelerator,
+    /// Cached parse of `acc.binding` in vimcode's native form
+    /// (`(ctrl, shift, alt, key_name)`). `None` if the binding string is
+    /// unparseable; the registration is still kept so `unregister_accelerator`
+    /// can find it by id.
+    pub parsed: Option<(bool, bool, bool, String)>,
+}
+
+/// Per-call backend context that [`Engine::handle_ui_event`] needs to act on
+/// terminal-oriented accelerators. Backends fill this in from their own native
+/// viewport math (TUI: cells; GTK/Win-GUI: pixel/line_height).
+///
+/// See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11 for the rationale on
+/// why the engine doesn't compute these itself: the per-backend chrome
+/// arithmetic uses native units, and `PanelChromeDesc` is the right place
+/// for backends to derive `terminal_max_rows`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UiEventContext {
+    /// Terminal width in columns/cells (TUI: crossterm size; GTK/Win-GUI:
+    /// `floor(width_px / char_width)`).
+    pub terminal_cols: u16,
+    /// Maximum content rows the terminal panel can fill when maximized.
+    /// Backends compute via `PanelChromeDesc::max_panel_content_rows()`.
+    pub terminal_max_rows: u16,
+}
+
+/// Row-count description of everything that surrounds a bottom panel (terminal,
+/// debug output, future equivalents) in the active viewport. Each backend fills
+/// this in using its own native units converted to row count, then calls
+/// [`PanelChromeDesc::max_panel_content_rows`] to get the largest *content*
+/// row count the panel can take when maximized.
+///
+/// The intent is to let the engine own the "what fits?" arithmetic so TUI,
+/// GTK, and Win-GUI can't drift — each would otherwise reimplement the same
+/// subtraction of menu / qf / dbg / wildmenu / tab-bar / status / cmd rows.
+///
+/// For normal (non-maximized) rendering, backends keep using
+/// `session.terminal_panel_rows` directly — this helper only matters when
+/// computing the `max_target_rows` argument to
+/// [`Engine::effective_terminal_panel_rows`].
+///
+/// # Mental model
+///
+/// The viewport is a stack of rows. `viewport_rows = sum(every chrome field)
+/// + content_rows`. Rearranged:
+/// `content_rows = viewport_rows − sum(chrome)`, clamped to
+/// `min_content_rows`.
+#[derive(Debug, Clone, Default)]
+pub struct PanelChromeDesc {
+    /// Total rows available in the backend's viewport.
+    /// - TUI: crossterm screen height in cells.
+    /// - GTK: `floor(drawing_area.height() / line_height)`.
+    /// - Win-GUI: `floor(client_rect.height / line_height)`.
+    pub viewport_rows: u16,
+    /// Menu bar row (0 or 1). For GTK this is 0 — the menu bar lives
+    /// outside the DrawingArea.
+    pub menu_rows: u16,
+    /// Quickfix panel rows (0 or 6).
+    pub quickfix_rows: u16,
+    /// Debug toolbar row (0 or 1).
+    pub debug_toolbar_rows: u16,
+    /// Wildmenu row (0 or 1).
+    pub wildmenu_rows: u16,
+    /// Editor tab-bar + optional breadcrumbs. When maximizing a bottom
+    /// panel, callers usually pass **1** (the tab row only) because
+    /// breadcrumbs collapse behind the panel.
+    pub tab_bar_rows: u16,
+    /// "Separated" per-window status row below the bottom panel, if
+    /// the `window_status_line` + `!status_line_above_terminal` combo
+    /// is active.
+    pub separated_status_rows: u16,
+    /// Global status + command-line rows. Typically 1 (per-window
+    /// status on, only cmd line remains globally) or 2 (per-window
+    /// status off, both global status and cmd).
+    pub status_cmd_rows: u16,
+    /// Chrome *inside* the bottom panel itself: bottom-panel tabs
+    /// ("TERMINAL" / "DEBUG CONSOLE") + terminal/debug toolbar.
+    /// For terminal / debug output, this is **2**.
+    pub panel_chrome_rows: u16,
+    /// Minimum content rows to guarantee even on cramped viewports.
+    pub min_content_rows: u16,
+}
+
+impl PanelChromeDesc {
+    /// Largest panel *content* row count that fits in the viewport after
+    /// subtracting every chrome row. Floor at `min_content_rows.max(1)`.
+    ///
+    /// Backends pass this return value to
+    /// [`Engine::effective_terminal_panel_rows`] as the `max_target_rows`
+    /// argument.
+    pub fn max_panel_content_rows(&self) -> u16 {
+        let used = self.menu_rows
+            + self.quickfix_rows
+            + self.debug_toolbar_rows
+            + self.wildmenu_rows
+            + self.tab_bar_rows
+            + self.separated_status_rows
+            + self.status_cmd_rows
+            + self.panel_chrome_rows;
+        self.viewport_rows
+            .saturating_sub(used)
+            .max(self.min_content_rows.max(1))
+    }
 }
 
 /// A row in the Settings sidebar flat list.
@@ -790,6 +911,22 @@ pub struct Notification {
     pub done_at: Option<std::time::Instant>,
 }
 
+/// How long toasts stay visible before `prune_toasts` drops them.
+pub const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A transient toast popup, rendered in the bottom-right corner by the
+/// backend via `quadraui::*::draw_toast_stack`. Currently used to surface
+/// LSP `$/progress` lifecycle events (#450); general-purpose for any
+/// future transient notification (build done, save error, etc.).
+#[derive(Debug, Clone)]
+pub struct EngineToast {
+    pub id: u64,
+    pub title: String,
+    pub body: String,
+    pub severity: quadraui::ToastSeverity,
+    pub created_at: std::time::Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum PickerSource {
@@ -810,6 +947,9 @@ pub enum PickerSource {
     Indentation,
     /// Line ending picker (LF / CRLF).
     LineEndings,
+    /// Recent workspaces (#274). Replaces the native GTK Dialog and the
+    /// TUI's `FolderPickerState::new_recent` with the engine-driven picker.
+    RecentWorkspaces,
     Custom(String),
 }
 
@@ -873,6 +1013,8 @@ pub enum PickerAction {
     SetIndentation(bool, u8),
     /// Set line ending format: true = CRLF, false = LF.
     SetLineEnding(bool),
+    /// Open a workspace folder (recent-workspaces picker; #274).
+    OpenWorkspace(PathBuf),
     Custom(String),
 }
 
@@ -936,157 +1078,29 @@ pub struct FindReplaceOptions {
     pub in_selection: bool,
 }
 
-/// Click target within the find/replace overlay.
-/// Backends resolve native coordinates → `FindReplaceClickTarget`, then call
-/// `Engine::handle_find_replace_click()` for shared dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FindReplaceClickTarget {
-    /// Toggle replace row visibility (the ▶/▼ chevron).
-    Chevron,
-    /// Click in the find input field at the given char offset.
-    FindInput(usize),
-    /// Click in the replace input field at the given char offset.
-    ReplaceInput(usize),
-    ToggleCase,
-    ToggleWholeWord,
-    ToggleRegex,
-    PrevMatch,
-    NextMatch,
-    ToggleInSelection,
-    Close,
-    TogglePreserveCase,
-    ReplaceCurrent,
-    ReplaceAll,
-}
+// ── Find/replace overlay types (lifted to quadraui in #271) ────────────────
 
-/// A hit region within the find/replace panel, expressed in character-cell units
-/// relative to the panel's top-left **content** corner (inside borders).
-#[derive(Debug, Clone)]
-pub struct FrHitRegion {
-    /// Column offset from panel content-left edge.
-    pub col: u16,
-    /// Row: 0 = find row, 1 = replace row.
-    pub row: u16,
-    /// Width of this region in char cells.
-    pub width: u16,
-}
+/// Re-exports of the lifted `FindReplace` primitive types from
+/// quadraui. Existing engine + render + backend call sites keep
+/// referencing `core::engine::FindReplaceClickTarget` etc. unchanged
+/// — the canonical definitions live in
+/// [`quadraui::primitives::find_replace`].
+pub use quadraui::{FindReplaceClickTarget, FrHitRegion, FR_PANEL_WIDTH};
 
-/// Default panel width for the find/replace overlay (in char cells, including borders).
-pub const FR_PANEL_WIDTH: u16 = 50;
-
-/// Compute hit regions for the find/replace overlay.
-/// Layout: `[chevron(2)] [input(variable)] [Aa(2+1)][ab(2+1)][.*(2+1)] [count(max(len,5)+1)] [↑(2)][↓(2)][≡(2)][×(2)]`
-/// All positions are in char-cell units relative to the panel content corner (inside borders).
+/// Wrapper around `quadraui::compute_find_replace_hit_regions` that
+/// reads the replace-button glyph widths from
+/// [`crate::icons::FIND_REPLACE`] / `FIND_REPLACE_ALL`. Engine /
+/// render call sites that don't want to touch icons keep the same
+/// `(panel_w, show_replace, match_info)` signature this wrapper
+/// preserves.
 pub fn compute_find_replace_hit_regions(
     panel_w: u16,
     show_replace: bool,
     match_info: &str,
 ) -> (Vec<(FrHitRegion, FindReplaceClickTarget)>, u16) {
-    use FindReplaceClickTarget::*;
-
-    let mut regions = Vec::with_capacity(16);
-    let content_w = panel_w.saturating_sub(2);
-
-    // Chevron: cols 0..2
-    regions.push((
-        FrHitRegion {
-            col: 0,
-            row: 0,
-            width: 2,
-        },
-        Chevron,
-    ));
-
-    // Find input: starts at col 2, right side uses remaining space for buttons.
-    // Right side: toggles(3×3=9) + gap(1) + match_info(max(len,5)) + gap(1) + nav(4×2=8) = dynamic
-    let info_len = (match_info.len() as u16).max(5);
-    let right_side_w: u16 = 9 + info_len + 1 + 8; // toggles + count + gap + nav
-    let input_start: u16 = 2;
-    let input_w = content_w.saturating_sub(2 + right_side_w);
-    regions.push((
-        FrHitRegion {
-            col: input_start,
-            row: 0,
-            width: input_w,
-        },
-        FindInput(0),
-    ));
-
-    // Toggle buttons: [Aa(2)gap(1)] [ab(2)gap(1)] [.*(2)gap(1)]
-    let mut tx = input_start + input_w + 1;
-    for target in [ToggleCase, ToggleWholeWord, ToggleRegex] {
-        regions.push((
-            FrHitRegion {
-                col: tx,
-                row: 0,
-                width: 2,
-            },
-            target,
-        ));
-        tx += 3;
-    }
-
-    // Match count (not clickable)
-    tx += info_len + 1;
-
-    // Nav buttons: [↑(2)][↓(2)][≡(2)][×(2)]
-    for target in [PrevMatch, NextMatch, ToggleInSelection, Close] {
-        regions.push((
-            FrHitRegion {
-                col: tx,
-                row: 0,
-                width: 2,
-            },
-            target,
-        ));
-        tx += 2;
-    }
-
-    // Replace row (row 1)
-    if show_replace {
-        regions.push((
-            FrHitRegion {
-                col: input_start,
-                row: 1,
-                width: input_w,
-            },
-            ReplaceInput(0),
-        ));
-
-        let mut bx = input_start + input_w + 1;
-        regions.push((
-            FrHitRegion {
-                col: bx,
-                row: 1,
-                width: 2,
-            },
-            TogglePreserveCase,
-        ));
-        bx += 3;
-
-        let r1_w = crate::icons::FIND_REPLACE.s().chars().count() as u16;
-        regions.push((
-            FrHitRegion {
-                col: bx,
-                row: 1,
-                width: r1_w,
-            },
-            ReplaceCurrent,
-        ));
-        bx += r1_w + 1;
-
-        let ra_w = crate::icons::FIND_REPLACE_ALL.s().chars().count() as u16;
-        regions.push((
-            FrHitRegion {
-                col: bx,
-                row: 1,
-                width: ra_w,
-            },
-            ReplaceAll,
-        ));
-    }
-
-    (regions, input_w)
+    let r1_w = crate::icons::FIND_REPLACE.s().chars().count() as u16;
+    let ra_w = crate::icons::FIND_REPLACE_ALL.s().chars().count() as u16;
+    quadraui::compute_find_replace_hit_regions(panel_w, show_replace, match_info, r1_w, ra_w)
 }
 
 // ── Activity bar hit regions ────────────────────────────────────────────────
@@ -1183,6 +1197,7 @@ pub struct TabBarHitRegion {
 // ── Context menu hit regions ────────────────────────────────────────────────
 
 /// Result of resolving a click against a context menu popup.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuClickResult {
     /// Click on a menu item at this index.
@@ -1193,6 +1208,20 @@ pub enum ContextMenuClickResult {
     Outside,
 }
 
+/// Parse a `ContextMenuHit::Item(id)` back to the engine-side item index.
+/// The adapter (`context_menu_panel_to_quadraui_context_menu`) synthesises
+/// ids as `"context:N"` where N is the engine index.
+pub fn context_menu_hit_to_idx(hit: &quadraui::ContextMenuHit) -> Option<usize> {
+    if let quadraui::ContextMenuHit::Item(id) = hit {
+        id.as_str()
+            .strip_prefix("context:")
+            .and_then(|s| s.parse::<usize>().ok())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
 /// Compute the context menu popup bounds and resolve a click position.
 ///
 /// `items` — the menu items (separator_after items add an extra visual row).
@@ -1371,6 +1400,79 @@ pub enum BottomPanelKind {
     #[default]
     Terminal,
     DebugOutput,
+}
+
+/// Cached hit-test data from the last paint of the terminal toolbar.
+pub enum TerminalToolbarHits {
+    FindBar {
+        layout: quadraui::StatusBarLayout,
+        origin_x: f64,
+    },
+    TabStrip(quadraui::TabBarHits),
+}
+
+/// Cached vertical geometry of the bottom panel (tab bar + toolbar + content),
+/// written at paint time so click handlers don't have to recompute the snapped
+/// panel top from chrome/status/wildmenu heights. Units match the backend's
+/// click coordinates: pixels for GTK, character rows for TUI.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BottomPanelGeometry {
+    /// Top edge of the tab-bar row (= panel top).
+    pub top_y: f64,
+    /// Total panel height in the same unit as `top_y`.
+    pub height: f64,
+    /// Y offset of the toolbar row relative to `top_y`.
+    /// GTK: `(line_height * 1.6).ceil()` (tab bar is taller than a normal row).
+    /// TUI: `1.0`.
+    pub toolbar_y: f64,
+    /// Y offset of the content area relative to `top_y`.
+    /// GTK: `toolbar_y + line_height`. TUI: `2.0`.
+    pub content_y: f64,
+    /// Height of one content row (line_height for GTK, 1.0 for TUI).
+    /// Used to compute `row_offset` within the content zone.
+    pub content_row_h: f64,
+}
+
+/// Click zone within the bottom panel as resolved by
+/// [`Engine::resolve_bottom_panel_zone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BottomPanelZone {
+    /// Row 0 — the shared "TERMINAL / DEBUG CONSOLE" tab strip.
+    TabBar,
+    /// Row 1 — the per-terminal toolbar (tab strip or find bar).
+    Toolbar,
+    /// Row 2+ — the panel content. `row_offset` is the row index relative
+    /// to the top of the content area (0 = first content row).
+    Content { row_offset: u16 },
+}
+
+/// Action resolved from a terminal toolbar click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalToolbarAction {
+    SwitchTab(usize),
+    CloseTab,
+    ToggleMaximize,
+    ToggleSplit,
+    AddTab,
+    CloseFindBar,
+    StartResize,
+    None,
+}
+
+/// Action returned by [`Engine::handle_terminal_key`] — the engine decides
+/// what a keypress means; the backend executes it (#351).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalKeyAction {
+    /// Send raw bytes to the PTY.
+    SendToPty(Vec<u8>),
+    /// Copy terminal selection — backend reads text and writes to clipboard.
+    CopySelection,
+    /// Paste clipboard text to PTY (bracketed-paste wrapped).
+    PasteClipboard,
+    /// Already handled by the engine (tab switch, find bar, etc.).
+    Handled,
+    /// Key has no terminal mapping — ignore.
+    Ignore,
 }
 
 /// State of an in-progress tab drag operation.
@@ -1604,6 +1706,22 @@ pub struct ContextMenuState {
     pub selected: usize,
     pub screen_x: u16,
     pub screen_y: u16,
+    /// Height of the trigger element in line_height units (f32 so
+    /// backends with sub-cell row heights — e.g. GTK's tab row at
+    /// ceil(1.6 * line_height) — can place the menu flush against the
+    /// trigger). Non-zero opts into `ContextMenuPlacement::Below`
+    /// (#434); right-click flows leave this at 0.0 and use AnchorPoint.
+    pub trigger_height: f32,
+}
+
+/// One visible row in the flat explorer file-tree list.
+#[derive(Debug, Clone)]
+pub struct ExplorerRow {
+    pub depth: usize,
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub is_expanded: bool,
 }
 
 /// State for inline rename editing in the explorer sidebar.
@@ -2279,6 +2397,15 @@ pub struct Engine {
     /// Consumed by the UI backend to move focus to sidebar/toolbar.
     pub window_nav_overflow: Option<bool>,
 
+    /// True when the activity bar (toolbar) has keyboard focus.
+    /// Shared between TUI and GTK backends; both read from this field
+    /// for key routing and rendering.
+    pub activity_bar_focused: bool,
+    /// Keyboard-cursor index within the activity bar while focused.
+    /// 0=menu, 1=Explorer, 2=Search, 3=Debug, 4=Git, 5=Extensions,
+    /// 6=AI, 7=Settings, 8+=extension panels (sorted by name).
+    pub activity_bar_selected: u16,
+
     // --- Registers (yank/delete storage) ---
     /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is (content, is_linewise).
     pub registers: HashMap<char, (String, bool)>,
@@ -2340,6 +2467,10 @@ pub struct Engine {
     // --- Settings ---
     /// Editor settings (line numbers, etc.)
     pub settings: Settings,
+    /// mtime of settings.json at last check — poll-based reload detection.
+    settings_mtime: Option<std::time::SystemTime>,
+    /// save_revision at last check — distinguishes self-saves from external edits.
+    settings_save_revision: u64,
 
     // --- Session state (history, window geometry, etc.) ---
     /// Session state persisted across restarts
@@ -2403,14 +2534,18 @@ pub struct Engine {
     /// True when the popup was triggered automatically (typing/Ctrl-Space):
     /// Tab accepts the highlighted item. False for Ctrl-N/P (inserts immediately as before).
     pub completion_display_only: bool,
+    /// Prefix the current `completion_candidates` were last filtered against.
+    /// Used to detect when typing extends the prefix (`S` → `Sc`) so the list
+    /// can be narrowed instead of wholesale-replaced — keeps items the user
+    /// already saw from being silently dropped when a fresh LSP / buffer-word
+    /// scan happens to return a smaller set (#467).
+    pub completion_filter_prefix: String,
 
     // --- Project search state ---
     /// Current text typed in the project search input box.
     pub project_search_query: String,
     /// Results from the last `run_project_search` call.
     pub project_search_results: Vec<ProjectMatch>,
-    /// Index of the currently highlighted result (0-based).
-    pub project_search_selected: usize,
     /// Search mode toggles (case-sensitive, whole word, regex).
     pub project_search_options: SearchOptions,
     /// Receiver for async search results (set while a search thread is running).
@@ -2427,6 +2562,16 @@ pub struct Engine {
         Option<std::sync::mpsc::Receiver<Result<ReplaceResult, SearchError>>>,
     /// True while a background replace thread is running.
     pub project_replace_running: bool,
+    /// Search-specific status message ("N matches in M files").
+    pub project_search_status: String,
+    /// File indices that are collapsed in search results (toggled by clicking headers).
+    pub search_collapsed_files: std::cell::RefCell<std::collections::HashSet<usize>>,
+    /// Which form field in the search panel has focus (widget ID string).
+    pub search_panel_form_focus: std::cell::RefCell<Option<String>>,
+    /// Cursor position (char offset) in the search query input.
+    pub search_query_caret: std::cell::Cell<usize>,
+    /// Cursor position (char offset) in the replace text input.
+    pub replace_text_caret: std::cell::Cell<usize>,
 
     // --- LSP state ---
     /// Multi-server LSP coordinator. None until first LSP-capable file is opened.
@@ -2522,6 +2667,11 @@ pub struct Engine {
     pub explorer_has_focus: bool,
     /// Whether the Search sidebar panel has keyboard focus.
     pub search_has_focus: bool,
+    /// quadraui SidebarSystem — owns Search panel (2 sections: Form chrome +
+    /// Tree results) selection, scroll, keyboard nav, and mouse handling.
+    /// Both TUI and GTK call `render()` and `handle()`.
+    pub search_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    pub search_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- Source Control panel ---
     /// Cached file statuses from the last `sc_refresh()` call.
@@ -2534,6 +2684,16 @@ pub struct Engine {
     pub sc_sections_expanded: [bool; 4],
     /// Whether the Source Control panel currently has keyboard focus.
     pub sc_has_focus: bool,
+    /// quadraui SidebarSystem — owns SC sidebar (4 sections: Staged Changes,
+    /// Changes, Worktrees, Recent Commits) selection, scroll, keyboard nav,
+    /// and mouse handling. Both TUI and GTK call `render()` and `handle()`.
+    pub sc_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    pub sc_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
+    /// Cached layout of the SC `quadraui::SidebarPanel` from the last paint.
+    /// Click/hover dispatch reads it via `hit_test()` (#509) — no per-backend
+    /// button-row or section-start arithmetic. `toolbar_layout` inside carries
+    /// the per-button bounds for `sc_button_hit`.
+    pub sc_panel_layout: std::cell::RefCell<Option<quadraui::SidebarPanelLayout>>,
     /// Ahead/behind counts relative to upstream (cached alongside `sc_refresh`).
     pub sc_ahead: u32,
     pub sc_behind: u32,
@@ -2668,6 +2828,13 @@ pub struct Engine {
     /// When `Some`, `picker_populate_document_symbols` filters to symbols
     /// whose container matches this value. `Some(None)` = top-level only.
     pub breadcrumb_scoped_parent: Option<Option<String>>,
+    /// When `Some`, the line at which the parent scope starts in the buffer.
+    /// Used as the primary key for finding the parent in the LSP document
+    /// symbol tree, since tree-sitter's name (e.g. `"VsplitLayout"` for an
+    /// `impl X for VsplitLayout` block) doesn't match rust-analyzer's
+    /// `"impl X for VsplitLayout"` container string. Falls back to the
+    /// name-based filter when this is `None`.
+    pub breadcrumb_scoped_parent_line: Option<usize>,
 
     // --- Two-way diff state ---
     /// The pair of windows currently in diff mode, or None when diff is off.
@@ -2688,6 +2855,35 @@ pub struct Engine {
     pub sc_diff_rx: Option<std::sync::mpsc::Receiver<(PathBuf, String)>>,
     /// Window ID of the tab pre-opened for the pending SC diff.
     pub sc_diff_pending_win: Option<WindowId>,
+
+    /// Receiver for background `sc_refresh` results (status + worktrees +
+    /// ahead/behind + log). The SC / Explorer sidebars consume these
+    /// snapshots to render git indicators without blocking the main
+    /// thread on a burst of `git` subprocesses — four of them per
+    /// refresh took ~1 s on typical workspaces and pegged CPU at 100 %.
+    #[allow(clippy::type_complexity)]
+    pub sc_refresh_rx: Option<
+        std::sync::mpsc::Receiver<(
+            Vec<git::FileStatus>,
+            Vec<git::WorktreeEntry>,
+            u32,
+            u32,
+            Vec<git::GitLogEntry>,
+        )>,
+    >,
+    /// True while a background `sc_refresh` thread is in flight, so we
+    /// don't spawn another one on top of it.
+    pub sc_refresh_in_flight: bool,
+
+    /// Cached result of `explorer_indicators()`. The computation
+    /// canonicalises every file-status path and scans every LSP
+    /// diagnostic; on a workspace with thousands of untracked files
+    /// this was costing seconds per explorer draw (see #153). The
+    /// cache is invalidated via `invalidate_explorer_indicators()`
+    /// whenever `sc_file_statuses` or `lsp_diagnostics` changes.
+    #[allow(clippy::type_complexity)]
+    pub explorer_indicators_cache:
+        std::cell::RefCell<Option<(HashMap<PathBuf, char>, HashMap<PathBuf, (usize, usize)>)>>,
 
     // --- Inline diff peek popup ---
     /// Git diff peek popup state, or `None` when no peek is active.
@@ -2717,14 +2913,46 @@ pub struct Engine {
     pub menu_bar_visible: bool,
     /// Whether the menu bar can be fully hidden (true in TUI, false in GTK where it's the title bar).
     pub menu_bar_toggleable: bool,
-    /// Index of the currently open top-level menu dropdown (None = bar visible but no dropdown).
-    pub menu_open_idx: Option<usize>,
+    /// quadraui MenuSystem — owns all menu bar + dropdown state and logic.
+    /// Both TUI and GTK call `menu_system.render()` and `menu_system.handle()`.
+    pub menu_system: std::rc::Rc<std::cell::RefCell<quadraui::MenuSystem>>,
+    /// quadraui SidebarSystem — owns debug sidebar (4 sections: Variables,
+    /// Watch, Call Stack, Breakpoints) selection, scroll, keyboard nav, and
+    /// mouse handling. Both TUI and GTK call `render()` and `handle()`.
+    pub dap_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// Cached body rect from last render frame — used by handle() in event
+    /// dispatch to pass the same rect that render() used.
+    pub dap_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
+    /// quadraui TreeController — owns explorer file tree selection, scroll,
+    /// scrollbar, and click hit-testing. Both TUI and GTK call `render()`
+    /// for painting and `handle()` for mouse events. Keyboard dispatch goes
+    /// through `dispatch_explorer_key()` using the navigation primitives.
+    pub explorer_tree: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    /// Flat visible rows for the explorer tree, rebuilt on demand (toggle,
+    /// refresh, reveal). `TreePath` index maps directly into this vec.
+    pub explorer_rows: Vec<ExplorerRow>,
+    /// Set of directory paths currently expanded in the explorer tree.
+    pub explorer_expanded: std::collections::HashSet<PathBuf>,
+    /// When a new-file/folder inline edit is active, stores the parent
+    /// directory and whether it's a folder.  Cleared on EditConfirmed /
+    /// EditCancelled.
+    pub explorer_new_entry_pending: Option<(PathBuf, bool)>,
+    /// Cached explorer rect from last render frame.
+    pub explorer_tree_rect: std::cell::Cell<quadraui::Rect>,
+    /// Cached viewport row count from last render frame.
+    pub explorer_viewport_rows: std::cell::Cell<usize>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
     pub debug_toolbar_visible: bool,
+    /// Cached layout of the debug action-button `quadraui::Toolbar` from the
+    /// last paint. Click/hover dispatch reads it verbatim via `hit_test()`
+    /// (#510) — no per-backend button-row arithmetic.
+    pub debug_toolbar_layout: std::cell::RefCell<Option<quadraui::ToolbarLayout>>,
+    /// Which debug button the mouse is hovering over (0–6), or None.
+    pub debug_button_hovered: Option<usize>,
+    /// Which debug button is visually pressed (0–6), or None.
+    pub debug_button_pressed: Option<usize>,
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
-    /// Index of the keyboard-highlighted item in the currently open menu dropdown.
-    pub menu_highlighted_item: Option<usize>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -2786,6 +3014,20 @@ pub struct Engine {
     /// Per-section allocated heights in content rows (excluding header).
     /// Computed by backends and stored for ensure_visible calculations.
     pub dap_sidebar_section_heights: [u16; 4],
+    /// Cached layout for the debug sidebar action-button row.
+    /// Paint fills; click reads via `hit_test()` (paint↔click pattern).
+    pub dap_sidebar_action_hits: std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
+    /// Forward-indexed scroll offset for the debug output panel (0 = top/oldest).
+    pub debug_output_scroll: usize,
+    /// When true, debug output auto-scrolls to show newest lines.
+    pub debug_output_auto_scroll: bool,
+    /// Scroll surfaces registered at paint time for `dispatch_scroll`.
+    /// Cleared at the start of each frame.
+    pub scroll_surfaces: std::cell::RefCell<Vec<quadraui::ScrollSurface>>,
+    /// Per-window text viewport columns computed at paint time by
+    /// `build_screen_layout`. `ensure_cursor_visible` reads this
+    /// instead of the stale `view.viewport_cols` for horizontal scroll.
+    pub paint_viewport_cols: std::cell::RefCell<HashMap<WindowId, usize>>,
     /// Watch expressions added by the user (`:DapWatch <expr>`).
     pub dap_watch_expressions: Vec<String>,
     /// Evaluated values for each watch expression (parallel vec; `None` = not yet evaluated).
@@ -2796,6 +3038,26 @@ pub struct Engine {
     pub dap_selected_launch_config: usize,
     /// Which panel is shown in the shared bottom area (Terminal or Debug Output).
     pub bottom_panel_kind: BottomPanelKind,
+    /// Cached hit regions from the last paint of the bottom panel tab bar.
+    /// Written at paint time by both backends; read by click handlers.
+    pub bottom_tab_bar_hits: std::cell::RefCell<Option<quadraui::TabBarHits>>,
+    /// Cached hit data from the last paint of the terminal toolbar (find bar
+    /// or tab strip). Written at paint time; read by `resolve_terminal_toolbar_click`.
+    pub terminal_toolbar_hits: std::cell::RefCell<Option<TerminalToolbarHits>>,
+    /// Cached vertical geometry of the bottom panel from the last paint.
+    /// Written at paint time by both backends; read by `resolve_bottom_panel_zone`
+    /// so click handlers don't recompute the snapped panel top (#418).
+    pub bottom_panel_geometry: std::cell::RefCell<Option<BottomPanelGeometry>>,
+    /// Cached terminal split layout from the last paint. Written at paint
+    /// time; read by click handlers via `handle_terminal_split_click` (#430).
+    pub terminal_split_layout: std::cell::RefCell<Option<quadraui::TerminalSplitLayout>>,
+    /// Cached layout from the last paint of the command center (nav arrows + search box).
+    /// Written at paint time; read by click handlers.
+    pub command_center_layout: std::cell::RefCell<Option<quadraui::CommandCenterLayout>>,
+    /// Cached toast-stack layout from the last paint (#450). Written at
+    /// paint time; click handlers use it to dispatch dismiss-`×` /
+    /// action-button taps via `handle_toast_hit`.
+    pub toast_layout: std::cell::RefCell<Option<quadraui::ToastStackLayout>>,
     /// Launch arguments stored between `initialize` send and response receipt.
     /// We defer `launch`/`attach` until the adapter confirms `initialize` to avoid a race
     /// where codelldb processes both requests concurrently and reads arguments
@@ -2845,6 +3107,12 @@ pub struct Engine {
     /// Zero means "use the pane's actual PTY column count".
     /// Set by `terminal_split_set_drag_cols`; cleared by `terminal_split_finalize_drag`.
     pub terminal_split_left_cols: u16,
+    /// Whether the terminal panel is maximized (covers full editor area).
+    /// Transient — not persisted across restarts. When set, backends
+    /// compute the effective panel height from current window dimensions
+    /// each frame via [`Engine::effective_terminal_panel_rows`], so window
+    /// resizes are handled automatically without re-triggering maximize.
+    pub terminal_maximized: bool,
 
     // --- Special marks (for '', '., '<, '>) ---
     /// Position before last jump (for '' and `` marks).
@@ -2936,6 +3204,14 @@ pub struct Engine {
         Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
 
     // --- Extensions sidebar state ---
+    /// quadraui SidebarSystem — owns extensions sidebar (2 sections:
+    /// Installed, Available) selection, scroll, keyboard nav, and mouse
+    /// handling. WholePanel scroll mode. Both TUI and GTK will call
+    /// `render()` and `handle()` once backend migration (#337/#338) lands.
+    pub ext_sidebar_system: std::rc::Rc<std::cell::RefCell<quadraui::SidebarSystem>>,
+    /// Cached body rect from last render frame — used by handle() in
+    /// event dispatch to pass the same rect that render() used.
+    pub ext_sidebar_body_rect: std::cell::Cell<quadraui::Rect>,
     /// Whether the Extensions sidebar panel has keyboard focus.
     pub ext_sidebar_has_focus: bool,
     /// Flat selection index across installed + available items.
@@ -2946,6 +3222,12 @@ pub struct Engine {
     pub ext_sidebar_sections_expanded: [bool; 2],
     /// Whether the sidebar search input field is active.
     pub ext_sidebar_input_active: bool,
+    /// Vertical scroll offset of the Extensions panel content, in
+    /// main-axis units (cells for TUI, pixels for GTK). Drives
+    /// `MultiSectionView::panel_scroll` in `WholePanel` mode (#293).
+    /// Cleared on session start.
+    pub ext_sidebar_panel_scroll: f32,
+    /// Cache of the most recent rendered body height (cells for TUI,
     /// Extension name pending removal (set when the remove-confirmation dialog opens).
     pub pending_ext_remove: Option<String>,
 
@@ -2963,6 +3245,8 @@ pub struct Engine {
     pub settings_selected: usize,
     /// Scroll offset for the settings panel content.
     pub settings_scroll_top: usize,
+    /// Form scroll/scrollbar controller for the settings panel.
+    pub settings_form_controller: std::cell::RefCell<quadraui::FormController>,
     /// Search/filter query typed in the settings panel.
     pub settings_query: String,
     /// Whether the search input is active (user typing a filter).
@@ -3099,6 +3383,15 @@ pub struct Engine {
     /// Counter for generating unique notification IDs.
     next_notification_id: u64,
 
+    // --- Toasts (transient corner notifications) ---
+    /// Active toast popups rendered in the bottom-right corner. Each one
+    /// auto-dismisses after `TOAST_LIFETIME` via `prune_toasts()` (driven
+    /// from `poll_idle`). Initially populated by `push_toast(...)` from
+    /// LSP `$/progress` events for visibility into workspace-indexing
+    /// status (#450); general-purpose for any future transient UX.
+    pub toasts: Vec<EngineToast>,
+    next_toast_id: u64,
+
     // --- Editor hover popup ---
     /// Active editor hover popup with rendered markdown content.
     pub editor_hover: Option<EditorHoverPopup>,
@@ -3151,6 +3444,9 @@ pub struct Engine {
     /// a temporary editable row is inserted in the tree under `parent_dir`.
     pub explorer_new_entry: Option<ExplorerNewEntryState>,
 
+    // --- AppShell (activity bar + sidebar state) ---
+    pub app_shell: quadraui::AppShell,
+
     // --- File watching (external modification detection) ---
     /// Cross-platform file watcher (notify crate). Watches open buffer files for changes.
     file_watcher: Option<notify::RecommendedWatcher>,
@@ -3158,6 +3454,16 @@ pub struct Engine {
     file_watcher_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
     /// Paths that have been reported as modified but not yet handled (avoids duplicate dialogs).
     pub file_watcher_pending: HashSet<PathBuf>,
+
+    // ─── Phase B.2: accelerator registry ─────────────────────────────────
+    /// Registered accelerators. Backends call [`Engine::match_accelerator`]
+    /// from their existing key handlers to look up matches; on a match
+    /// they dispatch via [`Engine::handle_ui_event`] with backend-supplied
+    /// viewport context. See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11.
+    pub accelerators: Vec<RegisteredAccelerator>,
+
+    /// Rate-limiting timer for `check_file_changes` inside `poll_idle`.
+    idle_last_file_check: std::time::Instant,
 }
 
 impl Engine {
@@ -3211,6 +3517,8 @@ impl Engine {
             keymap_buf: Vec::new(),
             keymap_replaying: false,
             window_nav_overflow: None,
+            activity_bar_focused: false,
+            activity_bar_selected: 1,
             registers: HashMap::new(),
             selected_register: None,
             marks: HashMap::new(),
@@ -3232,6 +3540,13 @@ impl Engine {
                 Settings::ensure_exists().ok();
                 Settings::load()
             },
+            settings_mtime: {
+                let path = Settings::settings_file_path();
+                std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+            },
+            settings_save_revision: crate::core::settings::save_revision(),
             session: SessionState::load(),
             history: HistoryState::load(),
             command_history_index: None,
@@ -3256,15 +3571,20 @@ impl Engine {
             completion_idx: None,
             completion_start_col: 0,
             completion_display_only: false,
+            completion_filter_prefix: String::new(),
             project_search_query: String::new(),
             project_search_results: Vec::new(),
-            project_search_selected: 0,
             project_search_options: SearchOptions::default(),
             project_search_receiver: None,
             project_search_running: false,
             project_replace_text: String::new(),
             project_replace_receiver: None,
             project_replace_running: false,
+            project_search_status: String::new(),
+            search_collapsed_files: std::cell::RefCell::new(std::collections::HashSet::new()),
+            search_panel_form_focus: std::cell::RefCell::new(Some("search:query".to_string())),
+            search_query_caret: std::cell::Cell::new(0),
+            replace_text_caret: std::cell::Cell::new(0),
             lsp_manager: None,
             lsp_diagnostics: HashMap::new(),
             lsp_hover_text: None,
@@ -3314,11 +3634,35 @@ impl Engine {
             base_settings: None,
             explorer_has_focus: false,
             search_has_focus: false,
+            search_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::form("chrome", "SEARCH"),
+                    quadraui::SidebarSectionDef::new("results", "RESULTS"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                s.set_allow_collapse(false);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            search_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             sc_file_statuses: Vec::new(),
             sc_worktrees: Vec::new(),
             sc_selected: 0,
             sc_sections_expanded: [true, true, true, true],
             sc_has_focus: false,
+            sc_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("staged", "STAGED CHANGES"),
+                    quadraui::SidebarSectionDef::new("changes", "CHANGES"),
+                    quadraui::SidebarSectionDef::new("worktrees", "WORKTREES"),
+                    quadraui::SidebarSectionDef::new("log", "RECENT COMMITS"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                s.set_scroll_mode(quadraui::ScrollMode::WholePanel);
+                s.set_allow_collapse(true);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            sc_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            sc_panel_layout: std::cell::RefCell::new(None),
             sc_ahead: 0,
             sc_behind: 0,
             sc_log: Vec::new(),
@@ -3366,12 +3710,16 @@ impl Engine {
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),
             breadcrumb_scoped_parent: None,
+            breadcrumb_scoped_parent_line: None,
             diff_window_pair: None,
             diff_results: HashMap::new(),
             diff_aligned: HashMap::new(),
             diff_unchanged_hidden: false,
             sc_diff_rx: None,
             sc_diff_pending_win: None,
+            sc_refresh_rx: None,
+            sc_refresh_in_flight: false,
+            explorer_indicators_cache: std::cell::RefCell::new(None),
             diff_peek: None,
             clipboard_read: None,
             clipboard_write: None,
@@ -3391,12 +3739,42 @@ impl Engine {
             terminal_find_matches: Vec::new(),
             terminal_split: false,
             terminal_split_left_cols: 0,
+            terminal_maximized: false,
             menu_bar_visible: false,
             menu_bar_toggleable: false,
-            menu_open_idx: None,
+            menu_system: std::rc::Rc::new(std::cell::RefCell::new(quadraui::MenuSystem::new(
+                Vec::new(),
+            ))),
+            dap_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("vars", "VARIABLES"),
+                    quadraui::SidebarSectionDef::new("watch", "WATCH"),
+                    quadraui::SidebarSectionDef::new("stack", "CALL STACK"),
+                    quadraui::SidebarSectionDef::new("bps", "BREAKPOINTS"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            dap_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            explorer_tree: {
+                let mut tc = quadraui::TreeController::new("explorer-tree");
+                tc.set_vim_keys(true);
+                std::rc::Rc::new(std::cell::RefCell::new(tc))
+            },
+            explorer_rows: Vec::new(),
+            explorer_expanded: {
+                let mut set = std::collections::HashSet::new();
+                set.insert(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+                set
+            },
+            explorer_new_entry_pending: None,
+            explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            explorer_viewport_rows: std::cell::Cell::new(0),
             debug_toolbar_visible: false,
+            debug_toolbar_layout: std::cell::RefCell::new(None),
+            debug_button_hovered: None,
+            debug_button_pressed: None,
             dap_session_active: false,
-            menu_highlighted_item: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -3419,11 +3797,22 @@ impl Engine {
             dap_sidebar_selected: 0,
             dap_sidebar_scroll: [0; 4],
             dap_sidebar_section_heights: [0; 4],
+            dap_sidebar_action_hits: std::cell::RefCell::new(None),
+            debug_output_scroll: 0,
+            debug_output_auto_scroll: true,
+            scroll_surfaces: std::cell::RefCell::new(Vec::new()),
+            paint_viewport_cols: std::cell::RefCell::new(HashMap::new()),
             dap_watch_expressions: Vec::new(),
             dap_watch_values: Vec::new(),
             dap_launch_configs: Vec::new(),
             dap_selected_launch_config: 0,
             bottom_panel_kind: BottomPanelKind::Terminal,
+            bottom_tab_bar_hits: std::cell::RefCell::new(None),
+            terminal_toolbar_hits: std::cell::RefCell::new(None),
+            bottom_panel_geometry: std::cell::RefCell::new(None),
+            terminal_split_layout: std::cell::RefCell::new(None),
+            toast_layout: std::cell::RefCell::new(None),
+            command_center_layout: std::cell::RefCell::new(None),
             dap_pending_launch: None,
             bottom_panel_open: false,
             dap_wants_sidebar: false,
@@ -3460,17 +3849,32 @@ impl Engine {
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
+            ext_sidebar_system: {
+                let mut s = quadraui::SidebarSystem::new(vec![
+                    quadraui::SidebarSectionDef::new("installed", "INSTALLED"),
+                    quadraui::SidebarSectionDef::new("available", "AVAILABLE"),
+                ]);
+                s.set_navigation_mode(quadraui::NavigationMode::Selection);
+                s.set_scroll_mode(quadraui::ScrollMode::WholePanel);
+                s.set_allow_collapse(true);
+                std::rc::Rc::new(std::cell::RefCell::new(s))
+            },
+            ext_sidebar_body_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             ext_sidebar_has_focus: false,
             ext_sidebar_selected: 0,
             ext_sidebar_query: String::new(),
             ext_sidebar_sections_expanded: [true, true],
             ext_sidebar_input_active: false,
+            ext_sidebar_panel_scroll: 0.0,
             pending_ext_remove: None,
             pending_git_remote_op: None,
             pending_sc_discard: None,
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,
+            settings_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
+                "settings".to_string(),
+            )),
             settings_query: String::new(),
             settings_input_active: false,
             settings_editing: None,
@@ -3522,6 +3926,8 @@ impl Engine {
             ext_panel_help_bindings: HashMap::new(),
             notifications: Vec::new(),
             next_notification_id: 1,
+            toasts: Vec::new(),
+            next_toast_id: 1,
             editor_hover: None,
             editor_hover_dwell: None,
             editor_hover_dismiss_at: None,
@@ -3542,12 +3948,73 @@ impl Engine {
             explorer_needs_refresh: false,
             explorer_rename: None,
             explorer_new_entry: None,
+            app_shell: {
+                use quadraui::{AppShell, PanelDefinition, WidgetId};
+                AppShell::new(
+                    vec![
+                        PanelDefinition {
+                            id: WidgetId::new("panel:explorer"),
+                            icon: "".to_string(),
+                            tooltip: "Explorer".to_string(),
+                            title: "EXPLORER".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:search"),
+                            icon: "".to_string(),
+                            tooltip: "Search".to_string(),
+                            title: "SEARCH".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:debug"),
+                            icon: "".to_string(),
+                            tooltip: "Run and Debug".to_string(),
+                            title: "RUN AND DEBUG".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:git"),
+                            icon: "".to_string(),
+                            tooltip: "Source Control".to_string(),
+                            title: "SOURCE CONTROL".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:extensions"),
+                            icon: "".to_string(),
+                            tooltip: "Extensions".to_string(),
+                            title: "EXTENSIONS".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("panel:ai"),
+                            icon: "".to_string(),
+                            tooltip: "AI".to_string(),
+                            title: "AI".to_string(),
+                        },
+                        PanelDefinition {
+                            id: WidgetId::new("bottom:settings"),
+                            icon: "".to_string(),
+                            tooltip: "Settings".to_string(),
+                            title: "SETTINGS".to_string(),
+                        },
+                    ],
+                    30.0,
+                )
+            },
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
+            accelerators: Vec::new(),
+            idle_last_file_check: std::time::Instant::now(),
         };
-        // Initialize file watcher
+        let show_sidebar = if engine.settings.autohide_panels {
+            false
+        } else {
+            engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
+        };
+        if !show_sidebar {
+            engine.app_shell.hide_sidebar();
+        }
         engine.init_file_watcher();
+        // Register Phase B.2 accelerators (terminal maximize for now).
+        engine.register_default_accelerators();
         // If vscode mode is configured, start in Insert mode with menu visible
         if engine.is_vscode_mode() {
             engine.mode = Mode::Insert;
@@ -3555,7 +4022,78 @@ impl Engine {
         }
         engine.rebuild_user_keymaps();
         engine.ensure_spell_checker();
+        // Sync the syntax-highlighting line-count threshold before any file
+        // is opened via restore_session_files / CLI args, so huge buffers
+        // skip the expensive initial tree-sitter parse.
+        crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
+        engine.explorer_rebuild_rows();
         engine
+    }
+
+    /// Shared post-construction startup: load plugins, fetch extension
+    /// registry, then either open the CLI-supplied path or restore the
+    /// previous session.  Both TUI and GTK call this identically.
+    pub fn startup(&mut self, file_path: Option<&Path>) {
+        self.plugin_init();
+        self.ext_refresh();
+        if let Some(path) = file_path {
+            if path.is_dir() {
+                self.open_folder(path);
+            } else {
+                let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+            }
+        } else {
+            self.restore_session_files();
+        }
+    }
+
+    /// Run all periodic background work. Call once per idle tick from either
+    /// backend. Returns `true` if a redraw is needed.
+    ///
+    /// Backend-specific follow-ups that remain outside this method:
+    /// - `format_save_quit_ready` — backends must check and trigger exit
+    /// - `pending_terminal_command` — needs backend-supplied terminal size
+    /// - `ext_panel_focus_pending` — extension panel reveals (needs dynamic AppShell panels)
+    /// - `explorer_needs_refresh` — GTK sends Msg::RefreshFileTree
+    /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
+    /// - Settings file auto-reload (#376)
+    pub fn poll_idle(&mut self) -> bool {
+        let mut redraw = false;
+        redraw |= self.process_pending_sidebar();
+        redraw |= self.flush_cursor_move_hook();
+        self.lsp_flush_changes();
+        redraw |= self.poll_lsp();
+        if self.poll_project_search() {
+            self.search_switch_to_results();
+            redraw = true;
+        }
+        redraw |= self.poll_project_replace();
+        redraw |= self.poll_terminal();
+        redraw |= self.poll_dap();
+        redraw |= self.poll_ext_registry();
+        redraw |= self.poll_sc_diff();
+        redraw |= self.poll_ai();
+        redraw |= self.poll_async_shells();
+        redraw |= self.poll_panel_hover();
+        redraw |= self.poll_editor_hover();
+        redraw |= self.poll_blame();
+        redraw |= self.tick_ai_completion();
+        redraw |= self.tick_syntax_debounce();
+        self.tick_swap_files();
+        self.tick_file_watcher();
+        redraw |= self.tick_git_branch();
+        if self.prune_toasts() {
+            redraw = true;
+        }
+        if !self.notifications.is_empty() {
+            redraw = true;
+        }
+        self.tick_notifications();
+        if self.idle_last_file_check.elapsed() >= std::time::Duration::from_secs(2) {
+            self.idle_last_file_check = std::time::Instant::now();
+            redraw |= self.check_file_changes();
+        }
+        redraw
     }
 
     /// Create an engine with a file loaded (or empty buffer for new file).
@@ -3677,6 +4215,222 @@ impl Engine {
     /// Returns true if there are any completed notifications waiting to be dismissed.
     pub fn has_done_notifications(&self) -> bool {
         self.notifications.iter().any(|n| n.done)
+    }
+
+    // ── Toasts ──────────────────────────────────────────────────────────────
+
+    /// Push a transient toast popup. Auto-dismissed after `TOAST_LIFETIME`
+    /// by `prune_toasts()` (run from `poll_idle`). Returns the toast id.
+    pub fn push_toast(
+        &mut self,
+        title: &str,
+        body: &str,
+        severity: quadraui::ToastSeverity,
+    ) -> u64 {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push(EngineToast {
+            id,
+            title: title.to_string(),
+            body: body.to_string(),
+            severity,
+            created_at: std::time::Instant::now(),
+        });
+        id
+    }
+
+    /// Drop toasts older than `TOAST_LIFETIME`. Returns true if any were
+    /// removed (so the caller can request a redraw).
+    pub fn prune_toasts(&mut self) -> bool {
+        let before = self.toasts.len();
+        self.toasts
+            .retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
+        self.toasts.len() != before
+    }
+
+    /// Dispatch a `ToastHit` from the cached `toast_layout` to the engine
+    /// (#450). Both backends call this with the result of
+    /// `layout.hit_test(x, y)` and check the bool: true = consumed (don't
+    /// let the click reach the editor underneath); false = empty hit,
+    /// fall through to whatever was below the toast.
+    pub fn handle_toast_hit(&mut self, hit: quadraui::ToastHit) -> bool {
+        match hit {
+            quadraui::ToastHit::Dismiss(widget_id) => {
+                self.dismiss_toast_by_widget(&widget_id);
+                true
+            }
+            quadraui::ToastHit::Action(_) | quadraui::ToastHit::Body(_) => {
+                // Currently no consumers use action buttons or body
+                // clicks; treat as consumed so the click doesn't leak
+                // through to the editor under the toast.
+                true
+            }
+            quadraui::ToastHit::Empty => false,
+        }
+    }
+
+    /// Remove a toast whose adapter-side widget id matches `widget_id`.
+    /// Widget ids are formatted as `toast-{id}` by `build_toast_stack`.
+    fn dismiss_toast_by_widget(&mut self, widget_id: &quadraui::WidgetId) {
+        let key = widget_id.as_str();
+        let target_id: Option<u64> = key.strip_prefix("toast-").and_then(|s| s.parse().ok());
+        if let Some(id) = target_id {
+            self.toasts.retain(|t| t.id != id);
+        }
+    }
+
+    // ─── Phase B.2: accelerator registry + UiEvent dispatch ──────────────
+    //
+    // Backends look up matches synchronously via `match_accelerator` from
+    // their existing key handlers. On a match they fill a `UiEventContext`
+    // (terminal cols + max-rows in their native units) and call
+    // `handle_ui_event`. The engine owns the dispatch — no per-backend
+    // duplication of the toggle + resize sequence.
+    //
+    // See `quadraui/docs/BACKEND_TRAIT_PROPOSAL.md` §11 for the design,
+    // including why this is engine-owned (not backend-owned) for B.2.
+
+    /// Register an accelerator. Re-registration with the same id replaces
+    /// the prior entry (for live rebinding).
+    pub fn register_accelerator(&mut self, acc: Accelerator) {
+        let parsed = match &acc.binding {
+            KeyBinding::Literal(s) => crate::core::settings::parse_key_binding_named(s),
+            // Universal bindings render platform-appropriately; for vimcode
+            // (Linux/Windows; macOS not yet a backend) Ctrl+letter is the
+            // canonical form. parse_key_binding_named handles the vim-style
+            // strings.
+            KeyBinding::Save => crate::core::settings::parse_key_binding_named("<C-s>"),
+            KeyBinding::Open => crate::core::settings::parse_key_binding_named("<C-o>"),
+            KeyBinding::New => crate::core::settings::parse_key_binding_named("<C-n>"),
+            KeyBinding::Close => crate::core::settings::parse_key_binding_named("<C-w>"),
+            KeyBinding::Copy => crate::core::settings::parse_key_binding_named("<C-c>"),
+            KeyBinding::Cut => crate::core::settings::parse_key_binding_named("<C-x>"),
+            KeyBinding::Paste => crate::core::settings::parse_key_binding_named("<C-v>"),
+            KeyBinding::Undo => crate::core::settings::parse_key_binding_named("<C-z>"),
+            KeyBinding::Redo => crate::core::settings::parse_key_binding_named("<C-S-z>"),
+            KeyBinding::SelectAll => crate::core::settings::parse_key_binding_named("<C-a>"),
+            KeyBinding::Find => crate::core::settings::parse_key_binding_named("<C-f>"),
+            KeyBinding::Replace => crate::core::settings::parse_key_binding_named("<C-h>"),
+            KeyBinding::Quit => crate::core::settings::parse_key_binding_named("<C-q>"),
+        };
+        self.accelerators.retain(|r| r.acc.id != acc.id);
+        self.accelerators
+            .push(RegisteredAccelerator { acc, parsed });
+    }
+
+    /// Remove a previously-registered accelerator by id. No-op if not found.
+    /// Public API surface for live rebinding; no internal callers in B.2 yet
+    /// (the integration test suite covers the behaviour).
+    #[allow(dead_code)]
+    pub fn unregister_accelerator(&mut self, id: &AcceleratorId) {
+        self.accelerators.retain(|r| &r.acc.id != id);
+    }
+
+    /// Look up the registered accelerator (if any) that matches the given
+    /// modifier+key combo. First-match-wins, scope-filtered (only `Global`
+    /// scope is honoured in B.2; `Widget` and `Mode` scope are deferred to
+    /// B.3+).
+    ///
+    /// Backends pass the same `(ctrl, shift, alt, key_char, is_tab,
+    /// is_space, is_escape)` shape they already use with
+    /// [`crate::render::matches_key_binding`], so this slots into existing
+    /// key-handler sites without translation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_accelerator(
+        &self,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        key_char: Option<char>,
+        is_tab: bool,
+        is_space: bool,
+        is_escape: bool,
+    ) -> Option<AcceleratorId> {
+        for reg in &self.accelerators {
+            if !matches!(reg.acc.scope, AcceleratorScope::Global) {
+                continue;
+            }
+            let Some((want_ctrl, want_shift, want_alt, ref key_name)) = reg.parsed else {
+                continue;
+            };
+            if want_ctrl != ctrl || want_shift != shift || want_alt != alt {
+                continue;
+            }
+            let matches = match key_name.as_str() {
+                "Tab" | "tab" => is_tab,
+                "Space" | "space" => is_space,
+                "Escape" | "Esc" => is_escape,
+                s if s.chars().count() == 1 => {
+                    let want = s.chars().next().unwrap().to_ascii_lowercase();
+                    key_char
+                        .map(|c| c.to_ascii_lowercase() == want)
+                        .unwrap_or(false)
+                }
+                _ => false,
+            };
+            if matches {
+                return Some(reg.acc.id.clone());
+            }
+        }
+        None
+    }
+
+    /// Dispatch a `UiEvent` to its engine-side handler. B.2 supports exactly
+    /// one accelerator (`"terminal.toggle_maximize"`); other arms are no-ops
+    /// for now.
+    pub fn handle_ui_event(&mut self, ev: UiEvent, ctx: UiEventContext) {
+        if let UiEvent::Accelerator(id, _mods) = ev {
+            if id.as_str() == "terminal.toggle_maximize" {
+                self.toggle_terminal_maximize();
+                let effective = self.effective_terminal_panel_rows(ctx.terminal_max_rows);
+                if self.terminal_panes.is_empty() {
+                    self.terminal_new_tab(ctx.terminal_cols, effective);
+                } else {
+                    self.terminal_resize(ctx.terminal_cols, effective);
+                }
+            }
+        }
+    }
+
+    /// Poll settings.json for changes and reload if modified externally.
+    /// Returns `true` if settings were reloaded (caller should redraw).
+    /// Self-saves (`:set`, settings panel) are detected via save_revision
+    /// and skipped.
+    pub fn check_settings_reload(&mut self) -> bool {
+        let path = Settings::settings_file_path();
+        let mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if mtime.is_none() || mtime == self.settings_mtime {
+            return false;
+        }
+        self.settings_mtime = mtime;
+        let cur_rev = crate::core::settings::save_revision();
+        let is_self_save = cur_rev != self.settings_save_revision;
+        self.settings_save_revision = cur_rev;
+        if is_self_save {
+            return false;
+        }
+        if let Ok(new_settings) = Settings::load_with_validation() {
+            self.settings = new_settings;
+            self.ensure_spell_checker();
+            self.message = "Settings reloaded".to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Register the built-in accelerators that ship with vimcode. Called
+    /// once from `Engine::new()`. New accelerators added in B.4+ go here.
+    /// Public so integration tests can re-run after resetting settings.
+    pub fn register_default_accelerators(&mut self) {
+        self.register_accelerator(Accelerator {
+            id: AcceleratorId::new("terminal.toggle_maximize"),
+            binding: KeyBinding::Literal(self.settings.panel_keys.toggle_terminal_maximize.clone()),
+            scope: AcceleratorScope::Global,
+            label: Some("Toggle terminal maximize".into()),
+        });
     }
 }
 
@@ -3935,6 +4689,20 @@ fn merge_short_same_runs(results: &mut [DiffLine], fill: DiffLine) {
 /// does not.
 ///
 /// Returns `(aligned_a, aligned_b)` — both the same length.
+impl Engine {
+    /// Drop all aligned-diff state and reset every window's
+    /// `aligned_top` pin. Use this anywhere `diff_aligned.clear()`
+    /// would have been called: leaving the pin dangling would let the
+    /// render code keep starting at a stale aligned-row index after
+    /// the user exits diff mode (#166 fallout).
+    pub(crate) fn clear_all_diff_alignment(&mut self) {
+        self.diff_aligned.clear();
+        for w in self.windows.values_mut() {
+            w.view.aligned_top = None;
+        }
+    }
+}
+
 pub fn build_aligned_diff(
     da: &[DiffLine],
     db: &[DiffLine],
@@ -4136,8 +4904,12 @@ pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
 mod accessors;
 mod buffers;
 mod dap_ops;
+pub use dap_ops::DEBUG_BUTTON_IDS;
+mod explorer_ops;
+pub use explorer_ops::ExplorerKeyResult;
 mod execute;
 mod ext_panel;
+pub use ext_panel::ExtSidebarKeyResult;
 mod keys;
 mod lsp_ops;
 mod motions;
@@ -4145,13 +4917,18 @@ mod panels;
 mod picker;
 mod plugins;
 mod search;
-pub use search::find_word_boundaries;
+pub use search::{find_word_boundaries, SearchKeyResult};
+pub mod sidebar;
 mod source_control;
+pub use source_control::ScKeyResult;
+pub use source_control::SC_BUTTON_IDS;
 mod spell_ops;
 mod terminal_ops;
 mod visual;
 mod vscode;
 mod windows;
 
+// #438: pub(crate) so render.rs's own test module can use shared
+// engine-test helpers like `engine_with_text`.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

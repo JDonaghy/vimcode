@@ -177,12 +177,27 @@ impl Engine {
 
         // Quickfix panel intercepts all keys when it has focus.
         if self.quickfix_has_focus {
-            return self.handle_quickfix_key(key_name, ctrl);
+            // TUI sends printable keys as `key_name=""` + `unicode=Some(c)`;
+            // GTK sends `key_name="j"`. Normalise so `j`/`k`/`q` close and
+            // navigate consistently across backends (mirrors the pattern
+            // used for editor-hover key routing).
+            let qf_key = if key_name.is_empty() {
+                unicode.map(|c| c.to_string()).unwrap_or_default()
+            } else {
+                key_name.to_string()
+            };
+            return self.handle_quickfix_key(&qf_key, ctrl);
         }
 
-        // Debug sidebar intercepts all keys when it has focus.
+        // Debug sidebar intercepts all keys when it has focus
+        // (TUI and GTK route through SidebarSystem directly),
+        // EXCEPT debug F-keys which must always reach the engine.
         if self.dap_sidebar_has_focus {
-            return self.handle_debug_sidebar_key(key_name, ctrl);
+            if !ctrl && matches!(key_name, "F5" | "F9" | "F10" | "F11") {
+                // Fall through to the global F-key handler below.
+            } else {
+                return EngineAction::None;
+            }
         }
 
         // Extension panel input field intercepts keys when active.
@@ -277,6 +292,34 @@ impl Engine {
         let pre_cursor_line = self.cursor().line;
         let pre_cursor_col = self.cursor().col;
         let pre_mode = self.mode;
+
+        // Debug F-keys work from any mode (global debugger commands).
+        if !ctrl {
+            match key_name {
+                "F5" => {
+                    let cmd = if self.dap_session_active {
+                        "continue"
+                    } else {
+                        "debug"
+                    };
+                    let _ = self.execute_command(cmd);
+                    return EngineAction::None;
+                }
+                "F9" => {
+                    let _ = self.execute_command("brkpt");
+                    return EngineAction::None;
+                }
+                "F10" => {
+                    let _ = self.execute_command("stepover");
+                    return EngineAction::None;
+                }
+                "F11" => {
+                    let _ = self.execute_command("stepin");
+                    return EngineAction::None;
+                }
+                _ => {}
+            }
+        }
 
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
         if ctrl
@@ -802,20 +845,18 @@ impl Engine {
                     }
                     return EngineAction::None;
                 }
-                '0' => {
-                    if self.count.is_some() {
-                        // Accumulate: 10, 20, 100, etc.
-                        let new_count = self.count.unwrap() * 10;
-                        if new_count > 10_000 {
-                            self.count = Some(10_000);
-                            self.message = "Count limited to 10,000".to_string();
-                        } else {
-                            self.count = Some(new_count);
-                        }
-                        return EngineAction::None;
+                '0' if self.count.is_some() => {
+                    // Accumulate: 10, 20, 100, etc.
+                    let new_count = self.count.unwrap() * 10;
+                    if new_count > 10_000 {
+                        self.count = Some(10_000);
+                        self.message = "Count limited to 10,000".to_string();
+                    } else {
+                        self.count = Some(new_count);
                     }
-                    // Fall through to handle '0' as "go to column 0" below
+                    return EngineAction::None;
                 }
+                // Fall through to handle '0' as "go to column 0" below
                 _ => {}
             }
         }
@@ -1653,26 +1694,9 @@ impl Engine {
                     self.open_picker(PickerSource::Commands);
                     return EngineAction::None;
                 }
-                // Debug / DAP function keys
-                "F5" => {
-                    let cmd = if self.dap_session_active {
-                        "continue"
-                    } else {
-                        "debug"
-                    };
-                    let _ = self.execute_command(cmd);
-                }
+                // F5/F9/F10/F11 handled globally before mode dispatch.
                 "F6" => {
                     let _ = self.execute_command("pause");
-                }
-                "F9" => {
-                    let _ = self.execute_command("brkpt");
-                }
-                "F10" => {
-                    let _ = self.execute_command("stepover");
-                }
-                "F11" => {
-                    let _ = self.execute_command("stepin");
                 }
                 _ => {}
             },
@@ -2401,16 +2425,15 @@ impl Engine {
                 }
                 _ => {}
             },
-            'd' => {
+            'd'
                 // This should not be reached - 'd' is now handled as pending_operator
                 // But keep for backward compatibility during transition
-                if unicode == Some('d') {
+                if unicode == Some('d') => {
                     let count = self.take_count();
                     self.start_undo_group();
                     self.delete_lines(count, changed);
                     self.finish_undo_group();
                 }
-            }
             '"' => {
                 // Register selection: "x sets selected_register for next operation
                 // Uppercase A-Z appends to lowercase register
@@ -4609,12 +4632,12 @@ impl Engine {
             {
                 let key_char = key_name.chars().next().unwrap_or('\0');
                 if ctrl == t_ctrl && (key_char == t_ch || (key_name == "space" && t_ch == ' ')) {
-                    self.trigger_auto_completion();
+                    self.trigger_completion(true);
                     return;
                 }
             } else if ctrl && key_name == "space" {
                 // Fallback for default <C-Space> trigger
-                self.trigger_auto_completion();
+                self.trigger_completion(true);
                 return;
             }
         }
@@ -4738,8 +4761,13 @@ impl Engine {
             return;
         }
 
-        // Clear completion state on any non-completion key.
-        if self.completion_idx.is_some() {
+        // Clear completion state on non-completion keys. Word characters
+        // pass through — `trigger_completion` will either narrow (prefix
+        // extension) or clear (new word) after the char is inserted. Any
+        // non-word key (space, punctuation, navigation) means the user
+        // has left the current word, so the popup should dismiss.
+        let extends_word = unicode.is_some_and(Self::is_word_char) && !ctrl;
+        if self.completion_idx.is_some() && !extends_word {
             self.dismiss_completion();
         }
 
@@ -5199,7 +5227,7 @@ impl Engine {
                     }
                 }
                 if *changed {
-                    self.trigger_auto_completion();
+                    self.trigger_completion(false);
                 }
             }
             "Delete" => {
@@ -5380,7 +5408,7 @@ impl Engine {
                     }
                 }
                 if *changed {
-                    self.trigger_auto_completion();
+                    self.trigger_completion(false);
                 }
             }
         }
@@ -5447,7 +5475,7 @@ impl Engine {
         self.ensure_cursor_visible();
         self.sync_scroll_binds();
         self.update_bracket_match();
-        self.trigger_auto_completion();
+        self.trigger_completion(false);
     }
 
     /// Insert `text` at the current command-line cursor position and advance the cursor.
@@ -7478,6 +7506,11 @@ impl Engine {
         self.mouse_drag_word_origin = None;
         self.mouse_drag_active = false;
         self.mouse_drag_origin_window = None;
+        // Clicking into the editor returns keyboard focus to the buffer, so
+        // any bottom-panel focus (currently just quickfix) must be released
+        // — otherwise the panel keeps the `[FOCUS]` marker and j/k keep
+        // routing to the panel until Esc is pressed.
+        self.quickfix_has_focus = false;
         // Switch to the group that owns this window.
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
@@ -7673,11 +7706,95 @@ impl Engine {
         }
     }
 
-    /// Pre-load clipboard text into the `+` and `*` registers.
-    /// Called by GTK backend after an async GDK clipboard read, before paste.
-    pub fn load_clipboard_register(&mut self, text: String) {
-        self.registers.insert('+', (text.clone(), false));
-        self.registers.insert('*', (text, false));
+    /// Route pasted text to the correct input context.
+    ///
+    /// Checks active contexts in priority order (terminal, picker, search,
+    /// SC commit, extension sidebar, AI chat) before falling through to
+    /// mode-based dispatch. Both backends call this instead of reimplementing
+    /// the priority chain.
+    pub fn route_paste(&mut self, text: &str) {
+        let first_line = text.lines().next().unwrap_or("");
+
+        if self.terminal_has_focus {
+            if self.terminal_find_active {
+                for ch in first_line.chars() {
+                    if !ch.is_control() {
+                        self.terminal_find_char(ch);
+                    }
+                }
+            } else if !text.is_empty() {
+                self.terminal_write(b"\x1b[200~");
+                self.terminal_write(text.as_bytes());
+                self.terminal_write(b"\x1b[201~");
+                self.poll_terminal();
+            }
+            return;
+        }
+
+        if self.picker_open {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.picker_query.push(c);
+                }
+            }
+            self.picker_selected = 0;
+            self.picker_scroll_top = 0;
+            self.picker_filter();
+            self.picker_load_preview();
+            return;
+        }
+
+        if self.search_has_focus {
+            let focus_id = self.search_panel_form_focus.borrow().clone();
+            if focus_id.is_some() {
+                let is_replace = focus_id.as_deref() == Some("search:replace");
+                self.search_input_paste(is_replace, first_line);
+                return;
+            }
+        }
+
+        if self.sc_commit_input_active {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.sc_commit_message.insert(self.sc_commit_cursor, c);
+                    self.sc_commit_cursor += c.len_utf8();
+                }
+            }
+            return;
+        }
+
+        if self.ext_sidebar_input_active {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.ext_sidebar_query.push(c);
+                }
+            }
+            return;
+        }
+
+        if self.ai_has_focus && self.ai_input_active {
+            for c in first_line.chars() {
+                if !c.is_control() {
+                    self.ai_input.push(c);
+                }
+            }
+            return;
+        }
+
+        match self.mode {
+            Mode::Command | Mode::Search => {
+                self.paste_text_to_input(text);
+            }
+            Mode::Insert | Mode::Replace => {
+                self.paste_in_insert_mode(text);
+            }
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                if !text.is_empty() {
+                    self.load_clipboard_for_paste(text.to_string());
+                    self.handle_key("p", Some('p'), false);
+                }
+            }
+        }
     }
 
     /// Pre-load clipboard text into `"`, `+`, and `*` before a p/P keypress.
@@ -7720,6 +7837,43 @@ impl Engine {
         self.registers.insert('"', (text.clone(), existing_lw));
         self.registers.insert('+', (text.clone(), false));
         self.registers.insert('*', (text, false));
+    }
+
+    /// Returns `true` if the upcoming key is a paste that needs system clipboard
+    /// contents pre-loaded into registers. Backends call this before reading the
+    /// clipboard (which may be expensive or async) so the detection logic is shared.
+    pub fn needs_clipboard_for_paste(&self, key: &str, unicode: Option<char>, ctrl: bool) -> bool {
+        if ctrl && key == "v" && self.is_vscode_mode() {
+            return true;
+        }
+        if !ctrl
+            && matches!(unicode, Some('p') | Some('P'))
+            && matches!(
+                self.mode,
+                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+            )
+            && matches!(
+                self.selected_register,
+                None | Some('"') | Some('+') | Some('*')
+            )
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Load system clipboard text into the engine's paste registers, handling
+    /// VSCode mode (always charwise) vs Vim mode (preserves linewise state).
+    /// Call after `needs_clipboard_for_paste` returns `true`.
+    pub fn prepare_paste_clipboard(&mut self, clipboard_text: Option<String>) {
+        if let Some(text) = clipboard_text.filter(|t| !t.is_empty()) {
+            if self.is_vscode_mode() {
+                self.registers.insert('+', (text.clone(), false));
+                self.registers.insert('"', (text, false));
+            } else {
+                self.load_clipboard_for_paste(text);
+            }
+        }
     }
 
     /// Feed a key sequence string into the engine, parsing special key notation.

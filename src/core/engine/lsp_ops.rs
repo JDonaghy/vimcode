@@ -93,6 +93,12 @@ impl Engine {
                     "No {} extension — :ExtInstall {}  (N to dismiss)",
                     manifest.display_name, name
                 );
+            } else if let Some(err) = no_server {
+                // #436: extension is installed but the LSP didn't start
+                // (binary missing, install crashed, etc.).  Surface the
+                // hint from `ensure_server_for_language` instead of
+                // silently failing.
+                self.message = err;
             }
         } else if let Some(err) = no_server {
             // Show dependency errors prominently; generic "no server" only as fallback.
@@ -174,7 +180,6 @@ impl Engine {
         });
         self.ext_registry_rx = Some(rx);
         self.ext_registry_fetching = true;
-        self.message = "Fetching extension registries...".to_string();
     }
 
     /// Non-blocking check for a completed registry fetch.
@@ -198,7 +203,12 @@ impl Engine {
                     self.message = format!("Extension registry updated ({count} extensions)");
                 }
                 None => {
-                    self.message = "Registry fetch failed — try again later".to_string();
+                    if self.ext_registry.is_some() {
+                        // Cache from a previous fetch is still available —
+                        // silently keep it rather than alarming the user.
+                    } else {
+                        self.message = "Registry fetch failed — try again later".to_string();
+                    }
                 }
             }
             true
@@ -289,33 +299,46 @@ impl Engine {
             }
         }
 
+        // `install_cmd_for_adapter` needs the manifest list to look up
+        // manifest-declared installs; fetch once for the DAP block.
+        let available_manifests = self.ext_available_manifests();
+
         // ── DAP ──────────────────────────────────────────────────────────────
-        // Check PATH first (idempotent).  Only auto-install if the manifest
-        // provides an explicit dap.install command.  An empty dap.install means
-        // "this adapter needs a manual/complex install" — guide the user to run
-        // :DapInstall instead of silently attempting a potentially large download.
+        // Check PATH first (idempotent), then consult the unified resolver
+        // that knows about both manifest-declared installs AND the built-in
+        // multi-step installers (codelldb, debugpy venv, netcoredbg archive
+        // unpack). Previously this branch read `manifest.dap.install` only,
+        // which is empty for adapters with hardcoded installers — sending
+        // the user into a `:DapInstall <lang>` loop that resolved back here.
         if !manifest.dap.adapter.is_empty() {
             let dap_binary = manifest.dap.binary.as_str();
             let already_on_path = !dap_binary.is_empty() && binary_on_path(dap_binary);
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
-            } else if !manifest.dap.install_cmd_for_platform().is_empty() {
-                let dap_key = format!("dap:{}", manifest.dap.adapter);
-                self.lsp_installing.insert(dap_key.clone());
-                install_commands.push(manifest.dap.install_cmd_for_platform().to_string());
-                // Only set install context if LSP didn't already set it.
-                if self.pending_install_context.is_none() {
-                    self.pending_install_context = Some(InstallContext {
-                        ext_name: ext_name.clone(),
-                        install_key: dap_key,
-                    });
+            } else {
+                let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
+                    manifest.dap.adapter.as_str(),
+                    &available_manifests,
+                );
+                if let Some(cmd_str) = adapter_install {
+                    let dap_key = format!("dap:{}", manifest.dap.adapter);
+                    self.lsp_installing.insert(dap_key.clone());
+                    install_commands.push(cmd_str);
+                    // Only set install context if LSP didn't already set it.
+                    if self.pending_install_context.is_none() {
+                        self.pending_install_context = Some(InstallContext {
+                            ext_name: ext_name.clone(),
+                            install_key: dap_key,
+                        });
+                    }
+                    status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
+                } else if !dap_binary.is_empty() {
+                    // Nothing knows how to install this adapter — fall back
+                    // to telling the user.
+                    status_parts.push(format!(
+                        "DAP: {dap_binary} needs manual install (no automated installer)"
+                    ));
                 }
-                status_parts.push(format!("DAP: installing {}…", manifest.dap.adapter));
-            } else if !dap_binary.is_empty() {
-                // No auto-install — guide the user to :DapInstall.
-                status_parts.push(format!(
-                    "DAP: run :DapInstall {ext_name} to set up {dap_binary}"
-                ));
             }
         }
 
@@ -375,7 +398,7 @@ impl Engine {
     /// Used by Enter and double-click.
     pub fn ext_open_selected_readme(&mut self) {
         let manifests = self.ext_available_manifests();
-        let (in_installed, idx) = self.ext_selected_to_section(self.ext_sidebar_selected);
+        let (in_installed, idx) = self.ext_selected_from_sidebar_system();
         let manifest = if in_installed {
             let installed = self.ext_installed_items();
             installed
@@ -507,14 +530,9 @@ impl Engine {
             self.message = format!("Extension '{name}' removed (tools kept on PATH)");
         }
 
-        // Keep sidebar selection in bounds.
-        if self.ext_flat_item_count() == 0 {
-            self.ext_sidebar_sections_expanded[1] = true;
-        }
-        let new_total = self.ext_flat_item_count();
-        if new_total > 0 && self.ext_sidebar_selected >= new_total {
-            self.ext_sidebar_selected = new_total - 1;
-        }
+        // Ensure the available section is visible after removal so the
+        // user can see where the extension moved.
+        self.ext_sidebar_system.borrow_mut().set_collapsed(1, false);
     }
 
     /// Remove LSP/DAP tool binaries installed by an extension.
@@ -557,7 +575,23 @@ impl Engine {
             // Remove binary from safe dirs.
             for dir in &safe_dirs {
                 let path = dir.join(bin_name);
-                if path.exists() && std::fs::remove_file(&path).is_ok() {
+                if !path.exists() {
+                    continue;
+                }
+                // #436: ~/.cargo/bin/<binary> may be a symlink to `rustup`
+                // (rustup creates these proxies for every component binary,
+                // including rust-analyzer).  Removing the proxy strands the
+                // rustup-managed binary — `rustup component add` won't
+                // recreate it, so the user has to do `ln -s rustup …` by
+                // hand.  Skip rustup proxies and leave them in place.
+                if is_rustup_proxy(&path) {
+                    crate::core::lsp_manager::install_log(&format!(
+                        "[ext-remove] Skipping rustup proxy at {}",
+                        path.display()
+                    ));
+                    continue;
+                }
+                if std::fs::remove_file(&path).is_ok() {
                     removed.push(format!("{}", path.display()));
                 }
             }
@@ -729,19 +763,149 @@ impl Engine {
         buffer_id: crate::core::buffer::BufferId,
     ) -> crate::core::lsp_manager::LspStatus {
         use crate::core::lsp_manager::LspStatus;
-        let lang = match self.buffer_manager.get(buffer_id) {
-            Some(s) => match s.lsp_language_id.as_deref() {
-                Some(l) => l,
-                None => return LspStatus::None,
-            },
+        let buf = match self.buffer_manager.get(buffer_id) {
+            Some(s) => s,
+            None => return LspStatus::None,
+        };
+        let lang = match buf.lsp_language_id.as_deref() {
+            Some(l) => l,
             None => return LspStatus::None,
         };
         if self.lsp_installing.contains(lang) {
             return LspStatus::Installing;
         }
-        match &self.lsp_manager {
-            Some(mgr) => mgr.lsp_status_for_language(lang),
-            None => LspStatus::None,
+        let mgr = match &self.lsp_manager {
+            Some(m) => m,
+            None => return LspStatus::None,
+        };
+        let status = mgr.lsp_status_for_language(lang);
+        // #450: keep the indicator dimmed (`name…`) while the server has
+        // any open `$/progress` work item. This is the LSP-protocol signal
+        // for "still indexing the workspace" — rust-analyzer / gopls /
+        // pyright all emit it. Previously we tried two semantic-tokens
+        // heuristics:
+        //   - `semantic_tokens.is_empty()` (Session 243) — pinned forever
+        //     for files with no tokens (#230).
+        //   - `!semantic_tokens_received` (#230 fix) — went bright on the
+        //     first empty response, well before indexing actually finished.
+        // The progress-notification gate is both. Servers that don't emit
+        // progress notifications (marksman, simple servers) brighten on
+        // handshake — same as before.
+        if let LspStatus::Running(name) = &status {
+            if let Some(server_id) = mgr.server_id_for_language(lang) {
+                if mgr.is_indexing(server_id) {
+                    return LspStatus::Initializing(name.clone());
+                }
+            }
         }
+        status
     }
+
+    /// Return the active `$/progress` snapshot for the buffer's server
+    /// (#221). Used by the status bar to format
+    /// `name • Indexing: 319/320` segments. Returns None when no
+    /// progress is open or the manager/language isn't set up.
+    pub fn lsp_progress_for_buffer(
+        &self,
+        buffer_id: crate::core::buffer::BufferId,
+    ) -> Option<crate::core::lsp_manager::LspProgress> {
+        let buf = self.buffer_manager.get(buffer_id)?;
+        let lang = buf.lsp_language_id.as_deref()?;
+        let mgr = self.lsp_manager.as_ref()?;
+        let server_id = mgr.server_id_for_language(lang)?;
+        mgr.current_progress(server_id).cloned()
+    }
+}
+
+/// Returns true if `path` is a symlink pointing to `rustup` (the rustup
+/// proxy used to dispatch component binaries like `rust-analyzer`,
+/// `rustc`, `rustfmt`).  These proxies are created by rustup and cannot
+/// be restored by `rustup component add` once removed.
+#[cfg(not(target_os = "windows"))]
+fn is_rustup_proxy(path: &Path) -> bool {
+    match std::fs::read_link(path) {
+        Ok(target) => {
+            // Target is just `rustup` (relative symlink, the common case)
+            // or an absolute path ending in `/rustup`.
+            target == Path::new("rustup")
+                || target.file_name().map(|n| n == "rustup").unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod rustup_proxy_tests {
+    use super::is_rustup_proxy;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("vimcode-rustup-test-{tag}-{pid}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn symlink_to_relative_rustup_is_proxy() {
+        // #436: rustup creates `~/.cargo/bin/rust-analyzer -> rustup`
+        // (relative symlink).  ext_remove_tools must skip these.
+        let dir = scratch_dir("relative");
+        let link = dir.join("rust-analyzer");
+        symlink("rustup", &link).unwrap();
+        assert!(is_rustup_proxy(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_to_absolute_rustup_is_proxy() {
+        let dir = scratch_dir("absolute");
+        let link = dir.join("rust-analyzer");
+        symlink("/usr/local/bin/rustup", &link).unwrap();
+        assert!(is_rustup_proxy(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_file_is_not_proxy() {
+        // A real binary (not a symlink) must be removed normally.
+        let dir = scratch_dir("real");
+        let bin = dir.join("codelldb");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        assert!(!is_rustup_proxy(&bin));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_to_other_target_is_not_proxy() {
+        // A symlink to a non-rustup target should still be removable.
+        let dir = scratch_dir("other");
+        let target = dir.join("some-binary");
+        std::fs::write(&target, b"").unwrap();
+        let link = dir.join("rust-analyzer");
+        symlink(&target, &link).unwrap();
+        assert!(!is_rustup_proxy(&link));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// On Windows rustup proxies are hard-linked copies of rustup.exe;
+/// detect by matching file size against the sibling `rustup.exe`.
+/// Falls back to false on any I/O error — better to over-delete than
+/// to leak unmanaged binaries.
+#[cfg(target_os = "windows")]
+fn is_rustup_proxy(path: &Path) -> bool {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    let rustup_exe = parent.join("rustup.exe");
+    if !rustup_exe.exists() {
+        return false;
+    }
+    let proxy_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let rustup_len = std::fs::metadata(&rustup_exe).map(|m| m.len()).unwrap_or(0);
+    proxy_len != 0 && proxy_len == rustup_len
 }

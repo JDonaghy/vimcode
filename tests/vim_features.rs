@@ -432,10 +432,10 @@ fn test_move_line_down() {
 #[test]
 fn test_move_line_to_dest() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
-    // Move current line (0) to after line 2 (bottom)
+    // Move current line (aaa) to after line 2 (bbb) — 1-based per #114.
     exec(&mut e, "m 2");
     let lines = get_lines(&e);
-    assert_eq!(lines, vec!["bbb", "ccc", "aaa"]);
+    assert_eq!(lines, vec!["bbb", "aaa", "ccc"]);
 }
 
 #[test]
@@ -452,10 +452,10 @@ fn test_copy_line_to_top() {
     let mut e = engine_with("aaa\nbbb\nccc\n");
     // Move to last line
     press(&mut e, 'G');
-    // :t 0 copies current line (ccc) to top (after line 0 = before line 1)
+    // :t 0 copies current line (ccc) to top — 1-based address 0 means "before line 1" (#114).
     exec(&mut e, "t 0");
     let lines = get_lines(&e);
-    assert_eq!(lines, vec!["aaa", "ccc", "bbb", "ccc"]);
+    assert_eq!(lines, vec!["ccc", "aaa", "bbb", "ccc"]);
 }
 
 #[test]

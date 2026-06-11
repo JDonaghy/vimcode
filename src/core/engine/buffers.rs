@@ -379,6 +379,12 @@ impl Engine {
                     .unwrap_or_default();
                 if let Some(state) = self.buffer_manager.get_mut(buf_id) {
                     if state.reload_from_disk().is_ok() {
+                        // #222: re-sync the buffer with the LSP server so
+                        // semantic_tokens (which override tree-sitter for
+                        // Rust) are refreshed against the new content.
+                        // lsp_flush_changes clears the cached tokens,
+                        // sends notify_did_change, and re-requests them.
+                        self.lsp_dirty_buffers.insert(buf_id, true);
                         self.message = format!("\"{}\" reloaded", name);
                         any_changed = true;
                     }
@@ -788,7 +794,7 @@ impl Engine {
         // If a diff split is already active, tear it down first.
         if let Some((left_win, right_win)) = self.diff_window_pair.take() {
             self.diff_results.clear();
-            self.diff_aligned.clear();
+            self.clear_all_diff_alignment();
             self.scroll_bind_pairs
                 .retain(|&(a, b)| !(a == left_win && b == right_win));
             // Clear the diff label on the working copy buffer.
@@ -913,71 +919,6 @@ impl Engine {
     /// Returns `true` if the action was fully handled synchronously (the
     /// caller should give focus back to the editor), `false` if a background
     /// diff was requested (the caller should keep SC focus and poll later).
-    pub fn sc_open_selected_async(&mut self) -> bool {
-        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
-        if section == 2 {
-            self.sc_switch_worktree(idx);
-            return true;
-        }
-        if section == 3 && idx != usize::MAX {
-            if let Some(entry) = self.sc_log.get(idx) {
-                self.message = format!("{} {}", entry.hash, entry.message);
-            }
-            return true;
-        }
-        if idx == usize::MAX {
-            // Header row — no action.
-            return true;
-        }
-        let statuses = self.sc_file_statuses.clone();
-        let all_files: Vec<&git::FileStatus> = if section == 0 {
-            statuses.iter().filter(|f| f.staged.is_some()).collect()
-        } else {
-            statuses.iter().filter(|f| f.unstaged.is_some()).collect()
-        };
-        let f = match all_files.get(idx) {
-            Some(f) => *f,
-            None => return true,
-        };
-        let git_root = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-        let abs_path = git_root.join(&f.path);
-        if !abs_path.exists() {
-            self.message = format!("SC: file not found: {}", abs_path.display());
-            return true;
-        }
-        let is_new = matches!(f.unstaged, Some(git::StatusKind::Untracked))
-            || matches!(f.staged, Some(git::StatusKind::Added));
-        if is_new {
-            self.new_tab(Some(&abs_path));
-            self.sc_has_focus = false;
-            return true;
-        }
-        // Open the tab immediately so it appears while the background
-        // thread fetches the HEAD content for the diff split.
-        let file_name = abs_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
-        self.new_tab(Some(&abs_path));
-        let right_win = self.active_window_id();
-        let right_buf_id = self.active_window().buffer_id;
-        if let Some(state) = self.buffer_manager.get_mut(right_buf_id) {
-            state.diff_label = Some(format!("{file_name} (Working Tree)"));
-        }
-        self.sc_diff_pending_win = Some(right_win);
-
-        // Kick off background git show for diff.
-        let rel_path = f.path.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.sc_diff_rx = Some(rx);
-        let root = git_root.clone();
-        std::thread::spawn(move || {
-            let content = git::show_file_at_ref(&root, "HEAD", &rel_path).unwrap_or_default();
-            let _ = tx.send((abs_path, content));
-        });
-        false
-    }
-
     /// Poll for a completed background diff request. Returns `true` when
     /// new results arrived and a redraw is needed.
     pub fn poll_sc_diff(&mut self) -> bool {
@@ -1022,7 +963,7 @@ impl Engine {
         // Tear down any existing diff split.
         if let Some((left_win, old_right)) = self.diff_window_pair.take() {
             self.diff_results.clear();
-            self.diff_aligned.clear();
+            self.clear_all_diff_alignment();
             self.scroll_bind_pairs
                 .retain(|&(a, b)| !(a == left_win && b == old_right));
             self.clear_diff_labels(left_win, old_right);
@@ -1928,6 +1869,7 @@ impl Engine {
     /// Pre-fills the input with the current filename and places the cursor
     /// at the end.  Backends should render an editable text field on the
     /// matching explorer row while this state is active.
+    #[allow(dead_code)] // used by win-gui backend
     pub fn start_explorer_rename(&mut self, path: PathBuf) {
         let name = path
             .file_name()
@@ -2143,6 +2085,7 @@ impl Engine {
     ///
     /// Creates an empty editable entry under `parent_dir`.  Backends should
     /// render a temporary row in the tree for this entry.
+    #[allow(dead_code)] // used by win-gui backend
     pub fn start_explorer_new_file(&mut self, parent_dir: PathBuf) {
         self.explorer_new_entry = Some(ExplorerNewEntryState {
             parent_dir,
@@ -2153,6 +2096,7 @@ impl Engine {
     }
 
     /// Start inline new-folder creation in the explorer sidebar.
+    #[allow(dead_code)] // used by win-gui backend
     pub fn start_explorer_new_folder(&mut self, parent_dir: PathBuf) {
         self.explorer_new_entry = Some(ExplorerNewEntryState {
             parent_dir,
@@ -2534,8 +2478,7 @@ impl Engine {
         }
         self.diff_window_pair = None;
         self.diff_results.clear();
-        self.diff_aligned.clear();
-        self.diff_aligned.clear();
+        self.clear_all_diff_alignment();
         self.diff_unchanged_hidden = false;
         self.message = "Diff off".to_string();
         EngineAction::None
@@ -3029,6 +2972,7 @@ impl Engine {
             }
             self.switch_window_buffer(buffer_id);
             self.message = format!("\"{}\"", path.display());
+            self.explorer_reveal_path(path);
             return Ok(());
         }
 
@@ -3065,6 +3009,7 @@ impl Engine {
         self.lsp_did_open(buffer_id);
         // Watch the file for external changes
         self.watch_file(path);
+        self.explorer_reveal_path(path);
         Ok(())
     }
 }
@@ -3240,6 +3185,12 @@ impl Engine {
                     state.update_syntax();
                 }
                 self.refresh_git_diff(bid);
+                // #222: re-sync the buffer with the LSP server so
+                // semantic_tokens (which override tree-sitter for Rust)
+                // are refreshed against the new content. lsp_flush_changes
+                // clears the cached tokens, sends notify_did_change, and
+                // re-requests them.
+                self.lsp_dirty_buffers.insert(bid, true);
                 let display = canonical
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -3336,6 +3287,13 @@ impl Engine {
         self.cwd = canonical.clone();
         self.workspace_root = Some(canonical.clone());
         let _ = std::env::set_current_dir(&canonical);
+
+        // Reset explorer state for the new workspace (#274). The old
+        // workspace's `explorer_expanded` paths don't apply here, and the
+        // new root needs to be in the set so `build_explorer_rows` shows
+        // top-level entries instead of just the collapsed root.
+        self.explorer_expanded.clear();
+        self.explorer_expanded.insert(canonical.clone());
 
         // Update git branch
         self.git_branch = git::current_branch(&canonical);

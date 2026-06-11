@@ -43,6 +43,7 @@ For detailed how-to guides and configuration references, see the **[VimCode Wiki
 
 ## Vision
 
+some test text
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
@@ -109,6 +110,7 @@ Download `vcd-windows-x86_64.exe` from the release page (rename to `vcd.exe` for
 
 ### Prerequisites
 
+some more test text
 The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windows GUI** is built separately with a Cargo feature flag.
 
 | Platform | GTK4 GUI deps |
@@ -362,7 +364,7 @@ The tab context menu offers both: "Split Right/Down" creates a Vim window split 
 
 ### Project Search
 
-- `Alt+F` — focus search panel (or click the search icon in the activity bar)
+- `Ctrl+Shift+F` — focus search panel (or click the search icon in the activity bar)
 - Type a query and press `Enter` to search all text files under the project root
 - Respects `.gitignore` rules (powered by the `ignore` crate — same walker as ripgrep)
 - Hidden files/directories and binary files are skipped; results capped at 10,000
@@ -411,7 +413,7 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 
 #### Live Grep
 
-- `Ctrl-Shift-F` or `<leader>sg` (Normal mode) — open the live grep picker
+- `Ctrl-Shift-G` or `<leader>sg` (Normal mode) — open the live grep picker
 - `<leader>sw` — open live grep pre-filled with the word under the cursor
 - A centered floating two-column modal appears over the editor
 - Type to instantly search file *contents* across the entire project (live-as-you-type, query ≥ 2 chars)
@@ -443,8 +445,11 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 ### Integrated Terminal
 
 - `Ctrl-T` (Normal mode) — toggle the integrated terminal panel
+- `Ctrl-Shift-T` — toggle **terminal maximize**: the panel grows to fill the entire editor area. Press again to restore the previous height. Works in TUI and GTK (Win-GUI supports the binding but panel geometry may lag until the next repaint)
+- Click the `󰊗` / `󰊓` icon in the terminal toolbar (between split `󰤼` and close `󰅖`) to toggle maximize with the mouse
 - `:term` / `:terminal` — open a **new terminal tab** (always spawns a fresh shell, even if the panel is already open)
-- The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions
+- `:TerminalMaximize` / `:TerminalMax` — toggle maximize from the ex-command line
+- The terminal is a **resizable bottom strip** (default 1 toolbar + 12 content rows) above the status bar; drag the header row up/down to resize; height persists across sessions. Closing the terminal while maximized restores the saved height
 - Shell is determined by the `$SHELL` environment variable, falling back to `/bin/bash`; starts in the editor's working directory
 - Full **ANSI/VT100 color support** — 256-color xterm palette rendered cell-by-cell
 - **Multiple terminal tabs** — each tab runs an independent PTY; the toolbar shows `[1] [2] …` labels:
@@ -465,7 +470,7 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 - **Horizontal split** — click `󰤼` in the toolbar (or `Ctrl-W` when split is active) to toggle a side-by-side two-pane view:
   - Click either pane or press `Ctrl-W` to switch keyboard focus between panes
   - Drag the `│` divider left/right to resize the panes; both PTYs are resized on mouse release
-- **Nerd Font toolbar** — tab strip + split (`󰤼`) and close (`󰅖`) icons
+- **Nerd Font toolbar** — tab strip + split (`󰤼`), maximize (`󰊗` / `󰊓` when maximized), and close (`󰅖`) icons
 - **All keys forwarded to shell PTY** — Ctrl-C, Ctrl-D, Ctrl-L, Ctrl-Z, arrow keys, Tab, etc. work as expected
 - `Ctrl-T` while the terminal has focus **closes the panel** while keeping all shell sessions alive; reopening restores the same sessions
 - When a shell exits (Ctrl-D, `exit`, etc.) its tab closes immediately; the panel closes automatically when the last tab exits; clicking outside the terminal returns focus to the editor
@@ -492,7 +497,7 @@ For full details on adapters, launch.json, conditional breakpoints, and the debu
 
 ### File Explorer
 
-- `Ctrl-B` — toggle sidebar; `Alt+E` — focus explorer; `Alt+F` — focus search panel
+- `Ctrl-B` — toggle sidebar; `Ctrl+Shift+E` — focus explorer; `Ctrl+Shift+F` — focus search panel
 - Tree view with Nerd Font file-type icons
 - `j` / `k` — navigate; `l` or `Enter` — open file/expand; `h` — collapse
 - `a` — create file; `A` — create folder; `D` — delete
@@ -730,6 +735,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `formatonsave` / `noformatonsave` | `fos` | off | Auto-format buffer via LSP before saving |
 | `spell` / `nospell` | | off | Enable spell checking (wavy underline on misspelled words) |
 | `spelllang=XX` | | `en_US` | Spell check language (currently only `en_US` is bundled) |
+| `syntax_max_lines=N` | `syntaxmaxlines` | 20000 | Skip tree-sitter highlighting for buffers over N lines (plain text for huge generated files) |
 | `explorersortcaseinsensitive` / `noexplorersortcaseinsensitive` | `esci` | on | Case-insensitive sorting in the file explorer |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
@@ -820,6 +826,23 @@ All three GUI/TUI backends consume the same `ScreenLayout` abstraction from `ren
 - Scrollbar click-to-jump and drag support
 
 **Per-window status line** — mode, filename, branch, filetype, indentation, encoding, line ending, Ln:Col, LSP status; clickable segments open pickers (language, indentation, line ending, branch); layout toggle icons (sidebar, terminal, menu bar) with Nerd Font glyphs or `[S]`/`[T]`/`[M]` fallbacks — dimmed when inactive
+
+**Status-bar notifications** — a single indicator on the right side of the status bar reports background-operation state, followed by a short message (truncated to 29 chars)
+
+| State | Icon | Color |
+|-------|------|-------|
+| In progress | animated Braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) | function color |
+| Done | `󰂞` (Nerd Font) / `*` (ASCII fallback) | string-literal color |
+
+Triggers currently wired up:
+
+| User action | In-progress message | Done message |
+|-------------|--------------------|--------------|
+| Install an LSP/DAP server (Extensions panel `i`, or `:ExtInstall <name>`) | `Installing <binary>…` | `Install complete` / `Install failed` |
+| Project-wide search (search panel) | `Searching for "<query>"…` | `Search complete` |
+| Project-wide replace (search panel) | `Replacing "<query>" → "<replacement>"…` | `Replace complete` |
+
+Done notifications auto-dismiss after **5 seconds**. Click the bell to dismiss them immediately. The spinner is purely informational — clicking it does nothing.
 
 **Font** — configurable family and size via `settings.json`
 
@@ -954,7 +977,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `<leader>rn` | LSP rename symbol — pre-fills `:Rename <word>` |
 | `<leader>ca` | Show LSP code actions for current line |
 | `<leader>sf` | Open fuzzy file finder (same as Ctrl-P) |
-| `<leader>sg` | Open live grep picker (same as Ctrl-Shift-F) |
+| `<leader>sg` | Open live grep picker (same as Ctrl-Shift-G) |
 | `<leader>sw` | Grep word under cursor |
 | `<leader>sb` | Open buffer picker (fuzzy search open buffers) |
 | `<leader>sk` | Search key bindings (fuzzy-filterable reference) |
@@ -987,7 +1010,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `Ctrl-W f` | Split and open file under cursor (`:wincmd f`) |
 | `Ctrl-W d` | Split and go to definition (LSP) (`:wincmd d`) |
 | `Ctrl-P` | Open fuzzy file finder |
-| `Ctrl-Shift-F` | Open live grep picker |
+| `Ctrl-Shift-G` | Open live grep picker |
 | `Ctrl-G` | Show file info (name, line, col, %) |
 | `Ctrl-Shift-P` / `F1` | Command palette |
 | `F5` | Start debugging / continue |
@@ -997,8 +1020,8 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `F10` | Step over |
 | `F11` | Step into |
 | `Shift+F11` | Step out |
-| `Alt+E` | Focus / unfocus file explorer |
-| `Alt+F` | Focus / unfocus search panel |
+| `Ctrl+Shift+E` | Focus / unfocus file explorer |
+| `Ctrl+Shift+F` | Focus / unfocus search panel |
 | `Ctrl+\` | Split editor right (new editor group) |
 | `Ctrl+1` / `Ctrl+2` | Focus editor group 0 / 1 |
 | `Shift+Alt+F` | Format document (LSP) |
@@ -1130,6 +1153,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:EditorGroupClose` / `:egc` | Close active editor group |
 | `:EditorGroupFocus` / `:egf` | Toggle focus between editor groups |
 | `:EditorGroupMoveTab` / `:egmt` | Move current tab to other editor group |
+| `:TerminalMaximize` / `:TerminalMax` | Toggle terminal panel maximize (fill editor area) |
 | `:Plugin list` | List loaded plugins |
 | `:Plugin reload` | Reload plugins from disk |
 | `:Plugin enable <name>` | Enable a plugin |
@@ -1158,18 +1182,18 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 src/                  (~137,000 lines total)
 ├── main.rs              (~57 lines)  Thin CLI dispatcher → gtk::run() or tui_main::run()
 ├── win_gui_bin.rs       (~36 lines)  Windows native GUI entry point → win_gui::run()
-├── gtk/             (~18,156 lines)  GTK4/Relm4 UI backend (Linux + macOS)
-│   ├── mod.rs       (~10,029 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
-│   ├── draw.rs       (~5,975 lines)  All draw_* rendering functions + Pango attrs
-│   ├── click.rs        (~622 lines)  Mouse click/drag/double-click handlers
-│   ├── css.rs          (~553 lines)  Theme CSS generation + static CSS
-│   ├── util.rs         (~474 lines)  GTK key mapping, settings form builders, URL/icon helpers
-│   └── tree.rs         (~503 lines)  File tree construction, expansion tracking, name validation
-├── tui_main/        (~14,814 lines)  ratatui/crossterm TUI backend (all platforms)
-│   ├── mod.rs        (~4,173 lines)  Structs, event_loop, key translation, clipboard, run()
-│   ├── panels.rs     (~4,040 lines)  Activity bar, sidebar, status/command lines, all panel renders
-│   ├── render_impl.rs(~3,947 lines)  draw_frame orchestrator, tab bar, editor windows, popups
-│   └── mouse.rs      (~2,654 lines)  All mouse click/drag/scroll interaction handling
+├── gtk/             (~15,760 lines)  GTK4/Relm4 UI backend (Linux + macOS)
+│   ├── mod.rs       (~10,351 lines)  App struct, Msg enum, SimpleComponent, geometry helpers, run()
+│   ├── draw.rs       (~4,198 lines)  All draw_* rendering functions + Pango attrs (shrunk via #446 ScreenLayout migration + #469 popup migration)
+│   ├── click.rs        (~476 lines)  Mouse click/drag/double-click handlers
+│   ├── css.rs          (~507 lines)  Theme CSS generation + static CSS
+│   ├── util.rs         (~186 lines)  GTK key mapping, URL/icon helpers, log handler
+│   └── quadraui_gtk.rs  (~23 lines)  Theme adapter + RICH_TEXT_POPUP_SB_* re-exports (most rasterisers now via trait)
+├── tui_main/        (~10,864 lines)  ratatui/crossterm TUI backend (all platforms)
+│   ├── mod.rs        (~3,406 lines)  Structs, event_loop, key translation, clipboard, run()
+│   ├── mouse.rs      (~3,058 lines)  All mouse click/drag/scroll interaction handling
+│   ├── panels.rs     (~2,199 lines)  Activity bar, sidebar, status/command lines, all panel renders
+│   └── render_impl.rs(~1,996 lines)  draw_frame orchestrator, tab bar, editor windows, popups
 ├── win_gui/         (~10,877 lines)  Native Windows GUI backend (Win32 + Direct2D + DirectWrite)
 │   ├── mod.rs        (~6,263 lines)  HWND, D2D render target, event loop, DWM title bar, IME, font install
 │   ├── draw.rs       (~4,614 lines)  Direct2D rendering: editor, tabs, sidebar, popups, scrollbar

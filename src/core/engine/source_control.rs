@@ -1,9 +1,29 @@
 use super::*;
 
+/// Stable `quadraui::WidgetId` strings for the SC action-button toolbar,
+/// in button-index order: 0=Commit, 1=Push, 2=Pull, 3=Sync. Shared by the
+/// `render::sc_button_toolbar` adapter and the click/hover hit-test so the
+/// id↔index mapping has a single source of truth (#505).
+pub const SC_BUTTON_IDS: [&str; 4] = ["sc:commit", "sc:push", "sc:pull", "sc:sync"];
+
+pub enum ScKeyResult {
+    Consumed,
+    Unfocused,
+    /// h/Left from the SC panel moved focus to the activity bar at the Git row.
+    FocusActivityBar,
+}
+
 impl Engine {
     // ─── Source Control ────────────────────────────────────────────────────────
 
-    /// Refresh SC panel: re-run `git status` and `git worktree list`.
+    /// Refresh SC panel synchronously: re-run `git status`, `git worktree
+    /// list`, `git rev-list --count` (ahead/behind), and `git log -20`.
+    /// Four subprocesses — on a non-trivial workspace this takes ~1 s.
+    /// Use [`sc_refresh_async`] from the GUI poll loops to avoid blocking
+    /// the main thread; call this variant only from places that already
+    /// expect the refresh to have completed before returning (e.g. right
+    /// after a stage/unstage where the sidebar must reflect the new
+    /// state immediately).
     pub fn sc_refresh(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         self.sc_file_statuses = git::status_detailed(&dir);
@@ -12,6 +32,61 @@ impl Engine {
         self.sc_ahead = ahead;
         self.sc_behind = behind;
         self.sc_log = git::git_log(&dir, 20);
+        self.invalidate_explorer_indicators();
+    }
+
+    /// Spawn a background thread that runs the same four `git`
+    /// subprocesses as [`sc_refresh`] and delivers the snapshot back
+    /// via `sc_refresh_rx`. Subsequent calls are no-ops while a
+    /// previous refresh is still in flight, so the main thread can
+    /// call this as often as a polling loop wants without stacking
+    /// up threads. The UI poll loop should call [`poll_sc_refresh`]
+    /// each tick to drain the channel and apply the snapshot.
+    pub fn sc_refresh_async(&mut self) {
+        if self.sc_refresh_in_flight {
+            return;
+        }
+        let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sc_refresh_rx = Some(rx);
+        self.sc_refresh_in_flight = true;
+        std::thread::spawn(move || {
+            let statuses = git::status_detailed(&dir);
+            let worktrees = git::worktree_list(&dir);
+            let (ahead, behind) = git::ahead_behind(&dir);
+            let log = git::git_log(&dir, 20);
+            let _ = tx.send((statuses, worktrees, ahead, behind, log));
+        });
+    }
+
+    /// Check whether the background `sc_refresh_async` thread has
+    /// delivered a snapshot and, if so, apply it to the engine state.
+    /// Returns `true` when new data was applied so the UI can redraw.
+    pub fn poll_sc_refresh(&mut self) -> bool {
+        let Some(ref rx) = self.sc_refresh_rx else {
+            return false;
+        };
+        let result = rx.try_recv();
+        match result {
+            Ok((statuses, worktrees, ahead, behind, log)) => {
+                self.sc_file_statuses = statuses;
+                self.sc_worktrees = worktrees;
+                self.sc_ahead = ahead;
+                self.sc_behind = behind;
+                self.sc_log = log;
+                self.sc_refresh_rx = None;
+                self.sc_refresh_in_flight = false;
+                self.invalidate_explorer_indicators();
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Thread dropped the tx without sending — treat as done.
+                self.sc_refresh_rx = None;
+                self.sc_refresh_in_flight = false;
+                false
+            }
+        }
     }
 
     /// Stage or unstage the currently selected SC item.
@@ -19,7 +94,7 @@ impl Engine {
     ///   - STAGED header → unstage all
     ///   - CHANGES header → stage all
     pub fn sc_stage_selected(&mut self) {
-        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        let (section, idx) = self.sc_selected_from_sidebar_system();
         // Section header: bulk operation
         if idx == usize::MAX {
             if section == 0 {
@@ -69,12 +144,13 @@ impl Engine {
     /// Stage all unstaged/untracked files.
     pub fn sc_stage_all(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
-        let _ = git::stage_path(&dir, ".");
+        if let Err(e) = git::stage_path(&dir, ".") {
+            self.message = format!("stage all: {e}");
+        }
         self.sc_refresh();
     }
 
     /// Unstage all staged files.
-    #[allow(dead_code)]
     pub fn sc_unstage_all(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let _ = git::unstage_all(&dir);
@@ -85,6 +161,14 @@ impl Engine {
     pub fn sc_discard_all_unstaged(&mut self) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         let _ = git::discard_all(&dir);
+        // #189: reload any open buffer whose file just got discarded on
+        // disk. Without this the editor keeps showing the pre-discard
+        // rope contents + stale `git_diff` hunks, so the diff-peek
+        // popup offers to stage changes that no longer exist. Iterate
+        // every buffer with a file_path — `git discard_all` doesn't
+        // tell us which files actually changed, so reload them all
+        // and let `refresh_git_diff` no-op on unchanged ones.
+        self.reload_all_buffers_from_disk();
         self.sc_refresh();
     }
 
@@ -475,8 +559,7 @@ impl Engine {
             }
             // Fully exit SC panel.
             "q" => {
-                self.sc_button_focused = None;
-                self.sc_has_focus = false;
+                self.sc_set_focus(false);
                 true
             }
             _ => true,
@@ -487,15 +570,71 @@ impl Engine {
     pub fn sc_discard_file(&mut self, path: &str) {
         let dir = git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
         match git::discard_path(&dir, path) {
-            Ok(()) => {}
+            Ok(()) => {
+                // #189: if this file is currently open in a buffer,
+                // reload from disk so the editor reflects the post-
+                // discard state. Without the reload, the buffer keeps
+                // the pre-discard content + stale git_diff hunks and
+                // the diff-peek popup offers to stage changes that no
+                // longer exist. Mirrors the pattern in
+                // `Engine::diff_peek_revert`.
+                if let Some(bid) = self.buffer_manager.find_by_path(path) {
+                    self.reload_buffer_from_disk(bid);
+                }
+            }
             Err(e) => self.message = format!("discard: {e}"),
         }
         self.sc_refresh();
     }
 
+    /// Reload a single buffer's contents from disk and refresh its
+    /// git-diff cache. Silent no-op if the buffer has no file path or
+    /// the read fails (the caller typically logs its own message).
+    fn reload_buffer_from_disk(&mut self, bid: crate::core::engine::BufferId) {
+        let path = match self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(state) = self.buffer_manager.get_mut(bid) {
+                state.buffer.content = ropey::Rope::from_str(&contents);
+            }
+            self.refresh_git_diff(bid);
+            // Notify the LSP that the buffer contents changed — without
+            // this, the server keeps the pre-discard text in its
+            // internal model and the gutter keeps showing stale
+            // diagnostics even though the buffer rope + file on disk
+            // both no longer have the offending code. `lsp_flush_changes`
+            // (driven from the UI poll loop) picks this up and sends
+            // `textDocument/didChange` + clears cached diagnostics.
+            self.lsp_dirty_buffers.insert(bid, true);
+            // Also send `didSave`: rust-analyzer (and other servers
+            // configured with `check on save`) won't re-run diagnostics
+            // until they see a save. Discard IS effectively a save
+            // from disk's perspective, so synthesising one here makes
+            // the stale-error clear immediately instead of waiting for
+            // the user's next real save.
+            self.lsp_did_save(bid);
+        }
+    }
+
+    /// Reload every open buffer from disk + refresh git diffs. Used
+    /// after bulk git operations (discard-all) where we don't know
+    /// which files changed.
+    fn reload_all_buffers_from_disk(&mut self) {
+        let ids: Vec<_> = self.buffer_manager.list();
+        for bid in ids {
+            self.reload_buffer_from_disk(bid);
+        }
+    }
+
     /// Show a confirmation dialog before discarding changes for the selected file.
     pub fn sc_confirm_discard_selected(&mut self) {
-        let (section, idx) = self.sc_flat_to_section_idx(self.sc_selected);
+        let (section, idx) = self.sc_selected_from_sidebar_system();
         if section != 1 || idx == usize::MAX {
             return;
         }
@@ -670,9 +809,7 @@ impl Engine {
                                 let _ = self
                                     .open_file_with_mode(&path, crate::core::OpenMode::Permanent);
                             }
-                            // Clear focus so the editor receives keys after opening.
-                            self.sc_has_focus = false;
-                            self.sc_button_focused = None;
+                            self.sc_set_focus(false);
                         }
                     }
                 }
@@ -680,8 +817,7 @@ impl Engine {
                 true
             }
             "q" | "Escape" => {
-                self.sc_has_focus = false;
-                self.sc_button_focused = None;
+                self.sc_set_focus(false);
                 true
             }
             "r" => {
@@ -1029,5 +1165,315 @@ impl Engine {
             return (3, flat - pos);
         }
         (3, usize::MAX) // fallback
+    }
+
+    // ─── SidebarSystem integration ───────────────────────────────────
+
+    /// Set SC panel keyboard focus on both the engine flag and the
+    /// SidebarSystem. Backends should call this instead of setting
+    /// `sc_has_focus` directly to keep the two in sync.
+    pub fn sc_set_focus(&mut self, focused: bool) {
+        self.sc_has_focus = focused;
+        self.sc_sidebar_system.borrow_mut().set_has_focus(focused);
+        if !focused {
+            self.sc_button_focused = None;
+        }
+    }
+
+    /// Stable `quadraui::WidgetId` for SC action button `idx`
+    /// (0=Commit, 1=Push, 2=Pull, 3=Sync), or `None` if out of range.
+    pub fn sc_button_id(idx: usize) -> Option<quadraui::WidgetId> {
+        SC_BUTTON_IDS.get(idx).map(|s| quadraui::WidgetId::new(*s))
+    }
+
+    /// Inverse of [`Self::sc_button_id`] — map a toolbar `WidgetId` back to
+    /// its button index.
+    pub fn sc_button_index(id: &quadraui::WidgetId) -> Option<usize> {
+        SC_BUTTON_IDS.iter().position(|s| *s == id.as_str())
+    }
+
+    /// Resolve which SC button (if any) sits under absolute point `(x, y)`,
+    /// using the `SidebarPanelLayout` cached at paint time (#509).
+    /// Returns `None` for clicks in the toolbar's empty gutter, the content
+    /// area, or outside the panel.
+    pub fn sc_button_hit(&self, x: f32, y: f32) -> Option<usize> {
+        let layout = self.sc_panel_layout.borrow();
+        match layout.as_ref()?.toolbar_layout.as_ref()?.hit_test(x, y) {
+            quadraui::ToolbarHit::Button(id) => Self::sc_button_index(&id),
+            quadraui::ToolbarHit::Empty => None,
+        }
+    }
+
+    /// Map a content-local row index (row 0 = first section header) to a
+    /// flat `(index, is_header)` pair for the SC panel sections area (#509).
+    ///
+    /// This is the content-coordinate variant of [`Self::sc_visual_row_to_flat`]:
+    /// callers that receive content-local y from `SidebarPanelLayout::hit_test`
+    /// use this function directly instead of offsetting by 3.
+    pub fn sc_content_row_to_flat(
+        &self,
+        content_row: usize,
+        empty_section_hint: bool,
+    ) -> Option<(usize, bool)> {
+        // content_row 0 == first section header == visual_row 3 in
+        // sc_visual_row_to_flat's coordinate system.
+        self.sc_visual_row_to_flat(content_row + 3, empty_section_hint)
+    }
+
+    /// Read the active section index and selected item index from the
+    /// SidebarSystem. Returns `(section, item_idx)` where section is
+    /// 0=staged, 1=changes, 2=worktrees, 3=log. Returns `(0, usize::MAX)`
+    /// if nothing is selected.
+    pub fn sc_selected_from_sidebar_system(&self) -> (usize, usize) {
+        let sidebar = self.sc_sidebar_system.borrow();
+        let section = sidebar.active_section().unwrap_or(0);
+        let idx = sidebar
+            .selected_path(section)
+            .and_then(|p| p.first().copied())
+            .map(|v| v as usize)
+            .unwrap_or(usize::MAX);
+        (section, idx)
+    }
+
+    /// Feed a navigation key through the SidebarSystem (using the layout
+    /// cached during the previous render frame) and dispatch the result.
+    fn sc_sidebar_navigate(&mut self, key: quadraui::Key) {
+        let rect = self.sc_sidebar_body_rect.get();
+        let ev = quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        };
+        let sidebar_event = self.sc_sidebar_system.borrow_mut().handle_cached(&ev, rect);
+        self.dispatch_sc_sidebar_event(sidebar_event);
+    }
+
+    /// Handle a SidebarEvent produced by the SidebarSystem after a
+    /// navigation key or mouse click.
+    pub fn dispatch_sc_sidebar_event(&mut self, event: quadraui::SidebarEvent) -> bool {
+        match event {
+            quadraui::SidebarEvent::RowActivated { section, .. } => {
+                self.sc_activate_row(section);
+                true
+            }
+            quadraui::SidebarEvent::RowSelected { .. } => true,
+            quadraui::SidebarEvent::HeaderActivated { section } => {
+                let mut sys = self.sc_sidebar_system.borrow_mut();
+                let collapsed = sys.is_collapsed(section);
+                sys.set_collapsed(section, !collapsed);
+                true
+            }
+            quadraui::SidebarEvent::Ignored => false,
+            _ => true,
+        }
+    }
+
+    /// Activate the selected row in the given section (equivalent to
+    /// pressing Enter).
+    fn sc_activate_row(&mut self, section: usize) {
+        let (_, idx) = self.sc_selected_from_sidebar_system();
+        if idx == usize::MAX {
+            return;
+        }
+        match section {
+            2 => self.sc_switch_worktree(idx),
+            3 => {
+                if let Some(entry) = self.sc_log.get(idx) {
+                    self.message = format!("{} {}", entry.hash, entry.message);
+                }
+            }
+            0 | 1 => {
+                let statuses = self.sc_file_statuses.clone();
+                let files: Vec<&git::FileStatus> = if section == 0 {
+                    statuses.iter().filter(|f| f.staged.is_some()).collect()
+                } else {
+                    statuses.iter().filter(|f| f.unstaged.is_some()).collect()
+                };
+                if let Some(f) = files.get(idx) {
+                    let git_root =
+                        git::find_repo_root(&self.cwd).unwrap_or_else(|| self.cwd.clone());
+                    let path = git_root.join(&f.path);
+                    if !path.exists() {
+                        self.message = format!("SC: file not found: {}", path.display());
+                    } else {
+                        let is_new = matches!(f.unstaged, Some(git::StatusKind::Untracked))
+                            || matches!(f.staged, Some(git::StatusKind::Added));
+                        let has_head =
+                            !is_new && git::show_file_at_ref(&git_root, "HEAD", &f.path).is_some();
+                        if has_head {
+                            self.cmd_git_diff_split(&path);
+                        } else {
+                            let _ =
+                                self.open_file_with_mode(&path, crate::core::OpenMode::Permanent);
+                        }
+                        self.sc_set_focus(false);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle domain-specific action keys (stage, discard, commit, etc.)
+    /// that are NOT navigation. Returns true if consumed.
+    pub fn dispatch_sc_action_key(&mut self, key: &str) -> bool {
+        match key {
+            "s" => {
+                self.sc_stage_selected();
+                true
+            }
+            "S" => {
+                self.sc_stage_all();
+                true
+            }
+            "d" => {
+                self.sc_confirm_discard_selected();
+                true
+            }
+            "D" => {
+                self.sc_confirm_discard_all();
+                true
+            }
+            "c" => {
+                self.sc_commit_input_active = true;
+                true
+            }
+            "C" => {
+                if self.sc_commit_message.trim().is_empty() {
+                    self.sc_commit_input_active = true;
+                } else {
+                    self.sc_do_commit();
+                }
+                true
+            }
+            "p" => {
+                self.sc_pull();
+                true
+            }
+            "P" => {
+                self.sc_push();
+                true
+            }
+            "f" => {
+                self.sc_fetch();
+                true
+            }
+            "r" => {
+                self.sc_refresh();
+                true
+            }
+            "b" => {
+                self.sc_open_branch_picker();
+                true
+            }
+            "B" => {
+                self.sc_open_branch_create();
+                true
+            }
+            "?" => {
+                self.sc_help_open = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Unified key dispatch for the SC panel. Both TUI and GTK call this
+    /// single method — no per-backend key→action mapping needed.
+    pub fn dispatch_sc_sidebar_key_unified(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        unicode: Option<char>,
+    ) -> ScKeyResult {
+        use quadraui::{Key, NamedKey};
+
+        // h/Left: move focus to the activity bar (Git row) when not in a sub-mode.
+        if (key == "h" || key == "Left")
+            && !ctrl
+            && !self.sc_help_open
+            && !self.sc_branch_picker_open
+            && !self.sc_branch_create_mode
+            && !self.sc_commit_input_active
+            && self.sc_button_focused.is_none()
+        {
+            self.sc_set_focus(false);
+            self.activity_bar_focus_in_at(4);
+            return ScKeyResult::FocusActivityBar;
+        }
+
+        if self.sc_help_open {
+            self.sc_help_open = false;
+            return ScKeyResult::Consumed;
+        }
+        if self.sc_branch_picker_open {
+            self.handle_sc_branch_picker_key(key, ctrl, unicode);
+            return ScKeyResult::Consumed;
+        }
+        if self.sc_branch_create_mode {
+            self.handle_sc_branch_create_key(key, unicode);
+            return ScKeyResult::Consumed;
+        }
+        if self.sc_commit_input_active {
+            self.handle_sc_commit_input_key(key, ctrl, unicode);
+            return ScKeyResult::Consumed;
+        }
+        if let Some(btn) = self.sc_button_focused {
+            self.handle_sc_button_key(key, btn);
+            if !self.sc_has_focus {
+                return ScKeyResult::Unfocused;
+            }
+            return ScKeyResult::Consumed;
+        }
+
+        // Navigation keys → feed through SidebarSystem.
+        let nav_key = match key {
+            "j" | "Down" => Some(Key::Named(NamedKey::Down)),
+            "k" | "Up" => Some(Key::Named(NamedKey::Up)),
+            "Home" => Some(Key::Named(NamedKey::Home)),
+            "End" => Some(Key::Named(NamedKey::End)),
+            "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
+            "Page_Down" => Some(Key::Named(NamedKey::PageDown)),
+            "Tab" => Some(Key::Named(NamedKey::Tab)),
+            "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+            _ => None,
+        };
+        if let Some(k) = nav_key {
+            self.sc_sidebar_navigate(k);
+            return ScKeyResult::Consumed;
+        }
+
+        // Domain action keys.
+        match key {
+            "Escape" | "q" => {
+                self.sc_set_focus(false);
+                ScKeyResult::Unfocused
+            }
+            "Return" | "Enter" => {
+                let (section, _) = self.sc_selected_from_sidebar_system();
+                self.sc_activate_row(section);
+                if !self.sc_has_focus {
+                    ScKeyResult::Unfocused
+                } else {
+                    ScKeyResult::Consumed
+                }
+            }
+            _ => {
+                self.dispatch_sc_action_key(key);
+                ScKeyResult::Consumed
+            }
+        }
+    }
+
+    /// Handle a mouse/scroll UiEvent by feeding it through the
+    /// SidebarSystem (using the layout cached during the previous
+    /// render frame) and dispatching the result.
+    pub fn handle_sc_sidebar_ui_event(&mut self, event: quadraui::UiEvent) -> bool {
+        let rect = self.sc_sidebar_body_rect.get();
+        let sidebar_event = self
+            .sc_sidebar_system
+            .borrow_mut()
+            .handle_cached(&event, rect);
+        self.dispatch_sc_sidebar_event(sidebar_event)
     }
 }

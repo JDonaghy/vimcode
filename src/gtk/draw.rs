@@ -1,8 +1,37 @@
 use super::*;
 
-/// Pango font description string for UI panels (menu bar, sidebars, dropdown).
-/// Matches VSCode's Linux font stack at 11pt ≈ 13px @ 96 dpi.
-pub(super) const UI_FONT: &str = "Segoe UI, Ubuntu, Droid Sans, Sans 10";
+/// Pango font family for UI panels (menu bar, sidebars, dropdown,
+/// dialogs, hover popups). Size is appended at use via [`UI_FONT`]
+/// from the configured `settings.ui_font_size` (#217).
+pub(super) const UI_FONT_FAMILY: &str = "Segoe UI, Ubuntu, Droid Sans, Sans";
+
+/// Process-global UI font size (points). Synced from
+/// `settings.ui_font_size` at the start of each frame by
+/// [`sync_ui_font_size`]. Read everywhere a Pango font description
+/// is built — avoids threading `&Settings` through ~20 draw
+/// functions for what's effectively one shared knob (#217).
+static UI_FONT_SIZE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(10);
+
+/// Update the process-global UI font size from `settings`. Called
+/// once per frame at the top of [`draw_editor`].
+pub(super) fn sync_ui_font_size(settings: &core::settings::Settings) {
+    UI_FONT_SIZE.store(
+        settings.ui_font_size.max(6),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Pango font description string for UI chrome at the currently
+/// configured size. Drop-in replacement for the legacy `UI_FONT`
+/// const — call sites do `FontDescription::from_string(&UI_FONT())`.
+#[allow(non_snake_case)]
+pub(super) fn UI_FONT() -> String {
+    format!(
+        "{} {}",
+        UI_FONT_FAMILY,
+        UI_FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn draw_editor(
@@ -16,23 +45,42 @@ pub(super) fn draw_editor(
     h_sb_dragging_window: Option<core::WindowId>,
     last_metrics: &std::rc::Rc<std::cell::Cell<(f64, f64)>>,
     tab_slot_positions_out: &Rc<RefCell<TabSlotMap>>,
+    tab_close_bounds_out: &Rc<RefCell<TabCloseMap>>,
     diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
     action_btn_map_out: &Rc<RefCell<ActionBtnMap>>,
     dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
+    dialog_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    completion_layout_out: &Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
+    context_menu_layout_out: &Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
+    tab_switcher_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_link_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
+    editor_hover_scrollbar_out: &Rc<Cell<Option<render::PopupScrollbarHit>>>,
     mouse_pos: (f64, f64),
-    tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize)>>>,
+    tab_visible_counts_out: &Rc<RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>>,
     status_segment_map_out: &Rc<RefCell<StatusSegmentMap>>,
+    screen_layout_out: &Rc<RefCell<Option<render::ScreenLayout>>>,
+    debug_toolbar_y_offset_out: &Rc<Cell<f64>>,
+    debug_toolbar_height_out: &Rc<Cell<f64>>,
+    // Phase B.5 Stage 3: shared `quadraui::Backend` impl. Routed
+    // through to draw paths that go through the trait. Today only
+    // the quickfix panel uses it as a pilot — the rest still call
+    // `quadraui_gtk::draw_*` shims directly.
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let theme = Theme::from_name(&engine.settings.colorscheme);
+
+    // Sync the UI font size atomic from settings so all
+    // `UI_FONT()` callers below see the configured size (#217).
+    sync_ui_font_size(&engine.settings);
 
     // Clear cached button positions from previous frame.
     diff_btn_map_out.borrow_mut().clear();
     split_btn_map_out.borrow_mut().clear();
     action_btn_map_out.borrow_mut().clear();
     status_segment_map_out.borrow_mut().clear();
+    engine.scroll_surfaces.borrow_mut().clear();
 
     // 1. Background
     let (bg_r, bg_g, bg_b) = theme.background.to_cairo();
@@ -51,10 +99,13 @@ pub(super) fn draw_editor(
     let font_desc = FontDescription::from_string(&font_str);
     layout.set_font_description(Some(&font_desc));
 
-    // Derive line height and char width from font metrics
+    // Derive line height and char width from font metrics.
+    // Use Pango layout measurement for char_width (not approximate_char_width)
+    // so the value matches actual glyph positioning in draw_editor.
     let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
     let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-    let char_width = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
+    layout.set_text("0");
+    let char_width = layout.pixel_size().0 as f64;
 
     // Only send CacheFontMetrics when metrics actually change (e.g. on startup or font change).
     // Sending on every draw creates a feedback loop: draw → message → #[watch] → queue_draw → draw.
@@ -66,9 +117,12 @@ pub(super) fn draw_editor(
             .ok();
     }
 
-    // Calculate layout regions
+    // Calculate layout regions.
+    // When terminal is maximized, breadcrumbs are suppressed — the editor
+    // area is reduced to the tab row only so the panel can fill the rest.
+    let show_breadcrumbs = engine.settings.breadcrumbs && !engine.terminal_maximized;
     let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
+    let tab_bar_height = if show_breadcrumbs {
         tab_row_height + line_height
     } else {
         tab_row_height
@@ -96,11 +150,10 @@ pub(super) fn draw_editor(
 
     // Reserve space for the bottom panel when open (1 tab-bar row + content rows).
     // Triggered by either a live terminal OR the debug output panel being shown.
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
-    } else {
-        0.0
-    };
+    // When maximized, the effective row count is derived from the current DA
+    // height each frame so window resizes take effect immediately.
+    let term_px =
+        crate::render::compute_editor_layout(engine, height as f64, line_height, false).terminal_h;
 
     let debug_toolbar_px = if engine.debug_toolbar_visible {
         line_height
@@ -145,6 +198,7 @@ pub(super) fn draw_editor(
     // 3b. Draw each window (before tab bars so tabs paint on top)
     for rendered_window in &screen.windows {
         draw_window(
+            backend,
             cr,
             &layout,
             &font_metrics,
@@ -191,10 +245,6 @@ pub(super) fn draw_editor(
             let tab_y = gtb.bounds.y - tab_bar_height;
             let tab_x = gtb.bounds.x;
             let tab_w = gtb.bounds.width;
-            let is_active = gtb.group_id == split.active_group;
-            // In diff mode, show split buttons on all groups so clicking
-            // an inactive group's toolbar doesn't cause a visual shift.
-            let show_split = is_active || engine.is_in_diff_view();
             cr.save().ok();
             cr.rectangle(tab_x, tab_y, tab_w, tab_row_height);
             cr.clip();
@@ -206,28 +256,23 @@ pub(super) fn draw_editor(
                     None
                 }
             });
-            let accent = if is_active {
-                Some(theme.tab_active_accent)
-            } else {
-                None
-            };
-            let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
+            let (positions, close_b, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
+                backend,
                 cr,
                 &layout,
                 &theme,
-                &gtb.tabs,
+                &gtb.bar,
                 tab_w,
                 line_height,
                 0.0,
-                show_split,
                 hover_idx,
-                gtb.diff_toolbar.as_ref(),
-                gtb.tab_scroll_offset,
-                accent,
             );
             tab_slot_positions_out
                 .borrow_mut()
                 .insert(gtb.group_id.0, positions);
+            tab_close_bounds_out
+                .borrow_mut()
+                .insert(gtb.group_id.0, close_b);
             if let Some(dp) = dbp {
                 diff_btn_map_out.borrow_mut().insert(gtb.group_id.0, dp);
             }
@@ -239,30 +284,30 @@ pub(super) fn draw_editor(
             }
             tab_visible_counts_out
                 .borrow_mut()
-                .push((gtb.group_id, vis_count));
+                .push((gtb.group_id, vis_count, correct_offset));
             cr.restore().ok();
         }
     } else if !engine.is_tab_bar_hidden(engine.active_group) {
         // Single group: draw tab bar at full width with split buttons.
         let hover_idx = tab_close_hover.map(|(_gid, tidx)| tidx);
-        let (positions, dbp, sbp, vis_count, abp) = draw_tab_bar(
+        let (positions, close_b, dbp, sbp, vis_count, abp, correct_offset) = draw_tab_bar(
+            backend,
             cr,
             &layout,
             &theme,
-            &screen.tab_bar,
+            &screen.tab_bar_primitive,
             width as f64,
             line_height,
             0.0,
-            true,
             hover_idx,
-            screen.diff_toolbar.as_ref(),
-            screen.tab_scroll_offset,
-            Some(theme.tab_active_accent),
         );
         // Use group_id 0 for single-group mode
         tab_slot_positions_out
             .borrow_mut()
             .insert(engine.active_group.0, positions);
+        tab_close_bounds_out
+            .borrow_mut()
+            .insert(engine.active_group.0, close_b);
         if let Some(dp) = dbp {
             diff_btn_map_out
                 .borrow_mut()
@@ -280,33 +325,32 @@ pub(super) fn draw_editor(
         }
         tab_visible_counts_out
             .borrow_mut()
-            .push((engine.active_group, vis_count));
+            .push((engine.active_group, vis_count, correct_offset));
     }
 
-    // 4b. Draw breadcrumb bar(s) below tab bar(s)
+    // 4b. Draw breadcrumb bar(s) below tab bar(s). Skipped while the terminal
+    // is maximized so the panel can claim the breadcrumb row.
     for bc in &screen.breadcrumbs {
-        if bc.segments.is_empty() {
+        if bc.segments.is_empty() || engine.terminal_maximized {
             continue;
         }
-        // Breadcrumb bar sits one line_height above the window content (bc.bounds.y)
-        // and one line_height below the tab bar.
-        let bc_y = bc.bounds.y - line_height;
+        let bc_y = bc.bounds.y;
         let bc_x = bc.bounds.x;
         let bc_w = bc.bounds.width;
         cr.save().ok();
         cr.translate(bc_x, 0.0);
-        draw_breadcrumb_bar(
+        let bar_layout = draw_breadcrumb_bar(
+            backend,
             cr,
             &layout,
             &theme,
-            &bc.segments,
+            &bc.bar,
             bc_w,
             line_height,
             bc_y,
-            engine.breadcrumb_focus,
-            engine.breadcrumb_selected,
         );
         cr.restore().ok();
+        *bc.draw_layout.borrow_mut() = Some(bar_layout);
     }
 
     // 5. Draw tab drag overlay (drop zone highlight + ghost label).
@@ -320,26 +364,74 @@ pub(super) fn draw_editor(
             line_height,
             char_width,
             &layout,
+            &tab_slot_positions_out.borrow(),
         );
     }
 
-    // 5b. Draw completion popup (on top of everything else)
-    draw_completion_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    // 5b. Draw completion popup (on top of everything else). Cache
+    //     the layout so the click handler can hit-test items.
+    *completion_layout_out.borrow_mut() = draw_completion_popup(
+        backend,
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+    );
 
     // 5c. Draw hover popup (on top of everything else)
-    draw_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    draw_hover_popup(
+        backend,
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+        width as f64,
+        height as f64,
+    );
 
     // 5c2. Draw signature-help popup (on top of everything else, shown in insert mode)
-    draw_signature_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    draw_signature_popup(
+        backend,
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+        width as f64,
+        height as f64,
+    );
 
     // 5c3. Draw diff peek popup (inline git hunk preview)
-    draw_diff_peek_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    draw_diff_peek_popup(
+        backend,
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+        width as f64,
+        height as f64,
+    );
 
     // 5c4. Draw editor hover popup (gh key, diagnostic/annotation/plugin hovers)
-    let (eh_rect, eh_links) =
-        draw_editor_hover_popup(cr, &layout, &screen, &theme, line_height, char_width);
+    let (eh_rect, eh_links, eh_sb) = draw_editor_hover_popup(
+        backend,
+        cr,
+        &layout,
+        &screen,
+        &theme,
+        line_height,
+        char_width,
+    );
     editor_hover_rect_out.set(eh_rect);
     *editor_hover_link_rects_out.borrow_mut() = eh_links;
+    editor_hover_scrollbar_out.set(eh_sb);
 
     // 5c5. Draw tab hover tooltip (small popup below hovered tab).
     if let Some(ref tooltip_text) = screen.tab_tooltip {
@@ -405,17 +497,46 @@ pub(super) fn draw_editor(
             width as f64,
             qf_px,
             line_height,
+            backend,
         );
     }
 
     // 5g. Draw bottom panel (Terminal or Debug Output) with a tab bar.
     if term_px > 0.0 {
-        let term_y = height as f64 - status_bar_height - debug_toolbar_px - term_px;
+        // When maximized, snap the panel up to the editor tab bar's bottom
+        // edge. Without this, the row-based `PanelChromeDesc` helper reserves
+        // `ceil(1.6) = 2` row-units for the editor tab bar while GTK's
+        // actual `tab_bar_height = ceil(1.6 * line_height)` is only 1.6 lh —
+        // the 0.4 lh slack leaks through as a strip of editor content above
+        // the terminal, and shows up as a partial first line ("25 …").
+        let (term_y, term_px) = if engine.terminal_maximized {
+            let snapped_y = tab_bar_height;
+            let snapped_px = (height as f64
+                - status_bar_height
+                - debug_toolbar_px
+                - separated_status_px
+                - snapped_y)
+                .max(line_height);
+            (snapped_y, snapped_px)
+        } else {
+            let y = height as f64 - status_bar_height - debug_toolbar_px - term_px;
+            (y, term_px)
+        };
+        engine
+            .bottom_panel_geometry
+            .replace(Some(crate::core::engine::BottomPanelGeometry {
+                top_y: term_y,
+                height: term_px,
+                toolbar_y: line_height,
+                content_y: 2.0 * line_height,
+                content_row_h: line_height,
+            }));
         // Tab bar row (1 line high) at the top of the bottom panel area.
-        draw_bottom_panel_tabs(
+        let hits = draw_bottom_panel_tabs(
+            backend,
             cr,
             &layout,
-            &screen,
+            &screen.bottom_tabs.active,
             &theme,
             0.0,
             term_y,
@@ -424,57 +545,225 @@ pub(super) fn draw_editor(
             engine.terminal_open,
             !screen.bottom_tabs.output_lines.is_empty(),
         );
+        engine.bottom_tab_bar_hits.replace(Some(hits));
         match screen.bottom_tabs.active {
             render::BottomPanelKind::Terminal => {
                 if let Some(ref term_panel) = screen.bottom_tabs.terminal {
-                    draw_terminal_panel(
+                    let toolbar_y = term_y + line_height;
+                    let hits = draw_terminal_toolbar(
+                        backend,
                         cr,
                         &layout,
                         term_panel,
                         &theme,
                         0.0,
-                        term_y + line_height, // skip tab bar row
+                        toolbar_y,
                         width as f64,
-                        term_px - line_height,
                         line_height,
-                        char_width,
-                        sender,
                     );
+                    engine.terminal_toolbar_hits.replace(Some(hits));
+                    let content_h = (term_px - 2.0 * line_height).max(0.0);
+                    if content_h > 0.0 {
+                        let content_y = toolbar_y + line_height;
+                        let visible_rows = (content_h / line_height) as usize;
+                        let q_theme = super::quadraui_gtk::q_theme(&theme);
+                        let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
+                        cr.set_source_rgb(tbgr, tbgg, tbgb);
+                        cr.rectangle(0.0, content_y, width as f64, content_h);
+                        cr.fill().ok();
+                        let q_area = quadraui::Rect::new(
+                            0.0,
+                            content_y as f32,
+                            width as f32,
+                            content_h as f32,
+                        );
+                        let td = render::build_terminal_draw_data(
+                            term_panel,
+                            q_area,
+                            char_width as f32,
+                            line_height as f32,
+                            visible_rows,
+                            Some(6),
+                        );
+                        engine.terminal_split_layout.replace(td.split);
+                        {
+                            let mut b = backend.borrow_mut();
+                            b.set_current_theme(q_theme);
+                            b.set_current_line_height(line_height);
+                            b.set_current_char_width(char_width);
+                        }
+                        if let Some(split) = &td.split {
+                            let left = td.left.as_ref().unwrap();
+                            let right = td.right.as_ref().unwrap();
+                            let sl = *split;
+                            // #462: route paint through quadraui::ScreenLayout.
+                            use quadraui::{ScreenLayout as QScreenLayout, Surface};
+                            backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                                let mut frame = QScreenLayout::new();
+                                frame.push(Surface::Terminal {
+                                    rect: sl.left,
+                                    term: left,
+                                });
+                                frame.push(Surface::Terminal {
+                                    rect: sl.right,
+                                    term: right,
+                                });
+                                frame.draw(b);
+                            });
+                            quadraui::gtk::draw_terminal_divider(
+                                cr,
+                                split.divider_x as f64,
+                                content_y,
+                                content_h,
+                                &q_theme,
+                            );
+                        } else if let Some(ref term) = td.single {
+                            use quadraui::{ScreenLayout as QScreenLayout, Surface};
+                            backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                                let mut frame = QScreenLayout::new();
+                                frame.push(Surface::Terminal { rect: q_area, term });
+                                frame.draw(b);
+                            });
+                        }
+                        // Register scroll surface for dispatch.
+                        let geom = render::terminal_scrollbar_geometry(term_panel, visible_rows);
+                        let surface_sb = geom.map(|g| {
+                            let sb_w = 6.0;
+                            let sb_x = width as f64 - sb_w;
+                            let thumb_t = g.thumb_top_frac * content_h;
+                            let thumb_h = (g.thumb_height_frac * content_h).max(4.0);
+                            quadraui::SurfaceScrollbar {
+                                axis: quadraui::ScrollAxis::Vertical,
+                                track_bounds: quadraui::Rect::new(
+                                    sb_x as f32,
+                                    content_y as f32,
+                                    sb_w as f32,
+                                    content_h as f32,
+                                ),
+                                thumb_bounds: quadraui::Rect::new(
+                                    (sb_x + 1.0) as f32,
+                                    (content_y + thumb_t) as f32,
+                                    (sb_w - 2.0) as f32,
+                                    thumb_h as f32,
+                                ),
+                                total_items: g.total_items,
+                                visible_items: g.visible_items,
+                                scroll_offset: term_panel.scroll_offset,
+                                inverted: true,
+                            }
+                        });
+                        engine
+                            .scroll_surfaces
+                            .borrow_mut()
+                            .push(quadraui::ScrollSurface {
+                                id: quadraui::WidgetId::new("terminal_scrollback"),
+                                bounds: quadraui::Rect::new(
+                                    0.0,
+                                    content_y as f32,
+                                    width as f32,
+                                    content_h as f32,
+                                ),
+                                scrollbar: surface_sb,
+                            });
+                    }
                 }
             }
             render::BottomPanelKind::DebugOutput => {
-                draw_debug_output(
-                    cr,
-                    &layout,
+                let td = render::debug_output_to_text_display(
                     &screen.bottom_tabs.output_lines,
-                    &theme,
-                    0.0,
-                    term_y + line_height,
-                    width as f64,
-                    term_px - line_height,
-                    line_height,
+                    engine.debug_output_scroll,
+                    engine.debug_output_auto_scroll,
                 );
+                let q_rect = quadraui::Rect::new(
+                    0.0,
+                    (term_y + line_height) as f32,
+                    width as f32,
+                    (term_px - line_height) as f32,
+                );
+                let td_layout = {
+                    use quadraui::Backend;
+                    let mut b = backend.borrow_mut();
+                    b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                    b.set_current_line_height(line_height);
+                    let layout_result = b.text_display_layout(q_rect, &td);
+                    b.enter_frame_scope(cr, &layout, |b| {
+                        b.draw_text_display(q_rect, &td);
+                    });
+                    layout_result
+                };
+                let scrollbar =
+                    td_layout
+                        .scrollbar_bounds
+                        .zip(td_layout.thumb_bounds)
+                        .map(|(track, thumb)| {
+                            let offset_y = q_rect.y;
+                            quadraui::SurfaceScrollbar {
+                                axis: quadraui::ScrollAxis::Vertical,
+                                track_bounds: quadraui::Rect::new(
+                                    q_rect.x + track.x,
+                                    offset_y + track.y,
+                                    track.width,
+                                    track.height,
+                                ),
+                                thumb_bounds: quadraui::Rect::new(
+                                    q_rect.x + thumb.x,
+                                    offset_y + thumb.y,
+                                    thumb.width,
+                                    thumb.height,
+                                ),
+                                total_items: td.lines.len(),
+                                visible_items: td_layout.visible_lines.len(),
+                                scroll_offset: td_layout.resolved_scroll_offset,
+                                inverted: false,
+                            }
+                        });
+                engine
+                    .scroll_surfaces
+                    .borrow_mut()
+                    .push(quadraui::ScrollSurface {
+                        id: quadraui::WidgetId::new("debug_output"),
+                        bounds: q_rect,
+                        scrollbar,
+                    });
             }
         }
+    } else {
+        engine.bottom_panel_geometry.replace(None);
     }
 
-    // 5h. Draw debug toolbar strip if visible (above status bar)
-    if let Some(ref toolbar) = screen.debug_toolbar {
+    // 5h. Draw debug toolbar strip if visible (above status bar) (#510).
+    // Route through `Backend::draw_toolbar`; layout cached on engine for
+    // click/hover hit-testing.
+    if screen.debug_toolbar.is_some() {
         let toolbar_y = height as f64 - status_bar_height - debug_toolbar_px;
-        draw_debug_toolbar(
-            cr,
-            toolbar,
-            &theme,
+        let rect = quadraui::Rect::new(
             0.0,
-            toolbar_y,
-            width as f64,
-            line_height,
+            toolbar_y as f32,
+            width as f64 as f32,
+            line_height as f32,
         );
+        // Use UI font layout so toolbar text is measured at the UI font size.
+        let pango_ctx = pangocairo::create_context(cr);
+        let ui_font_desc = FontDescription::from_string(&UI_FONT());
+        let ui_layout = pango::Layout::new(&pango_ctx);
+        ui_layout.set_font_description(Some(&ui_font_desc));
+        backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+            b.set_current_line_height(line_height);
+            render::draw_debug_toolbar(b, engine, rect);
+        });
+        debug_toolbar_y_offset_out.set(toolbar_y);
+        debug_toolbar_height_out.set(line_height);
+    } else {
+        debug_toolbar_y_offset_out.set(0.0);
+        debug_toolbar_height_out.set(0.0);
     }
 
     // 5i. Draw horizontal scrollbars in Cairo (VSCode-style overlay on window bottom)
     draw_h_scrollbars(
+        backend,
         cr,
+        &layout,
         engine,
         &theme,
         &window_rects,
@@ -485,13 +774,17 @@ pub(super) fn draw_editor(
     );
 
     // 5j. Draw per-window status bars (after scrollbars so they paint on top)
-    if per_window_status {
+    //     When terminal_maximized, the editor area is collapsed to just the
+    //     tab bar; drawing the per-window status line there would overlap the
+    //     terminal toolbar below, so we skip it entirely.
+    if per_window_status && !engine.terminal_maximized {
         for rendered_window in &screen.windows {
             if let Some(ref status) = rendered_window.status_line {
                 let wr = &rendered_window.rect;
                 let bar_y = wr.y + wr.height - line_height;
                 let mut zones = Vec::new();
                 draw_window_status_bar(
+                    backend,
                     cr,
                     &layout,
                     &theme,
@@ -515,6 +808,7 @@ pub(super) fn draw_editor(
         let status_y = height as f64 - status_bar_height - separated_status_px;
         let mut zones = Vec::new();
         draw_window_status_bar(
+            backend,
             cr,
             &layout,
             &theme,
@@ -530,7 +824,20 @@ pub(super) fn draw_editor(
             .insert(screen.active_window_id.0, zones);
         let mut next_y = status_y + line_height;
         if let Some(ref wm) = screen.wildmenu {
-            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            let bar = render::wildmenu_to_status_bar(wm, &theme);
+            {
+                use quadraui::Backend;
+                backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                    b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                    b.set_current_line_height(line_height);
+                    b.draw_status_bar(
+                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32),
+                        &bar,
+                        None,
+                        None,
+                    );
+                });
+            }
             next_y += line_height;
         }
         draw_command_line(
@@ -545,17 +852,25 @@ pub(super) fn draw_editor(
     } else {
         // No terminal: original layout with per-window or global status at bottom
         let status_y = height as f64 - status_bar_height;
-        if !per_window_status {
-            draw_status_line(
-                cr,
-                &layout,
-                &theme,
-                &screen.status_left,
-                &screen.status_right,
-                width as f64,
-                status_y,
-                line_height,
-            );
+        if let Some(ref bar) = screen.global_status_bar {
+            // #446: route paint through quadraui's ScreenLayout. Layout return
+            // is discarded — the global status bar isn't a click target so it
+            // doesn't need the StatusBarLayout cached for hit-test.
+            use quadraui::{ScreenLayout as QScreenLayout, Surface};
+            backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                b.set_current_line_height(line_height);
+                let rect =
+                    quadraui::Rect::new(0.0, status_y as f32, width as f32, line_height as f32);
+                let mut frame = QScreenLayout::new();
+                frame.push(Surface::StatusBar {
+                    rect,
+                    bar,
+                    hovered: None,
+                    pressed: None,
+                });
+                frame.draw(b);
+            });
         }
         let mut next_y = if per_window_status {
             status_y
@@ -563,7 +878,20 @@ pub(super) fn draw_editor(
             status_y + line_height
         };
         if let Some(ref wm) = screen.wildmenu {
-            draw_wildmenu(cr, &layout, &theme, wm, width as f64, next_y, line_height);
+            let bar = render::wildmenu_to_status_bar(wm, &theme);
+            {
+                use quadraui::Backend;
+                backend.borrow_mut().enter_frame_scope(cr, &layout, |b| {
+                    b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+                    b.set_current_line_height(line_height);
+                    b.draw_status_bar(
+                        quadraui::Rect::new(0.0, next_y as f32, width as f32, line_height as f32),
+                        &bar,
+                        None,
+                        None,
+                    );
+                });
+            }
             next_y += line_height;
         }
         draw_command_line(
@@ -579,6 +907,7 @@ pub(super) fn draw_editor(
 
     // 8. Popups and modals — drawn last so they appear on top of everything.
     draw_find_replace_popup(
+        backend,
         cr,
         &layout,
         &screen,
@@ -586,6 +915,7 @@ pub(super) fn draw_editor(
         width as f64,
         height as f64,
         line_height,
+        char_width,
     );
 
     draw_picker_popup(
@@ -596,18 +926,22 @@ pub(super) fn draw_editor(
         width as f64,
         height as f64,
         line_height,
+        backend,
     );
 
-    draw_tab_switcher_popup(
-        cr,
+    tab_switcher_popup_rect_out.set(draw_tab_switcher_popup_list(
         &screen,
         &theme,
         width as f64,
         height as f64,
         line_height,
-    );
+        backend,
+        cr,
+        &layout,
+    ));
 
-    let btn_rects = draw_dialog_popup(
+    let (btn_rects, popup_rect) = draw_dialog_popup(
+        backend,
         cr,
         &layout,
         &screen,
@@ -617,18 +951,38 @@ pub(super) fn draw_editor(
         line_height,
     );
     *dialog_btn_rects_out.borrow_mut() = btn_rects;
+    dialog_popup_rect_out.set(popup_rect);
 
-    draw_context_menu_popup(
-        cr,
-        &layout,
-        &screen,
-        &theme,
-        width as f64,
-        height as f64,
-        char_width,
-        line_height,
-        mouse_pos,
+    // #426: skip the editor-DA ctx menu render when the trigger was an
+    // explorer right-click — that menu paints on the explorer DA instead
+    // (different coord system, so anchoring on the editor DA would put it
+    // at the wrong screen position).
+    let on_explorer = matches!(
+        engine.context_menu.as_ref().map(|cm| &cm.target),
+        Some(
+            core::engine::ContextMenuTarget::ExplorerFile { .. }
+                | core::engine::ContextMenuTarget::ExplorerDir { .. }
+        )
     );
+    *context_menu_layout_out.borrow_mut() = if on_explorer {
+        None
+    } else {
+        draw_context_menu_popup(
+            backend,
+            cr,
+            &layout,
+            &screen,
+            &theme,
+            width as f64,
+            height as f64,
+            char_width,
+            line_height,
+            mouse_pos,
+        )
+    };
+
+    // Cache the ScreenLayout for click handlers (#344). Moves, not clones.
+    *screen_layout_out.borrow_mut() = Some(screen);
 }
 
 /// Draw thin Cairo horizontal scrollbars that overlay the bottom of each editor
@@ -637,7 +991,9 @@ pub(super) fn draw_editor(
 /// `dragging_window` — window being dragged (shows the active/dragging colour).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_h_scrollbars(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
+    layout: &pango::Layout,
     engine: &Engine,
     theme: &Theme,
     window_rects: &[(core::WindowId, core::WindowRect)],
@@ -646,6 +1002,9 @@ pub(super) fn draw_h_scrollbars(
     hovered: bool,
     dragging_window: Option<core::WindowId>,
 ) {
+    // #462: route paint through quadraui::ScreenLayout. One frame per
+    // window so each scrollbar is its own Surface::Scrollbar entry.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
     for (window_id, rect) in window_rects {
         let Some((track_x, track_y, track_w, sb_height, thumb_x, thumb_w, _, _)) =
             h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
@@ -653,27 +1012,31 @@ pub(super) fn draw_h_scrollbars(
             continue;
         };
 
-        let is_active = dragging_window == Some(*window_id);
-
-        // Track background (slightly darker when hovered/active)
-        let track_alpha = if hovered || is_active { 0.35 } else { 0.20 };
-        let (tr, tg, tb) = theme.scrollbar_track.to_cairo();
-        cr.set_source_rgba(tr, tg, tb, track_alpha);
-        cr.rectangle(track_x, track_y, track_w, sb_height);
-        cr.fill().ok();
-
-        // Thumb: brighter on hover, brighter still on active drag
-        let thumb_alpha = if is_active {
-            0.85
-        } else if hovered {
-            0.70
-        } else {
-            0.50
+        let scrollbar = quadraui::Scrollbar {
+            id: quadraui::WidgetId::new("gtk:editor:h_scrollbar"),
+            axis: quadraui::ScrollAxis::Horizontal,
+            track: quadraui::Rect::new(
+                track_x as f32,
+                track_y as f32,
+                track_w as f32,
+                sb_height as f32,
+            ),
+            thumb_start: (thumb_x - track_x) as f32,
+            thumb_len: thumb_w as f32,
+            hovered,
+            dragging: dragging_window == Some(*window_id),
         };
-        let (thr, thg, thb) = theme.scrollbar_thumb.to_cairo();
-        cr.set_source_rgba(thr, thg, thb, thumb_alpha);
-        cr.rectangle(thumb_x, track_y, thumb_w, sb_height);
-        cr.fill().ok();
+        let sb_rect = scrollbar.track;
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            let mut frame = QScreenLayout::new();
+            frame.push(Surface::Scrollbar {
+                rect: sb_rect,
+                sb: &scrollbar,
+            });
+            frame.draw(b);
+        });
     }
 }
 
@@ -688,109 +1051,57 @@ pub(super) fn draw_tab_drag_overlay(
     height: f64,
     line_height: f64,
     _char_width: f64,
-    layout: &pango::Layout,
+    pango_layout: &pango::Layout,
+    tab_slot_positions: &TabSlotMap,
 ) {
-    use crate::core::window::{DropZone, SplitDirection, WindowRect};
-
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
-    let wildmenu_px = if engine.wildmenu_items.is_empty() {
-        0.0
-    } else {
-        line_height
-    };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_rows = if per_window_status { 1.0 } else { 2.0 }; // cmd only vs status+cmd
-    let status_bar_height = line_height * global_status_rows + wildmenu_px;
-    let qf_px = if engine.quickfix_open {
-        let n = engine.quickfix_items.len().clamp(1, 10) as f64;
-        (n + 1.0) * line_height
-    } else {
-        0.0
-    };
-    let term_px = if engine.terminal_open || engine.bottom_panel_open {
-        (engine.session.terminal_panel_rows as usize + 2) as f64 * line_height
-    } else {
-        0.0
-    };
-    let debug_toolbar_px = if engine.debug_toolbar_visible {
-        line_height
-    } else {
-        0.0
-    };
-    let editor_bottom = height - status_bar_height - debug_toolbar_px - qf_px - term_px;
-    let content_bounds = WindowRect::new(0.0, 0.0, width, editor_bottom);
-    let mut group_rects = engine
-        .group_layout
-        .calculate_group_rects(content_bounds, tab_bar_height);
-    engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
-
-    // Helper: effective tab bar height for a group (0 if hidden).
-    let eff_tbh = |gid: crate::core::window::GroupId| -> f64 {
-        if engine.is_tab_bar_hidden(gid) {
-            if engine.settings.breadcrumbs {
-                tab_bar_height / 2.0
-            } else {
-                0.0
-            }
-        } else {
-            tab_bar_height
-        }
+    let (bounds, tbh, slots_map) =
+        super::click::build_gtk_tab_slots(engine, width, height, line_height, tab_slot_positions);
+    let (groups, eff_tbh) = render::build_tab_drop_groups(&bounds, engine, tbh, &slots_map);
+    let tbh = eff_tbh;
+    let cursor = engine
+        .tab_drag_mouse
+        .map(|(mx, my)| (mx as f32, my as f32))
+        .unwrap_or((0.0, 0.0));
+    let overlay = match render::compute_tab_drop_overlay(
+        &engine.tab_drop_zone,
+        &groups,
+        cursor,
+        tbh,
+        2.0,
+        12.0,
+    ) {
+        Some(o) => o,
+        None => return,
     };
 
-    // Compute highlight rect from the drop zone.
-    let zone = engine.tab_drop_zone;
-    let highlight: Option<(f64, f64, f64, f64)> = match zone {
-        DropZone::Center(gid) => group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
-            let tbh = eff_tbh(gid);
-            (r.x, r.y - tbh, r.width, r.height + tbh)
-        }),
-        DropZone::Split(gid, dir, new_first) => {
-            group_rects.iter().find(|(g, _)| *g == gid).map(|(_, r)| {
-                let tbh = eff_tbh(gid);
-                let full_y = r.y - tbh;
-                let full_h = r.height + tbh;
-                match (dir, new_first) {
-                    (SplitDirection::Vertical, true) => (r.x, full_y, r.width / 2.0, full_h),
-                    (SplitDirection::Vertical, false) => {
-                        (r.x + r.width / 2.0, full_y, r.width / 2.0, full_h)
-                    }
-                    (SplitDirection::Horizontal, true) => (r.x, full_y, r.width, full_h / 2.0),
-                    (SplitDirection::Horizontal, false) => {
-                        (r.x, full_y + full_h / 2.0, r.width, full_h / 2.0)
-                    }
-                }
-            })
-        }
-        DropZone::TabReorder(gid, _idx) => group_rects
-            .iter()
-            .find(|(g, _)| *g == gid)
-            .map(|(_, r)| (r.x, r.y - eff_tbh(gid), r.width, line_height)),
-        DropZone::None => None,
-    };
-
-    // Draw the highlight rectangle.
-    if let Some((hx, hy, hw, hh)) = highlight {
+    if let Some(h) = overlay.highlight {
         let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
         cr.set_source_rgba(cr_r, cr_g, cr_b, 0.15);
-        cr.rectangle(hx, hy, hw, hh);
+        cr.rectangle(h.x as f64, h.y as f64, h.width as f64, h.height as f64);
         cr.fill().ok();
         cr.set_source_rgba(cr_r, cr_g, cr_b, 0.5);
         cr.set_line_width(2.0);
-        cr.rectangle(hx, hy, hw, hh);
+        cr.rectangle(h.x as f64, h.y as f64, h.width as f64, h.height as f64);
         cr.stroke().ok();
     }
 
-    // Draw a small ghost label near the cursor.
+    if let Some(bar) = overlay.insertion_bar {
+        let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
+        cr.set_source_rgb(cr_r, cr_g, cr_b);
+        cr.rectangle(
+            bar.x as f64,
+            bar.y as f64,
+            bar.width as f64,
+            bar.height as f64,
+        );
+        cr.fill().ok();
+    }
+
     if let (Some((mx, my)), Some(ref drag)) = (engine.tab_drag_mouse, &engine.tab_drag) {
         let label = &drag.tab_name;
         if !label.is_empty() {
-            layout.set_text(label);
-            let (tw, th) = layout.pixel_size();
+            pango_layout.set_text(label);
+            let (tw, th) = pango_layout.pixel_size();
             let gx = mx + 12.0;
             let gy = my - th as f64 / 2.0;
             let pad = 4.0;
@@ -806,1151 +1117,196 @@ pub(super) fn draw_tab_drag_overlay(
             let (gfr, gfg, gfb) = theme.foreground.to_cairo();
             cr.set_source_rgba(gfr, gfg, gfb, 0.9);
             cr.move_to(gx, gy);
-            pangocairo::show_layout(cr, layout);
+            pangocairo::show_layout(cr, pango_layout);
         }
     }
 }
 
+/// GTK tab bar renders via `Backend::draw_tab_bar`.
+///
+/// Takes a pre-built `quadraui::TabBar` primitive (from `ScreenLayout`)
+/// and reshapes `TabBarHits.right_segment_bounds` (keyed by `WidgetId`)
+/// into the vimcode-specific (diff_btns, split_btns, action_btn)
+/// groupings the click handler consumes. The vimcode UI font is set
+/// on the Pango layout before the trait call and restored afterwards
+/// (the rasteriser uses whatever font is on the layout at call time).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_tab_bar(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
-    tabs: &[TabInfo],
+    bar: &quadraui::TabBar,
     width: f64,
     line_height: f64,
     y_offset: f64,
-    show_split_btn: bool,
     hovered_close_tab: Option<usize>,
-    diff_toolbar: Option<&render::DiffToolbarData>,
-    tab_scroll_offset: usize,
-    accent_color: Option<render::Color>,
 ) -> TabBarDrawResult {
-    // Tab row is taller than line_height for vertical padding.
-    let tab_row_height = (line_height * 1.6).ceil();
-    let text_y_offset = y_offset + (tab_row_height - line_height) / 2.0;
+    use pango::FontDescription;
 
-    // Tab bar background
-    let (r, g, b) = theme.tab_bar_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(0.0, y_offset, width, tab_row_height);
-    cr.fill().ok();
-
-    // Clear any leftover Pango attributes (e.g. syntax highlighting from draw_window).
-    layout.set_attributes(None);
-
-    // Use sans-serif UI font for tabs (like VSCode)
+    // The rasteriser uses whatever font is on the layout. Vimcode renders
+    // tabs in the UI sans-serif, not the editor monospace; set it before
+    // the trait call and restore the caller's font after.
     let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
 
-    let normal_font = ui_font_desc.clone();
-    let mut italic_font = normal_font.clone();
-    italic_font.set_style(pango::Style::Italic);
+    // #461: route paint through `quadraui::ScreenLayout` and recover the
+    // `TabBarHits` via the post-paint `b.tab_bar_layout()` call. quadraui#211
+    // aligned the layout method to use the same tab_pad/inner_gap/outer_gap
+    // constants as the rasteriser, so slot positions / close bounds /
+    // right-segment bounds / correct_scroll_offset all match what was painted.
+    use quadraui::{Backend, ScreenLayout as QScreenLayout, Surface};
+    let tab_row_h = (line_height * 1.6).ceil();
+    let rect = quadraui::Rect::new(0.0, y_offset as f32, width as f32, tab_row_h as f32);
+    let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::TabBar {
+            rect,
+            bar,
+            hovered_close: hovered_close_tab,
+        });
+        frame.draw(b);
+        b.tab_bar_layout(rect, bar)
+    });
 
-    // Measure both split buttons so tabs don't overlap them.
-    let btn_right_s = format!(" {} ", icons::SPLIT_RIGHT.nerd);
-    let btn_down_s = format!(" {} ", icons::SPLIT_DOWN.nerd);
-    let btn_right_text = btn_right_s.as_str();
-    let btn_down_text = btn_down_s.as_str();
-    let (both_btns_px, btn_right_px) = if show_split_btn {
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(btn_right_text);
-        let (wr, _) = layout.pixel_size();
-        layout.set_text(btn_down_text);
-        let (wd, _) = layout.pixel_size();
-        (wr as f64 + wd as f64, wr as f64)
-    } else {
-        (0.0, 0.0)
-    };
-    // Measure diff toolbar buttons if present.
-    let diff_prev_s = format!(" {}", icons::DIFF_PREV.nerd);
-    let diff_next_s = format!(" {}", icons::DIFF_NEXT.nerd);
-    let diff_fold_s = format!(" {}", icons::DIFF_FOLD.nerd);
-    let diff_btn_prev_text = diff_prev_s.as_str();
-    let diff_btn_next_text = diff_next_s.as_str();
-    let diff_btn_fold_text = diff_fold_s.as_str();
-    let (diff_btns_px, diff_label_px) = if let Some(dt) = diff_toolbar {
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(diff_btn_prev_text);
-        let (wp, _) = layout.pixel_size();
-        layout.set_text(diff_btn_next_text);
-        let (wn, _) = layout.pixel_size();
-        layout.set_text(diff_btn_fold_text);
-        let (wf, _) = layout.pixel_size();
-        let btns = wp as f64 + wn as f64 + wf as f64;
-        let label = if let Some(lbl) = &dt.change_label {
-            layout.set_text(&format!(" {lbl}"));
-            let (wl, _) = layout.pixel_size();
-            wl as f64
-        } else {
-            0.0
-        };
-        (btns, label)
-    } else {
-        (0.0, 0.0)
-    };
-    let diff_total_px = diff_btns_px + diff_label_px;
-
-    // Measure the action menu button ("…").
-    let action_btn_s = " \u{22EF} "; // " ⋯ " (midline ellipsis)
-    layout.set_font_description(Some(&normal_font));
-    layout.set_text(action_btn_s);
-    let (action_w_i, _) = layout.pixel_size();
-    let action_btn_px = action_w_i as f64;
-
-    let tab_area_width = width - both_btns_px - diff_total_px - action_btn_px;
-
-    // Measure the close button (×) once for use in every tab.
-    layout.set_font_description(Some(&normal_font));
-    layout.set_text("×");
-    let (close_w_i, _) = layout.pixel_size();
-    let close_w = close_w_i as f64;
-    // Gap between tab name and ×, and gap between tabs.
-    let tab_pad = 14.0; // horizontal padding inside each tab
-    let tab_inner_gap = 10.0; // space between name and ×
-    let tab_outer_gap = 1.0; // space between tabs
-
-    let mut x = 0.0_f64;
-    let effective_tab_area = tab_area_width;
-
-    let mut slot_positions: Vec<(f64, f64)> = Vec::with_capacity(tabs.len());
-    // Fill slots for hidden tabs (before scroll offset) with zero-width entries
-    // so that slot_positions indices match tab indices.
-    for _ in 0..tab_scroll_offset.min(tabs.len()) {
-        slot_positions.push((0.0, 0.0));
-    }
-    for (tab_idx, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
-        // Use italic font for preview tabs
-        if tab.preview {
-            layout.set_font_description(Some(&italic_font));
-        } else {
-            layout.set_font_description(Some(&normal_font));
-        }
-
-        layout.set_text(&tab.name);
-        let (tab_width, _) = layout.pixel_size();
-        let tab_w = tab_width as f64;
-        // Total per-tab slot: pad + name + gap + × + pad + outer_gap
-        let tab_content_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad;
-        let slot_w = tab_content_w + tab_outer_gap;
-
-        // Stop drawing tabs if they would overrun the available area.
-        if x + slot_w > effective_tab_area {
-            break;
-        }
-        slot_positions.push((x, x + slot_w));
-
-        // Tab background (covers pad + name + gap + × + pad)
-        let bg = if tab.active {
-            theme.tab_active_bg
-        } else {
-            theme.tab_bar_bg
-        };
-        let (br, bg_g, bb) = bg.to_cairo();
-        cr.set_source_rgb(br, bg_g, bb);
-        cr.rectangle(x, y_offset, tab_content_w, tab_row_height);
-        cr.fill().ok();
-
-        // Accent line at top of active tab in focused group.
-        if tab.active {
-            if let Some(accent) = accent_color {
-                let (ar, ag, ab) = accent.to_cairo();
-                cr.set_source_rgb(ar, ag, ab);
-                cr.rectangle(x, y_offset, tab_content_w, 2.0);
-                cr.fill().ok();
-            }
-        }
-
-        // Tab text — dimmed colours for preview tabs
-        cr.move_to(x + tab_pad, text_y_offset);
-        let fg = if tab.preview {
-            if tab.active {
-                theme.tab_preview_active_fg
-            } else {
-                theme.tab_preview_inactive_fg
-            }
-        } else if tab.active {
-            theme.tab_active_fg
-        } else {
-            theme.tab_inactive_fg
-        };
-        let (fr, fg_g, fb) = fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        layout.set_font_description(Some(
-            &(if tab.preview {
-                italic_font.clone()
-            } else {
-                normal_font.clone()
-            }),
-        ));
-        pangocairo::show_layout(cr, layout);
-
-        // Close (×) button — dim on inactive, matches active fg on the active tab.
-        let close_x = x + tab_pad + tab_w + tab_inner_gap;
-        let is_close_hovered = hovered_close_tab == Some(tab_idx);
-        if is_close_hovered {
-            // Draw a subtle rounded background behind the × on hover.
-            let pad = 2.0;
-            let rx = close_x - pad;
-            let ry = text_y_offset + pad;
-            let rw = close_w + pad * 2.0;
-            let rh = line_height - pad * 2.0;
-            let (hr, hg, hb) = theme.foreground.to_cairo();
-            cr.set_source_rgba(hr, hg, hb, 0.15);
-            let radius = 3.0;
-            cr.new_path();
-            cr.arc(
-                rx + rw - radius,
-                ry + radius,
-                radius,
-                -std::f64::consts::FRAC_PI_2,
-                0.0,
-            );
-            cr.arc(
-                rx + rw - radius,
-                ry + rh - radius,
-                radius,
-                0.0,
-                std::f64::consts::FRAC_PI_2,
-            );
-            cr.arc(
-                rx + radius,
-                ry + rh - radius,
-                radius,
-                std::f64::consts::FRAC_PI_2,
-                std::f64::consts::PI,
-            );
-            cr.arc(
-                rx + radius,
-                ry + radius,
-                radius,
-                std::f64::consts::PI,
-                3.0 * std::f64::consts::FRAC_PI_2,
-            );
-            cr.close_path();
-            cr.fill().ok();
-        }
-        // Show ● (modified dot) when dirty and not hovered, × otherwise (VSCode style).
-        let close_glyph = if tab.dirty && !is_close_hovered {
-            "●"
-        } else {
-            "×"
-        };
-        let (xr, xg, xb) = if tab.dirty && !is_close_hovered {
-            // White/foreground dot for modified indicator
-            theme.foreground.to_cairo()
-        } else if is_close_hovered {
-            theme.foreground.to_cairo()
-        } else if tab.active {
-            theme.tab_inactive_fg.to_cairo()
-        } else {
-            theme.separator.to_cairo()
-        };
-        cr.set_source_rgb(xr, xg, xb);
-        layout.set_font_description(Some(&normal_font));
-        layout.set_text(close_glyph);
-        cr.move_to(close_x, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-
-        x += slot_w;
-    }
-
-    // Draw diff toolbar buttons (to the left of split buttons).
-    let diff_btn_pos: Option<(f64, f64, f64, f64, f64, f64)> = if let Some(dt) = diff_toolbar {
-        layout.set_font_description(Some(&normal_font));
-        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        let mut dx = width - both_btns_px - diff_total_px - action_btn_px;
-        // Change label (e.g. " 2 of 5")
-        if let Some(lbl) = &dt.change_label {
-            let (fr2, fg2, fb2) = theme.foreground.to_cairo();
-            cr.set_source_rgb(fr2, fg2, fb2);
-            layout.set_text(&format!(" {lbl}"));
-            cr.move_to(dx, text_y_offset);
-            pangocairo::show_layout(cr, layout);
-            dx += diff_label_px;
-        }
-        // Prev button
-        let prev_start = dx;
-        cr.set_source_rgb(fr, fg_g, fb);
-        layout.set_text(diff_btn_prev_text);
-        cr.move_to(dx, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        let (wp, _) = layout.pixel_size();
-        dx += wp as f64;
-        let prev_end = dx;
-        // Next button
-        let next_start = dx;
-        layout.set_text(diff_btn_next_text);
-        cr.move_to(dx, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        let (wn, _) = layout.pixel_size();
-        dx += wn as f64;
-        let next_end = dx;
-        // Fold toggle (highlighted when active)
-        let fold_start = dx;
-        if dt.unchanged_hidden {
-            let (ar, ag, ab) = theme.tab_active_fg.to_cairo();
-            cr.set_source_rgb(ar, ag, ab);
-        }
-        layout.set_text(diff_btn_fold_text);
-        cr.move_to(dx, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        let (wf, _) = layout.pixel_size();
-        let fold_end = dx + wf as f64;
-        Some((
-            prev_start, prev_end, next_start, next_end, fold_start, fold_end,
-        ))
-    } else {
-        None
-    };
-
-    // Draw split-right then split-down buttons at the right edge.
-    if show_split_btn && both_btns_px > 0.0 {
-        layout.set_font_description(Some(&normal_font));
-        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        // Split-right button (shifted left to make room for action button)
-        layout.set_text(btn_right_text);
-        cr.move_to(width - both_btns_px - action_btn_px, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        // Split-down button
-        layout.set_text(btn_down_text);
-        cr.move_to(
-            width - both_btns_px - action_btn_px + btn_right_px,
-            text_y_offset,
-        );
-        pangocairo::show_layout(cr, layout);
-    }
-
-    let split_btn_info = if show_split_btn && both_btns_px > 0.0 {
-        Some((both_btns_px, btn_right_px))
-    } else {
-        None
-    };
-
-    // Measure average character width, then report tab bar width in
-    // character-column equivalents so the engine can compute tab fits
-    // using char-based tab name widths.  Use a representative sample
-    // string instead of just "M" — proportional fonts make "M" much
-    // wider than the average character, causing the engine to think
-    // fewer tabs fit than actually do.
-    layout.set_font_description(Some(&normal_font));
-    layout.set_text("ABCDabcd0123.:_");
-    let (sample_px, _) = layout.pixel_size();
-    let char_w = (sample_px as f64 / 15.0).max(1.0);
-    let available_cols = (effective_tab_area / char_w).floor().max(0.0) as usize;
-
-    // Draw the editor action menu button ("…") at the far right.
-    let action_btn_info = {
-        layout.set_font_description(Some(&normal_font));
-        let (fr, fg_g, fb) = theme.tab_inactive_fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        let ax = width - action_btn_px;
-        layout.set_text(action_btn_s);
-        cr.move_to(ax, text_y_offset);
-        pangocairo::show_layout(cr, layout);
-        Some((ax, width))
-    };
-
-    // Restore original editor font for subsequent rendering
     layout.set_font_description(Some(&saved_font));
+
+    // Reshape `hits.right_segment_bounds` into vimcode's app-specific
+    // (diff_btns, split_btns, action_btn) groupings using the
+    // `WidgetId`s emitted by `build_tab_bar_primitive`.
+    let mut prev: Option<(f64, f64)> = None;
+    let mut next: Option<(f64, f64)> = None;
+    let mut fold: Option<(f64, f64)> = None;
+    let mut split_right: Option<(f64, f64)> = None;
+    let mut split_down: Option<(f64, f64)> = None;
+    let mut action: Option<(f64, f64)> = None;
+    for (i, seg) in bar.right_segments.iter().enumerate() {
+        let Some(bounds) = hits.right_segment_bounds.get(i).copied() else {
+            continue;
+        };
+        if let Some(ref id) = seg.id {
+            match id.as_str() {
+                "tab:diff_prev" => prev = Some(bounds),
+                "tab:diff_next" => next = Some(bounds),
+                "tab:diff_toggle" => fold = Some(bounds),
+                "tab:split_right" => split_right = Some(bounds),
+                "tab:split_down" => split_down = Some(bounds),
+                "tab:action_menu" => action = Some(bounds),
+                _ => {}
+            }
+        }
+    }
+    let diff_btns = match (prev, next, fold) {
+        (Some(p), Some(n), Some(f)) => Some((p.0, p.1, n.0, n.1, f.0, f.1)),
+        _ => None,
+    };
+    // Preserve the legacy `(both_btns_px, btn_right_px)` contract.
+    let split_btns = match (split_right, split_down) {
+        (Some(sr), Some(sd)) => {
+            let sr_w = sr.1 - sr.0;
+            let sd_w = sd.1 - sd.0;
+            Some((sr_w + sd_w, sr_w))
+        }
+        _ => None,
+    };
+
     (
-        slot_positions,
-        diff_btn_pos,
-        split_btn_info,
-        available_cols,
-        action_btn_info,
+        hits.slot_positions,
+        hits.close_bounds,
+        diff_btns,
+        split_btns,
+        hits.available_cols,
+        action,
+        hits.correct_scroll_offset,
     )
 }
 
+/// Draw the breadcrumb bar via `quadraui::ScreenLayout::draw()`.
+///
+/// The pre-built `quadraui::StatusBar` primitive comes from
+/// `render::ScreenLayout` (built by `render::build_screen_layout`).
+/// Returns the `StatusBarLayout` recovered via `b.status_bar_layout()`
+/// for the caller's hit-test cache (#461, quadraui#211 aligned the
+/// layout method's measurement to the rasteriser).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_breadcrumb_bar(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
-    segments: &[render::BreadcrumbSegment],
+    bar: &quadraui::StatusBar,
     width: f64,
     line_height: f64,
     y_offset: f64,
-    focus_active: bool,
-    focus_selected: usize,
-) {
-    // Background
-    let (r, g, b) = theme.breadcrumb_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(0.0, y_offset, width, line_height);
-    cr.fill().ok();
-
-    let separator = " \u{203A} "; // " › "
-    let mut x = 4.0; // small left padding
-
-    for (i, seg) in segments.iter().enumerate() {
-        // Separator before all but the first
-        if x > 5.0 {
-            let (sr, sg, sb) = theme.breadcrumb_fg.to_cairo();
-            cr.set_source_rgb(sr, sg, sb);
-            layout.set_text(separator);
-            cr.move_to(x, y_offset);
-            pangocairo::show_layout(cr, layout);
-            let (sw, _) = layout.pixel_size();
-            x += sw as f64;
-        }
-
-        // Measure label width for highlight rect
-        layout.set_text(&seg.label);
-        let (lw, _) = layout.pixel_size();
-
-        // Draw highlight background for focused segment
-        let is_focused = focus_active && i == focus_selected;
-        if is_focused {
-            let (hr, hg, hb) = theme.breadcrumb_active_fg.to_cairo();
-            cr.set_source_rgb(hr, hg, hb);
-            cr.rectangle(x - 2.0, y_offset, lw as f64 + 4.0, line_height);
-            cr.fill().ok();
-        }
-
-        // Segment label
-        let fg = if is_focused {
-            theme.breadcrumb_bg
-        } else if seg.is_last {
-            theme.breadcrumb_active_fg
-        } else {
-            theme.breadcrumb_fg
-        };
-        let (fr, fg_g, fb) = fg.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        cr.move_to(x, y_offset);
-        pangocairo::show_layout(cr, layout);
-        x += lw as f64;
-
-        if x > width {
-            break;
-        }
-    }
+) -> quadraui::StatusBarLayout {
+    use quadraui::{Backend, ScreenLayout as QScreenLayout, Surface};
+    let mut result = quadraui::StatusBarLayout {
+        bar_width: 0.0,
+        bar_height: 0.0,
+        visible_segments: Vec::new(),
+        hit_regions: Vec::new(),
+        resolved_right_start: 0,
+    };
+    let rect = quadraui::Rect::new(0.0, y_offset as f32, width as f32, line_height as f32);
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::StatusBar {
+            rect,
+            bar,
+            hovered: None,
+            pressed: None,
+        });
+        frame.draw(b);
+        result = b.status_bar_layout(rect, bar);
+    });
+    result
 }
 
+/// Render one editor window (pane) onto `cr`.
+///
+/// Phase C Stage 1D (#276) collapsed the body of this function to a
+/// thin delegator. The actual paint code lives in
+/// `quadraui::gtk::draw_editor`, fed by `render::to_q_editor` (the
+/// boundary adapter that converts the engine-side `RenderedWindow`
+/// IR into the cross-backend `quadraui::Editor` primitive). GTK
+/// scrollbars are painted elsewhere (`draw_h_scrollbars` for
+/// horizontal, native gtk4 widgets for vertical) — preserved by this
+/// delegator since the rasteriser explicitly excludes scrollbar paint
+/// on GTK. The per-window status line is also painted separately (it
+/// was lifted in Session 241).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_window(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
-    font_metrics: &pango::FontMetrics,
+    _font_metrics: &pango::FontMetrics,
     theme: &Theme,
     rw: &RenderedWindow,
     char_width: f64,
     line_height: f64,
 ) {
-    let rect = &rw.rect;
-
-    // Gutter pixel width
-    let gutter_width = rw.gutter_char_width as f64 * char_width;
-
-    // Apply horizontal scroll offset
-    let h_scroll_offset = rw.scroll_left as f64 * char_width;
-    let text_x_offset = rect.x + gutter_width - h_scroll_offset;
-
-    // Window background
-    let bg = if rw.show_active_bg {
-        theme.active_background
-    } else {
-        theme.background
-    };
-    let (br, bg_g, bb) = bg.to_cairo();
-    cr.set_source_rgb(br, bg_g, bb);
-    cr.rectangle(rect.x, rect.y, rect.width, rect.height);
-    cr.fill().ok();
-
-    // Cursorline / Diff / DAP stopped-line background (drawn before selection so selection is on top)
-    for (view_idx, rl) in rw.lines.iter().enumerate() {
-        let y = rect.y + view_idx as f64 * line_height;
-        let bg_color = if rl.is_dap_current {
-            Some(theme.dap_stopped_bg)
-        } else if let Some(diff_status) = rl.diff_status {
-            use crate::core::engine::DiffLine;
-            match diff_status {
-                DiffLine::Added => Some(theme.diff_added_bg),
-                DiffLine::Removed => Some(theme.diff_removed_bg),
-                DiffLine::Padding => Some(theme.diff_padding_bg),
-                DiffLine::Same => None,
-            }
-        } else if rl.is_current_line && rw.is_active && rw.cursorline {
-            Some(theme.cursorline_bg)
-        } else {
-            None
-        };
-        if let Some(color) = bg_color {
-            let (dr, dg, db) = color.to_cairo();
-            cr.set_source_rgb(dr, dg, db);
-            cr.rectangle(rect.x, y, rect.width, line_height);
-            cr.fill().ok();
-        }
-    }
-
-    // Visual selection highlight (drawn before text so text renders on top)
-    if let Some(sel) = &rw.selection {
-        draw_visual_selection(
-            cr,
-            layout,
-            sel,
-            &rw.lines,
+    let editor = render::to_q_editor(rw);
+    let rect = editor.rect;
+    // #462: route paint through quadraui::ScreenLayout. The Backend
+    // trait method resolves FontMetrics from the cr's pango context
+    // internally — caller no longer needs to thread metrics in.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Editor {
             rect,
-            line_height,
-            rw.scroll_top,
-            text_x_offset,
-            theme.selection,
-            theme.selection_alpha,
-        );
-    }
-
-    // Extra selections (Ctrl+D multi-cursor word highlights)
-    for esel in &rw.extra_selections {
-        draw_visual_selection(
-            cr,
-            layout,
-            esel,
-            &rw.lines,
-            rect,
-            line_height,
-            rw.scroll_top,
-            text_x_offset,
-            theme.selection,
-            theme.selection_alpha,
-        );
-    }
-
-    // Yank highlight (brief flash after yank)
-    if let Some(yh) = &rw.yank_highlight {
-        draw_visual_selection(
-            cr,
-            layout,
-            yh,
-            &rw.lines,
-            rect,
-            line_height,
-            rw.scroll_top,
-            text_x_offset,
-            theme.yank_highlight_bg,
-            theme.yank_highlight_alpha,
-        );
-    }
-
-    // Render gutter (bp marker + git marker + fold indicators + optional line numbers)
-    if rw.gutter_char_width > 0 {
-        for (view_idx, rl) in rw.lines.iter().enumerate() {
-            let y = rect.y + view_idx as f64 * line_height;
-
-            // Track how many left-aligned marker chars have been rendered.
-            let mut char_offset = 0usize;
-
-            // Breakpoint column — leftmost when any breakpoints/session active.
-            if rw.has_breakpoints {
-                let bp_ch: String = rl.gutter_text.chars().take(1).collect();
-                let bp_color = if rl.is_dap_current || rl.is_breakpoint {
-                    theme.diagnostic_error
-                } else {
-                    theme.line_number_fg
-                };
-                layout.set_text(&bp_ch);
-                layout.set_attributes(None);
-                let (br, bg_c, bb) = bp_color.to_cairo();
-                cr.set_source_rgb(br, bg_c, bb);
-                cr.move_to(rect.x + 3.0, y);
-                pangocairo::show_layout(cr, layout);
-                char_offset += 1;
-            }
-
-            // Git marker column.
-            if rw.has_git_diff {
-                let git_ch: String = rl.gutter_text.chars().skip(char_offset).take(1).collect();
-                let git_color = match rl.git_diff {
-                    Some(GitLineStatus::Added) => theme.git_added,
-                    Some(GitLineStatus::Modified) => theme.git_modified,
-                    Some(GitLineStatus::Deleted) => theme.git_deleted,
-                    None => theme.line_number_fg,
-                };
-                layout.set_text(&git_ch);
-                layout.set_attributes(None);
-                let (gr, gg, gb) = git_color.to_cairo();
-                cr.set_source_rgb(gr, gg, gb);
-                cr.move_to(rect.x + char_offset as f64 * char_width + 3.0, y);
-                pangocairo::show_layout(cr, layout);
-                char_offset += 1;
-
-                // Fold+numbers portion right-aligned.
-                let rest: String = rl.gutter_text.chars().skip(char_offset).collect();
-                layout.set_text(&rest);
-                layout.set_attributes(None);
-            } else if char_offset > 0 {
-                // bp column only — rest is fold+numbers.
-                let rest: String = rl.gutter_text.chars().skip(char_offset).collect();
-                layout.set_text(&rest);
-                layout.set_attributes(None);
-            } else {
-                // No marker columns.
-                layout.set_text(&rl.gutter_text);
-                layout.set_attributes(None);
-            }
-
-            let (num_width, _) = layout.pixel_size();
-            let num_x = rect.x + gutter_width - num_width as f64 - char_width + 3.0;
-
-            let num_color = if rw.is_active && rl.is_current_line {
-                theme.line_number_active_fg
-            } else {
-                theme.line_number_fg
-            };
-            let (nr, ng, nb) = num_color.to_cairo();
-            cr.set_source_rgb(nr, ng, nb);
-            cr.move_to(num_x, y);
-            pangocairo::show_layout(cr, layout);
-
-            // Diagnostic gutter icon (colored dot at leftmost gutter position)
-            if let Some(severity) = rw.diagnostic_gutter.get(&rl.line_idx) {
-                let diag_color = match severity {
-                    DiagnosticSeverity::Error => theme.diagnostic_error,
-                    DiagnosticSeverity::Warning => theme.diagnostic_warning,
-                    DiagnosticSeverity::Information => theme.diagnostic_info,
-                    DiagnosticSeverity::Hint => theme.diagnostic_hint,
-                };
-                let (dr, dg, db) = diag_color.to_cairo();
-                cr.set_source_rgb(dr, dg, db);
-                let dot_r = line_height * 0.2;
-                let dot_cx = rect.x + 3.0 + dot_r;
-                let dot_cy = y + line_height * 0.5;
-                cr.arc(dot_cx, dot_cy, dot_r, 0.0, 2.0 * std::f64::consts::PI);
-                cr.fill().ok();
-            } else if !rl.is_wrap_continuation && rw.code_action_lines.contains(&rl.line_idx) {
-                // Code action lightbulb gutter icon
-                let (lr, lg, lb) = theme.lightbulb.to_cairo();
-                cr.set_source_rgb(lr, lg, lb);
-                let bulb_layout = layout.clone();
-                bulb_layout.set_text(icons::LIGHTBULB.nerd);
-                cr.move_to(rect.x + 1.0, y);
-                pangocairo::show_layout(cr, &bulb_layout);
-            }
-        }
-    } // end gutter rendering block
-
-    // Clip text area (excluding gutter)
-    cr.save().ok();
-    cr.rectangle(
-        rect.x + gutter_width,
-        rect.y,
-        rect.width - gutter_width,
-        rect.height,
-    );
-    cr.clip();
-
-    // Render each visible line
-    for (view_idx, rl) in rw.lines.iter().enumerate() {
-        let y = rect.y + view_idx as f64 * line_height;
-
-        layout.set_text(&rl.raw_text);
-
-        let attrs = build_pango_attrs(&rl.spans);
-        layout.set_attributes(Some(&attrs));
-
-        let (fr, fg_g, fb) = theme.foreground.to_cairo();
-        cr.set_source_rgb(fr, fg_g, fb);
-        cr.move_to(text_x_offset, y);
-        pangocairo::show_layout(cr, layout);
-
-        // Ghost continuation lines — full line drawn in ghost colour.
-        if rl.is_ghost_continuation {
-            if let Some(ghost) = &rl.ghost_suffix {
-                let (gr, gg, gb) = theme.ghost_text_fg.to_cairo();
-                cr.set_source_rgb(gr, gg, gb);
-                cr.move_to(text_x_offset, y);
-                layout.set_text(ghost);
-                layout.set_attributes(None);
-                pangocairo::show_layout(cr, layout);
-            }
-        }
-
-        // Inline annotation / virtual text (e.g. git blame)
-        if let Some(ann) = &rl.annotation {
-            let text_pixel_width = layout.pixel_size().0 as f64;
-            let ann_x = text_x_offset + text_pixel_width + char_width * 2.0;
-            let (ar, ag, ab) = theme.annotation_fg.to_cairo();
-            cr.set_source_rgb(ar, ag, ab);
-            cr.move_to(ann_x, y);
-            layout.set_text(ann);
-            layout.set_attributes(None);
-            pangocairo::show_layout(cr, layout);
-        }
-
-        // Indent guides: thin vertical lines at each guide column
-        if !rl.indent_guides.is_empty() {
-            cr.set_line_width(1.0);
-            for &guide_col in &rl.indent_guides {
-                let is_active = rw.active_indent_col == Some(guide_col);
-                let (gr, gg, gb) = if is_active {
-                    theme.indent_guide_active_fg.to_cairo()
-                } else {
-                    theme.indent_guide_fg.to_cairo()
-                };
-                cr.set_source_rgb(gr, gg, gb);
-                let gx = text_x_offset + guide_col as f64 * char_width;
-                cr.move_to(gx, y);
-                cr.line_to(gx, y + line_height);
-                cr.stroke().ok();
-            }
-        }
-
-        // Color columns: tinted background rectangle at each column
-        if !rl.colorcolumns.is_empty() {
-            let (cr2, cg, cb) = theme.colorcolumn_bg.to_cairo();
-            cr.set_source_rgb(cr2, cg, cb);
-            for &cc_col in &rl.colorcolumns {
-                let cx = text_x_offset + cc_col as f64 * char_width;
-                cr.rectangle(cx, y, char_width, line_height);
-                cr.fill().ok();
-            }
-        }
-
-        // Bracket match highlighting
-        for &(bm_view_line, bm_col) in &rw.bracket_match_positions {
-            if bm_view_line == view_idx {
-                let (br, bg_c, bb) = theme.bracket_match_bg.to_cairo();
-                cr.set_source_rgba(br, bg_c, bb, 0.6);
-                let bx = text_x_offset + bm_col as f64 * char_width;
-                cr.rectangle(bx, y, char_width, line_height);
-                cr.fill().ok();
-            }
-        }
-
-        // Restore layout to match rendered text (needed for correct
-        // index_to_pos when font_scale != 1.0, e.g. markdown headings).
-        layout.set_text(&rl.raw_text);
-        let line_attrs = build_pango_attrs(&rl.spans);
-        layout.set_attributes(Some(&line_attrs));
-
-        // Diagnostic underlines (wavy squiggles)
-        for dm in &rl.diagnostics {
-            let diag_color = match dm.severity {
-                DiagnosticSeverity::Error => theme.diagnostic_error,
-                DiagnosticSeverity::Warning => theme.diagnostic_warning,
-                DiagnosticSeverity::Information => theme.diagnostic_info,
-                DiagnosticSeverity::Hint => theme.diagnostic_hint,
-            };
-            let (dr, dg, db) = diag_color.to_cairo();
-            cr.set_source_rgb(dr, dg, db);
-            cr.set_line_width(1.0);
-
-            let start_byte = rl
-                .raw_text
-                .char_indices()
-                .nth(dm.start_col)
-                .map(|(i, _)| i)
-                .unwrap_or(rl.raw_text.len());
-            let end_byte = rl
-                .raw_text
-                .char_indices()
-                .nth(dm.end_col)
-                .map(|(i, _)| i)
-                .unwrap_or(rl.raw_text.len());
-
-            let start_pos = layout.index_to_pos(start_byte as i32);
-            let end_pos = layout.index_to_pos(end_byte as i32);
-            let x0 = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-            let x1 = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-            let underline_y = y + line_height - 2.0;
-
-            // Draw wavy underline
-            let wave_h = 1.5;
-            let wave_len = 4.0;
-            cr.move_to(x0, underline_y);
-            let mut wx = x0;
-            let mut up = true;
-            while wx < x1 {
-                let next_x = (wx + wave_len).min(x1);
-                let cy = if up {
-                    underline_y - wave_h
-                } else {
-                    underline_y + wave_h
-                };
-                cr.curve_to(
-                    wx + (next_x - wx) * 0.5,
-                    cy,
-                    wx + (next_x - wx) * 0.5,
-                    cy,
-                    next_x,
-                    underline_y,
-                );
-                wx = next_x;
-                up = !up;
-            }
-            cr.stroke().ok();
-        }
-
-        // Spell error underlines (dotted underline in spell_error color)
-        for sm in &rl.spell_errors {
-            let (sr, sg, sb) = theme.spell_error.to_cairo();
-            cr.set_source_rgb(sr, sg, sb);
-            cr.set_line_width(1.0);
-
-            let start_byte = rl
-                .raw_text
-                .char_indices()
-                .nth(sm.start_col)
-                .map(|(i, _)| i)
-                .unwrap_or(rl.raw_text.len());
-            let end_byte = rl
-                .raw_text
-                .char_indices()
-                .nth(sm.end_col)
-                .map(|(i, _)| i)
-                .unwrap_or(rl.raw_text.len());
-
-            let start_pos = layout.index_to_pos(start_byte as i32);
-            let end_pos = layout.index_to_pos(end_byte as i32);
-            let x0 = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-            let x1 = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-            let underline_y = y + line_height - 2.0;
-
-            // Draw dotted underline
-            let dot_spacing = 3.0;
-            let mut dx = x0;
-            while dx < x1 {
-                cr.rectangle(dx, underline_y, 1.0, 1.0);
-                dx += dot_spacing;
-            }
-            cr.fill().ok();
-        }
-    }
-
-    cr.restore().ok();
-    // Render cursor
-    if let Some((cursor_pos, cursor_shape)) = &rw.cursor {
-        if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
-            layout.set_text(&rl.raw_text);
-            let cursor_attrs = build_pango_attrs(&rl.spans);
-            layout.set_attributes(Some(&cursor_attrs));
-
-            // When Ctrl+D selections are active, draw bar at right edge (col+1)
-            let render_col = if !rw.extra_selections.is_empty() && *cursor_shape == CursorShape::Bar
-            {
-                cursor_pos.col + 1
-            } else {
-                cursor_pos.col
-            };
-            let byte_offset: usize = rl
-                .raw_text
-                .char_indices()
-                .nth(render_col)
-                .map(|(i, _)| i)
-                .unwrap_or(rl.raw_text.len());
-
-            let pos = layout.index_to_pos(byte_offset as i32);
-            let cursor_x = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
-            let char_w = pos.width() as f64 / pango::SCALE as f64;
-            let cursor_y = rect.y + cursor_pos.view_line as f64 * line_height;
-
-            let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
-            let char_w = if char_w > 0.0 {
-                char_w
-            } else {
-                font_metrics.approximate_char_width() as f64 / pango::SCALE as f64
-            };
-            match cursor_shape {
-                CursorShape::Block => {
-                    cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
-                    cr.rectangle(cursor_x, cursor_y, char_w, line_height);
-                    cr.fill().ok();
-                }
-                CursorShape::Bar => {
-                    cr.set_source_rgb(cr_r, cr_g, cr_b);
-                    cr.rectangle(cursor_x, cursor_y, 2.0, line_height);
-                    cr.fill().ok();
-                }
-                CursorShape::Underline => {
-                    cr.set_source_rgb(cr_r, cr_g, cr_b);
-                    let bar_h = (line_height * 0.12).max(2.0);
-                    cr.rectangle(cursor_x, cursor_y + line_height - bar_h, char_w, bar_h);
-                    cr.fill().ok();
-                }
-            }
-        }
-    }
-
-    // AI ghost text — draw after cursor so it's clearly a suggestion.
-    if let Some((cursor_pos, _)) = &rw.cursor {
-        if let Some(rl) = rw.lines.get(cursor_pos.view_line) {
-            if let Some(ghost) = &rl.ghost_suffix {
-                layout.set_text(&rl.raw_text);
-                let ghost_line_attrs = build_pango_attrs(&rl.spans);
-                layout.set_attributes(Some(&ghost_line_attrs));
-                let byte_offset: usize = rl
-                    .raw_text
-                    .char_indices()
-                    .nth(cursor_pos.col)
-                    .map(|(i, _)| i)
-                    .unwrap_or(rl.raw_text.len());
-                let pos = layout.index_to_pos(byte_offset as i32);
-                let ghost_x = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
-                let ghost_y = rect.y + cursor_pos.view_line as f64 * line_height;
-                let (gr, gg, gb) = theme.ghost_text_fg.to_cairo();
-                cr.set_source_rgb(gr, gg, gb);
-                cr.move_to(ghost_x, ghost_y);
-                layout.set_text(ghost);
-                layout.set_attributes(None);
-                pangocairo::show_layout(cr, layout);
-            }
-        }
-    }
-
-    // Secondary cursors — same shape as primary cursor (bar in Insert/VSCode, block in Normal).
-    let extra_cursor_shape = rw
-        .cursor
-        .as_ref()
-        .map(|(_, s)| *s)
-        .unwrap_or(CursorShape::Bar);
-    let has_extra_sels = !rw.extra_selections.is_empty();
-    let fallback_char_w = font_metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-    let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
-    for extra_pos in &rw.extra_cursors {
-        if let Some(rl) = rw.lines.get(extra_pos.view_line) {
-            layout.set_text(&rl.raw_text);
-            let extra_attrs = build_pango_attrs(&rl.spans);
-            layout.set_attributes(Some(&extra_attrs));
-            // When Ctrl+D selections are active, draw bar at right edge (col+1)
-            let render_col = if has_extra_sels && extra_cursor_shape == CursorShape::Bar {
-                extra_pos.col + 1
-            } else {
-                extra_pos.col
-            };
-            let byte_offset: usize = rl
-                .raw_text
-                .char_indices()
-                .nth(render_col)
-                .map(|(i, _)| i)
-                .unwrap_or(rl.raw_text.len());
-            let pos = layout.index_to_pos(byte_offset as i32);
-            let ex = text_x_offset + pos.x() as f64 / pango::SCALE as f64;
-            let ew = {
-                let w = pos.width() as f64 / pango::SCALE as f64;
-                if w > 0.0 {
-                    w
-                } else {
-                    fallback_char_w
-                }
-            };
-            let ey = rect.y + extra_pos.view_line as f64 * line_height;
-            match extra_cursor_shape {
-                CursorShape::Bar => {
-                    cr.set_source_rgb(cr_r, cr_g, cr_b);
-                    cr.rectangle(ex, ey, 2.0, line_height);
-                    cr.fill().ok();
-                }
-                CursorShape::Block => {
-                    cr.set_source_rgba(cr_r, cr_g, cr_b, theme.cursor_normal_alpha);
-                    cr.rectangle(ex, ey, ew, line_height);
-                    cr.fill().ok();
-                }
-                CursorShape::Underline => {
-                    cr.set_source_rgb(cr_r, cr_g, cr_b);
-                    let bar_h = (line_height * 0.12).max(2.0);
-                    cr.rectangle(ex, ey + line_height - bar_h, ew, bar_h);
-                    cr.fill().ok();
-                }
-            }
-        }
-    }
-}
-
-/// Convert a slice of [`StyledSpan`]s into a Pango [`AttrList`].
-pub(super) fn build_pango_attrs(spans: &[StyledSpan]) -> AttrList {
-    let attrs = AttrList::new();
-    for span in spans {
-        let (fr, fg_g, fb) = span.style.fg.to_pango_u16();
-        let mut fg_attr = AttrColor::new_foreground(fr, fg_g, fb);
-        fg_attr.set_start_index(span.start_byte as u32);
-        fg_attr.set_end_index(span.end_byte as u32);
-        attrs.insert(fg_attr);
-
-        if let Some(bg) = span.style.bg {
-            let (br, bg_g, bb) = bg.to_pango_u16();
-            let mut bg_attr = AttrColor::new_background(br, bg_g, bb);
-            bg_attr.set_start_index(span.start_byte as u32);
-            bg_attr.set_end_index(span.end_byte as u32);
-            attrs.insert(bg_attr);
-        }
-        if span.style.bold {
-            let mut w = pango::AttrInt::new_weight(pango::Weight::Bold);
-            w.set_start_index(span.start_byte as u32);
-            w.set_end_index(span.end_byte as u32);
-            attrs.insert(w);
-        }
-        if span.style.italic {
-            let mut s = pango::AttrInt::new_style(pango::Style::Italic);
-            s.set_start_index(span.start_byte as u32);
-            s.set_end_index(span.end_byte as u32);
-            attrs.insert(s);
-        }
-        if (span.style.font_scale - 1.0).abs() > f64::EPSILON {
-            let mut sc = pango::AttrFloat::new_scale(span.style.font_scale);
-            sc.set_start_index(span.start_byte as u32);
-            sc.set_end_index(span.end_byte as u32);
-            attrs.insert(sc);
-        }
-    }
-    attrs
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_visual_selection(
-    cr: &Context,
-    layout: &pango::Layout,
-    sel: &SelectionRange,
-    lines: &[render::RenderedLine],
-    rect: &WindowRect,
-    line_height: f64,
-    _scroll_top: usize,
-    text_x_offset: f64,
-    color: render::Color,
-    alpha: f64,
-) {
-    let (sr, sg, sb) = color.to_cairo();
-    cr.set_source_rgba(sr, sg, sb, alpha);
-
-    // Build a mapping from buffer line → view row index.  For each buffer
-    // line we take the LAST non-skippable rendered row (skipping wrap
-    // continuations, diff padding, and ghost continuations that share the
-    // same line_idx but occupy preceding view rows).
-    let mut line_to_view: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
-    for (view_idx, rl) in lines.iter().enumerate() {
-        if rl.is_wrap_continuation || rl.is_ghost_continuation {
-            continue;
-        }
-        if rl.diff_status == Some(crate::core::engine::DiffLine::Padding) {
-            continue;
-        }
-        // Overwrite with latest view_idx → picks the content row, not a
-        // preceding padding/ghost row with the same line_idx.
-        line_to_view.insert(rl.line_idx, view_idx);
-    }
-    match sel.kind {
-        SelectionKind::Line => {
-            // Line-mode: highlight ALL visual rows (including wrap continuations)
-            // for each selected buffer line, so wrapped lines are fully covered.
-            for (view_idx, rl) in lines.iter().enumerate() {
-                if rl.line_idx >= sel.start_line
-                    && rl.line_idx <= sel.end_line
-                    && rl.diff_status != Some(crate::core::engine::DiffLine::Padding)
-                    && !rl.is_ghost_continuation
-                {
-                    let y = rect.y + view_idx as f64 * line_height;
-                    let highlight_width = rect.width - (text_x_offset - rect.x);
-                    cr.rectangle(text_x_offset, y, highlight_width, line_height);
-                }
-            }
-            cr.fill().ok();
-        }
-        SelectionKind::Char => {
-            for line_idx in sel.start_line..=sel.end_line {
-                let Some(&view_idx) = line_to_view.get(&line_idx) else {
-                    continue;
-                };
-                let rl = &lines[view_idx];
-                let y = rect.y + view_idx as f64 * line_height;
-                let line_text = &rl.raw_text;
-
-                layout.set_text(line_text);
-                layout.set_attributes(None);
-
-                if sel.start_line == sel.end_line {
-                    // Single-line selection
-                    let start_byte = line_text
-                        .char_indices()
-                        .nth(sel.start_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line_text.len());
-                    let start_pos = layout.index_to_pos(start_byte as i32);
-                    let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-
-                    let end_col = (sel.end_col + 1).min(line_text.chars().count());
-                    let end_byte = line_text
-                        .char_indices()
-                        .nth(end_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line_text.len());
-                    let end_pos = layout.index_to_pos(end_byte as i32);
-                    let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-
-                    cr.rectangle(start_x, y, end_x - start_x, line_height);
-                    cr.fill().ok();
-                } else if line_idx == sel.start_line {
-                    let start_byte = line_text
-                        .char_indices()
-                        .nth(sel.start_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line_text.len());
-                    let start_pos = layout.index_to_pos(start_byte as i32);
-                    let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-                    let (line_width, _) = layout.pixel_size();
-                    cr.rectangle(
-                        start_x,
-                        y,
-                        text_x_offset + line_width as f64 - start_x,
-                        line_height,
-                    );
-                    cr.fill().ok();
-                } else if line_idx == sel.end_line {
-                    let end_col = (sel.end_col + 1).min(line_text.chars().count());
-                    let end_byte = line_text
-                        .char_indices()
-                        .nth(end_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line_text.len());
-                    let end_pos = layout.index_to_pos(end_byte as i32);
-                    let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-                    cr.rectangle(text_x_offset, y, end_x - text_x_offset, line_height);
-                    cr.fill().ok();
-                } else {
-                    let (line_width, _) = layout.pixel_size();
-                    cr.rectangle(text_x_offset, y, line_width as f64, line_height);
-                    cr.fill().ok();
-                }
-            }
-        }
-        SelectionKind::Block => {
-            for line_idx in sel.start_line..=sel.end_line {
-                let Some(&view_idx) = line_to_view.get(&line_idx) else {
-                    continue;
-                };
-                let rl = &lines[view_idx];
-                let y = rect.y + view_idx as f64 * line_height;
-                let line_text = &rl.raw_text;
-                let line_len = line_text.chars().count();
-
-                layout.set_text(line_text);
-                layout.set_attributes(None);
-
-                if sel.start_col < line_len {
-                    let start_byte = line_text
-                        .char_indices()
-                        .nth(sel.start_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line_text.len());
-                    let start_pos = layout.index_to_pos(start_byte as i32);
-                    let start_x = text_x_offset + start_pos.x() as f64 / pango::SCALE as f64;
-
-                    let block_end_col = (sel.end_col + 1).min(line_len);
-                    let end_byte = line_text
-                        .char_indices()
-                        .nth(block_end_col)
-                        .map(|(i, _)| i)
-                        .unwrap_or(line_text.len());
-                    let end_pos = layout.index_to_pos(end_byte as i32);
-                    let end_x = text_x_offset + end_pos.x() as f64 / pango::SCALE as f64;
-
-                    cr.rectangle(start_x, y, end_x - start_x, line_height);
-                }
-            }
-            cr.fill().ok();
-        }
-    }
+            editor: &editor,
+        });
+        frame.draw(b);
+    });
 }
 
 pub(super) fn draw_window_separators(
@@ -1997,82 +1353,94 @@ pub(super) fn draw_window_separators(
     }
 }
 
+/// Returns the popup's `(x, y, w, h)` if drawn, `None` otherwise. The
+/// caller writes the rect into `App.completion_popup_rect` so the
+/// click handler can register it on the modal stack (B.5b Stage 5).
+///
+/// Body is a thin delegator over `quadraui::gtk::draw_completions`
+/// (#285). Builds the `quadraui::Completions` description via the
+/// shared `render::completion_menu_to_quadraui_completions` adapter,
+/// computes the popup placement via `Completions::layout()`, then
+/// forwards to the lifted rasteriser through the
+/// `quadraui_gtk::draw_completions` shim. Returns the resolved
+/// `CompletionsLayout` so the click handler can hit-test items.
 pub(super) fn draw_completion_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
     theme: &Theme,
     line_height: f64,
     char_width: f64,
-) {
-    let Some(menu) = &screen.completion else {
-        return;
-    };
-    let Some(active_win) = screen
+) -> Option<quadraui::CompletionsLayout> {
+    let menu = screen.completion.as_ref()?;
+    let active_win = screen
         .windows
         .iter()
-        .find(|w| w.window_id == screen.active_window_id)
-    else {
-        return;
-    };
-    let Some((cursor_pos, _)) = &active_win.cursor else {
-        return;
-    };
+        .find(|w| w.window_id == screen.active_window_id)?;
+    let (cursor_pos, _) = active_win.cursor.as_ref()?;
 
-    // Anchor popup below the cursor cell, to the right of the gutter.
+    // Anchor: cell below the cursor cell, to the right of the gutter.
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let h_scroll_offset = active_win.scroll_left as f64 * char_width;
-    let popup_x =
+    let cursor_x =
         active_win.rect.x + gutter_width + cursor_pos.col as f64 * char_width - h_scroll_offset;
-    let popup_y = active_win.rect.y + (cursor_pos.view_line + 1) as f64 * line_height;
+    let cursor_y = active_win.rect.y + cursor_pos.view_line as f64 * line_height;
 
-    let visible = menu.candidates.len().min(10);
+    // Popup width matches the pre-lift bespoke math: longest candidate
+    // + 2 cells of padding/border, floored at 100 px.
     let popup_w = ((menu.max_width + 2) as f64 * char_width).max(100.0);
-    let popup_h = visible as f64 * line_height;
+    // Cap visible rows at 10 — same ceiling as the pre-lift code.
+    let max_popup_h = 10.0 * line_height;
 
-    // Background
-    let (r, g, b) = theme.completion_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
+    let completions = render::completion_menu_to_quadraui_completions(menu);
+    let viewport = quadraui::Rect::new(
+        active_win.rect.x as f32,
+        active_win.rect.y as f32,
+        active_win.rect.width as f32,
+        active_win.rect.height as f32,
+    );
+    let line_height_f = line_height as f32;
+    let q_layout = completions.layout(
+        cursor_x as f32,
+        cursor_y as f32,
+        line_height_f,
+        viewport,
+        popup_w as f32,
+        max_popup_h as f32,
+        |_| quadraui::CompletionItemMeasure::new(line_height_f),
+    );
 
-    // Border
-    let (r, g, b) = theme.completion_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
+    // #463: route paint through quadraui::ScreenLayout. The
+    // CompletionsLayout returned by `completions.layout(...)` is what
+    // both paint and click consume — one source of truth.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Completions {
+            completions: &completions,
+            layout: &q_layout,
+        });
+        frame.draw(b);
+    });
 
-    // Items
-    for (i, candidate) in menu.candidates.iter().enumerate().take(visible) {
-        let item_y = popup_y + i as f64 * line_height;
-
-        // Selected row highlight
-        if i == menu.selected_idx {
-            let (r, g, b) = theme.completion_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(popup_x, item_y, popup_w, line_height);
-            cr.fill().ok();
-        }
-
-        // Candidate text
-        let (r, g, b) = theme.completion_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        let display = format!(" {}", candidate);
-        layout.set_text(&display);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, item_y);
-        pangocairo::show_layout(cr, layout);
-    }
+    Some(q_layout)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_hover_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
     theme: &Theme,
     line_height: f64,
     char_width: f64,
+    viewport_w: f64,
+    viewport_h: f64,
 ) {
     let Some(hover) = &screen.hover else {
         return;
@@ -2085,54 +1453,62 @@ pub(super) fn draw_hover_popup(
         return;
     };
 
-    // Position above the anchor line
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let h_scroll_offset = active_win.scroll_left as f64 * char_width;
     let anchor_view_line = hover.anchor_line.saturating_sub(active_win.scroll_top);
-    let popup_x =
+    let anchor_x =
         active_win.rect.x + gutter_width + hover.anchor_col as f64 * char_width - h_scroll_offset;
+    let anchor_y = active_win.rect.y + anchor_view_line as f64 * line_height;
 
-    // Split text into lines and measure
-    let text_lines: Vec<&str> = hover.text.lines().collect();
-    let num_lines = text_lines.len().min(20) as f64;
+    let text_lines: Vec<&str> = hover.text.lines().take(20).collect();
+    let num_lines = text_lines.len() as f64;
     let max_line_len = text_lines.iter().map(|l| l.len()).max().unwrap_or(10);
-    let popup_w = ((max_line_len + 2) as f64 * char_width).max(100.0);
-    let popup_h = num_lines * line_height + 4.0;
+    let measured_w = ((max_line_len + 2) as f64 * char_width).max(100.0);
+    let measured_h = num_lines * line_height + 4.0;
 
-    // Place above cursor if possible, otherwise below
-    let popup_y = if anchor_view_line as f64 * line_height > popup_h {
-        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
-    } else {
-        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp:hover"),
+        text: text_lines.join("\n"),
+        styled_lines: None,
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
     };
+    let tip_layout = tooltip.layout(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            char_width as f32,
+            line_height as f32,
+        ),
+        quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
+        quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
+        0.0,
+    );
 
-    // Background
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Text
-    let (r, g, b) = theme.hover_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    for (i, text_line) in text_lines.iter().enumerate().take(20) {
-        let display = format!(" {}", text_line);
-        layout.set_text(&display);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
-        pangocairo::show_layout(cr, layout);
-    }
+    // #463: route paint through quadraui::ScreenLayout. Tooltip is
+    // non-interactive — no hit data to recover.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Tooltip {
+            tooltip: &tooltip,
+            layout: &tip_layout,
+        });
+        frame.draw(b);
+    });
 }
 
-#[allow(clippy::type_complexity)]
+/// Draw the LSP/editor hover popup via the `quadraui::RichTextPopup`
+/// primitive. Returns `(popup_bounds, link_rects, scrollbar_hit)` —
+/// scrollbar geometry feeds the click + drag handlers in `mod.rs`
+/// (#215).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn draw_editor_hover_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -2142,10 +1518,9 @@ pub(super) fn draw_editor_hover_popup(
 ) -> (
     Option<(f64, f64, f64, f64)>,
     Vec<(f64, f64, f64, f64, String)>,
+    Option<render::PopupScrollbarHit>,
 ) {
-    use crate::core::markdown::MdStyle;
-
-    let empty = (None, Vec::new());
+    let empty = (None, Vec::new(), None);
     let Some(eh) = screen.editor_hover.as_ref() else {
         return empty;
     };
@@ -2156,322 +1531,174 @@ pub(super) fn draw_editor_hover_popup(
     else {
         return empty;
     };
-    let lines = &eh.rendered.lines;
-    if lines.is_empty() {
+    if eh.rendered.lines.is_empty() {
         return empty;
     }
 
-    let padding = 4.0;
-    let scroll = eh.scroll_top;
+    // Anchor in pixels from window origin + frozen scroll.
+    let gutter_w = active_win.gutter_char_width as f64 * char_width;
+    let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as f64;
+    let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as f64;
+    let anchor_x = active_win.rect.x + gutter_w + vis_col * char_width;
+    let anchor_y = active_win.rect.y + anchor_view * line_height;
 
-    // Popup width: use a comfortable reading width, clamped to editor area
+    // Content width — clamp to a comfortable reading width inside the window.
     let da_width = active_win.rect.x + active_win.rect.width;
     let popup_w = ((eh.popup_width + 2) as f64 * char_width)
         .clamp(100.0, (da_width - active_win.rect.x) * 0.9)
         .min(80.0 * char_width);
-    let text_w = popup_w - padding * 2.0;
-    let pango_text_w = (text_w * pango::SCALE as f64) as i32;
+    let content_w = popup_w - 2.0;
 
-    // Pre-compute wrapped height of each logical line using Pango word wrap
-    let mut line_heights: Vec<f64> = Vec::with_capacity(lines.len());
-    for text_line in lines {
-        let display = format!(" {}", text_line);
-        layout.set_text(&display);
-        layout.set_width(pango_text_w);
-        layout.set_wrap(pango::WrapMode::WordChar);
-        let (_pw, ph) = layout.pixel_size();
-        line_heights.push(ph as f64);
-    }
-    layout.set_width(-1); // reset for later use
+    let popup = render::editor_hover_to_quadraui_rich_text(eh, theme);
+    let viewport = quadraui::Rect::new(
+        active_win.rect.x as f32,
+        active_win.rect.y as f32,
+        active_win.rect.width as f32,
+        active_win.rect.height as f32,
+    );
+    let measure = quadraui::RichTextPopupMeasure::new(content_w as f32, line_height as f32);
 
-    // Determine which lines are visible within a max pixel height
-    let max_popup_content_h = 20.0 * line_height;
-    let total_content_h: f64 = line_heights.iter().sum();
-    let can_scroll = total_content_h > max_popup_content_h;
-    let scrollbar_w = if can_scroll { char_width } else { 0.0 };
-    let popup_w = popup_w + scrollbar_w;
-
-    // Calculate visible content height (lines from scroll onward, capped)
-    let mut visible_content_h = 0.0;
-    let mut visible_end = scroll;
-    for (i, h) in line_heights.iter().enumerate().skip(scroll) {
-        let h = *h;
-        if visible_content_h + h > max_popup_content_h && visible_end > scroll {
-            break;
-        }
-        visible_content_h += h;
-        visible_end = i + 1;
-    }
-    visible_content_h = visible_content_h.min(max_popup_content_h);
-
-    let focus_bar_h = if eh.has_focus { line_height } else { 0.0 };
-    let popup_h = visible_content_h + padding * 2.0 + focus_bar_h;
-
-    let gutter_width = active_win.gutter_char_width as f64 * char_width;
-    // Use frozen scroll offsets so the popup stays fixed on screen
-    let h_scroll_offset = eh.frozen_scroll_left as f64 * char_width;
-    let anchor_view_line = eh.anchor_line.saturating_sub(eh.frozen_scroll_top);
-    let mut popup_x =
-        active_win.rect.x + gutter_width + eh.anchor_col as f64 * char_width - h_scroll_offset;
-
-    // Prefer above the word (like VSCode); below only near the top
-    let space_above = anchor_view_line as f64 * line_height;
-    let space_below = active_win.rect.height - (anchor_view_line as f64 + 1.0) * line_height;
-    let popup_y = if space_above >= popup_h {
-        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
-    } else if space_below >= popup_h {
-        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
-    } else {
-        // Neither fits perfectly — use the larger space
-        if space_above >= space_below {
-            (active_win.rect.y + anchor_view_line as f64 * line_height - popup_h).max(0.0)
-        } else {
-            active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
-        }
-    };
-    // Keep popup on-screen horizontally
-    if popup_x + popup_w > da_width {
-        popup_x = (da_width - popup_w).max(active_win.rect.x);
-    }
-
-    // Background
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border — use link color when focused to indicate keyboard mode
-    let border_color = if eh.has_focus {
-        theme.md_link
-    } else {
-        theme.hover_border
-    };
-    let (r, g, b) = border_color.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(if eh.has_focus { 2.0 } else { 1.0 });
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Clip rendering to popup bounds so text doesn't spill outside
-    cr.save().ok();
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.clip();
-
-    // Render styled markdown lines with word wrapping
-    let mut link_rects: Vec<(f64, f64, f64, f64, String)> = Vec::new();
-    let mut y_offset = 0.0;
-    for (li, text_line) in lines.iter().enumerate().take(visible_end).skip(scroll) {
-        let display = format!(" {}", text_line);
-        let actual_line = li;
-        let line_spans = eh.rendered.spans.get(actual_line);
-        let code_hl = eh.rendered.code_highlights.get(actual_line);
-        let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
-
-        let attrs = pango::AttrList::new();
-        if has_code_hl {
-            // Use tree-sitter syntax highlighting for code block lines.
-            for hl in code_hl.unwrap() {
-                let start = hl.start_byte as u32 + 1; // +1 for leading space
-                let end = hl.end_byte as u32 + 1;
-                let color = theme.scope_color(&hl.scope);
-                let (r, g, b) = color.to_pango_u16();
-                let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                attr.set_start_index(start);
-                attr.set_end_index(end);
-                attrs.insert(attr);
+    // #488: measure link spans with the same proportional UI font the
+    // rasteriser paints with. The old approach counted `chars() × char_width`
+    // (editor-monospace approximation) which diverged from the proportional
+    // UI font — positions drifted by several pixels per word, so most links'
+    // hit-rects landed to the left of the actual glyph run. Using Pango's
+    // `index_to_pos` with the UI font makes `link_hit_regions` match the
+    // painted glyphs exactly.
+    let ui_font_desc_for_measure = FontDescription::from_string(&UI_FONT());
+    // Save the pango layout's current font + attrs so we can restore after the
+    // measurement calls inside the closure. Without this the rasteriser's
+    // `saved_font = pango_layout.font_description()` call would capture our
+    // temporary UI font as the "original" and "restore" the wrong font at the
+    // end of the frame — reproducing the leakage fixed in #247.
+    let saved_layout_font = layout.font_description();
+    let popup_layout = popup.layout(
+        anchor_x as f32,
+        anchor_y as f32,
+        viewport,
+        measure,
+        |line_idx, start, end| {
+            let raw = popup.line_text.get(line_idx).map(String::as_str).unwrap_or("");
+            // Configure the shared pango layout for this line so `index_to_pos`
+            // returns the same glyph-accurate positions the rasteriser uses.
+            layout.set_text(raw);
+            layout.set_font_description(Some(&ui_font_desc_for_measure));
+            // Apply per-line font scale (markdown headings render at 1.1–1.4×)
+            // and bold/italic from styled spans — both affect glyph advance width
+            // and must match what the rasteriser sets when it paints the line.
+            let line_scale = popup.line_scales.get(line_idx).copied().unwrap_or(1.0);
+            let attrs = pango::AttrList::new();
+            if (line_scale - 1.0).abs() > 0.01 {
+                let mut a = pango::AttrFloat::new_scale(line_scale as f64);
+                a.set_start_index(0);
+                a.set_end_index(raw.len() as u32);
+                attrs.insert(a);
             }
-        } else if let Some(spans) = line_spans {
-            for sp in spans {
-                let start = sp.start_byte as u32 + 1; // +1 for leading space
-                let end = sp.end_byte as u32 + 1;
-                match sp.style {
-                    MdStyle::Heading(1) => {
-                        let (r, g, b) = theme.md_heading1.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
+            if let Some(styled) = popup.lines.get(line_idx) {
+                let mut byte_pos = 0usize;
+                for span in &styled.spans {
+                    let slen = span.text.len();
+                    let (s, e) = (byte_pos as u32, (byte_pos + slen) as u32);
+                    if span.bold {
+                        let mut a = pango::AttrInt::new_weight(pango::Weight::Bold);
+                        a.set_start_index(s);
+                        a.set_end_index(e);
+                        attrs.insert(a);
                     }
-                    MdStyle::Heading(2) => {
-                        let (r, g, b) = theme.md_heading2.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
+                    if span.italic {
+                        let mut a = pango::AttrInt::new_style(pango::Style::Italic);
+                        a.set_start_index(s);
+                        a.set_end_index(e);
+                        attrs.insert(a);
                     }
-                    MdStyle::Heading(_) => {
-                        let (r, g, b) = theme.md_heading3.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Bold | MdStyle::BoldItalic => {
-                        let mut attr = pango::AttrInt::new_weight(pango::Weight::Bold);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Code | MdStyle::CodeBlock => {
-                        let (r, g, b) = theme.md_code.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                    }
-                    MdStyle::Link | MdStyle::LinkUrl => {
-                        let (r, g, b) = theme.md_link.to_pango_u16();
-                        let mut attr = pango::AttrColor::new_foreground(r, g, b);
-                        attr.set_start_index(start);
-                        attr.set_end_index(end);
-                        attrs.insert(attr);
-                        // Underline focused link
-                        if eh.has_focus {
-                            if let Some(focused) = eh.focused_link {
-                                if let Some(&(link_line, sb, eb, _)) = eh.links.get(focused) {
-                                    if link_line == actual_line
-                                        && sp.start_byte >= sb
-                                        && sp.end_byte <= eb
-                                    {
-                                        let mut attr =
-                                            pango::AttrInt::new_underline(pango::Underline::Single);
-                                        attr.set_start_index(start);
-                                        attr.set_end_index(end);
-                                        attrs.insert(attr);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+                    byte_pos += slen;
                 }
             }
-        }
-
-        // Selection highlight via Pango background attribute
-        if let Some((sl, sc, el, ec)) = eh.selection {
-            let line_chars: Vec<char> = text_line.chars().collect();
-            let in_sel = if sl == el {
-                actual_line == sl
-            } else {
-                actual_line >= sl && actual_line <= el
-            };
-            if in_sel {
-                let sel_start_char = if actual_line == sl { sc } else { 0 };
-                let sel_end_char = if actual_line == el {
-                    ec
-                } else {
-                    line_chars.len()
-                };
-                if sel_start_char < sel_end_char && sel_start_char < line_chars.len() {
-                    // Convert char offsets to byte offsets in text_line
-                    let byte_start: usize = line_chars[..sel_start_char]
-                        .iter()
-                        .map(|c| c.len_utf8())
-                        .sum();
-                    let byte_end: usize = line_chars[..sel_end_char.min(line_chars.len())]
-                        .iter()
-                        .map(|c| c.len_utf8())
-                        .sum();
-                    // +1 for the leading space in `display`
-                    let (sr, sg, sb) = theme.selection.to_pango_u16();
-                    let mut bg_attr = pango::AttrColor::new_background(sr, sg, sb);
-                    bg_attr.set_start_index((byte_start + 1) as u32);
-                    bg_attr.set_end_index((byte_end + 1) as u32);
-                    attrs.insert(bg_attr);
-                }
-            }
-        }
-
-        layout.set_text(&display);
-        layout.set_attributes(Some(&attrs));
-        layout.set_width(pango_text_w);
-        layout.set_wrap(pango::WrapMode::WordChar);
-        let (r, g, b) = theme.hover_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        let line_draw_x = popup_x + padding;
-        let line_draw_y = popup_y + padding + y_offset;
-        cr.move_to(line_draw_x, line_draw_y);
-        pangocairo::show_layout(cr, layout);
-
-        // Compute pixel rects for any clickable links on this line.
-        for (link_line, sb, eb, url) in &eh.links {
-            if *link_line == actual_line {
-                // +1 for the leading space added to `display`
-                let start_idx = (*sb + 1) as i32;
-                let end_idx = (*eb + 1) as i32;
-                let start_rect = layout.index_to_pos(start_idx);
-                let end_rect = layout.index_to_pos(end_idx.saturating_sub(1));
-                let lx = line_draw_x + start_rect.x() as f64 / pango::SCALE as f64;
-                let ly = line_draw_y + start_rect.y() as f64 / pango::SCALE as f64;
-                let lw =
-                    (end_rect.x() + end_rect.width() - start_rect.x()) as f64 / pango::SCALE as f64;
-                let lh = start_rect.height() as f64 / pango::SCALE as f64;
-                link_rects.push((lx, ly, lw.max(char_width), lh, url.clone()));
-            }
-        }
-
-        let (_pw, ph) = layout.pixel_size();
-        y_offset += ph as f64;
-    }
-    layout.set_width(-1);
+            layout.set_attributes(Some(&attrs));
+            // `link_widths(line, 0, start_byte)` → x offset of link start from
+            // line origin; `link_widths(line, start_byte, end_byte)` → span width.
+            // Both reduce to (end_pos.x - start_pos.x) / SCALE.
+            let sp = layout.index_to_pos(start.min(raw.len()) as i32);
+            let ep = layout.index_to_pos(end.min(raw.len()) as i32);
+            ((ep.x() - sp.x()) as f32 / pango::SCALE as f32).max(0.0)
+        },
+    );
+    // Restore the pango layout to the editor's monospace font so subsequent
+    // paints in this frame are unaffected (#247).
     layout.set_attributes(None);
+    layout.set_font_description(saved_layout_font.as_ref());
 
-    // Scrollbar when content overflows
-    if can_scroll {
-        let track_h = visible_content_h;
-        let visible_ratio = visible_content_h / total_content_h;
-        let thumb_h = (track_h * visible_ratio).max(line_height);
-        let scroll_range_h: f64 = line_heights.iter().take(scroll).sum();
-        let thumb_top = if total_content_h > visible_content_h {
-            scroll_range_h / (total_content_h - visible_content_h) * (track_h - thumb_h)
-        } else {
-            0.0
-        };
-        let sb_x = popup_x + popup_w - char_width;
-        // Track background
-        let (r, g, b) = theme.hover_border.to_cairo();
-        cr.set_source_rgba(r, g, b, 0.2);
-        cr.rectangle(sb_x, popup_y + padding, char_width, track_h);
-        cr.fill().ok();
-        // Thumb
-        cr.set_source_rgba(r, g, b, 0.6);
-        cr.rectangle(sb_x, popup_y + padding + thumb_top, char_width, thumb_h);
-        cr.fill().ok();
-    }
-
-    // Focus indicator
-    if eh.has_focus {
-        let indicator = "y:copy  Tab:links  Esc:close";
-        let (r, g, b) = theme.line_number_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(indicator);
-        layout.set_attributes(None);
-        cr.move_to(popup_x + padding, popup_y + popup_h - line_height - 2.0);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // Restore clip
-    cr.restore().ok();
-
-    (Some((popup_x, popup_y, popup_w, popup_h)), link_rects)
+    // #469: route paint through quadraui::ScreenLayout. link_hit_regions
+    // are now glyph-accurate (Pango-measured, #488) so paint + click agree.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::RichTextPopup {
+            popup: &popup,
+            layout: &popup_layout,
+        });
+        frame.draw(b);
+    });
+    let link_rects: Vec<(f64, f64, f64, f64, String)> = popup_layout
+        .link_hit_regions
+        .iter()
+        .map(|(rect, idx)| {
+            let url = popup
+                .links
+                .get(*idx)
+                .map(|l| l.url.clone())
+                .unwrap_or_default();
+            (
+                rect.x as f64,
+                rect.y as f64,
+                rect.width as f64,
+                rect.height as f64,
+                url,
+            )
+        })
+        .collect();
+    let popup_rect = Some((
+        popup_layout.bounds.x as f64,
+        popup_layout.bounds.y as f64,
+        popup_layout.bounds.width as f64,
+        popup_layout.bounds.height as f64,
+    ));
+    // The GTK rasteriser paints the scrollbar wider than the layout's
+    // 1px border (so it's actually visible + clickable). Mirror that
+    // geometry here so hit-test matches what the user sees (#215).
+    let scrollbar_hit = popup_layout.scrollbar.map(|sb| {
+        let sb_w = super::quadraui_gtk::RICH_TEXT_POPUP_SB_WIDTH as f32;
+        let inset = super::quadraui_gtk::RICH_TEXT_POPUP_SB_INSET as f32;
+        let bw = popup_layout.bounds.width;
+        let bx = popup_layout.bounds.x;
+        let track_x = bx + bw - sb_w - inset;
+        // Thumb: rasteriser fills `(sb_x + 1, ..., sb_w - 2, ...)`.
+        let thumb_x = track_x + 1.0;
+        let thumb_w = (sb_w - 2.0).max(1.0);
+        render::PopupScrollbarHit {
+            track: quadraui::Rect::new(track_x, sb.track.y, sb_w, sb.track.height),
+            thumb: quadraui::Rect::new(thumb_x, sb.thumb.y, thumb_w, sb.thumb.height),
+            visible_rows: render::EDITOR_HOVER_MAX_ROWS,
+            total: popup.lines.len(),
+        }
+    });
+    (popup_rect, link_rects, scrollbar_hit)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_diff_peek_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
     theme: &Theme,
     line_height: f64,
     char_width: f64,
+    viewport_w: f64,
+    viewport_h: f64,
 ) {
     let Some(peek) = &screen.diff_peek else {
         return;
@@ -2486,70 +1713,93 @@ pub(super) fn draw_diff_peek_popup(
 
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let anchor_view_line = peek.anchor_line.saturating_sub(active_win.scroll_top);
+    let anchor_x = active_win.rect.x + gutter_width;
+    let anchor_y = active_win.rect.y + anchor_view_line as f64 * line_height;
 
-    // Dimensions.
-    let max_line_len = peek.hunk_lines.iter().map(|l| l.len()).max().unwrap_or(10);
-    let action_bar_lines = 1;
-    let num_lines = (peek.hunk_lines.len() + action_bar_lines).min(30);
-    let popup_w = ((max_line_len + 4) as f64 * char_width).max(200.0);
-    let popup_h = num_lines as f64 * line_height + 6.0;
+    let visible: Vec<&String> = peek.hunk_lines.iter().take(29).collect();
+    let action_text = "[s] Stage  [r] Revert  [q] Close";
+    let max_chars = visible
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(action_text.chars().count());
+    let measured_w = ((max_chars + 4) as f64 * char_width).max(200.0);
+    let measured_h = (visible.len() + 1) as f64 * line_height + 6.0;
 
-    // Position below the anchor line.
-    let popup_x = active_win.rect.x + gutter_width;
-    let popup_y = active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height;
+    // Build styled rows: per-line +/- colour for diff content, default fg
+    // for context and the action bar. Same colour logic as the legacy
+    // renderer; same as the TUI adapter at `render::diff_peek_to_quadraui_tooltip`.
+    let added = render::to_quadraui_color(theme.git_added);
+    let deleted = render::to_quadraui_color(theme.git_deleted);
+    let fg = render::to_quadraui_color(theme.hover_fg);
 
-    // Background.
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border.
-    let (r, g, b) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Diff lines with color coding.
-    for (i, hline) in peek.hunk_lines.iter().enumerate().take(29) {
-        let (r, g, b) = if hline.starts_with('+') {
-            theme.git_added.to_cairo()
+    let mut styled_lines: Vec<quadraui::StyledText> = Vec::with_capacity(visible.len() + 1);
+    for hline in &visible {
+        let line_fg = if hline.starts_with('+') {
+            added
         } else if hline.starts_with('-') {
-            theme.git_deleted.to_cairo()
+            deleted
         } else {
-            theme.hover_fg.to_cairo()
+            fg
         };
-        cr.set_source_rgb(r, g, b);
-        let display = format!(" {}", hline);
-        layout.set_text(&display);
-        layout.set_attributes(None);
-        cr.move_to(popup_x, popup_y + 2.0 + i as f64 * line_height);
-        pangocairo::show_layout(cr, layout);
+        styled_lines.push(quadraui::StyledText {
+            spans: vec![quadraui::StyledSpan::with_fg(hline.as_str(), line_fg)],
+        });
     }
+    styled_lines.push(quadraui::StyledText {
+        spans: vec![quadraui::StyledSpan::with_fg(action_text, fg)],
+    });
 
-    // Action bar at bottom.
-    let action_y = popup_y + 2.0 + peek.hunk_lines.len().min(29) as f64 * line_height;
-    let labels = ["[s] Stage", "[r] Revert", "[q] Close"];
-    let mut ax = popup_x + char_width;
-    let (r, g, b) = theme.hover_fg.to_cairo();
-    for label in &labels {
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(label);
-        layout.set_attributes(None);
-        cr.move_to(ax, action_y);
-        pangocairo::show_layout(cr, layout);
-        ax += (label.len() as f64 + 2.0) * char_width;
-    }
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("diff_peek"),
+        text: String::new(),
+        styled_lines: Some(styled_lines),
+        // Legacy diff peek always rendered below the anchor line —
+        // mirror that with placement=Bottom (with primitive fallback
+        // to Top when there's no room below).
+        placement: quadraui::TooltipPlacement::Bottom,
+        bg: None,
+        fg: None,
+    };
+    let tip_layout = tooltip.layout(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            measured_w as f32,
+            line_height as f32,
+        ),
+        quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
+        quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
+        0.0,
+    );
+
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Tooltip {
+            tooltip: &tooltip,
+            layout: &tip_layout,
+        });
+        frame.draw(b);
+    });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn draw_signature_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
     theme: &Theme,
     line_height: f64,
     char_width: f64,
+    viewport_w: f64,
+    viewport_h: f64,
 ) {
     let Some(sig) = &screen.signature_help else {
         return;
@@ -2565,340 +1815,111 @@ pub(super) fn draw_signature_popup(
     let gutter_width = active_win.gutter_char_width as f64 * char_width;
     let h_scroll_offset = active_win.scroll_left as f64 * char_width;
     let anchor_view_line = sig.anchor_line.saturating_sub(active_win.scroll_top);
-    let popup_x =
+    let anchor_x =
         active_win.rect.x + gutter_width + sig.anchor_col as f64 * char_width - h_scroll_offset;
+    let anchor_y = active_win.rect.y + anchor_view_line as f64 * line_height;
 
-    let popup_w = ((sig.label.len() + 4) as f64 * char_width).max(120.0);
-    let popup_h = line_height + 4.0;
+    let measured_w = ((sig.label.len() + 4) as f64 * char_width).max(120.0);
+    let measured_h = line_height + 4.0;
 
-    // Place above the cursor if space allows, otherwise below.
-    let popup_y = if anchor_view_line as f64 * line_height > popup_h {
-        active_win.rect.y + anchor_view_line as f64 * line_height - popup_h
-    } else {
-        active_win.rect.y + (anchor_view_line as f64 + 1.0) * line_height
-    };
-
-    // Background
-    let (r, g, b) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Build Pango attr list: active parameter in keyword color, rest in hover_fg.
-    let display = format!(" {}", sig.label);
-    let offset = 1usize; // accounts for the leading space
-
-    let attrs = AttrList::new();
-    let (fr, fg_g, fb) = theme.hover_fg.to_pango_u16();
-    let mut base_attr = AttrColor::new_foreground(fr, fg_g, fb);
-    base_attr.set_start_index(0);
-    base_attr.set_end_index(display.len() as u32);
-    attrs.insert(base_attr);
-
-    if let Some(idx) = sig.active_param {
-        if let Some(&(start, end)) = sig.params.get(idx) {
-            let (kr, kg, kb) = theme.keyword.to_pango_u16();
-            let mut kw_attr = AttrColor::new_foreground(kr, kg, kb);
-            kw_attr.set_start_index((offset + start) as u32);
-            kw_attr.set_end_index((offset + end) as u32);
-            attrs.insert(kw_attr);
+    // Build a single styled line: pre-active text, active parameter (in
+    // keyword colour), post-active text. The active parameter byte range
+    // is in `sig.params[active_param]` and indexes into `sig.label`.
+    let kw_color = render::to_quadraui_color(theme.keyword);
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    let active_range = sig
+        .active_param
+        .and_then(|idx| sig.params.get(idx).copied());
+    if let Some((start, end)) = active_range {
+        if start < sig.label.len() && end <= sig.label.len() && start < end {
+            if start > 0 {
+                spans.push(quadraui::StyledSpan::plain(sig.label[..start].to_string()));
+            }
+            spans.push(quadraui::StyledSpan::with_fg(
+                sig.label[start..end].to_string(),
+                kw_color,
+            ));
+            if end < sig.label.len() {
+                spans.push(quadraui::StyledSpan::plain(sig.label[end..].to_string()));
+            }
         }
     }
+    if spans.is_empty() {
+        spans.push(quadraui::StyledSpan::plain(sig.label.clone()));
+    }
+    let styled_line = quadraui::StyledText { spans };
 
-    layout.set_text(&display);
-    layout.set_attributes(Some(&attrs));
-    cr.move_to(popup_x, popup_y + 2.0);
-    pangocairo::show_layout(cr, layout);
-    layout.set_attributes(None);
+    let tooltip = quadraui::Tooltip {
+        id: quadraui::WidgetId::new("lsp:signature"),
+        text: String::new(),
+        styled_lines: Some(vec![styled_line]),
+        placement: quadraui::TooltipPlacement::Top,
+        bg: None,
+        fg: None,
+    };
+    let tip_layout = tooltip.layout(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            char_width as f32,
+            line_height as f32,
+        ),
+        quadraui::Rect::new(0.0, 0.0, viewport_w as f32, viewport_h as f32),
+        quadraui::TooltipMeasure::new(measured_w as f32, measured_h as f32),
+        0.0,
+    );
+
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Tooltip {
+            tooltip: &tooltip,
+            layout: &tip_layout,
+        });
+        frame.draw(b);
+    });
 }
 
 /// Draw the inline find/replace overlay at the top-right of the editor.
+///
+/// #196: paint layout is driven by `compute_find_replace_hit_regions`
+/// — the same cell-unit region list TUI walks in its rasteriser and
+/// the click handler in `src/gtk/mod.rs` resolves clicks against.
+/// Paint and hit-test derive from the same source of truth, so the
+/// toggle-button misalignment bug can't recur by construction.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_find_replace_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
     theme: &Theme,
-    _editor_width: f64,
-    _editor_height: f64,
+    editor_width: f64,
+    editor_height: f64,
     line_height: f64,
+    char_width: f64,
 ) {
     let Some(panel) = &screen.find_replace else {
         return;
     };
-
-    let pad = 6.0;
-    let input_w = 200.0;
-    let btn_s = line_height; // square button size
-
-    // Layout: [chevron] [input] [Aa][ab][.*] [count] [↑][↓][≡][×]
-    let chevron_w = 16.0;
-    let toggles_w = 3.0 * (btn_s + 4.0);
-    let info_w = 80.0; // "99 of 999"
-    let nav_w = 4.0 * (btn_s + 2.0);
-    let popup_w = chevron_w + input_w + pad + toggles_w + info_w + nav_w + pad;
-    let row_count = if panel.show_replace { 2.0 } else { 1.0 };
-    let popup_h = line_height * row_count + pad * (row_count + 1.0);
-
-    let gb = &panel.group_bounds;
-    let popup_x = (gb.x + gb.width - popup_w - 10.0).max(gb.x);
-    let popup_y = gb.y + 2.0;
-
-    // Background & border
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    let _ = cr.fill();
-    let (r, g, b) = theme.separator.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.set_line_width(1.0);
-    let _ = cr.stroke();
-
-    // Helper to draw a toggle button
-    let draw_toggle =
-        |cr: &Context, layout: &pango::Layout, label: &str, bx: f64, by: f64, active: bool| {
-            layout.set_text(label);
-            let (tw, _) = layout.pixel_size();
-            let bw = tw as f64 + 8.0;
-            if active {
-                let (r, g, b) = theme.tab_active_accent.to_cairo();
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(bx, by, bw, line_height);
-                let _ = cr.fill();
-                let (r, g, b) = theme.background.to_cairo();
-                cr.set_source_rgb(r, g, b);
-            } else {
-                let (r, g, b) = theme.separator.to_cairo();
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(bx, by, bw, line_height);
-                cr.set_line_width(0.5);
-                let _ = cr.stroke();
-                let (r, g, b) = theme.foreground.to_cairo();
-                cr.set_source_rgb(r, g, b);
-            }
-            cr.move_to(bx + 4.0, by);
-            pangocairo::show_layout(cr, layout);
-            bw + 4.0
-        };
-
-    // Helper to draw a nav button
-    let draw_nav_btn = |cr: &Context, layout: &pango::Layout, label: &str, bx: f64, by: f64| {
-        let (r, g, b) = theme.separator.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        cr.rectangle(bx, by, btn_s, line_height);
-        cr.set_line_width(0.5);
-        let _ = cr.stroke();
-        let (r, g, b) = theme.foreground.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(label);
-        let (tw, _) = layout.pixel_size();
-        cr.move_to(bx + (btn_s - tw as f64) / 2.0, by);
-        pangocairo::show_layout(cr, layout);
-    };
-
-    // --- Find row ---
-    let row_y = popup_y + pad;
-
-    // Chevron
-    let chevron = if panel.show_replace { "▼" } else { "▶" };
-    let (r, g, b) = theme.foreground.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.move_to(popup_x + pad, row_y);
-    layout.set_text(chevron);
-    pangocairo::show_layout(cr, layout);
-    let input_x = popup_x + chevron_w;
-
-    // Find input
-    let (r, g, b) = theme.background.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(input_x, row_y, input_w, line_height);
-    let _ = cr.fill();
-    let (r, g, b) = theme.separator.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(input_x, row_y, input_w, line_height);
-    cr.set_line_width(0.5);
-    let _ = cr.stroke();
-
-    // Query text + cursor
-    cr.move_to(input_x + 4.0, row_y);
-    let (r, g, b) = theme.foreground.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&panel.query);
-    pangocairo::show_layout(cr, layout);
-    if panel.focus == 0 {
-        // Selection highlight
-        if let Some(anchor) = panel.sel_anchor {
-            let s = anchor.min(panel.cursor);
-            let e = anchor.max(panel.cursor);
-            if s != e {
-                let s_prefix = &panel.query[..panel
-                    .query
-                    .char_indices()
-                    .nth(s)
-                    .map(|(i, _)| i)
-                    .unwrap_or(panel.query.len())];
-                let e_prefix = &panel.query[..panel
-                    .query
-                    .char_indices()
-                    .nth(e)
-                    .map(|(i, _)| i)
-                    .unwrap_or(panel.query.len())];
-                layout.set_text(s_prefix);
-                let (sx, _) = layout.pixel_size();
-                layout.set_text(e_prefix);
-                let (ex, _) = layout.pixel_size();
-                let (sr, sg, sb) = theme.selection.to_cairo();
-                cr.set_source_rgba(sr, sg, sb, 0.5);
-                cr.rectangle(
-                    input_x + 4.0 + sx as f64,
-                    row_y,
-                    (ex - sx) as f64,
-                    line_height,
-                );
-                let _ = cr.fill();
-            }
-        }
-        // Cursor
-        let (r, g, b) = theme.foreground.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        let prefix = &panel.query[..panel
-            .query
-            .char_indices()
-            .nth(panel.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(panel.query.len())];
-        layout.set_text(prefix);
-        let (cpx, _) = layout.pixel_size();
-        cr.rectangle(
-            input_x + 4.0 + cpx as f64,
-            row_y + 2.0,
-            2.0,
-            line_height - 4.0,
-        );
-        let _ = cr.fill();
-    }
-
-    // Toggles: [Aa] [ab] [.*]
-    let mut bx = input_x + input_w + pad;
-    bx += draw_toggle(cr, layout, "Aa", bx, row_y, panel.case_sensitive);
-    bx += draw_toggle(cr, layout, "ab", bx, row_y, panel.whole_word);
-    bx += draw_toggle(cr, layout, ".*", bx, row_y, panel.use_regex);
-
-    // Match count (fixed-width slot)
-    bx += 4.0;
-    let (r, g, b) = theme.foreground.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&panel.match_info);
-    cr.move_to(bx, row_y);
-    pangocairo::show_layout(cr, layout);
-    bx += info_w;
-
-    // Nav: [↑] [↓] [≡] [×]
-    use crate::icons;
-    let nav_items: [(&str, bool); 4] = [
-        ("\u{2191}", false),
-        ("\u{2193}", false),
-        (icons::FIND_IN_SEL.s(), panel.in_selection),
-        (icons::FIND_CLOSE.s(), false),
-    ];
-    for (label, active) in &nav_items {
-        if *active {
-            draw_toggle(cr, layout, label, bx, row_y, true);
-        } else {
-            draw_nav_btn(cr, layout, label, bx, row_y);
-        }
-        bx += btn_s + 2.0;
-    }
-
-    // --- Replace row ---
-    if panel.show_replace {
-        let rep_y = row_y + line_height + pad;
-
-        // Replace input (aligned with find input)
-        let (r, g, b) = theme.background.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        cr.rectangle(input_x, rep_y, input_w, line_height);
-        let _ = cr.fill();
-        let (r, g, b) = theme.separator.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        cr.rectangle(input_x, rep_y, input_w, line_height);
-        cr.set_line_width(0.5);
-        let _ = cr.stroke();
-
-        // Replace text + cursor
-        cr.move_to(input_x + 4.0, rep_y);
-        let (r, g, b) = theme.foreground.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&panel.replacement);
-        pangocairo::show_layout(cr, layout);
-        if panel.focus == 1 {
-            // Selection highlight
-            if let Some(anchor) = panel.sel_anchor {
-                let s = anchor.min(panel.cursor);
-                let e = anchor.max(panel.cursor);
-                if s != e {
-                    let s_prefix = &panel.replacement[..panel
-                        .replacement
-                        .char_indices()
-                        .nth(s)
-                        .map(|(i, _)| i)
-                        .unwrap_or(panel.replacement.len())];
-                    let e_prefix = &panel.replacement[..panel
-                        .replacement
-                        .char_indices()
-                        .nth(e)
-                        .map(|(i, _)| i)
-                        .unwrap_or(panel.replacement.len())];
-                    layout.set_text(s_prefix);
-                    let (sx, _) = layout.pixel_size();
-                    layout.set_text(e_prefix);
-                    let (ex, _) = layout.pixel_size();
-                    let (sr, sg, sb) = theme.selection.to_cairo();
-                    cr.set_source_rgba(sr, sg, sb, 0.5);
-                    cr.rectangle(
-                        input_x + 4.0 + sx as f64,
-                        rep_y,
-                        (ex - sx) as f64,
-                        line_height,
-                    );
-                    let _ = cr.fill();
-                }
-            }
-            // Cursor
-            let (r, g, b) = theme.foreground.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            let prefix = &panel.replacement[..panel
-                .replacement
-                .char_indices()
-                .nth(panel.cursor)
-                .map(|(i, _)| i)
-                .unwrap_or(panel.replacement.len())];
-            layout.set_text(prefix);
-            let (cpx, _) = layout.pixel_size();
-            cr.rectangle(
-                input_x + 4.0 + cpx as f64,
-                rep_y + 2.0,
-                2.0,
-                line_height - 4.0,
-            );
-            let _ = cr.fill();
-        }
-
-        // [AB] [replace] [replace_all]
-        let mut rbx = input_x + input_w + pad;
-        rbx += draw_toggle(cr, layout, "AB", rbx, rep_y, panel.preserve_case);
-        draw_nav_btn(cr, layout, icons::FIND_REPLACE.s(), rbx, rep_y);
-        rbx += btn_s + 2.0;
-        draw_nav_btn(cr, layout, icons::FIND_REPLACE_ALL.s(), rbx, rep_y);
-    }
+    // #462: route paint through quadraui::ScreenLayout. The GTK
+    // find_replace rasteriser ignores `rect` (positions via its own
+    // anchor logic); we still pass the full viewport rect for the
+    // FrameHitMap zone registration.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    let rect = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.set_current_char_width(char_width);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::FindReplace { rect, panel });
+        frame.draw(b);
+    });
 }
 
 /// Draw the unified picker modal (supports single-pane and two-pane with preview).
@@ -2911,367 +1932,106 @@ pub(super) fn draw_picker_popup(
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let Some(picker) = &screen.picker else {
         return;
     };
 
     let has_preview = picker.preview.is_some();
-
-    // Size adapts based on whether we have a preview pane
-    let popup_w = if has_preview {
-        (editor_width * 0.8).max(600.0)
-    } else {
-        (editor_width * 0.55).max(500.0)
-    };
-    let popup_h = if has_preview {
-        (editor_height * 0.65).max(400.0)
-    } else {
-        (editor_height * 0.60).max(350.0)
-    };
-
-    let popup_x = (editor_width - popup_w) / 2.0;
-    let popup_y = (editor_height - popup_h) / 2.0;
-
-    // Background
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Title row
-    let title = format!(
-        "  {}  ({}/{})",
-        picker.title,
-        picker.items.len(),
-        picker.total_count
+    let geo = render::PickerGeometry::compute(
+        editor_width as f32,
+        editor_height as f32,
+        has_preview,
+        &render::gtk_picker_sizing(line_height as f32),
     );
-    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&title);
-    layout.set_attributes(None);
-    cr.move_to(popup_x, popup_y);
-    pangocairo::show_layout(cr, layout);
-
-    // Query row
-    let query_text = format!("> {}_", picker.query);
-    let (r, g, b) = theme.fuzzy_query_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(&query_text);
-    layout.set_attributes(None);
-    cr.move_to(popup_x, popup_y + line_height);
-    pangocairo::show_layout(cr, layout);
-
-    // Horizontal separator
-    let sep_y = popup_y + 2.0 * line_height;
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.move_to(popup_x, sep_y);
-    cr.line_to(popup_x + popup_w, sep_y);
-    cr.stroke().ok();
-
-    // Two-pane layout
-    let left_pane_w = if has_preview { popup_w * 0.4 } else { popup_w };
-
-    if has_preview {
-        // Vertical separator
-        cr.move_to(popup_x + left_pane_w, sep_y);
-        cr.line_to(popup_x + left_pane_w, popup_y + popup_h);
-        cr.stroke().ok();
-    }
-
-    let rows_area_h = popup_h - 2.0 * line_height - 2.0;
-    let visible_rows = (rows_area_h / line_height) as usize;
-
-    // Scrollbar geometry (single-pane only)
-    let total_items = picker.items.len();
-    let has_scrollbar = !has_preview && total_items > visible_rows;
-    const SB_W: f64 = 6.0;
-    let content_w = if has_scrollbar {
-        left_pane_w - SB_W
-    } else {
-        left_pane_w
-    };
-
-    // Left pane: result rows — clipped
-    cr.save().ok();
-    cr.rectangle(popup_x, sep_y, content_w, rows_area_h + 2.0);
-    cr.clip();
-
-    let has_tree = picker.items.iter().any(|i| i.expandable || i.depth > 0);
-
-    for i in 0..visible_rows {
-        let result_idx = picker.scroll_top + i;
-        let Some(item) = picker.items.get(result_idx) else {
-            break;
-        };
-        let item_y = sep_y + 1.0 + i as f64 * line_height;
-        let is_selected = result_idx == picker.selected_idx;
-
-        // Selected row highlight
-        if is_selected {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(popup_x, item_y, content_w, line_height);
-            cr.fill().ok();
-        }
-
-        // Build pango attributed string with match highlighting
-        let sel_prefix = if is_selected { "▶ " } else { "  " };
-        let indent: String = "  ".repeat(item.depth);
-        let arrow = if item.expandable {
-            if item.expanded {
-                "▼ "
-            } else {
-                "▷ "
-            }
-        } else if has_tree {
-            "  "
-        } else {
-            ""
-        };
-        let prefix = format!("{}{}{}", sel_prefix, indent, arrow);
-        let full_text = format!("{}{}", prefix, item.display);
-        let prefix_bytes = prefix.len();
-
-        // Create attributes for match highlighting
-        let attr_list = pango::AttrList::new();
-
-        // Default color
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        let mut attr_fg = pango::AttrColor::new_foreground(
-            (r * 65535.0) as u16,
-            (g * 65535.0) as u16,
-            (b * 65535.0) as u16,
-        );
-        attr_fg.set_start_index(0);
-        attr_fg.set_end_index(full_text.len() as u32);
-        attr_list.insert(attr_fg);
-
-        // Match highlight color for matched positions
-        if !item.match_positions.is_empty() {
-            let (mr, mg, mb) = theme.fuzzy_match_fg.to_cairo();
-            for &pos in &item.match_positions {
-                // pos is a byte index into the display text; offset by prefix length
-                let start = prefix_bytes + pos;
-                if start < full_text.len() {
-                    // Find the byte length of the char at this position
-                    let end = start
-                        + full_text[start..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(1);
-                    let mut attr_match = pango::AttrColor::new_foreground(
-                        (mr * 65535.0) as u16,
-                        (mg * 65535.0) as u16,
-                        (mb * 65535.0) as u16,
-                    );
-                    attr_match.set_start_index(start as u32);
-                    attr_match.set_end_index(end as u32);
-                    attr_list.insert(attr_match);
-                }
-            }
-        }
-
-        layout.set_text(&full_text);
-        layout.set_attributes(Some(&attr_list));
-        cr.move_to(popup_x, item_y);
-        pangocairo::show_layout(cr, layout);
-
-        // Right-aligned detail (shortcut) — single-pane only
-        if !has_preview {
-            if let Some(ref detail) = item.detail {
-                if !detail.is_empty() {
-                    let detail_text = format!("{}  ", detail);
-                    let (r, g, b) = theme.fuzzy_border.to_cairo();
-                    cr.set_source_rgb(r, g, b);
-                    layout.set_text(&detail_text);
-                    layout.set_attributes(None);
-                    let (sc_w, _) = layout.pixel_size();
-                    cr.move_to(popup_x + content_w - sc_w as f64, item_y);
-                    pangocairo::show_layout(cr, layout);
-                }
-            }
-        }
-    }
-
-    cr.restore().ok();
-
-    // Right pane: preview lines (two-pane only)
-    if has_preview {
-        let right_pane_x = popup_x + left_pane_w + 1.0;
-        let right_pane_w = popup_w - left_pane_w - 1.0;
-
-        cr.save().ok();
-        cr.rectangle(right_pane_x, sep_y, right_pane_w, rows_area_h + 2.0);
-        cr.clip();
-
-        if let Some(ref preview) = picker.preview {
-            for (i, (lineno, text, is_match)) in preview.iter().enumerate().take(visible_rows) {
-                let item_y = sep_y + 1.0 + i as f64 * line_height;
-                let preview_text = format!("{:4}: {}", lineno, text);
-
-                if *is_match {
-                    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-                    cr.set_source_rgb(r, g, b);
-                } else {
-                    let (r, g, b) = theme.fuzzy_fg.to_cairo();
-                    cr.set_source_rgb(r, g, b);
-                }
-
-                layout.set_text(&preview_text);
-                layout.set_attributes(None);
-                cr.move_to(right_pane_x, item_y);
-                pangocairo::show_layout(cr, layout);
-            }
-        }
-
-        cr.restore().ok();
-    }
-
-    // Scrollbar (single-pane only)
-    if has_scrollbar && visible_rows > 0 {
-        let sb_x = popup_x + popup_w - SB_W;
-        let sb_track_y = sep_y + 1.0;
-        let sb_track_h = rows_area_h;
-
-        let (tr, tg, tb) = theme.fuzzy_bg.to_cairo();
-        cr.set_source_rgb(tr * 0.7, tg * 0.7, tb * 0.7);
-        cr.rectangle(sb_x, sb_track_y, SB_W, sb_track_h);
-        cr.fill().ok();
-
-        let thumb_ratio = visible_rows as f64 / total_items as f64;
-        let thumb_h = (sb_track_h * thumb_ratio).max(8.0);
-        let max_scroll = total_items.saturating_sub(visible_rows) as f64;
-        let scroll_frac = if max_scroll > 0.0 {
-            picker.scroll_top as f64 / max_scroll
-        } else {
-            0.0
-        };
-        let thumb_y = sb_track_y + scroll_frac * (sb_track_h - thumb_h);
-
-        let (br, bg_c, bb) = theme.fuzzy_border.to_cairo();
-        cr.set_source_rgb(br, bg_c, bb);
-        cr.rectangle(sb_x + 1.0, thumb_y, SB_W - 2.0, thumb_h);
-        cr.fill().ok();
-    }
+    let palette = render::picker_panel_to_palette(picker);
+    // #462: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    let rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Palette {
+            rect,
+            palette: &palette,
+        });
+        frame.draw(b);
+    });
 }
 
-/// Draw the tab switcher popup (Ctrl+Tab MRU list).
-pub(super) fn draw_tab_switcher_popup(
-    cr: &Context,
+/// Draw the tab switcher popup (Ctrl+Tab MRU list). Returns the
+/// popup's `(x, y, w, h)` if drawn, `None` otherwise — the caller
+/// caches this for `ModalStack` registration in the click handler
+/// (B.5b Stage 7).
+#[allow(clippy::too_many_arguments)]
+fn draw_tab_switcher_popup_list(
     screen: &render::ScreenLayout,
     theme: &Theme,
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
-) {
-    let Some(ts) = &screen.tab_switcher else {
-        return;
-    };
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    cr: &Context,
+    layout: &pango::Layout,
+) -> Option<(f64, f64, f64, f64)> {
+    let ts = screen.tab_switcher.as_ref()?;
     if ts.items.is_empty() {
-        return;
+        return None;
     }
 
-    let item_count = ts.items.len();
     let max_visible = ((editor_height * 0.6) / line_height) as usize;
-    let visible = item_count.min(max_visible).min(20);
-
+    let visible = ts.items.len().min(max_visible).min(20);
     let popup_w = (editor_width * 0.40).clamp(350.0, 600.0);
-    let popup_h = (visible as f64 + 1.5) * line_height; // items + title
-
+    let popup_h = (visible as f64 + 1.5) * line_height;
     let popup_x = (editor_width - popup_w) / 2.0;
     let popup_y = (editor_height - popup_h) / 2.0;
 
-    // Background
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
+    let list = render::tab_switcher_to_quadraui_list_view(ts, visible);
+    let q_rect = quadraui::Rect::new(
+        popup_x as f32,
+        popup_y as f32,
+        popup_w as f32,
+        popup_h as f32,
+    );
 
-    // Border
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Use sans-serif UI font (same as VSCode tabs)
-    let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
-    let layout = pango::Layout::new(&pango_ctx);
+    // Tab switcher is chrome — use UI font, not the editor monospace.
+    // Save the layout's current font + size so the post-popup state matches.
+    let saved_font = layout.font_description();
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
 
-    // Title
-    let title = " Open Tabs";
-    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    layout.set_text(title);
-    layout.set_attributes(None);
-    cr.move_to(popup_x + 4.0, popup_y);
-    pangocairo::show_layout(cr, &layout);
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        use quadraui::Backend;
+        // Explicitly set theme + line_height instead of inheriting whatever
+        // the previous enter_frame_scope left behind: defensive, matches the
+        // pattern in draw_picker_popup / draw_tab_bar.
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_list(q_rect, &list);
+    });
 
-    // Scroll offset
-    let scroll = if ts.selected_idx >= visible {
-        ts.selected_idx - visible + 1
-    } else {
-        0
-    };
+    layout.set_font_description(saved_font.as_ref());
 
-    let items_y = popup_y + line_height * 1.2;
-    for i in 0..visible {
-        let item_idx = scroll + i;
-        if item_idx >= item_count {
-            break;
-        }
-        let item_y = items_y + i as f64 * line_height;
-        let is_selected = item_idx == ts.selected_idx;
-
-        if is_selected {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(popup_x + 1.0, item_y, popup_w - 2.0, line_height);
-            cr.fill().ok();
-        }
-
-        let (name, path, dirty) = &ts.items[item_idx];
-        let dirty_mark = if *dirty { " \u{25cf}" } else { "" }; // ●
-        let prefix = if is_selected { "\u{25b6} " } else { "  " }; // ▶
-        let label = format!("{}{}{}", prefix, name, dirty_mark);
-
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&label);
-        layout.set_attributes(None);
-        cr.move_to(popup_x + 4.0, item_y);
-        pangocairo::show_layout(cr, &layout);
-
-        // Path right-aligned (dimmed)
-        if !path.is_empty() {
-            let (r, g, b) = theme.fuzzy_border.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            layout.set_text(path);
-            layout.set_attributes(None);
-            let (pw, _) = layout.pixel_size();
-            cr.move_to(popup_x + popup_w - pw as f64 - 8.0, item_y);
-            pangocairo::show_layout(cr, &layout);
-        }
-    }
+    Some((popup_x, popup_y, popup_w, popup_h))
 }
 
 /// Draw a modal dialog popup centered on the screen.
-#[allow(clippy::too_many_arguments)]
-/// Returns button hit-rects `(x, y, w, h)` for each dialog button.
+///
+/// Returns `(btn_rects, popup_rect)` where:
+/// - `btn_rects` — `(x, y, w, h)` for each dialog button (same as
+///   pre-B5b.13).
+/// - `popup_rect` — the dialog box's resolved bounds in DA-local
+///   pixels, or `None` if no dialog is being drawn. The click
+///   handler caches this in `App.dialog_popup_rect` for `ModalStack`
+///   registration; previously it derived bounds from the button
+///   rects with a fixed-min-width fudge that overshot the actual
+///   popup width on small dialogs (e.g. `:about`), causing
+///   click-outside-to-dismiss to mis-fire.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn draw_dialog_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -3279,173 +2039,137 @@ pub(super) fn draw_dialog_popup(
     editor_width: f64,
     editor_height: f64,
     line_height: f64,
-) -> Vec<(f64, f64, f64, f64)> {
-    let Some(dialog) = &screen.dialog else {
-        return Vec::new();
+) -> (Vec<(f64, f64, f64, f64)>, Option<(f64, f64, f64, f64)>) {
+    let Some(panel) = &screen.dialog else {
+        return (Vec::new(), None);
     };
 
     let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 
-    // Measure button widths.
-    let mut btn_total_w = 8.0; // padding
-    let mut btn_max_w = 0.0f64;
-    for (label, _) in &dialog.buttons {
-        ui_layout.set_text(&format!("  {}  ", label));
-        let (w, _) = ui_layout.pixel_size();
-        btn_total_w += w as f64 + 4.0;
-        btn_max_w = btn_max_w.max(w as f64 + 4.0);
-    }
+    // Convert engine-side panel → quadraui::Dialog (synthesises button
+    // ids, lifts is_selected → is_default). Same adapter TUI uses.
+    let dialog = render::dialog_panel_to_quadraui_dialog(panel);
 
-    // Measure body width.
+    // Measure each region in pixels so the primitive's `layout()` can
+    // place sub-bounds without owning Pango itself.
+    let title_text = dialog
+        .title
+        .spans
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<String>();
+    ui_layout.set_text(&title_text);
+    let (title_w, _) = ui_layout.pixel_size();
+
+    let body_lines: Vec<String> = dialog
+        .body
+        .iter()
+        .map(|st| st.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+        .collect();
     let mut body_max_w = 0.0f64;
-    for line in &dialog.body {
+    for line in &body_lines {
         layout.set_text(line);
         let (w, _) = layout.pixel_size();
         body_max_w = body_max_w.max(w as f64);
     }
+    let body_line_count = body_lines.len();
 
-    // Title width.
-    ui_layout.set_text(&dialog.title);
-    let (title_w, _) = ui_layout.pixel_size();
+    // Measure horizontal-button widths uniformly (max of formatted
+    // labels) so layout's `button_width` is consistent.
+    let mut btn_max_w = 0.0f64;
+    for btn in &dialog.buttons {
+        ui_layout.set_text(&format!("  {}  ", btn.label));
+        let (w, _) = ui_layout.pixel_size();
+        btn_max_w = btn_max_w.max(w as f64);
+    }
 
-    let has_input = dialog.input.is_some();
-    let input_rows = if has_input { 1.0 } else { 0.0 };
-    let effective_btn_w = if dialog.vertical_buttons {
+    let padding = 12.0;
+    let button_gap = 4.0;
+    let button_row_height = if dialog.vertical_buttons {
+        line_height * dialog.buttons.len() as f64
+    } else {
+        line_height * 1.5
+    };
+    let title_height = if title_text.is_empty() {
+        0.0
+    } else {
+        line_height * 1.5
+    };
+    let body_height = body_line_count as f64 * line_height;
+    let input_height = if dialog.input.is_some() {
+        line_height + 4.0
+    } else {
+        0.0
+    };
+
+    let total_btns_w = if dialog.vertical_buttons {
         btn_max_w + 24.0
     } else {
-        btn_total_w
+        dialog.buttons.len() as f64 * btn_max_w
+            + (dialog.buttons.len().saturating_sub(1)) as f64 * button_gap
     };
-    let content_w = body_max_w.max(title_w as f64 + 16.0).max(effective_btn_w);
-    let popup_w = (content_w + 32.0).clamp(350.0, editor_width - 40.0);
-    let btn_rows = if dialog.vertical_buttons {
-        dialog.buttons.len() as f64
-    } else {
-        1.0
+    let content_w = body_max_w.max(title_w as f64 + 16.0).max(total_btns_w);
+    let popup_w = (content_w + padding * 2.0).clamp(350.0, editor_width - 40.0);
+
+    let measure = quadraui::DialogMeasure {
+        width: popup_w as f32,
+        title_height: title_height as f32,
+        body_height: body_height as f32,
+        input_height: input_height as f32,
+        button_row_height: button_row_height as f32,
+        button_width: btn_max_w as f32,
+        button_gap: button_gap as f32,
+        padding: padding as f32,
     };
-    let popup_h = ((3.0 + dialog.body.len() as f64 + input_rows + btn_rows + 1.0) * line_height)
-        .min(editor_height - 40.0);
+    let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
+    let dialog_layout = dialog.layout(viewport, measure, |_| {
+        quadraui::ToolbarItemMeasure::new(0.0)
+    });
 
-    let popup_x = (editor_width - popup_w) / 2.0;
-    let popup_y = (editor_height - popup_h) / 2.0;
+    let popup_rect = (
+        dialog_layout.bounds.x as f64,
+        dialog_layout.bounds.y as f64,
+        dialog_layout.bounds.width as f64,
+        dialog_layout.bounds.height as f64,
+    );
 
-    // Background.
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.fill().ok();
-
-    // Border.
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(popup_x, popup_y, popup_w, popup_h);
-    cr.stroke().ok();
-
-    // Title.
-    let (r, g, b) = theme.fuzzy_title_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    ui_layout.set_text(&dialog.title);
-    ui_layout.set_attributes(None);
-    cr.move_to(popup_x + 12.0, popup_y + line_height * 0.3);
-    pangocairo::show_layout(cr, &ui_layout);
-
-    // Body lines.
-    let body_y = popup_y + line_height * 1.8;
-    let (r, g, b) = theme.fuzzy_fg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    for (i, line) in dialog.body.iter().enumerate() {
-        layout.set_text(line);
-        layout.set_attributes(None);
-        cr.move_to(popup_x + 12.0, body_y + i as f64 * line_height);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // Input field (if present).
-    if let Some(ref input) = dialog.input {
-        let input_y = body_y + dialog.body.len() as f64 * line_height + line_height * 0.3;
-        // Draw input background.
-        let (ibg_r, ibg_g, ibg_b) = theme.completion_bg.to_cairo();
-        cr.set_source_rgb(ibg_r, ibg_g, ibg_b);
-        cr.rectangle(popup_x + 12.0, input_y, popup_w - 24.0, line_height);
-        cr.fill().ok();
-        // Draw input border.
-        let (br_r, br_g, br_b) = theme.fuzzy_border.to_cairo();
-        cr.set_source_rgb(br_r, br_g, br_b);
-        cr.rectangle(popup_x + 12.0, input_y, popup_w - 24.0, line_height);
-        cr.stroke().ok();
-        // Draw input text.
-        let (r, g, b) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        layout.set_text(&format!(" {}", input.display));
-        layout.set_attributes(None);
-        let (_, ilh) = layout.pixel_size();
-        cr.move_to(popup_x + 14.0, input_y + (line_height - ilh as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // Buttons — vertical list or horizontal row.
-    let mut rects = Vec::with_capacity(dialog.buttons.len());
-    if dialog.vertical_buttons {
-        let btn_start_y = popup_y + popup_h - (btn_rows + 0.5) * line_height;
-        for (i, (label, is_selected)) in dialog.buttons.iter().enumerate() {
-            let by = btn_start_y + i as f64 * line_height;
-            let row_w = popup_w - 24.0;
-            rects.push((popup_x + 12.0, by, row_w, line_height));
-
-            if *is_selected {
-                let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(popup_x + 12.0, by, row_w, line_height);
-                cr.fill().ok();
-            }
-
-            let prefix = if *is_selected { "▸ " } else { "  " };
-            let btn_text = format!("{}{}", prefix, label);
-            let (r, g, b) = theme.fuzzy_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            ui_layout.set_text(&btn_text);
-            ui_layout.set_attributes(None);
-            cr.move_to(popup_x + 14.0, by);
-            pangocairo::show_layout(cr, &ui_layout);
-        }
-    } else {
-        let btn_y = popup_y + popup_h - line_height * 1.5;
-        let mut bx = popup_x + 12.0;
-        for (label, is_selected) in &dialog.buttons {
-            let btn_text = format!("  {}  ", label);
-            ui_layout.set_text(&btn_text);
-            let (bw, bh) = ui_layout.pixel_size();
-            let bw = bw as f64;
-            let bh = bh as f64;
-
-            rects.push((bx, btn_y, bw, bh));
-
-            if *is_selected {
-                let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-                cr.set_source_rgb(r, g, b);
-                cr.rectangle(bx, btn_y, bw, bh);
-                cr.fill().ok();
-            }
-
-            let (r, g, b) = theme.fuzzy_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            ui_layout.set_attributes(None);
-            cr.move_to(bx, btn_y);
-            pangocairo::show_layout(cr, &ui_layout);
-
-            bx += bw + 4.0;
-        }
-    }
-    rects
+    // #463: route paint through quadraui::ScreenLayout. Button click
+    // rectangles are already carried by `DialogLayout.visible_buttons`,
+    // so no need for a second backend call to recover them.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::Dialog {
+            dialog: &dialog,
+            layout: &dialog_layout,
+        });
+        frame.draw(b);
+    });
+    let btn_rects: Vec<(f64, f64, f64, f64)> = dialog_layout
+        .visible_buttons
+        .iter()
+        .map(|vb| {
+            (
+                vb.bounds.x as f64,
+                vb.bounds.y as f64,
+                vb.bounds.width as f64,
+                vb.bounds.height as f64,
+            )
+        })
+        .collect();
+    (btn_rects, Some(popup_rect))
 }
 
 /// Draw an engine-driven context menu popup on the DrawingArea.
 /// Uses the same data as TUI/Win-GUI for visual consistency.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_context_menu_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     _layout: &pango::Layout,
     screen: &render::ScreenLayout,
@@ -3454,142 +2178,185 @@ pub(super) fn draw_context_menu_popup(
     editor_height: f64,
     char_width: f64,
     line_height: f64,
-    mouse_pos: (f64, f64),
-) {
+    _mouse_pos: (f64, f64),
+) -> Option<quadraui::ContextMenuLayout> {
     let Some(cm) = &screen.context_menu else {
-        return;
+        return None;
     };
     if cm.items.is_empty() {
-        return;
+        return None;
     }
 
     let pango_ctx = pangocairo::create_context(cr);
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     let ui_layout = pango::Layout::new(&pango_ctx);
     ui_layout.set_font_description(Some(&ui_font_desc));
 
-    // Calculate popup dimensions.
-    let sep_count = cm.items.iter().filter(|i| i.separator_after).count();
+    // Convert engine-side panel → quadraui::ContextMenu (synthesises
+    // `context:N` ids, lifts separator_after into separator rows). Same
+    // adapter TUI uses.
+    let menu = render::context_menu_panel_to_quadraui_context_menu(cm);
+
+    // Each non-separator row is `line_height`; separators get a
+    // half-line slot to render as a thin rule.
+    // Uniform `line_height` per row (separators included) so the row
+    // index a backend mouse-handler computes from `(y / line_height)`
+    // matches the row index this layout produces. Separator rendering
+    // (a thin rule centred in the row) happens inside `draw_context_menu`.
+    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+
+    // Width: budget to fit longest label + longest shortcut + padding.
     let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
     let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
     let content_cols = (max_label + max_sc + 6).clamp(20, 50);
-    let popup_w = content_cols as f64 * char_width;
-    let popup_h = (cm.items.len() + sep_count + 2) as f64 * line_height;
+    let menu_w = content_cols as f64 * char_width;
 
-    // Position: use char-cell coordinates from engine, scaled to pixels.
-    let raw_x = cm.screen_col as f64 * char_width;
-    let raw_y = cm.screen_row as f64 * line_height;
-    let px = raw_x.min(editor_width - popup_w);
-    let py = raw_y.min(editor_height - popup_h);
+    let anchor_x = cm.screen_col as f64 * char_width;
+    let anchor_y = cm.screen_row as f64 * line_height;
+    let trigger_height_px = cm.trigger_height as f64 * line_height;
+    // trigger_height is in line_height units (f32 — see ContextMenuState
+    // docs). GTK's tab row is 1.6× line_height, so the caller passes 1.6
+    // for the action button and the menu sits flush against the button
+    // bottom (#434).
+    let viewport = quadraui::Rect::new(0.0, 0.0, editor_width as f32, editor_height as f32);
+    let menu_layout = menu.layout_at(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            0.0,
+            trigger_height_px as f32,
+        ),
+        viewport,
+        menu_w as f32,
+        item_height,
+    );
 
-    // Background.
-    let (r, g, b) = theme.fuzzy_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(px, py, popup_w, popup_h);
-    cr.fill().ok();
+    // #435: do NOT override menu.selected_idx from mouse_pos at draw time.
+    // The motion handler in `mod.rs` already updates
+    // `engine.context_menu.selected` from mouse position on actual motion
+    // events; the adapter copies that into `menu.selected_idx` above. Doing
+    // a redundant hover override here clobbered keyboard navigation: every
+    // queue_draw triggered by `j`/`k` would re-snap selection back to the
+    // item under the (stationary) cursor.
 
-    // Border.
-    let (r, g, b) = theme.fuzzy_border.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.set_line_width(1.0);
-    cr.rectangle(px, py, popup_w, popup_h);
-    cr.stroke().ok();
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::ContextMenu {
+            menu: &menu,
+            layout: &menu_layout,
+        });
+        frame.draw(b);
+    });
 
-    // Compute hovered item from mouse position (avoids engine borrow in motion callback).
-    let hover_idx: Option<usize> = if mouse_pos.0 >= 0.0 {
-        let mcol = (mouse_pos.0 / char_width) as u16;
-        let mrow = (mouse_pos.1 / line_height) as u16;
-        let tw = (editor_width / char_width) as u16;
-        let th = (editor_height / line_height) as u16;
-        match crate::core::engine::resolve_context_menu_click(
-            &cm.items
-                .iter()
-                .map(|i| crate::core::engine::ContextMenuItem {
-                    label: i.label.clone(),
-                    action: String::new(),
-                    shortcut: i.shortcut.clone(),
-                    separator_after: i.separator_after,
-                    enabled: i.enabled,
-                })
-                .collect::<Vec<_>>(),
-            cm.screen_col,
-            cm.screen_row,
-            tw,
-            th,
-            mcol,
-            mrow,
-        ) {
-            crate::core::engine::ContextMenuClickResult::Item(idx) => Some(idx),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    // Use hover index if mouse is over an item; otherwise keep engine selection
-    // (preserves last-hovered or keyboard-navigated item when mouse leaves).
-    let selected = hover_idx.unwrap_or(cm.selected_idx);
-
-    // Items.
-    let mut visual_row: usize = 0;
-    let item_x = px + char_width;
-    for (i, item) in cm.items.iter().enumerate() {
-        let item_y = py + (visual_row + 1) as f64 * line_height;
-
-        // Selection highlight.
-        if i == selected && item.enabled {
-            let (r, g, b) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.rectangle(px + 1.0, item_y, popup_w - 2.0, line_height);
-            cr.fill().ok();
-        }
-
-        // Label — disabled items heavily darkened for obvious visual distinction.
-        let fg = if item.enabled {
-            theme.fuzzy_fg
-        } else {
-            theme.fuzzy_fg.darken(0.5)
-        };
-        let (r, g, b) = fg.to_cairo();
-        cr.set_source_rgb(r, g, b);
-        ui_layout.set_text(&item.label);
-        ui_layout.set_attributes(None);
-        cr.move_to(item_x, item_y);
-        pangocairo::show_layout(cr, &ui_layout);
-
-        // Shortcut (right-aligned).
-        if !item.shortcut.is_empty() {
-            ui_layout.set_text(&item.shortcut);
-            let (sw, _) = ui_layout.pixel_size();
-            let sc_x = px + popup_w - sw as f64 - char_width;
-            let (r, g, b) = theme.line_number_fg.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.move_to(sc_x, item_y);
-            pangocairo::show_layout(cr, &ui_layout);
-        }
-
-        visual_row += 1;
-
-        // Separator line.
-        if item.separator_after {
-            let sep_y = py + (visual_row + 1) as f64 * line_height + line_height / 2.0;
-            let (r, g, b) = theme.fuzzy_border.to_cairo();
-            cr.set_source_rgb(r, g, b);
-            cr.set_line_width(0.5);
-            cr.move_to(px + 4.0, sep_y);
-            cr.line_to(px + popup_w - 4.0, sep_y);
-            cr.stroke().ok();
-            visual_row += 1;
-        }
-    }
+    Some(menu_layout)
 }
 
-/// Draw the tab bar for the bottom panel (Terminal / Debug Output).
-/// One row high at `(x, y)`, full width `w`.
+/// Draw the engine-drawn context menu on the explorer DA (#426).
+/// Mirrors `draw_context_menu_popup` but renders only when the menu's
+/// target is `ExplorerFile/Dir` and uses explorer-DA-local coords
+/// (UI-font char_width × line_height). Returns the resolved
+/// `ContextMenuLayout` for the click/motion hit-test cache.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_explorer_context_menu_popup(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    cr: &Context,
+    _layout: &pango::Layout,
+    engine: &Engine,
+    theme: &Theme,
+    da_width: f64,
+    da_height: f64,
+    char_width: f64,
+    line_height: f64,
+) -> Option<quadraui::ContextMenuLayout> {
+    let cm = engine.context_menu.as_ref()?;
+    if !matches!(
+        cm.target,
+        core::engine::ContextMenuTarget::ExplorerFile { .. }
+            | core::engine::ContextMenuTarget::ExplorerDir { .. }
+    ) {
+        return None;
+    }
+    if cm.items.is_empty() {
+        return None;
+    }
+
+    let pango_ctx = pangocairo::create_context(cr);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
+    let ui_layout = pango::Layout::new(&pango_ctx);
+    ui_layout.set_font_description(Some(&ui_font_desc));
+
+    // Build the render-side panel from the engine state, then the
+    // quadraui ContextMenu via the shared adapter.
+    let panel = render::ContextMenuPanel {
+        items: cm
+            .items
+            .iter()
+            .map(|i| render::ContextMenuRenderItem {
+                label: i.label.clone(),
+                shortcut: i.shortcut.clone(),
+                separator_after: i.separator_after,
+                enabled: i.enabled,
+            })
+            .collect(),
+        selected_idx: cm.selected,
+        screen_col: cm.screen_x,
+        screen_row: cm.screen_y,
+        trigger_height: cm.trigger_height,
+    };
+    let menu = render::context_menu_panel_to_quadraui_context_menu(&panel);
+
+    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+
+    let max_label = cm.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+    let max_sc = cm.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+    let content_cols = (max_label + max_sc + 6).clamp(20, 50);
+    let menu_w = content_cols as f64 * char_width;
+
+    let anchor_x = cm.screen_x as f64 * char_width;
+    let anchor_y = cm.screen_y as f64 * line_height;
+    let trigger_height_px = cm.trigger_height as f64 * line_height;
+    let viewport = quadraui::Rect::new(0.0, 0.0, da_width as f32, da_height as f32);
+    let menu_layout = menu.layout_at(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            0.0,
+            trigger_height_px as f32,
+        ),
+        viewport,
+        menu_w as f32,
+        item_height,
+    );
+
+    // #463: route paint through quadraui::ScreenLayout.
+    use quadraui::{ScreenLayout as QScreenLayout, Surface};
+    backend.borrow_mut().enter_frame_scope(cr, &ui_layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::ContextMenu {
+            menu: &menu,
+            layout: &menu_layout,
+        });
+        frame.draw(b);
+    });
+
+    Some(menu_layout)
+}
+
+/// Draw the tab bar for the bottom panel (Terminal / Debug Output) via
+/// `quadraui::Backend::draw_tab_bar`. Returns `TabBarHits` for the
+/// click handler (caller caches on `engine.bottom_tab_bar_hits`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_bottom_panel_tabs(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
-    screen: &render::ScreenLayout,
+    active: &render::BottomPanelKind,
     theme: &Theme,
     x: f64,
     y: f64,
@@ -3597,117 +2364,45 @@ pub(super) fn draw_bottom_panel_tabs(
     line_height: f64,
     has_terminal: bool,
     has_debug_output: bool,
-) {
-    let (br, bg, bb) = theme.tab_bar_bg.to_cairo();
-    let (fr, fg2, fb) = theme.status_fg.to_cairo();
-    let (ar, ag, ab) = theme.tab_active_fg.to_cairo();
+) -> quadraui::TabBarHits {
+    use pango::FontDescription;
 
-    // Background — use tab bar bg to match the editor tab bar.
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(x, y, w, line_height);
-    cr.fill().ok();
+    let bar = render::build_bottom_panel_tab_bar(active, has_terminal, has_debug_output);
 
-    // Thin separator line at the top.
-    let (sr, sg, sb) = theme.separator.to_cairo();
-    cr.set_source_rgb(sr, sg, sb);
-    cr.rectangle(x, y, w, 1.0);
-    cr.fill().ok();
-
-    // Use sans-serif UI font (like VSCode panel tabs).
     let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
-    layout.set_attributes(None);
 
-    let all_tabs: &[(&str, render::BottomPanelKind, bool)] = &[
-        ("TERMINAL", render::BottomPanelKind::Terminal, has_terminal),
-        (
-            "DEBUG CONSOLE",
-            render::BottomPanelKind::DebugOutput,
-            has_debug_output,
-        ),
-    ];
+    use quadraui::Backend;
+    let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_tab_bar(
+            quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32),
+            &bar,
+            None,
+        )
+    });
 
-    let padding = 12.0;
-    let mut cursor_x = x + padding;
-    for (label, kind, visible) in all_tabs {
-        if !visible {
-            continue;
-        }
-        let is_active = screen.bottom_tabs.active == *kind;
-        let (lr, lg, lb) = if is_active {
-            (ar, ag, ab)
-        } else {
-            (fr, fg2, fb)
-        };
-        cr.set_source_rgb(lr, lg, lb);
-        layout.set_text(label);
-        cr.move_to(cursor_x, y);
-        pangocairo::show_layout(cr, layout);
-        let extents = layout.pixel_extents().1;
-        let tab_w = extents.width() as f64;
-        // Underline the active tab.
-        if is_active {
-            cr.set_source_rgb(ar, ag, ab);
-            cr.rectangle(cursor_x, y + line_height - 2.0, tab_w, 2.0);
-            cr.fill().ok();
-        }
-        cursor_x += tab_w + padding * 2.0;
-    }
-
-    // Close button (×) at right edge
-    let close_x = x + w - padding - 10.0;
-    cr.set_source_rgb(fr, fg2, fb);
-    layout.set_text("\u{00d7}"); // ×
-    cr.move_to(close_x, y);
-    pangocairo::show_layout(cr, layout);
-
-    // Restore the original monospace font.
     layout.set_font_description(Some(&saved_font));
-}
-
-/// Draw debug output lines (read-only scrolling log).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_debug_output(
-    cr: &Context,
-    layout: &pango::Layout,
-    output_lines: &[String],
-    theme: &Theme,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    line_height: f64,
-) {
-    let (br, bg_g, bb) = theme.completion_bg.to_cairo();
-    cr.set_source_rgb(br, bg_g, bb);
-    cr.rectangle(x, y, w, h);
-    cr.fill().ok();
-
-    let (fr, fg, fb) = theme.fuzzy_fg.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
-    layout.set_attributes(None);
-
-    let visible_rows = (h / line_height) as usize;
-    let start = output_lines.len().saturating_sub(visible_rows);
-    for (row, line_text) in output_lines.iter().skip(start).enumerate() {
-        let ry = y + row as f64 * line_height;
-        let text = format!("  {line_text}");
-        layout.set_text(&text);
-        cr.move_to(x, ry);
-        pangocairo::show_layout(cr, layout);
-    }
+    hits
 }
 
 /// Draw the VSCode-style debug sidebar content.
 ///
 /// Shows four sections stacked vertically:
-///   • VARIABLES (with ▶/▼ expansion)
-///   • WATCH (expressions + values)
-///   • CALL STACK (frames, active highlighted)
-///   • BREAKPOINTS (file:line list)
+///   - VARIABLES (with chevron expansion)
+///   - WATCH (expressions + values)
+///   - CALL STACK (frames, active highlighted)
+///   - BREAKPOINTS (file:line list)
 ///
-/// A 2-row header at the top shows the session status and a Run/Stop button.
+/// A 2-row header at the top shows the session status and a Run/Stop
+/// button.
+///
+/// Migrated to four `quadraui::TreeView` instances (#281), one per
+/// section. Panel header + Run/Stop button + per-section title rows +
+/// per-section scrollbar overlays stay panel-specific chrome; item
+/// rendering goes through `Backend::draw_tree`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_debug_sidebar(
     cr: &Context,
@@ -3719,201 +2414,47 @@ pub(super) fn draw_debug_sidebar(
     w: f64,
     h: f64,
     line_height: f64,
-) {
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    engine: &crate::core::engine::Engine,
+) -> quadraui::StatusBarLayout {
     let sidebar = &screen.debug_sidebar;
 
     let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
-    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
-    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
-    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
-    let (act_r, act_g, act_b) = theme.tab_active_fg.to_cairo();
 
     // Paint sidebar background.
     cr.set_source_rgb(bg_r, bg_g, bg_b);
     cr.rectangle(x, y, w, h);
     cr.fill().ok();
 
-    layout.set_attributes(None);
-
-    // ── Row 0: header strip ─────────────────────────────────────────────────
-    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-    cr.rectangle(x, y, w, line_height);
-    cr.fill().ok();
-
-    let cfg_name = sidebar.launch_config_name.as_deref().unwrap_or("no config");
-    let header_text = format!("  {} DEBUG  |  {cfg_name}", icons::DEBUG.nerd);
-    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-    layout.set_text(&header_text);
-    cr.move_to(x + 4.0, y);
-    pangocairo::show_layout(cr, layout);
-
-    // ── Row 1: Run/Stop button ───────────────────────────────────────────────
+    // ── Chrome rows via StatusBar primitive. ──
+    let (title_bar, action_bar) = render::debug_sidebar_chrome_to_status_bars(sidebar, theme);
+    let title_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32);
     let btn_y = y + line_height;
-    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-    cr.rectangle(x, btn_y, w, line_height);
-    cr.fill().ok();
-
-    let continue_label = format!("{}  Continue", icons::DBG_PLAY.nerd);
-    let stop_label = format!("{}  Stop", icons::DBG_STOP_ALT.nerd);
-    let start_label = format!("{}  Start Debugging", icons::DBG_PLAY.nerd);
-    let (btn_label, btn_color) = if sidebar.session_active && sidebar.stopped {
-        (continue_label.as_str(), (0.38_f64, 0.73_f64, 0.45_f64))
-    } else if sidebar.session_active {
-        (stop_label.as_str(), (0.86_f64, 0.27_f64, 0.22_f64))
-    } else {
-        (start_label.as_str(), (0.38_f64, 0.73_f64, 0.45_f64))
-    };
-    cr.set_source_rgb(btn_color.0, btn_color.1, btn_color.2);
-    layout.set_text(btn_label);
-    cr.move_to(x + 8.0, btn_y);
-    pangocairo::show_layout(cr, layout);
-
-    // ── Sections with fixed-height allocation + per-section scrolling ──────
-    let sections: [(
-        &str,
-        &[render::DebugSidebarItem],
-        render::DebugSidebarSection,
-        usize,
-    ); 4] = [
-        (
-            &format!("{} VARIABLES", icons::DBG_VARIABLES.nerd),
-            &sidebar.variables,
-            render::DebugSidebarSection::Variables,
-            0,
-        ),
-        (
-            &format!("{} WATCH", icons::DBG_WATCH.nerd),
-            &sidebar.watch,
-            render::DebugSidebarSection::Watch,
-            1,
-        ),
-        (
-            &format!("{} CALL STACK", icons::DBG_CALL_STACK.nerd),
-            &sidebar.frames,
-            render::DebugSidebarSection::CallStack,
-            2,
-        ),
-        (
-            &format!("{} BREAKPOINTS", icons::DBG_BREAKPOINTS.nerd),
-            &sidebar.breakpoints,
-            render::DebugSidebarSection::Breakpoints,
-            3,
-        ),
-    ];
-
-    // Compute per-section content heights (equal share of remaining space).
-    // Available px after header(1) + button(1) = 2 line_heights.
-    // Each section has 1 header row (4 total), so content px = h - 6*line_height.
-    let content_px = (h - 6.0 * line_height).max(0.0);
-    let sec_content_h = (content_px / 4.0).floor();
-
-    let mut cursor_y = btn_y + line_height;
-    let max_y = y + h;
-
-    let (sb_r, sb_g, sb_b) = (0.5_f64, 0.5_f64, 0.5_f64); // scrollbar thumb color
-
-    for (section_label, items, section_kind, sec_idx) in &sections {
-        if cursor_y >= max_y {
-            break;
-        }
-
-        // Section header row.
-        let is_active_section = sidebar.active_section == *section_kind;
-        let (shr, shg, shb) = if is_active_section {
-            (act_r, act_g, act_b)
-        } else {
-            (hdr_fg_r, hdr_fg_g, hdr_fg_b)
-        };
-        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-        cr.rectangle(x, cursor_y, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(shr, shg, shb);
-        layout.set_text(section_label);
-        cr.move_to(x + 4.0, cursor_y);
-        pangocairo::show_layout(cr, layout);
-        cursor_y += line_height;
-
-        let scroll_off = sidebar.scroll_offsets[*sec_idx];
-        let sec_height = sidebar.section_heights[*sec_idx] as usize;
-        let visible_rows = if sec_height > 0 {
-            sec_height
-        } else {
-            (sec_content_h / line_height).floor() as usize
-        };
-
-        // Clip to section content area.
-        let section_start_y = cursor_y;
-        let section_end_y = (cursor_y + visible_rows as f64 * line_height).min(max_y);
-
-        cr.save().ok();
-        cr.rectangle(x, section_start_y, w, section_end_y - section_start_y);
-        cr.clip();
-
-        // Render items within the allocated height.
-        for row_offset in 0..visible_rows {
-            let item_y = section_start_y + row_offset as f64 * line_height;
-            if item_y >= section_end_y {
-                break;
-            }
-            let item_idx = scroll_off + row_offset;
-            if items.is_empty() && row_offset == 0 {
-                // Empty hint.
-                cr.set_source_rgb(dim_r, dim_g, dim_b);
-                let hint = if sidebar.session_active {
-                    "  (empty)"
-                } else {
-                    "  (not running)"
-                };
-                layout.set_text(hint);
-                cr.move_to(x + 4.0, item_y);
-                pangocairo::show_layout(cr, layout);
-            } else if item_idx < items.len() {
-                let item = &items[item_idx];
-                if item.is_selected {
-                    cr.set_source_rgb(sel_r, sel_g, sel_b);
-                    cr.rectangle(x, item_y, w, line_height);
-                    cr.fill().ok();
-                    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-                } else {
-                    cr.set_source_rgb(dim_r, dim_g, dim_b);
-                }
-                let indent_px = item.indent as f64 * 12.0;
-                layout.set_text(&item.text);
-                cr.move_to(x + 4.0 + indent_px, item_y);
-                pangocairo::show_layout(cr, layout);
-            }
-        }
-
-        // Draw scrollbar if items exceed visible height.
-        if items.len() > visible_rows && visible_rows > 0 {
-            let sb_w = 4.0_f64;
-            let sb_x = x + w - sb_w;
-            let track_h = visible_rows as f64 * line_height;
-            let total_items = items.len();
-            let thumb_h = ((visible_rows as f64 / total_items as f64) * track_h)
-                .ceil()
-                .max(line_height * 0.5);
-            let max_scroll = total_items - visible_rows;
-            let thumb_top = if max_scroll > 0 {
-                (scroll_off as f64 / max_scroll as f64) * (track_h - thumb_h)
-            } else {
-                0.0
-            };
-            // Track background.
-            let (st_r, st_g, st_b) = theme.scrollbar_track.to_cairo();
-            cr.set_source_rgba(st_r, st_g, st_b, 0.3);
-            cr.rectangle(sb_x, section_start_y, sb_w, track_h);
-            cr.fill().ok();
-            // Thumb.
-            cr.set_source_rgb(sb_r, sb_g, sb_b);
-            cr.rectangle(sb_x, section_start_y + thumb_top, sb_w, thumb_h);
-            cr.fill().ok();
-        }
-
-        cr.restore().ok();
-        cursor_y = section_start_y + visible_rows as f64 * line_height;
+    let action_rect = quadraui::Rect::new(x as f32, btn_y as f32, w as f32, line_height as f32);
+    let action_hits;
+    {
+        use quadraui::Backend;
+        action_hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            let _ = b.draw_status_bar(title_rect, &title_bar, None, None);
+            b.draw_status_bar(action_rect, &action_bar, None, None)
+        });
     }
+
+    // ── SidebarSystem body (the four sections). ──
+    let msv_y = btn_y + line_height;
+    let msv_h = (h - 2.0 * line_height).max(0.0);
+    if msv_h > 0.0 {
+        let body_rect = quadraui::Rect::new(x as f32, msv_y as f32, w as f32, msv_h as f32);
+        engine.dap_sidebar_body_rect.set(body_rect);
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            engine.dap_sidebar_system.borrow().render(b, body_rect);
+        });
+    }
+    action_hits
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3927,58 +2468,57 @@ pub(super) fn draw_quickfix_panel(
     editor_w: f64,
     qf_px: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
 ) {
     let Some(qf) = &screen.quickfix else {
         return;
     };
 
-    // Header row
-    let (hr, hg, hb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(hr, hg, hb);
-    cr.rectangle(editor_x, editor_y, editor_w, line_height);
-    cr.fill().ok();
-    let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
-    let title = format!("  QUICKFIX  ({} items){}", qf.total_items, focus_mark);
-    let (fr, fg, fb) = theme.status_fg.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
-    layout.set_attributes(None);
-    layout.set_text(&title);
-    cr.move_to(editor_x, editor_y);
-    pangocairo::show_layout(cr, layout);
-
-    // Result rows
+    // Phase A.5b migration: quickfix now renders through the shared
+    // `quadraui::ListView` primitive. The adapter produces a ListView
+    // with a `QUICKFIX (N items)` header; `Backend::draw_list`
+    // renders header + rows with selection indicator.
+    //
+    // Phase B.5 Stage 3 pilot: this is the first GTK draw site routed
+    // through the `quadraui::Backend` trait — `enter_frame_scope`
+    // stashes the cairo context + pango layout for the closure
+    // duration; `b.draw_list(rect, &list)` reaches them via the
+    // backend's frame-scope accessor. The same generic
+    // `paint::<B: Backend>` shape now drives both backends.
+    //
+    // Scroll-to-selection: reserve one row for the header, then keep the
+    // selected item within the remaining visible rows. Matches prior
+    // GTK behaviour.
     let visible_rows = ((qf_px / line_height) as usize).saturating_sub(1);
-    let scroll_top = (qf.selected_idx + 1).saturating_sub(visible_rows);
-    for row_idx in 0..visible_rows {
-        let item_idx = scroll_top + row_idx;
-        if item_idx >= qf.items.len() {
-            break;
-        }
-        let ry = editor_y + line_height * (row_idx + 1) as f64;
-        let is_selected = item_idx == qf.selected_idx;
-        if is_selected {
-            let (sr, sg, sb) = theme.fuzzy_selected_bg.to_cairo();
-            cr.set_source_rgb(sr, sg, sb);
-            cr.rectangle(editor_x, ry, editor_w, line_height);
-            cr.fill().ok();
-        }
-        let prefix = if is_selected { "▶ " } else { "  " };
-        let text = format!("{}{}", prefix, qf.items[item_idx]);
-        let (ir, ig, ib) = theme.fuzzy_fg.to_cairo();
-        cr.set_source_rgb(ir, ig, ib);
-        layout.set_text(&text);
-        cr.move_to(editor_x, ry);
-        pangocairo::show_layout(cr, layout);
-    }
+    let scroll_top = if visible_rows == 0 {
+        0
+    } else {
+        (qf.selected_idx + 1).saturating_sub(visible_rows)
+    };
+    let mut list = render::quickfix_to_list_view(qf);
+    list.scroll_offset = scroll_top;
+
+    use quadraui::Backend;
+    backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        b.draw_list(
+            quadraui::Rect::new(
+                editor_x as f32,
+                editor_y as f32,
+                editor_w as f32,
+                qf_px as f32,
+            ),
+            &list,
+        );
+    });
 }
 
-/// Nerd Font icons for the terminal panel toolbar.
-pub(super) const NF_CLOSE: &str = "󰅖"; // nf-md-close_box
-pub(super) const NF_SPLIT: &str = "󰤼"; // nf-md-view_split_vertical
-
-/// Draw the integrated terminal bottom panel.
+/// Draw the terminal toolbar row (find bar or tab strip) through
+/// quadraui primitives. Returns cached hit data for click dispatch.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn draw_terminal_panel(
+pub(super) fn draw_terminal_toolbar(
+    backend: &std::rc::Rc<std::cell::RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     panel: &render::TerminalPanel,
@@ -3986,333 +2526,62 @@ pub(super) fn draw_terminal_panel(
     x: f64,
     y: f64,
     w: f64,
-    term_px: f64,
     line_height: f64,
-    char_width: f64,
-    sender: &relm4::Sender<Msg>,
-) {
-    // Toolbar row (header) — use sans-serif UI font like VSCode.
+) -> crate::core::engine::TerminalToolbarHits {
+    use crate::core::engine::TerminalToolbarHits;
+    use pango::FontDescription;
+
+    let toolbar = render::build_terminal_toolbar(panel, theme);
+
     let saved_font = layout.font_description().unwrap_or_default();
-    let ui_font_desc = FontDescription::from_string(UI_FONT);
-
-    let (hr, hg, hb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(hr, hg, hb);
-    cr.rectangle(x, y, w, line_height);
-    cr.fill().ok();
-
-    let (fr, fg2, fb) = theme.status_fg.to_cairo();
+    let ui_font_desc = FontDescription::from_string(&UI_FONT());
     layout.set_font_description(Some(&ui_font_desc));
-    layout.set_attributes(None);
 
-    if panel.find_active {
-        // Find bar mode: replace tab strip with query + match count
-        let match_info = if panel.find_match_count == 0 {
-            if panel.find_query.is_empty() {
-                String::new()
-            } else {
-                "  (no matches)".to_string()
+    let result = match toolbar {
+        render::TerminalToolbar::FindBar(bar) => {
+            use quadraui::Backend;
+            let q_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32);
+            backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+                b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+                b.set_current_line_height(line_height);
+                b.draw_status_bar(q_rect, &bar, None, None);
+            });
+            let sb_layout = bar.layout(w as f32, line_height as f32, 16.0, |seg| {
+                layout.set_text(&seg.text);
+                quadraui::StatusSegmentMeasure::new(layout.pixel_size().0.max(0) as f32)
+            });
+            TerminalToolbarHits::FindBar {
+                layout: sb_layout,
+                origin_x: x,
             }
-        } else {
-            format!(
-                "  ({}/{})",
-                panel.find_selected_idx + 1,
-                panel.find_match_count
-            )
-        };
-        let find_text = format!(" FIND: {}█{}", panel.find_query, match_info);
-        cr.set_source_rgb(fr, fg2, fb);
-        layout.set_text(&find_text);
-        cr.move_to(x, y);
-        pangocairo::show_layout(cr, layout);
-        // Close icon right-aligned
-        layout.set_text(NF_CLOSE);
-        let (cw, _) = layout.pixel_size();
-        cr.move_to(x + w - cw as f64 - 4.0, y);
-        pangocairo::show_layout(cr, layout);
-    } else {
-        // Tab strip — each tab is 4 chars: "[N] "
-        const TERMINAL_TAB_COLS: usize = 4;
-        let mut tab_x = x;
-        for i in 0..panel.tab_count {
-            let label = format!("[{}] ", i + 1);
-            if i == panel.active_tab {
-                // Active tab: inverted colors (cursor background)
-                let (ar, ag, ab) = theme.cursor.to_cairo();
-                cr.set_source_rgb(ar, ag, ab);
-                cr.rectangle(tab_x, y, char_width * TERMINAL_TAB_COLS as f64, line_height);
-                cr.fill().ok();
-                let (br, bg_, bb) = theme.background.to_cairo();
-                cr.set_source_rgb(br, bg_, bb);
-            } else {
-                cr.set_source_rgb(fr, fg2, fb);
-            }
-            layout.set_text(&label);
-            cr.move_to(tab_x, y);
-            pangocairo::show_layout(cr, layout);
-            tab_x += char_width * TERMINAL_TAB_COLS as f64;
         }
-
-        // If no tabs yet (panel open but spawning), show a minimal title
-        if panel.tab_count == 0 {
-            cr.set_source_rgb(fr, fg2, fb);
-            layout.set_text("  TERMINAL");
-            cr.move_to(x, y);
-            pangocairo::show_layout(cr, layout);
+        render::TerminalToolbar::TabStrip(bar) => {
+            use quadraui::Backend;
+            let q_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, line_height as f32);
+            let hits = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+                b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+                b.set_current_line_height(line_height);
+                b.draw_tab_bar(q_rect, &bar, None)
+            });
+            TerminalToolbarHits::TabStrip(hits)
         }
-
-        // Right-aligned toolbar buttons: + ⊞ ×  (each ~2 chars wide)
-        cr.set_source_rgb(fr, fg2, fb);
-        let btn_text = format!("+ {} {}", NF_SPLIT, NF_CLOSE);
-        layout.set_text(&btn_text);
-        let (btn_w, _) = layout.pixel_size();
-        cr.move_to(x + w - btn_w as f64 - 4.0, y);
-        pangocairo::show_layout(cr, layout);
-    }
-
-    // close_x / split_x used by click detection in MouseClick handler
-    let _ = sender; // click detection handled in MouseClick
-
-    // Restore monospace font for terminal content rendering.
-    layout.set_font_description(Some(&saved_font));
-
-    // Scrollbar geometry
-    const SB_W: f64 = 6.0;
-    let content_y = y + line_height;
-    let content_h = term_px - line_height;
-    let rows_to_draw = ((term_px / line_height) as usize).saturating_sub(1);
-    let total = panel.scrollback_rows + rows_to_draw;
-    let (thumb_top_px, thumb_bot_px) = if panel.scrollback_rows == 0 {
-        (0.0, content_h) // no scrollback → full bar
-    } else {
-        let thumb_h = ((rows_to_draw as f64 / total as f64) * content_h).max(4.0);
-        let max_off = panel.scrollback_rows as f64;
-        let frac = if panel.scroll_offset == 0 {
-            1.0 // at live bottom → thumb at bottom
-        } else {
-            1.0 - (panel.scroll_offset as f64 / max_off).min(1.0)
-        };
-        let thumb_t = frac * (content_h - thumb_h);
-        (thumb_t, thumb_t + thumb_h)
     };
 
-    // Draw scrollbar track (right edge of whole panel)
-    let sb_x = x + w - SB_W;
-    let (tbr, tbg, tbb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(tbr * 1.4, tbg * 1.4, tbb * 1.4); // slightly lighter than header
-    cr.rectangle(sb_x, content_y, SB_W, content_h);
-    cr.fill().ok();
-    // Draw scrollbar thumb
-    let (fr, fg2, fb) = theme.status_fg.to_cairo();
-    cr.set_source_rgba(fr, fg2, fb, 0.5);
-    cr.rectangle(
-        sb_x + 1.0,
-        content_y + thumb_top_px,
-        SB_W - 2.0,
-        thumb_bot_px - thumb_top_px,
-    );
-    cr.fill().ok();
-
-    // ── Split view: draw left pane + divider + right pane ─────────────────────
-    if let Some(ref left_rows) = panel.split_left_rows {
-        let half_w = panel.split_left_cols as f64 * char_width;
-        let div_x = x + half_w;
-
-        // Fill both halves with terminal default bg.
-        let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
-        cr.set_source_rgb(tbgr, tbgg, tbgb);
-        cr.rectangle(x, content_y, w - SB_W, content_h);
-        cr.fill().ok();
-
-        // Draw left pane cells.
-        draw_terminal_cells(
-            cr,
-            layout,
-            left_rows,
-            x,
-            content_y,
-            half_w,
-            line_height,
-            char_width,
-            theme,
-        );
-
-        // Draw divider (1px vertical line).
-        let (dr, dg, db) = theme.separator.to_cairo();
-        cr.set_source_rgb(dr, dg, db);
-        cr.rectangle(div_x, content_y, 1.0, content_h);
-        cr.fill().ok();
-
-        // Draw right pane cells.
-        draw_terminal_cells(
-            cr,
-            layout,
-            &panel.rows,
-            div_x + 1.0,
-            content_y,
-            half_w - 1.0,
-            line_height,
-            char_width,
-            theme,
-        );
-        return;
-    }
-
-    // ── Normal single-pane view ────────────────────────────────────────────────
-    // Content rows (terminal cells)
-    let cell_area_w = w - SB_W;
-
-    // Fill the entire content area with the default terminal background first.
-    let (tbgr, tbgg, tbgb) = theme.terminal_bg.to_cairo();
-    cr.set_source_rgb(tbgr, tbgg, tbgb);
-    cr.rectangle(x, content_y, cell_area_w, content_h);
-    cr.fill().ok();
-
-    draw_terminal_cells(
-        cr,
-        layout,
-        &panel.rows,
-        x,
-        content_y,
-        cell_area_w,
-        line_height,
-        char_width,
-        theme,
-    );
-}
-
-/// Draw a grid of terminal cells into a rectangular region.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_terminal_cells(
-    cr: &Context,
-    layout: &pango::Layout,
-    rows: &[Vec<render::TerminalCell>],
-    x: f64,
-    content_y: f64,
-    cell_area_w: f64,
-    line_height: f64,
-    char_width: f64,
-    theme: &Theme,
-) {
-    for (row_idx, row) in rows.iter().enumerate() {
-        let row_y = content_y + row_idx as f64 * line_height;
-        let mut cell_x = x;
-        for cell in row {
-            if cell_x + char_width > x + cell_area_w {
-                break;
-            }
-            let (br, bg, bb) = cell.bg;
-            let (fr, fg2, fb) = cell.fg;
-
-            // Cell background
-            let (draw_br, draw_bg, draw_bb) = if cell.is_cursor {
-                // Cursor: inverted colors (white on normal bg)
-                (fr, fg2, fb)
-            } else if cell.is_find_active {
-                // Active find match: orange background
-                (255u8, 165u8, 0u8)
-            } else if cell.is_find_match {
-                // Other find matches: dark amber background
-                (100u8, 80u8, 20u8)
-            } else if cell.selected {
-                // Selection highlight (use theme selection color)
-                let (sr, sg, sb) = theme.selection.to_cairo();
-                ((sr * 255.0) as u8, (sg * 255.0) as u8, (sb * 255.0) as u8)
-            } else {
-                (br, bg, bb)
-            };
-            cr.set_source_rgb(
-                draw_br as f64 / 255.0,
-                draw_bg as f64 / 255.0,
-                draw_bb as f64 / 255.0,
-            );
-            cr.rectangle(cell_x, row_y, char_width, line_height);
-            cr.fill().ok();
-
-            // Cell foreground text
-            let ch_str = cell.ch.to_string();
-            if cell.ch != ' ' {
-                let (draw_fr, draw_fg, draw_fb) = if cell.is_cursor {
-                    (br, bg, bb) // inverted for cursor
-                } else if cell.is_find_active {
-                    (0u8, 0u8, 0u8) // black text on orange
-                } else {
-                    (fr, fg2, fb)
-                };
-                cr.set_source_rgb(
-                    draw_fr as f64 / 255.0,
-                    draw_fg as f64 / 255.0,
-                    draw_fb as f64 / 255.0,
-                );
-
-                // Apply bold/italic via Pango attributes if needed
-                let attrs = AttrList::new();
-                if cell.bold {
-                    attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-                }
-                if cell.italic {
-                    attrs.insert(pango::AttrInt::new_style(pango::Style::Italic));
-                }
-                if cell.underline {
-                    attrs.insert(pango::AttrInt::new_underline(pango::Underline::Single));
-                }
-                layout.set_attributes(Some(&attrs));
-                layout.set_text(&ch_str);
-                cr.move_to(cell_x, row_y);
-                pangocairo::show_layout(cr, layout);
-                layout.set_attributes(None);
-            }
-
-            cell_x += char_width;
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_status_line(
-    cr: &Context,
-    layout: &pango::Layout,
-    theme: &Theme,
-    left: &str,
-    right: &str,
-    width: f64,
-    y: f64,
-    line_height: f64,
-) {
-    let (br, bg, bb) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(0.0, y, width, line_height);
-    cr.fill().ok();
-
-    layout.set_attributes(None);
-
-    let (fr, fg, fb) = theme.status_fg.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
-
-    // Measure right text first so we can clamp left text width.
-    layout.set_width(-1); // reset to natural width
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-    layout.set_text(right);
-    let (right_w, _) = layout.pixel_size();
-
-    // Draw left text, truncated to not overlap right text.
-    let left_max = (width - right_w as f64 - 8.0).max(0.0);
-    layout.set_text(left);
-    layout.set_width((left_max * pango::SCALE as f64) as i32);
-    layout.set_ellipsize(pango::EllipsizeMode::End);
-    cr.move_to(0.0, y);
-    pangocairo::show_layout(cr, layout);
-    layout.set_width(-1);
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-
-    // Draw right text, right-aligned.
-    layout.set_text(right);
-    cr.move_to(width - right_w as f64, y);
-    pangocairo::show_layout(cr, layout);
+    layout.set_font_description(Some(&saved_font));
+    result
 }
 
 /// Draw a per-window status bar with styled segments.
 #[allow(clippy::too_many_arguments)]
+/// Render a per-window / separated status bar row (A.6b).
+///
+/// Routes through `Backend::draw_status_bar` via the
+/// `window_status_line_to_status_bar` adapter. `StatusAction` is decoded from
+/// the primitive's `WidgetId`s so the existing per-window
+/// `status_segment_map` stays on `StatusAction` and the click handler in
+/// `src/gtk/click.rs` is unchanged.
 fn draw_window_status_bar(
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     cr: &Context,
     layout: &pango::Layout,
     theme: &Theme,
@@ -4323,145 +2592,36 @@ fn draw_window_status_bar(
     line_height: f64,
     segment_zones: &mut Vec<(f64, f64, crate::core::engine::StatusAction)>,
 ) {
-    // Fill background using the first segment's bg (derived from theme, not status_bg)
-    let fill_bg = status
-        .left_segments
-        .first()
-        .or(status.right_segments.first())
-        .map(|s| s.bg)
-        .unwrap_or(theme.background);
-    let (br, bg, bb) = fill_bg.to_cairo();
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(x, y, width, line_height);
-    cr.fill().ok();
+    let bar =
+        render::window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:window"));
+    // #461: paint via `Surface::StatusBar`; recover layout for segment
+    // hit-test via `b.status_bar_layout` (quadraui#211 aligned the
+    // measurement to the rasteriser).
+    use quadraui::{Backend, ScreenLayout as QScreenLayout, Surface};
+    let rect = quadraui::Rect::new(x as f32, y as f32, width as f32, line_height as f32);
+    let bar_layout = backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+        b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+        b.set_current_line_height(line_height);
+        let mut frame = QScreenLayout::new();
+        frame.push(Surface::StatusBar {
+            rect,
+            bar: &bar,
+            hovered: None,
+            pressed: None,
+        });
+        frame.draw(b);
+        b.status_bar_layout(rect, &bar)
+    });
 
-    layout.set_attributes(None);
-    layout.set_width(-1);
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-
-    // Draw left segments
     segment_zones.clear();
-    let mut cx = x;
-    for seg in &status.left_segments {
-        let (sr, sg, sb) = seg.bg.to_cairo();
-        cr.set_source_rgb(sr, sg, sb);
-        // Measure segment width
-        layout.set_text(&seg.text);
-        if seg.bold {
-            let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            layout.set_attributes(Some(&attrs));
-        } else {
-            layout.set_attributes(None);
+    for (rect, hit) in &bar_layout.hit_regions {
+        if let quadraui::StatusBarHit::Segment(ref id) = hit {
+            if let Some(action) = render::status_action_from_id(id.as_str()) {
+                let start = rect.x as f64;
+                let end = start + rect.width as f64;
+                segment_zones.push((start, end, action));
+            }
         }
-        let (seg_w, _) = layout.pixel_size();
-        let seg_w = seg_w as f64;
-        if let Some(ref action) = seg.action {
-            segment_zones.push((cx - x, cx - x + seg_w, action.clone()));
-        }
-        // Draw segment background
-        cr.rectangle(cx, y, seg_w, line_height);
-        cr.fill().ok();
-        // Draw segment text
-        let (fr, fg, fb) = seg.fg.to_cairo();
-        cr.set_source_rgb(fr, fg, fb);
-        cr.move_to(cx, y);
-        pangocairo::show_layout(cr, layout);
-        cx += seg_w;
-        if cx >= x + width {
-            break;
-        }
-    }
-
-    // Draw right segments, right-aligned
-    let mut right_total_w = 0.0;
-    for seg in &status.right_segments {
-        layout.set_text(&seg.text);
-        if seg.bold {
-            let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            layout.set_attributes(Some(&attrs));
-        } else {
-            layout.set_attributes(None);
-        }
-        let (seg_w, _) = layout.pixel_size();
-        right_total_w += seg_w as f64;
-    }
-    let mut rx = (x + width - right_total_w).max(cx);
-    for seg in &status.right_segments {
-        let (sr, sg, sb) = seg.bg.to_cairo();
-        cr.set_source_rgb(sr, sg, sb);
-        layout.set_text(&seg.text);
-        if seg.bold {
-            let attrs = pango::AttrList::new();
-            attrs.insert(pango::AttrInt::new_weight(pango::Weight::Bold));
-            layout.set_attributes(Some(&attrs));
-        } else {
-            layout.set_attributes(None);
-        }
-        let (seg_w, _) = layout.pixel_size();
-        let seg_w = seg_w as f64;
-        if let Some(ref action) = seg.action {
-            segment_zones.push((rx - x, rx - x + seg_w, action.clone()));
-        }
-        cr.rectangle(rx, y, seg_w, line_height);
-        cr.fill().ok();
-        let (fr, fg, fb) = seg.fg.to_cairo();
-        cr.set_source_rgb(fr, fg, fb);
-        cr.move_to(rx, y);
-        pangocairo::show_layout(cr, layout);
-        rx += seg_w;
-    }
-
-    layout.set_attributes(None);
-}
-
-pub(super) fn draw_wildmenu(
-    cr: &Context,
-    layout: &pango::Layout,
-    theme: &Theme,
-    wm: &render::WildmenuData,
-    width: f64,
-    y: f64,
-    line_height: f64,
-) {
-    // Fill background
-    let (br, bg, bb) = theme.wildmenu_bg.to_cairo();
-    cr.set_source_rgb(br, bg, bb);
-    cr.rectangle(0.0, y, width, line_height);
-    cr.fill().ok();
-
-    layout.set_attributes(None);
-    layout.set_width(-1);
-    layout.set_ellipsize(pango::EllipsizeMode::None);
-
-    let mut x = 0.0;
-    for (i, item) in wm.items.iter().enumerate() {
-        if x >= width {
-            break;
-        }
-        let is_selected = wm.selected == Some(i);
-        let label = format!(" {} ", item);
-        layout.set_text(&label);
-        let (item_w, _) = layout.pixel_size();
-
-        if is_selected {
-            // Draw selected item background
-            let (sbr, sbg, sbb) = theme.wildmenu_sel_bg.to_cairo();
-            cr.set_source_rgb(sbr, sbg, sbb);
-            cr.rectangle(x, y, item_w as f64, line_height);
-            cr.fill().ok();
-            // Selected item foreground
-            let (sfr, sfg, sfb) = theme.wildmenu_sel_fg.to_cairo();
-            cr.set_source_rgb(sfr, sfg, sfb);
-        } else {
-            let (fr, fg, fb) = theme.wildmenu_fg.to_cairo();
-            cr.set_source_rgb(fr, fg, fb);
-        }
-
-        cr.move_to(x, y);
-        pangocairo::show_layout(cr, layout);
-        x += item_w as f64;
     }
 }
 
@@ -4507,270 +2667,6 @@ pub(super) fn draw_command_line(
     }
 }
 
-/// Returns `(back_x, back_end, fwd_x, fwd_end, unit_end)` — pixel hit rects for nav arrows
-/// and the right edge of the entire interactive area (arrows + search box).
-pub(super) fn draw_menu_bar(
-    cr: &Context,
-    data: &render::MenuBarData,
-    theme: &Theme,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> (f64, f64, f64, f64, f64) {
-    // Title bar background: use tab_bar_bg (adapts to light/dark themes).
-    let (tbr, tbg, tbb) = theme.tab_bar_bg.to_cairo();
-    cr.set_source_rgb(tbr, tbg, tbb);
-    cr.rectangle(x, y, width, height);
-    let _ = cr.fill();
-
-    let pango_ctx = pangocairo::create_context(cr);
-    let font_desc = pango::FontDescription::from_string(UI_FONT);
-    let layout = pango::Layout::new(&pango_ctx);
-    layout.set_font_description(Some(&font_desc));
-
-    let (fr, fg, fb) = theme.foreground.to_cairo();
-    cr.set_source_rgb(fr, fg, fb);
-
-    // Menu labels
-    let mut cursor_x = x + 8.0;
-
-    for (idx, (name, _, _)) in render::MENU_STRUCTURE.iter().enumerate() {
-        let is_open = data.open_menu_idx == Some(idx);
-        if is_open {
-            let (ar, ag, ab) = theme.keyword.to_cairo();
-            cr.set_source_rgb(ar, ag, ab);
-        } else {
-            cr.set_source_rgb(fr, fg, fb);
-        }
-        layout.set_text(name);
-        let (_lw, lh) = layout.pixel_size();
-        cr.move_to(cursor_x, y + (height - lh as f64) / 2.0);
-        pangocairo::show_layout(cr, &layout);
-        // Use same metric as click/hover handlers: 7px/char + 10px padding.
-        cursor_x += name.len() as f64 * 7.0 + 10.0;
-    }
-
-    // Centered nav arrows + search box (like VSCode Command Center).
-    // The entire unit is centered between the menu labels and the right edge.
-    let menu_end_x = cursor_x;
-
-    // Measure arrow widths.
-    layout.set_text("\u{25C0}"); // ◀
-    let (back_w, _) = layout.pixel_size();
-    layout.set_text("\u{25B6}"); // ▶
-    let (fwd_w, _) = layout.pixel_size();
-    let arrow_gap = 6.0;
-    let arrows_w = back_w as f64 + arrow_gap + fwd_w as f64;
-
-    // Measure search box text.
-    let display = if data.title.is_empty() {
-        String::new()
-    } else {
-        format!("\u{1f50d}  {}", data.title)
-    };
-    let box_pad = 12.0;
-    let min_box_w = 280.0; // minimum search bar width to match VSCode proportions
-    let (box_text_w, _) = if !display.is_empty() {
-        layout.set_text(&display);
-        layout.pixel_size()
-    } else {
-        (0, 0)
-    };
-    let box_w = if !display.is_empty() {
-        (box_text_w as f64 + box_pad * 2.0).max(min_box_w)
-    } else {
-        0.0
-    };
-    let gap_between = if box_w > 0.0 { 10.0 } else { 0.0 };
-    let total_unit_w = arrows_w + gap_between + box_w;
-
-    // Center the unit between menu_end_x and right edge.
-    let available = x + width - menu_end_x;
-    let unit_x = (menu_end_x + (available - total_unit_w) / 2.0).max(menu_end_x + 8.0);
-
-    // Draw back arrow.
-    let dim_fg = theme.line_number_fg;
-    let back_color = if data.nav_back_enabled {
-        theme.foreground
-    } else {
-        dim_fg
-    };
-    let (br2, bg2, bb2) = back_color.to_cairo();
-    cr.set_source_rgb(br2, bg2, bb2);
-    layout.set_text("\u{25C0}");
-    let (_, bh) = layout.pixel_size();
-    cr.move_to(unit_x, y + (height - bh as f64) / 2.0);
-    pangocairo::show_layout(cr, &layout);
-
-    // Draw forward arrow.
-    let fwd_color = if data.nav_forward_enabled {
-        theme.foreground
-    } else {
-        dim_fg
-    };
-    let (fr2, fg2, fb2) = fwd_color.to_cairo();
-    cr.set_source_rgb(fr2, fg2, fb2);
-    layout.set_text("\u{25B6}");
-    let (_, fh) = layout.pixel_size();
-    cr.move_to(
-        unit_x + back_w as f64 + arrow_gap,
-        y + (height - fh as f64) / 2.0,
-    );
-    pangocairo::show_layout(cr, &layout);
-
-    // Draw search box.
-    if !display.is_empty() {
-        let bx = unit_x + arrows_w + gap_between;
-        let by = y + 3.0;
-        let bh_box = height - 6.0;
-        let radius = 4.0;
-        // Border
-        let (sr, sg, sb) = theme.separator.to_cairo();
-        cr.set_source_rgb(sr, sg, sb);
-        cr.new_path();
-        cr.arc(
-            bx + box_w - radius,
-            by + radius,
-            radius,
-            -std::f64::consts::FRAC_PI_2,
-            0.0,
-        );
-        cr.arc(
-            bx + box_w - radius,
-            by + bh_box - radius,
-            radius,
-            0.0,
-            std::f64::consts::FRAC_PI_2,
-        );
-        cr.arc(
-            bx + radius,
-            by + bh_box - radius,
-            radius,
-            std::f64::consts::FRAC_PI_2,
-            std::f64::consts::PI,
-        );
-        cr.arc(
-            bx + radius,
-            by + radius,
-            radius,
-            std::f64::consts::PI,
-            3.0 * std::f64::consts::FRAC_PI_2,
-        );
-        cr.close_path();
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-        // Text inside box — same color as menu labels (foreground)
-        cr.set_source_rgb(fr, fg, fb);
-        layout.set_text(&display);
-        let (_, th) = layout.pixel_size();
-        cr.move_to(bx + box_pad, y + (height - th as f64) / 2.0);
-        pangocairo::show_layout(cr, &layout);
-    }
-
-    // Return pixel hit rects for back and forward arrows + interactive area end.
-    let fwd_x = unit_x + back_w as f64 + arrow_gap;
-    let unit_end = unit_x + total_unit_w;
-    (
-        unit_x,
-        unit_x + back_w as f64,
-        fwd_x,
-        fwd_x + fwd_w as f64,
-        unit_end,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_menu_dropdown(
-    cr: &Context,
-    data: &render::MenuBarData,
-    theme: &Theme,
-    x: f64,
-    anchor_y: f64,
-    _width: f64,
-    _height: f64,
-    line_height: f64,
-) {
-    if data.open_items.is_empty() {
-        return;
-    }
-
-    let pango_ctx = pangocairo::create_context(cr);
-    let font_desc = pango::FontDescription::from_string(UI_FONT);
-    let layout = pango::Layout::new(&pango_ctx);
-    layout.set_font_description(Some(&font_desc));
-
-    // Compute popup_x using the same metric as the click/hover handlers.
-    let mut popup_x = x + 8.0;
-    if let Some(midx) = data.open_menu_idx {
-        for i in 0..midx {
-            if let Some((name, _, _)) = render::MENU_STRUCTURE.get(i) {
-                popup_x += name.len() as f64 * 7.0 + 10.0;
-            }
-        }
-    }
-    let item_count = data.open_items.len() as f64;
-    let popup_width = 220.0_f64;
-    let pad = 4.0; // small top/bottom padding
-    let popup_height = item_count * line_height + pad * 2.0;
-    let popup_y = anchor_y;
-
-    // Background — use hover_bg (adapts to light/dark themes).
-    let (hbr, hbg, hbb) = theme.hover_bg.to_cairo();
-    cr.set_source_rgb(hbr, hbg, hbb);
-    cr.rectangle(popup_x, popup_y, popup_width, popup_height);
-    let _ = cr.fill();
-
-    // Border
-    let (bdr, bdg, bdb) = theme.hover_border.to_cairo();
-    cr.set_source_rgb(bdr, bdg, bdb);
-    cr.rectangle(popup_x, popup_y, popup_width, popup_height);
-    let _ = cr.stroke();
-
-    // Items — each occupies one line_height row starting at popup_y + pad.
-    let (fr, fg_c, fb) = theme.foreground.to_cairo();
-    let (sr, sg, sb) = theme.line_number_fg.to_cairo();
-    cr.set_source_rgb(fr, fg_c, fb);
-    for (i, item) in data.open_items.iter().enumerate() {
-        let row_top = popup_y + pad + i as f64 * line_height;
-        if item.separator {
-            cr.set_source_rgb(sr, sg, sb);
-            let sep_y = row_top + line_height * 0.5;
-            cr.move_to(popup_x + 4.0, sep_y);
-            cr.line_to(popup_x + popup_width - 4.0, sep_y);
-            let _ = cr.stroke();
-            cr.set_source_rgb(fr, fg_c, fb);
-        } else {
-            // Draw highlight bar for hovered/keyboard-selected item.
-            if data.highlighted_item_idx == Some(i) {
-                let (slr, slg, slb) = theme.sidebar_sel_bg.to_cairo();
-                cr.set_source_rgb(slr, slg, slb);
-                cr.rectangle(popup_x + 1.0, row_top, popup_width - 2.0, line_height);
-                let _ = cr.fill();
-            }
-            layout.set_text(item.label);
-            let (_, lh) = layout.pixel_size();
-            let text_y = row_top + (line_height - lh as f64) * 0.5;
-            cr.set_source_rgb(fr, fg_c, fb);
-            cr.move_to(popup_x + 8.0, text_y);
-            pangocairo::show_layout(cr, &layout);
-            let sc = if data.is_vscode_mode && !item.vscode_shortcut.is_empty() {
-                item.vscode_shortcut
-            } else {
-                item.shortcut
-            };
-            if !sc.is_empty() {
-                layout.set_text(sc);
-                let (sc_w, _) = layout.pixel_size();
-                cr.set_source_rgb(sr, sg, sb);
-                cr.move_to(popup_x + popup_width - sc_w as f64 - 8.0, text_y);
-                pangocairo::show_layout(cr, &layout);
-                cr.set_source_rgb(fr, fg_c, fb);
-            }
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_source_control_panel(
     cr: &Context,
@@ -4782,6 +2678,8 @@ pub(super) fn draw_source_control_panel(
     w: f64,
     h: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    engine: &Engine,
 ) {
     let Some(ref sc) = screen.source_control else {
         return;
@@ -4812,7 +2710,6 @@ pub(super) fn draw_source_control_panel(
     let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
     let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
     let (add_r, add_g, add_b) = theme.diff_added_bg.to_cairo();
     let (del_r, del_g, del_b) = theme.diff_removed_bg.to_cairo();
 
@@ -4930,235 +2827,40 @@ pub(super) fn draw_source_control_panel(
         y_commit += commit_h;
     }
 
-    // ── Action buttons (with padding above and below) ──────────────────────
+    // ── Bottom slab: toolbar slot + sections via SidebarPanel (#509) ──────────
+    // Passes the entire remaining area (from just below commit input) to
+    // draw_sc_sidebar_panel. The backend reserves one `line_height` row for
+    // the toolbar slot; content_bounds below receives the sections. No manual
+    // btn_pad / btn_h arithmetic — option (a): tighter layout, single source
+    // of truth in the cached SidebarPanelLayout.
     {
-        let btn_pad = gap; // same gap as after header
-        let btn_y_base = y_commit + btn_pad;
-        let btn_h = line_height;
-        let margin = 4.0;
-        let btn_x = x + margin;
-        let btn_w = w - margin * 2.0;
-
-        // Commit gets ~50% of the width (with label text).
-        // Push / Pull / Sync get equal shares of the remaining width, icon only.
-        let commit_w = btn_w / 2.0;
-        let remain_w = btn_w - commit_w;
-        let icon_w = remain_w / 3.0;
-
-        // Button background color (slightly contrasting).
-        let (btn_bg_r, btn_bg_g, btn_bg_b) = theme.status_bg.to_cairo();
-        // Hover: lighten the button bg slightly.
-        let lighten = |c: f64| (c + 0.08).min(1.0);
-        let (hover_bg_r, hover_bg_g, hover_bg_b) =
-            (lighten(btn_bg_r), lighten(btn_bg_g), lighten(btn_bg_b));
-
-        // Helper: fill and label one button segment.
-        let draw_btn = |bx: f64, seg_w: f64, text: &str, focused: bool, hovered: bool| {
-            let (fill_r, fill_g, fill_b) = if focused {
-                (hdr_r, hdr_g, hdr_b)
-            } else if hovered {
-                (hover_bg_r, hover_bg_g, hover_bg_b)
-            } else {
-                (btn_bg_r, btn_bg_g, btn_bg_b)
-            };
-            cr.set_source_rgb(fill_r, fill_g, fill_b);
-            cr.rectangle(bx, btn_y_base, seg_w, btn_h);
-            cr.fill().ok();
-            cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-            layout.set_text(text);
-            let (_, lh_btn) = layout.pixel_size();
-            cr.move_to(bx + 2.0, btn_y_base + (btn_h - lh_btn as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-        };
-
-        let commit_lbl = format!(" {} Commit", icons::GIT_COMMIT.nerd);
-        let push_lbl = format!(" {}", icons::GIT_PUSH.nerd);
-        let pull_lbl = format!(" {}", icons::GIT_PULL.nerd);
-        let sync_lbl = format!(" {}", icons::GIT_SYNC.nerd);
-        for (i, (bx, bw, label)) in [
-            (btn_x, commit_w, commit_lbl.as_str()),
-            (btn_x + commit_w, icon_w, push_lbl.as_str()),
-            (btn_x + commit_w + icon_w, icon_w, pull_lbl.as_str()),
-            (
-                btn_x + commit_w + icon_w * 2.0,
-                btn_w - (commit_w + icon_w * 2.0),
-                sync_lbl.as_str(),
-            ),
-        ]
-        .iter()
-        .enumerate()
-        {
-            draw_btn(
-                *bx,
-                *bw,
-                label,
-                sc.button_focused == Some(i),
-                sc.button_hovered == Some(i),
-            );
-        }
-
-        y_commit = btn_y_base + btn_h + btn_pad;
+        let slab_h = (y + h - y_commit).max(0.0);
+        let slab_rect = quadraui::Rect::new(x as f32, y_commit as f32, w as f32, slab_h as f32);
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            render::draw_sc_sidebar_panel(b, engine, sc, slab_rect);
+        });
     }
 
-    // Helper to draw a section — uses y_off (float) for vertical positioning.
-    let item_height = (line_height * 1.4).round();
-    let draw_section = |cr: &Context,
-                        layout: &pango::Layout,
-                        title: &str,
-                        items: &[String],
-                        expanded: bool,
-                        y_off: &mut f64,
-                        flat_start: usize,
-                        selected: usize| {
-        let arrow = if expanded { "▼" } else { "▶" };
-        let header_text = format!("  {} {} ({})", arrow, title, items.len());
-        cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
-        cr.rectangle(x, *y_off, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
-        layout.set_text(&header_text);
-        let (_, lh) = layout.pixel_size();
-        cr.move_to(x + 2.0, *y_off + (line_height - lh as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-        *y_off += line_height;
-
-        if expanded {
-            for (i, item) in items.iter().enumerate() {
-                let flat_idx = flat_start + 1 + i; // +1 for section header
-                let is_sel = flat_idx == selected;
-                if is_sel {
-                    cr.set_source_rgb(sel_r, sel_g, sel_b);
-                    cr.rectangle(x, *y_off, w, item_height);
-                    cr.fill().ok();
-                }
-                cr.set_source_rgb(
-                    if is_sel { hdr_fg_r } else { dim_r },
-                    if is_sel { hdr_fg_g } else { dim_g },
-                    if is_sel { hdr_fg_b } else { dim_b },
-                );
-                layout.set_text(&format!("    {}", item));
-                let (_, lh) = layout.pixel_size();
-                cr.move_to(x + 2.0, *y_off + (item_height - lh as f64) / 2.0);
-                pangocairo::show_layout(cr, layout);
-                *y_off += item_height;
-                if *y_off > y + h {
-                    break;
-                }
-            }
-        }
-    };
-
-    // Compute flat start offsets
-    let staged_items: Vec<String> = sc
-        .staged
-        .iter()
-        .map(|f| format!("{} {}", f.status_char, f.path))
-        .collect();
-    let unstaged_items: Vec<String> = sc
-        .unstaged
-        .iter()
-        .map(|f| format!("{} {}", f.status_char, f.path))
-        .collect();
-    let wt_items: Vec<String> = sc
-        .worktrees
-        .iter()
-        .map(|wt| {
-            let marker = if wt.is_current { "\u{2714} " } else { "  " };
-            format!("{}{} {}", marker, wt.branch, wt.path)
-        })
-        .collect();
-
-    let staged_flat_start = 0usize;
-    let unstaged_flat_start = 1 + if sc.sections_expanded[0] {
-        sc.staged.len()
-    } else {
-        0
-    };
-    let wt_flat_start = unstaged_flat_start
-        + 1
-        + if sc.sections_expanded[1] {
-            sc.unstaged.len()
-        } else {
-            0
-        };
-    let show_worktrees = sc.worktrees.len() > 1;
-    let log_flat_start = if show_worktrees {
-        wt_flat_start
-            + 1
-            + if sc.sections_expanded[2] {
-                sc.worktrees.len()
-            } else {
-                0
-            }
-    } else {
-        wt_flat_start
-    };
-
-    // Track vertical position for sections (float, since item_height != line_height).
-    let mut y_off = y_commit;
-
-    // Draw staged section
-    if y_off < y + h {
-        draw_section(
-            cr,
-            layout,
-            "STAGED CHANGES",
-            &staged_items,
-            sc.sections_expanded[0],
-            &mut y_off,
-            staged_flat_start,
-            sc.selected,
-        );
-    }
-
-    // Color hint for diff-add
+    // Section rendering — migrated to SidebarSystem (#321).
+    // Read content_bounds from the layout that draw_sc_sidebar_panel just cached.
     let _ = (add_r, add_g, add_b, del_r, del_g, del_b);
-
-    // Draw unstaged section
-    if y_off < y + h {
-        draw_section(
-            cr,
-            layout,
-            "CHANGES",
-            &unstaged_items,
-            sc.sections_expanded[1],
-            &mut y_off,
-            unstaged_flat_start,
-            sc.selected,
-        );
-    }
-
-    // Draw worktrees section (only when there are linked worktrees beyond the main one).
-    if y_off < y + h && show_worktrees {
-        draw_section(
-            cr,
-            layout,
-            "WORKTREES",
-            &wt_items,
-            sc.sections_expanded[2],
-            &mut y_off,
-            wt_flat_start,
-            sc.selected,
-        );
-    }
-
-    // Draw log section (RECENT COMMITS) — always present.
-    if y_off < y + h {
-        let log_items: Vec<String> = sc
-            .log
-            .iter()
-            .map(|e| format!("{} {}", e.hash, e.message))
-            .collect();
-        draw_section(
-            cr,
-            layout,
-            &format!("{} RECENT COMMITS", icons::GIT_HISTORY.nerd),
-            &log_items,
-            sc.sections_expanded[3],
-            &mut y_off,
-            log_flat_start,
-            sc.selected,
-        );
+    let body_rect = {
+        let l = engine.sc_panel_layout.borrow();
+        l.as_ref().map(|l| l.content_bounds).unwrap_or(
+            // Fallback: old arithmetic for the first frame before layout is cached.
+            quadraui::Rect::new(x as f32, (y_commit + line_height) as f32, w as f32, 0.0),
+        )
+    };
+    engine.sc_sidebar_body_rect.set(body_rect);
+    render::populate_sc_sidebar_system(engine, theme);
+    {
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            engine.sc_sidebar_system.borrow().render(b, body_rect);
+        });
     }
 
     // ── Branch picker / create overlay ───────────────────────────────────────
@@ -5301,6 +3003,187 @@ pub(super) fn draw_source_control_panel(
             pangocairo::show_layout(cr, layout);
         }
     }
+}
+
+// ─── Settings sidebar panel ───────────────────────────────────────────────────
+
+/// Phase A.3c-2: settings panel renders into a `DrawingArea` via the
+/// shared `quadraui::Form` primitive. Layout from top to bottom:
+///   - Row 0: header bar (status-bar styling, "  SETTINGS")
+///   - Row 1: search input row (`/ <query>` with cursor when active)
+///   - Body: scrollable form (`quadraui_gtk::draw_form`) + scrollbar column
+///   - Bottom row: "Open settings.json" footer button (status-bar styling)
+///
+/// **Geometry contract:** the click handler in
+/// `App::handle_settings_msg` mirrors these row positions exactly
+/// (header @ 0..line_height, search @ line_height..2*line_height, body
+/// rows of `(line_height * 1.4).round()` starting at `2*line_height`,
+/// footer at `panel_h - line_height`). Update both sites together.
+///
+/// Inline-edit mode (Integer / String) overlays the editing row's value
+/// plus cursor on top of the form rendering, since `settings_to_form`
+/// does not yet emit `TextInput` for active-edit fields (tracked as a
+/// future adapter refinement; matches the TUI fallback in `panels.rs`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_settings_panel(
+    cr: &Context,
+    layout: &pango::Layout,
+    engine: &Engine,
+    theme: &Theme,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    line_height: f64,
+) {
+    use crate::core::engine::SettingsRow;
+    use crate::core::settings::SETTING_DEFS;
+
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+
+    // Geometry — keep in sync with `App::handle_settings_msg`.
+    let row_h = (line_height * 1.4).round();
+    let footer_h = line_height;
+
+    let (bg_r, bg_g, bg_b) = theme.tab_bar_bg.to_cairo();
+    let (hdr_r, hdr_g, hdr_b) = theme.status_bg.to_cairo();
+    let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
+    let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
+    let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
+    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
+    let (accent_r, accent_g, accent_b) = theme.cursor.to_cairo();
+
+    // Background.
+    cr.set_source_rgb(bg_r, bg_g, bg_b);
+    cr.rectangle(x, y, w, h);
+    cr.fill().ok();
+    layout.set_attributes(None);
+
+    // ── Rows 0–1: header + search input chrome ──────────────────────────────
+    quadraui::gtk::draw_settings_chrome(
+        cr,
+        layout,
+        x,
+        y,
+        w,
+        line_height,
+        "  SETTINGS",
+        &engine.settings_query,
+        "Search settings…",
+        engine.settings_input_active,
+        &super::quadraui_gtk::q_theme(theme),
+    );
+    let (_, header_lh) = layout.pixel_size();
+
+    // ── Body: form + scrollbar; bottom row reserved for footer ──────────────
+    let body_y = y + line_height * 2.0;
+    let body_h = (y + h - body_y - footer_h).max(0.0);
+    if body_h <= 0.0 {
+        return;
+    }
+
+    let total = engine.settings_flat_list().len();
+    let visible_rows = (body_h / row_h).floor() as usize;
+    let need_sb = visible_rows > 0 && total > visible_rows;
+    let sb_w = if need_sb { 8.0 } else { 0.0 };
+    let form_w = (w - sb_w).max(0.0);
+
+    // Form + scrollbar via FormController.
+    render::populate_settings_form_controller(engine);
+    {
+        let q_rect = quadraui::Rect::new(x as f32, body_y as f32, w as f32, body_h as f32);
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            engine
+                .settings_form_controller
+                .borrow_mut()
+                .render_and_cache(b, q_rect);
+        });
+    }
+
+    // ── Inline-edit overlay ─────────────────────────────────────────────────
+    let editing_idx: Option<usize> = if let Some(def_idx) = engine.settings_editing {
+        engine
+            .settings_flat_list()
+            .iter()
+            .position(|r| matches!(r, SettingsRow::CoreSetting(i) if *i == def_idx))
+    } else if let Some((ext_name, ext_key)) = engine.ext_settings_editing.clone() {
+        engine.settings_flat_list().iter().position(
+            |r| matches!(r, SettingsRow::ExtSetting(en, ek) if en == &ext_name && ek == &ext_key),
+        )
+    } else {
+        None
+    };
+    if let Some(flat_idx) = editing_idx {
+        let scroll = engine.settings_scroll_top;
+        if flat_idx >= scroll {
+            let local = flat_idx - scroll;
+            let ey = body_y + local as f64 * row_h;
+            if ey + row_h <= body_y + body_h {
+                let buf = &engine.settings_edit_buf;
+                let value_max_w = (form_w * 0.6).max(80.0);
+                let input_right = x + form_w - 8.0;
+
+                // Highlight the row.
+                cr.set_source_rgb(sel_r, sel_g, sel_b);
+                cr.rectangle(x, ey, form_w, row_h);
+                cr.fill().ok();
+
+                // Re-draw label.
+                let flat = engine.settings_flat_list();
+                let label_text = match &flat[flat_idx] {
+                    SettingsRow::CoreSetting(i) => SETTING_DEFS[*i].label.to_string(),
+                    SettingsRow::ExtSetting(_, k) => k.clone(),
+                    _ => String::new(),
+                };
+                cr.set_source_rgb(fg_r, fg_g, fg_b);
+                layout.set_text(&label_text);
+                let (_, lh2) = layout.pixel_size();
+                cr.move_to(x + 6.0, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                // Bracketed editable value with cursor at end of buffer.
+                layout.set_text(buf);
+                let (bw, _) = layout.pixel_size();
+                let draw_w = (bw as f64).min(value_max_w);
+                let ix = input_right - draw_w - 14.0;
+
+                cr.set_source_rgb(dim_r, dim_g, dim_b);
+                layout.set_text("[");
+                cr.move_to(ix, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                cr.set_source_rgb(fg_r, fg_g, fg_b);
+                layout.set_text(buf);
+                cr.move_to(ix + 8.0, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                cr.set_source_rgb(dim_r, dim_g, dim_b);
+                layout.set_text("]");
+                cr.move_to(ix + 8.0 + draw_w + 2.0, ey + (row_h - lh2 as f64) / 2.0);
+                pangocairo::show_layout(cr, layout);
+
+                // Cursor at end of buf.
+                cr.set_source_rgb(accent_r, accent_g, accent_b);
+                cr.rectangle(ix + 8.0 + bw as f64, ey + 3.0, 1.5, row_h - 6.0);
+                cr.fill().ok();
+            }
+        }
+    }
+
+    // ── Footer: "Open settings.json" ───────────────────────────────────────
+    let footer_y = y + h - footer_h;
+    cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
+    cr.rectangle(x, footer_y, w, footer_h);
+    cr.fill().ok();
+    cr.set_source_rgb(hdr_fg_r, hdr_fg_g, hdr_fg_b);
+    layout.set_text("  Open settings.json");
+    cr.move_to(x + 4.0, footer_y + (footer_h - header_lh as f64) / 2.0);
+    pangocairo::show_layout(cr, layout);
 }
 
 // ─── Extension-provided panel (e.g. git-insights GIT LOG) ─────────────────────
@@ -5719,16 +3602,24 @@ pub(super) fn draw_panel_hover_popup(
 
     // Y position: align with the hovered item row.
     let item_row_y = if hover.panel_name == "source_control" {
-        // SC layout: header(lh) + gap + commit(lh*rows) + gap + buttons(lh) + gap + sections
-        // The flat index maps into the sections area. Use SC-specific geometry.
-        let gap = (line_height * 0.3).round();
+        // SC layout after #509: section_top is read from the cached
+        // SidebarPanelLayout.content_bounds.y so we don't re-derive it.
         let item_height = (line_height * 1.4).round();
-        let commit_rows = screen
+        let section_top = screen
             .source_control
             .as_ref()
-            .map(|sc| sc.commit_message.split('\n').count().max(1))
-            .unwrap_or(1) as f64;
-        let section_top = line_height + gap + commit_rows * line_height + gap + line_height + gap;
+            .and_then(|sc| sc.sc_sections_start_y)
+            .map(|y| y as f64)
+            .unwrap_or_else(|| {
+                // Fallback: recompute from commit_rows (one frame lag is acceptable).
+                let gap = (line_height * 0.3).round();
+                let commit_rows = screen
+                    .source_control
+                    .as_ref()
+                    .map(|sc| sc.commit_message.split('\n').count().max(1))
+                    .unwrap_or(1) as f64;
+                line_height + gap + commit_rows * line_height + line_height
+            });
         // Walk sections to find the accumulated Y offset for the hovered flat_idx.
         // Headers use line_height, items use item_height.
         // Staged + Unstaged always show; Worktrees only when > 1; Log always shows.
@@ -5932,6 +3823,17 @@ pub(super) fn draw_panel_hover_popup(
     (link_rects, Some((popup_x, popup_y, popup_w, popup_h)))
 }
 
+/// Migrated to `quadraui::MultiSectionView` (#293).
+///
+/// Panel header + search input + focus border stay panel-specific
+/// chrome; the two "INSTALLED" / "AVAILABLE" sections become a
+/// `MultiSectionView` built by
+/// `render::ext_sidebar_to_multi_section_view` and rasterised via
+/// `quadraui::gtk::draw_multi_section_view`. Both paint and
+/// `Msg::ExtSidebarClick` consult the same `MultiSectionViewLayout`
+/// (via `quadraui::gtk::gtk_msv_layout`), so per-section
+/// drift is impossible by construction (the structural fix for the
+/// #281 bug classes).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_ext_sidebar(
     cr: &Context,
@@ -5943,6 +3845,8 @@ pub(super) fn draw_ext_sidebar(
     w: f64,
     h: f64,
     line_height: f64,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    engine: &crate::core::engine::Engine,
 ) {
     let Some(ref ext) = screen.ext_sidebar else {
         return;
@@ -5953,78 +3857,14 @@ pub(super) fn draw_ext_sidebar(
     let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
     let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-    let (sel_r, sel_g, sel_b) = theme.fuzzy_selected_bg.to_cairo();
 
     // Background
     cr.set_source_rgb(bg_r, bg_g, bg_b);
     cr.rectangle(x, y, w, h);
     cr.fill().ok();
 
-    // Item rows get extra vertical padding for readability.
-    let item_height = (line_height * 1.4).ceil();
-    let pad = (item_height - line_height) / 2.0;
-
     layout.set_attributes(None);
     let mut ry: f64 = 0.0;
-
-    // Helper: draw a text row with optional right-aligned hint (only on selected).
-    // Returns the row height used.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_item_row(
-        cr: &Context,
-        layout: &pango::Layout,
-        x: f64,
-        y: f64,
-        ry: f64,
-        w: f64,
-        item_height: f64,
-        pad: f64,
-        is_selected: bool,
-        sel_rgb: (f64, f64, f64),
-        fg_rgb: (f64, f64, f64),
-        sel_fg_rgb: (f64, f64, f64),
-        dim_rgb: (f64, f64, f64),
-        name_text: &str,
-        hint: &str,
-    ) {
-        if is_selected {
-            cr.set_source_rgb(sel_rgb.0, sel_rgb.1, sel_rgb.2);
-            cr.rectangle(x, y + ry, w, item_height);
-            cr.fill().ok();
-        }
-        // Measure hint width.
-        let hint_w = if is_selected && !hint.is_empty() {
-            layout.set_text(hint);
-            layout.pixel_size().0
-        } else {
-            0
-        };
-        // Draw name with ellipsis if needed.
-        let name_max = (w - 6.0 - hint_w as f64).max(20.0) as i32;
-        let text_rgb = if is_selected { sel_fg_rgb } else { fg_rgb };
-        cr.set_source_rgb(text_rgb.0, text_rgb.1, text_rgb.2);
-        layout.set_text(name_text);
-        layout.set_width(name_max * pango::SCALE);
-        layout.set_ellipsize(pango::EllipsizeMode::End);
-        let (_, text_h) = layout.pixel_size();
-        cr.move_to(
-            x + 2.0,
-            y + ry + pad + (item_height - pad * 2.0 - text_h as f64) / 2.0,
-        );
-        pangocairo::show_layout(cr, layout);
-        layout.set_width(-1);
-        layout.set_ellipsize(pango::EllipsizeMode::None);
-        // Right-aligned hint.
-        if hint_w > 0 {
-            cr.set_source_rgb(dim_rgb.0, dim_rgb.1, dim_rgb.2);
-            layout.set_text(hint);
-            cr.move_to(
-                x + w - hint_w as f64 - 4.0,
-                y + ry + pad + (item_height - pad * 2.0 - text_h as f64) / 2.0,
-            );
-            pangocairo::show_layout(cr, layout);
-        }
-    }
 
     // ── Row 0: panel header ──────────────────────────────────────────────────
     cr.set_source_rgb(hdr_r, hdr_g, hdr_b);
@@ -6073,137 +3913,20 @@ pub(super) fn draw_ext_sidebar(
         ry += line_height;
     }
 
-    // ── INSTALLED section ─────────────────────────────────────────────────────
-    let installed_count = ext.items_installed.len();
-    if ry < h {
-        let arrow = if ext.sections_expanded[0] {
-            "▼"
-        } else {
-            "▶"
-        };
-        let sec_hdr = format!("  {} INSTALLED ({})", arrow, installed_count);
-        cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
-        cr.rectangle(x, y + ry, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(dim_r, dim_g, dim_b);
-        layout.set_text(&sec_hdr);
-        let (_, lh3) = layout.pixel_size();
-        cr.move_to(x + 2.0, y + ry + (line_height - lh3 as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-        ry += line_height;
+    // ── SidebarSystem body: rest of the panel ──────────────────────────────
+    let body_h = (h - ry).max(0.0);
+    if body_h > 0.0 {
+        let body_rect = quadraui::Rect::new(x as f32, (y + ry) as f32, w as f32, body_h as f32);
+        engine.ext_sidebar_body_rect.set(body_rect);
+        render::populate_ext_sidebar_system(engine);
+        backend.borrow_mut().enter_frame_scope(cr, layout, |b| {
+            b.set_current_theme(super::quadraui_gtk::q_theme(theme));
+            b.set_current_line_height(line_height);
+            engine.ext_sidebar_system.borrow().render(b, body_rect);
+        });
     }
 
-    if ext.sections_expanded[0] {
-        for (idx, item) in ext.items_installed.iter().enumerate() {
-            if ry >= h {
-                break;
-            }
-            let is_selected = ext.has_focus && ext.selected == idx;
-            let name_text = if item.update_available {
-                format!("  ● {} \u{2191}", item.display_name)
-            } else {
-                format!("  ● {}", item.display_name)
-            };
-            let hint = if !is_selected {
-                ""
-            } else if item.update_available {
-                "[u]update"
-            } else {
-                "[d]remove"
-            };
-            draw_item_row(
-                cr,
-                layout,
-                x,
-                y,
-                ry,
-                w,
-                item_height,
-                pad,
-                is_selected,
-                (sel_r, sel_g, sel_b),
-                (fg_r, fg_g, fg_b),
-                (hdr_fg_r, hdr_fg_g, hdr_fg_b),
-                (dim_r, dim_g, dim_b),
-                &name_text,
-                hint,
-            );
-            ry += item_height;
-        }
-        if installed_count == 0 && ry < h {
-            cr.set_source_rgb(dim_r, dim_g, dim_b);
-            layout.set_text("    (none installed)");
-            let (_, lhn) = layout.pixel_size();
-            cr.move_to(x + 2.0, y + ry + (item_height - lhn as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-            ry += item_height;
-        }
-    }
-
-    // ── AVAILABLE section ─────────────────────────────────────────────────────
-    let available_count = ext.items_available.len();
-    if ry < h {
-        let arrow = if ext.sections_expanded[1] {
-            "▼"
-        } else {
-            "▶"
-        };
-        let sec_hdr = format!("  {} AVAILABLE ({})", arrow, available_count);
-        cr.set_source_rgb(hdr_r * 0.85, hdr_g * 0.85, hdr_b * 0.85);
-        cr.rectangle(x, y + ry, w, line_height);
-        cr.fill().ok();
-        cr.set_source_rgb(dim_r, dim_g, dim_b);
-        layout.set_text(&sec_hdr);
-        let (_, lh5) = layout.pixel_size();
-        cr.move_to(x + 2.0, y + ry + (line_height - lh5 as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-        ry += line_height;
-    }
-
-    if ext.sections_expanded[1] {
-        for (idx, item) in ext.items_available.iter().enumerate() {
-            if ry >= h {
-                break;
-            }
-            let flat_idx = installed_count + idx;
-            let is_selected = ext.has_focus && ext.selected == flat_idx;
-            let name_text = format!("  ○ {}", item.display_name);
-            let hint = if is_selected { "[i]install" } else { "" };
-            draw_item_row(
-                cr,
-                layout,
-                x,
-                y,
-                ry,
-                w,
-                item_height,
-                pad,
-                is_selected,
-                (sel_r, sel_g, sel_b),
-                (fg_r, fg_g, fg_b),
-                (hdr_fg_r, hdr_fg_g, hdr_fg_b),
-                (dim_r, dim_g, dim_b),
-                &name_text,
-                hint,
-            );
-            ry += item_height;
-        }
-        if available_count == 0 && ry < h {
-            let msg = if ext.fetching {
-                "    Fetching registry…"
-            } else {
-                "    (all extensions installed)"
-            };
-            cr.set_source_rgb(dim_r, dim_g, dim_b);
-            layout.set_text(msg);
-            let (_, lhn) = layout.pixel_size();
-            cr.move_to(x + 2.0, y + ry + (item_height - lhn as f64) / 2.0);
-            pangocairo::show_layout(cr, layout);
-            ry += item_height;
-        }
-    }
-
-    // Focus border
+    // Focus border (drawn last so it sits on top of bg + section paint)
     if ext.has_focus {
         let (kr, kg, kb) = theme.keyword.to_cairo();
         cr.set_source_rgb(kr, kg, kb);
@@ -6211,8 +3934,6 @@ pub(super) fn draw_ext_sidebar(
         cr.rectangle(x + 0.75, y + 0.75, w - 1.5, h - 1.5);
         cr.stroke().ok();
     }
-
-    let _ = ry;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6236,8 +3957,6 @@ pub(super) fn draw_ai_sidebar(
     let (hdr_fg_r, hdr_fg_g, hdr_fg_b) = theme.status_fg.to_cairo();
     let (fg_r, fg_g, fg_b) = theme.foreground.to_cairo();
     let (dim_r, dim_g, dim_b) = theme.line_number_fg.to_cairo();
-    let (user_r, user_g, user_b) = theme.keyword.to_cairo();
-    let (asst_r, asst_g, asst_b) = theme.string_lit.to_cairo();
 
     // Background
     cr.set_source_rgb(bg_r, bg_g, bg_b);
@@ -6300,18 +4019,22 @@ pub(super) fn draw_ai_sidebar(
     let max_row_y = input_y; // messages render above this
 
     // ── Message history ───────────────────────────────────────────────────────
-    let mut vis_rows: Vec<(String, f64, f64, f64, f64)> = Vec::new();
+    let q_user_fg = render::to_quadraui_color(theme.keyword);
+    let q_asst_fg = render::to_quadraui_color(theme.string_lit);
+    let q_default_fg = render::to_quadraui_color(theme.foreground);
+    let q_dim_fg = render::to_quadraui_color(theme.line_number_fg);
+    let mut rows: Vec<quadraui::MessageRow> = Vec::new();
     for msg in &ai.messages {
         let is_user = msg.role == "user";
-        let (role_label, rr, rg, rb) = if is_user {
-            ("You:", user_r, user_g, user_b)
+        let (role_label, role_fg) = if is_user {
+            ("You:", q_user_fg)
         } else {
-            ("AI:", asst_r, asst_g, asst_b)
+            ("AI:", q_asst_fg)
         };
-        vis_rows.push((role_label.to_string(), rr, rg, rb, 4.0));
+        rows.push(quadraui::MessageRow::new(role_label, role_fg, 4.0));
         for line in msg.content.lines() {
             if line.is_empty() {
-                vis_rows.push((" ".to_string(), fg_r, fg_g, fg_b, 12.0));
+                rows.push(quadraui::MessageRow::new(" ", q_default_fg, 12.0));
                 continue;
             }
             let chars: Vec<char> = line.chars().collect();
@@ -6319,26 +4042,28 @@ pub(super) fn draw_ai_sidebar(
             while pos < chars.len() {
                 let end = (pos + wrap_cols).min(chars.len());
                 let chunk: String = chars[pos..end].iter().collect();
-                vis_rows.push((chunk, fg_r, fg_g, fg_b, 12.0));
+                rows.push(quadraui::MessageRow::new(chunk, q_default_fg, 12.0));
                 pos = end;
             }
         }
-        vis_rows.push((" ".to_string(), dim_r, dim_g, dim_b, 0.0));
+        rows.push(quadraui::MessageRow::new(" ", q_dim_fg, 0.0));
     }
-
-    let scroll = ai.scroll_top.min(vis_rows.len().saturating_sub(1));
-    for (i, (text, rr, rg, rb, xi)) in vis_rows.iter().enumerate().skip(scroll) {
-        let vrow = (i - scroll + 1) as f64;
-        let ry = vrow * line_height;
-        if ry >= max_row_y {
-            break;
-        }
-        cr.set_source_rgb(*rr, *rg, *rb);
-        layout.set_text(text);
-        let (_, lh) = layout.pixel_size();
-        cr.move_to(x + xi, y + ry + (line_height - lh as f64) / 2.0);
-        pangocairo::show_layout(cr, layout);
-    }
+    let scroll = ai.scroll_top.min(rows.len().saturating_sub(1));
+    let msg_list = quadraui::MessageList {
+        id: quadraui::WidgetId::new("gtk:ai:messages"),
+        rows,
+        scroll_top: scroll,
+    };
+    quadraui::gtk::draw_message_list(
+        cr,
+        layout,
+        &msg_list,
+        x,
+        y + line_height,
+        w,
+        y + max_row_y,
+        line_height,
+    );
 
     // ── Input area (grows with content) ───────────────────────────────────────
     // Separator line
@@ -6443,44 +4168,4 @@ pub(super) fn draw_ai_sidebar(
     }
 
     let _ = row;
-}
-
-pub(super) fn draw_debug_toolbar(
-    cr: &Context,
-    toolbar: &render::DebugToolbarData,
-    theme: &Theme,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) {
-    let (r, g, b) = theme.status_bg.to_cairo();
-    cr.set_source_rgb(r, g, b);
-    cr.rectangle(x, y, width, height);
-    let _ = cr.fill();
-
-    let (fr, fg_c, fb) = if toolbar.session_active {
-        theme.status_fg.to_cairo()
-    } else {
-        theme.line_number_fg.to_cairo()
-    };
-    cr.set_source_rgb(fr, fg_c, fb);
-
-    let mut cursor_x = x + 8.0;
-    for (idx, btn) in toolbar.buttons.iter().enumerate() {
-        if idx == 4 {
-            // Separator
-            let (dr, dg, db) = theme.line_number_fg.to_cairo();
-            cr.set_source_rgb(dr, dg, db);
-            cr.move_to(cursor_x, y + 2.0);
-            cr.line_to(cursor_x, y + height - 2.0);
-            let _ = cr.stroke();
-            cr.set_source_rgb(fr, fg_c, fb);
-            cursor_x += 8.0;
-        }
-        cr.move_to(cursor_x, y + height * 0.7);
-        let text = format!("{} ({}) ", btn.label, btn.key_hint);
-        let _ = cr.show_text(&text);
-        cursor_x += text.len() as f64 * 7.0;
-    }
 }

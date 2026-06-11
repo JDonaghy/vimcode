@@ -11,6 +11,11 @@ impl Engine {
         body: Vec<String>,
         buttons: Vec<DialogButton>,
     ) {
+        // Opening a dialog is a "user is now focused on this modal"
+        // event — dismiss any passive overlays (LSP hover) so they
+        // don't render behind the dialog (#247).
+        self.dismiss_editor_hover();
+
         self.dialog = Some(Dialog {
             title: title.to_string(),
             body,
@@ -19,6 +24,61 @@ impl Engine {
             tag: tag.to_string(),
             input: None,
         });
+    }
+
+    /// Show the quit-with-unsaved-changes confirm dialog.
+    pub fn show_quit_confirm(&mut self) {
+        self.show_dialog(
+            "quit_unsaved",
+            "Unsaved Changes",
+            vec![
+                "You have unsaved changes.".to_string(),
+                "Do you want to save before quitting?".to_string(),
+            ],
+            vec![
+                DialogButton {
+                    label: "Save All & Quit".into(),
+                    hotkey: 's',
+                    action: "save_quit".into(),
+                },
+                DialogButton {
+                    label: "Quit Without Saving".into(),
+                    hotkey: 'q',
+                    action: "discard_quit".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+    }
+
+    /// Show the close-tab-with-unsaved-changes confirm dialog.
+    pub fn show_close_tab_confirm(&mut self) {
+        self.show_dialog(
+            "close_tab_confirm",
+            "Unsaved Changes",
+            vec!["This file has unsaved changes.".to_string()],
+            vec![
+                DialogButton {
+                    label: "Save & Close".into(),
+                    hotkey: 's',
+                    action: "save_close".into(),
+                },
+                DialogButton {
+                    label: "Discard & Close".into(),
+                    hotkey: 'd',
+                    action: "discard".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
     }
 
     /// Convenience: show an error dialog with a single OK button.
@@ -94,10 +154,16 @@ impl Engine {
                 }
                 None
             }
-            "Tab" | "Shift_Tab" => {
+            // "Shift_Tab" is sent by the TUI backend explicitly.
+            // "ISO_Left_Tab" is GDK's key name for Shift+Tab; "BackTab" is the
+            // value produced by map_gtk_key_name("ISO_Left_Tab").  Accept all
+            // three so backward button cycling works on both backends.
+            "Tab" | "Shift_Tab" | "ISO_Left_Tab" | "BackTab" => {
                 let len = dialog.buttons.len();
                 if len > 0 {
-                    if effective == "Shift_Tab" {
+                    let go_back =
+                        matches!(effective.as_str(), "Shift_Tab" | "ISO_Left_Tab" | "BackTab");
+                    if go_back {
                         dialog.selected = if dialog.selected > 0 {
                             dialog.selected - 1
                         } else {
@@ -135,6 +201,16 @@ impl Engine {
                             input.value.push(ch);
                         }
                     }
+                    return None;
+                }
+                // Only single-character keys can be dialog hotkeys.
+                // Multi-character key names — modifier keys ("Shift_L",
+                // "Control_R"), function keys ("F5"), named keys
+                // ("Delete"), GDK nav keys ("ISO_Left_Tab") — are NOT
+                // hotkey characters.  Without this guard the first letter
+                // of e.g. "Shift_L" is 'S', which would accidentally fire
+                // a "Save" button whose hotkey is 's'.
+                if effective.chars().count() != 1 {
                     return None;
                 }
                 // Check hotkeys (case-insensitive).
@@ -277,6 +353,13 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "search_replace_all" => {
+                if action == "replace" {
+                    let root = self.cwd.clone();
+                    self.start_project_replace(root);
+                }
+                EngineAction::None
+            }
             "ext_remove" => {
                 if let Some(name) = self.pending_ext_remove.take() {
                     match action {
@@ -355,11 +438,11 @@ impl Engine {
                     "save_close" => {
                         self.escape_to_normal();
                         let _ = self.save();
-                        self.close_tab();
+                        return self.execute_command("quit");
                     }
                     "discard" => {
                         self.escape_to_normal();
-                        self.close_tab();
+                        return self.execute_command("quit!");
                     }
                     _ => {} // cancel — do nothing
                 }
@@ -632,16 +715,27 @@ impl Engine {
 
     /// Notify LSP that a file was closed.
     pub(crate) fn lsp_did_close(&mut self, buffer_id: BufferId) {
-        let path = self
-            .buffer_manager
-            .get(buffer_id)
-            .and_then(|s| s.file_path.clone());
-        if let Some(ref path) = path {
-            if let Some(mgr) = &mut self.lsp_manager {
-                mgr.notify_did_close(path);
+        let (notify_path, key_path) = match self.buffer_manager.get(buffer_id) {
+            Some(s) => {
+                let notify = match &s.file_path {
+                    Some(p) => p.clone(),
+                    None => return,
+                };
+                // #208: lsp_diagnostics is keyed by the URI-derived canonical
+                // path (insertions in the Diagnostics handler use uri_to_path).
+                // Removing by the buffer's original `file_path` is a no-op
+                // when that path was relative, leaving stale diagnostics in
+                // the gutter. canonical_path is cached at file-open time.
+                let key = s.canonical_path.clone().unwrap_or_else(|| notify.clone());
+                (notify, key)
             }
-            self.lsp_diagnostics.remove(path);
+            None => return,
+        };
+        if let Some(mgr) = &mut self.lsp_manager {
+            mgr.notify_did_close(&notify_path);
         }
+        self.lsp_diagnostics.remove(&key_path);
+        self.invalidate_explorer_indicators();
     }
 
     /// Flush any pending didChange notifications (called from UI poll loop).
@@ -663,33 +757,49 @@ impl Engine {
         let dirty: Vec<BufferId> = self.lsp_dirty_buffers.keys().copied().collect();
         for buffer_id in dirty {
             self.lsp_dirty_buffers.remove(&buffer_id);
-            let (path, text) = {
+            // `notify_path` is what we pass to LSP calls (path_to_uri
+            // canonicalizes internally). `key_path` is the canonical path
+            // used to key our own HashMaps (lsp_diagnostics,
+            // lsp_code_actions) — they're populated by handlers that
+            // decode the URI back via uri_to_path, which always yields the
+            // canonical absolute path. Removing by a relative `file_path`
+            // was silently a no-op (#208) — stale gutter markers persisted
+            // after git discard / revert until the server re-published.
+            let (notify_path, key_path, text) = {
                 let state = match self.buffer_manager.get(buffer_id) {
                     Some(s) => s,
                     None => continue,
                 };
-                let path = match &state.file_path {
+                let notify = match &state.file_path {
                     Some(p) => p.clone(),
                     None => continue,
                 };
                 if state.lsp_language_id.is_none() {
                     continue;
                 }
-                (path, state.buffer.to_string())
+                let key = state
+                    .canonical_path
+                    .clone()
+                    .unwrap_or_else(|| notify.clone());
+                (notify, key, state.buffer.to_string())
             };
             // Clear stale position-based data immediately — line numbers from
             // the previous buffer state would highlight/annotate wrong lines.
+            // Also reset the received flag so the indicator briefly returns
+            // to `Initializing` until the re-requested tokens arrive (#230).
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.semantic_tokens.clear();
+                state.semantic_tokens_received = false;
             }
-            self.lsp_diagnostics.remove(&path);
-            self.lsp_code_actions.remove(&path);
+            self.lsp_diagnostics.remove(&key_path);
+            self.invalidate_explorer_indicators();
+            self.lsp_code_actions.remove(&key_path);
             self.lsp_code_action_last_line = None;
             if let Some(mgr) = &mut self.lsp_manager {
-                mgr.notify_did_change(&path, &text);
+                mgr.notify_did_change(&notify_path, &text);
             }
             // Re-request semantic tokens after the server processes the change.
-            self.lsp_request_semantic_tokens(&path);
+            self.lsp_request_semantic_tokens(&notify_path);
         }
     }
 
@@ -788,6 +898,7 @@ impl Engine {
                             .collect()
                     };
                     self.lsp_diagnostics.insert(path, filtered);
+                    self.invalidate_explorer_indicators();
                 }
                 LspEvent::CompletionResponse {
                     request_id, items, ..
@@ -810,9 +921,24 @@ impl Engine {
                             if !lsp_cands.is_empty() {
                                 self.completion_start_col =
                                     self.view().cursor.col - cur_prefix.chars().count();
-                                self.completion_candidates = lsp_cands;
-                                self.completion_idx = Some(0);
+                                // #467: merge into existing candidates instead
+                                // of replacing — fresh LSP fetches at narrower
+                                // prefixes can return a smaller set than the
+                                // previous response, and items the user already
+                                // saw shouldn't silently disappear. The narrow
+                                // step in `trigger_completion` already pruned
+                                // anything that no longer matches the prefix,
+                                // so existing candidates are still valid.
+                                for cand in lsp_cands {
+                                    if !self.completion_candidates.iter().any(|c| c == &cand) {
+                                        self.completion_candidates.push(cand);
+                                    }
+                                }
+                                if self.completion_idx.is_none() {
+                                    self.completion_idx = Some(0);
+                                }
                                 self.completion_display_only = true;
+                                self.completion_filter_prefix = cur_prefix;
                                 redraw = true;
                             }
                         }
@@ -1077,7 +1203,11 @@ impl Engine {
                             .collect();
                         self.quickfix_selected = 0;
                         self.quickfix_open = true;
-                        self.quickfix_has_focus = false;
+                        // Focus the panel — Neovim convention for `gr`
+                        // (Find References) is to land the user in the
+                        // quickfix so j/k/Enter drive the result list
+                        // without a follow-up `:copen`. Closes #150.
+                        self.quickfix_has_focus = true;
                         self.message = format!("{} references found", self.quickfix_items.len());
                     }
                     redraw = true;
@@ -1219,6 +1349,12 @@ impl Engine {
                                 if let Some(state) = self.buffer_manager.get_mut(bid) {
                                     if state.file_path.as_deref() == Some(path.as_path()) {
                                         state.semantic_tokens = decoded;
+                                        // #230: record receipt even when the
+                                        // server returns zero tokens. The
+                                        // LSP status indicator uses this to
+                                        // distinguish "haven't responded
+                                        // yet" from "responded empty".
+                                        state.semantic_tokens_received = true;
                                         redraw = true;
                                         break;
                                     }
@@ -1277,6 +1413,40 @@ impl Engine {
                             redraw = true;
                         }
                     }
+                }
+                LspEvent::WorkProgressBegin {
+                    server_id,
+                    token,
+                    title,
+                    message,
+                    percentage,
+                } => {
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.work_progress_begin(server_id, token, title, message, percentage);
+                    }
+                    // Status indicator may change (Running → Initializing
+                    // while indexing) — request a redraw (#450).
+                    redraw = true;
+                }
+                LspEvent::WorkProgressReport {
+                    server_id,
+                    token,
+                    message,
+                    percentage,
+                } => {
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.work_progress_report(server_id, &token, message, percentage);
+                    }
+                    // Message/percentage changed → segment text changed (#221).
+                    redraw = true;
+                }
+                LspEvent::WorkProgressEnd { server_id, token } => {
+                    if let Some(mgr) = self.lsp_manager.as_mut() {
+                        mgr.work_progress_end(server_id, &token);
+                    }
+                    // Status indicator may change (Initializing → Running
+                    // once indexing completes) — request a redraw (#450).
+                    redraw = true;
                 }
             }
         }
@@ -1352,10 +1522,17 @@ impl Engine {
 
     /// Extract clickable links from rendered markdown.
     ///
-    /// Pairs each `Link` span (the label text) with the following `LinkUrl` span
-    /// (the URL) on the same line. The returned click region covers the label,
-    /// while the URL is used for dispatch. Command URIs displayed as `:Name?args`
-    /// are restored to `command:Name?args`.
+    /// Two sources of click regions are handled:
+    ///
+    /// 1. **Markdown links** — each `Link` span (the label text) is paired with
+    ///    the following `LinkUrl` span on the same line.  The click region covers
+    ///    the label; the URL drives dispatch.  Command URIs displayed as
+    ///    `:Name?args` are restored to `command:Name?args`.
+    ///
+    /// 2. **Bare URLs** — standalone `LinkUrl` spans (emitted by `render_markdown`
+    ///    for plain `http://` / `https://` text) become their own click regions.
+    ///    The span text is the URL itself, so no reconstruction is needed beyond
+    ///    the same `:` → `command:` prefix check used for markdown link URLs.
     pub(crate) fn extract_hover_links(
         rendered: &crate::core::markdown::MdRendered,
     ) -> Vec<(usize, usize, usize, String)> {
@@ -1365,11 +1542,11 @@ impl Engine {
             let Some(line) = rendered.lines.get(line_idx) else {
                 continue;
             };
-            // Find each Link span and pair it with the next LinkUrl on the same line.
+            // Walk every span on this line.
             let mut span_iter = line_spans.iter().peekable();
             while let Some(span) = span_iter.next() {
                 if span.style == MdStyle::Link {
-                    // Look for the following LinkUrl span to get the URL.
+                    // Paired markdown link: look for the following LinkUrl span.
                     let url = span_iter
                         .peek()
                         .filter(|next| next.style == MdStyle::LinkUrl)
@@ -1391,6 +1568,19 @@ impl Engine {
                             // Click region = the Link label span.
                             links.push((line_idx, span.start_byte, span.end_byte, url));
                         }
+                    }
+                } else if span.style == MdStyle::LinkUrl && span.end_byte <= line.len() {
+                    // Standalone LinkUrl span (bare URL or the URL display of a
+                    // markdown link).  Make the span itself clickable.
+                    let url_text = &line[span.start_byte..span.end_byte];
+                    // Restore command: prefix if displayed as ":Name?args".
+                    let url = if url_text.starts_with(':') {
+                        format!("command{}", url_text)
+                    } else {
+                        url_text.to_string()
+                    };
+                    if is_safe_url(&url) {
+                        links.push((line_idx, span.start_byte, span.end_byte, url));
                     }
                 }
             }
@@ -1547,7 +1737,7 @@ impl Engine {
         serde_json::Value::Array(arr)
     }
 
-    /// Whether any code actions are available on the given line.
+    #[allow(dead_code)]
     pub fn has_code_actions_on_line(&self, line: usize) -> bool {
         let Some(path) = self.active_buffer_path() else {
             return false;
@@ -1667,6 +1857,17 @@ impl Engine {
         if !self.settings.lsp_enabled {
             return;
         }
+        // Signature help fires from `handle_insert_key` (`(` / `,` keystrokes)
+        // BEFORE `handle_key` reaches the line that marks the buffer dirty,
+        // and well before the UI loop's normal `lsp_flush_changes` poll. So
+        // the LSP server's view of the buffer is stale at this point: the
+        // request would point past a character the server doesn't yet know
+        // about, and rust-analyzer would respond with no signatures.
+        // Mark the active buffer dirty ourselves and flush synchronously so
+        // the server sees the current text + cursor position together.
+        let active_id = self.active_buffer_id();
+        self.lsp_dirty_buffers.insert(active_id, true);
+        self.lsp_flush_changes();
         let (path, line, col_utf16) = match self.lsp_cursor_position() {
             Some(v) => v,
             None => return,

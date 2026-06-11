@@ -255,10 +255,19 @@ fn test_z_minus_scroll_bottom_first_nonblank() {
 
 // ── zh/zl: horizontal scroll ────────────────────────────────────────────────
 
+// NOTE on test setup: `ensure_cursor_visible` runs after every key press
+// (see `handle_key` in keys.rs) and snaps `scroll_left` to keep the cursor
+// inside the viewport. If the test sets `scroll_left` without also placing
+// the cursor inside the new visible range, the very first key press
+// (including the `z` that only sets `pending_key`) will reset `scroll_left`
+// to follow the cursor. So these tests set cursor.col consistently with
+// scroll_left — the same invariant the engine maintains in real usage.
+
 #[test]
 fn test_zh_scroll_left() {
     let mut e = engine_with("hello world\n");
     e.view_mut().scroll_left = 5;
+    e.view_mut().cursor.col = 5;
     type_chars(&mut e, "zh");
     assert_eq!(e.view().scroll_left, 4);
 }
@@ -274,6 +283,7 @@ fn test_zl_scroll_right() {
 fn test_zh_with_count() {
     let mut e = engine_with("hello world\n");
     e.view_mut().scroll_left = 10;
+    e.view_mut().cursor.col = 10;
     type_chars(&mut e, "3zh");
     assert_eq!(e.view().scroll_left, 7);
 }
@@ -291,6 +301,7 @@ fn test_zl_with_count() {
 fn test_zh_big_scroll_half_left() {
     let mut e = engine_with("hello world\n");
     e.view_mut().scroll_left = 50;
+    e.view_mut().cursor.col = 50;
     e.view_mut().viewport_cols = 80;
     type_chars(&mut e, "zH");
     assert_eq!(e.view().scroll_left, 10); // 50 - 40 = 10

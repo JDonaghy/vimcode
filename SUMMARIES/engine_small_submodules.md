@@ -14,6 +14,18 @@ Convenience facade methods for accessing the active group/buffer/window.
 - `clear_sidebar_focus()` — clear all sidebar panel focus flags
 - `explorer_indicators()` — git statuses + diagnostic counts for explorer tree; propagates both recursively to parent dirs
 
+## explorer_ops.rs — 572 lines
+Explorer file tree operations, TreeController event dispatch, inline editing, drag-and-drop.
+- `explorer_rebuild_rows()` — flatten dir tree into `explorer_rows` with expand/collapse state
+- `explorer_toggle_dir(idx)` — toggle dir expand/collapse
+- `explorer_reveal_path(target)` — expand ancestors + scroll to file
+- `explorer_activate_selected()` — Enter key: toggle dir / open file
+- `explorer_scroll(delta)` — scroll tree by delta rows
+- `handle_explorer_mouse_event(tree_event) -> bool` — single-click dispatch: toggle dir / preview file (#415)
+- `dispatch_explorer_tree_event(tree_event) -> bool` — double-click + keyboard dispatch: toggle dir / open file + inline edit confirm/cancel
+- `dispatch_explorer_key(key, ctrl, unicode)` — keyboard routing (j/k nav, Enter, rename, delete, etc.)
+- `explorer_move_file(src, target)` / `explorer_confirm_delete()` — file operations
+
 ## search.rs — 642 lines
 Cursor visibility, scroll synchronization, project search/replace, word search.
 - `ensure_cursor_visible()` / `ensure_cursor_visible_wrap()` — scroll to keep cursor in view
@@ -116,9 +128,11 @@ Unified fuzzy picker (Telescope-style), command center, quickfix, and branch pic
 - `picker_request_workspace_symbols()` — send LSP workspace/symbol request
 - `fuzzy_filter_items()` — shared fuzzy filter helper
 
-## terminal_ops.rs — 478 lines
+## terminal_ops.rs — 525 lines
 Integrated terminal management.
 - `terminal_toggle()` — Ctrl-T show/hide terminal panel
+- `toggle_terminal_maximize(target_rows)` — Ctrl-Shift-T toggle maximize; saves/restores session.terminal_panel_rows via terminal_saved_rows
+- `close_terminal()` — hide panel; auto-restores saved rows if maximized
 - `terminal_new()` — create new terminal tab
 - `terminal_close(idx)` — close terminal tab
 - `terminal_write(data)` — send input to active terminal
