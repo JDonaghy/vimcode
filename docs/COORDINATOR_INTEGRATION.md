@@ -3,6 +3,7 @@
 > **Status:** Design / pre-implementation — _2026-06-12_
 > **Repos:** `JDonaghy/vimcode` (host), `JDonaghy/quadraui` (shared component), `JDonaghy/claude-coordinator` (data + pipeline brain)
 > **Pre-req issues:** [quadraui#362](https://github.com/JDonaghy/quadraui/issues/362) (Board component), [claude-coordinator#550](https://github.com/JDonaghy/claude-coordinator/issues/550) (`coord board --json`), [vimcode#521](https://github.com/JDonaghy/vimcode/issues/521) (Issues panel)
+> **Roadmap:** milestone [`vimcode-coordinator`](https://github.com/JDonaghy/vimcode/milestone/6) · epic [#531](https://github.com/JDonaghy/vimcode/issues/531) (live tracker + dependency graph)
 
 ## 1. Goal — client parity
 
@@ -247,16 +248,21 @@ host is vimcode specifically rather than any board renderer.
 
 ## 11. Phased plan
 
-0. **Read-only board panel** — Issues activity entry renders the shared component from
-   `coord board --json`. No actions. Proves the seam. *(blocks: quadraui Board, coord JSON,
-   vimcode panel — the three pre-reqs.)*
-1. **Issue authoring as buffers** — `:CoordRefine`, `:w` pushes. Cheap, very vimcode-native.
-2. **In-editor diff review** — `OpenReview` → multi-file diff tab, hunk nav, approve /
-   request-changes → `coord report-result`. *The differentiator.*
-3. **Inline comments → findings + human edits pushed back.**
-4. **Observability** — live worker-log stream, plan preview, growing diff (wants the
-   quadraui terminal primitive vimcode doesn't yet adopt).
-5. **Remote / terminal** — vimcode-over-ssh as the fleet's review seat.
+_Issue numbers in brackets; epic [#531](https://github.com/JDonaghy/vimcode/issues/531) is the live tracker._
+
+- **Foundation** — `coord_client.rs` subprocess + JSON bridge. **[#522]** _(blocks all)_
+- **Phase 0 — read-only board panel** — Issues activity entry renders the shared component
+  from `coord board --json`. **[#521]** _(blocks: quadraui#362, coord#550, #522)_
+- **Phase 0b — board actions** — wire `BoardAction` → `coord` (dispatch/test/review/merge).
+  **[#523]**
+- **Phase 1 — issue authoring as buffers** — `:CoordRefine`, `:w` pushes. **[#524]**
+- **Phase 2 — in-editor diff review** — `OpenReview` → multi-file diff tab, hunk nav. **[#525]**
+  → verdict via `coord report-result`. **[#526]** *The differentiator.*
+- **Phase 3 — hands-on** — inline comments → findings **[#527]**; human edits pushed back
+  to the branch **[#528]**.
+- **Phase 4 — observability** — live worker-log stream, plan preview, growing diff (adopts
+  the quadraui terminal primitive). **[#529]**
+- **Phase 5 — remote / terminal** — vimcode-over-ssh as the fleet's review seat. **[#530]**
 
 ## 12. Pre-req issues
 
