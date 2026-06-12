@@ -2124,7 +2124,7 @@ pub(super) fn handle_mouse(
                             let track_len = (geom.height - geom.content_y).max(0.0) as u16;
                             let total = engine
                                 .active_terminal()
-                                .map(|t| t.history.len())
+                                .map(|t| t.history_len())
                                 .unwrap_or(0);
                             let tl = track_len as f32;
                             drag_state.begin(quadraui::DragTarget::ScrollbarY {

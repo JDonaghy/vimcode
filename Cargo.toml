@@ -49,7 +49,7 @@ gui = ["gtk4", "relm4", "pangocairo", "gio", "quadraui/gtk"]
 # next to vimcode (i.e. `~/src/quadraui` and `~/src/vimcode` as siblings).
 # CI configuration that doesn't have quadraui sibling-checked-out is
 # currently disabled — see `.github/workflows/*.disabled`.
-quadraui = { path = "../quadraui/quadraui", features = ["tui"] }
+quadraui = { path = "../quadraui/quadraui", features = ["tui", "terminal"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 relm4 = { version = "0.7", optional = true }
 pangocairo = { version = "0.18", optional = true }
@@ -83,8 +83,6 @@ ignore = "0.4"
 regex = "1"
 lsp-types = "0.97"
 copypasta-ext = "0.4"
-portable-pty = "0.8"
-vt100 = "0.15"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 toml = "0.8"
 libc = "0.2"

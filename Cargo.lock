@@ -1859,9 +1859,11 @@ dependencies = [
  "arboard",
  "gtk4",
  "pangocairo",
+ "portable-pty",
  "ratatui",
  "serde",
  "unicode-width 0.2.0",
+ "vt100",
 ]
 
 [[package]]
@@ -2809,7 +2811,6 @@ dependencies = [
  "mlua",
  "notify",
  "pangocairo",
- "portable-pty",
  "pulldown-cmark",
  "quadraui",
  "ratatui",
@@ -2841,7 +2842,6 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
- "vt100",
 ]
 
 [[package]]

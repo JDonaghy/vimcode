@@ -3,13 +3,13 @@ use super::*;
 impl Engine {
     // ── Integrated Terminal ────────────────────────────────────────────────
 
-    /// Get a reference to the active terminal pane, if any.
-    pub fn active_terminal(&self) -> Option<&TerminalPane> {
+    /// Get a reference to the active terminal session, if any.
+    pub fn active_terminal(&self) -> Option<&TerminalSession> {
         self.terminal_panes.get(self.terminal_active)
     }
 
-    /// Get a mutable reference to the active terminal pane, if any.
-    pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalPane> {
+    /// Get a mutable reference to the active terminal session, if any.
+    pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalSession> {
         self.terminal_panes.get_mut(self.terminal_active)
     }
 
@@ -35,9 +35,10 @@ impl Engine {
         let shell = default_shell();
         let cwd = dir.unwrap_or(&self.cwd).to_path_buf();
         let history_cap = self.settings.terminal_scrollback_lines;
-        match TerminalPane::new(cols, rows, &shell, &cwd, history_cap) {
-            Ok(pane) => {
-                self.terminal_panes.push(pane);
+        match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
+            Ok(sess) => {
+                self.terminal_panes.push(sess);
+                self.terminal_install_contexts.push(None);
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -49,14 +50,47 @@ impl Engine {
     /// Run a command in a new terminal pane (visible to the user).
     /// Used for extension installs so the user can see progress, errors, and enter
     /// sudo passwords. The pane waits for Enter after the command finishes.
+    ///
+    /// Spawns an interactive shell via the quadraui `TerminalSession` primitive, then
+    /// immediately injects the wrapped command into the PTY so the shell executes it.
     pub fn terminal_run_command(&mut self, command: &str, cols: u16, rows: u16) {
         let cwd = self.cwd.clone();
         let history_cap = self.settings.terminal_scrollback_lines;
-        // Extract install context from pending_install_context (set by ext_install_from_registry).
+        // Extract install context set by ext_install_from_registry.
         let ctx = self.pending_install_context.take();
-        match TerminalPane::new_command(cols, rows, command, &cwd, history_cap, ctx) {
-            Ok(pane) => {
-                self.terminal_panes.push(pane);
+        let shell = default_shell();
+        let is_powershell =
+            shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
+        // Build the same wrapper script as before, sent to the interactive shell via PTY stdin.
+        let wrapped = if is_powershell {
+            format!(
+                concat!(
+                    "{cmd}; ",
+                    "$__ec = $LASTEXITCODE; ",
+                    "Write-Host ''; ",
+                    "if ($__ec -eq 0 -or $null -eq $__ec) {{ ",
+                    "Write-Host \"`e[32m✓ Command completed successfully`e[0m\" ",
+                    "}} else {{ ",
+                    "Write-Host \"`e[31m✗ Command failed (exit code $__ec)`e[0m\" ",
+                    "}}; ",
+                    "Write-Host ''; ",
+                    "Write-Host 'Press Enter to close…'; ",
+                    "Read-Host\n"
+                ),
+                cmd = command
+            )
+        } else {
+            format!(
+                "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy\n",
+                cmd = command
+            )
+        };
+        match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
+            Ok(mut sess) => {
+                // Inject the wrapped command immediately; the shell reads it from its PTY stdin.
+                sess.write_input(wrapped.as_bytes());
+                self.terminal_panes.push(sess);
+                self.terminal_install_contexts.push(ctx);
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -74,6 +108,9 @@ impl Engine {
         // Exiting split mode before removing the pane keeps tab indices sane.
         self.terminal_split = false;
         self.terminal_panes.remove(self.terminal_active);
+        if self.terminal_active < self.terminal_install_contexts.len() {
+            self.terminal_install_contexts.remove(self.terminal_active);
+        }
         if self.terminal_panes.is_empty() {
             self.terminal_open = false;
             self.terminal_has_focus = false;
@@ -93,8 +130,11 @@ impl Engine {
             let shell = default_shell();
             let cwd = self.cwd.clone();
             for _ in 0..2 {
-                match TerminalPane::new(half_cols, rows, &shell, &cwd, history_cap) {
-                    Ok(pane) => self.terminal_panes.push(pane),
+                match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
+                    Ok(sess) => {
+                        self.terminal_panes.push(sess);
+                        self.terminal_install_contexts.push(None);
+                    }
                     Err(e) => {
                         self.message = format!("terminal: failed to open PTY: {e}");
                         return;
@@ -108,8 +148,11 @@ impl Engine {
             self.terminal_panes[0].resize(half_cols, rows);
             let shell = default_shell();
             let cwd = self.cwd.clone();
-            match TerminalPane::new(half_cols, rows, &shell, &cwd, history_cap) {
-                Ok(pane) => self.terminal_panes.push(pane),
+            match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
+                Ok(sess) => {
+                    self.terminal_panes.push(sess);
+                    self.terminal_install_contexts.push(None);
+                }
                 Err(e) => {
                     self.message = format!("terminal: failed to open PTY: {e}");
                     return;
@@ -218,7 +261,7 @@ impl Engine {
         self.terminal_has_focus = true;
         self.terminal_scroll_reset();
         if let Some(term) = self.active_terminal_mut() {
-            term.selection = Some(crate::core::terminal::TermSelection {
+            term.selection = Some(quadraui::terminal_engine::TerminalSelection {
                 start_row: row,
                 start_col: col,
                 end_row: row,
@@ -441,24 +484,31 @@ impl Engine {
         }
     }
 
-    /// Drain PTY output from all panes and update VT100 screens.
+    /// Drain PTY output from all sessions and update VT100 screens.
     /// Returns true if a redraw is needed.
-    /// Exited panes are automatically removed; closes the panel when the last pane exits.
+    /// Exited sessions are automatically removed; closes the panel when the last one exits.
     pub fn poll_terminal(&mut self) -> bool {
         let mut got_data = false;
-        for pane in &mut self.terminal_panes {
-            got_data |= pane.poll();
+        for sess in &mut self.terminal_panes {
+            got_data |= sess.poll();
         }
-        // Remove exited panes in reverse order (preserves earlier indices during removal).
+        // Remove exited sessions in reverse order (preserves earlier indices during removal).
         // For install panes, finalize the install (check binary, register LSP) before removing.
         let mut i = self.terminal_panes.len();
         while i > 0 {
             i -= 1;
-            if self.terminal_panes[i].exited {
-                if let Some(ctx) = self.terminal_panes[i].install_context.take() {
+            if self.terminal_panes[i].is_exited() {
+                let ctx = self
+                    .terminal_install_contexts
+                    .get_mut(i)
+                    .and_then(|slot| slot.take());
+                if let Some(ctx) = ctx {
                     self.finalize_install_from_terminal(&ctx);
                 }
                 self.terminal_panes.remove(i);
+                if i < self.terminal_install_contexts.len() {
+                    self.terminal_install_contexts.remove(i);
+                }
                 if self.terminal_active > i {
                     self.terminal_active = self.terminal_active.saturating_sub(1);
                 }
@@ -635,15 +685,18 @@ impl Engine {
         }
     }
 
-    /// Scan the entire history buffer and the live vt100 screen, rebuilding
+    /// Scan the entire history buffer and the live screen, rebuilding
     /// `terminal_find_matches`.  Case-insensitive.
     ///
     /// Matches are `(required_scroll_offset, row, col)` where:
-    /// - History match at `history[H]`: required_offset = `history.len() - H`, row = 0.
+    /// - History match at history row H: required_offset = `history_len - H`, row = 0.
     ///   Formula: visible_row = row + current_offset − required_offset.
-    /// - Live match at vt100 row R:    required_offset = 0, row = R.
+    /// - Live match at screen row R:     required_offset = 0, row = R.
     ///
     /// Sorted oldest-first (highest required_offset first, then top-to-bottom).
+    ///
+    /// Uses the quadraui `TerminalSession` public API (`scrollback_text()` /
+    /// `screen_text()`) to avoid touching private `history` / `parser` fields.
     fn terminal_find_update_matches(&mut self) {
         self.terminal_find_matches.clear();
         if !self.terminal_find_active || self.terminal_find_query.is_empty() {
@@ -652,58 +705,49 @@ impl Engine {
         let q_lower: Vec<char> = self.terminal_find_query.to_lowercase().chars().collect();
         let qlen = q_lower.len();
         let active_idx = self.terminal_active;
-        let term = match self.terminal_panes.get(active_idx) {
-            Some(t) => t,
+        let sess = match self.terminal_panes.get(active_idx) {
+            Some(s) => s,
             None => return,
         };
 
         let mut matches: Vec<(usize, u16, u16)> = Vec::new();
-        let hist_len = term.history.len();
 
-        // ── History rows (oldest → newest) ──────────────────────────────────
-        for (hist_idx, hist_row) in term.history.iter().enumerate() {
-            let required_offset = hist_len - hist_idx;
-            let row_lower: Vec<char> = hist_row
-                .iter()
-                .map(|cell| {
-                    let ch = cell.ch;
-                    ch.to_lowercase().next().unwrap_or(ch)
-                })
-                .collect();
-            if qlen <= row_lower.len() {
-                for c in 0..=(row_lower.len() - qlen) {
-                    if row_lower[c..c + qlen] == q_lower[..] {
-                        matches.push((required_offset, 0, c as u16));
+        // ── History rows via scrollback_text() ──────────────────────────────
+        // hist_len is the total ring-buffer size (including any trailing blank rows
+        // that scrollback_text() drops). required_offset uses hist_len so that
+        // scroll navigation stays correct for all non-blank rows.
+        let hist_len = sess.history_len();
+        let scrollback = sess.scrollback_text();
+        if !scrollback.is_empty() {
+            for (hist_idx, hist_line) in scrollback.split('\n').enumerate() {
+                let required_offset = hist_len - hist_idx;
+                let row_lower: Vec<char> = hist_line
+                    .chars()
+                    .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+                    .collect();
+                if qlen <= row_lower.len() {
+                    for c in 0..=(row_lower.len() - qlen) {
+                        if row_lower[c..c + qlen] == q_lower[..] {
+                            matches.push((required_offset, 0, c as u16));
+                        }
                     }
                 }
             }
         }
 
-        // ── Live vt100 rows (always at scrollback_offset = 0) ───────────────
-        let cols = term.cols;
-        let rows = term.rows;
-        let screen = term.parser.screen();
-        for r in 0..rows {
-            let row_lower: Vec<char> = (0..cols)
-                .map(|c| {
-                    let ch = screen
-                        .cell(r, c)
-                        .map(|cell| {
-                            let s = cell.contents();
-                            if s.is_empty() {
-                                ' '
-                            } else {
-                                s.chars().next().unwrap_or(' ')
-                            }
-                        })
-                        .unwrap_or(' ');
-                    ch.to_lowercase().next().unwrap_or(ch)
-                })
-                .collect();
-            if qlen <= row_lower.len() {
-                for c in 0..=(row_lower.len() - qlen) {
-                    if row_lower[c..c + qlen] == q_lower[..] {
-                        matches.push((0, r, c as u16));
+        // ── Live screen rows via screen_text() ──────────────────────────────
+        let screen_str = sess.screen_text();
+        if !screen_str.is_empty() {
+            for (r, line) in screen_str.split('\n').enumerate() {
+                let row_lower: Vec<char> = line
+                    .chars()
+                    .map(|ch| ch.to_lowercase().next().unwrap_or(ch))
+                    .collect();
+                if qlen <= row_lower.len() {
+                    for c in 0..=(row_lower.len() - qlen) {
+                        if row_lower[c..c + qlen] == q_lower[..] {
+                            matches.push((0, r as u16, c as u16));
+                        }
                     }
                 }
             }

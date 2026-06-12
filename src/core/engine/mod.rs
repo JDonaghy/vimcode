@@ -25,7 +25,8 @@ use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionSt
 use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
-use super::terminal::{default_shell, InstallContext, TerminalPane};
+use super::terminal::{default_shell, InstallContext};
+use quadraui::terminal_engine::TerminalSession;
 use super::view::{FoldRegion, View};
 use super::window::{
     DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
@@ -3078,8 +3079,11 @@ pub struct Engine {
     pub dap_deferred_lang: Option<String>,
 
     // --- Integrated terminal ---
-    /// All open terminal panes (PTY + VT100 parser). Empty until first open.
-    pub terminal_panes: Vec<TerminalPane>,
+    /// All open terminal sessions (PTY + VT100 parser, via quadraui primitive). Empty until first open.
+    pub terminal_panes: Vec<TerminalSession>,
+    /// Per-session install context (parallel to `terminal_panes`).
+    /// `Some` only for panes opened by `terminal_run_command` (extension installs).
+    pub terminal_install_contexts: Vec<Option<InstallContext>>,
     /// Pending install context for the next `terminal_run_command()` call.
     pub pending_install_context: Option<InstallContext>,
     /// Command that should be run in a visible terminal pane (set by ext_install).
@@ -3728,6 +3732,7 @@ impl Engine {
             mouse_drag_word_mode: false,
             mouse_drag_word_origin: None,
             terminal_panes: Vec::new(),
+            terminal_install_contexts: Vec::new(),
             pending_install_context: None,
             pending_terminal_command: None,
             terminal_active: 0,

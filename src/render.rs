@@ -18,7 +18,6 @@ use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, S
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
-use crate::core::terminal::TermSelection as CoreTermSelection;
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
@@ -8364,193 +8363,49 @@ fn build_ai_panel_data(engine: &Engine) -> Option<AiPanelData> {
     })
 }
 
-/// Map a vt100 color to an RGB triple.
-/// Falls back to reasonable defaults for the OneDark theme.
-fn map_vt100_color(color: vt100::Color, is_bg: bool) -> (u8, u8, u8) {
-    match color {
-        vt100::Color::Default => {
-            if is_bg {
-                (30, 30, 30) // terminal background (~#1e1e1e)
-            } else {
-                (229, 229, 229) // terminal foreground (~#e5e5e5)
-            }
-        }
-        vt100::Color::Rgb(r, g, b) => (r, g, b),
-        vt100::Color::Idx(n) => xterm_256_color(n),
-    }
-}
-
-/// Standard xterm 256-color palette lookup.
-fn xterm_256_color(n: u8) -> (u8, u8, u8) {
-    // Colors 0-15: system colors (approximate)
-    const SYSTEM: [(u8, u8, u8); 16] = [
-        (0, 0, 0),       // 0: Black
-        (128, 0, 0),     // 1: Maroon
-        (0, 128, 0),     // 2: Green
-        (128, 128, 0),   // 3: Olive
-        (0, 0, 128),     // 4: Navy
-        (128, 0, 128),   // 5: Purple
-        (0, 128, 128),   // 6: Teal
-        (192, 192, 192), // 7: Silver
-        (128, 128, 128), // 8: Grey
-        (255, 0, 0),     // 9: Red
-        (0, 255, 0),     // 10: Lime
-        (255, 255, 0),   // 11: Yellow
-        (0, 0, 255),     // 12: Blue
-        (255, 0, 255),   // 13: Fuchsia
-        (0, 255, 255),   // 14: Aqua
-        (255, 255, 255), // 15: White
-    ];
-    if n < 16 {
-        return SYSTEM[n as usize];
-    }
-    // Colors 16-231: 6×6×6 color cube
-    if n < 232 {
-        let idx = n - 16;
-        let b = idx % 6;
-        let g = (idx / 6) % 6;
-        let r = idx / 36;
-        let to_byte = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
-        return (to_byte(r), to_byte(g), to_byte(b));
-    }
-    // Colors 232-255: grayscale
-    let gray = 8 + (n - 232) * 10;
-    (gray, gray, gray)
-}
-
-/// Normalize a terminal selection so start ≤ end in reading order.
-fn normalize_term_selection(sel: &CoreTermSelection) -> (u16, u16, u16, u16) {
-    if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
-        (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
-    } else {
-        (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
-    }
-}
-
-/// Build the cell grid for a single terminal pane.
+/// Build the cell grid for a single terminal session.
 ///
-/// `cursor_active` controls whether the VT100 cursor position is highlighted.
-/// `find` carries per-match highlighting data; pass `None` for the inactive pane.
+/// Uses `TerminalSession::to_terminal()` from the quadraui primitive to get the
+/// base cell snapshot, then post-processes: clears `is_cursor` when `cursor_active`
+/// is `false`, and applies find-match highlights from the engine's match list.
+///
+/// `find` is `(matches, qlen, active_match_idx)`.
 #[allow(clippy::type_complexity)]
 fn build_pane_rows(
-    term: &crate::core::terminal::TerminalPane,
+    sess: &quadraui::terminal_engine::TerminalSession,
     cursor_active: bool,
-    find: Option<(&[(usize, u16, u16)], usize, usize)>, // (matches, qlen, active_idx)
+    find: Option<(&[(usize, u16, u16)], usize, usize)>,
 ) -> Vec<Vec<TerminalCell>> {
-    let screen = term.parser.screen();
-    let (cursor_row, cursor_col) = screen.cursor_position();
-    let rows_count = term.rows as usize;
-    let cols_count = term.cols as usize;
-    let scroll_offset = term.scroll_offset;
-    let hist_len = term.history.len();
+    // Build snapshot — quadraui handles history blending, scroll offset, selection, cursor.
+    let snapshot =
+        sess.to_terminal(quadraui::WidgetId::new("_pane"), None);
 
-    let sel_bounds = if scroll_offset == 0 {
-        term.selection.as_ref().map(normalize_term_selection)
-    } else {
-        None
-    };
+    let scroll_offset = sess.scroll_offset();
+    let rows_count = snapshot.cells.len();
 
-    let mut rows: Vec<Vec<TerminalCell>> = (0..rows_count)
-        .map(|display_r| {
-            (0..cols_count)
-                .map(|c| {
-                    let cu = c as u16;
-                    let (ch, fg, bg, bold, italic, underline, is_cursor, selected) = if display_r
-                        < scroll_offset
-                    {
-                        let hist_idx_signed =
-                            hist_len as isize - scroll_offset as isize + display_r as isize;
-                        if hist_idx_signed >= 0 {
-                            let hist_idx = hist_idx_signed as usize;
-                            if let Some(hist_row) = term.history.get(hist_idx) {
-                                let hc = hist_row.get(c).copied().unwrap_or_default();
-                                (
-                                    hc.ch,
-                                    map_vt100_color(hc.fg, false),
-                                    map_vt100_color(hc.bg, true),
-                                    hc.bold,
-                                    hc.italic,
-                                    hc.underline,
-                                    false,
-                                    false,
-                                )
-                            } else {
-                                (
-                                    ' ',
-                                    (229, 229, 229),
-                                    (30, 30, 30),
-                                    false,
-                                    false,
-                                    false,
-                                    false,
-                                    false,
-                                )
-                            }
-                        } else {
-                            (
-                                ' ',
-                                (229, 229, 229),
-                                (30, 30, 30),
-                                false,
-                                false,
-                                false,
-                                false,
-                                false,
-                            )
-                        }
-                    } else {
-                        let live_r = (display_r - scroll_offset) as u16;
-                        let cell_opt = screen.cell(live_r, cu);
-                        let (ch, fg, bg, bold, italic, underline) = if let Some(cell) = cell_opt {
-                            let contents = cell.contents();
-                            let ch = contents.chars().next().unwrap_or(' ');
-                            (
-                                ch,
-                                map_vt100_color(cell.fgcolor(), false),
-                                map_vt100_color(cell.bgcolor(), true),
-                                cell.bold(),
-                                cell.italic(),
-                                cell.underline(),
-                            )
-                        } else {
-                            (' ', (229, 229, 229), (30, 30, 30), false, false, false)
-                        };
-                        let is_cursor = scroll_offset == 0
-                            && cursor_active
-                            && live_r == cursor_row
-                            && cu == cursor_col;
-                        let selected = sel_bounds.is_some_and(|(r0, c0, r1, c1)| {
-                            if r0 == r1 {
-                                live_r == r0 && cu >= c0 && cu <= c1
-                            } else if live_r == r0 {
-                                cu >= c0
-                            } else if live_r == r1 {
-                                cu <= c1
-                            } else {
-                                live_r > r0 && live_r < r1
-                            }
-                        });
-                        (ch, fg, bg, bold, italic, underline, is_cursor, selected)
-                    };
-
-                    TerminalCell {
-                        ch,
-                        fg,
-                        bg,
-                        bold,
-                        italic,
-                        underline,
-                        selected,
-                        is_cursor,
-                        is_find_match: false,
-                        is_find_active: false,
-                    }
+    let mut rows: Vec<Vec<TerminalCell>> = snapshot
+        .cells
+        .into_iter()
+        .map(|qrow| {
+            qrow.into_iter()
+                .map(|qc| TerminalCell {
+                    ch: qc.ch,
+                    fg: (qc.fg.r, qc.fg.g, qc.fg.b),
+                    bg: (qc.bg.r, qc.bg.g, qc.bg.b),
+                    bold: qc.bold,
+                    italic: qc.italic,
+                    underline: qc.underline,
+                    selected: qc.selected,
+                    // Clear cursor marker when this pane is not the focused one.
+                    is_cursor: qc.is_cursor && cursor_active,
+                    is_find_match: false,
+                    is_find_active: false,
                 })
                 .collect()
         })
         .collect();
 
-    // Apply find match highlights when provided.
+    // Apply find-match highlights.
     if let Some((matches, qlen, active_idx)) = find {
         let current_offset = scroll_offset as isize;
         let term_rows = rows_count as isize;
@@ -8634,11 +8489,11 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
 
         return Some(TerminalPanel {
             rows,
-            content_rows: right_pane.rows,
-            content_cols: right_pane.cols,
+            content_rows: right_pane.rows(),
+            content_cols: right_pane.cols(),
             has_focus: engine.terminal_has_focus,
-            scroll_offset: active_pane.scroll_offset,
-            scrollback_rows: active_pane.history.len(),
+            scroll_offset: active_pane.scroll_offset(),
+            scrollback_rows: active_pane.history_len(),
             tab_count: engine.terminal_panes.len(),
             active_tab: engine.terminal_active,
             find_active: engine.terminal_find_active,
@@ -8649,7 +8504,7 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
             split_left_cols: if engine.terminal_split_left_cols > 0 {
                 engine.terminal_split_left_cols
             } else {
-                left_pane.cols
+                left_pane.cols()
             },
             split_focus: engine.terminal_active as u8,
             maximized: engine.terminal_maximized,
@@ -8658,15 +8513,15 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
 
     // ── Single-pane (normal) view ──────────────────────────────────────────────
     let term = engine.active_terminal()?;
-    let hist_len = term.history.len();
-    let scroll_offset = term.scroll_offset;
+    let hist_len = term.history_len();
+    let scroll_offset = term.scroll_offset();
     let cursor_active = engine.terminal_has_focus;
     let rows = build_pane_rows(term, cursor_active, find_data);
 
     Some(TerminalPanel {
         rows,
-        content_rows: term.rows,
-        content_cols: term.cols,
+        content_rows: term.rows(),
+        content_cols: term.cols(),
         has_focus: engine.terminal_has_focus,
         scroll_offset,
         scrollback_rows: hist_len,
