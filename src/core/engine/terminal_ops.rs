@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::terminal::TermSelection;
 
 impl Engine {
     // ── Integrated Terminal ────────────────────────────────────────────────
@@ -261,7 +262,7 @@ impl Engine {
         self.terminal_has_focus = true;
         self.terminal_scroll_reset();
         if let Some(term) = self.active_terminal_mut() {
-            term.selection = Some(quadraui::terminal_engine::TerminalSelection {
+            term.selection = Some(TermSelection {
                 start_row: row,
                 start_col: col,
                 end_row: row,

@@ -1743,39 +1743,12 @@ pub struct BottomPanelTabs {
 
 // ─── TerminalPanel ────────────────────────────────────────────────────────────
 
-/// A single rendered cell in the terminal grid.
-#[derive(Debug, Clone)]
-pub struct TerminalCell {
-    pub ch: char,
-    pub fg: (u8, u8, u8),
-    pub bg: (u8, u8, u8),
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    /// Whether this cell is within the mouse selection.
-    pub selected: bool,
-    /// Whether this cell is the VT100 cursor position.
-    pub is_cursor: bool,
-    /// Whether this cell is part of a non-active find match (dim highlight).
-    pub is_find_match: bool,
-    /// Whether this cell is part of the currently selected find match (bright highlight).
-    pub is_find_active: bool,
-}
-
-/// A text selection range within the terminal content area.
-#[derive(Debug, Clone)]
-pub struct TermSelection {
-    pub start_row: u16,
-    pub start_col: u16,
-    pub end_row: u16,
-    pub end_col: u16,
-}
-
 /// Data needed to render the integrated terminal bottom panel.
 #[derive(Debug)]
 pub struct TerminalPanel {
-    /// Rendered cell grid: `rows[content_row][col]`
-    pub rows: Vec<Vec<TerminalCell>>,
+    /// Rendered cell grid: `rows[content_row][col]` — quadraui cells with all
+    /// overlay flags (cursor, selection, find-match) already applied.
+    pub rows: Vec<Vec<quadraui::TerminalCell>>,
     /// Number of content rows (excluding toolbar).
     pub content_rows: u16,
     /// Number of columns.
@@ -1801,7 +1774,7 @@ pub struct TerminalPanel {
     /// In split view: cell grid for the LEFT pane (pane[0]).
     /// When `Some`, the main `rows` field represents the RIGHT pane (pane[1]).
     /// `None` in normal (non-split) mode.
-    pub split_left_rows: Option<Vec<Vec<TerminalCell>>>,
+    pub split_left_rows: Option<Vec<Vec<quadraui::TerminalCell>>>,
     /// Column count of the left pane in split view.
     pub split_left_cols: u16,
     /// Which pane has keyboard focus in split view: 0 = left, 1 = right.
@@ -1880,10 +1853,16 @@ pub fn build_terminal_draw_data(
             cell_height,
             sb_px,
         );
-        let left =
-            terminal_cells_to_quadraui(left_rows, quadraui::WidgetId::new("terminal:left"), None);
-        let right =
-            terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:right"), sb);
+        let left = quadraui::Terminal {
+            id: quadraui::WidgetId::new("terminal:left"),
+            cells: left_rows.clone(),
+            scrollbar: None,
+        };
+        let right = quadraui::Terminal {
+            id: quadraui::WidgetId::new("terminal:right"),
+            cells: panel.rows.clone(),
+            scrollbar: sb,
+        };
         TerminalDrawData {
             single: None,
             left: Some(left),
@@ -1891,8 +1870,11 @@ pub fn build_terminal_draw_data(
             split: Some(split),
         }
     } else {
-        let term =
-            terminal_cells_to_quadraui(&panel.rows, quadraui::WidgetId::new("terminal:pane"), sb);
+        let term = quadraui::Terminal {
+            id: quadraui::WidgetId::new("terminal:pane"),
+            cells: panel.rows.clone(),
+            scrollbar: sb,
+        };
         TerminalDrawData {
             single: Some(term),
             left: None,
@@ -8365,9 +8347,9 @@ fn build_ai_panel_data(engine: &Engine) -> Option<AiPanelData> {
 
 /// Build the cell grid for a single terminal session.
 ///
-/// Uses `TerminalSession::to_terminal()` from the quadraui primitive to get the
-/// base cell snapshot, then post-processes: clears `is_cursor` when `cursor_active`
-/// is `false`, and applies find-match highlights from the engine's match list.
+/// Uses `TerminalSession::to_terminal()` to get the base snapshot from the
+/// quadraui primitive. Post-processes in place: clears `is_cursor` when
+/// `cursor_active` is `false`, and stamps find-match highlights.
 ///
 /// `find` is `(matches, qlen, active_match_idx)`.
 #[allow(clippy::type_complexity)]
@@ -8375,35 +8357,22 @@ fn build_pane_rows(
     sess: &quadraui::terminal_engine::TerminalSession,
     cursor_active: bool,
     find: Option<(&[(usize, u16, u16)], usize, usize)>,
-) -> Vec<Vec<TerminalCell>> {
+) -> Vec<Vec<quadraui::TerminalCell>> {
     // Build snapshot — quadraui handles history blending, scroll offset, selection, cursor.
-    let snapshot =
-        sess.to_terminal(quadraui::WidgetId::new("_pane"), None);
-
+    let snapshot = sess.to_terminal(quadraui::WidgetId::new("_pane"), None);
     let scroll_offset = sess.scroll_offset();
     let rows_count = snapshot.cells.len();
 
-    let mut rows: Vec<Vec<TerminalCell>> = snapshot
-        .cells
-        .into_iter()
-        .map(|qrow| {
-            qrow.into_iter()
-                .map(|qc| TerminalCell {
-                    ch: qc.ch,
-                    fg: (qc.fg.r, qc.fg.g, qc.fg.b),
-                    bg: (qc.bg.r, qc.bg.g, qc.bg.b),
-                    bold: qc.bold,
-                    italic: qc.italic,
-                    underline: qc.underline,
-                    selected: qc.selected,
-                    // Clear cursor marker when this pane is not the focused one.
-                    is_cursor: qc.is_cursor && cursor_active,
-                    is_find_match: false,
-                    is_find_active: false,
-                })
-                .collect()
-        })
-        .collect();
+    let mut rows = snapshot.cells;
+
+    // Clear cursor marker when this pane is not the focused one.
+    if !cursor_active {
+        for row in &mut rows {
+            for cell in row {
+                cell.is_cursor = false;
+            }
+        }
+    }
 
     // Apply find-match highlights.
     if let Some((matches, qlen, active_idx)) = find {
@@ -11054,46 +11023,6 @@ pub fn resolve_status_bar_click(
         }
     }
     None
-}
-
-// ─── quadraui::Terminal adapter (A.7) ────────────────────────────────────────
-
-/// Convert a vimcode `TerminalCell` row grid into a `quadraui::Terminal`
-/// snapshot. Used by both TUI (`render_terminal_pane_cells`) and GTK
-/// (`draw_terminal_cells`) so the per-cell rendering path is shared.
-///
-/// The conversion is a 1:1 mapping — render-side cells already carry the
-/// overlay flags (selected, is_cursor, is_find_match, is_find_active) the
-/// primitive expects.
-pub fn terminal_cells_to_quadraui(
-    rows: &[Vec<TerminalCell>],
-    id: quadraui::WidgetId,
-    scrollbar: Option<quadraui::TerminalScrollbar>,
-) -> quadraui::Terminal {
-    let cells = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .map(|c| quadraui::TerminalCell {
-                    ch: c.ch,
-                    fg: quadraui::Color::rgb(c.fg.0, c.fg.1, c.fg.2),
-                    bg: quadraui::Color::rgb(c.bg.0, c.bg.1, c.bg.2),
-                    bold: c.bold,
-                    italic: c.italic,
-                    underline: c.underline,
-                    selected: c.selected,
-                    is_cursor: c.is_cursor,
-                    is_find_match: c.is_find_match,
-                    is_find_active: c.is_find_active,
-                })
-                .collect()
-        })
-        .collect();
-    quadraui::Terminal {
-        id,
-        cells,
-        scrollbar,
-    }
 }
 
 // ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────
