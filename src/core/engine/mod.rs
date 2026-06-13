@@ -26,12 +26,12 @@ use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, InstallContext};
-use quadraui::terminal_engine::TerminalSession;
 use super::view::{FoldRegion, View};
 use super::window::{
     DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
     WindowRect,
 };
+use quadraui::terminal_engine::TerminalSession;
 use std::borrow::Cow;
 
 use super::{Cursor, Mode};

@@ -50,10 +50,15 @@ impl Engine {
 
     /// Run a command in a new terminal pane (visible to the user).
     /// Used for extension installs so the user can see progress, errors, and enter
-    /// sudo passwords. The pane waits for Enter after the command finishes.
+    /// sudo passwords. The pane waits for Enter after the command finishes, then
+    /// the shell **exits** so `poll_terminal` detects `is_exited()` and calls
+    /// `finalize_install_from_terminal` to register the LSP/DAP server.
     ///
     /// Spawns an interactive shell via the quadraui `TerminalSession` primitive, then
     /// immediately injects the wrapped command into the PTY so the shell executes it.
+    /// The wrapper ends with `exit` / `Exit` so the shell process exits after Enter —
+    /// without that suffix the interactive shell would return to its PS1 prompt and
+    /// `is_exited()` would never fire, leaving the install context unregistered.
     pub fn terminal_run_command(&mut self, command: &str, cols: u16, rows: u16) {
         let cwd = self.cwd.clone();
         let history_cap = self.settings.terminal_scrollback_lines;
@@ -62,30 +67,10 @@ impl Engine {
         let shell = default_shell();
         let is_powershell =
             shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
-        // Build the same wrapper script as before, sent to the interactive shell via PTY stdin.
-        let wrapped = if is_powershell {
-            format!(
-                concat!(
-                    "{cmd}; ",
-                    "$__ec = $LASTEXITCODE; ",
-                    "Write-Host ''; ",
-                    "if ($__ec -eq 0 -or $null -eq $__ec) {{ ",
-                    "Write-Host \"`e[32m✓ Command completed successfully`e[0m\" ",
-                    "}} else {{ ",
-                    "Write-Host \"`e[31m✗ Command failed (exit code $__ec)`e[0m\" ",
-                    "}}; ",
-                    "Write-Host ''; ",
-                    "Write-Host 'Press Enter to close…'; ",
-                    "Read-Host\n"
-                ),
-                cmd = command
-            )
-        } else {
-            format!(
-                "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy\n",
-                cmd = command
-            )
-        };
+        // Build a wrapper script that runs the command, shows the exit status, waits
+        // for Enter, then exits the shell so `TerminalSession::is_exited()` fires and
+        // `poll_terminal` can call `finalize_install_from_terminal`.
+        let wrapped = build_terminal_install_wrapper(command, is_powershell);
         match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
             Ok(mut sess) => {
                 // Inject the wrapped command immediately; the shell reads it from its PTY stdin.
@@ -489,6 +474,12 @@ impl Engine {
     /// Returns true if a redraw is needed.
     /// Exited sessions are automatically removed; closes the panel when the last one exits.
     pub fn poll_terminal(&mut self) -> bool {
+        // The two vecs must stay in sync: every push/remove in terminal_ops.rs updates both.
+        debug_assert_eq!(
+            self.terminal_panes.len(),
+            self.terminal_install_contexts.len(),
+            "terminal_panes and terminal_install_contexts are out of sync"
+        );
         let mut got_data = false;
         for sess in &mut self.terminal_panes {
             got_data |= sess.poll();
@@ -875,6 +866,45 @@ impl Engine {
     }
 }
 
+/// Build the PTY-injected wrapper script for `terminal_run_command`.
+///
+/// Wraps `command` in a shell fragment that:
+/// 1. Runs the command.
+/// 2. Prints a colour-coded success/failure banner.
+/// 3. Prints "Press Enter to close…" and waits for the user.
+/// 4. **Exits the shell** — without this final `exit` / `Exit`, the interactive
+///    shell returns to its PS1 prompt and `TerminalSession::is_exited()` never
+///    fires, so `poll_terminal` would never call `finalize_install_from_terminal`
+///    and the LSP/DAP server would never be registered.
+///
+/// Extracted as a pure function so the exit-suffix invariant can be tested
+/// without spawning a real PTY.
+pub fn build_terminal_install_wrapper(command: &str, is_powershell: bool) -> String {
+    if is_powershell {
+        format!(
+            concat!(
+                "{cmd}; ",
+                "$__ec = $LASTEXITCODE; ",
+                "Write-Host ''; ",
+                "if ($__ec -eq 0 -or $null -eq $__ec) {{ ",
+                "Write-Host \"`e[32m✓ Command completed successfully`e[0m\" ",
+                "}} else {{ ",
+                "Write-Host \"`e[31m✗ Command failed (exit code $__ec)`e[0m\" ",
+                "}}; ",
+                "Write-Host ''; ",
+                "Write-Host 'Press Enter to close…'; ",
+                "Read-Host; Exit\n"
+            ),
+            cmd = command
+        )
+    } else {
+        format!(
+            "{cmd}\n__exit_code=$?\necho ''\nif [ $__exit_code -eq 0 ]; then echo '\\033[32m✓ Command completed successfully\\033[0m'; else echo \"\\033[31m✗ Command failed (exit code $__exit_code)\\033[0m\"; fi\necho ''\necho 'Press Enter to close…'\nread __dummy\nexit\n",
+            cmd = command
+        )
+    }
+}
+
 /// Translate a key event to PTY input bytes. Shared by both backends (#351).
 pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Vec<u8> {
     if ctrl {
@@ -932,5 +962,49 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
                 vec![]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_terminal_install_wrapper;
+
+    /// Verify that the POSIX wrapper ends with `\nexit\n` so the shell process
+    /// exits after the user presses Enter, enabling `poll_terminal` to call
+    /// `finalize_install_from_terminal` and register the LSP/DAP server.
+    #[test]
+    fn posix_wrapper_ends_with_exit() {
+        let script = build_terminal_install_wrapper("pip install foo", false);
+        assert!(
+            script.contains("read __dummy\nexit\n"),
+            "POSIX wrapper must end with `read __dummy\\nexit\\n` so the shell exits; got:\n{script}"
+        );
+    }
+
+    /// Verify that the PowerShell wrapper ends with `Read-Host; Exit\n` for the
+    /// same reason.
+    #[test]
+    fn powershell_wrapper_ends_with_exit() {
+        let script = build_terminal_install_wrapper("pip install foo", true);
+        assert!(
+            script.contains("Read-Host; Exit\n"),
+            "PowerShell wrapper must end with `Read-Host; Exit\\n` so the shell exits; got:\n{script}"
+        );
+    }
+
+    /// The command appears verbatim at the start of both wrapper flavours.
+    #[test]
+    fn wrapper_contains_command() {
+        let cmd = "cargo install my-tool";
+        let posix = build_terminal_install_wrapper(cmd, false);
+        let ps = build_terminal_install_wrapper(cmd, true);
+        assert!(
+            posix.starts_with(cmd),
+            "POSIX wrapper must start with the command"
+        );
+        assert!(
+            ps.starts_with(cmd),
+            "PowerShell wrapper must start with the command"
+        );
     }
 }

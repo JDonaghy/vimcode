@@ -1578,7 +1578,11 @@ pub(super) fn draw_editor_hover_popup(
         viewport,
         measure,
         |line_idx, start, end| {
-            let raw = popup.line_text.get(line_idx).map(String::as_str).unwrap_or("");
+            let raw = popup
+                .line_text
+                .get(line_idx)
+                .map(String::as_str)
+                .unwrap_or("");
             // Configure the shared pango layout for this line so `index_to_pos`
             // returns the same glyph-accurate positions the rasteriser uses.
             layout.set_text(raw);

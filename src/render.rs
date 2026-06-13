@@ -8359,6 +8359,9 @@ fn build_pane_rows(
     find: Option<(&[(usize, u16, u16)], usize, usize)>,
 ) -> Vec<Vec<quadraui::TerminalCell>> {
     // Build snapshot — quadraui handles history blending, scroll offset, selection, cursor.
+    // The WidgetId is a placeholder; only `snapshot.cells` is used here — the Terminal
+    // struct is immediately destructured and the id is discarded.  The scrollbar is
+    // built separately in `build_terminal_draw_data` from `TerminalPanel` fields.
     let snapshot = sess.to_terminal(quadraui::WidgetId::new("_pane"), None);
     let scroll_offset = sess.scroll_offset();
     let rows_count = snapshot.cells.len();
@@ -14877,14 +14880,21 @@ mod tests {
         let link = &popup.links[0];
         // Byte offsets must survive the conversion unchanged.
         assert_eq!(link.line, 0);
-        assert_eq!(link.start_byte, link_start,
-            "start_byte mismatch — GTK index_to_pos would compute wrong x0");
-        assert_eq!(link.end_byte, link_end,
-            "end_byte mismatch — GTK index_to_pos would compute wrong x1");
+        assert_eq!(
+            link.start_byte, link_start,
+            "start_byte mismatch — GTK index_to_pos would compute wrong x0"
+        );
+        assert_eq!(
+            link.end_byte, link_end,
+            "end_byte mismatch — GTK index_to_pos would compute wrong x1"
+        );
         assert_eq!(link.url, "https://example.com");
         // line_text[0] must equal the raw line so index_to_pos byte indices are valid.
-        assert_eq!(popup.line_text.get(0).map(String::as_str), Some(line),
-            "line_text must carry the raw text unchanged");
+        assert_eq!(
+            popup.line_text.get(0).map(String::as_str),
+            Some(line),
+            "line_text must carry the raw text unchanged"
+        );
         // Sanity: the byte range must index valid UTF-8 within line_text.
         let raw = &popup.line_text[0];
         assert_eq!(&raw[link.start_byte..link.end_byte], "https://example.com");
@@ -14909,8 +14919,16 @@ mod tests {
         let rendered = MdRendered {
             lines: vec![line0.to_string(), line1.to_string()],
             spans: vec![
-                vec![MdSpan { start_byte: s0, end_byte: e0, style: MdStyle::LinkUrl }],
-                vec![MdSpan { start_byte: s1, end_byte: e1, style: MdStyle::LinkUrl }],
+                vec![MdSpan {
+                    start_byte: s0,
+                    end_byte: e0,
+                    style: MdStyle::LinkUrl,
+                }],
+                vec![MdSpan {
+                    start_byte: s1,
+                    end_byte: e1,
+                    style: MdStyle::LinkUrl,
+                }],
             ],
             code_highlights: vec![vec![], vec![]],
         };
