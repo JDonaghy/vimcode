@@ -1481,6 +1481,7 @@ pub fn tab_switcher_to_quadraui_list_view(
         bordered: true,
         h_scroll: 0,
         max_content_width: None,
+        show_v_scrollbar: false,
     }
 }
 
@@ -8194,6 +8195,7 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
         bordered: false,
         h_scroll: 0,
         max_content_width: None,
+        show_v_scrollbar: false,
     }
 }
 
@@ -8432,8 +8434,8 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
 
     // ── Split view: two panes side-by-side ────────────────────────────────────
     if engine.terminal_split && engine.terminal_panes.len() >= 2 {
-        let left_pane = &engine.terminal_panes[0];
-        let right_pane = &engine.terminal_panes[1];
+        let left_pane = &engine.terminal_panes[0].session;
+        let right_pane = &engine.terminal_panes[1].session;
         let left_cursor_active = engine.terminal_has_focus && engine.terminal_active == 0;
         let right_cursor_active = engine.terminal_has_focus && engine.terminal_active == 1;
 

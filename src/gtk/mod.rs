@@ -7629,7 +7629,7 @@ impl App {
                 let left_cols = if engine.terminal_split_left_cols > 0 {
                     engine.terminal_split_left_cols
                 } else if !engine.terminal_panes.is_empty() {
-                    engine.terminal_panes[0].cols()
+                    engine.terminal_panes[0].session.cols()
                 } else {
                     0
                 };

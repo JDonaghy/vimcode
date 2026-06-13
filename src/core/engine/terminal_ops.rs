@@ -6,12 +6,12 @@ impl Engine {
 
     /// Get a reference to the active terminal session, if any.
     pub fn active_terminal(&self) -> Option<&TerminalSession> {
-        self.terminal_panes.get(self.terminal_active)
+        self.terminal_panes.get(self.terminal_active).map(|s| &s.session)
     }
 
     /// Get a mutable reference to the active terminal session, if any.
     pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalSession> {
-        self.terminal_panes.get_mut(self.terminal_active)
+        self.terminal_panes.get_mut(self.terminal_active).map(|s| &mut s.session)
     }
 
     /// Open the terminal panel. If no panes exist, create the first one.
@@ -38,8 +38,7 @@ impl Engine {
         let history_cap = self.settings.terminal_scrollback_lines;
         match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
             Ok(sess) => {
-                self.terminal_panes.push(sess);
-                self.terminal_install_contexts.push(None);
+                self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: None });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -73,10 +72,13 @@ impl Engine {
         let wrapped = build_terminal_install_wrapper(command, is_powershell);
         match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
             Ok(mut sess) => {
-                // Inject the wrapped command immediately; the shell reads it from its PTY stdin.
+                // Inject the wrapped command immediately.  The PTY master writer is
+                // ready as soon as `spawn` returns — the kernel PTY subsystem buffers
+                // the bytes and the shell reads them from its stdin when it starts
+                // processing input, so there is no race between this write and the
+                // shell's readiness.
                 sess.write_input(wrapped.as_bytes());
-                self.terminal_panes.push(sess);
-                self.terminal_install_contexts.push(ctx);
+                self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: ctx });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -94,9 +96,6 @@ impl Engine {
         // Exiting split mode before removing the pane keeps tab indices sane.
         self.terminal_split = false;
         self.terminal_panes.remove(self.terminal_active);
-        if self.terminal_active < self.terminal_install_contexts.len() {
-            self.terminal_install_contexts.remove(self.terminal_active);
-        }
         if self.terminal_panes.is_empty() {
             self.terminal_open = false;
             self.terminal_has_focus = false;
@@ -118,8 +117,7 @@ impl Engine {
             for _ in 0..2 {
                 match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
                     Ok(sess) => {
-                        self.terminal_panes.push(sess);
-                        self.terminal_install_contexts.push(None);
+                        self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: None });
                     }
                     Err(e) => {
                         self.message = format!("terminal: failed to open PTY: {e}");
@@ -131,13 +129,12 @@ impl Engine {
             self.terminal_has_focus = true;
         } else if self.terminal_panes.len() == 1 {
             // Resize existing pane to half-width, then spawn a second.
-            self.terminal_panes[0].resize(half_cols, rows);
+            self.terminal_panes[0].session.resize(half_cols, rows);
             let shell = default_shell();
             let cwd = self.cwd.clone();
             match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
                 Ok(sess) => {
-                    self.terminal_panes.push(sess);
-                    self.terminal_install_contexts.push(None);
+                    self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: None });
                 }
                 Err(e) => {
                     self.message = format!("terminal: failed to open PTY: {e}");
@@ -146,8 +143,8 @@ impl Engine {
             }
         } else {
             // Two or more panes exist — resize the first two to half-width.
-            self.terminal_panes[0].resize(half_cols, rows);
-            self.terminal_panes[1].resize(half_cols, rows);
+            self.terminal_panes[0].session.resize(half_cols, rows);
+            self.terminal_panes[1].session.resize(half_cols, rows);
         }
         self.terminal_split = true;
         self.terminal_active = 1; // right pane gets focus
@@ -160,8 +157,8 @@ impl Engine {
         self.terminal_split = false;
         self.terminal_split_left_cols = 0;
         // Resize whatever is now the active pane to full width.
-        if let Some(pane) = self.terminal_panes.get_mut(self.terminal_active) {
-            pane.resize(full_cols, rows);
+        if let Some(slot) = self.terminal_panes.get_mut(self.terminal_active) {
+            slot.session.resize(full_cols, rows);
         }
     }
 
@@ -193,8 +190,8 @@ impl Engine {
     pub fn terminal_split_finalize_drag(&mut self, left_cols: u16, right_cols: u16, rows: u16) {
         self.terminal_split_left_cols = 0;
         if self.terminal_panes.len() >= 2 {
-            self.terminal_panes[0].resize(left_cols, rows);
-            self.terminal_panes[1].resize(right_cols, rows);
+            self.terminal_panes[0].session.resize(left_cols, rows);
+            self.terminal_panes[1].session.resize(right_cols, rows);
         }
     }
 
@@ -474,33 +471,21 @@ impl Engine {
     /// Returns true if a redraw is needed.
     /// Exited sessions are automatically removed; closes the panel when the last one exits.
     pub fn poll_terminal(&mut self) -> bool {
-        // The two vecs must stay in sync: every push/remove in terminal_ops.rs updates both.
-        debug_assert_eq!(
-            self.terminal_panes.len(),
-            self.terminal_install_contexts.len(),
-            "terminal_panes and terminal_install_contexts are out of sync"
-        );
         let mut got_data = false;
-        for sess in &mut self.terminal_panes {
-            got_data |= sess.poll();
+        for slot in &mut self.terminal_panes {
+            got_data |= slot.session.poll();
         }
         // Remove exited sessions in reverse order (preserves earlier indices during removal).
         // For install panes, finalize the install (check binary, register LSP) before removing.
         let mut i = self.terminal_panes.len();
         while i > 0 {
             i -= 1;
-            if self.terminal_panes[i].is_exited() {
-                let ctx = self
-                    .terminal_install_contexts
-                    .get_mut(i)
-                    .and_then(|slot| slot.take());
+            if self.terminal_panes[i].session.is_exited() {
+                let ctx = self.terminal_panes[i].install_ctx.take();
                 if let Some(ctx) = ctx {
                     self.finalize_install_from_terminal(&ctx);
                 }
                 self.terminal_panes.remove(i);
-                if i < self.terminal_install_contexts.len() {
-                    self.terminal_install_contexts.remove(i);
-                }
                 if self.terminal_active > i {
                     self.terminal_active = self.terminal_active.saturating_sub(1);
                 }
@@ -590,8 +575,8 @@ impl Engine {
 
     /// Resize all terminal panes (shared panel height).
     pub fn terminal_resize(&mut self, cols: u16, rows: u16) {
-        for pane in &mut self.terminal_panes {
-            pane.resize(cols, rows);
+        for slot in &mut self.terminal_panes {
+            slot.session.resize(cols, rows);
         }
     }
 
@@ -659,8 +644,8 @@ impl Engine {
         if n > 0 {
             self.terminal_find_selected = (self.terminal_find_selected + 1) % n;
             let (req_offset, _, _) = self.terminal_find_matches[self.terminal_find_selected];
-            if let Some(term) = self.terminal_panes.get_mut(self.terminal_active) {
-                term.set_scroll_offset(req_offset);
+            if let Some(slot) = self.terminal_panes.get_mut(self.terminal_active) {
+                slot.session.set_scroll_offset(req_offset);
             }
         }
     }
@@ -671,8 +656,8 @@ impl Engine {
         if n > 0 {
             self.terminal_find_selected = (self.terminal_find_selected + n - 1) % n;
             let (req_offset, _, _) = self.terminal_find_matches[self.terminal_find_selected];
-            if let Some(term) = self.terminal_panes.get_mut(self.terminal_active) {
-                term.set_scroll_offset(req_offset);
+            if let Some(slot) = self.terminal_panes.get_mut(self.terminal_active) {
+                slot.session.set_scroll_offset(req_offset);
             }
         }
     }
@@ -698,7 +683,7 @@ impl Engine {
         let qlen = q_lower.len();
         let active_idx = self.terminal_active;
         let sess = match self.terminal_panes.get(active_idx) {
-            Some(s) => s,
+            Some(slot) => &slot.session,
             None => return,
         };
 

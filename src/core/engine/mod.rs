@@ -47,6 +47,17 @@ pub use quadraui::{Accelerator, AcceleratorId, AcceleratorScope, KeyBinding, UiE
 /// Real DAP adapters use sequential integers that never set this bit.
 const SYNTHETIC_NON_PUBLIC_MASK: u64 = 0x8000_0000_0000_0000;
 
+/// A single terminal slot: a running PTY session plus its optional install context.
+///
+/// Coupling the session and its context in one struct prevents the `terminal_panes` and
+/// `terminal_install_contexts` parallel-Vec desync bug (any push/pop that touched one Vec
+/// but forgot the other would silently corrupt which context belongs to which session).
+pub struct TerminalSlot {
+    pub session: TerminalSession,
+    /// `Some` only for panes opened by `terminal_run_command` (extension installs).
+    pub install_ctx: Option<InstallContext>,
+}
+
 /// Actions returned from `handle_key` that the UI layer must act on.
 /// This keeps GTK/platform concerns out of the core engine.
 #[derive(Debug, PartialEq)]
@@ -3080,10 +3091,7 @@ pub struct Engine {
 
     // --- Integrated terminal ---
     /// All open terminal sessions (PTY + VT100 parser, via quadraui primitive). Empty until first open.
-    pub terminal_panes: Vec<TerminalSession>,
-    /// Per-session install context (parallel to `terminal_panes`).
-    /// `Some` only for panes opened by `terminal_run_command` (extension installs).
-    pub terminal_install_contexts: Vec<Option<InstallContext>>,
+    pub terminal_panes: Vec<TerminalSlot>,
     /// Pending install context for the next `terminal_run_command()` call.
     pub pending_install_context: Option<InstallContext>,
     /// Command that should be run in a visible terminal pane (set by ext_install).
@@ -3732,7 +3740,6 @@ impl Engine {
             mouse_drag_word_mode: false,
             mouse_drag_word_origin: None,
             terminal_panes: Vec::new(),
-            terminal_install_contexts: Vec::new(),
             pending_install_context: None,
             pending_terminal_command: None,
             terminal_active: 0,
