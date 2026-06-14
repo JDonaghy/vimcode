@@ -81,7 +81,7 @@ fn apply_scrollbar_drag(
                 // Inverted scrollbars: top of track = max offset (oldest
                 // content), bottom = 0 (newest). dispatch_mouse_drag
                 // reports the raw forward offset; flip it here.
-                "tui:terminal_scrollback" => {
+                "terminal_scrollback" => {
                     if let Some(term) = engine.active_terminal_mut() {
                         term.set_scroll_offset(*new_offset);
                     }
@@ -1061,12 +1061,10 @@ pub(super) fn handle_mouse(
                     };
                     drop(split_layout);
                     let term_col = col.saturating_sub(active_pane_x);
-                    if let Some(term) = engine.active_terminal_mut() {
-                        if let Some(ref mut sel) = term.selection {
-                            sel.end_row = term_row;
-                            sel.end_col = term_col;
-                        }
-                    }
+                    // #533: shared drag handler — tries forward_mouse(Move)
+                    // when the child has mouse reporting, falls back to
+                    // local selection update.
+                    engine.handle_terminal_pane_drag(term_col, term_row);
                     return sidebar_width;
                 }
             }
@@ -1142,15 +1140,9 @@ pub(super) fn handle_mouse(
             *mouse_text_drag = false;
             engine.mouse_drag_active = false;
             engine.mouse_drag_origin_window = None;
-            // Auto-copy terminal selection to clipboard on mouse-release.
-            if engine.terminal_has_focus {
-                let text = engine.active_terminal().and_then(|t| t.selected_text());
-                if let Some(ref text) = text {
-                    if let Some(ref cb) = engine.clipboard_write {
-                        let _ = cb(text);
-                    }
-                }
-            }
+            // #533: auto-copy terminal selection to clipboard on
+            // mouse-release via shared engine method (mirrors GTK).
+            engine.terminal_autocopy_selection();
             return sidebar_width;
         }
         // Scroll wheel — sidebar or editor
@@ -1298,12 +1290,12 @@ pub(super) fn handle_mouse(
                                 // SidebarSystem handles scroll internally
                                 return sidebar_width;
                             }
-                            "tui:terminal_scrollback" => {
-                                // #514: forward the wheel to the child when it
-                                // owns the alt-screen / mouse reporting, else
-                                // scroll local scrollback. Policy lives in
-                                // Engine::terminal_wheel (shared with GTK).
-                                engine.terminal_wheel(!down, step);
+                            "terminal_scrollback" => {
+                                // #533: single shared scroll entry point.
+                                // delta.y < 0 = up (into history); > 0 = down
+                                // (toward live).  Policy + forwarding live in
+                                // Engine::handle_terminal_scroll.
+                                engine.handle_terminal_scroll(delta.y);
                                 return sidebar_width;
                             }
                             "tui:editor_viewport" => {
@@ -2128,7 +2120,7 @@ pub(super) fn handle_mouse(
                                 .unwrap_or(0);
                             let tl = track_len as f32;
                             drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                                widget: quadraui::WidgetId::new("tui:terminal_scrollback"),
+                                widget: quadraui::WidgetId::new("terminal_scrollback"),
                                 track_start: track_start as f32,
                                 track_length: tl,
                                 thumb_length: (tl / total.max(1) as f32).max(1.0),
@@ -2147,18 +2139,31 @@ pub(super) fn handle_mouse(
                             );
                         }
                         _ => {
-                            if engine.handle_terminal_split_click(hit) {
+                            // #533: pass button/mods so split click can
+                            // forward_mouse(Press) to the child when it
+                            // has mouse reporting enabled.
+                            if engine.handle_terminal_split_click(
+                                hit,
+                                quadraui::MouseButton::Left,
+                                quadraui::Modifiers::default(),
+                            ) {
                                 *dragging_terminal_split = true;
                             }
                         }
                     }
                 } else {
                     drop(split_layout);
-                    // #429: focus + scroll reset + selection are now owned by
-                    // the engine. TUI still does the col conversion (panel
-                    // is offset by sidebar/activity-bar width on the left).
+                    // #429/#533: focus + scroll reset + selection / mouse
+                    // forwarding are owned by the engine.  TUI still does
+                    // the col conversion (panel is offset by the
+                    // sidebar/activity-bar on the left).
                     let term_col = col.saturating_sub(editor_left);
-                    engine.handle_terminal_pane_click(term_col, row_offset);
+                    engine.handle_terminal_pane_press(
+                        term_col,
+                        row_offset,
+                        quadraui::MouseButton::Left,
+                        quadraui::Modifiers::default(),
+                    );
                 }
             }
             return sidebar_width;

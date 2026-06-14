@@ -250,42 +250,195 @@ impl Engine {
         Some(zone)
     }
 
-    /// Handle a content click on a non-split terminal pane. Focuses the
-    /// terminal, resets scrollback, and starts a zero-length selection
-    /// at `(col, row)` (0-based cells within the pane). Backends call
-    /// this when there is no `TerminalSplitLayout` cached — in the split
-    /// case, [`Self::handle_terminal_split_click`] delegates here after
-    /// setting the active pane (#429).
-    pub fn handle_terminal_pane_click(&mut self, col: u16, row: u16) {
+    /// Handle a mouse-button press on a non-split terminal pane.
+    ///
+    /// **Forwarding first**: when the child process has enabled SGR mouse
+    /// reporting (`mouse_reporting_enabled()`) the click is forwarded as an
+    /// SGR-1006 `Press` byte sequence and the function returns `true`.  In
+    /// that case no local selection is started — the inner app owns the
+    /// pointer.
+    ///
+    /// **Local fallback**: when forwarding returns `false` (ordinary shell on
+    /// the primary screen) the function focuses the terminal, resets any
+    /// scrollback offset, and starts a zero-length selection at `(col, row)`
+    /// (0-based cells within the pane).
+    ///
+    /// Backends call this for every left- (or right-) click in the content
+    /// area, passing the cell coordinates they already had to translate from
+    /// their native pixel / cell space.  The forwarding policy lives entirely
+    /// here — no backend-specific branching needed.
+    ///
+    /// Returns `true` when the event was forwarded to the child process.
+    ///
+    /// # Gold standard
+    /// Mirrors `examples/common/terminal_app.rs` `UiEvent::MouseDown` arm
+    /// (quadraui#279/#365) — zero backend-specific code.
+    pub fn handle_terminal_pane_press(
+        &mut self,
+        col: u16,
+        row: u16,
+        button: quadraui::MouseButton,
+        mods: quadraui::Modifiers,
+    ) -> bool {
+        use quadraui::terminal_engine::TerminalMouseKind;
         self.terminal_has_focus = true;
         self.terminal_scroll_reset();
-        if let Some(term) = self.active_terminal_mut() {
-            term.selection = Some(TermSelection {
-                start_row: row,
-                start_col: col,
-                end_row: row,
-                end_col: col,
-            });
+        // Try to forward to the child first.  `forward_mouse` checks
+        // `should_forward_mouse(Press)` which is gated on
+        // `mouse_reporting_enabled()` only (not alt-screen — clicks are
+        // only forwarded when the child explicitly asked for them).
+        let forwarded = if let Some(term) = self.active_terminal_mut() {
+            term.forward_mouse(TerminalMouseKind::Press, button, col, row, mods)
+        } else {
+            false
+        };
+        if !forwarded {
+            // Local selection start.
+            if let Some(term) = self.active_terminal_mut() {
+                term.selection = Some(TermSelection {
+                    start_row: row,
+                    start_col: col,
+                    end_row: row,
+                    end_col: col,
+                });
+            }
         }
+        forwarded
+    }
+
+    /// Backward-compat wrapper: press with left button and no modifiers.
+    ///
+    /// Callers that don't have button/modifier info (e.g. split-click
+    /// helpers) use this.  New code should prefer
+    /// [`handle_terminal_pane_press`](Self::handle_terminal_pane_press).
+    pub fn handle_terminal_pane_click(&mut self, col: u16, row: u16) {
+        self.handle_terminal_pane_press(
+            col,
+            row,
+            quadraui::MouseButton::Left,
+            quadraui::Modifiers::default(),
+        );
+    }
+
+    /// Update the active pane's selection endpoint during a mouse drag.
+    ///
+    /// **Forwarding first**: when the child has mouse reporting enabled the
+    /// drag is forwarded as a `Move` (button-held) event.  The inner app
+    /// sees the live pointer position and can act on it (e.g. select text
+    /// inside a nested vim).
+    ///
+    /// **Local fallback**: when forwarding returns `false` the endpoint of
+    /// the in-progress selection is extended to `(col, row)`.
+    ///
+    /// Both TUI and GTK call this with their pane-relative cell coordinates
+    /// — no backend-specific branching.
+    ///
+    /// # Gold standard
+    /// Mirrors the `UiEvent::MouseMoved { buttons: left, .. }` arm of
+    /// `examples/common/terminal_app.rs`.
+    pub fn handle_terminal_pane_drag(&mut self, col: u16, row: u16) {
+        use quadraui::terminal_engine::TerminalMouseKind;
+        let forwarded = if let Some(term) = self.active_terminal_mut() {
+            term.forward_mouse(
+                TerminalMouseKind::Move,
+                quadraui::MouseButton::Left,
+                col,
+                row,
+                quadraui::Modifiers::default(),
+            )
+        } else {
+            false
+        };
+        if !forwarded {
+            if let Some(term) = self.active_terminal_mut() {
+                if let Some(ref mut sel) = term.selection {
+                    sel.end_row = row;
+                    sel.end_col = col;
+                }
+            }
+        }
+    }
+
+    /// Handle a mouse-button release over the terminal content area.
+    ///
+    /// Forwards the release to the child when it has mouse reporting enabled
+    /// (matches `UiEvent::MouseUp` in `terminal_app.rs`), then auto-copies
+    /// any live selection to the clipboard via the engine's `clipboard_write`
+    /// callback.
+    ///
+    /// Returns `true` when text was copied to the clipboard.
+    ///
+    /// Both TUI and GTK call this on every left-button release over the
+    /// terminal panel — no per-backend auto-copy logic needed.
+    pub fn handle_terminal_pane_release(
+        &mut self,
+        col: u16,
+        row: u16,
+        button: quadraui::MouseButton,
+    ) -> bool {
+        use quadraui::terminal_engine::TerminalMouseKind;
+        // Forward release to child when it owns the pointer.
+        if let Some(term) = self.active_terminal_mut() {
+            term.forward_mouse(
+                TerminalMouseKind::Release,
+                button,
+                col,
+                row,
+                quadraui::Modifiers::default(),
+            );
+        }
+        // Auto-copy selection to clipboard.
+        self.terminal_autocopy_selection()
+    }
+
+    /// Copy the active pane's current text selection to the clipboard via
+    /// the engine's `clipboard_write` callback.
+    ///
+    /// Called from [`handle_terminal_pane_release`] and by each backend on
+    /// mouse-up when the terminal has focus.  Returns `true` when text was
+    /// copied.
+    pub fn terminal_autocopy_selection(&mut self) -> bool {
+        if !self.terminal_has_focus {
+            return false;
+        }
+        let text = self
+            .active_terminal()
+            .and_then(|t| t.selected_text());
+        if let Some(ref text) = text {
+            if let Some(ref cb) = self.clipboard_write {
+                let _ = cb(text);
+                return true;
+            }
+        }
+        false
     }
 
     /// Handle a click on the terminal content area using a
     /// `TerminalSplitHit` from the cached layout. Sets pane focus,
-    /// starts selection, or signals a divider drag. Returns `true` if
-    /// the caller should start a split-divider drag.
-    pub fn handle_terminal_split_click(&mut self, hit: quadraui::TerminalSplitHit) -> bool {
+    /// starts selection or forwards press, or signals a divider drag.
+    /// Returns `true` if the caller should start a split-divider drag.
+    ///
+    /// `button` and `mods` are forwarded to
+    /// [`handle_terminal_pane_press`](Self::handle_terminal_pane_press)
+    /// for the pane-hit branches.
+    pub fn handle_terminal_split_click(
+        &mut self,
+        hit: quadraui::TerminalSplitHit,
+        button: quadraui::MouseButton,
+        mods: quadraui::Modifiers,
+    ) -> bool {
         use quadraui::TerminalSplitHit;
         self.terminal_has_focus = true;
         match hit {
             TerminalSplitHit::Divider => true,
             TerminalSplitHit::LeftPane { col, row } => {
                 self.terminal_active = 0;
-                self.handle_terminal_pane_click(col, row);
+                self.handle_terminal_pane_press(col, row, button, mods);
                 false
             }
             TerminalSplitHit::RightPane { col, row } => {
                 self.terminal_active = 1;
-                self.handle_terminal_pane_click(col, row);
+                self.handle_terminal_pane_press(col, row, button, mods);
                 false
             }
             TerminalSplitHit::Scrollbar | TerminalSplitHit::Outside => false,
@@ -615,20 +768,49 @@ impl Engine {
         }
     }
 
+    /// Route a scroll-wheel notch from a raw `UiEvent::Scroll` delta.
+    ///
+    /// Both the TUI and GTK backends emit `UiEvent::Scroll { delta, .. }`
+    /// through `quadraui::dispatch_scroll`, where the canonical sign is:
+    ///
+    /// - `delta_y < 0` → scroll **up** into history
+    /// - `delta_y > 0` → scroll **down** toward the live view
+    ///
+    /// This matches the convention in `examples/common/terminal_app.rs` and
+    /// the GTK `EventControllerScroll` / TUI `crossterm::ScrollUp` (which
+    /// vimcode maps to `delta_y = -1.0`).
+    ///
+    /// A step of `ceil(|delta_y| × 3)` rows mirrors the example app (3 rows
+    /// per notch).  The forward-vs-scroll policy is delegated to
+    /// [`terminal_wheel`](Self::terminal_wheel) which calls
+    /// `TerminalSession::forward_mouse` / `scroll_up` / `scroll_down`.
+    ///
+    /// Backends call this in **one line** from their
+    /// `"terminal_scrollback"` dispatch arm — no per-backend step
+    /// computation, sign reversal, or forwarding logic needed.  When
+    /// quadraui ships `TerminalSession::handle_wheel` (quadraui#365) this
+    /// method will thin further to a single delegation.
+    pub fn handle_terminal_scroll(&mut self, delta_y: f32) {
+        if delta_y == 0.0 {
+            return;
+        }
+        let step = (delta_y.abs() * 3.0).ceil() as usize;
+        let up = delta_y < 0.0;
+        self.terminal_wheel(up, step);
+    }
+
     /// Route a mouse-wheel notch for the active terminal pane: forward it to
     /// the child when the child owns the wheel (alt-screen / mouse reporting),
     /// otherwise scroll local scrollback by `step` rows.
     ///
-    /// This is the single shared entry point both backends call — they only
-    /// translate their own wheel-delta sign into `up` and supply `step`; the
-    /// forward-vs-scroll policy lives here, not in `src/gtk/` or
-    /// `src/tui_main/` (#514).
+    /// Called by [`handle_terminal_scroll`](Self::handle_terminal_scroll)
+    /// which backends should prefer.  Direct callers pass a pre-computed
+    /// step count — use this when you already have `up`/`step` (e.g. tests).
     ///
     /// Mirrors quadraui's `examples/common/terminal_app.rs` scroll handler,
-    /// which composes `forward_mouse()` + `scroll_up/down` the same way. The
-    /// longer-term goal is to lift this orchestration into quadraui
-    /// (JDonaghy/quadraui#365) and route both backends through a single shared
-    /// `UiEvent` handler (vimcode#533).
+    /// which composes `forward_mouse()` + `scroll_up/down` the same way.
+    /// The longer-term goal (quadraui#365) is to lift this into
+    /// `TerminalSession::handle_wheel`.
     pub fn terminal_wheel(&mut self, up: bool, step: usize) {
         if !self.terminal_forward_wheel(up) {
             if up {
@@ -652,10 +834,9 @@ impl Engine {
     /// (#514 stress-test: a stray wheel must never leak the previous command's
     /// output into the shell's scrollback while an app owns the alt-screen).
     ///
-    /// Wheel events report at cell `(0, 0)`: vimcode does not yet forward mouse
-    /// clicks/motion to the child, so the precise pointer position carries no
-    /// meaning for the inner app (it scrolls/swallows regardless). Revisit when
-    /// click forwarding lands.
+    /// Wheel events report at cell `(0, 0)`.  The pointer position for wheels
+    /// is not yet passed through — this is tracked as part of the full
+    /// `UiEvent` unification (quadraui#365).
     pub fn terminal_forward_wheel(&mut self, up: bool) -> bool {
         use quadraui::terminal_engine::TerminalMouseKind;
         if let Some(term) = self.active_terminal_mut() {
