@@ -4416,13 +4416,11 @@ impl SimpleComponent for App {
                                     return;
                                 }
                                 "terminal_scrollback" => {
-                                    // #514: forward the wheel to the child when
-                                    // it owns the alt-screen / mouse reporting,
-                                    // else scroll local scrollback (delta.y >
-                                    // 0.0 ⇒ scroll down/newer). Policy lives in
-                                    // Engine::terminal_wheel (shared with TUI).
-                                    let step = (delta.y.abs() * 3.0).ceil() as usize;
-                                    engine.terminal_wheel(delta.y <= 0.0, step);
+                                    // #533: single shared scroll entry point.
+                                    // delta.y < 0 = up (into history); > 0 =
+                                    // down (toward live).  Policy + forwarding
+                                    // live in Engine::handle_terminal_scroll.
+                                    engine.handle_terminal_scroll(delta.y);
                                     drop(engine);
                                     self.draw_needed.set(true);
                                     return;
@@ -6933,7 +6931,14 @@ impl App {
                     let split_layout = *self.engine.borrow().terminal_split_layout.borrow();
                     if let Some(ref sl) = split_layout {
                         let hit = sl.hit_test(x as f32, y as f32);
-                        if self.engine.borrow_mut().handle_terminal_split_click(hit) {
+                        // #533: pass button/mods so the engine can
+                        // forward_mouse(Press) to the child when it has mouse
+                        // reporting enabled.
+                        if self.engine.borrow_mut().handle_terminal_split_click(
+                            hit,
+                            quadraui::MouseButton::Left,
+                            quadraui::Modifiers::default(),
+                        ) {
                             self.terminal_split_dragging = true;
                         }
                     } else {
@@ -6943,15 +6948,15 @@ impl App {
                             BottomPanelZone::Content { row_offset } => row_offset,
                             _ => 0,
                         };
-                        self.engine.borrow_mut().terminal_scroll_reset();
-                        if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                            term.selection = Some(crate::core::terminal::TermSelection {
-                                start_row: row_offset,
-                                start_col: col,
-                                end_row: row_offset,
-                                end_col: col,
-                            });
-                        }
+                        // #533: shared press handler — tries forward_mouse(Press)
+                        // when the child has mouse reporting, falls back to
+                        // terminal_scroll_reset + local selection start.
+                        self.engine.borrow_mut().handle_terminal_pane_press(
+                            col,
+                            row_offset,
+                            quadraui::MouseButton::Left,
+                            quadraui::Modifiers::default(),
+                        );
                     }
                 } else {
                     // Header row — dispatch through cached toolbar hit regions.
@@ -7522,12 +7527,12 @@ impl App {
             };
             if let Some(row) = content_row {
                 let col = (x / self.cached_char_width.max(1.0)) as u16;
-                if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                    if let Some(ref mut sel) = term.selection {
-                        sel.end_row = row;
-                        sel.end_col = col;
-                    }
-                }
+                // #533: shared drag handler — tries forward_mouse(Move)
+                // when the child has mouse reporting, falls back to local
+                // selection update.
+                self.engine
+                    .borrow_mut()
+                    .handle_terminal_pane_drag(col, row);
                 self.draw_needed.set(true);
             } else {
                 let layout_ref = self.cached_screen_layout.borrow();
@@ -7635,9 +7640,15 @@ impl App {
         }
         self.h_sb_drag_cell.set(None);
         self.group_divider_dragging = None;
-        let mut engine = self.engine.borrow_mut();
-        engine.mouse_drag_active = false;
-        engine.mouse_drag_origin_window = None;
+        {
+            let mut engine = self.engine.borrow_mut();
+            engine.mouse_drag_active = false;
+            engine.mouse_drag_origin_window = None;
+            // #533: auto-copy terminal selection on mouse-release, mirroring
+            // TUI.  terminal_autocopy_selection() is a no-op when the
+            // terminal isn't focused or has no selection.
+            engine.terminal_autocopy_selection();
+        }
         self.draw_needed.set(true);
     }
 
