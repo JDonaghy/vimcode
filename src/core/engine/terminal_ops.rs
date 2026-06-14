@@ -6,12 +6,16 @@ impl Engine {
 
     /// Get a reference to the active terminal session, if any.
     pub fn active_terminal(&self) -> Option<&TerminalSession> {
-        self.terminal_panes.get(self.terminal_active).map(|s| &s.session)
+        self.terminal_panes
+            .get(self.terminal_active)
+            .map(|s| &s.session)
     }
 
     /// Get a mutable reference to the active terminal session, if any.
     pub fn active_terminal_mut(&mut self) -> Option<&mut TerminalSession> {
-        self.terminal_panes.get_mut(self.terminal_active).map(|s| &mut s.session)
+        self.terminal_panes
+            .get_mut(self.terminal_active)
+            .map(|s| &mut s.session)
     }
 
     /// Open the terminal panel. If no panes exist, create the first one.
@@ -38,7 +42,10 @@ impl Engine {
         let history_cap = self.settings.terminal_scrollback_lines;
         match TerminalSession::spawn(cols, rows, &shell, &cwd, history_cap) {
             Ok(sess) => {
-                self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: None });
+                self.terminal_panes.push(TerminalSlot {
+                    session: sess,
+                    install_ctx: None,
+                });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -78,7 +85,10 @@ impl Engine {
                 // processing input, so there is no race between this write and the
                 // shell's readiness.
                 sess.write_input(wrapped.as_bytes());
-                self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: ctx });
+                self.terminal_panes.push(TerminalSlot {
+                    session: sess,
+                    install_ctx: ctx,
+                });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
                 self.terminal_has_focus = true;
@@ -117,7 +127,10 @@ impl Engine {
             for _ in 0..2 {
                 match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
                     Ok(sess) => {
-                        self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: None });
+                        self.terminal_panes.push(TerminalSlot {
+                            session: sess,
+                            install_ctx: None,
+                        });
                     }
                     Err(e) => {
                         self.message = format!("terminal: failed to open PTY: {e}");
@@ -134,7 +147,10 @@ impl Engine {
             let cwd = self.cwd.clone();
             match TerminalSession::spawn(half_cols, rows, &shell, &cwd, history_cap) {
                 Ok(sess) => {
-                    self.terminal_panes.push(TerminalSlot { session: sess, install_ctx: None });
+                    self.terminal_panes.push(TerminalSlot {
+                        session: sess,
+                        install_ctx: None,
+                    });
                 }
                 Err(e) => {
                     self.message = format!("terminal: failed to open PTY: {e}");
@@ -596,6 +612,67 @@ impl Engine {
     pub fn terminal_scroll_down(&mut self, rows: usize) {
         if let Some(term) = self.active_terminal_mut() {
             term.scroll_down(rows);
+        }
+    }
+
+    /// Route a mouse-wheel notch for the active terminal pane: forward it to
+    /// the child when the child owns the wheel (alt-screen / mouse reporting),
+    /// otherwise scroll local scrollback by `step` rows.
+    ///
+    /// This is the single shared entry point both backends call — they only
+    /// translate their own wheel-delta sign into `up` and supply `step`; the
+    /// forward-vs-scroll policy lives here, not in `src/gtk/` or
+    /// `src/tui_main/` (#514).
+    ///
+    /// Mirrors quadraui's `examples/common/terminal_app.rs` scroll handler,
+    /// which composes `forward_mouse()` + `scroll_up/down` the same way. The
+    /// longer-term goal is to lift this orchestration into quadraui
+    /// (JDonaghy/quadraui#365) and route both backends through a single shared
+    /// `UiEvent` handler (vimcode#533).
+    pub fn terminal_wheel(&mut self, up: bool, step: usize) {
+        if !self.terminal_forward_wheel(up) {
+            if up {
+                self.terminal_scroll_up(step);
+            } else {
+                self.terminal_scroll_down(step);
+            }
+        }
+    }
+
+    /// Forward a mouse-wheel notch to the active pane's child process when it
+    /// owns the alternate screen or has enabled mouse reporting (vim, less,
+    /// tmux, claude, …). Returns `true` when the wheel was written to the
+    /// child — in that case the caller MUST NOT scroll local scrollback.
+    /// Returns `false` for an ordinary shell (primary screen, no mouse
+    /// reporting), where the caller falls back to
+    /// [`terminal_scroll_up`](Self::terminal_scroll_up) /
+    /// [`terminal_scroll_down`](Self::terminal_scroll_down).
+    ///
+    /// quadraui gates this through `TerminalSession::should_forward_wheel()`
+    /// (#514 stress-test: a stray wheel must never leak the previous command's
+    /// output into the shell's scrollback while an app owns the alt-screen).
+    ///
+    /// Wheel events report at cell `(0, 0)`: vimcode does not yet forward mouse
+    /// clicks/motion to the child, so the precise pointer position carries no
+    /// meaning for the inner app (it scrolls/swallows regardless). Revisit when
+    /// click forwarding lands.
+    pub fn terminal_forward_wheel(&mut self, up: bool) -> bool {
+        use quadraui::terminal_engine::TerminalMouseKind;
+        if let Some(term) = self.active_terminal_mut() {
+            let kind = if up {
+                TerminalMouseKind::WheelUp
+            } else {
+                TerminalMouseKind::WheelDown
+            };
+            term.forward_mouse(
+                kind,
+                quadraui::MouseButton::Left,
+                0,
+                0,
+                quadraui::Modifiers::default(),
+            )
+        } else {
+            false
         }
     }
 

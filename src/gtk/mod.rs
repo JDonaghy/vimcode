@@ -4411,12 +4411,13 @@ impl SimpleComponent for App {
                                     return;
                                 }
                                 "terminal_scrollback" => {
+                                    // #514: forward the wheel to the child when
+                                    // it owns the alt-screen / mouse reporting,
+                                    // else scroll local scrollback (delta.y >
+                                    // 0.0 ⇒ scroll down/newer). Policy lives in
+                                    // Engine::terminal_wheel (shared with TUI).
                                     let step = (delta.y.abs() * 3.0).ceil() as usize;
-                                    if delta.y > 0.0 {
-                                        engine.terminal_scroll_down(step);
-                                    } else {
-                                        engine.terminal_scroll_up(step);
-                                    }
+                                    engine.terminal_wheel(delta.y <= 0.0, step);
                                     drop(engine);
                                     self.draw_needed.set(true);
                                     return;

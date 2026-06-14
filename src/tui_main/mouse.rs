@@ -1299,11 +1299,11 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "tui:terminal_scrollback" => {
-                                if down {
-                                    engine.terminal_scroll_down(step);
-                                } else {
-                                    engine.terminal_scroll_up(step);
-                                }
+                                // #514: forward the wheel to the child when it
+                                // owns the alt-screen / mouse reporting, else
+                                // scroll local scrollback. Policy lives in
+                                // Engine::terminal_wheel (shared with GTK).
+                                engine.terminal_wheel(!down, step);
                                 return sidebar_width;
                             }
                             "tui:editor_viewport" => {
