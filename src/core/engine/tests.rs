@@ -16439,6 +16439,7 @@ fn test_clear_sidebar_focus() {
     engine.ai_has_focus = true;
     engine.settings_has_focus = true;
     engine.ext_panel_has_focus = true;
+    engine.activity_bar_focused = true;
     assert!(engine.sidebar_has_focus());
 
     engine.clear_sidebar_focus();
@@ -16451,6 +16452,7 @@ fn test_clear_sidebar_focus() {
     assert!(!engine.ai_has_focus);
     assert!(!engine.settings_has_focus);
     assert!(!engine.ext_panel_has_focus);
+    assert!(!engine.activity_bar_focused);
 }
 
 #[test]

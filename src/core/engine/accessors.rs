@@ -572,7 +572,7 @@ impl Engine {
             || self.activity_bar_focused
     }
 
-    /// Clear all sidebar panel focus flags at once.
+    /// Clear all sidebar panel focus flags at once, including the activity bar.
     pub fn clear_sidebar_focus(&mut self) {
         self.explorer_has_focus = false;
         self.search_has_focus = false;
@@ -582,6 +582,7 @@ impl Engine {
         self.ai_has_focus = false;
         self.settings_has_focus = false;
         self.ext_panel_has_focus = false;
+        self.activity_bar_focused = false;
     }
 
     /// Returns true if any user-focused modal popup is currently open
