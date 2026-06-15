@@ -8617,7 +8617,7 @@ impl App {
                     engine.handle_ext_panel_key(mapped, false, unicode);
                     let still_focused = engine.ext_panel_has_focus;
                     drop(engine);
-                    self.focus_editor_if_needed(still_focused);
+                    self.focus_after_sidebar_key(still_focused);
                 }
                 self.sync_plus_register_to_clipboard();
                 if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
