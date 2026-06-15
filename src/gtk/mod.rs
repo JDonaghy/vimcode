@@ -5434,7 +5434,8 @@ impl App {
                 let still_focused = engine.ext_panel_has_focus;
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
-                self.focus_editor_if_needed(still_focused && !has_dialog);
+                // h/Left moves focus to the activity bar; other exits go to the editor.
+                self.focus_after_sidebar_key(still_focused && !has_dialog);
                 if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
                     da.queue_draw();
                 }
@@ -5503,7 +5504,7 @@ impl App {
                 }
                 let still_focused = engine.search_has_focus;
                 drop(engine);
-                self.focus_editor_if_needed(still_focused);
+                self.focus_after_sidebar_key(still_focused);
                 if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
                     da.queue_draw();
                 }

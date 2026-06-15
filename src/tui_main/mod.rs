@@ -1987,24 +1987,6 @@ fn event_loop(
 
                     // ── Extension panel (plugin-provided) keyboard handling ─
                     if engine.ext_panel_has_focus && sidebar.ext_panel_name.is_some() {
-                        // h/Left: switch focus to activity bar toolbar.
-                        // (engine.activity_bar_focus_in_at is called inside handle_ext_panel_key)
-                        if matches!(key_event.code, KeyCode::Char('h') | KeyCode::Left)
-                            && !key_event.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            // Find the toolbar row index for this ext panel.
-                            let mut ext_names: Vec<_> = engine.ext_panels.keys().cloned().collect();
-                            ext_names.sort();
-                            let idx = ext_names
-                                .iter()
-                                .position(|n| Some(n) == sidebar.ext_panel_name.as_ref())
-                                .unwrap_or(0);
-                            sidebar.has_focus = false;
-                            engine.ext_panel_has_focus = false;
-                            engine.activity_bar_focus_in_at(8 + idx as u16);
-                            needs_redraw = true;
-                            continue;
-                        }
                         // When the input field is active, pass characters as
                         // input text instead of navigation commands.
                         if engine.ext_panel_input_active {
@@ -2026,9 +2008,12 @@ fn event_loop(
                             needs_redraw = true;
                             continue;
                         }
+                        // h/Left: engine sets activity_bar_focused via handle_ext_panel_key.
                         let (key_name, unicode): (&str, Option<char>) = match key_event.code {
                             KeyCode::Char('j') | KeyCode::Down => ("j", None),
                             KeyCode::Char('k') | KeyCode::Up => ("k", None),
+                            KeyCode::Char('h') => ("h", None),
+                            KeyCode::Left => ("Left", None),
                             KeyCode::Char('g') => ("g", None),
                             KeyCode::Char('G') => ("G", None),
                             KeyCode::Tab => ("Tab", None),
@@ -2047,7 +2032,11 @@ fn event_loop(
                             engine.handle_ext_panel_key(&name, ctrl, ch);
                             if !engine.ext_panel_has_focus {
                                 sidebar.has_focus = false;
-                                sidebar.ext_panel_name = None;
+                                // Keep ext_panel_name when focus moved to activity bar
+                                // (the ext panel remains visible while the toolbar cursor shows).
+                                if !engine.activity_bar_focused {
+                                    sidebar.ext_panel_name = None;
+                                }
                             }
                         }
                         needs_redraw = true;
