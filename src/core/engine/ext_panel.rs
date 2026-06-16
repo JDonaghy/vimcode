@@ -239,6 +239,18 @@ impl Engine {
             "q" | "Escape" => {
                 self.ext_panel_has_focus = false;
             }
+            "h" | "Left" => {
+                // Leave this panel and focus the activity bar at the matching row.
+                // Uses the same sorted-index mapping as the activity bar primitive.
+                let mut ext_names: Vec<_> = self.ext_panels.keys().cloned().collect();
+                ext_names.sort();
+                let idx = ext_names
+                    .iter()
+                    .position(|n| self.ext_panel_active.as_deref() == Some(n.as_str()))
+                    .unwrap_or(0);
+                self.ext_panel_has_focus = false;
+                self.activity_bar_focus_in_at(8 + idx as u16);
+            }
             "j" | "Down" => {
                 let max = self.ext_panel_flat_len();
                 if max > 0 && self.ext_panel_selected + 1 < max {

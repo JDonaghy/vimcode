@@ -16439,6 +16439,7 @@ fn test_clear_sidebar_focus() {
     engine.ai_has_focus = true;
     engine.settings_has_focus = true;
     engine.ext_panel_has_focus = true;
+    engine.activity_bar_focused = true;
     assert!(engine.sidebar_has_focus());
 
     engine.clear_sidebar_focus();
@@ -16451,6 +16452,7 @@ fn test_clear_sidebar_focus() {
     assert!(!engine.ai_has_focus);
     assert!(!engine.settings_has_focus);
     assert!(!engine.ext_panel_has_focus);
+    assert!(!engine.activity_bar_focused);
 }
 
 #[test]
@@ -27288,6 +27290,68 @@ fn test_activity_bar_resolve_extension_panels() {
     );
     // Row 9 with only 2 extensions = None (gap)
     assert_eq!(resolve_activity_bar_click(9, 30, &ext_names), None);
+}
+
+#[test]
+fn test_ext_panel_h_focuses_activity_bar() {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    // Register two ext panels (sorted: "alpha", "beta").
+    engine.ext_panels.insert(
+        "beta".to_string(),
+        PanelRegistration {
+            name: "beta".to_string(),
+            title: "Beta".to_string(),
+            icon: 'B',
+            fallback_icon: None,
+            sections: vec![],
+        },
+    );
+    engine.ext_panels.insert(
+        "alpha".to_string(),
+        PanelRegistration {
+            name: "alpha".to_string(),
+            title: "Alpha".to_string(),
+            icon: 'A',
+            fallback_icon: None,
+            sections: vec![],
+        },
+    );
+    // Simulate "beta" ext panel being focused (sorted index 1 → toolbar idx 9).
+    engine.ext_panel_has_focus = true;
+    engine.ext_panel_active = Some("beta".to_string());
+
+    engine.handle_ext_panel_key("h", false, None);
+
+    assert!(!engine.ext_panel_has_focus, "ext_panel_has_focus should be cleared");
+    assert!(engine.activity_bar_focused, "activity_bar_focused should be set");
+    // "beta" is sorted index 1 (["alpha", "beta"]) → toolbar index 9.
+    assert_eq!(engine.activity_bar_selected, 9, "toolbar index should be 8 + sorted_idx");
+}
+
+#[test]
+fn test_ext_panel_left_focuses_activity_bar() {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    // Register one ext panel (sorted index 0 → toolbar idx 8).
+    engine.ext_panels.insert(
+        "mypanel".to_string(),
+        PanelRegistration {
+            name: "mypanel".to_string(),
+            title: "My Panel".to_string(),
+            icon: 'M',
+            fallback_icon: None,
+            sections: vec![],
+        },
+    );
+    engine.ext_panel_has_focus = true;
+    engine.ext_panel_active = Some("mypanel".to_string());
+
+    engine.handle_ext_panel_key("Left", false, None);
+
+    assert!(!engine.ext_panel_has_focus);
+    assert!(engine.activity_bar_focused);
+    assert_eq!(engine.activity_bar_selected, 8);
 }
 
 // --- Context menu hit regions ---
