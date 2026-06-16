@@ -113,6 +113,10 @@ fn build_activity_bar_primitive(
             theme.cursor.g,
             theme.cursor.b,
         )),
+        // Signals to the quadraui TUI backend that this bar owns the
+        // keyboard so it intercepts KeyPressed as ActivityBarEvent::KeyPressed
+        // (Q#368 protocol).
+        is_keyboard_focused: engine.activity_bar_focused,
     }
 }
 

@@ -576,6 +576,11 @@ fn build_gtk_activity_bar_primitive(
             theme.cursor.g,
             theme.cursor.b,
         )),
+        // Signals to the quadraui GTK backend that this bar owns the
+        // keyboard.  The backend's draw_activity_bar impl records the bar ID
+        // in GtkBackend::focused_activity_bar so window-level key events can
+        // be converted to ActivityBarEvent::KeyPressed (Q#368).
+        is_keyboard_focused: engine.activity_bar_focused,
     }
 }
 
