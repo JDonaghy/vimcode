@@ -9423,12 +9423,17 @@ impl App {
             }
             ExplorerKeyResult::FocusToolbar => {
                 // engine.activity_bar_focus_in_at(1) was already called inside
-                // dispatch_explorer_key. Grab GTK focus on the activity bar DA
-                // so the visual highlight is shown and key events route there.
+                // dispatch_explorer_key. Redraw the activity bar for the
+                // selection highlight; key events route through the editor DA
+                // whose handle_key_press checks activity_bar_focused and
+                // dispatches to handle_activity_bar_key. The activity bar DA
+                // has no EventControllerKey, so grab_focus on it drops keys.
                 self.engine.borrow_mut().explorer_has_focus = false;
                 if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
-                    da.grab_focus();
                     da.queue_draw();
+                }
+                if let Some(ref da) = *self.drawing_area.borrow() {
+                    da.grab_focus();
                 }
             }
             _ => {}
@@ -9443,18 +9448,29 @@ impl App {
         }
     }
 
-    /// After a sidebar panel processes a key, redirect GTK focus to the
-    /// activity bar DA if the engine just set `activity_bar_focused`, otherwise
-    /// fall back to the normal editor-focus logic.
+    /// After a sidebar panel processes a key, queue a redraw of the activity
+    /// bar if the engine just set `activity_bar_focused`, and in all cases
+    /// give GTK widget focus to the editor DA so its `handle_key_press` can
+    /// route the next key via engine flags (`activity_bar_focused`,
+    /// `ext_panel_has_focus`, …).
     ///
-    /// `fallback_focused` is the "panel still has focus" flag that would
-    /// normally be passed to `focus_editor_if_needed`.
+    /// Why the editor DA, not the activity bar DA?  The activity bar DA has
+    /// no `EventControllerKey`; routing GTK focus there drops subsequent key
+    /// events.  The editor DA's capture-phase controller checks engine focus
+    /// flags and dispatches to `handle_activity_bar_key` when needed — the
+    /// same engine-flag routing that the TUI backend uses.
+    ///
+    /// `fallback_focused` is the "panel still has focus" flag passed through
+    /// to `focus_editor_if_needed` when neither activity-bar nor editor focus
+    /// applies (i.e. the sidebar panel kept focus → don't steal it).
     fn focus_after_sidebar_key(&self, fallback_focused: bool) {
         if self.engine.borrow().activity_bar_focused {
+            // Activity bar has logical focus — redraw it for the keyboard-
+            // selection highlight. Key routing flows through the editor DA.
             if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
-                da.grab_focus();
                 da.queue_draw();
             }
+            self.focus_editor_if_needed(false);
         } else {
             self.focus_editor_if_needed(fallback_focused);
         }
