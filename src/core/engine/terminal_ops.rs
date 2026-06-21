@@ -311,6 +311,7 @@ impl Engine {
     /// Callers that don't have button/modifier info (e.g. split-click
     /// helpers) use this.  New code should prefer
     /// [`handle_terminal_pane_press`](Self::handle_terminal_pane_press).
+    #[allow(dead_code)]
     pub fn handle_terminal_pane_click(&mut self, col: u16, row: u16) {
         self.handle_terminal_pane_press(
             col,
@@ -368,8 +369,13 @@ impl Engine {
     ///
     /// Returns `true` when text was copied to the clipboard.
     ///
-    /// Both TUI and GTK call this on every left-button release over the
-    /// terminal panel — no per-backend auto-copy logic needed.
+    /// Currently both backends call [`Self::terminal_autocopy_selection`]
+    /// directly from their general mouse-release handler rather than routing
+    /// through this method (doing so would incorrectly forward releases that
+    /// originate outside the terminal panel to the child process).  This
+    /// method is infrastructure for a future terminal-specific release handler
+    /// that can safely pass the coordinates and button through.
+    #[allow(dead_code)]
     pub fn handle_terminal_pane_release(
         &mut self,
         col: u16,

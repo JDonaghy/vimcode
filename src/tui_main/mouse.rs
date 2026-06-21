@@ -917,7 +917,7 @@ pub(super) fn handle_mouse(
             // matching scroll-state field. Sites covered:
             // - `explorer:sb`, `ext_panel:sb`, `editor_hover` (Stage 5a)
             // - `tui:search_results`, `tui:debug_sidebar:N` (5c)
-            // - `tui:terminal_scrollback`, `tui:debug_output` (5c, inverted)
+            // - `terminal_scrollback`, `tui:debug_output` (5c, inverted)
             if drag_state.is_active() {
                 let point = quadraui::Point {
                     x: col as f32,
@@ -974,7 +974,7 @@ pub(super) fn handle_mouse(
             // scrollbars are inverted (top of track = oldest content,
             // bottom = live view). Their drag math now lives in the
             // shared `if drag_state.is_active()` block above; the
-            // receive site for `tui:terminal_scrollback` /
+            // receive site for `terminal_scrollback` /
             // `tui:debug_output` flips the offset with `max - new_offset`
             // so `term.set_scroll_offset` / `engine.debug_output_scroll`
             // continue to mean "lines from the bottom".
@@ -1223,7 +1223,7 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
             // Terminal panel scroll now routes through dispatch_scroll
-            // via the registered "tui:terminal_scrollback" surface.
+            // via the registered "terminal_scrollback" surface.
             // Scroll-surface wheel dispatch — routes to registered surfaces.
             {
                 let surfaces = engine.scroll_surfaces.borrow();
