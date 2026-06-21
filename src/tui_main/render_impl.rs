@@ -684,7 +684,7 @@ pub(super) fn draw_frame(
                         .scroll_surfaces
                         .borrow_mut()
                         .push(quadraui::ScrollSurface {
-                            id: quadraui::WidgetId::new("tui:terminal_scrollback"),
+                            id: quadraui::WidgetId::new("terminal_scrollback"),
                             bounds: quadraui::Rect::new(
                                 term_content.x as f32,
                                 term_content.y as f32,
