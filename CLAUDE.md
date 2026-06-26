@@ -1,3 +1,13 @@
+## Current Goal — read first
+
+**[`GOALS.md`](GOALS.md) holds the current north-star objective:** *eliminate all
+platform-specific code from vimcode and lift it into quadraui.* It is meta-level
+(above any single issue or session) and sequences the work — read it first, plan
+against it, and keep it current. The **Platform-Neutrality Rule** below is the
+operational rule that stops *new* per-backend code; `GOALS.md` tracks *deleting the
+existing* per-backend code via milestone **#7 Platform-Neutral** (the vimcode-side
+adoption of shipped quadraui APIs; #5 is the quadraui-build supply side).
+
 ## Platform-Neutrality Rule (MANDATORY — overrides all other guidance)
 
 **NEVER add per-backend code to vimcode to fix a problem.** If a feature requires new code in `src/gtk/` or `src/tui_main/` beyond thin event-to-engine wiring, STOP. Do not attempt the fix. Instead:
