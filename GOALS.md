@@ -41,6 +41,7 @@ The work splits cleanly across **two milestones**. Don't conflate them:
 | Milestone | Repo | What it is |
 |---|---|---|
 | **#5 Cross-Platform UI Crate** | `JDonaghy/vimcode` (tracking) + `JDonaghy/quadraui` | **Build quadraui itself** — new primitives, validation consumers, the macOS/Windows backends. The *supply* side. |
+| **quadraui #9 "vimcode Platform-Neutral blockers"** | `JDonaghy/quadraui` | **The exact supply-side infra that gates #7 below.** Tightly scoped: only the remaining open blockers (#223 ButtonBar, #224 dual-mode Palette, #225 Dialog rich content, #375 TabGroup drag panic). |
 | **#7 Platform-Neutral** | `JDonaghy/vimcode` | **vimcode adopts a shipped quadraui API and deletes its bespoke per-backend code.** The *consume* side — this north star's execution surface. |
 
 A typical feature flows: gap found → quadraui issue (#5 / quadraui repo) → infra
@@ -64,28 +65,39 @@ deletions waiting to be picked up:
 | **#478** | TUI sidebar-item hover popup → shared tooltip builder | |
 | **#133** | unified sidebar rendering → `ScreenLayout` | (was tracked under Crate Extraction) |
 | **#146** | Lua plugin API → expose quadraui primitives | weakest fit — re-triage if it drifts |
+| **#479** | TUI Settings inline-edit → `FormController` | 🟢 quadraui#221/#157/#222 LANDED |
+| **#481** | TUI window-sep scrollbar + tab-drop overlay → primitives | 🟢 quadraui#226 + #121 LANDED |
+| **#493** | Full GTK `run_with_shell` migration (collapse 14 DAs → 1, strip Relm4) | 🟢 quadraui#217 LANDED |
+| **#508** | TUI text-selection + OSC52 clipboard; delete bespoke plumbing | 🟢 quadraui#269 + #283 LANDED |
 
-**Blocked on quadraui** — the #7 adoption can't start until the named quadraui infra
-lands and `~/src/quadraui` is pulled:
+**Ready once a quadraui fix lands** (feature exists, but with an open correctness bug):
 
-| Issue | Migration | Blocked on |
+| Issue | Migration | Waiting on |
 |---|---|---|
-| **#479** | TUI Settings inline-edit → `FormController` | quadraui `Form` text-cursor support |
-| **#480** | TUI Source Control panel → shared primitives | quadraui TextInput / ButtonBar / dual-mode Palette / Dialog rich content |
-| **#481** | TUI window-separator scrollbar + tab-drop overlay → primitives | quadraui `Backend::draw_scrollbar()` + drag-drop visual |
-| **#493** | Full GTK `run_with_shell` migration (collapse 14 DAs → 1, strip Relm4) | quadraui#217 |
-| **#508** | TUI text-selection + OSC52 clipboard; delete bespoke plumbing | quadraui#269 |
-| **#515** | editor-group drag-and-drop → `TabGroupController` | quadraui#349 |
+| **#515** | editor-group drag-and-drop → `TabGroupController` | quadraui#349 LANDED, but **quadraui#375** (TUI drag-start panics) must be fixed before adoption is safe |
+
+**Blocked on quadraui** — genuinely waiting on unbuilt infra (the *only* one left):
+
+| Issue | Migration | Blocked on (quadraui milestone #9) |
+|---|---|---|
+| **#480** | TUI Source Control panel → shared primitives | **#223** ButtonBar · **#224** dual-mode Palette · **#225** Dialog rich content (TextInput #222 already landed) |
 
 ## Status (2026-06-26)
 
 - ✅ **Milestone #7 "Platform-Neutral" created** and seeded with 15 adoption issues
   (11 pulled out of #5, #133 out of Crate Extraction, + #146/#512/#515 from
-  no-milestone). #5 is now scoped to pure quadraui-build.
-- 📋 **Next pick:** #512 — quadraui#294 (`DiffView`) has landed, so this is the
-  highest-value unblocked deletion. Then sweep the rest of the "Ready now" block.
-- 🚧 **Six issues are blocked on quadraui infra** (#479/#480/#481/#493/#508/#515) —
-  each names the gap; those are the priority quadraui-repo asks.
+  no-milestone). #5 is now scoped to pure quadraui-build. All 15 sent to the coord
+  Pipeline:New (`coord` + `status:ready`).
+- 🔎 **Supply audit (2026-06-26): the supply side is ~80% already built.** Of the 6
+  issues first thought "blocked on quadraui", **4 are actually unblocked** (#479/#481/
+  #493/#508 — infra closed, `~/src/quadraui` current), **#515 is unblocked but unsafe**
+  until quadraui#375's drag panic is fixed, and **only #480 truly waits** on unbuilt
+  quadraui infra (#223/#224/#225).
+- ✅ **quadraui milestone #9 "vimcode Platform-Neutral blockers" created** — the
+  supply-side counterpart, scoped to exactly #223/#224/#225 (gate #480) + #375
+  (gate #515). When those close, the whole #7 milestone is unblocked.
+- 📋 **Next pick:** #512 — quadraui#294 (`DiffView`) has landed; highest-value first
+  deletion. Then sweep the rest of "Ready now" (#479/#481/#493/#508 are also free now).
 
 ## How to use this doc
 
@@ -95,5 +107,8 @@ lands and `~/src/quadraui` is pulled:
   the old backend code in the same PR — a migration that leaves both paths is not done.
 - **Humans:** edit freely as priorities shift; keep it short, re-date Status. When
   quadraui infra lands, move the corresponding #7 issue from "Blocked" to "Ready now".
-- **Milestone discipline:** new quadraui-build gaps → #5 (or the quadraui repo);
-  new "delete vimcode's bespoke X for shared Y" work → **#7 Platform-Neutral**.
+- **Milestone discipline:** new "delete vimcode's bespoke X for shared Y" work →
+  **#7 Platform-Neutral**. A quadraui gap that *blocks* a #7 issue → file it on
+  `JDonaghy/quadraui` and add it to **quadraui milestone #9 "vimcode Platform-Neutral
+  blockers"** (general quadraui-build that isn't a #7 blocker → vimcode #5 / the
+  quadraui repo's own milestones).
