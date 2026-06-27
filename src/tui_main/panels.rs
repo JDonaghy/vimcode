@@ -8,116 +8,15 @@ pub(super) fn render_activity_bar(
     _menu_bar_visible: bool,
     engine: &Engine,
 ) {
-    // A.6e: activity bar rendering delegates to the `quadraui::ActivityBar`
-    // primitive. Build the declarative state from Engine (keyboard focus) +
-    // TuiSidebar (ext panel name), then call `draw_activity_bar`.
-    let bar = build_activity_bar_primitive(sidebar, engine, theme);
+    // Delegate to the shared adapter in render.rs (#133). TUI includes the
+    // hamburger item (index 0) because there is no native menu bar.
+    let bar = crate::render::build_activity_bar(
+        engine,
+        theme,
+        true,
+        sidebar.ext_panel_name.as_deref(),
+    );
     super::quadraui_tui::draw_activity_bar(buf, area, &bar, theme);
-}
-
-/// Build a `quadraui::ActivityBar` describing the current sidebar state.
-///
-/// Item ordering (matches the pre-migration layout):
-/// * Top: hamburger (menu) · explorer · search · debug · git · extensions
-///   · AI · dynamically-registered extension panels
-/// * Bottom: settings
-///
-/// Toolbar-keyboard selection indices are preserved:
-/// 0 = hamburger, 1-6 = fixed panels, 7 = settings, 8+ = extension panels.
-fn build_activity_bar_primitive(
-    sidebar: &TuiSidebar,
-    engine: &Engine,
-    theme: &Theme,
-) -> quadraui::ActivityBar {
-    // Keyboard highlight uses engine state (shared with GTK).
-    let kbd_sel = |idx: u16| engine.activity_bar_focused && engine.activity_bar_selected == idx;
-    let sb_visible = engine.app_shell.sidebar_visible();
-    let has_ext_panel = sidebar.ext_panel_name.is_some();
-    let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
-
-    let mut top = Vec::new();
-    top.push(quadraui::ActivityItem {
-        id: quadraui::WidgetId::new("activity:menu"),
-        icon: crate::icons::HAMBURGER.c().to_string(),
-        tooltip: "Menu".to_string(),
-        is_active: false,
-        is_keyboard_selected: kbd_sel(0),
-    });
-
-    let fixed: [(u16, &str, char, &str); 6] = [
-        (1, PANEL_EXPLORER, crate::icons::EXPLORER.c(), "Explorer"),
-        (2, PANEL_SEARCH, crate::icons::SEARCH.c(), "Search"),
-        (3, PANEL_DEBUG, crate::icons::DEBUG.c(), "Debug"),
-        (4, PANEL_GIT, crate::icons::GIT_BRANCH.c(), "Source Control"),
-        (
-            5,
-            PANEL_EXTENSIONS,
-            crate::icons::EXTENSIONS.c(),
-            "Extensions",
-        ),
-        (6, PANEL_AI, crate::icons::AI_CHAT.c(), "AI Assistant"),
-    ];
-    for (idx, panel_id, icon, tooltip) in fixed {
-        let activity_id = match panel_id {
-            PANEL_EXPLORER => "activity:explorer",
-            PANEL_SEARCH => "activity:search",
-            PANEL_DEBUG => "activity:debug",
-            PANEL_GIT => "activity:git",
-            PANEL_EXTENSIONS => "activity:extensions",
-            PANEL_AI => "activity:ai",
-            _ => "activity:unknown",
-        };
-        top.push(quadraui::ActivityItem {
-            id: quadraui::WidgetId::new(activity_id),
-            icon: icon.to_string(),
-            tooltip: tooltip.to_string(),
-            is_active: sb_visible && !has_ext_panel && active_id == Some(panel_id),
-            is_keyboard_selected: kbd_sel(idx),
-        });
-    }
-
-    // Dynamic extension panels (sorted by name; toolbar indices 8+).
-    let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
-    ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
-    for (i, panel) in ext_panels.iter().enumerate() {
-        let toolbar_idx = 8 + i as u16;
-        let is_active = sidebar.ext_panel_name.as_deref() == Some(&panel.name) && sb_visible;
-        top.push(quadraui::ActivityItem {
-            id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
-            icon: panel.resolved_icon().to_string(),
-            tooltip: panel.title.clone(),
-            is_active,
-            is_keyboard_selected: kbd_sel(toolbar_idx),
-        });
-    }
-
-    let bottom = vec![quadraui::ActivityItem {
-        id: quadraui::WidgetId::new("activity:settings"),
-        icon: crate::icons::SETTINGS.c().to_string(),
-        tooltip: "Settings".to_string(),
-        is_active: sb_visible && !has_ext_panel && active_id == Some(PANEL_SETTINGS),
-        is_keyboard_selected: kbd_sel(7),
-    }];
-
-    quadraui::ActivityBar {
-        id: quadraui::WidgetId::new("activity-bar"),
-        top_items: top,
-        bottom_items: bottom,
-        active_accent: Some(quadraui::Color::rgb(
-            theme.cursor.r,
-            theme.cursor.g,
-            theme.cursor.b,
-        )),
-        selection_bg: Some(quadraui::Color::rgb(
-            theme.cursor.r,
-            theme.cursor.g,
-            theme.cursor.b,
-        )),
-        // Signals to the quadraui TUI backend that this bar owns the
-        // keyboard so it intercepts KeyPressed as ActivityBarEvent::KeyPressed
-        // (Q#368 protocol).
-        is_keyboard_focused: engine.activity_bar_focused,
-    }
 }
 
 // ─── Sidebar rendering ────────────────────────────────────────────────────────
