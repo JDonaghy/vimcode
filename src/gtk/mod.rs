@@ -456,134 +456,6 @@ struct App {
     backend: Rc<RefCell<backend::GtkBackend>>,
 }
 
-/// Map GDK key names to the engine's expected key names.
-///
-/// This is the canonical superset mapping — callers that only care about a
-/// subset simply ignore the extra translations (they're harmless).
-/// A.6f: adapter — build the `quadraui::ActivityBar` primitive that the
-/// GTK activity bar DrawingArea renders each frame.
-///
-/// Item order matches the pre-migration view! macro layout:
-/// * Top: explorer · search · debug · git · extensions · AI
-///   · dynamically-registered extension panels (sorted by name)
-/// * Bottom: settings
-///
-/// `is_keyboard_selected` is set from `engine.activity_bar_focused` +
-/// `engine.activity_bar_selected` so the keyboard cursor renders on both
-/// backends using the same engine state. Hover state is layered in by the
-/// draw function via a separate `hovered_idx` parameter.
-fn build_gtk_activity_bar_primitive(
-    engine: &crate::core::engine::Engine,
-    theme: &crate::render::Theme,
-) -> quadraui::ActivityBar {
-    use crate::core::engine::sidebar::*;
-    let sb_visible = engine.app_shell.sidebar_visible();
-    let has_ext = engine.ext_panel_active.is_some();
-    let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
-    // Keyboard highlight: index 1-6 map to the fixed panel items (0-based in top[]).
-    // top[0] = hamburger (idx 0), top[1]=Explorer(1), ..., top[6]=AI(6), top[7+]=ext panels.
-    // bottom[0] = settings (idx 7).
-    let kbd_sel = |idx: u16| engine.activity_bar_focused && engine.activity_bar_selected == idx;
-
-    // Note: GTK doesn't show a hamburger menu button (item 0) in the fixed list
-    // — the menu bar is toggled by keyboard only. The indices for fixed panels
-    // start at 1 (Explorer) matching the engine toolbar index.
-    let fixed: [(&str, &str, &str, &str, u16); 6] = [
-        (
-            PANEL_EXPLORER,
-            icons::EXPLORER.nerd,
-            "Explorer (Ctrl+Shift+E)",
-            "activity:explorer",
-            1,
-        ),
-        (
-            PANEL_SEARCH,
-            icons::SEARCH_COD.nerd,
-            "Search (Ctrl+Shift+F)",
-            "activity:search",
-            2,
-        ),
-        (PANEL_DEBUG, icons::DEBUG.nerd, "Debug", "activity:debug", 3),
-        (
-            PANEL_GIT,
-            icons::GIT_BRANCH.nerd,
-            "Source Control",
-            "activity:git",
-            4,
-        ),
-        (
-            PANEL_EXTENSIONS,
-            icons::EXTENSIONS.nerd,
-            "Extensions",
-            "activity:extensions",
-            5,
-        ),
-        (
-            PANEL_AI,
-            icons::AI_CHAT.nerd,
-            "AI Assistant",
-            "activity:ai",
-            6,
-        ),
-    ];
-
-    let mut top: Vec<quadraui::ActivityItem> = fixed
-        .iter()
-        .map(
-            |(panel_id, icon, tooltip, activity_id, toolbar_idx)| quadraui::ActivityItem {
-                id: quadraui::WidgetId::new(*activity_id),
-                icon: (*icon).to_string(),
-                tooltip: (*tooltip).to_string(),
-                is_active: sb_visible && !has_ext && active_id == Some(*panel_id),
-                is_keyboard_selected: kbd_sel(*toolbar_idx),
-            },
-        )
-        .collect();
-
-    let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
-    ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
-    for (i, panel) in ext_panels.iter().enumerate() {
-        let is_active = sb_visible && engine.ext_panel_active.as_deref() == Some(&panel.name);
-        let toolbar_idx = 8 + i as u16;
-        top.push(quadraui::ActivityItem {
-            id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
-            icon: panel.resolved_icon().to_string(),
-            tooltip: panel.title.clone(),
-            is_active,
-            is_keyboard_selected: kbd_sel(toolbar_idx),
-        });
-    }
-
-    let bottom = vec![quadraui::ActivityItem {
-        id: quadraui::WidgetId::new("activity:settings"),
-        icon: icons::SETTINGS.nerd.to_string(),
-        tooltip: "Settings".to_string(),
-        is_active: sb_visible && !has_ext && active_id == Some(PANEL_SETTINGS),
-        is_keyboard_selected: kbd_sel(7),
-    }];
-
-    quadraui::ActivityBar {
-        id: quadraui::WidgetId::new("activity-bar"),
-        top_items: top,
-        bottom_items: bottom,
-        active_accent: Some(quadraui::Color::rgb(
-            theme.cursor.r,
-            theme.cursor.g,
-            theme.cursor.b,
-        )),
-        selection_bg: Some(quadraui::Color::rgb(
-            theme.cursor.r,
-            theme.cursor.g,
-            theme.cursor.b,
-        )),
-        // Signals to the quadraui GTK backend that this bar owns the
-        // keyboard.  The backend's draw_activity_bar impl records the bar ID
-        // in GtkBackend::focused_activity_bar so window-level key events can
-        // be converted to ActivityBarEvent::KeyPressed (Q#368).
-        is_keyboard_focused: engine.activity_bar_focused,
-    }
-}
-
 /// Decode an activity bar widget ID into a panel ID for `Msg::SwitchPanel`.
 fn activity_id_to_panel_id(id: &str) -> Option<String> {
     match id {
@@ -600,6 +472,10 @@ fn activity_id_to_panel_id(id: &str) -> Option<String> {
     }
 }
 
+/// Map GDK key names to the engine's expected key names.
+///
+/// This is the canonical superset mapping — callers that only care about a
+/// subset simply ignore the extra translations (they're harmless).
 fn map_gtk_key_name(gdk_name: &str) -> &str {
     match gdk_name {
         "Return" | "KP_Enter" => "Return",
@@ -3339,7 +3215,12 @@ impl SimpleComponent for App {
                 let theme = Theme::from_name(&engine.settings.colorscheme);
                 let pango_ctx = pangocairo::create_context(cr);
                 let layout = pango::Layout::new(&pango_ctx);
-                let bar = build_gtk_activity_bar_primitive(&engine, &theme);
+                let bar = crate::render::build_activity_bar(
+                    &engine,
+                    &theme,
+                    false,
+                    engine.ext_panel_active.as_deref(),
+                );
                 let hovered = hover_d.get();
                 let hits = quadraui::gtk::draw_activity_bar(
                     cr,

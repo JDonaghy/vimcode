@@ -2795,7 +2795,8 @@ pub enum UiElement {
     TabTooltip,
     /// Diff toolbar (change navigation buttons in tab bar).
     DiffToolbar,
-    /// Activity bar (sidebar icon strip) — rendered by backends, not in ScreenLayout directly.
+    /// Activity bar (sidebar icon strip) — built by `render::build_activity_bar()` and
+    /// painted by `quadraui::{tui,gtk}::draw_activity_bar`; not stored in `ScreenLayout`.
     ActivityBar,
     /// Sidebar panel content — rendered by backends from ScreenLayout sidebar data.
     Sidebar,
@@ -7401,6 +7402,145 @@ fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tre
         vec![empty_placeholder_row(session_active)]
     } else {
         rows
+    }
+}
+
+// ─── Activity bar adapter (#133) ─────────────────────────────────────────────
+
+/// Build a `quadraui::ActivityBar` primitive from engine state.
+///
+/// Both backends call this once per frame, then delegate to
+/// `quadraui::{tui,gtk}::draw_activity_bar`.
+///
+/// * `include_hamburger` — `true` for TUI (no native menu bar so the
+///   hamburger item at keyboard-index 0 provides keyboard access to the
+///   menu); `false` for GTK (the menu bar is a native GTK widget).
+/// * `active_ext_panel` — name of the currently-active extension panel, if
+///   any. GTK passes `engine.ext_panel_active.as_deref()`; TUI passes
+///   `sidebar.ext_panel_name.as_deref()`.
+///
+/// Icons use `icons::*.s()` which respects the `USE_NERD_FONTS` global flag
+/// set at startup — both GTK and TUI set it from `settings.use_nerd_fonts`.
+pub fn build_activity_bar(
+    engine: &Engine,
+    theme: &Theme,
+    include_hamburger: bool,
+    active_ext_panel: Option<&str>,
+) -> quadraui::ActivityBar {
+    use crate::core::engine::sidebar::{
+        PANEL_AI, PANEL_DEBUG, PANEL_EXPLORER, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH,
+        PANEL_SETTINGS,
+    };
+
+    let kbd_sel = |idx: u16| engine.activity_bar_focused && engine.activity_bar_selected == idx;
+    let sb_visible = engine.app_shell.sidebar_visible();
+    let has_ext = active_ext_panel.is_some();
+    let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
+
+    let mut top = Vec::new();
+
+    if include_hamburger {
+        top.push(quadraui::ActivityItem {
+            id: quadraui::WidgetId::new("activity:menu"),
+            icon: icons::HAMBURGER.s().to_string(),
+            tooltip: "Menu".to_string(),
+            is_active: false,
+            is_keyboard_selected: kbd_sel(0),
+        });
+    }
+
+    // (toolbar_idx, panel_id, icon, tooltip, activity_id)
+    // Toolbar-keyboard selection indices:
+    //   0 = hamburger (TUI only), 1-6 = fixed panels, 7 = settings, 8+ = ext panels.
+    let fixed: [(u16, &str, &str, &str, &str); 6] = [
+        (
+            1,
+            PANEL_EXPLORER,
+            icons::EXPLORER.s(),
+            "Explorer (Ctrl+Shift+E)",
+            "activity:explorer",
+        ),
+        (
+            2,
+            PANEL_SEARCH,
+            icons::SEARCH.s(),
+            "Search (Ctrl+Shift+F)",
+            "activity:search",
+        ),
+        (3, PANEL_DEBUG, icons::DEBUG.s(), "Debug", "activity:debug"),
+        (
+            4,
+            PANEL_GIT,
+            icons::GIT_BRANCH.s(),
+            "Source Control",
+            "activity:git",
+        ),
+        (
+            5,
+            PANEL_EXTENSIONS,
+            icons::EXTENSIONS.s(),
+            "Extensions",
+            "activity:extensions",
+        ),
+        (
+            6,
+            PANEL_AI,
+            icons::AI_CHAT.s(),
+            "AI Assistant",
+            "activity:ai",
+        ),
+    ];
+
+    for (toolbar_idx, panel_id, icon, tooltip, activity_id) in fixed {
+        top.push(quadraui::ActivityItem {
+            id: quadraui::WidgetId::new(activity_id),
+            icon: icon.to_string(),
+            tooltip: tooltip.to_string(),
+            is_active: sb_visible && !has_ext && active_id == Some(panel_id),
+            is_keyboard_selected: kbd_sel(toolbar_idx),
+        });
+    }
+
+    // Dynamic extension panels (sorted by name; toolbar indices 8+).
+    let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
+    ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
+    for (i, panel) in ext_panels.iter().enumerate() {
+        let toolbar_idx = 8 + i as u16;
+        let is_active = sb_visible && active_ext_panel == Some(panel.name.as_str());
+        top.push(quadraui::ActivityItem {
+            id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
+            icon: panel.resolved_icon().to_string(),
+            tooltip: panel.title.clone(),
+            is_active,
+            is_keyboard_selected: kbd_sel(toolbar_idx),
+        });
+    }
+
+    let bottom = vec![quadraui::ActivityItem {
+        id: quadraui::WidgetId::new("activity:settings"),
+        icon: icons::SETTINGS.s().to_string(),
+        tooltip: "Settings".to_string(),
+        is_active: sb_visible && !has_ext && active_id == Some(PANEL_SETTINGS),
+        is_keyboard_selected: kbd_sel(7),
+    }];
+
+    quadraui::ActivityBar {
+        id: quadraui::WidgetId::new("activity-bar"),
+        top_items: top,
+        bottom_items: bottom,
+        active_accent: Some(quadraui::Color::rgb(
+            theme.cursor.r,
+            theme.cursor.g,
+            theme.cursor.b,
+        )),
+        selection_bg: Some(quadraui::Color::rgb(
+            theme.cursor.r,
+            theme.cursor.g,
+            theme.cursor.b,
+        )),
+        // Signals to the quadraui backend that this bar owns the keyboard so
+        // it intercepts KeyPressed as ActivityBarEvent::KeyPressed (Q#368).
+        is_keyboard_focused: engine.activity_bar_focused,
     }
 }
 
