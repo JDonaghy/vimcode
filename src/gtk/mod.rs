@@ -4006,7 +4006,95 @@ impl SimpleComponent for App {
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+        self.dispatch(msg);
+    }
+}
+
+/// Reposition existing scrollbar widgets for the given drawing-area size.
+///
+/// This is a free function so it can be called both from `sync_scrollbar` (via
+/// Relm4's message queue) AND from a `connect_resize` callback that runs
+/// synchronously during GTK's layout pass — before each frame is rendered.
+/// Calling it synchronously eliminates the 1-frame lag where the editor draws
+/// at the new size while scrollbars are still at the old position.
+///
+/// It only updates widget geometry; it does NOT create/remove scrollbars or
+/// update adjustment values (that is `sync_scrollbar`'s job).
+#[allow(clippy::too_many_arguments)]
+fn sync_scrollbar_positions(
+    da_width: f64,
+    da_height: f64,
+    line_height: f64,
+    _char_width: f64,
+    engine: &core::Engine,
+    scrollbars: &HashMap<core::WindowId, WindowScrollbars>,
+) {
+    if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
+        return;
+    }
+    let tab_row_height = (line_height * 1.6).ceil();
+    let tab_bar_height = if engine.settings.breadcrumbs {
+        tab_row_height + line_height
+    } else {
+        tab_row_height
+    };
+    let editor_bounds = core::WindowRect::new(
+        0.0,
+        0.0,
+        da_width,
+        gtk_editor_bottom(engine, da_width, da_height, line_height),
+    );
+    let (window_rects, _dividers) =
+        engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
+
+    // Hide scrollbars for windows not in the current visible set
+    // (e.g. windows in non-active tabs), or when a modal popup is
+    // open. Native gtk4::Scrollbar widgets render above the
+    // DrawingArea, so they would otherwise poke through the
+    // palette / picker / tab-switcher overlays.
+    let visible_ids: std::collections::HashSet<core::WindowId> =
+        window_rects.iter().map(|(wid, _)| *wid).collect();
+    let modal_open = engine.is_blocking_modal_open();
+    for (wid, ws) in scrollbars.iter() {
+        let show = visible_ids.contains(wid) && !modal_open;
+        ws.vertical.set_visible(show);
+        ws.cursor_indicator.set_visible(show);
+    }
+
+    for (window_id, rect) in &window_rects {
+        let ws = match scrollbars.get(window_id) {
+            Some(ws) => ws,
+            None => continue,
+        };
+        let window = match engine.windows.get(window_id) {
+            Some(w) => w,
+            None => continue,
+        };
+        if engine.buffer_manager.get(window.buffer_id).is_none() {
+            continue;
+        }
+
+        // — Vertical scrollbar —
+        // Query the actual allocated width so we position correctly even if
+        // GTK's theme enforces a minimum wider than our CSS min-width.
+        // Inset 2px from the right edge so the scrollbar doesn't visually
+        // overlap the group divider or the adjacent group's space.
+        let sb_actual_w = ws.vertical.width().max(4) as f64;
+        ws.vertical.set_halign(gtk4::Align::Start);
+        ws.vertical.set_valign(gtk4::Align::Start);
+        ws.vertical
+            .set_margin_start(rect.x as i32 + (rect.width - sb_actual_w) as i32 - 2);
+        ws.vertical.set_margin_top(rect.y as i32);
+        ws.vertical
+            .set_height_request((rect.height as i32 - 4).max(0));
+
+        // Horizontal scrollbar is drawn in Cairo by draw_editor — nothing to do here.
+    }
+}
+
+impl App {
+    fn dispatch(&mut self, msg: Msg) {
         // Track if this is a scrollbar change to avoid syncing feedback loop
         let is_scrollbar_msg = matches!(
             &msg,
@@ -4020,7 +4108,7 @@ impl SimpleComponent for App {
                 ctrl,
                 alt,
             } => {
-                self.handle_key_press(key_name, unicode, ctrl, alt, &sender);
+                self.handle_key_press(key_name, unicode, ctrl, alt);
             }
             Msg::ClearYankHighlight => {
                 self.engine.borrow_mut().clear_yank_highlight();
@@ -4096,7 +4184,7 @@ impl SimpleComponent for App {
                 height,
                 alt,
             } => {
-                self.handle_mouse_click_msg(x, y, width, height, alt, &sender);
+                self.handle_mouse_click_msg(x, y, width, height, alt);
             }
             Msg::CtrlMouseClick {
                 x,
@@ -4206,7 +4294,7 @@ impl SimpleComponent for App {
                 self.handle_mouse_up_msg();
             }
             Msg::ToggleSidebar | Msg::SwitchPanel(_) => {
-                self.handle_sidebar_panel_msg(msg, &sender);
+                self.handle_sidebar_panel_msg(msg);
             }
             Msg::OpenFileFromSidebar(_)
             | Msg::OpenSide(_)
@@ -4223,7 +4311,7 @@ impl SimpleComponent for App {
             | Msg::ToggleFocusExplorer
             | Msg::ToggleFocusSearch
             | Msg::FocusEditor => {
-                self.handle_explorer_msg(msg, &sender);
+                self.handle_explorer_msg(msg);
             }
             Msg::VerticalScrollbarChanged { window_id, value } => {
                 // Update specific window's scroll_top based on scrollbar value
@@ -4464,7 +4552,7 @@ impl SimpleComponent for App {
                     if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
                         drawing_area.queue_draw();
                     }
-                    sender.input(Msg::RefreshFileTree);
+                    self.dispatch(Msg::RefreshFileTree);
                     self.draw_needed.set(true);
                 }
             }
@@ -4479,7 +4567,7 @@ impl SimpleComponent for App {
                 }
                 drop(engine);
                 if key == "show_hidden_files" {
-                    sender.input(Msg::RefreshFileTree);
+                    self.dispatch(Msg::RefreshFileTree);
                 }
                 self.draw_needed.set(true);
             }
@@ -4525,7 +4613,7 @@ impl SimpleComponent for App {
                 self.draw_needed.set(true);
             }
             Msg::SearchPollTick => {
-                self.handle_poll_tick(&sender);
+                self.handle_poll_tick();
             }
             Msg::ProjectSearchOpenResult(idx) => {
                 let result = self
@@ -4563,7 +4651,7 @@ impl SimpleComponent for App {
             | Msg::DiffWithSelected(_)
             | Msg::ClipboardPasteToInput { .. }
             | Msg::WindowClosing { .. } => {
-                self.handle_file_ops_msg(msg, &sender);
+                self.handle_file_ops_msg(msg);
             }
             Msg::ToggleTerminal
             | Msg::ToggleTerminalMaximize
@@ -4594,7 +4682,7 @@ impl SimpleComponent for App {
             | Msg::MruNavBack
             | Msg::MruNavForward
             | Msg::OpenCommandCenter => {
-                self.handle_menu_msg(msg, &sender);
+                self.handle_menu_msg(msg);
             }
             Msg::DebugSidebarClick(_, _)
             | Msg::DebugSidebarDrag(_, _)
@@ -4622,7 +4710,7 @@ impl SimpleComponent for App {
             | Msg::ExplorerUiEvent(_)
             | Msg::ExplorerCtxMenuClick(..)
             | Msg::ExplorerCtxMenuMotion(..) => {
-                self.handle_explorer_msg(msg, &sender);
+                self.handle_explorer_msg(msg);
             }
             Msg::ExtPanelKey(_, _)
             | Msg::ExtPanelClick(_, _, _)
@@ -4647,7 +4735,7 @@ impl SimpleComponent for App {
             | Msg::QuitConfirmed
             | Msg::ShowCloseTabConfirm
             | Msg::CloseTabConfirmed { .. } => {
-                self.handle_dialog_msg(msg, &sender);
+                self.handle_dialog_msg(msg);
             }
         }
 
@@ -4684,91 +4772,7 @@ impl SimpleComponent for App {
             }
         }
     }
-}
 
-/// Reposition existing scrollbar widgets for the given drawing-area size.
-///
-/// This is a free function so it can be called both from `sync_scrollbar` (via
-/// Relm4's message queue) AND from a `connect_resize` callback that runs
-/// synchronously during GTK's layout pass — before each frame is rendered.
-/// Calling it synchronously eliminates the 1-frame lag where the editor draws
-/// at the new size while scrollbars are still at the old position.
-///
-/// It only updates widget geometry; it does NOT create/remove scrollbars or
-/// update adjustment values (that is `sync_scrollbar`'s job).
-#[allow(clippy::too_many_arguments)]
-fn sync_scrollbar_positions(
-    da_width: f64,
-    da_height: f64,
-    line_height: f64,
-    _char_width: f64,
-    engine: &core::Engine,
-    scrollbars: &HashMap<core::WindowId, WindowScrollbars>,
-) {
-    if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
-        return;
-    }
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
-    let editor_bounds = core::WindowRect::new(
-        0.0,
-        0.0,
-        da_width,
-        gtk_editor_bottom(engine, da_width, da_height, line_height),
-    );
-    let (window_rects, _dividers) =
-        engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-
-    // Hide scrollbars for windows not in the current visible set
-    // (e.g. windows in non-active tabs), or when a modal popup is
-    // open. Native gtk4::Scrollbar widgets render above the
-    // DrawingArea, so they would otherwise poke through the
-    // palette / picker / tab-switcher overlays.
-    let visible_ids: std::collections::HashSet<core::WindowId> =
-        window_rects.iter().map(|(wid, _)| *wid).collect();
-    let modal_open = engine.is_blocking_modal_open();
-    for (wid, ws) in scrollbars.iter() {
-        let show = visible_ids.contains(wid) && !modal_open;
-        ws.vertical.set_visible(show);
-        ws.cursor_indicator.set_visible(show);
-    }
-
-    for (window_id, rect) in &window_rects {
-        let ws = match scrollbars.get(window_id) {
-            Some(ws) => ws,
-            None => continue,
-        };
-        let window = match engine.windows.get(window_id) {
-            Some(w) => w,
-            None => continue,
-        };
-        if engine.buffer_manager.get(window.buffer_id).is_none() {
-            continue;
-        }
-
-        // — Vertical scrollbar —
-        // Query the actual allocated width so we position correctly even if
-        // GTK's theme enforces a minimum wider than our CSS min-width.
-        // Inset 2px from the right edge so the scrollbar doesn't visually
-        // overlap the group divider or the adjacent group's space.
-        let sb_actual_w = ws.vertical.width().max(4) as f64;
-        ws.vertical.set_halign(gtk4::Align::Start);
-        ws.vertical.set_valign(gtk4::Align::Start);
-        ws.vertical
-            .set_margin_start(rect.x as i32 + (rect.width - sb_actual_w) as i32 - 2);
-        ws.vertical.set_margin_top(rect.y as i32);
-        ws.vertical
-            .set_height_request((rect.height as i32 - 4).max(0));
-
-        // Horizontal scrollbar is drawn in Cairo by draw_editor — nothing to do here.
-    }
-}
-
-impl App {
     /// Reveal `target` in the explorer sidebar: expand all ancestors,
     /// rebuild the row list, select the matching row, scroll into view,
     /// and queue a redraw of the explorer DrawingArea. Phase A.2b-2
@@ -4824,12 +4828,7 @@ impl App {
     ///
     /// `is_macro`: when true, `OpenTerminal` toggles instead of creating a new
     /// tab, and dialog-open actions are suppressed (macros can't drive dialogs).
-    fn dispatch_engine_action(
-        &mut self,
-        action: EngineAction,
-        sender: &ComponentSender<Self>,
-        is_macro: bool,
-    ) {
+    fn dispatch_engine_action(&mut self, action: EngineAction, is_macro: bool) {
         match action {
             EngineAction::Quit | EngineAction::SaveQuit => {
                 self.save_session_and_exit();
@@ -4850,39 +4849,39 @@ impl App {
             }
             EngineAction::OpenTerminal => {
                 if is_macro {
-                    sender.input(Msg::ToggleTerminal);
+                    self.dispatch(Msg::ToggleTerminal);
                 } else {
-                    sender.input(Msg::NewTerminalTab);
+                    self.dispatch(Msg::NewTerminalTab);
                 }
             }
             EngineAction::ToggleTerminalMaximize => {
-                sender.input(Msg::ToggleTerminalMaximize);
+                self.dispatch(Msg::ToggleTerminalMaximize);
             }
             EngineAction::RunInTerminal(cmd) => {
-                sender.input(Msg::RunCommandInTerminal(cmd));
+                self.dispatch(Msg::RunCommandInTerminal(cmd));
             }
             EngineAction::OpenFolderDialog => {
                 if !is_macro {
-                    sender.input(Msg::OpenFolderDialog);
+                    self.dispatch(Msg::OpenFolderDialog);
                 }
             }
             EngineAction::OpenWorkspaceDialog => {
                 if !is_macro {
-                    sender.input(Msg::OpenWorkspaceDialog);
+                    self.dispatch(Msg::OpenWorkspaceDialog);
                 }
             }
             EngineAction::SaveWorkspaceAsDialog => {
                 if !is_macro {
-                    sender.input(Msg::SaveWorkspaceAsDialog);
+                    self.dispatch(Msg::SaveWorkspaceAsDialog);
                 }
             }
             EngineAction::OpenRecentDialog => {
                 if !is_macro {
-                    sender.input(Msg::OpenRecentDialog);
+                    self.dispatch(Msg::OpenRecentDialog);
                 }
             }
             EngineAction::QuitWithUnsaved => {
-                sender.input(Msg::ShowQuitConfirm);
+                self.dispatch(Msg::ShowQuitConfirm);
             }
             EngineAction::ToggleSidebar => {
                 // Engine handles this internally; sync local cache.
@@ -5158,19 +5157,12 @@ impl App {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn handle_key_press(
-        &mut self,
-        key_name: String,
-        unicode: Option<char>,
-        ctrl: bool,
-        alt: bool,
-        sender: &ComponentSender<Self>,
-    ) {
+    fn handle_key_press(&mut self, key_name: String, unicode: Option<char>, ctrl: bool, alt: bool) {
         // Handle Ctrl-Shift-V paste (sent as synthetic "PasteClipboard" key):
         // do async GDK clipboard read → ClipboardPasteToInput
         if key_name == "PasteClipboard" {
             if let Some(display) = gdk::Display::default() {
-                let sender = sender.clone();
+                let sender = self.sender.clone();
                 display
                     .clipboard()
                     .read_text_async(gtk4::gio::Cancellable::NONE, move |result| {
@@ -5179,7 +5171,7 @@ impl App {
                             .flatten()
                             .map(|s| s.to_string())
                             .unwrap_or_default();
-                        sender.input(Msg::ClipboardPasteToInput { text });
+                        sender.send(Msg::ClipboardPasteToInput { text }).ok();
                     });
             }
             return;
@@ -5203,7 +5195,7 @@ impl App {
                     }
                     drop(engine);
                     if needs_refresh {
-                        sender.input(Msg::RefreshFileTree);
+                        self.dispatch(Msg::RefreshFileTree);
                     }
                     self.draw_needed.set(true);
                     return;
@@ -5269,7 +5261,7 @@ impl App {
         // Activity bar keyboard navigation: j/k move cursor, l/Enter activate,
         // h/Esc return focus to the editor.
         if self.engine.borrow().activity_bar_focused && !self.engine.borrow().picker_open {
-            self.handle_activity_bar_key(&key_name, ctrl, sender);
+            self.handle_activity_bar_key(&key_name, ctrl);
             self.draw_needed.set(true);
             return;
         }
@@ -5282,7 +5274,7 @@ impl App {
                 "F5" | "F9" | "F10" | "F11" => {
                     let mapped = map_gtk_key_name(&key_name);
                     let action = self.engine.borrow_mut().handle_key(mapped, None, false);
-                    self.dispatch_engine_action(action, sender, false);
+                    self.dispatch_engine_action(action, false);
                     self.draw_needed.set(true);
                     return;
                 }
@@ -5299,7 +5291,7 @@ impl App {
         // widget focus (grab_focus is unreliable for DrawingAreas).
         if self.engine.borrow().explorer_has_focus {
             let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
-            self.handle_explorer_da_key(key_mapped, unicode, ctrl, sender);
+            self.handle_explorer_da_key(key_mapped, unicode, ctrl);
             self.draw_needed.set(true);
             return;
         }
@@ -5368,7 +5360,7 @@ impl App {
                 } else if ctrl && mapped == "v" {
                     drop(engine);
                     if let Some(display) = gdk::Display::default() {
-                        let sender = sender.clone();
+                        let sender = self.sender.clone();
                         display.clipboard().read_text_async(
                             gtk4::gio::Cancellable::NONE,
                             move |result| {
@@ -5377,7 +5369,7 @@ impl App {
                                     .flatten()
                                     .map(|s| s.to_string())
                                     .unwrap_or_default();
-                                sender.input(Msg::ClipboardPasteToInput { text });
+                                sender.send(Msg::ClipboardPasteToInput { text }).ok();
                             },
                         );
                     }
@@ -5490,7 +5482,7 @@ impl App {
             a
         };
 
-        self.dispatch_engine_action(action, sender, false);
+        self.dispatch_engine_action(action, false);
         self.draw_needed.set(true);
 
         // Process macro playback queue if active
@@ -5500,7 +5492,7 @@ impl App {
                 engine.advance_macro_playback()
             };
 
-            self.dispatch_engine_action(action, sender, true);
+            self.dispatch_engine_action(action, true);
 
             if !has_more {
                 break;
@@ -5528,16 +5520,16 @@ impl App {
 
         // If a yank just happened, schedule a 200 ms one-shot to clear the highlight.
         if self.engine.borrow().yank_highlight.is_some() {
-            let s = sender.clone();
+            let s = self.sender.clone();
             gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                s.input(Msg::ClearYankHighlight);
+                s.send(Msg::ClearYankHighlight).ok();
             });
         }
 
         self.draw_needed.set(true);
     }
 
-    fn handle_poll_tick(&mut self, sender: &ComponentSender<Self>) {
+    fn handle_poll_tick(&mut self) {
         // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
@@ -5716,7 +5708,7 @@ impl App {
         // Format-on-save + :wq/:x deferred quit
         if self.engine.borrow().format_save_quit_ready {
             self.engine.borrow_mut().format_save_quit_ready = false;
-            sender.input(Msg::QuitConfirmed);
+            self.dispatch(Msg::QuitConfirmed);
         }
         // Run pending terminal commands (needs backend-supplied terminal size).
         if self.engine.borrow().pending_terminal_command.is_some() {
@@ -5726,7 +5718,7 @@ impl App {
                 .pending_terminal_command
                 .take()
                 .unwrap();
-            sender.input(Msg::RunCommandInTerminal(cmd));
+            self.dispatch(Msg::RunCommandInTerminal(cmd));
         }
         // Explicitly redraw the debug sidebar if it's active so the
         // Run/Stop button text and section data stay in sync.
@@ -5739,7 +5731,7 @@ impl App {
         // Explorer refresh after confirmed file move.
         if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
-            sender.input(Msg::RefreshFileTree);
+            self.dispatch(Msg::RefreshFileTree);
         }
         // Auto-refresh SC panel periodically (gated on sidebar visibility).
         if self.current_sidebar_visible()
@@ -5918,15 +5910,7 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn handle_mouse_click_msg(
-        &mut self,
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-        alt: bool,
-        sender: &ComponentSender<Self>,
-    ) {
+    fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
         self.reconcile_editor_hover_modal();
 
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
@@ -6162,7 +6146,7 @@ impl App {
                                 .borrow_mut()
                                 .pop(&cm_id);
                             if needs_tree_refresh {
-                                sender.input(Msg::RefreshFileTree);
+                                self.dispatch(Msg::RefreshFileTree);
                             }
                         }
                     }
@@ -6689,7 +6673,7 @@ impl App {
                 let action = self.engine.borrow_mut().dialog_click_button(idx);
                 if self.engine.borrow().explorer_needs_refresh {
                     self.engine.borrow_mut().explorer_needs_refresh = false;
-                    sender.input(Msg::RefreshFileTree);
+                    self.dispatch(Msg::RefreshFileTree);
                 }
                 match action {
                     EngineAction::Quit | EngineAction::SaveQuit => {
@@ -6804,7 +6788,7 @@ impl App {
                 use crate::core::engine::BottomPanelZone;
                 if matches!(zone, BottomPanelZone::TabBar) {
                     self.engine.borrow_mut().handle_bottom_tab_bar_click(x);
-                    sender.input(Msg::Resize);
+                    self.dispatch(Msg::Resize);
                     return;
                 }
                 self.engine.borrow_mut().terminal_has_focus = true;
@@ -7044,7 +7028,7 @@ impl App {
                     match click_result {
                         Some(true) => {
                             drop(engine);
-                            sender.input(Msg::ShowCloseTabConfirm);
+                            self.dispatch(Msg::ShowCloseTabConfirm);
                             self.draw_needed.set(true);
                             return;
                         }
@@ -7411,9 +7395,7 @@ impl App {
                 // #533: shared drag handler — tries forward_mouse(Move)
                 // when the child has mouse reporting, falls back to local
                 // selection update.
-                self.engine
-                    .borrow_mut()
-                    .handle_terminal_pane_drag(col, row);
+                self.engine.borrow_mut().handle_terminal_pane_drag(col, row);
                 self.draw_needed.set(true);
             } else {
                 let layout_ref = self.cached_screen_layout.borrow();
@@ -7713,7 +7695,7 @@ impl App {
         }
     }
 
-    fn handle_menu_msg(&mut self, msg: Msg, sender: &ComponentSender<Self>) {
+    fn handle_menu_msg(&mut self, msg: Msg) {
         match msg {
             Msg::ToggleMenuBar => {
                 if let Some(ref da) = *self.menu_bar_da.borrow() {
@@ -7740,20 +7722,20 @@ impl App {
             Msg::HandleMenuAction(action) => {
                 match action.as_str() {
                     "open_file_dialog" => {
-                        sender.input(Msg::OpenFileDialog);
+                        self.dispatch(Msg::OpenFileDialog);
                     }
                     "open_folder_dialog" => {
-                        sender.input(Msg::OpenFolderDialog);
+                        self.dispatch(Msg::OpenFolderDialog);
                     }
                     "open_workspace_dialog" => {
                         self.engine.borrow_mut().open_workspace_from_file();
-                        sender.input(Msg::RefreshFileTree);
+                        self.dispatch(Msg::RefreshFileTree);
                     }
                     "save_workspace_as_dialog" => {
-                        sender.input(Msg::SaveWorkspaceAsDialog);
+                        self.dispatch(Msg::SaveWorkspaceAsDialog);
                     }
                     "openrecent" => {
-                        sender.input(Msg::OpenRecentDialog);
+                        self.dispatch(Msg::OpenRecentDialog);
                     }
                     "find" => {
                         self.engine.borrow_mut().open_find_replace();
@@ -7761,7 +7743,7 @@ impl App {
                     }
                     "quit_menu" => {
                         if self.engine.borrow().has_any_unsaved() {
-                            sender.input(Msg::ShowQuitConfirm);
+                            self.dispatch(Msg::ShowQuitConfirm);
                         } else {
                             self.save_session_and_exit();
                         }
@@ -7770,16 +7752,16 @@ impl App {
                         let engine_action = self.engine.borrow_mut().dispatch_menu_action(&action);
                         match engine_action {
                             EngineAction::Quit | EngineAction::SaveQuit => {
-                                sender.input(Msg::QuitConfirmed);
+                                self.dispatch(Msg::QuitConfirmed);
                             }
                             EngineAction::QuitWithUnsaved => {
-                                sender.input(Msg::ShowQuitConfirm);
+                                self.dispatch(Msg::ShowQuitConfirm);
                             }
                             EngineAction::ToggleSidebar => {
                                 self.sync_sidebar_from_engine();
                             }
                             EngineAction::OpenTerminal => {
-                                sender.input(Msg::NewTerminalTab);
+                                self.dispatch(Msg::NewTerminalTab);
                             }
                             _ => {}
                         }
@@ -8873,7 +8855,7 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    fn handle_sidebar_panel_msg(&mut self, msg: Msg, _sender: &ComponentSender<Self>) {
+    fn handle_sidebar_panel_msg(&mut self, msg: Msg) {
         match msg {
             Msg::ToggleSidebar => {
                 self.engine.borrow_mut().toggle_sidebar();
@@ -8920,7 +8902,7 @@ impl App {
         }
     }
 
-    fn handle_explorer_msg(&mut self, msg: Msg, sender: &ComponentSender<Self>) {
+    fn handle_explorer_msg(&mut self, msg: Msg) {
         match msg {
             Msg::OpenFileFromSidebar(path) => {
                 {
@@ -8979,10 +8961,10 @@ impl App {
                         self.engine.borrow_mut().message = format!("Created: {}", name);
 
                         // Trigger tree refresh
-                        sender.input(Msg::RefreshFileTree);
+                        self.dispatch(Msg::RefreshFileTree);
 
                         // Open the new file
-                        sender.input(Msg::OpenFileFromSidebar(file_path));
+                        self.dispatch(Msg::OpenFileFromSidebar(file_path));
                     }
                     Err(e) => {
                         self.engine.borrow_mut().message =
@@ -9012,7 +8994,7 @@ impl App {
                 match std::fs::create_dir(&folder_path) {
                     Ok(_) => {
                         self.engine.borrow_mut().message = format!("Created folder: {}", name);
-                        sender.input(Msg::RefreshFileTree);
+                        self.dispatch(Msg::RefreshFileTree);
                         self.reveal_path_in_explorer(&folder_path);
                     }
                     Err(e) => {
@@ -9023,10 +9005,10 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::StartInlineNewFile(_) => {
-                sender.input(Msg::ExplorerAction("new_file".to_string()));
+                self.dispatch(Msg::ExplorerAction("new_file".to_string()));
             }
             Msg::StartInlineNewFolder(_) => {
-                sender.input(Msg::ExplorerAction("new_folder".to_string()));
+                self.dispatch(Msg::ExplorerAction("new_folder".to_string()));
             }
             Msg::ExplorerActivateSelected => {
                 self.engine.borrow_mut().explorer_activate_selected();
@@ -9148,15 +9130,15 @@ impl App {
                 unicode,
                 ctrl,
             } => {
-                self.handle_explorer_da_key(key_name, unicode, ctrl, sender);
+                self.handle_explorer_da_key(key_name, unicode, ctrl);
                 self.queue_explorer_draw();
                 self.draw_needed.set(true);
             }
             Msg::ExplorerClick { x, y, n_press } => {
-                self.handle_explorer_da_click(x, y, n_press, sender);
+                self.handle_explorer_da_click(x, y, n_press);
             }
             Msg::ExplorerRightClick { x, y } => {
-                self.handle_explorer_da_right_click(x, y, sender);
+                self.handle_explorer_da_right_click(x, y);
             }
             Msg::ExplorerScroll(dy) => {
                 let scaled = dy * 3.0;
@@ -9170,7 +9152,7 @@ impl App {
                 self.queue_explorer_draw();
             }
             Msg::ExplorerCtxMenuClick(x, y) => {
-                self.handle_explorer_ctx_menu_overlay_click(x, y, sender);
+                self.handle_explorer_ctx_menu_overlay_click(x, y);
             }
             Msg::ExplorerCtxMenuMotion(x, y) => {
                 self.handle_explorer_ctx_menu_overlay_motion(x, y);
@@ -9250,18 +9232,12 @@ impl App {
         }
     }
 
-    fn handle_explorer_da_key(
-        &mut self,
-        key_name: String,
-        unicode: Option<char>,
-        ctrl: bool,
-        sender: &ComponentSender<Self>,
-    ) {
+    fn handle_explorer_da_key(&mut self, key_name: String, unicode: Option<char>, ctrl: bool) {
         // #426: when an explorer ctx menu is open, dispatch j/k/Esc/Enter
         // to the engine ctx menu handler. On Enter, forward the returned
         // action via the shared dispatcher so backend-only flows
         // (new_file, open_terminal, etc.) fire.
-        if self.handle_explorer_ctx_menu_key(&key_name, sender) {
+        if self.handle_explorer_ctx_menu_key(&key_name) {
             self.queue_explorer_draw();
             self.draw_needed.set(true);
             return;
@@ -9293,15 +9269,15 @@ impl App {
             _ => key_name.clone(),
         };
         if printable == pk_toggle {
-            sender.input(Msg::ToggleSidebar);
+            self.dispatch(Msg::ToggleSidebar);
             return;
         }
         if printable == pk_explorer {
-            sender.input(Msg::ToggleFocusExplorer);
+            self.dispatch(Msg::ToggleFocusExplorer);
             return;
         }
         if printable == pk_search {
-            sender.input(Msg::ToggleFocusSearch);
+            self.dispatch(Msg::ToggleFocusSearch);
             return;
         }
 
@@ -9375,12 +9351,7 @@ impl App {
 
     /// Handle a key press while the activity bar has keyboard focus.
     /// j/k move the cursor, l/Enter activates, h/Esc returns to the editor.
-    fn handle_activity_bar_key(
-        &mut self,
-        key_name: &str,
-        ctrl: bool,
-        sender: &ComponentSender<Self>,
-    ) {
+    fn handle_activity_bar_key(&mut self, key_name: &str, ctrl: bool) {
         let mapped = map_gtk_key_name(key_name);
         match mapped {
             "j" | "Down" => {
@@ -9437,16 +9408,9 @@ impl App {
             da.queue_draw();
         }
         // Suppress the default engine key handler — key is consumed.
-        let _ = sender;
     }
 
-    fn handle_explorer_da_click(
-        &mut self,
-        _x: f64,
-        y: f64,
-        n_press: i32,
-        sender: &ComponentSender<Self>,
-    ) {
+    fn handle_explorer_da_click(&mut self, _x: f64, y: f64, n_press: i32) {
         if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
             da.grab_focus();
         }
@@ -9473,19 +9437,15 @@ impl App {
             self.engine.borrow_mut().explorer_toggle_dir(idx);
             self.queue_explorer_draw();
         } else if n_press >= 2 {
-            sender.input(Msg::OpenFileFromSidebar(path));
+            self.dispatch(Msg::OpenFileFromSidebar(path));
         } else {
-            sender.input(Msg::PreviewFileFromSidebar(path));
+            self.dispatch(Msg::PreviewFileFromSidebar(path));
         }
     }
 
     /// #426: Intercept j/k/Enter/Esc on the explorer DA when an
     /// engine-drawn explorer ctx menu is open. Returns true if consumed.
-    fn handle_explorer_ctx_menu_key(
-        &mut self,
-        key_name: &str,
-        sender: &ComponentSender<Self>,
-    ) -> bool {
+    fn handle_explorer_ctx_menu_key(&mut self, key_name: &str) -> bool {
         use core::engine::ContextMenuTarget;
         {
             let eng = self.engine.borrow();
@@ -9515,7 +9475,7 @@ impl App {
                         });
                 let action = self.engine.borrow_mut().context_menu_confirm();
                 if let (Some(action), Some(target)) = (action, target_path) {
-                    self.dispatch_explorer_ctx_action(&action, &target, sender);
+                    self.dispatch_explorer_ctx_action(&action, &target);
                 }
                 self.dismiss_ctx_menu_overlay();
                 true
@@ -9587,12 +9547,7 @@ impl App {
 
     /// #426: Click on the ctx-menu overlay DA — hit-test cached layout
     /// and confirm or dismiss. On confirm, dispatch backend-only actions.
-    fn handle_explorer_ctx_menu_overlay_click(
-        &mut self,
-        x: f64,
-        y: f64,
-        sender: &ComponentSender<Self>,
-    ) {
+    fn handle_explorer_ctx_menu_overlay_click(&mut self, x: f64, y: f64) {
         use core::engine::ContextMenuTarget;
         let layout = match self.explorer_ctx_menu_layout.borrow().clone() {
             Some(l) => l,
@@ -9623,7 +9578,7 @@ impl App {
                 eng.context_menu_confirm()
             };
             if let (Some(action), Some(target)) = (action, target_path) {
-                self.dispatch_explorer_ctx_action(&action, &target, sender);
+                self.dispatch_explorer_ctx_action(&action, &target);
             }
         } else {
             // Click outside any item → dismiss.
@@ -9647,15 +9602,10 @@ impl App {
     /// actions (copy_path, reveal, select_for_diff, etc.) were already
     /// handled inside `context_menu_confirm`; this only covers actions
     /// that require GTK plumbing.
-    fn dispatch_explorer_ctx_action(
-        &self,
-        action: &str,
-        target: &std::path::Path,
-        sender: &ComponentSender<Self>,
-    ) {
+    fn dispatch_explorer_ctx_action(&mut self, action: &str, target: &std::path::Path) {
         match action {
             "new_file" | "new_folder" | "rename" | "delete" | "move_file" => {
-                sender.input(Msg::ExplorerAction(action.to_string()));
+                self.dispatch(Msg::ExplorerAction(action.to_string()));
             }
             "open_terminal" => {
                 let dir = if target.is_dir() {
@@ -9666,16 +9616,16 @@ impl App {
                         .unwrap_or(std::path::Path::new("."))
                         .to_path_buf()
                 };
-                sender.input(Msg::OpenTerminalAt(dir));
+                self.dispatch(Msg::OpenTerminalAt(dir));
             }
             "find_in_folder" => {
-                sender.input(Msg::ToggleFocusSearch);
+                self.dispatch(Msg::ToggleFocusSearch);
             }
             _ => {} // engine-handled actions (copy_path, reveal, etc.)
         }
     }
 
-    fn handle_explorer_da_right_click(&mut self, x: f64, y: f64, _sender: &ComponentSender<Self>) {
+    fn handle_explorer_da_right_click(&mut self, x: f64, y: f64) {
         if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
             da.grab_focus();
         }
@@ -9745,14 +9695,14 @@ impl App {
         }
     }
 
-    fn handle_file_ops_msg(&mut self, msg: Msg, sender: &ComponentSender<Self>) {
+    fn handle_file_ops_msg(&mut self, msg: Msg) {
         match msg {
             Msg::RenameFile(old_path, new_name) => {
                 let result = self.engine.borrow_mut().rename_file(&old_path, &new_name);
                 match result {
                     Ok(()) => {
                         self.engine.borrow_mut().message = format!("Renamed to '{}'", new_name);
-                        sender.input(Msg::RefreshFileTree);
+                        self.dispatch(Msg::RefreshFileTree);
                     }
                     Err(e) => {
                         self.engine.borrow_mut().message = e;
@@ -9841,7 +9791,7 @@ impl App {
         }
     }
 
-    fn handle_dialog_msg(&mut self, msg: Msg, sender: &ComponentSender<Self>) {
+    fn handle_dialog_msg(&mut self, msg: Msg) {
         match msg {
             Msg::WindowMinimize => {
                 self.window.minimize();
@@ -9858,7 +9808,7 @@ impl App {
             }
             Msg::OpenFileDialog => {
                 let engine = self.engine.clone();
-                let sender2 = sender.input_sender().clone();
+                let sender2 = self.sender.clone();
                 let dialog = gtk4::FileDialog::new();
                 dialog.set_title("Open File");
                 let win = self.window.clone();
@@ -9877,7 +9827,7 @@ impl App {
             }
             Msg::OpenFolderDialog => {
                 let engine = self.engine.clone();
-                let sender2 = sender.input_sender().clone();
+                let sender2 = self.sender.clone();
                 let dialog = gtk4::FileDialog::new();
                 dialog.set_title("Open Folder");
                 dialog.set_accept_label(Some("Open Folder"));
@@ -9896,7 +9846,7 @@ impl App {
             Msg::OpenWorkspaceDialog => {
                 // open_workspace_from_file() already ran in the engine;
                 // just refresh the file tree.
-                sender.input(Msg::RefreshFileTree);
+                self.dispatch(Msg::RefreshFileTree);
                 self.draw_needed.set(true);
             }
             Msg::SaveWorkspaceAsDialog => {
