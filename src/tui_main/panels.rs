@@ -10,12 +10,8 @@ pub(super) fn render_activity_bar(
 ) {
     // Delegate to the shared adapter in render.rs (#133). TUI includes the
     // hamburger item (index 0) because there is no native menu bar.
-    let bar = crate::render::build_activity_bar(
-        engine,
-        theme,
-        true,
-        sidebar.ext_panel_name.as_deref(),
-    );
+    let bar =
+        crate::render::build_activity_bar(engine, theme, true, sidebar.ext_panel_name.as_deref());
     super::quadraui_tui::draw_activity_bar(buf, area, &bar, theme);
 }
 

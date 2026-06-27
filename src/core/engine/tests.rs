@@ -27323,10 +27323,19 @@ fn test_ext_panel_h_focuses_activity_bar() {
 
     engine.handle_ext_panel_key("h", false, None);
 
-    assert!(!engine.ext_panel_has_focus, "ext_panel_has_focus should be cleared");
-    assert!(engine.activity_bar_focused, "activity_bar_focused should be set");
+    assert!(
+        !engine.ext_panel_has_focus,
+        "ext_panel_has_focus should be cleared"
+    );
+    assert!(
+        engine.activity_bar_focused,
+        "activity_bar_focused should be set"
+    );
     // "beta" is sorted index 1 (["alpha", "beta"]) → toolbar index 9.
-    assert_eq!(engine.activity_bar_selected, 9, "toolbar index should be 8 + sorted_idx");
+    assert_eq!(
+        engine.activity_bar_selected, 9,
+        "toolbar index should be 8 + sorted_idx"
+    );
 }
 
 #[test]
