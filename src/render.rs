@@ -1965,6 +1965,7 @@ pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
     Toolbar {
         id: WidgetId::new("debug:toolbar"),
         bg: None,
+        focused_index: None,
         buttons: vec![
             // 0: Continue — enabled when session active and stopped
             action(
@@ -3716,6 +3717,7 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
         buttons,
         severity: None,
         vertical_buttons: panel.vertical_buttons,
+        table: None,
         input: panel.input.as_ref().map(|inp| {
             quadraui::DialogInput::TextInput(quadraui::DialogTextInput {
                 value: inp.display.clone(),
@@ -6484,6 +6486,7 @@ pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
     Toolbar {
         id: WidgetId::new("sc:buttons"),
         bg: None,
+        focused_index: None,
         buttons: vec![
             action(
                 0,
@@ -8147,6 +8150,7 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> quadraui::Palette {
         show_query: true,
         create_label: None,
         preview,
+        mode: quadraui::PaletteMode::List,
     }
 }
 

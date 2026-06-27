@@ -407,9 +407,7 @@ impl Engine {
         if !self.terminal_has_focus {
             return false;
         }
-        let text = self
-            .active_terminal()
-            .and_then(|t| t.selected_text());
+        let text = self.active_terminal().and_then(|t| t.selected_text());
         if let Some(ref text) = text {
             if let Some(ref cb) = self.clipboard_write {
                 let _ = cb(text);
