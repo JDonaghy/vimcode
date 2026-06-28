@@ -1032,6 +1032,7 @@ pub(super) fn draw_frame(
             button_width: capped_btn_w,
             button_gap: 0.0,
             padding: 1.0,
+            table_height: 0.0,
         };
         let layout = q_dialog.layout(viewport, measure, |_| {
             quadraui::ToolbarItemMeasure::new(0.0)
@@ -1148,6 +1149,7 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
         show_query: true,
         create_label: None,
         preview: None,
+        mode: quadraui::PaletteMode::List,
     }
 }
 
