@@ -1619,6 +1619,8 @@ impl Engine {
 
     /// Open the tab switcher if not already open, then cycle the selection.
     /// `forward`: true = next (Alt+t, Ctrl+Tab), false = previous (Shift+Tab).
+    /// Dead in ShellApp mode until tab-switcher key handling is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn tab_switcher_cycle(&mut self, forward: bool) {
         if !self.tab_switcher_open {
             self.open_tab_switcher();
@@ -1881,6 +1883,8 @@ impl Engine {
     /// GTK / Win-GUI / macOS have pixel-based padding that doesn't map to
     /// char units, so they compute their own offset via
     /// `quadraui::TabBar::fit_active_scroll_offset` and write it here.
+    /// Dead in ShellApp mode until tab scroll offset is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn set_tab_scroll_offset(&mut self, group_id: GroupId, offset: usize) -> bool {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {
             if g.tab_scroll_offset != offset {
