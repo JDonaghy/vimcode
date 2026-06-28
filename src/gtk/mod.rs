@@ -7745,6 +7745,12 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     unsafe {
         gtk4::glib::ffi::g_log_set_writer_func(Some(gtk_log_writer), std::ptr::null_mut(), None);
     }
+    // Initialize GTK before App::new() so that CssProvider, Display,
+    // and Settings calls inside App::new() find an initialized toolkit.
+    // Under the old Relm4 path this happened inside RelmApp::create_and_run();
+    // with the ShellApp runner it happens inside gapp.run() which is called
+    // by run_with_shell() — too late for App::new().
+    gtk4::init().expect("Failed to initialize GTK");
     // Create the App and run via the quadraui ShellApp runner.
     // The runner creates its own GTK Application + window; vimcode's engine
     // and event handling are wired in via impl ShellApp for App above.
