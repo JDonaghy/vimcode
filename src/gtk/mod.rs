@@ -1,8 +1,6 @@
 // TreeView/TreeStore are deprecated in GTK4 4.10+ but still functional
 // TODO: Migrate to ListView/ColumnView in a future phase
 #![allow(deprecated)]
-// Relm4 view! macro generates #[name = "..."] bindings that trigger this lint
-#![allow(unused_assignments)]
 
 use gio::prelude::{FileExt, FileMonitorExt};
 use gtk4::cairo::Context;
@@ -10,8 +8,8 @@ use gtk4::gdk;
 use gtk4::pango::{self, AttrColor, AttrList, FontDescription};
 use gtk4::prelude::*;
 use pangocairo::functions as pangocairo;
-use relm4::prelude::*;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -116,6 +114,8 @@ pub(super) const ACC_NAV_FORWARD: &str = "gtk.panel.nav_forward";
 
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
+/// Dead in ShellApp mode until accelerator re-binding is re-wired (#448-C follow-on).
+#[allow(dead_code)]
 fn register_panel_accelerators(
     backend: &mut backend::GtkBackend,
     pk: &crate::core::settings::PanelKeys,
@@ -170,59 +170,59 @@ fn register_panel_accelerators(
 // registration is removed.
 fn dispatch_gtk_panel_accelerator(
     id: &str,
-    sender: &ComponentSender<App>,
+    sender: &MsgSender,
     engine: &Rc<RefCell<Engine>>,
 ) -> bool {
     match id {
         ACC_OPEN_TERMINAL => {
-            sender.input(Msg::ToggleTerminal);
+            sender.send(Msg::ToggleTerminal).ok();
             true
         }
         ACC_TOGGLE_SIDEBAR => {
-            sender.input(Msg::ToggleSidebar);
+            sender.send(Msg::ToggleSidebar).ok();
             true
         }
         ACC_FOCUS_EXPLORER => {
-            sender.input(Msg::ToggleFocusExplorer);
+            sender.send(Msg::ToggleFocusExplorer).ok();
             true
         }
         ACC_FOCUS_SEARCH => {
-            sender.input(Msg::ToggleFocusSearch);
+            sender.send(Msg::ToggleFocusSearch).ok();
             true
         }
         ACC_FUZZY_FINDER => {
             engine
                 .borrow_mut()
                 .open_picker(core::engine::PickerSource::Files);
-            sender.input(Msg::Resize);
+            sender.send(Msg::Resize).ok();
             true
         }
         ACC_LIVE_GREP => {
             engine
                 .borrow_mut()
                 .open_picker(core::engine::PickerSource::Grep);
-            sender.input(Msg::Resize);
+            sender.send(Msg::Resize).ok();
             true
         }
         ACC_COMMAND_PALETTE => {
             engine
                 .borrow_mut()
                 .open_picker(core::engine::PickerSource::Commands);
-            sender.input(Msg::Resize);
+            sender.send(Msg::Resize).ok();
             true
         }
         ACC_TERMINAL_TOGGLE_MAX => {
-            sender.input(Msg::ToggleTerminalMaximize);
+            sender.send(Msg::ToggleTerminalMaximize).ok();
             true
         }
         ACC_ADD_CURSOR => {
             engine.borrow_mut().add_cursor_at_next_match();
-            sender.input(Msg::Resize);
+            sender.send(Msg::Resize).ok();
             true
         }
         ACC_SELECT_ALL_MATCHES => {
             engine.borrow_mut().select_all_occurrences();
-            sender.input(Msg::Resize);
+            sender.send(Msg::Resize).ok();
             true
         }
         ACC_SPLIT_EDITOR_RIGHT => {
@@ -246,6 +246,32 @@ fn dispatch_gtk_panel_accelerator(
             true
         }
         _ => false,
+    }
+}
+
+/// Drop-in replacement for the removed `relm4::Sender<Msg>`.
+///
+/// Async GTK callbacks (clipboard reads, file dialogs, timers) clone this
+/// sender and push messages to the shared VecDeque. `ShellApp::tick` drains
+/// the queue on every frame to process them synchronously.
+#[derive(Clone)]
+struct MsgSender(Rc<RefCell<VecDeque<Msg>>>);
+
+impl MsgSender {
+    fn new() -> Self {
+        MsgSender(Rc::new(RefCell::new(VecDeque::new())))
+    }
+
+    /// Enqueue a message for processing in the next `tick()` call.
+    fn send(&self, msg: Msg) -> Result<(), ()> {
+        self.0.borrow_mut().push_back(msg);
+        Ok(())
+    }
+
+    /// Take all pending messages, leaving the queue empty.
+    fn drain(&self) -> Vec<Msg> {
+        let mut q = self.0.borrow_mut();
+        q.drain(..).collect()
     }
 }
 
@@ -350,7 +376,7 @@ struct App {
     fr_input_dragging: bool,
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
-    sender: relm4::Sender<Msg>,
+    sender: MsgSender,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
     last_clipboard_content: Option<String>,
@@ -392,8 +418,8 @@ struct App {
     tab_dragging: bool,
     /// Start position of a potential tab drag (set on MouseClick in tab bar).
     tab_drag_start: Option<(f64, f64)>,
-    /// Reference to the root GTK window used for minimize / maximize / close actions.
-    window: gtk4::Window,
+    /// GTK window handle — set in `ShellApp::setup` once the runner creates the window.
+    window: Option<gtk4::Window>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     last_sc_refresh: std::time::Instant,
     /// Last time explorer tree indicators (modified/diagnostics) were refreshed.
@@ -457,6 +483,8 @@ struct App {
 }
 
 /// Decode an activity bar widget ID into a panel ID for `Msg::SwitchPanel`.
+/// Dead in ShellApp mode until the activity bar DA is re-wired (#448-C follow-on).
+#[allow(dead_code)]
 fn activity_id_to_panel_id(id: &str) -> Option<String> {
     match id {
         "activity:explorer" => Some(PANEL_EXPLORER.to_string()),
@@ -951,3066 +979,6 @@ enum Msg {
     },
 }
 
-#[relm4::component]
-impl SimpleComponent for App {
-    type Init = Option<PathBuf>;
-    type Input = Msg;
-    type Output = ();
-
-    view! {
-        gtk4::Window {
-            set_title: Some("VimCode"),
-            set_default_size: (800, 600),
-            set_icon_name: Some("vimcode"),
-
-            // Intercept window close — check for unsaved changes before allowing quit.
-            connect_close_request[sender] => move |_window| {
-                sender.input(Msg::ShowQuitConfirm);
-                gtk4::glib::Propagation::Stop
-            },
-
-            #[name = "window_overlay"]
-            gtk4::Overlay {
-            gtk4::Box {
-                set_orientation: gtk4::Orientation::Vertical,
-
-                // Menu bar row — set as custom titlebar imperatively in init().
-                // CSD provides edge resize handles; WindowHandle enables drag-to-move.
-                #[name = "menu_bar_row"]
-                gtk4::Box {
-                    set_orientation: gtk4::Orientation::Horizontal,
-                    set_css_classes: &["custom-titlebar"],
-
-                    gtk4::WindowHandle {
-                        set_hexpand: true,
-
-                        #[name = "menu_bar_da"]
-                        gtk4::DrawingArea {
-                            set_hexpand: true,
-                            set_height_request: 24,
-                        },
-                    },
-
-                    // Window control buttons — VSCode style
-                    // Minimize: thin dash; Maximize: thin square; Close: thin ×
-                    gtk4::Button {
-                        set_label: "\u{2212}",
-                        set_tooltip_text: Some("Minimize"),
-                        set_css_classes: &["window-control"],
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::WindowMinimize);
-                        }
-                    },
-                    #[name = "maximize_button"]
-                    gtk4::Button {
-                        set_label: "\u{25a1}",
-                        set_tooltip_text: Some("Maximize"),
-                        set_css_classes: &["window-control"],
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::WindowMaximize);
-                        }
-                    },
-                    gtk4::Button {
-                        set_label: "\u{2715}",
-                        set_tooltip_text: Some("Close"),
-                        set_css_classes: &["window-control"],
-                        connect_clicked[sender] => move |_| {
-                            sender.input(Msg::WindowClose);
-                        }
-                    },
-                },
-
-                #[name = "main_hbox"]
-                gtk4::Box {
-                    set_orientation: gtk4::Orientation::Horizontal,
-                    set_vexpand: true,
-
-                // Activity Bar (48px, always visible).
-                // A.6f: migrated from a `gtk4::Box` with native `gtk4::Button`
-                // children to a single `DrawingArea` that renders via
-                // `quadraui_gtk::draw_activity_bar`. Rendering + click +
-                // hover + tooltip wiring is imperative (below this view!
-                // macro) to match the A.2b-2 / A.3c-2 pattern.
-                #[name = "activity_bar"]
-                gtk4::DrawingArea {
-                    set_width_request: 48,
-                    set_vexpand: true,
-                    set_css_classes: &["activity-bar"],
-                    set_can_focus: true,
-                    set_has_tooltip: true,
-                },
-
-                // Sidebar (collapsible with Revealer)
-                #[name = "sidebar_revealer"]
-                gtk4::Revealer {
-                    set_transition_type: gtk4::RevealerTransitionType::SlideRight,
-                    set_transition_duration: 200,
-
-                    #[watch]
-                    set_reveal_child: model.current_sidebar_visible(),
-
-                    // ScrolledWindow constrains children to the allocated width
-                    // (hscrollbar Never prevents content from growing the sidebar).
-                    #[name = "sidebar_inner_sw"]
-                    gtk4::ScrolledWindow {
-                        set_width_request: 260,
-                        set_hexpand: false,
-                        set_hscrollbar_policy: gtk4::PolicyType::Never,
-                        set_vscrollbar_policy: gtk4::PolicyType::Never,
-
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar-container"],
-
-                        // Explorer panel (A.2b-2: DrawingArea + quadraui_gtk::draw_tree)
-                        #[name = "explorer_panel"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: model.current_active_panel_id() == PANEL_EXPLORER,
-
-                            #[name = "explorer_da"]
-                            gtk4::DrawingArea {
-                                set_hexpand: true,
-                                set_vexpand: true,
-                                set_focusable: true,
-                            },
-                        },
-
-                        // Settings panel — Phase A.3c-2: native widget tree replaced
-                        // by a single DrawingArea that renders via `draw_settings_panel`
-                        // (which calls `quadraui_gtk::draw_form`). Visibility
-                        // managed imperatively via settings_panel_box.
-                        #[name = "settings_panel"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-                            set_visible: false,  // hidden initially; toggled via settings_panel_box
-
-                            #[name = "settings_da"]
-                            gtk4::DrawingArea {
-                                set_hexpand: true,
-                                set_vexpand: true,
-                            },
-                        },
-
-                        // Search panel (quadraui DrawingArea)
-                        #[name = "search_panel"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: {
-                                let id = model.current_active_panel_id();
-                                if id == PANEL_SEARCH {
-                                    search_sidebar_da.queue_draw();
-                                }
-                                id == PANEL_SEARCH
-                            },
-
-                            #[name = "search_sidebar_da"]
-                            gtk4::DrawingArea {
-                                set_vexpand: true,
-                            },
-                        },
-
-                        // Debug sidebar panel
-                        #[name = "debug_panel"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: {
-                                let id = model.current_active_panel_id();
-                                if id == PANEL_DEBUG {
-                                    debug_sidebar_da.queue_draw();
-                                }
-                                id == PANEL_DEBUG
-                            },
-
-                            #[name = "debug_sidebar_da"]
-                            gtk4::DrawingArea {
-                                set_vexpand: true,
-                            },
-                        },
-
-                        // Source Control (Git) sidebar panel
-                        #[name = "git_panel"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: {
-                                let id = model.current_active_panel_id();
-                                if id == PANEL_GIT {
-                                    git_sidebar_da.queue_draw();
-                                }
-                                id == PANEL_GIT
-                            },
-
-                            #[name = "git_sidebar_da"]
-                            gtk4::DrawingArea {
-                                set_vexpand: true,
-                            },
-                        },
-
-                        // Extensions sidebar panel
-                        #[name = "ext_panel"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: {
-                                let id = model.current_active_panel_id();
-                                if id == PANEL_EXTENSIONS {
-                                    ext_sidebar_da.queue_draw();
-                                }
-                                id == PANEL_EXTENSIONS
-                            },
-
-                            #[name = "ext_sidebar_da"]
-                            gtk4::DrawingArea {
-                                set_vexpand: true,
-                            },
-                        },
-
-                        // Extension-provided panel (e.g. git-insights GIT LOG)
-                        #[name = "ext_dyn_panel"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: {
-                                let id = model.current_active_panel_id();
-                                let is_ext = is_ext_panel_id(&id);
-                                if is_ext {
-                                    ext_dyn_panel_da.queue_draw();
-                                }
-                                is_ext
-                            },
-
-                            #[name = "ext_dyn_panel_da"]
-                            gtk4::DrawingArea {
-                                set_vexpand: true,
-                            },
-                        },
-
-                        // AI assistant sidebar panel
-                        #[name = "ai_panel_box"]
-                        gtk4::Box {
-                            set_orientation: gtk4::Orientation::Vertical,
-                            set_css_classes: &["sidebar"],
-
-                            #[watch]
-                            set_visible: {
-                                let id = model.current_active_panel_id();
-                                if id == PANEL_AI {
-                                    ai_sidebar_da.queue_draw();
-                                }
-                                id == PANEL_AI
-                            },
-
-                            #[name = "ai_sidebar_da"]
-                            gtk4::DrawingArea {
-                                set_vexpand: true,
-                                set_focusable: true,
-                            },
-                        },
-                    },  // close inner Box
-                    },  // close ScrolledWindow
-                },  // close Revealer
-
-                // Sidebar resize drag handle (6px wide, ew-resize cursor)
-                #[name = "sidebar_resize_handle"]
-                gtk4::Box {
-                    set_width_request: 6,
-                    set_vexpand: true,
-                    set_css_classes: &["sidebar-resize-handle"],
-
-                    #[watch]
-                    set_visible: model.current_sidebar_visible(),
-                },
-
-                // Editor area (DrawingArea wrapped in Overlay for scrollbars)
-                gtk4::Box {
-                    set_orientation: gtk4::Orientation::Vertical,
-                    set_hexpand: true,
-
-                    #[name = "editor_overlay"]
-                    gtk4::Overlay {
-                        #[name = "drawing_area"]
-                        gtk4::DrawingArea {
-                            set_hexpand: true,
-                            set_vexpand: true,
-                            set_focusable: true,
-                            grab_focus: (),
-
-                            add_controller = gtk4::EventControllerKey {
-                                set_propagation_phase: gtk4::PropagationPhase::Capture,
-                                connect_key_pressed[sender, engine, backend_events, backend, lh_cell = line_height_cell.clone()] => move |ctrl_ref, key, _, modifier| {
-                                    // Phase B.5b Stage 1: dual-write the
-                                    // translated UiEvent into the backend
-                                    // queue. The drain timer consumes and
-                                    // discards today; B5b.2 routes the
-                                    // accelerator-shaped events back into
-                                    // dispatch.
-                                    let ui_event = events::gdk_key_to_uievent(key, modifier, false);
-                                    if let Some(ref ev) = ui_event {
-                                        backend_events.borrow_mut().push_back(ev.clone());
-                                    }
-
-                                    let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                                    let unicode = key.to_unicode().filter(|c| !c.is_control());
-                                    let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                                    let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
-                                    let alt = modifier.contains(gdk::ModifierType::ALT_MASK);
-
-                                    if util::is_modifier_only_key(&key_name) {
-                                        return gtk4::glib::Propagation::Proceed;
-                                    }
-
-                                    let entry_has_focus = ctrl_ref
-                                        .widget()
-                                        .root()
-                                        .and_then(|r| r.downcast::<gtk4::Window>().ok())
-                                        .and_then(|w| gtk4::prelude::GtkWindowExt::focus(&w))
-                                        .is_some_and(|f| {
-                                            f.downcast_ref::<gtk4::Entry>().is_some()
-                                                || f.downcast_ref::<gtk4::Text>().is_some()
-                                        });
-                                    if entry_has_focus {
-                                        return gtk4::glib::Propagation::Proceed;
-                                    }
-
-                                    // MenuSystem intercept — handles Alt+letter, arrow keys, Enter, Escape.
-                                    // Same pattern as TUI: one call handles all menu keyboard events.
-                                    if let Some(ref ev) = ui_event {
-                                        let bar_visible = engine.borrow().menu_bar_visible;
-                                        if bar_visible {
-                                            let lh = lh_cell.get() as f32;
-                                            let win_w = ctrl_ref
-                                                .widget()
-                                                .root()
-                                                .and_then(|r| r.downcast::<gtk4::Window>().ok())
-                                                .map(|w| w.width() as f32)
-                                                .unwrap_or(800.0);
-                                            let bar_rect = quadraui::Rect::new(0.0, 0.0, win_w, lh);
-                                            if lh > 1.0 {
-                                                let menu_event = engine.borrow().menu_system.borrow_mut()
-                                                    .handle(ev, &mut *backend.borrow_mut(), bar_rect);
-                                                match menu_event {
-                                                    quadraui::MenuEvent::Activated(id) => {
-                                                        sender.input(Msg::HandleMenuAction(id.as_str().to_string()));
-                                                        return gtk4::glib::Propagation::Stop;
-                                                    }
-                                                    quadraui::MenuEvent::StateChanged
-                                                    | quadraui::MenuEvent::Consumed => {
-                                                        sender.input(Msg::MenuRedraw);
-                                                        return gtk4::glib::Propagation::Stop;
-                                                    }
-                                                    quadraui::MenuEvent::Ignored => {}
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Ctrl+Tab / Ctrl+Shift+Tab: MRU tab switcher
-                                    if ctrl && !alt && key_name == "Tab" {
-                                        engine.borrow_mut().tab_switcher_cycle(true);
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    if ctrl && !alt && key_name == "ISO_Left_Tab" {
-                                        engine.borrow_mut().tab_switcher_cycle(false);
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    // Alt+t: MRU tab switcher (open or cycle forward)
-                                    if alt && !ctrl && !shift && unicode == Some('t') {
-                                        engine.borrow_mut().tab_switcher_cycle(true);
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    // Alt-M: toggle Vim ↔ VSCode editing mode
-                                    if alt && !ctrl && !shift && unicode == Some('m') {
-                                        engine.borrow_mut().toggle_editor_mode();
-                                        sender.input(Msg::Resize);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    // Alt+, / Alt+. — resize editor group split
-                                    if alt && !ctrl && !shift {
-                                        if unicode == Some(',') {
-                                            engine.borrow_mut().group_resize(-0.05);
-                                            sender.input(Msg::Resize);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        if unicode == Some('.') {
-                                            engine.borrow_mut().group_resize(0.05);
-                                            sender.input(Msg::Resize);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                    }
-
-                                    // Shift+Alt+F: LSP format document
-                                    if alt && shift && !ctrl {
-                                        let key_lower = key_name.to_ascii_lowercase();
-                                        if key_lower == "f" {
-                                            engine.borrow_mut().lsp_format_current();
-                                            sender.input(Msg::Resize);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                    }
-
-                                    // Ctrl-F without terminal focus: engine find/replace.
-                                    // (Terminal-focused Ctrl+F is handled by handle_terminal_key.)
-                                    if ctrl && !shift && unicode == Some('f')
-                                        && !engine.borrow().terminal_has_focus
-                                    {
-                                        engine.borrow_mut().handle_key("f", Some('f'), true);
-                                        sender.input(Msg::SearchPollTick);
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    // Ctrl-Shift-V without terminal focus: paste to editor.
-                                    // (Terminal-focused paste is handled by handle_terminal_key.)
-                                    if ctrl && shift && (key_name == "v" || key_name == "V")
-                                        && !engine.borrow().terminal_has_focus
-                                    {
-                                        sender.input(Msg::KeyPress {
-                                            key_name: "PasteClipboard".to_string(),
-                                            unicode: None,
-                                            ctrl: false,
-                                            alt: false,
-                                        });
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-
-                                    // Panel navigation — driven by panel_keys settings.
-                                    //
-                                    // Phase B.5b Stage 2: a single
-                                    // registry lookup against `GtkBackend`'s
-                                    // accelerator table replaces 13 inline
-                                    // `if matches_gtk_key(&pk.X, ...)`
-                                    // arms. The lookup runs once and the
-                                    // result is dispatched in two windows:
-                                    // — early (here) only for
-                                    //   `ACC_OPEN_TERMINAL`, so Ctrl+T
-                                    //   keeps working when the terminal has
-                                    //   focus;
-                                    // — late (after the terminal-focus
-                                    //   block) for every other id.
-                                    let matched_acc_id = events::gdk_key_to_quadraui_key(key)
-                                        .and_then(|qkey| {
-                                            let qmods = events::gdk_modifiers_to_quadraui(modifier);
-                                            backend.borrow().match_keypress(&qkey, qmods)
-                                        });
-                                    if let Some(ref id) = matched_acc_id {
-                                        if id.as_str() == ACC_OPEN_TERMINAL {
-                                            sender.input(Msg::ToggleTerminal);
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                    }
-                                    // Phase B.2: engine-side accelerator
-                                    // registry. Currently only carries
-                                    // `terminal.toggle_maximize`. Distinct
-                                    // from `GtkBackend`'s registry; both
-                                    // exist so the engine can register
-                                    // accelerators visible to all backends
-                                    // while the GTK-only panel keys live on
-                                    // the backend.
-                                    {
-                                        let eng = engine.borrow();
-                                        if let Some(id) = eng.match_accelerator(
-                                            modifier.contains(gdk::ModifierType::CONTROL_MASK),
-                                            modifier.contains(gdk::ModifierType::SHIFT_MASK),
-                                            modifier.contains(gdk::ModifierType::ALT_MASK),
-                                            key.to_unicode(),
-                                            key == gdk::Key::Tab
-                                                || key == gdk::Key::ISO_Left_Tab,
-                                            key.to_unicode() == Some(' '),
-                                            key == gdk::Key::Escape,
-                                        ) {
-                                            drop(eng);
-                                            if id.as_str() == "terminal.toggle_maximize" {
-                                                sender.input(Msg::ToggleTerminalMaximize);
-                                            }
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                    }
-                                    // Terminal key routing (#351): engine decides
-                                    // the action, backend executes clipboard I/O.
-                                    if engine.borrow().terminal_has_focus {
-                                        use core::engine::TerminalKeyAction;
-                                        let action = engine.borrow_mut().handle_terminal_key(
-                                            &key_name, unicode, ctrl, shift, alt,
-                                        );
-                                        match action {
-                                            TerminalKeyAction::CopySelection => {
-                                                sender.input(Msg::TerminalCopySelection);
-                                            }
-                                            TerminalKeyAction::PasteClipboard => {
-                                                sender.input(Msg::TerminalPasteClipboard);
-                                            }
-                                            TerminalKeyAction::SendToPty(data) => {
-                                                engine.borrow_mut().terminal_write(&data);
-                                                sender.input(Msg::Resize);
-                                            }
-                                            TerminalKeyAction::Handled => {
-                                                sender.input(Msg::Resize);
-                                            }
-                                            TerminalKeyAction::Ignore => {}
-                                        }
-                                        return gtk4::glib::Propagation::Stop;
-                                    }
-                                    // Phase B.5b Stage 2: late panel-key
-                                    // dispatch. The lookup ran once before
-                                    // the engine's accelerator block; if
-                                    // it matched and wasn't the early
-                                    // `ACC_OPEN_TERMINAL` shortcut, the
-                                    // dispatcher routes the action here.
-                                    // Replaces 12 inline `matches_gtk_key`
-                                    // arms (toggle_sidebar / focus_explorer /
-                                    // focus_search / fuzzy_finder / live_grep /
-                                    // command_palette / add_cursor /
-                                    // select_all_matches / split_editor_right /
-                                    // split_editor_down / nav_back /
-                                    // nav_forward).
-                                    //
-                                    // #287: yield to insert-mode completion
-                                    // for the keys it consumes (Ctrl-N /
-                                    // Ctrl-P always; Tab / Down / Up when a
-                                    // display-only popup is active) so the
-                                    // global accelerator (e.g. <C-p> →
-                                    // fuzzy_finder) doesn't win over
-                                    // candidate-cycling.
-                                    let completion_intercepts = engine
-                                        .borrow()
-                                        .insert_completion_intercepts_key(&key_name, ctrl);
-                                    if !completion_intercepts {
-                                        if let Some(id) = &matched_acc_id {
-                                            if dispatch_gtk_panel_accelerator(id.as_str(), &sender, &engine) {
-                                                return gtk4::glib::Propagation::Stop;
-                                            }
-                                        }
-                                    }
-
-                                    // Shift+F5 → stop, Shift+F11 → stepout (debug shortcuts)
-                                    if shift && !ctrl && !alt {
-                                        match key_name.as_str() {
-                                            "F5" => {
-                                                engine.borrow_mut().execute_command("stop");
-                                                return gtk4::glib::Propagation::Stop;
-                                            }
-                                            "F11" => {
-                                                engine.borrow_mut().execute_command("stepout");
-                                                return gtk4::glib::Propagation::Stop;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-
-                                    // Alt+] / Alt+[ — cycle AI ghost text alternatives.
-                                    if alt && !ctrl && !shift {
-                                        let in_insert = engine.borrow().mode == crate::core::Mode::Insert;
-                                        if in_insert {
-                                            if key_name == "bracketright" {
-                                                engine.borrow_mut().ai_ghost_next_alt();
-                                                sender.input(Msg::Resize);
-                                                return gtk4::glib::Propagation::Stop;
-                                            }
-                                            if key_name == "bracketleft" {
-                                                engine.borrow_mut().ai_ghost_prev_alt();
-                                                sender.input(Msg::Resize);
-                                                return gtk4::glib::Propagation::Stop;
-                                            }
-                                        }
-                                    }
-
-                                    // VSCode mode: Ctrl+] indent / Ctrl+[ outdent.
-                                    // GDK may report bracket keys as "bracketright"/"bracketleft"
-                                    // OR as control characters, so handle both.
-                                    if engine.borrow().is_vscode_mode() && ctrl && !alt {
-                                        let is_bracket_right = key_name == "bracketright"
-                                            || key == gdk::Key::bracketright;
-                                        let is_bracket_left = key_name == "bracketleft"
-                                            || key == gdk::Key::bracketleft;
-                                        // Shift+[ → braceleft/{, Shift+] → braceright/}
-                                        let is_brace_left = key_name == "braceleft"
-                                            || key_name == "{"
-                                            || key == gdk::Key::braceleft;
-                                        let is_brace_right = key_name == "braceright"
-                                            || key_name == "}"
-                                            || key == gdk::Key::braceright;
-                                        // Ctrl+Shift+[ → fold, Ctrl+Shift+] → unfold
-                                        if shift && (is_bracket_left || is_brace_left) {
-                                            sender.input(Msg::KeyPress {
-                                                key_name: "Shift_bracketleft".to_string(),
-                                                unicode: None,
-                                                ctrl: true,
-                                                alt: false,
-                                            });
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        if shift && (is_bracket_right || is_brace_right) {
-                                            sender.input(Msg::KeyPress {
-                                                key_name: "Shift_bracketright".to_string(),
-                                                unicode: None,
-                                                ctrl: true,
-                                                alt: false,
-                                            });
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        // Ctrl+[ → outdent, Ctrl+] → indent (no shift)
-                                        if is_bracket_right && !shift {
-                                            sender.input(Msg::KeyPress {
-                                                key_name: "bracketright".to_string(),
-                                                unicode: None,
-                                                ctrl: true,
-                                                alt: false,
-                                            });
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                        if is_bracket_left && !shift {
-                                            sender.input(Msg::KeyPress {
-                                                key_name: "bracketleft".to_string(),
-                                                unicode: None,
-                                                ctrl: true,
-                                                alt: false,
-                                            });
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                    }
-
-                                    // In VSCode mode, encode Alt+key and Shift+key into
-                                    // prefixed key names for the engine's vscode handler.
-                                    let is_vscode = engine.borrow().is_vscode_mode();
-
-                                    // Alt+key → "Alt_" encoded key for VSCode mode
-                                    if is_vscode && alt && !ctrl {
-                                        let alt_key_name = if shift {
-                                            match key_name.as_str() {
-                                                "Up"   => Some("Alt_Shift_Up"),
-                                                "Down" => Some("Alt_Shift_Down"),
-                                                _      => None,
-                                            }
-                                        } else {
-                                            match key_name.as_str() {
-                                                "Up"   => Some("Alt_Up"),
-                                                "Down" => Some("Alt_Down"),
-                                                "z"    => Some("Alt_z"),
-                                                _      => None,
-                                            }
-                                        };
-                                        if let Some(name) = alt_key_name {
-                                            sender.input(Msg::KeyPress {
-                                                key_name: name.to_string(),
-                                                unicode: None,
-                                                ctrl: false,
-                                                alt: true,
-                                            });
-                                            return gtk4::glib::Propagation::Stop;
-                                        }
-                                    }
-
-                                    let effective_key = if is_vscode && shift {
-                                        match key_name.as_str() {
-                                            "Right"        => "Shift_Right".to_string(),
-                                            "Left"         => "Shift_Left".to_string(),
-                                            "Up"           => "Shift_Up".to_string(),
-                                            "Down"         => "Shift_Down".to_string(),
-                                            "Home"         => "Shift_Home".to_string(),
-                                            "End"          => "Shift_End".to_string(),
-                                            "Return" if ctrl => "Shift_Return".to_string(),
-                                            "bracketleft" if ctrl  => "Shift_bracketleft".to_string(),
-                                            "bracketright" if ctrl => "Shift_bracketright".to_string(),
-                                            // Ctrl+Shift+letter: uppercase single-letter key names
-                                            // so engine can distinguish Ctrl+L from Ctrl+Shift+L
-                                            s if ctrl && s.len() == 1 => s.to_ascii_uppercase(),
-                                            _              => key_name,
-                                        }
-                                    } else {
-                                        key_name
-                                    };
-
-                                    sender.input(Msg::KeyPress { key_name: effective_key, unicode, ctrl, alt });
-                                    gtk4::glib::Propagation::Stop
-                                }
-                            },
-
-                            add_controller = gtk4::GestureClick {
-                                set_button: 1,
-                                connect_pressed[sender, drawing_area, backend_events] => move |gesture, n_press, x, y| {
-                                    // Grab focus when clicking in editor
-                                    drawing_area.grab_focus();
-
-                                    let width = drawing_area.width() as f64;
-                                    let height = drawing_area.height() as f64;
-                                    let modifier = gesture.current_event_state();
-                                    let alt = gesture
-                                        .current_event()
-                                        .map(|ev| ev.modifier_state().contains(gdk::ModifierType::ALT_MASK))
-                                        .unwrap_or(false);
-
-                                    // Phase B.5b Stage 1: dual-write
-                                    // `UiEvent::MouseDown`. The trait
-                                    // doesn't carry `n_press`, so consumers
-                                    // detect double-clicks separately.
-                                    backend_events.borrow_mut().push_back(
-                                        events::gdk_button_to_mouse_down(1, x, y, modifier),
-                                    );
-
-                                    if modifier.contains(gdk::ModifierType::CONTROL_MASK) {
-                                        sender.input(Msg::CtrlMouseClick { x, y, width, height });
-                                    } else if n_press >= 2 {
-                                        sender.input(Msg::MouseDoubleClick { x, y, width, height });
-                                    } else {
-                                        sender.input(Msg::MouseClick { x, y, width, height, alt });
-                                    }
-                                }
-                            },
-
-                            add_controller = gtk4::GestureDrag {
-                                set_button: 1,
-                                connect_drag_update[sender, drawing_area, backend_events] => move |gesture, dx, dy| {
-                                    // Dead zone: ignore sub-4px movement to avoid
-                                    // accidental visual mode on click jitter.
-                                    if dx * dx + dy * dy < 16.0 {
-                                        return;
-                                    }
-                                    if let Some((start_x, start_y)) = gesture.start_point() {
-                                        let x = start_x + dx;
-                                        let y = start_y + dy;
-                                        let width = drawing_area.width() as f64;
-                                        let height = drawing_area.height() as f64;
-
-                                        // Phase B.5b Stage 1: drag updates
-                                        // surface as `MouseMoved` with a
-                                        // left-button-held mask. Buttons
-                                        // mask matches the gesture's
-                                        // configured button (1 = left).
-                                        let buttons = quadraui::ButtonMask {
-                                            left: true,
-                                            right: false,
-                                            middle: false,
-                                        };
-                                        backend_events.borrow_mut().push_back(
-                                            events::gdk_motion_to_uievent(x, y, buttons),
-                                        );
-
-                                        sender.input(Msg::MouseDrag { x, y, width, height });
-                                    }
-                                },
-                                connect_drag_end[sender, backend_events] => move |gesture, dx, dy| {
-                                    // Phase B.5b Stage 1: dual-write
-                                    // `UiEvent::MouseUp`. Reconstruct the
-                                    // release coords from the gesture's
-                                    // start + delta (the existing Msg
-                                    // discards them but the trait carries
-                                    // them through).
-                                    let (rx, ry) = gesture
-                                        .start_point()
-                                        .map(|(sx, sy)| (sx + dx, sy + dy))
-                                        .unwrap_or((0.0, 0.0));
-                                    backend_events.borrow_mut().push_back(
-                                        events::gdk_button_to_mouse_up(1, rx, ry),
-                                    );
-                                    sender.input(Msg::MouseUp);
-                                },
-                            },
-
-                            add_controller = gtk4::EventControllerScroll {
-                                set_flags: gtk4::EventControllerScrollFlags::VERTICAL
-                                         | gtk4::EventControllerScrollFlags::HORIZONTAL,
-                                connect_scroll[sender, backend_events, last_editor_pointer] => move |_, dx, dy| {
-                                    // Phase B.5b Stage 1: dual-write
-                                    // `UiEvent::Scroll`. Use the cached
-                                    // editor-pointer position (#240) so
-                                    // consumers can route the wheel event
-                                    // to the window under the cursor.
-                                    let (px, py) = last_editor_pointer
-                                        .get()
-                                        .unwrap_or((0.0, 0.0));
-                                    backend_events.borrow_mut().push_back(
-                                        events::gdk_scroll_to_uievent(dx, dy, px, py),
-                                    );
-
-                                    sender.input(Msg::MouseScroll { delta_x: dx, delta_y: dy });
-                                    gtk4::glib::Propagation::Stop
-                                },
-                            },
-
-                            // #240: track the editor pointer so the scroll
-                            // handler can route wheel events to the window
-                            // under the cursor (across editor groups), not
-                            // just the active one.
-                            add_controller = gtk4::EventControllerMotion {
-                                connect_motion[last_editor_pointer] => move |_, x, y| {
-                                    last_editor_pointer.set(Some((x, y)));
-                                },
-                                connect_leave[last_editor_pointer] => move |_| {
-                                    last_editor_pointer.set(None);
-                                },
-                            },
-
-                            #[watch]
-                            set_css_classes: {
-                                // Only queue a draw when explicitly requested by update().
-                                // Using take() clears the flag atomically so it fires once per request.
-                                if model.draw_needed.take() {
-                                    drawing_area.queue_draw();
-                                    menu_bar_da.queue_draw();
-                                }
-                                // Return static classes — no even/odd alternation — so GTK
-                                // skips CSS re-resolution when classes haven't changed.
-                                // This eliminates expensive CSS thrashing on every update().
-                                &["vim-code"]
-                            },
-                        },
-
-                        // Find/Replace is now engine-level (drawn by Cairo in draw.rs)
-                    }
-                }
-                }  // close main_hbox
-            }  // close outer gtk4::Box
-            }  // close window_overlay (gtk4::Overlay)
-        }
-    }
-
-    fn init(
-        file_path: Self::Init,
-        root: Self::Root,
-        sender: ComponentSender<Self>,
-    ) -> ComponentParts<Self> {
-        // Dark/light preference is set after engine init, once we know the colorscheme.
-
-        // Ensure GTK finds our installed SVG icon by adding
-        // ~/.local/share/icons to the icon theme search path.
-        if let Some(home) = std::env::var_os("HOME") {
-            let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
-            if let Some(display) = gdk::Display::default() {
-                let icon_theme = gtk4::IconTheme::for_display(&display);
-                icon_theme.add_search_path(&icon_dir);
-            }
-        }
-
-        // Install bundled Nerd Font icon subset so UI glyphs render without
-        // requiring the user to install a Nerd Font system-wide.
-        install_bundled_icon_font();
-
-        let mut engine = {
-            let mut e = Engine::new();
-            icons::set_nerd_fonts(e.settings.use_nerd_fonts);
-            e.startup(file_path.as_deref());
-            e
-        };
-
-        // Wire system clipboard callbacks onto the engine so paste, yank, and
-        // hover-copy paths all route through `engine.clipboard_{read,write}`
-        // instead of a per-backend ClipboardCtx.
-        setup_gtk_clipboard(&mut engine);
-
-        // Load CSS after engine so we can read the saved colorscheme setting.
-        let initial_theme = Theme::from_name(&engine.settings.colorscheme);
-        let css_provider = load_css(&initial_theme);
-        let last_colorscheme = engine.settings.colorscheme.clone();
-
-        // Set GTK dark/light preference based on the active colorscheme.
-        if let Some(gtk_settings) = gtk4::Settings::default() {
-            gtk_settings.set_gtk_application_prefer_dark_theme(!initial_theme.is_light());
-        }
-
-        // Set window title based on file
-        let title = match engine.file_path() {
-            Some(p) => format!("VimCode - {}", p.display()),
-            None => "VimCode - [No Name]".to_string(),
-        };
-
-        let engine = Rc::new(RefCell::new(engine));
-
-        // Register engine pointer for emergency swap flush from the panic hook.
-        // SAFETY: The Rc<RefCell<Engine>> lives for the GTK app's lifetime.
-        // The pointer is only dereferenced during panic recovery on the main thread.
-        unsafe {
-            crate::core::swap::register_emergency_engine(
-                engine.as_ptr() as *const crate::core::Engine
-            );
-        }
-
-        let explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let activity_bar_hits: Rc<RefCell<Vec<quadraui::ActivityBarRowHit>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let activity_bar_hover: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
-
-        let explorer_row_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(28.0));
-        let explorer_line_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(20.0));
-        let explorer_char_width_cell: Rc<Cell<f64>> = Rc::new(Cell::new(8.0));
-        let explorer_ctx_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>> =
-            Rc::new(RefCell::new(None));
-        let ctx_menu_overlay_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let explorer_scroll_accum: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
-        let drawing_area_ref = Rc::new(RefCell::new(None));
-        // Editor pointer cache (#240): updated by EventControllerMotion on
-        // the editor DA, read by the scroll handler to route wheel events
-        // to the window under the cursor across editor groups.
-        let last_editor_pointer: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
-        let menu_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
-        let menu_dropdown_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let panel_hover_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        #[allow(clippy::type_complexity)]
-        let panel_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String, bool)>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        #[allow(clippy::type_complexity)]
-        let panel_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
-            Rc::new(Cell::new(None));
-        #[allow(clippy::type_complexity)]
-        let editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
-            Rc::new(Cell::new(None));
-        let completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>> =
-            Rc::new(RefCell::new(None));
-        let context_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>> =
-            Rc::new(RefCell::new(None));
-        #[allow(clippy::type_complexity)]
-        let tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> =
-            Rc::new(Cell::new(None));
-        #[allow(clippy::type_complexity)]
-        let dialog_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>> = Rc::new(Cell::new(None));
-        #[allow(clippy::type_complexity)]
-        let editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let editor_hover_scrollbar: Rc<Cell<Option<render::PopupScrollbarHit>>> =
-            Rc::new(Cell::new(None));
-        let menu_dd_lh: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
-        let debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let debug_sidebar_lh: Rc<Cell<f64>> = Rc::new(Cell::new(20.0));
-        let git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let overlay_ref = Rc::new(RefCell::new(None));
-        let window_scrollbars_ref = Rc::new(RefCell::new(HashMap::new()));
-        let line_height_cell: Rc<Cell<f64>> = Rc::new(Cell::new(24.0));
-        let char_width_cell: Rc<Cell<f64>> = Rc::new(Cell::new(9.0));
-        // Last font metrics sent via CacheFontMetrics — avoids sending on every draw.
-        let last_metrics_cell: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
-        // Current mouse position written directly from the motion callback — avoids routing
-        // every motion event through the Relm4 message loop (which fires at 100-200 Hz).
-        // (-1.0, -1.0) means the pointer is outside the drawing area.
-        let mouse_pos_cell: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((-1.0, -1.0)));
-        // Shared state for Cairo h scrollbar hover/drag — read by set_draw_func closure.
-        let h_sb_hovered_cell: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        let tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
-        let h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>> = Rc::new(Cell::new(None));
-        let tab_slot_positions_cell: Rc<RefCell<TabSlotMap>> =
-            Rc::new(RefCell::new(HashMap::new()));
-        let tab_close_bounds_cell: Rc<RefCell<TabCloseMap>> = Rc::new(RefCell::new(HashMap::new()));
-        let diff_btn_map_cell: Rc<RefCell<DiffBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
-        let split_btn_map_cell: Rc<RefCell<SplitBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
-        let action_btn_map_cell: Rc<RefCell<ActionBtnMap>> = Rc::new(RefCell::new(HashMap::new()));
-        let status_segment_map_cell: Rc<RefCell<StatusSegmentMap>> =
-            Rc::new(RefCell::new(HashMap::new()));
-        let tab_visible_counts_cell: Rc<
-            RefCell<Vec<(crate::core::window::GroupId, usize, usize)>>,
-        > = Rc::new(RefCell::new(Vec::new()));
-        let command_center_layout_cell: Rc<RefCell<Option<quadraui::CommandCenterLayout>>> =
-            Rc::new(RefCell::new(None));
-        let sidebar_inner_sw_ref: Rc<RefCell<Option<gtk4::ScrolledWindow>>> =
-            Rc::new(RefCell::new(None));
-        let sidebar_revealer_ref: Rc<RefCell<Option<gtk4::Revealer>>> = Rc::new(RefCell::new(None));
-        // Saves the sidebar width at the start of a drag so we can compute
-        // initial_width + total_offset instead of accumulating delta per event.
-        let sidebar_drag_start_w: Rc<Cell<i32>> = Rc::new(Cell::new(300));
-        let explorer_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let search_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let debug_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let git_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let ext_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let ext_dyn_panel_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> =
-            Rc::new(RefCell::new(None));
-        let ext_dyn_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let settings_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let settings_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
-        let ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>> = Rc::new(RefCell::new(None));
-        let ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>> = Rc::new(RefCell::new(None));
-
-        // Set up file watcher for settings.json
-        let settings_path = std::env::var("HOME")
-            .map(|h| format!("{}/.config/vimcode/settings.json", h))
-            .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
-
-        let file = gio::File::for_path(&settings_path);
-        let settings_monitor =
-            match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
-                Ok(monitor) => {
-                    let sender_for_monitor = sender.input_sender().clone();
-                    monitor.connect_changed(move |_, _, _, event| {
-                        // ChangesDoneHint fires once after the file is fully written and
-                        // closed (IN_CLOSE_WRITE on Linux/inotify).  This is the most
-                        // reliable single event per save.  We do NOT also listen for
-                        // Changed (IN_MODIFY) to avoid processing two events per VimCode
-                        // save — the self-save guard in SettingsFileChanged handles any
-                        // stray duplicates anyway.
-                        if event == gio::FileMonitorEvent::ChangesDoneHint {
-                            sender_for_monitor.send(Msg::SettingsFileChanged).ok();
-                        }
-                    });
-                    Some(monitor)
-                }
-                Err(_) => None,
-            };
-
-        // Sidebar visibility startup is owned by `Engine::new` —
-        // it inspects `session.explorer_visible` + `settings` +
-        // `autohide_panels` and calls `app_shell.hide_sidebar()` as
-        // needed before we get here. The Relm4 view! macro reads it
-        // back via `model.current_sidebar_visible()`.
-
-        // Phase B.5 Stage 1: build the `quadraui::Backend` impl now,
-        // before constructing the App. Both the App's modal_stack /
-        // drag_state alias fields and the App's `backend` field share
-        // the same underlying `Rc<RefCell<>>`s — B.5b Stage 11 migrates
-        // the alias call sites onto `backend.borrow().*_handle()` and
-        // drops the duplicates.
-        //
-        // Panel-key accelerators are registered here (re-runs on each
-        // settings reload via `register_panel_accelerators`). The
-        // editor key handler dispatches matches through
-        // `dispatch_gtk_panel_accelerator` — see B.5b Stage 2.
-        let mut gtk_backend = backend::GtkBackend::new();
-        register_panel_accelerators(&mut gtk_backend, &engine.borrow().settings.panel_keys);
-        // #270 lift: GtkBackend no longer reads the `crate::icons`
-        // global atomic or `UI_FONT()` macro internally (those are
-        // vimcode-private). Sync the values onto the backend instead.
-        // Re-synced per-frame in the `CacheFontMetrics` handler below
-        // so runtime toggles (`:set nonerdfonts`, `:set guifont=...`)
-        // propagate.
-        {
-            let e = engine.borrow();
-            gtk_backend.set_nerd_fonts(e.settings.use_nerd_fonts);
-            gtk_backend.set_ui_font(format!(
-                "{} {}",
-                UI_FONT_FAMILY,
-                e.settings.ui_font_size.max(1)
-            ));
-        }
-        // Phase B.5b Stage 1: shared event-queue handle. Producer-side
-        // signal callbacks (key/mouse/scroll on the editor DA) push
-        // translated `UiEvent`s into this `RefCell<VecDeque>`; the drain
-        // hook installed below polls and discards. Dual-write today —
-        // Relm4 `Msg` flow remains authoritative, the queue just proves
-        // producers + consumer are wired so subsequent stages can route
-        // dispatch off it.
-        let backend_events = gtk_backend.events_handle();
-        let backend = Rc::new(RefCell::new(gtk_backend));
-
-        let model = App {
-            engine: engine.clone(),
-            window: root.clone(),
-            explorer_sidebar_da_ref: explorer_sidebar_da_ref.clone(),
-            activity_bar_da_ref: activity_bar_da_ref.clone(),
-            explorer_row_height_cell: explorer_row_height_cell.clone(),
-            explorer_line_height_cell: explorer_line_height_cell.clone(),
-            explorer_char_width_cell: explorer_char_width_cell.clone(),
-            explorer_ctx_menu_layout: explorer_ctx_menu_layout.clone(),
-            ctx_menu_overlay_da: ctx_menu_overlay_da_ref.clone(),
-            explorer_scroll_accum: explorer_scroll_accum.clone(),
-            drawing_area: drawing_area_ref.clone(),
-            menu_bar_da: menu_bar_da_ref.clone(),
-            debug_sidebar_da_ref: debug_sidebar_da_ref.clone(),
-            debug_sidebar_lh: debug_sidebar_lh.clone(),
-            git_sidebar_da_ref: git_sidebar_da_ref.clone(),
-            ext_sidebar_da_ref: ext_sidebar_da_ref.clone(),
-            ai_sidebar_da_ref: ai_sidebar_da_ref.clone(),
-            window_scrollbars: window_scrollbars_ref.clone(),
-            overlay: overlay_ref.clone(),
-            cached_line_height: 24.0,
-            cached_char_width: 9.0,
-            last_editor_pointer: last_editor_pointer.clone(),
-            cached_ui_line_height: 20.0,
-            dialog_btn_rects: Rc::new(RefCell::new(Vec::new())),
-            line_height_cell: line_height_cell.clone(),
-            char_width_cell: char_width_cell.clone(),
-            draw_needed: Rc::new(Cell::new(false)),
-            mouse_pos_cell: mouse_pos_cell.clone(),
-            h_sb_hovered_cell: h_sb_hovered_cell.clone(),
-            tab_close_hover_cell: tab_close_hover_cell.clone(),
-            h_sb_drag_cell: h_sb_drag_cell.clone(),
-            fr_input_dragging: false,
-            settings_monitor,
-            sender: sender.input_sender().clone(),
-            sidebar_inner_sw: sidebar_inner_sw_ref.clone(),
-            sidebar_revealer: sidebar_revealer_ref.clone(),
-            explorer_panel_box: explorer_panel_box_ref.clone(),
-            search_sidebar_da_ref: search_sidebar_da_ref.clone(),
-            debug_panel_box: debug_panel_box_ref.clone(),
-            git_panel_box: git_panel_box_ref.clone(),
-            ext_panel_box: ext_panel_box_ref.clone(),
-            ext_dyn_panel_da_ref: ext_dyn_panel_da_ref.clone(),
-            ext_dyn_panel_box: ext_dyn_panel_box_ref.clone(),
-            settings_panel_box: settings_panel_box_ref.clone(),
-            settings_da_ref: settings_da_ref.clone(),
-            ai_panel_box_ref: ai_panel_box_ref.clone(),
-            last_clipboard_content: None,
-            h_sb_hovered: false,
-            tab_close_hover: None,
-            tab_slot_positions: tab_slot_positions_cell.clone(),
-            tab_close_bounds: tab_close_bounds_cell.clone(),
-            diff_btn_map: diff_btn_map_cell.clone(),
-            split_btn_map: split_btn_map_cell.clone(),
-            action_btn_map: action_btn_map_cell.clone(),
-            status_segment_map: status_segment_map_cell.clone(),
-            cached_screen_layout: Rc::new(RefCell::new(None)),
-            debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
-            debug_toolbar_height: Rc::new(Cell::new(0.0)),
-            terminal_resize_dragging: false,
-            terminal_split_dragging: false,
-            group_divider_dragging: None,
-            tab_dragging: false,
-            tab_drag_start: None,
-            last_sc_refresh: std::time::Instant::now(),
-            last_tree_indicator_update: std::time::Instant::now(),
-            menu_dropdown_da: menu_dropdown_da_ref.clone(),
-            panel_hover_da: panel_hover_da_ref.clone(),
-            panel_hover_link_rects: panel_hover_link_rects.clone(),
-            panel_hover_popup_rect: panel_hover_popup_rect.clone(),
-            editor_hover_popup_rect: editor_hover_popup_rect.clone(),
-            completion_layout: completion_layout.clone(),
-            context_menu_layout: context_menu_layout.clone(),
-            tab_switcher_popup_rect: tab_switcher_popup_rect.clone(),
-            dialog_popup_rect: dialog_popup_rect.clone(),
-            editor_hover_link_rects: editor_hover_link_rects.clone(),
-            editor_hover_scrollbar: editor_hover_scrollbar.clone(),
-            menu_dd_line_height: menu_dd_lh.clone(),
-            css_provider,
-            last_colorscheme,
-            backend: backend.clone(),
-        };
-        let widgets = view_output!();
-
-        // Store widget references
-        *explorer_sidebar_da_ref.borrow_mut() = Some(widgets.explorer_da.clone());
-        *drawing_area_ref.borrow_mut() = Some(widgets.drawing_area.clone());
-        *menu_bar_da_ref.borrow_mut() = Some(widgets.menu_bar_da.clone());
-        *overlay_ref.borrow_mut() = Some(widgets.editor_overlay.clone());
-        *sidebar_inner_sw_ref.borrow_mut() = Some(widgets.sidebar_inner_sw.clone());
-        *sidebar_revealer_ref.borrow_mut() = Some(widgets.sidebar_revealer.clone());
-        *explorer_panel_box_ref.borrow_mut() = Some(widgets.explorer_panel.clone());
-        *search_sidebar_da_ref.borrow_mut() = Some(widgets.search_sidebar_da.clone());
-        *debug_panel_box_ref.borrow_mut() = Some(widgets.debug_panel.clone());
-        *git_panel_box_ref.borrow_mut() = Some(widgets.git_panel.clone());
-        *ext_panel_box_ref.borrow_mut() = Some(widgets.ext_panel.clone());
-        *ext_dyn_panel_box_ref.borrow_mut() = Some(widgets.ext_dyn_panel.clone());
-        *settings_panel_box_ref.borrow_mut() = Some(widgets.settings_panel.clone());
-        *ai_panel_box_ref.borrow_mut() = Some(widgets.ai_panel_box.clone());
-        // ── Search sidebar DrawingArea setup ──────────────────────────────
-        {
-            let pango_ctx = widgets.search_sidebar_da.pango_context();
-            let font_desc = pango::FontDescription::from_string(&draw::UI_FONT());
-            pango_ctx.set_font_description(Some(&font_desc));
-            let metrics = pango_ctx.metrics(Some(&font_desc), None);
-            let lh = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
-            let cw = metrics.approximate_char_width() as f64 / pango::SCALE as f64;
-            let mut b = backend.borrow_mut();
-            b.set_pango_context(pango_ctx);
-            b.set_current_line_height(lh);
-            b.set_current_char_width(cw);
-            {
-                use quadraui::Backend;
-                b.begin_frame(quadraui::Viewport::new(
-                    root.width().max(800) as f32,
-                    root.height().max(600) as f32,
-                    1.0,
-                ));
-            }
-        }
-        {
-            let engine = engine.clone();
-            let backend_d = backend.clone();
-            widgets
-                .search_sidebar_da
-                .set_draw_func(move |da, cr, _w, _h| {
-                    let engine = engine.borrow();
-                    let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let q_theme = crate::gtk::quadraui_gtk::q_theme(&theme);
-                    render::populate_search_sidebar_system(&engine, &engine.cwd);
-                    let w = da.width() as f64;
-                    let h = da.height() as f64;
-                    let area = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
-                    engine.search_sidebar_body_rect.set(area);
-                    let pango_ctx = pangocairo::create_context(cr);
-                    let font_desc = pango::FontDescription::from_string(&draw::UI_FONT());
-                    let pango_layout = pango::Layout::new(&pango_ctx);
-                    pango_layout.set_font_description(Some(&font_desc));
-                    pango_layout.set_text("Xy");
-                    let line_height = pango_layout.pixel_size().1 as f64;
-                    pango_layout.set_text("M");
-                    let char_width = pango_layout.pixel_size().0 as f64;
-                    backend_d
-                        .borrow_mut()
-                        .enter_frame_scope(cr, &pango_layout, |b| {
-                            b.set_current_theme(q_theme);
-                            b.set_current_line_height(line_height);
-                            b.set_current_char_width(char_width);
-                            engine.search_sidebar_system.borrow().render(b, area);
-                        });
-                });
-        }
-        {
-            let sender_ev = sender.input_sender().clone();
-            quadraui::gtk::wire_da_events(&widgets.search_sidebar_da, move |ev| {
-                sender_ev.send(Msg::SearchSidebarEvent(ev)).ok();
-            });
-        }
-
-        // ── Settings sidebar (Phase A.3c-2: native widgets → DrawingArea) ──────
-        {
-            let engine_d = engine.clone();
-            let backend_d = backend.clone();
-            widgets.settings_da.set_draw_func(move |da, cr, _w, _h| {
-                let engine = engine_d.borrow();
-                let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(&UI_FONT());
-                let pango_ctx = pangocairo::create_context(cr);
-                let layout = pango::Layout::new(&pango_ctx);
-                layout.set_font_description(Some(&font_desc));
-                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                let line_height =
-                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let w = da.width() as f64;
-                let h = da.height() as f64;
-                draw_settings_panel(
-                    cr,
-                    &layout,
-                    &engine,
-                    &theme,
-                    &backend_d,
-                    0.0,
-                    0.0,
-                    w,
-                    h,
-                    line_height,
-                );
-            });
-        }
-        {
-            let sender_set = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                sender_set
-                    .send(Msg::SettingsKey(key_name, ctrl, unicode))
-                    .ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.settings_da.set_focusable(true);
-            widgets.settings_da.add_controller(key_ctrl);
-        }
-        {
-            let sender_set = sender.input_sender().clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, n_press, x, y| {
-                sender_set.send(Msg::SettingsClick(x, y, n_press)).ok();
-            });
-            widgets.settings_da.add_controller(gesture);
-        }
-        {
-            let sender_set = sender.input_sender().clone();
-            let scroll_ctrl =
-                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                sender_set.send(Msg::SettingsScroll(dy)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.settings_da.add_controller(scroll_ctrl);
-        }
-        {
-            let engine_drag = engine.clone();
-            let sender_drag = sender.input_sender().clone();
-            let settings_da_drag = model.settings_da_ref.clone();
-            let gesture = gtk4::GestureDrag::new();
-            gesture.set_button(1);
-            gesture.connect_drag_update(move |g, dx, dy| {
-                let (sx, sy) = g.start_point().unwrap_or((0.0, 0.0));
-                let pt = quadraui::Point::new((sx + dx) as f32, (sy + dy) as f32);
-                let da_h = settings_da_drag
-                    .borrow()
-                    .as_ref()
-                    .map(|da| da.height() as f32)
-                    .unwrap_or(0.0);
-                let event = quadraui::UiEvent::MouseMoved {
-                    position: pt,
-                    buttons: quadraui::ButtonMask {
-                        left: true,
-                        middle: false,
-                        right: false,
-                    },
-                };
-                let q_rect = quadraui::Rect::new(0.0, 0.0, 1.0, da_h);
-                let eng = engine_drag.borrow();
-                render::populate_settings_form_controller(&eng);
-                let result = eng
-                    .settings_form_controller
-                    .borrow_mut()
-                    .handle_cached(&event, q_rect);
-                if matches!(
-                    result,
-                    quadraui::FormControllerEvent::ScrollChanged
-                        | quadraui::FormControllerEvent::Consumed
-                ) {
-                    let new_offset = eng.settings_form_controller.borrow().scroll_offset();
-                    drop(eng);
-                    engine_drag.borrow_mut().settings_scroll_top = new_offset;
-                    sender_drag.send(Msg::SettingsScroll(0.0)).ok();
-                }
-            });
-            widgets.settings_da.add_controller(gesture);
-        }
-        *settings_da_ref.borrow_mut() = Some(widgets.settings_da.clone());
-
-        // ── Explorer sidebar — TreeController render ─────────────────────────
-        {
-            let engine_d = engine.clone();
-            let row_h_cell = explorer_row_height_cell.clone();
-            let lh_cell = explorer_line_height_cell.clone();
-            let cw_cell = explorer_char_width_cell.clone();
-            let ctx_menu_layout_d = explorer_ctx_menu_layout.clone();
-            let backend_d = backend.clone();
-            widgets.explorer_da.set_draw_func(move |da, cr, _w, _h| {
-                let engine = engine_d.borrow();
-                let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(&UI_FONT());
-                let pango_ctx = pangocairo::create_context(cr);
-                let layout = pango::Layout::new(&pango_ctx);
-                layout.set_font_description(Some(&font_desc));
-                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                let line_height =
-                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let row_h = (line_height * 1.4).round().max(1.0);
-                row_h_cell.set(row_h);
-                lh_cell.set(line_height);
-                // Measure char width with the same pango layout used for
-                // text — keeps the right-click cell math in sync with what
-                // the rasteriser sees (#426).
-                layout.set_text("0");
-                let char_width = layout.pixel_size().0 as f64;
-                cw_cell.set(char_width.max(1.0));
-                let w = da.width() as f64;
-                let h = da.height() as f64;
-
-                let item_height = row_h;
-                let visible_rows = if item_height > 0.0 {
-                    (h / item_height).floor() as usize
-                } else {
-                    0
-                };
-                engine.explorer_viewport_rows.set(visible_rows);
-                let q_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
-                engine.explorer_tree_rect.set(q_rect);
-
-                crate::render::populate_explorer_tree_controller(&engine, &theme);
-
-                engine
-                    .explorer_tree
-                    .borrow_mut()
-                    .set_scrollbar_width(Some(8.0));
-                backend_d.borrow_mut().enter_frame_scope(cr, &layout, |b| {
-                    b.set_current_theme(crate::gtk::quadraui_gtk::q_theme(&theme));
-                    b.set_current_line_height(line_height);
-                    engine.explorer_tree.borrow().render(b, q_rect);
-                });
-
-                // #426: the explorer ctx menu paints on a window-level
-                // overlay DA (`ctx_menu_overlay_da`) so it can extend past
-                // the explorer's narrow width into the editor area —
-                // rendering it here would clip on the right edge.
-                let _ = (char_width, &ctx_menu_layout_d, w, h);
-            });
-        }
-        {
-            let sender_ex = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                sender_ex
-                    .send(Msg::ExplorerKey {
-                        key_name,
-                        unicode,
-                        ctrl,
-                    })
-                    .ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.explorer_da.add_controller(key_ctrl);
-        }
-        // Right-click context menu (kept separate — TreeController returns
-        // ContextMenuRequested but the menu-open logic lives in the GTK handler).
-        {
-            let sender_ex = sender.input_sender().clone();
-            let right_click = gtk4::GestureClick::new();
-            right_click.set_button(3);
-            right_click.connect_pressed(move |_, _n_press, x, y| {
-                sender_ex.send(Msg::ExplorerRightClick { x, y }).ok();
-            });
-            widgets.explorer_da.add_controller(right_click);
-        }
-        // Wire all mouse/scroll events through TreeController.handle() for
-        // unified click, scrollbar, and scroll-wheel handling.
-        {
-            let sender_ev = sender.input_sender().clone();
-            quadraui::gtk::wire_da_events(&widgets.explorer_da, move |ev| {
-                sender_ev.send(Msg::ExplorerUiEvent(ev)).ok();
-            });
-        }
-
-        // Drag-and-drop from the explorer was part of the native
-        // `gtk4::TreeView` setup. DnD is deferred — tracked as
-        // https://github.com/JDonaghy/vimcode/issues/149.
-
-        // ── Sidebar resize drag handle ─────────────────────────────────────────
-        // Attach the GestureDrag to main_hbox (which never moves during a sidebar
-        // resize) rather than to the 6-px handle strip itself.  When the handle
-        // strip is a child of a reflowing layout, GTK4 may cancel the gesture as
-        // soon as the widget allocation changes (premature drag-end / jitter).
-        // We gate on the x-position in drag_begin so that only clicks near the
-        // sidebar/editor boundary are treated as a sidebar resize.
-        {
-            let is_sb_drag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-            let is_sb_drag_begin = is_sb_drag.clone();
-            let is_sb_drag_update = is_sb_drag.clone();
-            let is_sb_drag_end = is_sb_drag.clone();
-
-            let gesture = gtk4::GestureDrag::new();
-
-            let sb_ref = sidebar_inner_sw_ref.clone();
-            let sw = sidebar_drag_start_w.clone();
-            gesture.connect_drag_begin(move |_, x, _| {
-                let Some(ref sb) = *sb_ref.borrow() else {
-                    is_sb_drag_begin.set(false);
-                    return;
-                };
-                if !sb.is_visible() {
-                    is_sb_drag_begin.set(false);
-                    return;
-                }
-                // The resize handle strip sits immediately to the right of
-                // the sidebar. Accept clicks only from the sidebar's right
-                // edge outward, so drags that start inside the sidebar
-                // (including on the explorer scrollbar which is flush with
-                // the right edge) aren't stolen as panel-resize drags.
-                const ACTIVITY_W: f64 = 48.0;
-                let aw = sb.allocated_width();
-                let sidebar_right = ACTIVITY_W + aw as f64;
-                if x >= sidebar_right && x <= sidebar_right + 10.0 {
-                    is_sb_drag_begin.set(true);
-                    sw.set(sb.width_request());
-                } else {
-                    is_sb_drag_begin.set(false);
-                }
-            });
-
-            let sb_ref2 = sidebar_inner_sw_ref.clone();
-            let sw2 = sidebar_drag_start_w.clone();
-            gesture.connect_drag_update(move |_, dx, _| {
-                if !is_sb_drag_update.get() {
-                    return;
-                }
-                let new_w = (sw2.get() as f64 + dx).round() as i32;
-                if let Some(ref sb) = *sb_ref2.borrow() {
-                    sb.set_width_request(new_w.clamp(80, 600));
-                }
-            });
-
-            let sender_resize = sender.input_sender().clone();
-            gesture.connect_drag_end(move |_, _, _| {
-                if !is_sb_drag_end.get() {
-                    return;
-                }
-                is_sb_drag_end.set(false);
-                sender_resize.send(Msg::SidebarResized).ok();
-            });
-
-            widgets.main_hbox.add_controller(gesture);
-        }
-
-        // Shared bar_rect — set by the menu bar DA's draw_func each frame,
-        // read by all menu click/motion/key handlers for MenuSystem::handle().
-        let menu_bar_rect_cell: Rc<Cell<quadraui::Rect>> =
-            Rc::new(Cell::new(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0)));
-
-        // ── Menu dropdown overlay — quadraui::gtk::MenuOverlay ────────────────
-        {
-            let menu_overlay = quadraui::gtk::MenuOverlay::new();
-            let menu_system_rc = engine.borrow().menu_system.clone();
-            menu_overlay.connect(
-                menu_system_rc,
-                backend.clone(),
-                menu_bar_rect_cell.clone(),
-                &UI_FONT(),
-                {
-                    let sender = sender.input_sender().clone();
-                    move |ev| match ev {
-                        quadraui::MenuEvent::Activated(id) => {
-                            sender
-                                .send(Msg::HandleMenuAction(id.as_str().to_string()))
-                                .ok();
-                        }
-                        quadraui::MenuEvent::Ignored => {}
-                        _ => {
-                            sender.send(Msg::MenuRedraw).ok();
-                        }
-                    }
-                },
-            );
-            widgets
-                .window_overlay
-                .add_overlay(menu_overlay.drawing_area());
-            *menu_dropdown_da_ref.borrow_mut() = Some(menu_overlay.drawing_area().clone());
-        }
-
-        // ── Panel hover popup overlay DrawingArea ────────────────────────────
-        // A full-window transparent overlay that draws the panel hover popup
-        // to the right of the sidebar (extending into the editor area).
-        {
-            let hover_da = gtk4::DrawingArea::new();
-            hover_da.set_hexpand(true);
-            hover_da.set_vexpand(true);
-            hover_da.set_can_target(false); // pass-through until popup has links
-
-            {
-                let engine = engine.clone();
-                let lh = menu_dd_lh.clone();
-                let link_rects = panel_hover_link_rects.clone();
-                let popup_rect = panel_hover_popup_rect.clone();
-                hover_da.set_draw_func(move |da, cr, _w, _h| {
-                    link_rects.borrow_mut().clear();
-                    popup_rect.set(None);
-                    let engine = engine.borrow();
-                    if engine.panel_hover.is_none() {
-                        return;
-                    }
-                    let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let font_desc = FontDescription::from_string(&UI_FONT());
-                    let pango_ctx = pangocairo::create_context(cr);
-                    let layout = pango::Layout::new(&pango_ctx);
-                    layout.set_font_description(Some(&font_desc));
-                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
-                        / pango::SCALE as f64;
-                    lh.set(line_height);
-                    let char_width = {
-                        layout.set_text("0");
-                        layout.pixel_size().0 as f64
-                    };
-                    let screen =
-                        build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
-                    let window_w = da.width() as f64;
-                    let window_h = da.height() as f64;
-                    let sidebar_right = 48.0 + engine.session.sidebar_width as f64;
-                    let is_native = engine
-                        .panel_hover
-                        .as_ref()
-                        .map(|ph| ph.is_native())
-                        .unwrap_or(false);
-                    let (rects, bounds) = draw_panel_hover_popup(
-                        cr,
-                        &layout,
-                        &screen,
-                        &theme,
-                        sidebar_right,
-                        0.0,
-                        window_w,
-                        window_h,
-                        line_height,
-                        is_native,
-                    );
-                    *link_rects.borrow_mut() = rects;
-                    popup_rect.set(bounds);
-                });
-            }
-
-            widgets.window_overlay.add_overlay(&hover_da);
-            *panel_hover_da_ref.borrow_mut() = Some(hover_da);
-        }
-
-        // ── Context-menu overlay DrawingArea (#426) ──────────────────────────
-        // Window-level overlay so explorer ctx menus can extend past the
-        // narrow sidebar into the editor area without being clipped.
-        // Editor/tab/action ctx menus stay on the editor DA (no clipping
-        // problem — editor DA is wide enough). This overlay only paints
-        // when the active ctx menu targets the explorer.
-        {
-            let ctx_overlay_da = gtk4::DrawingArea::new();
-            ctx_overlay_da.set_hexpand(true);
-            ctx_overlay_da.set_vexpand(true);
-            ctx_overlay_da.set_can_target(false);
-            ctx_overlay_da.set_focusable(false);
-
-            {
-                let engine_d = engine.clone();
-                let ctx_layout_d = explorer_ctx_menu_layout.clone();
-                let bk_ctx = backend.clone();
-                ctx_overlay_da.set_draw_func(move |da, cr, _w, _h| {
-                    let engine = engine_d.borrow();
-                    let on_explorer = matches!(
-                        engine.context_menu.as_ref().map(|cm| &cm.target),
-                        Some(
-                            core::engine::ContextMenuTarget::ExplorerFile { .. }
-                                | core::engine::ContextMenuTarget::ExplorerDir { .. }
-                        )
-                    );
-                    if !on_explorer {
-                        *ctx_layout_d.borrow_mut() = None;
-                        return;
-                    }
-                    let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let font_desc = FontDescription::from_string(&UI_FONT());
-                    let pango_ctx = pangocairo::create_context(cr);
-                    let layout = pango::Layout::new(&pango_ctx);
-                    layout.set_font_description(Some(&font_desc));
-                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
-                        / pango::SCALE as f64;
-                    layout.set_text("0");
-                    let char_width = layout.pixel_size().0 as f64;
-                    let w = da.width() as f64;
-                    let h = da.height() as f64;
-                    *ctx_layout_d.borrow_mut() = crate::gtk::draw::draw_explorer_context_menu_popup(
-                        &bk_ctx,
-                        cr,
-                        &layout,
-                        &engine,
-                        &theme,
-                        w,
-                        h,
-                        char_width.max(1.0),
-                        line_height.max(1.0),
-                    );
-                });
-            }
-
-            // Click handling: hit-test the cached layout. On hit, fire
-            // confirm via Msg::ExplorerCtxMenuClick. On miss, dismiss.
-            {
-                let sender_ctx = sender.input_sender().clone();
-                let gesture = gtk4::GestureClick::new();
-                gesture.set_button(1);
-                gesture.connect_pressed(move |_, _n_press, x, y| {
-                    sender_ctx.send(Msg::ExplorerCtxMenuClick(x, y)).ok();
-                });
-                ctx_overlay_da.add_controller(gesture);
-            }
-            // Motion handling: update hover idx.
-            {
-                let sender_ctx = sender.input_sender().clone();
-                let motion = gtk4::EventControllerMotion::new();
-                motion.connect_motion(move |_, x, y| {
-                    sender_ctx.send(Msg::ExplorerCtxMenuMotion(x, y)).ok();
-                });
-                ctx_overlay_da.add_controller(motion);
-            }
-
-            widgets.window_overlay.add_overlay(&ctx_overlay_da);
-            *ctx_menu_overlay_da_ref.borrow_mut() = Some(ctx_overlay_da);
-
-            // Capture-phase click on the window overlay: intercept clicks on
-            // popup links before they reach child widgets.
-            {
-                let sender_hover = sender.input_sender().clone();
-                let popup_rect_click = panel_hover_popup_rect.clone();
-                let gesture = gtk4::GestureClick::new();
-                gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-                gesture.connect_pressed(move |gesture, _n_press, x, y| {
-                    if let Some((px, py, pw, ph)) = popup_rect_click.get() {
-                        if x >= px && x <= px + pw && y >= py && y <= py + ph {
-                            sender_hover.send(Msg::PanelHoverClick(x, y)).ok();
-                            gesture.set_state(gtk4::EventSequenceState::Claimed);
-                        }
-                    }
-                });
-                widgets.window_overlay.add_controller(gesture);
-            }
-
-            // Capture-phase motion on the window overlay: cancel dismiss when
-            // the mouse is over the popup area.
-            {
-                let engine_motion = engine.clone();
-                let popup_rect_motion = panel_hover_popup_rect.clone();
-                let motion = gtk4::EventControllerMotion::new();
-                motion.set_propagation_phase(gtk4::PropagationPhase::Capture);
-                motion.connect_motion(move |_, x, y| {
-                    if let Some((px, py, pw, ph)) = popup_rect_motion.get() {
-                        if x >= px && x <= px + pw && y >= py && y <= py + ph {
-                            engine_motion.borrow_mut().cancel_panel_hover_dismiss();
-                        }
-                    }
-                });
-                widgets.window_overlay.add_controller(motion);
-            }
-        }
-
-        // ── Menu bar DrawingArea setup ─────────────────────────────────────────
-        // Draw: menu bar labels via Backend + command center adjacent.
-        {
-            let engine = engine.clone();
-            let backend_d = backend.clone();
-            let cc_layout_draw = command_center_layout_cell.clone();
-            let bar_rect_update = menu_bar_rect_cell.clone();
-            widgets.menu_bar_da.set_draw_func(move |da, cr, _w, _h| {
-                let eng = engine.borrow();
-                let theme = Theme::from_name(&eng.settings.colorscheme);
-                let q_theme = quadraui_gtk::q_theme(&theme);
-                let font_desc = FontDescription::from_string(&UI_FONT());
-                let pango_ctx = pangocairo::create_context(cr);
-                let pango_layout = pango::Layout::new(&pango_ctx);
-                pango_layout.set_font_description(Some(&font_desc));
-                pango_layout.set_text("Xy");
-                let lh = pango_layout.pixel_size().1 as f64;
-                pango_layout.set_text("M");
-                let cw = pango_layout.pixel_size().0 as f64;
-                let w = da.width() as f64;
-                let h = da.height() as f64;
-
-                use quadraui::Backend;
-                let bar = eng.menu_system.borrow().menu_bar();
-                let bar_rect = quadraui::Rect::new(0.0, 0.0, w as f32, h as f32);
-                bar_rect_update.set(bar_rect);
-                let mb_layout = backend_d
-                    .borrow_mut()
-                    .enter_frame_scope(cr, &pango_layout, |b| {
-                        b.set_current_theme(q_theme);
-                        b.set_current_line_height(lh);
-                        b.set_current_char_width(cw);
-                        b.draw_menu_bar(bar_rect, &bar)
-                    });
-
-                let menu_end = mb_layout
-                    .visible_items
-                    .last()
-                    .map(|vi| (vi.bounds.x + vi.bounds.width) as f64)
-                    .unwrap_or(0.0);
-                let title = eng
-                    .cwd
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "VimCode".to_string());
-                let cc = render::build_command_center_view(
-                    eng.tab_nav_can_go_back(),
-                    eng.tab_nav_can_go_forward(),
-                    &title,
-                );
-                let cc_layout = quadraui::gtk::draw_command_center(
-                    cr,
-                    &pango_layout,
-                    menu_end,
-                    0.0,
-                    (w - menu_end).max(0.0),
-                    h,
-                    &cc,
-                    &quadraui_gtk::q_theme(&theme),
-                    lh,
-                );
-                *cc_layout_draw.borrow_mut() = Some(cc_layout);
-            });
-        }
-        // Click: menu bar clicks → MenuSystem, command center clicks handled separately.
-        {
-            let sender_menu = sender.input_sender().clone();
-            let engine_menu = engine.clone();
-            let backend_click = backend.clone();
-            let cc_layout_click = command_center_layout_cell.clone();
-            let bar_rect_click = menu_bar_rect_cell.clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |gest, _, x, _y| {
-                // Try command center first (not part of MenuSystem).
-                let cc_hit = cc_layout_click
-                    .borrow()
-                    .as_ref()
-                    .map(|l| l.hit_test(x as f32, 0.5));
-                match cc_hit {
-                    Some(quadraui::CommandCenterHit::Back) => {
-                        gest.set_state(gtk4::EventSequenceState::Claimed);
-                        sender_menu.send(Msg::MruNavBack).ok();
-                        return;
-                    }
-                    Some(quadraui::CommandCenterHit::Forward) => {
-                        gest.set_state(gtk4::EventSequenceState::Claimed);
-                        sender_menu.send(Msg::MruNavForward).ok();
-                        return;
-                    }
-                    Some(quadraui::CommandCenterHit::SearchBox) => {
-                        gest.set_state(gtk4::EventSequenceState::Claimed);
-                        sender_menu.send(Msg::OpenCommandCenter).ok();
-                        return;
-                    }
-                    _ => {}
-                }
-                // Delegate to MenuSystem for menu bar label clicks.
-                let bar_rect = bar_rect_click.get();
-                let ev = quadraui::UiEvent::MouseDown {
-                    widget: None,
-                    button: quadraui::MouseButton::Left,
-                    position: quadraui::Point {
-                        x: x as f32,
-                        y: 0.5,
-                    },
-                    modifiers: quadraui::Modifiers::default(),
-                };
-                let menu_event = engine_menu.borrow().menu_system.borrow_mut().handle(
-                    &ev,
-                    &mut *backend_click.borrow_mut(),
-                    bar_rect,
-                );
-                match menu_event {
-                    quadraui::MenuEvent::Activated(id) => {
-                        sender_menu
-                            .send(Msg::HandleMenuAction(id.as_str().to_string()))
-                            .ok();
-                    }
-                    quadraui::MenuEvent::Ignored => {}
-                    _ => {
-                        sender_menu.send(Msg::MenuRedraw).ok();
-                    }
-                }
-            });
-            widgets.menu_bar_da.add_controller(gesture);
-        }
-        // Hover: delegate to MenuSystem for hover-to-switch.
-        {
-            let sender_hover = sender.input_sender().clone();
-            let engine_hover = engine.clone();
-            let backend_hover = backend.clone();
-            let bar_rect_hover = menu_bar_rect_cell.clone();
-            let motion = gtk4::EventControllerMotion::new();
-            motion.connect_motion(move |_, x, _y| {
-                let bar_rect = bar_rect_hover.get();
-                let ev = quadraui::UiEvent::MouseMoved {
-                    position: quadraui::Point {
-                        x: x as f32,
-                        y: 0.5,
-                    },
-                    buttons: quadraui::ButtonMask::default(),
-                };
-                let menu_event = engine_hover.borrow().menu_system.borrow_mut().handle(
-                    &ev,
-                    &mut *backend_hover.borrow_mut(),
-                    bar_rect,
-                );
-                match menu_event {
-                    quadraui::MenuEvent::Ignored => {}
-                    _ => {
-                        sender_hover.send(Msg::MenuRedraw).ok();
-                    }
-                }
-            });
-            widgets.menu_bar_da.add_controller(motion);
-        }
-        // ── Debug sidebar DrawingArea setup ───────────────────────────────────
-        {
-            let engine = engine.clone();
-            let backend_d = backend.clone();
-            let lh_cell = debug_sidebar_lh.clone();
-            widgets
-                .debug_sidebar_da
-                .set_draw_func(move |da, cr, _w, _h| {
-                    let engine = engine.borrow();
-                    let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let font_desc = FontDescription::from_string(&UI_FONT());
-                    let pango_ctx = pangocairo::create_context(cr);
-                    let layout = pango::Layout::new(&pango_ctx);
-                    layout.set_font_description(Some(&font_desc));
-                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
-                        / pango::SCALE as f64;
-                    let char_width = {
-                        layout.set_text("0");
-                        layout.pixel_size().0 as f64
-                    };
-                    // Publish line_height for the click / scroll / key
-                    // handlers — they can't recompute it themselves
-                    // (no cairo context available outside the draw
-                    // callback) and `cached_ui_line_height` (computed
-                    // from a different DA's pango_context()) drifts on
-                    // HiDPI displays. #281 smoke surfaced a 4:3 ratio
-                    // off-by-N when these diverged.
-                    lh_cell.set(line_height);
-                    let screen =
-                        build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
-                    let w = da.width() as f64;
-                    let h = da.height() as f64;
-                    render::populate_dap_sidebar_system(&engine);
-                    let action_hits = draw_debug_sidebar(
-                        cr,
-                        &layout,
-                        &screen,
-                        &theme,
-                        0.0,
-                        0.0,
-                        w,
-                        h,
-                        line_height,
-                        &backend_d,
-                        &engine,
-                    );
-                    engine.dap_sidebar_action_hits.replace(Some(action_hits));
-                });
-        }
-        // ── Debug sidebar click handler ────────────────────────────────────────
-        {
-            let sender_dbg = sender.input_sender().clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, _, x, y| {
-                sender_dbg.send(Msg::DebugSidebarClick(x, y)).ok();
-            });
-            widgets.debug_sidebar_da.add_controller(gesture);
-        }
-        // ── Debug sidebar drag handler (scrollbar thumb) ─────────────────────
-        {
-            let sender_drag = sender.input_sender().clone();
-            let sender_drag_end = sender.input_sender().clone();
-            let gesture = gtk4::GestureDrag::new();
-            gesture.set_button(1);
-            gesture.connect_drag_update(move |g, off_x, off_y| {
-                if let Some((sx, sy)) = g.start_point() {
-                    sender_drag
-                        .send(Msg::DebugSidebarDrag(sx + off_x, sy + off_y))
-                        .ok();
-                }
-            });
-            gesture.connect_drag_end(move |g, off_x, off_y| {
-                if let Some((sx, sy)) = g.start_point() {
-                    sender_drag_end
-                        .send(Msg::DebugSidebarDragEnd(sx + off_x, sy + off_y))
-                        .ok();
-                }
-            });
-            widgets.debug_sidebar_da.add_controller(gesture);
-        }
-        // ── Debug sidebar keyboard handler ───────────────────────────────────
-        {
-            let sender_dbg_key = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                sender_dbg_key
-                    .send(Msg::DebugSidebarKey(key_name, ctrl))
-                    .ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.debug_sidebar_da.set_focusable(true);
-            widgets.debug_sidebar_da.add_controller(key_ctrl);
-        }
-        // ── Debug sidebar scroll handler ──────────────────────────────────────
-        {
-            let sender_dbg_scroll = sender.input_sender().clone();
-            let scroll_ctrl =
-                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                sender_dbg_scroll.send(Msg::DebugSidebarScroll(dy)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.debug_sidebar_da.add_controller(scroll_ctrl);
-        }
-        // Store a reference so update() can explicitly queue_draw when DAP events arrive.
-        *debug_sidebar_da_ref.borrow_mut() = Some(widgets.debug_sidebar_da.clone());
-
-        // ── Source Control sidebar draw + key setup ────────────────────────────
-        {
-            let engine = engine.clone();
-            let backend_d = backend.clone();
-            widgets.git_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
-                let engine = engine.borrow();
-                let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(&UI_FONT());
-                let pango_ctx = pangocairo::create_context(cr);
-                let layout = pango::Layout::new(&pango_ctx);
-                layout.set_font_description(Some(&font_desc));
-                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                let line_height =
-                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let char_width = {
-                    layout.set_text("0");
-                    layout.pixel_size().0 as f64
-                };
-                let screen =
-                    build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
-                let w = da.width() as f64;
-                let h = da.height() as f64;
-                draw_source_control_panel(
-                    cr,
-                    &layout,
-                    &screen,
-                    &theme,
-                    0.0,
-                    0.0,
-                    w,
-                    h,
-                    line_height,
-                    &backend_d,
-                    &engine,
-                );
-            });
-        }
-        {
-            let sender_sc = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                sender_sc.send(Msg::ScKey(key_name, ctrl)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.git_sidebar_da.set_focusable(true);
-            widgets.git_sidebar_da.add_controller(key_ctrl);
-        }
-        {
-            let sender_sc = sender.input_sender().clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, n_press, x, y| {
-                sender_sc.send(Msg::ScSidebarClick(x, y, n_press)).ok();
-            });
-            widgets.git_sidebar_da.add_controller(gesture);
-        }
-        {
-            let sender_sc = sender.input_sender().clone();
-            let motion = gtk4::EventControllerMotion::new();
-            motion.connect_motion(move |_, x, y| {
-                sender_sc.send(Msg::ScSidebarMotion(x, y)).ok();
-            });
-            let sender_leave = sender.input_sender().clone();
-            motion.connect_leave(move |_| {
-                sender_leave.send(Msg::ScSidebarMotion(-1.0, -1.0)).ok();
-            });
-            widgets.git_sidebar_da.add_controller(motion);
-        }
-        {
-            let sender_sc = sender.input_sender().clone();
-            quadraui::gtk::wire_da_events(&widgets.git_sidebar_da, move |ev| {
-                sender_sc.send(Msg::ScSidebarEvent(ev)).ok();
-            });
-        }
-        *git_sidebar_da_ref.borrow_mut() = Some(widgets.git_sidebar_da.clone());
-
-        // ── Extensions sidebar draw + key setup ───────────────────────────────
-        {
-            let engine = engine.clone();
-            let backend_d = backend.clone();
-            widgets.ext_sidebar_da.set_draw_func(move |da, cr, _w, _h| {
-                let engine = engine.borrow();
-                let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_desc = FontDescription::from_string(&UI_FONT());
-                let pango_ctx = pangocairo::create_context(cr);
-                let layout = pango::Layout::new(&pango_ctx);
-                layout.set_font_description(Some(&font_desc));
-                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                let line_height =
-                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let char_width = {
-                    layout.set_text("0");
-                    layout.pixel_size().0 as f64
-                };
-                let screen =
-                    build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
-                let w = da.width() as f64;
-                let h = da.height() as f64;
-                draw_ext_sidebar(
-                    cr,
-                    &layout,
-                    &screen,
-                    &theme,
-                    0.0,
-                    0.0,
-                    w,
-                    h,
-                    line_height,
-                    &backend_d,
-                    &engine,
-                );
-            });
-        }
-        {
-            let sender_ext = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, _modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                sender_ext.send(Msg::ExtSidebarKey(key_name, unicode)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.ext_sidebar_da.set_focusable(true);
-            widgets.ext_sidebar_da.add_controller(key_ctrl);
-        }
-        {
-            let sender_ext = sender.input_sender().clone();
-            quadraui::gtk::wire_da_events(&widgets.ext_sidebar_da, move |ev| {
-                sender_ext.send(Msg::ExtSidebarEvent(ev)).ok();
-            });
-        }
-        *ext_sidebar_da_ref.borrow_mut() = Some(widgets.ext_sidebar_da.clone());
-
-        // ── Extension-provided panel (e.g. git-insights) draw + key + click ──
-        {
-            let engine = engine.clone();
-            widgets
-                .ext_dyn_panel_da
-                .set_draw_func(move |da, cr, _w, _h| {
-                    let engine = engine.borrow();
-                    let theme = Theme::from_name(&engine.settings.colorscheme);
-                    let font_desc = FontDescription::from_string(&UI_FONT());
-                    let pango_ctx = pangocairo::create_context(cr);
-                    let layout = pango::Layout::new(&pango_ctx);
-                    layout.set_font_description(Some(&font_desc));
-                    let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                    let line_height = (font_metrics.ascent() + font_metrics.descent()) as f64
-                        / pango::SCALE as f64;
-                    let char_width = {
-                        layout.set_text("0");
-                        layout.pixel_size().0 as f64
-                    };
-                    let screen =
-                        build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
-                    let w = da.width() as f64;
-                    let h = da.height() as f64;
-                    draw_ext_dyn_panel(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
-                });
-        }
-        {
-            let sender_ep = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, _modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                sender_ep.send(Msg::ExtPanelKey(key_name, unicode)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.ext_dyn_panel_da.set_focusable(true);
-            widgets.ext_dyn_panel_da.add_controller(key_ctrl);
-        }
-        {
-            let sender_ep = sender.input_sender().clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, n_press, x, y| {
-                sender_ep.send(Msg::ExtPanelClick(x, y, n_press)).ok();
-            });
-            widgets.ext_dyn_panel_da.add_controller(gesture);
-        }
-        {
-            let sender_ep_rc = sender.input_sender().clone();
-            let gesture_rc = gtk4::GestureClick::new();
-            gesture_rc.set_button(3);
-            gesture_rc.connect_pressed(move |_, _n_press, x, y| {
-                sender_ep_rc.send(Msg::ExtPanelRightClick(x, y)).ok();
-            });
-            widgets.ext_dyn_panel_da.add_controller(gesture_rc);
-        }
-        {
-            let sender_motion = sender.input_sender().clone();
-            let motion = gtk4::EventControllerMotion::new();
-            motion.connect_motion(move |_, x, y| {
-                sender_motion.send(Msg::ExtPanelMouseMove(x, y)).ok();
-            });
-            widgets.ext_dyn_panel_da.add_controller(motion);
-        }
-        {
-            let sender_scroll = sender.input_sender().clone();
-            let scroll_ctrl =
-                gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
-            scroll_ctrl.connect_scroll(move |_, _dx, dy| {
-                sender_scroll.send(Msg::ExtPanelScroll(dy)).ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.ext_dyn_panel_da.add_controller(scroll_ctrl);
-        }
-        // Scrollbar drag: when dragging on the scrollbar area, proportionally scroll.
-        {
-            let engine_drag = engine.clone();
-            let da_ref_drag = ext_dyn_panel_da_ref.clone();
-            let draw_needed = model.draw_needed.clone();
-            let gesture = gtk4::GestureDrag::new();
-            // Claim the gesture when the drag starts in the scrollbar area so that
-            // parent gestures (sidebar resize) cannot steal the sequence.
-            let da_ref_begin = ext_dyn_panel_da_ref.clone();
-            gesture.connect_drag_begin(move |g, x, _y| {
-                let da_w = if let Some(ref da) = *da_ref_begin.borrow() {
-                    da.width() as f64
-                } else {
-                    return;
-                };
-                if x >= da_w - 8.0 {
-                    g.set_state(gtk4::EventSequenceState::Claimed);
-                }
-            });
-            gesture.connect_drag_update(move |g, _dx, dy| {
-                let Some((start_x, start_y)) = g.start_point() else {
-                    return;
-                };
-                let da_w = if let Some(ref da) = *da_ref_drag.borrow() {
-                    da.width() as f64
-                } else {
-                    return;
-                };
-                // Only handle scrollbar drag (rightmost 8px)
-                if start_x < da_w - 8.0 {
-                    return;
-                }
-                let da_h = if let Some(ref da) = *da_ref_drag.borrow() {
-                    da.height() as f64
-                } else {
-                    return;
-                };
-                let y = start_y + dy;
-                let mut engine = engine_drag.borrow_mut();
-                let flat_len = engine.ext_panel_flat_len();
-                if flat_len == 0 || da_h <= 0.0 {
-                    return;
-                }
-                let ratio = (y / da_h).clamp(0.0, 1.0);
-                engine.ext_panel_scroll_top = (ratio * flat_len as f64) as usize;
-                engine.ext_panel_scroll_top =
-                    engine.ext_panel_scroll_top.min(flat_len.saturating_sub(1));
-                drop(engine);
-                if let Some(ref da) = *da_ref_drag.borrow() {
-                    da.queue_draw();
-                }
-                draw_needed.set(true);
-            });
-            widgets.ext_dyn_panel_da.add_controller(gesture);
-        }
-        *ext_dyn_panel_da_ref.borrow_mut() = Some(widgets.ext_dyn_panel_da.clone());
-
-        // ── Activity bar (A.6f: native Button chain → DrawingArea) ────────────
-        {
-            let engine_d = engine.clone();
-            let hits_d = activity_bar_hits.clone();
-            let hover_d = activity_bar_hover.clone();
-            widgets.activity_bar.set_draw_func(move |da, cr, _w, _h| {
-                let engine = engine_d.borrow();
-                let theme = Theme::from_name(&engine.settings.colorscheme);
-                let pango_ctx = pangocairo::create_context(cr);
-                let layout = pango::Layout::new(&pango_ctx);
-                let bar = crate::render::build_activity_bar(
-                    &engine,
-                    &theme,
-                    false,
-                    engine.ext_panel_active.as_deref(),
-                );
-                let hovered = hover_d.get();
-                let hits = quadraui::gtk::draw_activity_bar(
-                    cr,
-                    &layout,
-                    da.width() as f64,
-                    da.height() as f64,
-                    &bar,
-                    &crate::gtk::quadraui_gtk::q_theme(&theme),
-                    hovered,
-                );
-                *hits_d.borrow_mut() = hits;
-            });
-        }
-        // Left-click: resolve row → panel_id → Msg::SwitchPanel.
-        {
-            let sender_c = sender.input_sender().clone();
-            let hits_c = activity_bar_hits.clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, _n, _x, y| {
-                let hits = hits_c.borrow();
-                for hit in hits.iter() {
-                    if y >= hit.y_start && y < hit.y_end {
-                        if let Some(pid) = activity_id_to_panel_id(hit.id.as_str()) {
-                            let _ = sender_c.send(Msg::SwitchPanel(pid));
-                        }
-                        return;
-                    }
-                }
-            });
-            widgets.activity_bar.add_controller(gesture);
-        }
-        // Hover tracking — updates the cell used by the draw func and queues a redraw.
-        {
-            let hits_m = activity_bar_hits.clone();
-            let hover_m = activity_bar_hover.clone();
-            let da_weak = widgets.activity_bar.downgrade();
-            let motion = gtk4::EventControllerMotion::new();
-            motion.connect_motion(move |_, _x, y| {
-                let hits = hits_m.borrow();
-                let mut new_hover: Option<usize> = None;
-                for (i, hit) in hits.iter().enumerate() {
-                    if y >= hit.y_start && y < hit.y_end {
-                        new_hover = Some(i);
-                        break;
-                    }
-                }
-                if hover_m.get() != new_hover {
-                    hover_m.set(new_hover);
-                    if let Some(da) = da_weak.upgrade() {
-                        da.queue_draw();
-                    }
-                }
-            });
-            let hover_leave = activity_bar_hover.clone();
-            let da_weak_leave = widgets.activity_bar.downgrade();
-            motion.connect_leave(move |_| {
-                if hover_leave.get().is_some() {
-                    hover_leave.set(None);
-                    if let Some(da) = da_weak_leave.upgrade() {
-                        da.queue_draw();
-                    }
-                }
-            });
-            widgets.activity_bar.add_controller(motion);
-        }
-        // Per-row tooltip via the query-tooltip signal.
-        {
-            let hits_t = activity_bar_hits.clone();
-            widgets
-                .activity_bar
-                .connect_query_tooltip(move |_, _x, y, _kbd, tooltip| {
-                    let hits = hits_t.borrow();
-                    for hit in hits.iter() {
-                        if (y as f64) >= hit.y_start && (y as f64) < hit.y_end {
-                            if !hit.tooltip.is_empty() {
-                                tooltip.set_text(Some(&hit.tooltip));
-                                return true;
-                            }
-                            return false;
-                        }
-                    }
-                    false
-                });
-        }
-        *activity_bar_da_ref.borrow_mut() = Some(widgets.activity_bar.clone());
-
-        // AI sidebar DrawingArea: draw function + key controller + click gesture
-        {
-            let engine = engine.clone();
-            widgets.ai_sidebar_da.set_draw_func(move |da, cr, _, _| {
-                let engine = engine.borrow();
-                let theme = Theme::from_name(&engine.settings.colorscheme);
-                let font_size = engine.settings.font_size as f64;
-                let font_family = engine.settings.font_family.clone();
-                let font_desc =
-                    pango::FontDescription::from_string(&format!("{} {}", font_family, font_size));
-                let pango_ctx = pangocairo::create_context(cr);
-                let layout = pango::Layout::new(&pango_ctx);
-                layout.set_font_description(Some(&font_desc));
-                let font_metrics = pango_ctx.metrics(Some(&font_desc), None);
-                let line_height =
-                    (font_metrics.ascent() + font_metrics.descent()) as f64 / pango::SCALE as f64;
-                let char_width = {
-                    layout.set_text("0");
-                    layout.pixel_size().0 as f64
-                };
-                let screen =
-                    build_screen_layout(&engine, &theme, &[], line_height, char_width, false);
-                let w = da.width() as f64;
-                let h = da.height() as f64;
-                draw_ai_sidebar(cr, &layout, &screen, &theme, 0.0, 0.0, w, h, line_height);
-            });
-        }
-        {
-            let sender_ai = sender.input_sender().clone();
-            let key_ctrl = gtk4::EventControllerKey::new();
-            key_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                let key_name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
-                let unicode = key.to_unicode().filter(|c| !c.is_control());
-                sender_ai
-                    .send(Msg::AiSidebarKey(key_name, ctrl, unicode))
-                    .ok();
-                gtk4::glib::Propagation::Stop
-            });
-            widgets.ai_sidebar_da.add_controller(key_ctrl);
-        }
-        {
-            let sender_ai = sender.input_sender().clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_pressed(move |_, _, x, y| {
-                sender_ai.send(Msg::AiSidebarClick(x, y)).ok();
-            });
-            widgets.ai_sidebar_da.add_controller(gesture);
-        }
-        *ai_sidebar_da_ref.borrow_mut() = Some(widgets.ai_sidebar_da.clone());
-
-        // Move the menu bar row out of the content Box and set it as the window's
-        // custom titlebar.  This gives us CSD edge resize handles while keeping
-        // our dark custom title strip with WindowHandle for drag-to-move.
-        {
-            let menu_row = &widgets.menu_bar_row;
-            if let Some(parent) = menu_row.parent() {
-                if let Some(parent_box) = parent.downcast_ref::<gtk4::Box>() {
-                    parent_box.remove(menu_row);
-                }
-            }
-            root.set_titlebar(Some(menu_row));
-        }
-
-        // Restore saved sidebar width (clamp to reasonable range)
-        {
-            let saved_width = engine.borrow().session.sidebar_width.clamp(80, 600);
-            widgets.sidebar_inner_sw.set_width_request(saved_width);
-        }
-
-        // Set ew-resize cursor on drag handle
-        widgets
-            .sidebar_resize_handle
-            .set_cursor_from_name(Some("ew-resize"));
-
-        // Apply saved window geometry from session state
-        {
-            let eng = engine.borrow();
-            let geom = &eng.session.window;
-            root.set_default_size(geom.width, geom.height);
-        }
-
-        // Update maximize button icon and tooltip when window maximized state changes.
-        // □ = maximize; ❐ (U+2750 HEAVY RIGHT ARROW) not ideal; use ⧉ (TWO JOINED SQUARES).
-        {
-            let btn = widgets.maximize_button.clone();
-            root.connect_notify_local(Some("maximized"), move |win, _| {
-                if win.is_maximized() {
-                    btn.set_label("\u{29c9}"); // ⧉ two joined squares = restore
-                    btn.set_tooltip_text(Some("Restore Down"));
-                } else {
-                    btn.set_label("\u{25a1}"); // □ = maximize
-                    btn.set_tooltip_text(Some("Maximize"));
-                }
-            });
-        }
-
-        // Set the actual title after widget creation
-        root.set_title(Some(&title));
-
-        // Menu bar is always visible in GTK (it acts as the title bar).
-        engine.borrow_mut().menu_bar_visible = true;
-        engine
-            .borrow()
-            .menu_system
-            .borrow_mut()
-            .set_menus(render::build_menu_defs(engine.borrow().is_vscode_mode()));
-
-        // Create initial scrollbars for the first window
-        {
-            let initial_window_id = engine.borrow().active_window_id();
-            let ws = model.create_window_scrollbars(
-                &widgets.editor_overlay,
-                initial_window_id,
-                sender.input_sender(),
-            );
-            model
-                .window_scrollbars
-                .borrow_mut()
-                .insert(initial_window_id, ws);
-        }
-
-        // ── Capture-phase gesture on the editor overlay ───────────────────
-        // This intercepts drag events *before* the scrollbar widgets receive
-        // them, so the group divider can be grabbed even when a scrollbar
-        // overlaps the divider area.  The full drag cycle (press → motion →
-        // release) is handled here; the DrawingArea's divider hit-test is
-        // kept as a fallback but won't fire when the overlay claims the event.
-        {
-            let engine_div = engine.clone();
-            let lh_div = line_height_cell.clone();
-            let _sender_div = sender.input_sender().clone();
-            let div_active: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
-            let div_active_pressed = div_active.clone();
-            let div_active_motion = div_active.clone();
-            let div_active_end = div_active.clone();
-            let engine_motion = engine.clone();
-            let lh_motion = line_height_cell.clone();
-            let sender_motion = sender.input_sender().clone();
-            let gesture = gtk4::GestureDrag::new();
-            gesture.set_button(1);
-            gesture.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            gesture.connect_drag_begin(move |g, x, y| {
-                let engine = engine_div.borrow();
-                if engine.group_layout.is_single_group() {
-                    return; // let event propagate to scrollbar
-                }
-                let lh = lh_div.get().max(1.0);
-                let widget = g.widget();
-                let width = widget.width() as f64;
-                let height = widget.height() as f64;
-                let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
-                let tab_row_h = (lh * 1.6).ceil();
-                let tab_bar_h = if engine.settings.breadcrumbs {
-                    tab_row_h + lh
-                } else {
-                    tab_row_h
-                };
-                let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
-                let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                // Check if click is in a scrollbar zone (rightmost 10px of any
-                // window rect). If so, skip divider claim to let the scrollbar
-                // handle the click instead.
-                let (window_rects, _) =
-                    engine.calculate_group_window_rects(content_bounds, tab_bar_h);
-                let in_scrollbar = window_rects.iter().any(|(_, r)| {
-                    let sb_zone = 10.0; // scrollbar width + margin
-                    x >= r.x + r.width - sb_zone
-                        && x <= r.x + r.width
-                        && y >= r.y
-                        && y < r.y + r.height
-                });
-                // Check if click is in any group's tab bar region.
-                let group_rects = engine
-                    .group_layout
-                    .calculate_group_rects(content_bounds, tab_bar_h);
-                let in_tab_bar = group_rects.iter().any(|(gid, grect)| {
-                    if engine.is_tab_bar_hidden(*gid) {
-                        return false;
-                    }
-                    let ty = grect.y - tab_bar_h;
-                    y >= ty && y < ty + tab_bar_h && x >= grect.x && x < grect.x + grect.width
-                });
-                if !in_scrollbar && !in_tab_bar {
-                    for div in &dividers {
-                        let hit = match div.direction {
-                            core::window::SplitDirection::Vertical => {
-                                (x - div.position).abs() < 6.0
-                                    && y >= div.cross_start
-                                    && y < div.cross_start + div.cross_size
-                            }
-                            core::window::SplitDirection::Horizontal => {
-                                (y - div.position).abs() < 6.0
-                                    && x >= div.cross_start
-                                    && x < div.cross_start + div.cross_size
-                            }
-                        };
-                        if hit {
-                            div_active_pressed.set(Some(div.split_index));
-                            g.set_state(gtk4::EventSequenceState::Claimed);
-                            return;
-                        }
-                    }
-                }
-                // Not on a divider (or in scrollbar zone) — don't claim, let scrollbar handle it
-            });
-            gesture.connect_drag_update(move |g, offset_x, offset_y| {
-                if let Some(split_index) = div_active_motion.get() {
-                    let (start_x, start_y) = g.start_point().unwrap_or((0.0, 0.0));
-                    let x = start_x + offset_x;
-                    let y = start_y + offset_y;
-                    let engine = engine_motion.borrow();
-                    let lh = lh_motion.get().max(1.0);
-                    let widget = g.widget();
-                    let width = widget.width() as f64;
-                    let height = widget.height() as f64;
-                    let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
-                    let content_bounds =
-                        core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
-                    let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                    drop(engine);
-                    if let Some(div) = dividers.iter().find(|d| d.split_index == split_index) {
-                        let mouse_pos = match div.direction {
-                            core::window::SplitDirection::Vertical => x,
-                            core::window::SplitDirection::Horizontal => y,
-                        };
-                        let new_ratio =
-                            ((mouse_pos - div.axis_start) / div.axis_size).clamp(0.1, 0.9);
-                        engine_motion
-                            .borrow_mut()
-                            .group_layout
-                            .set_ratio_at_index(split_index, new_ratio);
-                        sender_motion.send(Msg::Resize).ok();
-                    }
-                }
-            });
-            gesture.connect_drag_end(move |_, _, _| {
-                div_active_end.set(None);
-            });
-            widgets.editor_overlay.add_controller(gesture);
-        }
-
-        // Track resize to update viewport_lines and viewport_cols
-        let sender_clone = sender.clone();
-        let engine_for_resize = engine.clone();
-        let cw_cell_resize = char_width_cell.clone();
-        let lh_cell_resize = line_height_cell.clone();
-        widgets
-            .drawing_area
-            .connect_resize(move |_, width, height| {
-                // Use actual measured font metrics when available; fall back to
-                // reasonable defaults before the first draw (Pango not yet measured).
-                let line_height = lh_cell_resize.get().max(1.0);
-                let char_width = cw_cell_resize.get().max(1.0);
-
-                let total_lines = (height as f64 / line_height).floor() as usize;
-                // Subtract status bar (1) + command line (1) + tab bar (1) +
-                // breadcrumbs (1 if enabled).  The per-window values from
-                // draw are more accurate; this is just the fallback estimate.
-                let chrome_rows = {
-                    let e = engine_for_resize.borrow();
-                    let mut rows = 3usize; // status + cmd + tab bar
-                    if e.settings.breadcrumbs {
-                        rows += 1;
-                    }
-                    if e.settings.hide_single_tab && e.active_group().tabs.len() <= 1 {
-                        rows -= 1; // tab bar hidden
-                    }
-                    rows
-                };
-                let viewport_lines = total_lines.saturating_sub(chrome_rows);
-
-                // viewport_cols here is a rough estimate used by ensure_cursor_visible.
-                // The accurate wrap column is computed in build_rendered_window from
-                // the precise rect + char_width, so a small error here only affects
-                // cursor scroll clamping, not wrap rendering.
-                let total_cols = (width as f64 / char_width).floor() as usize;
-                let viewport_cols = total_cols.saturating_sub(5); // Account for gutter
-
-                {
-                    let mut e = engine_for_resize.borrow_mut();
-                    e.set_viewport_lines(viewport_lines.max(1));
-                    e.set_viewport_cols(viewport_cols.max(40));
-                }
-                // NB: we intentionally do NOT call `terminal_resize` here when
-                // `terminal_maximized` is true. During drag-resize GTK fires
-                // this handler many times per second, and each `terminal_resize`
-                // sends SIGWINCH + re-lays out the VT100 grid. Combined with
-                // Relm4's `Msg::Resize` going through an idle queue that's
-                // starved under continuous events (see PLAN.md lesson
-                // "idle_add_local_once"), the panel ends up drawing at
-                // NEW dimensions while the VT100 is still catching up —
-                // which shows as stale cells / phantom prompts. The panel's
-                // *visual* size does still track the window via
-                // `effective_terminal_panel_rows` on every frame; the PTY
-                // simply stays at its toggle-time size until the user
-                // un-maximizes (which re-syncs via the toggle handlers).
-                sender_clone.input(Msg::Resize);
-            });
-
-        // Second connect_resize: synchronously reposition scrollbar widgets so
-        // they track the new size in the *same* frame as the editor redraw.
-        // This avoids the 1-frame lag that occurs when going through Relm4's
-        // message queue (Msg::Resize → sync_scrollbar).
-        {
-            let engine_for_sb = engine.clone();
-            let scrollbars_for_sb = window_scrollbars_ref.clone();
-            let lh_cell = line_height_cell.clone();
-            let cw_cell = char_width_cell.clone();
-            widgets
-                .drawing_area
-                .connect_resize(move |_, width, height| {
-                    let engine = engine_for_sb.borrow();
-                    let scrollbars = scrollbars_for_sb.borrow();
-                    sync_scrollbar_positions(
-                        width as f64,
-                        height as f64,
-                        lh_cell.get(),
-                        cw_cell.get(),
-                        &engine,
-                        &scrollbars,
-                    );
-                });
-        }
-
-        let engine_clone = engine.clone();
-        let sender_for_draw = sender.input_sender().clone();
-        let h_sb_hovered_for_draw = h_sb_hovered_cell.clone();
-        let tab_close_hover_for_draw = tab_close_hover_cell.clone();
-        let h_sb_drag_for_draw = h_sb_drag_cell.clone();
-        let last_metrics_for_draw = last_metrics_cell.clone();
-        let tab_slots_for_draw = tab_slot_positions_cell.clone();
-        let tab_close_bounds_for_draw = tab_close_bounds_cell.clone();
-        let diff_btn_for_draw = diff_btn_map_cell.clone();
-        let split_btn_for_draw = split_btn_map_cell.clone();
-        let action_btn_for_draw = action_btn_map_cell.clone();
-        let dialog_btn_for_draw = model.dialog_btn_rects.clone();
-        let dialog_popup_for_draw = model.dialog_popup_rect.clone();
-        let editor_hover_rect_for_draw = model.editor_hover_popup_rect.clone();
-        let completion_layout_for_draw = model.completion_layout.clone();
-        let context_menu_layout_for_draw = model.context_menu_layout.clone();
-        let tab_switcher_rect_for_draw = model.tab_switcher_popup_rect.clone();
-        let editor_hover_links_for_draw = model.editor_hover_link_rects.clone();
-        let editor_hover_sb_for_draw = model.editor_hover_scrollbar.clone();
-        let mouse_pos_for_draw = mouse_pos_cell.clone();
-        let tab_vis_for_draw = tab_visible_counts_cell.clone();
-        let status_seg_for_draw = model.status_segment_map.clone();
-        let screen_layout_for_draw = model.cached_screen_layout.clone();
-        let dbg_y_for_draw = model.debug_toolbar_y_offset.clone();
-        let dbg_h_for_draw = model.debug_toolbar_height.clone();
-        let backend_for_draw = model.backend.clone();
-        widgets
-            .drawing_area
-            .set_draw_func(move |_, cr, width, height| {
-                // Wrap in catch_unwind to prevent GTK abort on panic in extern "C" callback.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // Closure for one paint pass — borrows engine immutably,
-                    // calls draw_editor, drops the borrow.
-                    let do_paint = || {
-                        let engine = engine_clone.borrow();
-                        draw_editor(
-                            cr,
-                            &engine,
-                            width,
-                            height,
-                            &sender_for_draw,
-                            h_sb_hovered_for_draw.get(),
-                            tab_close_hover_for_draw.get(),
-                            h_sb_drag_for_draw.get(),
-                            &last_metrics_for_draw,
-                            &tab_slots_for_draw,
-                            &tab_close_bounds_for_draw,
-                            &diff_btn_for_draw,
-                            &split_btn_for_draw,
-                            &action_btn_for_draw,
-                            &dialog_btn_for_draw,
-                            &dialog_popup_for_draw,
-                            &editor_hover_rect_for_draw,
-                            &completion_layout_for_draw,
-                            &context_menu_layout_for_draw,
-                            &tab_switcher_rect_for_draw,
-                            &editor_hover_links_for_draw,
-                            &editor_hover_sb_for_draw,
-                            mouse_pos_for_draw.get(),
-                            &tab_vis_for_draw,
-                            &status_seg_for_draw,
-                            &screen_layout_for_draw,
-                            &dbg_y_for_draw,
-                            &dbg_h_for_draw,
-                            &backend_for_draw,
-                        );
-                    };
-
-                    // ── Pass 1: paint with current engine state ──────────────
-                    do_paint();
-
-                    // ── Apply pixel-correct scroll offsets per group ─────────
-                    // Each tuple is (group_id, available_cols, correct_offset).
-                    // available_cols is reported but unused for GTK because
-                    // the engine's char-based ensure_active_tab_visible
-                    // algorithm under-estimates GTK's per-tab pixel width
-                    // (label + tab_pad*2 + inner_gap + close + outer_gap)
-                    // by ~4 chars, which causes the active tab to land
-                    // off-screen. Instead the GTK draw_tab_bar computes the
-                    // correct offset using actual Pango pixel measurements
-                    // via quadraui::TabBar::fit_active_scroll_offset, and we
-                    // write it directly to the engine here.
-                    //
-                    // TUI/Win-GUI keep using post_draw_apply_widths because
-                    // their measurements use the same units as the engine.
-                    let reports: Vec<(crate::core::window::GroupId, usize, usize)> =
-                        tab_vis_for_draw.borrow_mut().drain(..).collect();
-                    let mut changed = false;
-                    {
-                        let mut engine = engine_clone.borrow_mut();
-                        for (gid, _available_cols, correct_offset) in &reports {
-                            if engine.set_tab_scroll_offset(*gid, *correct_offset) {
-                                changed = true;
-                            }
-                        }
-                    }
-
-                    // ── Pass 2: if state changed, repaint with fresh
-                    // scroll_offset — overdraws pass 1 in the same Cairo
-                    // context. Eliminates the one-frame lag. Converges
-                    // within this single callback: pass 2 measures the
-                    // same widths and computes the same correct_offset,
-                    // which now matches the engine state, so set returns
-                    // false and we don't loop.
-                    if changed {
-                        tab_vis_for_draw.borrow_mut().clear();
-                        do_paint();
-                        // Drain pass 2's reports so the queue is empty for
-                        // the next paint (avoids stale widths sitting around).
-                        let reports2: Vec<(_, _, _)> =
-                            tab_vis_for_draw.borrow_mut().drain(..).collect();
-                        let mut engine = engine_clone.borrow_mut();
-                        for (gid, _available_cols, correct_offset) in &reports2 {
-                            engine.set_tab_scroll_offset(*gid, *correct_offset);
-                        }
-                    }
-                }));
-                if let Err(e) = result {
-                    eprintln!("draw_editor panic: {:?}", e);
-                }
-            });
-
-        // Motion controller: write mouse position directly into a shared cell.
-        // This avoids routing every motion event (100-200 Hz on Linux) through the Relm4
-        // message loop. The hover state is computed in SearchPollTick (20 Hz) instead.
-        {
-            let pos_cell = mouse_pos_cell.clone();
-            let pos_cell_leave = mouse_pos_cell.clone();
-            let engine_motion = engine.clone();
-            let cm_layout_motion = model.context_menu_layout.clone();
-            let da_motion = widgets.drawing_area.clone();
-            let mc = gtk4::EventControllerMotion::new();
-            mc.connect_motion(move |_, x, y| {
-                pos_cell.set((x, y));
-                // Update context menu hover: persist selected index so it
-                // sticks when the mouse leaves. try_borrow_mut fails during
-                // draw (engine immutably borrowed) — that's fine, the draw
-                // function computes hover from mouse_pos directly.
-                if let Ok(mut eng) = engine_motion.try_borrow_mut() {
-                    if eng.context_menu.is_some() {
-                        if let Some(ref layout) = *cm_layout_motion.borrow() {
-                            let hit = layout.hit_test(x as f32, y as f32);
-                            if let Some(idx) = crate::core::engine::context_menu_hit_to_idx(&hit) {
-                                eng.context_menu.as_mut().unwrap().selected = idx;
-                            }
-                        }
-                        drop(eng);
-                        da_motion.queue_draw();
-                    }
-                }
-            });
-            mc.connect_leave(move |_| {
-                pos_cell_leave.set((-1.0, -1.0));
-            });
-            widgets.drawing_area.add_controller(mc);
-        }
-
-        // Right-click on drawing area (tab bar or editor context menu).
-        {
-            let engine_rc = engine.clone();
-            let sender_rc = sender.input_sender().clone();
-            let lh_rc = line_height_cell.clone();
-            let cw_rc = char_width_cell.clone();
-            let da_rc = model.drawing_area.clone();
-            let tab_slots_rc = tab_slot_positions_cell.clone();
-            let diff_btn_rc = diff_btn_map_cell.clone();
-            let split_btn_rc = split_btn_map_cell.clone();
-            let action_btn_rc = action_btn_map_cell.clone();
-            let status_seg_rc = status_segment_map_cell.clone();
-            let screen_layout_rc = model.cached_screen_layout.clone();
-            let rc_gesture = gtk4::GestureClick::new();
-            rc_gesture.set_button(3);
-            rc_gesture.connect_pressed(move |gesture, _n_press, x, y| {
-                let _widget = gesture.widget();
-                let lh = lh_rc.get().max(1.0);
-                let cw = cw_rc.get().max(1.0);
-                let layout_ref = screen_layout_rc.borrow();
-                let Some(ref layout) = *layout_ref else {
-                    return;
-                };
-                let mut engine = engine_rc.borrow_mut();
-                let editor_pl = {
-                    let da_ref = da_rc.borrow();
-                    let ctx = da_ref.as_ref().expect("drawing area").pango_context();
-                    let pl = pango::Layout::new(&ctx);
-                    let fd = FontDescription::from_string(&format!(
-                        "{} {}",
-                        engine.settings.font_family, engine.settings.font_size
-                    ));
-                    pl.set_font_description(Some(&fd));
-                    pl
-                };
-                let target = pixel_to_click_target(
-                    &mut engine,
-                    x,
-                    y,
-                    lh,
-                    cw,
-                    &editor_pl,
-                    layout,
-                    &tab_slots_rc.borrow(),
-                    &diff_btn_rc.borrow(),
-                    &split_btn_rc.borrow(),
-                    &action_btn_rc.borrow(),
-                    &status_seg_rc.borrow(),
-                );
-                match target {
-                    ClickTarget::TabBar => {
-                        let group_id = engine.active_group;
-                        let tab_idx = engine
-                            .editor_groups
-                            .get(&group_id)
-                            .map(|g| g.active_tab)
-                            .unwrap_or(0);
-                        drop(engine);
-                        let _ = sender_rc.send(Msg::TabRightClick {
-                            group_id,
-                            tab_idx,
-                            x,
-                            y,
-                        });
-                    }
-                    ClickTarget::BufferPos(..) | ClickTarget::Gutter => {
-                        drop(engine);
-                        let _ = sender_rc.send(Msg::EditorRightClick { x, y });
-                    }
-                    _ => {}
-                }
-            });
-            widgets.drawing_area.add_controller(rc_gesture);
-        }
-
-        // Tab switcher auto-confirm: poll modifier state every 50ms while open.
-        // When neither Ctrl nor Alt is held, confirm immediately.
-        {
-            let engine_ref = engine.clone();
-            let da = widgets.drawing_area.clone();
-            let root_ref = root.clone();
-            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                let open = engine_ref
-                    .try_borrow()
-                    .map(|e| e.tab_switcher_open)
-                    .unwrap_or(false);
-                if !open {
-                    return gtk4::glib::ControlFlow::Continue;
-                }
-                // Query the current keyboard modifier state from GDK
-                {
-                    let display = gtk4::prelude::WidgetExt::display(&root_ref);
-                    if let Some(seat) = display.default_seat() {
-                        if let Some(keyboard) = seat.keyboard() {
-                            let mods: gdk::ModifierType = keyboard.modifier_state();
-                            let ctrl = mods.contains(gdk::ModifierType::CONTROL_MASK);
-                            let alt = mods.contains(gdk::ModifierType::ALT_MASK);
-                            if !ctrl && !alt {
-                                if let Ok(mut e) = engine_ref.try_borrow_mut() {
-                                    e.tab_switcher_confirm();
-                                    drop(e);
-                                    da.queue_draw();
-                                }
-                            }
-                        }
-                    }
-                }
-                gtk4::glib::ControlFlow::Continue
-            });
-        }
-
-        // Ensure drawing area has keyboard focus on startup.
-        // grab_focus() during init runs before the window is mapped, so some
-        // window managers (e.g. Cinnamon/Mutter) ignore it.  Present the window
-        // and defer the grab until the first frame is drawn.
-        root.present();
-        {
-            let da = widgets.drawing_area.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                da.grab_focus();
-            });
-        }
-
-        // Poll for background search results every 50 ms.
-        let sender_for_poll = sender.input_sender().clone();
-        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-            sender_for_poll.send(Msg::SearchPollTick).ok();
-            gtk4::glib::ControlFlow::Continue
-        });
-
-        // Phase B.5b Stage 1: drain the backend's `UiEvent` queue.
-        // Producers — the editor DA's key/mouse/scroll signal
-        // callbacks — push translated events into
-        // `GtkBackend::events_handle()`. This consumer drains them
-        // periodically so the queue can't grow unbounded. Today the
-        // events are simply discarded (Relm4 `Msg` flow stays
-        // authoritative); subsequent B.5b stages route specific
-        // event shapes back through `dispatch_*` helpers as each
-        // surface migrates onto the trait. Tick at ~60 Hz so a real
-        // dispatcher introduced later sees no perceptible latency.
-        {
-            use quadraui::Backend;
-            let backend_for_drain = model.backend.clone();
-            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                let _ = backend_for_drain.borrow_mut().poll_events();
-                gtk4::glib::ControlFlow::Continue
-            });
-        }
-
-        // ── Disable GTK mnemonic Alt interception ─────────────────────────────
-        // GTK4 has a built-in ShortcutController on the window that intercepts
-        // Alt key events for mnemonic activation *during* the capture phase,
-        // before any user-added EventControllerKey can see them.  We don't use
-        // mnemonics, so reassign the trigger to HYPER_MASK (never pressed) so
-        // Alt keys reach our regular key handler for VSCode-mode shortcuts.
-        {
-            use gtk4::prelude::*;
-            let controllers = root.observe_controllers();
-            for i in 0..controllers.n_items() {
-                if let Some(obj) = controllers.item(i) {
-                    if let Ok(sc) = obj.downcast::<gtk4::ShortcutController>() {
-                        if sc
-                            .mnemonics_modifiers()
-                            .contains(gdk::ModifierType::ALT_MASK)
-                        {
-                            sc.set_mnemonics_modifiers(gdk::ModifierType::HYPER_MASK);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Intercept F10 at the window level before GTK's built-in
-        // menubar activation shortcut can swallow it.
-        {
-            let sender_fkey = sender.input_sender().clone();
-            let fkey_ctrl = gtk4::EventControllerKey::new();
-            fkey_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-            fkey_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                let name = key.name().map(|s| s.to_string()).unwrap_or_default();
-                let dominated = modifier.contains(gdk::ModifierType::CONTROL_MASK)
-                    || modifier.contains(gdk::ModifierType::ALT_MASK);
-                if !dominated && matches!(name.as_str(), "F5" | "F9" | "F10" | "F11") {
-                    sender_fkey
-                        .send(Msg::KeyPress {
-                            key_name: name,
-                            unicode: None,
-                            ctrl: false,
-                            alt: false,
-                        })
-                        .ok();
-                    return gtk4::glib::Propagation::Stop;
-                }
-                if modifier.contains(gdk::ModifierType::SHIFT_MASK)
-                    && !dominated
-                    && matches!(name.as_str(), "F5" | "F11")
-                {
-                    sender_fkey
-                        .send(Msg::KeyPress {
-                            key_name: name,
-                            unicode: None,
-                            ctrl: false,
-                            alt: false,
-                        })
-                        .ok();
-                    return gtk4::glib::Propagation::Stop;
-                }
-                gtk4::glib::Propagation::Proceed
-            });
-            root.add_controller(fkey_ctrl);
-        }
-
-        ComponentParts { model, widgets }
-    }
-
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
-        self.dispatch(msg);
-    }
-}
-
 /// Reposition existing scrollbar widgets for the given drawing-area size.
 ///
 /// This is a free function so it can be called both from `sync_scrollbar` (via
@@ -4090,6 +1058,152 @@ fn sync_scrollbar_positions(
             .set_height_request((rect.height as i32 - 4).max(0));
 
         // Horizontal scrollbar is drawn in Cairo by draw_editor — nothing to do here.
+    }
+}
+
+/// Create a new `App` instance.
+///
+/// All widget-dependent setup (window handle, CSS) is deferred to
+/// `ShellApp::setup()`, called by the runner once the window exists.
+impl App {
+    fn new(file_path: Option<PathBuf>) -> Self {
+        // Icon search path setup.
+        if let Some(home) = std::env::var_os("HOME") {
+            let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
+            if let Some(display) = gdk::Display::default() {
+                let icon_theme = gtk4::IconTheme::for_display(&display);
+                icon_theme.add_search_path(&icon_dir);
+            }
+        }
+        install_bundled_icon_font();
+
+        let mut engine = {
+            let mut e = Engine::new();
+            icons::set_nerd_fonts(e.settings.use_nerd_fonts);
+            e.startup(file_path.as_deref());
+            e
+        };
+        setup_gtk_clipboard(&mut engine);
+
+        let initial_theme = Theme::from_name(&engine.settings.colorscheme);
+        let css_provider = load_css(&initial_theme);
+        let last_colorscheme = engine.settings.colorscheme.clone();
+        if let Some(gtk_settings) = gtk4::Settings::default() {
+            gtk_settings.set_gtk_application_prefer_dark_theme(!initial_theme.is_light());
+        }
+
+        let engine = Rc::new(RefCell::new(engine));
+        unsafe {
+            crate::core::swap::register_emergency_engine(
+                engine.as_ptr() as *const crate::core::Engine
+            );
+        }
+
+        let sender = MsgSender::new();
+
+        // File watcher for settings.json hot-reload.
+        let settings_path = std::env::var("HOME")
+            .map(|h| format!("{}/.config/vimcode/settings.json", h))
+            .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
+        let file = gio::File::for_path(&settings_path);
+        let settings_monitor =
+            match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+                Ok(monitor) => {
+                    let sender_for_monitor = sender.clone();
+                    monitor.connect_changed(move |_, _, _, event| {
+                        if event == gio::FileMonitorEvent::ChangesDoneHint {
+                            sender_for_monitor.send(Msg::SettingsFileChanged).ok();
+                        }
+                    });
+                    Some(monitor)
+                }
+                Err(_) => None,
+            };
+
+        let backend = Rc::new(RefCell::new(backend::GtkBackend::new()));
+
+        App {
+            engine,
+            draw_needed: Rc::new(Cell::new(false)),
+            explorer_sidebar_da_ref: Rc::new(RefCell::new(None)),
+            activity_bar_da_ref: Rc::new(RefCell::new(None)),
+            explorer_row_height_cell: Rc::new(Cell::new(28.0)),
+            explorer_line_height_cell: Rc::new(Cell::new(20.0)),
+            explorer_char_width_cell: Rc::new(Cell::new(8.0)),
+            explorer_ctx_menu_layout: Rc::new(RefCell::new(None)),
+            ctx_menu_overlay_da: Rc::new(RefCell::new(None)),
+            explorer_scroll_accum: Rc::new(Cell::new(0.0)),
+            drawing_area: Rc::new(RefCell::new(None)),
+            menu_bar_da: Rc::new(RefCell::new(None)),
+            debug_sidebar_da_ref: Rc::new(RefCell::new(None)),
+            debug_sidebar_lh: Rc::new(Cell::new(20.0)),
+            git_sidebar_da_ref: Rc::new(RefCell::new(None)),
+            ext_sidebar_da_ref: Rc::new(RefCell::new(None)),
+            ext_dyn_panel_da_ref: Rc::new(RefCell::new(None)),
+            ext_dyn_panel_box: Rc::new(RefCell::new(None)),
+            ai_sidebar_da_ref: Rc::new(RefCell::new(None)),
+            sidebar_inner_sw: Rc::new(RefCell::new(None)),
+            sidebar_revealer: Rc::new(RefCell::new(None)),
+            explorer_panel_box: Rc::new(RefCell::new(None)),
+            search_sidebar_da_ref: Rc::new(RefCell::new(None)),
+            debug_panel_box: Rc::new(RefCell::new(None)),
+            git_panel_box: Rc::new(RefCell::new(None)),
+            ext_panel_box: Rc::new(RefCell::new(None)),
+            settings_panel_box: Rc::new(RefCell::new(None)),
+            settings_da_ref: Rc::new(RefCell::new(None)),
+            ai_panel_box_ref: Rc::new(RefCell::new(None)),
+            window_scrollbars: Rc::new(RefCell::new(HashMap::new())),
+            overlay: Rc::new(RefCell::new(None)),
+            cached_line_height: 24.0,
+            cached_char_width: 9.0,
+            last_editor_pointer: Rc::new(Cell::new(None)),
+            cached_ui_line_height: 20.0,
+            dialog_btn_rects: Rc::new(RefCell::new(Vec::new())),
+            line_height_cell: Rc::new(Cell::new(24.0)),
+            char_width_cell: Rc::new(Cell::new(9.0)),
+            mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
+            h_sb_hovered_cell: Rc::new(Cell::new(false)),
+            tab_close_hover_cell: Rc::new(Cell::new(None)),
+            h_sb_drag_cell: Rc::new(Cell::new(None)),
+            fr_input_dragging: false,
+            settings_monitor,
+            sender,
+            last_clipboard_content: None,
+            h_sb_hovered: false,
+            tab_close_hover: None,
+            tab_slot_positions: Rc::new(RefCell::new(HashMap::new())),
+            tab_close_bounds: Rc::new(RefCell::new(HashMap::new())),
+            diff_btn_map: Rc::new(RefCell::new(HashMap::new())),
+            split_btn_map: Rc::new(RefCell::new(HashMap::new())),
+            action_btn_map: Rc::new(RefCell::new(HashMap::new())),
+            status_segment_map: Rc::new(RefCell::new(HashMap::new())),
+            cached_screen_layout: Rc::new(RefCell::new(None)),
+            debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
+            debug_toolbar_height: Rc::new(Cell::new(0.0)),
+            terminal_resize_dragging: false,
+            terminal_split_dragging: false,
+            group_divider_dragging: None,
+            tab_dragging: false,
+            tab_drag_start: None,
+            window: None,
+            last_sc_refresh: std::time::Instant::now(),
+            last_tree_indicator_update: std::time::Instant::now(),
+            menu_dropdown_da: Rc::new(RefCell::new(None)),
+            panel_hover_da: Rc::new(RefCell::new(None)),
+            panel_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
+            panel_hover_popup_rect: Rc::new(Cell::new(None)),
+            editor_hover_popup_rect: Rc::new(Cell::new(None)),
+            completion_layout: Rc::new(RefCell::new(None)),
+            context_menu_layout: Rc::new(RefCell::new(None)),
+            tab_switcher_popup_rect: Rc::new(Cell::new(None)),
+            dialog_popup_rect: Rc::new(Cell::new(None)),
+            editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
+            editor_hover_scrollbar: Rc::new(Cell::new(None)),
+            menu_dd_line_height: Rc::new(Cell::new(24.0)),
+            css_provider,
+            last_colorscheme,
+            backend,
+        }
     }
 }
 
@@ -4811,8 +1925,16 @@ impl App {
                 view.scroll_top,
             );
         }
-        engine.session.window.width = self.window.default_width();
-        engine.session.window.height = self.window.default_height();
+        engine.session.window.width = self
+            .window
+            .as_ref()
+            .map(|w| w.default_width())
+            .unwrap_or(800);
+        engine.session.window.height = self
+            .window
+            .as_ref()
+            .map(|w| w.default_height())
+            .unwrap_or(600);
         engine.collect_session_open_files();
         if let Some(ref root) = engine.workspace_root.clone() {
             engine.save_session_for_workspace(root);
@@ -5102,7 +2224,7 @@ impl App {
         &self,
         overlay: &gtk4::Overlay,
         window_id: core::WindowId,
-        sender: &relm4::Sender<Msg>,
+        sender: &MsgSender,
     ) -> WindowScrollbars {
         // Vertical scrollbar — interactive for click-to-jump and drag.
         let v_adj = gtk4::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 20.0);
@@ -5796,7 +2918,9 @@ impl App {
             .active_buffer_name()
             .map(|n| format!("VimCode \u{2014} {}", n))
             .unwrap_or_else(|| "VimCode".to_string());
-        self.window.set_title(Some(&win_title));
+        if let Some(ref w) = self.window {
+            w.set_title(Some(&win_title));
+        }
     }
 
     /// Map a pixel x-offset within the editor hover popup's content
@@ -9794,17 +6918,25 @@ impl App {
     fn handle_dialog_msg(&mut self, msg: Msg) {
         match msg {
             Msg::WindowMinimize => {
-                self.window.minimize();
+                if let Some(ref w) = self.window {
+                    w.minimize();
+                }
             }
             Msg::WindowMaximize => {
-                if self.window.is_maximized() {
-                    self.window.unmaximize();
+                if self.window.as_ref().is_some_and(|w| w.is_maximized()) {
+                    if let Some(ref w) = self.window {
+                        w.unmaximize();
+                    }
                 } else {
-                    self.window.maximize();
+                    if let Some(ref w) = self.window {
+                        w.maximize();
+                    }
                 }
             }
             Msg::WindowClose => {
-                self.window.close();
+                if let Some(ref w) = self.window {
+                    w.close();
+                }
             }
             Msg::OpenFileDialog => {
                 let engine = self.engine.clone();
@@ -9812,7 +6944,7 @@ impl App {
                 let dialog = gtk4::FileDialog::new();
                 dialog.set_title("Open File");
                 let win = self.window.clone();
-                dialog.open(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                dialog.open(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
                     if let Ok(file) = result {
                         if let Some(path) = gtk4::prelude::FileExt::path(&file) {
                             let _ = engine.borrow_mut().open_file_with_mode(
@@ -9832,7 +6964,7 @@ impl App {
                 dialog.set_title("Open Folder");
                 dialog.set_accept_label(Some("Open Folder"));
                 let win = self.window.clone();
-                dialog.select_folder(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                dialog.select_folder(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
                     if let Ok(file) = result {
                         // Use UFCS to call gtk4's FileExt::path (avoids gio version conflict)
                         if let Some(path) = gtk4::prelude::FileExt::path(&file) {
@@ -9855,7 +6987,7 @@ impl App {
                 dialog.set_title("Save Workspace As");
                 dialog.set_initial_name(Some(".vimcode-workspace"));
                 let win = self.window.clone();
-                dialog.save(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                dialog.save(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
                     if let Ok(file) = result {
                         if let Some(path) = gtk4::prelude::FileExt::path(&file) {
                             engine.borrow_mut().save_workspace_as(&path);
@@ -9987,43 +7119,327 @@ impl App {
 
 // ── Dormant ShellApp impl (#448-B) ──────────────────────────────────────────
 // This impl compiles alongside the Relm4 path but is NOT wired up.
-// It will replace the Relm4 update loop in #448-C when the ShellApp runner
-// is activated.
 impl quadraui::ShellApp for App {
+    fn setup(&mut self, backend: &mut dyn quadraui::Backend) {
+        // Seed cached metrics from runner defaults.
+        self.cached_line_height = backend.line_height() as f64;
+        self.cached_char_width = backend.char_width() as f64;
+        self.cached_ui_line_height = self.cached_line_height;
+        self.line_height_cell.set(self.cached_line_height);
+        self.char_width_cell.set(self.cached_char_width);
+
+        // Grab the runner-created GTK window so minimize/maximize/close work.
+        let window = gtk4::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|obj| obj.downcast::<gtk4::Window>().ok())
+            .find(|w| w.is_visible());
+        self.window = window;
+
+        // Apply initial CSS.
+        let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
+        let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
+        self.css_provider.load_from_data(&combined);
+    }
+
     fn render_content(
         &self,
-        _backend: &mut dyn quadraui::Backend,
-        _layout: &quadraui::AppShellLayout,
+        backend: &mut dyn quadraui::Backend,
+        layout: &quadraui::AppShellLayout,
     ) {
-        // Will delegate to the Cairo draw pipeline once wired in #448-C.
-        todo!()
+        use quadraui::{ScreenLayout as QSL, Surface};
+
+        let engine = self.engine.borrow();
+        let theme = Theme::from_name(&engine.settings.colorscheme);
+        backend.set_theme(render::to_quadraui_theme(&theme));
+
+        let lh = self.cached_line_height.max(backend.line_height() as f64);
+        let cw = self.cached_char_width.max(backend.char_width() as f64);
+
+        let main = layout.main_content_bounds;
+        let (x, y, w, h) = (
+            main.x as f64,
+            main.y as f64,
+            main.width as f64,
+            main.height as f64,
+        );
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+
+        // ── Layout ────────────────────────────────────────────────────────────
+        let tab_row_h = (lh * 1.6).ceil();
+        let tab_bar_h = render::tab_bar_height_px(lh, engine.settings.breadcrumbs);
+        let per_window_status = engine.settings.window_status_line;
+        let wildmenu_px = if engine.wildmenu_items.is_empty() {
+            0.0
+        } else {
+            lh
+        };
+        let status_rows = if per_window_status { 1.0 } else { 2.0 };
+        let status_bar_h = lh * status_rows + wildmenu_px;
+        let el = render::compute_editor_layout(&engine, h, lh, false);
+        let editor_area_h =
+            (h - el.terminal_h - el.debug_toolbar_h - el.separated_status_h - status_bar_h)
+                .max(0.0);
+
+        let editor_bounds = WindowRect::new(x, y, w, editor_area_h);
+        let (window_rects, _dividers) =
+            engine.calculate_group_window_rects(editor_bounds, tab_bar_h);
+
+        let screen = build_screen_layout(&engine, &theme, &window_rects, lh, cw, false);
+
+        // Cache for click handlers (move into RefCell, then borrow back for drawing).
+        *self.cached_screen_layout.borrow_mut() = Some(screen);
+        let screen_ref = self.cached_screen_layout.borrow();
+        let screen = screen_ref.as_ref().unwrap();
+
+        // ── Draw editor windows ───────────────────────────────────────────────
+        for rw in &screen.windows {
+            let editor = render::to_q_editor(rw);
+            let rect = editor.rect;
+            let mut frame = QSL::new();
+            frame.push(Surface::Editor {
+                rect,
+                editor: &editor,
+            });
+            frame.draw(backend);
+        }
+
+        // ── Draw tab bar ──────────────────────────────────────────────────────
+        if !engine.is_tab_bar_hidden(engine.active_group) {
+            let tb_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, tab_row_h as f32);
+            let hover = self.tab_close_hover.map(|(_, i)| i);
+            let mut frame = QSL::new();
+            frame.push(Surface::TabBar {
+                rect: tb_rect,
+                bar: &screen.tab_bar_primitive,
+                hovered_close: hover,
+            });
+            frame.draw(backend);
+        }
+
+        // ── Draw global status bar / wildmenu ─────────────────────────────────
+        let status_y =
+            y + h - el.terminal_h - el.debug_toolbar_h - el.separated_status_h - status_bar_h;
+        if let Some(ref bar) = screen.global_status_bar {
+            let sb_rect = quadraui::Rect::new(x as f32, status_y as f32, w as f32, lh as f32);
+            let mut frame = QSL::new();
+            frame.push(Surface::StatusBar {
+                rect: sb_rect,
+                bar,
+                hovered: None,
+                pressed: None,
+            });
+            frame.draw(backend);
+        }
+        if let Some(ref wm) = screen.wildmenu {
+            let wm_bar = render::wildmenu_to_status_bar(wm, &theme);
+            let wm_y = if per_window_status {
+                status_y
+            } else {
+                status_y + lh
+            };
+            let wm_rect = quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);
+            let mut frame = QSL::new();
+            frame.push(Surface::StatusBar {
+                rect: wm_rect,
+                bar: &wm_bar,
+                hovered: None,
+                pressed: None,
+            });
+            frame.draw(backend);
+        }
+
+        // ── Draw command line ─────────────────────────────────────────────────
+        let cmd_y = status_y + (status_bar_h - lh);
+        let cmd = quadraui::CommandLine {
+            id: "cmd".into(),
+            text: screen.command.text.clone(),
+            cursor_offset: if screen.command.show_cursor {
+                Some(screen.command.cursor_anchor_text.len())
+            } else {
+                None
+            },
+            right_align: screen.command.right_align,
+        };
+        let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
+        let mut frame = QSL::new();
+        frame.push(Surface::CommandLine {
+            rect: cmd_rect,
+            cmd: &cmd,
+        });
+        frame.draw(backend);
     }
 
     fn handle(
         &mut self,
         event: quadraui::UiEvent,
-        _backend: &mut dyn quadraui::Backend,
-        _ctx: &quadraui::ShellContext<'_>,
+        backend: &mut dyn quadraui::Backend,
+        ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
-        // Routes UiEvent variants to the same handlers as the Relm4 update path.
-        // handle_key_press and dispatch_engine_action both require a
-        // ComponentSender; the sender integration is deferred to #448-C.
+        use quadraui::{Key, MouseButton, NamedKey, UiEvent};
+
         match event {
-            quadraui::UiEvent::KeyPressed { .. } | quadraui::UiEvent::CharTyped(_) => {
-                // Delegate to self.handle_key_press(key_name, unicode, ctrl, alt, sender)
-                // once the ComponentSender is available via the ShellApp runner.
-                todo!()
+            UiEvent::KeyPressed { key, modifiers, .. } => {
+                let (key_name, unicode) = match key {
+                    Key::Char(c) => (c.to_string(), Some(c)),
+                    Key::Named(ref named) => {
+                        let n: &str = match named {
+                            NamedKey::Escape => "Escape",
+                            NamedKey::Tab => "Tab",
+                            NamedKey::BackTab => "BackTab",
+                            NamedKey::Enter => "Return",
+                            NamedKey::Backspace => "BackSpace",
+                            NamedKey::Delete => "Delete",
+                            NamedKey::Insert => "Insert",
+                            NamedKey::Home => "Home",
+                            NamedKey::End => "End",
+                            NamedKey::PageUp => "PageUp",
+                            NamedKey::PageDown => "PageDown",
+                            NamedKey::Up => "Up",
+                            NamedKey::Down => "Down",
+                            NamedKey::Left => "Left",
+                            NamedKey::Right => "Right",
+                            NamedKey::F(1) => "F1",
+                            NamedKey::F(2) => "F2",
+                            NamedKey::F(3) => "F3",
+                            NamedKey::F(4) => "F4",
+                            NamedKey::F(5) => "F5",
+                            NamedKey::F(6) => "F6",
+                            NamedKey::F(7) => "F7",
+                            NamedKey::F(8) => "F8",
+                            NamedKey::F(9) => "F9",
+                            NamedKey::F(10) => "F10",
+                            NamedKey::F(11) => "F11",
+                            NamedKey::F(12) => "F12",
+                            _ => "",
+                        };
+                        (n.to_string(), None)
+                    }
+                };
+                if !key_name.is_empty() || unicode.is_some() {
+                    self.handle_key_press(key_name, unicode, modifiers.ctrl, modifiers.alt);
+                }
             }
-            quadraui::UiEvent::MouseDown { .. }
-            | quadraui::UiEvent::MouseUp { .. }
-            | quadraui::UiEvent::MouseMoved { .. }
-            | quadraui::UiEvent::DoubleClick { .. }
-            | quadraui::UiEvent::Scroll { .. } => {
-                // Route through self.dispatch_engine_action(action, sender, false)
-                // once the ComponentSender is available via the ShellApp runner.
-                todo!()
+            UiEvent::CharTyped(c) => {
+                // Ctrl-modified characters arrive via KeyPressed; CharTyped is
+                // for IME-composed printable characters only.
+                self.handle_key_press(c.to_string(), Some(c), false, false);
             }
-            _ => quadraui::Reaction::Continue,
+            UiEvent::Accelerator(id, _mods) => {
+                let id_str = id.as_str().to_string();
+                dispatch_gtk_panel_accelerator(&id_str, &self.sender, &self.engine);
+                self.draw_needed.set(true);
+            }
+            UiEvent::MouseDown {
+                button,
+                position,
+                modifiers,
+                ..
+            } => {
+                let main = ctx.layout.main_content_bounds;
+                let (w, h) = (main.width as f64, main.height as f64);
+                match button {
+                    MouseButton::Left if modifiers.ctrl => {
+                        self.dispatch(Msg::CtrlMouseClick {
+                            x: position.x as f64,
+                            y: position.y as f64,
+                            width: w,
+                            height: h,
+                        });
+                    }
+                    MouseButton::Left => {
+                        self.dispatch(Msg::MouseClick {
+                            x: position.x as f64,
+                            y: position.y as f64,
+                            width: w,
+                            height: h,
+                            alt: modifiers.alt,
+                        });
+                    }
+                    MouseButton::Right => {
+                        self.dispatch(Msg::EditorRightClick {
+                            x: position.x as f64,
+                            y: position.y as f64,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            UiEvent::DoubleClick { position, .. } => {
+                let main = ctx.layout.main_content_bounds;
+                self.dispatch(Msg::MouseDoubleClick {
+                    x: position.x as f64,
+                    y: position.y as f64,
+                    width: main.width as f64,
+                    height: main.height as f64,
+                });
+            }
+            UiEvent::MouseMoved { position, buttons } => {
+                self.mouse_pos_cell
+                    .set((position.x as f64, position.y as f64));
+                if buttons.left {
+                    let main = ctx.layout.main_content_bounds;
+                    self.dispatch(Msg::MouseDrag {
+                        x: position.x as f64,
+                        y: position.y as f64,
+                        width: main.width as f64,
+                        height: main.height as f64,
+                    });
+                }
+            }
+            UiEvent::MouseUp { .. } => {
+                self.dispatch(Msg::MouseUp);
+            }
+            UiEvent::Scroll { delta, .. } => {
+                self.dispatch(Msg::MouseScroll {
+                    delta_x: delta.x as f64,
+                    delta_y: delta.y as f64,
+                });
+            }
+            UiEvent::WindowResized { .. } => {
+                // Runner sets new line_height/char_width after resize.
+                self.cached_line_height = backend.line_height() as f64;
+                self.cached_char_width = backend.char_width() as f64;
+                self.line_height_cell.set(self.cached_line_height);
+                self.char_width_cell.set(self.cached_char_width);
+                self.dispatch(Msg::Resize);
+            }
+            UiEvent::WindowClose => {
+                self.dispatch(Msg::ShowQuitConfirm);
+            }
+            _ => {}
+        }
+
+        if self.draw_needed.get() {
+            self.draw_needed.set(false);
+            quadraui::Reaction::Redraw
+        } else {
+            quadraui::Reaction::Continue
+        }
+    }
+
+    fn tick(&mut self, backend: &mut dyn quadraui::Backend) -> quadraui::Reaction {
+        // Keep cached metrics up to date.
+        self.cached_line_height = backend.line_height() as f64;
+        self.cached_char_width = backend.char_width() as f64;
+        self.line_height_cell.set(self.cached_line_height);
+        self.char_width_cell.set(self.cached_char_width);
+
+        // Drain messages queued by async GTK callbacks.
+        let msgs = self.sender.drain();
+        for msg in msgs {
+            self.dispatch(msg);
+        }
+
+        // Periodic background work: LSP, DAP, git, search, etc.
+        self.handle_poll_tick();
+
+        if self.draw_needed.get() {
+            self.draw_needed.set(false);
+            quadraui::Reaction::Redraw
+        } else {
+            quadraui::Reaction::Continue
         }
     }
 }
@@ -10329,31 +7745,10 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     unsafe {
         gtk4::glib::ffi::g_log_set_writer_func(Some(gtk_log_writer), std::ptr::null_mut(), None);
     }
-    let gtk_app = gtk4::Application::builder()
-        .application_id("com.vimcode.VimCode")
-        .flags(
-            gtk4::gio::ApplicationFlags::NON_UNIQUE
-                | gtk4::gio::ApplicationFlags::HANDLES_COMMAND_LINE,
-        )
-        .build();
-    gtk_app.connect_command_line(|app, _| {
-        // GTK4 default is to warp the slider to the click position on
-        // a trough left-click — that means clicking near the bottom of
-        // the editor scrollbar in a long file jumps thousands of lines
-        // away from the cursor. Disabling makes left-click page by
-        // `page_increment` (one viewport, since we set that per-frame
-        // alongside `page_size`); middle-click / shift-click retain
-        // the warp behaviour for users who want it.
-        if let Some(settings) = gtk4::Settings::default() {
-            settings.set_gtk_primary_button_warps_slider(false);
-        }
-        app.activate();
-        0
-    });
-    // Unbind F10 from GTK's built-in "activate-menubar" action so it
-    // reaches our key controller (used for DAP step-over).
-    gtk_app.set_accels_for_action("win.show-help-overlay", &[]);
-    gtk_app.set_accels_for_action("win.activate-menubar", &[]);
-    let app = RelmApp::from_app(gtk_app);
-    app.run::<App>(file_path);
+    // Create the App and run via the quadraui ShellApp runner.
+    // The runner creates its own GTK Application + window; vimcode's engine
+    // and event handling are wired in via impl ShellApp for App above.
+    let vimcode_app = App::new(file_path);
+    let config = quadraui::ShellConfig::new("VimCode", vec![]);
+    quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
 }

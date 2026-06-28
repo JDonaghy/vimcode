@@ -1,3 +1,6 @@
+// Sidebar/panel draw functions are dead in ShellApp mode until per-DA
+// draw callbacks are re-wired in a follow-on task (#448-C follow-on).
+#![allow(dead_code)]
 use super::*;
 
 /// Pango font family for UI panels (menu bar, sidebars, dropdown,
@@ -33,13 +36,12 @@ pub(super) fn UI_FONT() -> String {
     )
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity, dead_code)]
 pub(super) fn draw_editor(
     cr: &Context,
     engine: &Engine,
     width: i32,
     height: i32,
-    sender: &relm4::Sender<Msg>,
     h_sb_hovered: bool,
     tab_close_hover: Option<(usize, usize)>,
     h_sb_dragging_window: Option<core::WindowId>,
@@ -112,9 +114,6 @@ pub(super) fn draw_editor(
     let (last_lh, last_cw) = last_metrics.get();
     if (last_lh - line_height).abs() > 0.01 || (last_cw - char_width).abs() > 0.01 {
         last_metrics.set((line_height, char_width));
-        sender
-            .send(Msg::CacheFontMetrics(line_height, char_width))
-            .ok();
     }
 
     // Calculate layout regions.

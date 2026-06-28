@@ -105,6 +105,8 @@ pub struct RegisteredAccelerator {
     /// (`(ctrl, shift, alt, key_name)`). `None` if the binding string is
     /// unparseable; the registration is still kept so `unregister_accelerator`
     /// can find it by id.
+    /// Dead in ShellApp mode until GTK accelerator lookup is re-wired.
+    #[allow(dead_code)]
     pub parsed: Option<(bool, bool, bool, String)>,
 }
 
@@ -1538,6 +1540,8 @@ pub struct PanelHoverPopup {
 
 impl PanelHoverPopup {
     /// Whether this hover comes from a native (trusted) panel like source_control.
+    /// Dead in ShellApp mode until panel hover is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn is_native(&self) -> bool {
         self.panel_name == "source_control"
     }
@@ -4347,6 +4351,8 @@ impl Engine {
     /// is_space, is_escape)` shape they already use with
     /// [`crate::render::matches_key_binding`], so this slots into existing
     /// key-handler sites without translation.
+    /// Dead in ShellApp mode until GTK accelerator matching is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub fn match_accelerator(
         &self,

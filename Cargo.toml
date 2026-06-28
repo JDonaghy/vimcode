@@ -37,7 +37,7 @@ default = ["gui"]
 # `quadraui/gtk` enables the public `quadraui::gtk::draw_*` rasterisers
 # (#223). vimcode adopts them one primitive at a time inside
 # `src/gtk/quadraui_gtk.rs`.
-gui = ["gtk4", "relm4", "pangocairo", "gio", "quadraui/gtk"]
+gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
 
 [dependencies]
 # `quadraui/tui` enables the public `quadraui::tui::draw_*` rasterisers
@@ -51,7 +51,6 @@ gui = ["gtk4", "relm4", "pangocairo", "gio", "quadraui/gtk"]
 # currently disabled — see `.github/workflows/*.disabled`.
 quadraui = { path = "../quadraui/quadraui", features = ["tui", "terminal"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
-relm4 = { version = "0.7", optional = true }
 pangocairo = { version = "0.18", optional = true }
 ropey = "1.6.1"
 tree-sitter = "0.26"

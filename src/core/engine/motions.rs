@@ -3298,6 +3298,9 @@ impl Engine {
     ///
     /// - `Ctrl+N` / `Ctrl+P` — always (start or cycle word completion).
     /// - `Tab` / `Down` / `Up` — only while a display-only popup is active.
+    ///
+    /// Dead in ShellApp mode until completion key intercept is re-wired (#448-C follow-on).
+    #[allow(dead_code)]
     pub fn insert_completion_intercepts_key(&self, key_name: &str, ctrl: bool) -> bool {
         if self.mode != Mode::Insert {
             return false;
