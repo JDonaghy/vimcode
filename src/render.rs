@@ -2020,6 +2020,7 @@ pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
                 session && stopped,
             ),
         ],
+        focused_index: None,
     }
 }
 
@@ -3725,6 +3726,7 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
                 cursor: None,
             })
         }),
+        table: None,
     }
 }
 
@@ -6499,6 +6501,7 @@ pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
             action(2, "", icons::GIT_PULL.s(), None, true),
             action(3, "", icons::GIT_SYNC.s(), None, true),
         ],
+        focused_index: None,
     }
 }
 

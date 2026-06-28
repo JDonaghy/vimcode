@@ -9985,6 +9985,49 @@ impl App {
     }
 }
 
+// ── Dormant ShellApp impl (#448-B) ──────────────────────────────────────────
+// This impl compiles alongside the Relm4 path but is NOT wired up.
+// It will replace the Relm4 update loop in #448-C when the ShellApp runner
+// is activated.
+impl quadraui::ShellApp for App {
+    fn render_content(
+        &self,
+        _backend: &mut dyn quadraui::Backend,
+        _layout: &quadraui::AppShellLayout,
+    ) {
+        // Will delegate to the Cairo draw pipeline once wired in #448-C.
+        todo!()
+    }
+
+    fn handle(
+        &mut self,
+        event: quadraui::UiEvent,
+        _backend: &mut dyn quadraui::Backend,
+        _ctx: &quadraui::ShellContext<'_>,
+    ) -> quadraui::Reaction {
+        // Routes UiEvent variants to the same handlers as the Relm4 update path.
+        // handle_key_press and dispatch_engine_action both require a
+        // ComponentSender; the sender integration is deferred to #448-C.
+        match event {
+            quadraui::UiEvent::KeyPressed { .. } | quadraui::UiEvent::CharTyped(_) => {
+                // Delegate to self.handle_key_press(key_name, unicode, ctrl, alt, sender)
+                // once the ComponentSender is available via the ShellApp runner.
+                todo!()
+            }
+            quadraui::UiEvent::MouseDown { .. }
+            | quadraui::UiEvent::MouseUp { .. }
+            | quadraui::UiEvent::MouseMoved { .. }
+            | quadraui::UiEvent::DoubleClick { .. }
+            | quadraui::UiEvent::Scroll { .. } => {
+                // Route through self.dispatch_engine_action(action, sender, false)
+                // once the ComponentSender is available via the ShellApp runner.
+                todo!()
+            }
+            _ => quadraui::Reaction::Continue,
+        }
+    }
+}
+
 // view_row_to_buf_line and view_row_to_buf_pos_wrap are now shared functions
 // in render.rs — use render::view_row_to_buf_line / render::view_row_to_buf_pos_wrap.
 
