@@ -123,6 +123,13 @@ cargo fmt                         # Format
 - **Full test suite:** `cargo test --no-default-features` — lib + integration tests
 - **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only
 
+### Coordinator pipeline: the **Test stage** (read this if you are a smoke / test-stage agent)
+The coordinator drives issues through `Work → Test → Review → Merge`. The **Test stage is a separate step from the work that built the branch — do NOT redo the worker's job:**
+- **ALWAYS pull the prebuilt artifact** with `coord pull-artifact <work_aid>`. Do **NOT** run `cargo build` / `cargo test` yourself — the work-stage worker already compiled the binary and ran the full suite before finishing. Rebuilding or re-testing here **pins the CPU for zero new signal**.
+- **Do NOT run the full test suite** (`cargo test --no-default-features`) at the Test stage. It already ran at the Work stage. The Test stage is **black-box behavior validation + user smoke**: drive the *pulled* binary, exercise the changed behavior end-to-end, and confirm it does what the issue asks.
+- The "**MANDATORY before commits: run all four commands**" rule above is for the **work-stage worker authoring the change**, NOT for the test-stage agent.
+- Record the verdict with `coord test --passed <work_aid>` or `coord test --fail <work_aid> --reason "<full repro: expected vs actual, steps, suspected files>"`.
+
 ## Branching & Releases
 - All work happens on `develop`; `main` is the release branch
 - Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
