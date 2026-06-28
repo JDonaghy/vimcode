@@ -2737,22 +2737,6 @@ impl App {
                     }
                 }
 
-                // Sync per-window viewport dimensions from the paint-time
-                // ScreenLayout so ensure_cursor_visible uses exact geometry.
-                {
-                    let layout_ref = self.cached_screen_layout.borrow();
-                    if let Some(ref layout) = *layout_ref {
-                        let mut engine = self.engine.borrow_mut();
-                        for rw in &layout.windows {
-                            engine.set_viewport_for_window(
-                                rw.window_id,
-                                rw.lines.len().max(1),
-                                rw.text_viewport_cols.max(1),
-                            );
-                        }
-                    }
-                }
-
                 // Editor hover: convert mouse pixel position to editor (line, col)
                 // and feed into dwell detection for auto-hover popups.
                 if mx >= 0.0 {
@@ -2821,6 +2805,26 @@ impl App {
                 }
             }
         }
+        // Sync per-window viewport dimensions from the paint-time ScreenLayout
+        // so ensure_cursor_visible uses exact geometry.  This block is outside
+        // the `da_size` guard because `cached_screen_layout` is populated by
+        // render_content() regardless of whether `self.drawing_area` is set —
+        // which it is not under the quadraui ShellApp runner (the runner owns
+        // the single DrawingArea, not vimcode).
+        {
+            let layout_ref = self.cached_screen_layout.borrow();
+            if let Some(ref layout) = *layout_ref {
+                let mut engine = self.engine.borrow_mut();
+                for rw in &layout.windows {
+                    engine.set_viewport_for_window(
+                        rw.window_id,
+                        rw.lines.len().max(1),
+                        rw.text_viewport_cols.max(1),
+                    );
+                }
+            }
+        }
+
         // Run all periodic background work (LSP, DAP, terminal, search, etc.)
         // poll_idle() consumes dap_wants_sidebar internally.
         let idle_dirty = self.engine.borrow_mut().poll_idle();
@@ -3020,9 +3024,22 @@ impl App {
     }
 
     fn editor_pango_layout(&self, engine: &Engine) -> pango::Layout {
-        let ctx = {
-            let da_ref = self.drawing_area.borrow();
-            da_ref.as_ref().expect("drawing area").pango_context()
+        // The old Relm4 path stored a per-App DrawingArea so we could always
+        // get a PangoContext from it.  Under the quadraui ShellApp runner the
+        // single DrawingArea is owned by the runner and `self.drawing_area` is
+        // never populated, so fall back to the runner-created Window (grabbed
+        // in `setup()`) or, as a last resort, the default Pango/Cairo font map.
+        // `pangocairo` is aliased to `pangocairo::functions` at the top of this
+        // file, so use the fully-qualified path `::pangocairo::FontMap` to reach
+        // the `FontMap` type from the crate root.
+        let ctx = if let Some(ref da) = *self.drawing_area.borrow() {
+            da.pango_context()
+        } else if let Some(ref win) = self.window {
+            win.pango_context()
+        } else {
+            // Last resort: GTK must be initialized at this point (enforced in
+            // run()) so the default PangoCairo font map is available.
+            ::pangocairo::FontMap::new().create_context()
         };
         let layout = pango::Layout::new(&ctx);
         let font_desc = FontDescription::from_string(&format!(
@@ -7269,6 +7286,93 @@ impl quadraui::ShellApp for App {
             cmd: &cmd,
         });
         frame.draw(backend);
+
+        // ── Draw sidebar panel content ─────────────────────────────────────────
+        // The quadraui AppShell chrome (activity bar + sidebar header) is rendered
+        // by the runner; we fill only the content area it exposes.
+        if let Some(q_sb) = layout.sidebar_content_bounds {
+            // Which panel is active?  Extension panels bypass AppShell.
+            let active_id: String = if let Some(ref name) = engine.ext_panel_active {
+                format!("ext:{name}")
+            } else {
+                engine
+                    .app_shell
+                    .active_panel_id()
+                    .map(|id| id.as_str().to_string())
+                    .unwrap_or_else(|| PANEL_EXPLORER.to_string())
+            };
+
+            match active_id.as_str() {
+                PANEL_EXPLORER => {
+                    render::populate_explorer_tree_controller(&engine, &theme);
+                    engine.explorer_tree_rect.set(q_sb);
+                    engine.explorer_viewport_rows.set(q_sb.height as usize);
+                    engine.explorer_tree.borrow().render(backend, q_sb);
+                }
+                PANEL_SEARCH => {
+                    render::populate_search_sidebar_system(&engine, &engine.cwd);
+                    engine.search_sidebar_body_rect.set(q_sb);
+                    engine.search_sidebar_system.borrow().render(backend, q_sb);
+                }
+                PANEL_DEBUG => {
+                    let (title_bar, action_bar) =
+                        render::debug_sidebar_chrome_to_status_bars(&screen.debug_sidebar, &theme);
+                    let title_rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
+                    let action_rect =
+                        quadraui::Rect::new(q_sb.x, q_sb.y + lh as f32, q_sb.width, lh as f32);
+                    let body_y = q_sb.y + 2.0 * lh as f32;
+                    let body_h = (q_sb.height - 2.0 * lh as f32).max(0.0);
+                    let body_rect = quadraui::Rect::new(q_sb.x, body_y, q_sb.width, body_h);
+                    let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
+                    let hits = backend.draw_status_bar(action_rect, &action_bar, None, None);
+                    engine.dap_sidebar_action_hits.replace(Some(hits));
+                    engine.dap_sidebar_body_rect.set(body_rect);
+                    render::populate_dap_sidebar_system(&engine);
+                    engine
+                        .dap_sidebar_system
+                        .borrow()
+                        .render(backend, body_rect);
+                }
+                PANEL_GIT => {
+                    if let Some(ref sc) = screen.source_control {
+                        // Render the toolbar-slab + section list; the header row
+                        // (branch name) and commit-input chrome are deferred to a
+                        // follow-up migration once a Backend primitive for them lands.
+                        render::draw_sc_sidebar_panel(backend, &engine, sc, q_sb);
+                        let body_rect = engine
+                            .sc_panel_layout
+                            .borrow()
+                            .as_ref()
+                            .map(|l| l.content_bounds)
+                            .unwrap_or(q_sb);
+                        engine.sc_sidebar_body_rect.set(body_rect);
+                        render::populate_sc_sidebar_system(&engine, &theme);
+                        engine.sc_sidebar_system.borrow().render(backend, body_rect);
+                    }
+                }
+                PANEL_EXTENSIONS => {
+                    render::populate_ext_sidebar_system(&engine);
+                    engine.ext_sidebar_body_rect.set(q_sb);
+                    engine.ext_sidebar_system.borrow().render(backend, q_sb);
+                }
+                PANEL_SETTINGS => {
+                    render::populate_settings_form_controller(&engine);
+                    engine
+                        .settings_form_controller
+                        .borrow_mut()
+                        .render_and_cache(backend, q_sb);
+                }
+                id if id.starts_with("ext:") => {
+                    // Extension panel — render via ext_sidebar_system.
+                    render::populate_ext_sidebar_system(&engine);
+                    engine.ext_sidebar_body_rect.set(q_sb);
+                    engine.ext_sidebar_system.borrow().render(backend, q_sb);
+                }
+                _ => {
+                    // PANEL_AI and unknowns: not yet migrated to Backend primitives.
+                }
+            }
+        }
     }
 
     fn handle(
@@ -7440,6 +7544,29 @@ impl quadraui::ShellApp for App {
             quadraui::Reaction::Redraw
         } else {
             quadraui::Reaction::Continue
+        }
+    }
+
+    fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
+        use quadraui::AppShellEvent;
+        match event {
+            AppShellEvent::PanelChanged { panel_id } => {
+                // Sync the runner's active panel into the engine's AppShell so
+                // render_content() draws the correct sidebar panel content.
+                self.engine.borrow_mut().app_shell.show_panel(panel_id);
+                self.draw_needed.set(true);
+            }
+            AppShellEvent::SidebarHidden => {
+                self.engine.borrow_mut().app_shell.hide_sidebar();
+                self.draw_needed.set(true);
+            }
+            AppShellEvent::SidebarResized { new_width } => {
+                self.engine
+                    .borrow_mut()
+                    .app_shell
+                    .set_sidebar_width(*new_width);
+            }
+            _ => {}
         }
     }
 }
@@ -7755,6 +7882,19 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     // The runner creates its own GTK Application + window; vimcode's engine
     // and event handling are wired in via impl ShellApp for App above.
     let vimcode_app = App::new(file_path);
-    let config = quadraui::ShellConfig::new("VimCode", vec![]);
+    // Mirror the engine's AppShell panel list into the ShellConfig so the
+    // quadraui runner renders the activity bar icons.  The engine stores all
+    // panels (including "bottom:settings") in a single `panels()` slice;
+    // ShellConfig wants top-pinned panels in its first arg and bottom-pinned
+    // items via `with_bottom_items()`, so split on the "bottom:" ID prefix.
+    let (top_panels, bottom_items): (Vec<_>, Vec<_>) = vimcode_app
+        .engine
+        .borrow()
+        .app_shell
+        .panels()
+        .iter()
+        .cloned()
+        .partition(|p| !p.id.as_str().starts_with("bottom:"));
+    let config = quadraui::ShellConfig::new("VimCode", top_panels).with_bottom_items(bottom_items);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
 }
