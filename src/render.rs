@@ -3566,6 +3566,15 @@ pub struct ScreenLayout {
     pub tab_scroll_offset: usize,
     /// Pre-built quadraui `TabBar` primitive for the single-group tab bar.
     pub tab_bar_primitive: quadraui::TabBar,
+    /// Hit regions (char-cell columns, relative to the tab bar's left edge) for
+    /// the single-group / active tab bar drawn from `tab_bar_primitive`. Empty in
+    /// multi-group mode (each group carries its own `hit_regions` on its
+    /// `GroupTabBar`). Lets backends resolve tab-bar clicks through the shared
+    /// `resolve_tab_bar_click` path instead of per-backend pixel maps. (#515)
+    pub tab_bar_hit_regions: Vec<(
+        crate::core::engine::TabBarHitRegion,
+        crate::core::engine::TabBarClickTarget,
+    )>,
     /// When `status_line_above_terminal` is OFF and the terminal panel is open,
     /// this carries the active window's status line to render as a dedicated row
     /// above the terminal panel. When `Some`, per-window `status_line` fields on
@@ -5983,7 +5992,13 @@ pub fn build_screen_layout(
                     .get(&gid)
                     .map(|g| g.tab_scroll_offset)
                     .unwrap_or(0);
-                let bar_width = bounds.width as u16;
+                // Hit regions are expressed in char-CELLS so they are
+                // backend-neutral. TUI passes char_width=1.0 (bounds already in
+                // cells); GTK passes pixel bounds + real char_width, so divide to
+                // recover cells. Without this, GTK's right-aligned button regions
+                // (split/diff/action) would land at pixel columns and never match
+                // a cell-converted click. (#515)
+                let bar_width = (bounds.width / char_width).round() as u16;
                 let has_diff_toolbar = diff_toolbar.is_some();
                 let diff_label_cols = diff_toolbar
                     .as_ref()
@@ -6132,8 +6147,41 @@ pub fn build_screen_layout(
         Some(to_quadraui_color(theme.tab_active_accent)),
     );
 
+    // Hit regions for the single-group / active tab bar, in char-cells. The bar
+    // spans the full editor content width (bounding box of all window rects);
+    // divide by char_width so the result is backend-neutral (TUI char_width=1.0).
+    // `has_split_buttons = true` mirrors the `true` passed to build_tab_bar_primitive
+    // above. Empty in multi-group mode (handled per-group on each GroupTabBar). (#515)
+    let tab_bar_hit_regions = if editor_group_split.is_some() || window_rects.is_empty() {
+        Vec::new()
+    } else {
+        let min_x = window_rects
+            .iter()
+            .map(|(_, r)| r.x)
+            .fold(f64::MAX, f64::min);
+        let max_r = window_rects
+            .iter()
+            .map(|(_, r)| r.x + r.width)
+            .fold(f64::MIN, f64::max);
+        let bar_width_cells = ((max_r - min_x) / char_width).round().max(0.0) as u16;
+        let diff_label_cols = diff_toolbar
+            .as_ref()
+            .and_then(|dt| dt.change_label.as_ref())
+            .map(|l| l.len() as u16 + 1)
+            .unwrap_or(0);
+        compute_tab_bar_hit_regions(
+            &tab_bar,
+            tab_scroll_offset_single,
+            bar_width_cells,
+            diff_toolbar.is_some(),
+            diff_label_cols,
+            true,
+        )
+    };
+
     ScreenLayout {
         tab_bar,
+        tab_bar_hit_regions,
         windows,
         global_status_bar,
         command,
