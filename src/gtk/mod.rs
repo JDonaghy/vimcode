@@ -399,6 +399,13 @@ struct App {
     /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
     /// read this instead of recomputing geometry from engine state (#344).
     cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
+    /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
+    /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
+    /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
+    /// detection and the highlight always use one identical bounds source. (#515)
+    cached_drop_groups: Rc<RefCell<Vec<render::TabDropGroup>>>,
+    /// Effective tab-bar height (px) paired with `cached_drop_groups`.
+    cached_drop_tbh: Rc<Cell<f32>>,
     /// Pixel y-offset where the debug toolbar was last drawn.
     debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
@@ -1182,6 +1189,8 @@ impl App {
             action_btn_map: Rc::new(RefCell::new(HashMap::new())),
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             cached_screen_layout: Rc::new(RefCell::new(None)),
+            cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
+            cached_drop_tbh: Rc::new(Cell::new(0.0)),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
             terminal_resize_dragging: false,
@@ -1577,7 +1586,6 @@ impl App {
                 // small String) and runtime toggles (`:set nonerdfonts`,
                 // `:set guifont=…`) propagate without a restart.
                 {
-                    use quadraui::Backend;
                     let e = self.engine.borrow();
                     let mut b = self.backend.borrow_mut();
                     b.set_nerd_fonts(e.settings.use_nerd_fonts);
@@ -4403,19 +4411,19 @@ impl App {
         }
         // Tab drag-and-drop handling.
         if self.tab_dragging {
-            // Update drop zone while dragging.
-            let engine = self.engine.borrow();
-            let zone = compute_tab_drop_zone(
-                &engine,
-                x,
-                y,
-                width,
-                height,
-                self.cached_line_height,
-                self.cached_char_width,
-                &self.tab_slot_positions.borrow(),
+            // Update drop zone while dragging, using the per-group bounds cached by
+            // render_content. Cursor (x, y) and those bounds are both in absolute
+            // surface coordinates, so the hit-test matches what the overlay draws.
+            // (#515 — previously used relative 0-based bounds vs an absolute cursor,
+            // which misclassified the zone after a split.)
+            let groups = self.cached_drop_groups.borrow();
+            let zone = render::compute_tab_drop_zone(
+                x as f32,
+                y as f32,
+                &groups,
+                self.cached_drop_tbh.get(),
             );
-            drop(engine);
+            drop(groups);
             self.tab_drag_drop_zone = zone;
             self.draw_needed.set(true);
             return;
@@ -7260,8 +7268,34 @@ impl quadraui::ShellApp for App {
             }
         }
 
-        // ── Draw tab bar ──────────────────────────────────────────────────────
-        if !engine.is_tab_bar_hidden(engine.active_group) {
+        // ── Draw tab bar(s) — one per editor group ────────────────────────────
+        // Multi-group (post-split) layouts have a tab bar per group, each drawn
+        // at the top edge of its own bounds. Single-group draws one full-width
+        // bar at the editor top. Previously only the single-group primitive was
+        // drawn, so split groups rendered with no tab bar at all. (#515)
+        if let Some(ref split) = screen.editor_group_split {
+            for gtb in &split.group_tab_bars {
+                if engine.is_tab_bar_hidden(gtb.group_id) {
+                    continue;
+                }
+                let tb_rect = quadraui::Rect::new(
+                    gtb.bounds.x as f32,
+                    (gtb.bounds.y - tab_bar_h) as f32,
+                    gtb.bounds.width as f32,
+                    tab_row_h as f32,
+                );
+                let hover = self
+                    .tab_close_hover
+                    .and_then(|(gid, i)| (gid == gtb.group_id.0).then_some(i));
+                let mut frame = QSL::new();
+                frame.push(Surface::TabBar {
+                    rect: tb_rect,
+                    bar: &gtb.bar,
+                    hovered_close: hover,
+                });
+                frame.draw(backend);
+            }
+        } else if !engine.is_tab_bar_hidden(engine.active_group) {
             let tb_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, tab_row_h as f32);
             let hover = self.tab_close_hover.map(|(_, i)| i);
             let mut frame = QSL::new();
@@ -7412,26 +7446,45 @@ impl quadraui::ShellApp for App {
             }
         }
 
-        // ── Draw tab drag overlay ─────────────────────────────────────────────
-        // When a tab drag is in progress, paint the drop-zone highlight and
-        // insertion bar on top of all other content.  The overlay uses the
-        // shared render::compute_tab_drop_overlay pipeline (same as TUI).
+        // ── Cache per-group tab-drop geometry ─────────────────────────────────
+        // Compute the absolute drop-group bounds from the shared screen layout and
+        // stash them so the drag hit-test (handle_mouse_drag_msg) and the overlay
+        // below use one identical source.
         //
-        // Tab slot positions are not available in the ShellApp path (they are
-        // populated by the legacy draw_editor Cairo path that runs only in the
-        // Relm4 branch), so we pass an empty map.  Center and split drop zones
-        // work correctly; tab-reorder insertion bars fall back to group-start X.
-        if self.tab_dragging {
-            let tab_bar_h_f = tab_bar_h as f32;
+        // Origin convention: in multi-group mode `gtb.bounds` are already absolute
+        // (built from absolute window rects), so the origin offset must be (0,0) —
+        // adding (x,y) again would double-count it and shift the highlight off the
+        // group (the prior "covers half the group" bug). Single-group mode returns
+        // (origin, size) directly, so it needs the real editor origin (x,y). (#515)
+        {
+            let drop_origin = if screen.editor_group_split.is_some() {
+                (0.0, 0.0)
+            } else {
+                (x as f32, y as f32)
+            };
             let bounds = render::screen_to_drop_group_bounds(
                 screen,
                 &engine,
-                (x as f32, y as f32),
+                drop_origin,
                 (w as f32, editor_area_h as f32),
             );
+            // Tab-reorder insertion bars need per-tab slot x-positions; those are a
+            // follow-up (empty map ⇒ center/split drop zones work, reorder bar
+            // falls back). Center/split highlighting — the reported regression — is
+            // bounds-only and works without slots.
             let empty_slots = std::collections::HashMap::<usize, Vec<(f32, f32)>>::new();
             let (groups, eff_tbh) =
-                render::build_tab_drop_groups(&bounds, &engine, tab_bar_h_f, &empty_slots);
+                render::build_tab_drop_groups(&bounds, &engine, tab_bar_h as f32, &empty_slots);
+            *self.cached_drop_groups.borrow_mut() = groups;
+            self.cached_drop_tbh.set(eff_tbh);
+        }
+
+        // ── Draw tab drag overlay ─────────────────────────────────────────────
+        // When a tab drag is in progress, paint the drop-zone highlight + insertion
+        // bar on top of all other content, using the geometry cached just above.
+        if self.tab_dragging {
+            let groups = self.cached_drop_groups.borrow();
+            let eff_tbh = self.cached_drop_tbh.get();
             let (mx, my) = self.mouse_pos_cell.get();
             if let Some(ov) = render::compute_tab_drop_overlay(
                 &self.tab_drag_drop_zone,
