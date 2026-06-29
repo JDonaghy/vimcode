@@ -1,8 +1,10 @@
 //! `VimcodeTabGroupCtrl` — bridges [`quadraui::TabGroupController`] with the
 //! engine's [`GroupId`]-keyed state.
-// The controller-building helpers (`new_from_engine`, pane builders, etc.) are
-// complete infrastructure but are not yet wired into the ShellApp render path.
-// That wiring is the remaining phase of #515 and will eliminate these warnings.
+// The overlay draw path (render_content → render::compute_tab_drop_overlay →
+// backend.draw_drop_overlay) is now live as of the fix in issue #515.  The
+// controller-building helpers below (`new_from_engine`, pane builders, etc.)
+// are complete infrastructure for the full TabGroupController integration phase
+// and will be wired in then; dead-code lint suppressed until that landing.
 #![allow(dead_code)]
 //!
 //! The controller is rebuilt from engine state at the start of each render
