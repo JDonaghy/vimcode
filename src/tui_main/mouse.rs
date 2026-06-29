@@ -154,6 +154,9 @@ pub(super) fn handle_mouse(
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
     tab_drag_start: &mut Option<(u16, u16)>,
     tab_dragging: &mut bool,
+    tab_drag_source: &mut Option<(crate::core::window::GroupId, usize)>,
+    tab_drag_cursor: &mut Option<(f64, f64)>,
+    tab_drop_zone: &mut crate::core::window::DropZone,
     hover_link_rects: &[(u16, u16, u16, u16, String)],
     hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
@@ -872,8 +875,8 @@ pub(super) fn handle_mouse(
             }
             // Tab drag-and-drop: update drop zone while dragging.
             if *tab_dragging {
-                engine.tab_drag_mouse = Some((col as f64, row as f64));
-                engine.tab_drop_zone = compute_tui_tab_drop_zone(
+                *tab_drag_cursor = Some((col as f64, row as f64));
+                *tab_drop_zone = compute_tui_tab_drop_zone(
                     engine,
                     col,
                     row,
@@ -895,8 +898,9 @@ pub(super) fn handle_mouse(
                         .get(&gid)
                         .map(|g| g.active_tab)
                         .unwrap_or(0);
-                    engine.tab_drag_begin(gid, tidx);
-                    engine.tab_drag_mouse = Some((col as f64, row as f64));
+                    *tab_drag_source = Some((gid, tidx));
+                    *tab_drag_cursor = Some((col as f64, row as f64));
+                    *tab_drop_zone = crate::core::window::DropZone::None;
                     *tab_dragging = true;
                     *tab_drag_start = None;
                     return sidebar_width;
@@ -1084,8 +1088,12 @@ pub(super) fn handle_mouse(
             if *tab_dragging {
                 *tab_dragging = false;
                 *tab_drag_start = None;
-                let zone = engine.tab_drop_zone;
-                engine.tab_drag_drop(zone);
+                if let Some((src_gid, src_tab_idx)) = tab_drag_source.take() {
+                    let zone = *tab_drop_zone;
+                    *tab_drop_zone = crate::core::window::DropZone::None;
+                    apply_tui_drop_zone(engine, src_gid, src_tab_idx, zone);
+                }
+                *tab_drag_cursor = None;
                 return sidebar_width;
             }
             *tab_drag_start = None;
@@ -3088,5 +3096,38 @@ fn status_segment_hit_test(
     match layout.hit_test(click_col as f32, 0.0) {
         quadraui::StatusBarHit::Segment(id) => crate::render::status_action_from_id(id.as_str()),
         quadraui::StatusBarHit::Empty => None,
+    }
+}
+
+// ── Tab drag drop zone application (TUI path) ─────────────────────────────────
+
+/// Apply a `DropZone` to the engine for the TUI tab drag path.
+///
+/// Equivalent to `tab_group_ctrl::apply_drop_zone` but does not require the
+/// `quadraui/gtk` feature, so it is safe to call from TUI code.
+fn apply_tui_drop_zone(
+    engine: &mut Engine,
+    source_gid: crate::core::window::GroupId,
+    source_tab_idx: usize,
+    zone: crate::core::window::DropZone,
+) {
+    use crate::core::window::DropZone;
+    match zone {
+        DropZone::Center(target) => {
+            if target != source_gid {
+                engine.move_tab_to_target_group(source_gid, source_tab_idx, target);
+            }
+        }
+        DropZone::Split(target, direction, new_first) => {
+            engine.move_tab_to_new_split(source_gid, source_tab_idx, target, direction, new_first);
+        }
+        DropZone::TabReorder(group_id, to_idx) => {
+            if group_id == source_gid {
+                engine.reorder_tab_in_group(group_id, source_tab_idx, to_idx);
+            } else {
+                engine.move_tab_to_target_group_at(source_gid, source_tab_idx, group_id, to_idx);
+            }
+        }
+        DropZone::None => {}
     }
 }

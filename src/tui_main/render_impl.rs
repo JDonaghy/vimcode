@@ -113,6 +113,9 @@ pub(super) fn draw_frame(
     // Set once per frame by the caller (cached theme); the migrated
     // call sites wrap their access in `backend.enter_frame_scope`.
     backend: &mut super::backend::TuiBackend,
+    tab_drag_source: Option<(crate::core::window::GroupId, usize)>,
+    tab_drag_cursor: Option<(f64, f64)>,
+    tab_drop_zone: &crate::core::window::DropZone,
 ) {
     let area = frame.area();
 
@@ -421,8 +424,17 @@ pub(super) fn draw_frame(
         });
 
     // ── Tab drag overlay ────────────────────────────────────────────────────
-    if engine.tab_drag.is_some() {
-        render_tab_drag_overlay(frame, engine, editor_area, screen, theme);
+    if tab_drag_source.is_some() {
+        render_tab_drag_overlay(
+            frame,
+            engine,
+            editor_area,
+            screen,
+            theme,
+            tab_drag_source,
+            tab_drag_cursor,
+            tab_drop_zone,
+        );
     }
 
     // ── Tab hover tooltip (rendered on top of editor, below tab bar) ──────
@@ -1235,12 +1247,21 @@ fn build_tui_tab_slots(
     map
 }
 
+/// Render the tab drag overlay for the TUI path.
+///
+/// `tab_drag_source` is the (GroupId, tab_index) captured when the drag started.
+/// `tab_drag_cursor` is the current cursor position during the drag.
+/// `tab_drop_zone` is the most recently computed drop zone.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_tab_drag_overlay(
     frame: &mut ratatui::Frame,
     engine: &Engine,
     editor_area: Rect,
     screen: &render::ScreenLayout,
     theme: &render::Theme,
+    tab_drag_source: Option<(crate::core::window::GroupId, usize)>,
+    tab_drag_cursor: Option<(f64, f64)>,
+    tab_drop_zone: &crate::core::window::DropZone,
 ) {
     let tab_slots = build_tui_tab_slots(screen, engine, editor_area.x as f32);
     let tbh_f = if engine.settings.breadcrumbs {
@@ -1255,21 +1276,14 @@ pub(super) fn render_tab_drag_overlay(
         (editor_area.width as f32, editor_area.height as f32),
     );
     let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
-    let cursor = engine
-        .tab_drag_mouse
+    let cursor = tab_drag_cursor
         .map(|(mx, my)| (mx as f32, my as f32))
         .unwrap_or((0.0, 0.0));
-    let overlay = match render::compute_tab_drop_overlay(
-        &engine.tab_drop_zone,
-        &groups,
-        cursor,
-        tbh,
-        1.0,
-        2.0,
-    ) {
-        Some(o) => o,
-        None => return,
-    };
+    let overlay =
+        match render::compute_tab_drop_overlay(tab_drop_zone, &groups, cursor, tbh, 1.0, 2.0) {
+            Some(o) => o,
+            None => return,
+        };
 
     let highlight_bg = RColor::Indexed(24);
     if let Some(h) = overlay.highlight {
@@ -1303,8 +1317,24 @@ pub(super) fn render_tab_drag_overlay(
         );
     }
 
-    if let (Some(ref drag), Some(_)) = (&engine.tab_drag, engine.tab_drag_mouse) {
-        let label = &drag.tab_name;
+    // Look up the tab label from engine using the captured drag source.
+    let drag_label: String = if let Some((src_gid, src_tab_idx)) = tab_drag_source {
+        engine
+            .editor_groups
+            .get(&src_gid)
+            .and_then(|g| g.tabs.get(src_tab_idx))
+            .and_then(|t| {
+                let win = engine.windows.get(&t.active_window)?;
+                let state = engine.buffer_manager.get(win.buffer_id)?;
+                Some(state.display_name().to_string())
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if tab_drag_cursor.is_some() && !drag_label.is_empty() {
+        let label = &drag_label;
         if !label.is_empty() {
             let gx = overlay.ghost_position.0 as u16;
             let gy = overlay.ghost_position.1 as u16;
@@ -1749,6 +1779,9 @@ mod tests {
                     &mut completion_layout,
                     &mut context_menu_layout,
                     &mut backend,
+                    None,                                 // tab_drag_source
+                    None,                                 // tab_drag_cursor
+                    &crate::core::window::DropZone::None, // tab_drop_zone
                 );
             })
             .unwrap();

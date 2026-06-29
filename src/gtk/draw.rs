@@ -352,20 +352,9 @@ pub(super) fn draw_editor(
         *bc.draw_layout.borrow_mut() = Some(bar_layout);
     }
 
-    // 5. Draw tab drag overlay (drop zone highlight + ghost label).
-    if engine.tab_drag.is_some() {
-        draw_tab_drag_overlay(
-            cr,
-            engine,
-            &theme,
-            width as f64,
-            height as f64,
-            line_height,
-            char_width,
-            &layout,
-            &tab_slot_positions_out.borrow(),
-        );
-    }
+    // 5. Tab drag overlay is handled by the ShellApp path via
+    //    TabGroupController::render (which draws the overlay internally).
+    //    The legacy Relm4 draw path no longer supports drag-and-drop overlays.
 
     // 5b. Draw completion popup (on top of everything else). Cache
     //     the layout so the click handler can hit-test items.
@@ -1039,87 +1028,8 @@ pub(super) fn draw_h_scrollbars(
     }
 }
 
-/// Draw the tab drag overlay: a semi-transparent highlight over the drop zone
-/// and a ghost label near the cursor.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn draw_tab_drag_overlay(
-    cr: &Context,
-    engine: &Engine,
-    theme: &Theme,
-    width: f64,
-    height: f64,
-    line_height: f64,
-    _char_width: f64,
-    pango_layout: &pango::Layout,
-    tab_slot_positions: &TabSlotMap,
-) {
-    let (bounds, tbh, slots_map) =
-        super::click::build_gtk_tab_slots(engine, width, height, line_height, tab_slot_positions);
-    let (groups, eff_tbh) = render::build_tab_drop_groups(&bounds, engine, tbh, &slots_map);
-    let tbh = eff_tbh;
-    let cursor = engine
-        .tab_drag_mouse
-        .map(|(mx, my)| (mx as f32, my as f32))
-        .unwrap_or((0.0, 0.0));
-    let overlay = match render::compute_tab_drop_overlay(
-        &engine.tab_drop_zone,
-        &groups,
-        cursor,
-        tbh,
-        2.0,
-        12.0,
-    ) {
-        Some(o) => o,
-        None => return,
-    };
-
-    if let Some(h) = overlay.highlight {
-        let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
-        cr.set_source_rgba(cr_r, cr_g, cr_b, 0.15);
-        cr.rectangle(h.x as f64, h.y as f64, h.width as f64, h.height as f64);
-        cr.fill().ok();
-        cr.set_source_rgba(cr_r, cr_g, cr_b, 0.5);
-        cr.set_line_width(2.0);
-        cr.rectangle(h.x as f64, h.y as f64, h.width as f64, h.height as f64);
-        cr.stroke().ok();
-    }
-
-    if let Some(bar) = overlay.insertion_bar {
-        let (cr_r, cr_g, cr_b) = theme.cursor.to_cairo();
-        cr.set_source_rgb(cr_r, cr_g, cr_b);
-        cr.rectangle(
-            bar.x as f64,
-            bar.y as f64,
-            bar.width as f64,
-            bar.height as f64,
-        );
-        cr.fill().ok();
-    }
-
-    if let (Some((mx, my)), Some(ref drag)) = (engine.tab_drag_mouse, &engine.tab_drag) {
-        let label = &drag.tab_name;
-        if !label.is_empty() {
-            pango_layout.set_text(label);
-            let (tw, th) = pango_layout.pixel_size();
-            let gx = mx + 12.0;
-            let gy = my - th as f64 / 2.0;
-            let pad = 4.0;
-            let (gbr, gbg, gbb) = theme.background.to_cairo();
-            cr.set_source_rgba(gbr, gbg, gbb, 0.85);
-            cr.rectangle(
-                gx - pad,
-                gy - pad,
-                tw as f64 + pad * 2.0,
-                th as f64 + pad * 2.0,
-            );
-            cr.fill().ok();
-            let (gfr, gfg, gfb) = theme.foreground.to_cairo();
-            cr.set_source_rgba(gfr, gfg, gfb, 0.9);
-            cr.move_to(gx, gy);
-            pangocairo::show_layout(cr, pango_layout);
-        }
-    }
-}
+// draw_tab_drag_overlay removed — drag overlay is now handled by
+// TabGroupController::render() in the ShellApp path.
 
 /// GTK tab bar renders via `Backend::draw_tab_bar`.
 ///

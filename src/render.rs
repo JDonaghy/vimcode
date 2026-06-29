@@ -2847,7 +2847,7 @@ pub enum UiAction {
     /// Must call: `engine.open_tab_context_menu(group_id, tab_idx, x, y)`
     TabRightClick,
     /// Drag a tab → reorder or move between groups.
-    /// Must call: `engine.tab_drag_begin()`, `engine.tab_drag_drop(zone)`
+    /// Handled by `TabGroupController::handle_tab_drag_start/move/drop`.
     TabDragDrop,
 
     // ── Editor ───────────────────────────────────────────────────────
@@ -14772,14 +14772,14 @@ mod tests {
         assert_eq!(e.editor_groups.len(), 1, "start with one group");
 
         let gid = e.active_group;
-        e.tab_drag_begin(gid, 1); // drag f1's tab
-
-        // Drop to create a vertical split
-        e.tab_drag_drop(crate::core::window::DropZone::Split(
+        // Move tab 1 (f1) to create a vertical split
+        e.move_tab_to_new_split(
+            gid,
+            1,
             gid,
             crate::core::window::SplitDirection::Vertical,
             false,
-        ));
+        );
         assert_eq!(
             e.editor_groups.len(),
             2,
