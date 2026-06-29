@@ -1028,8 +1028,8 @@ pub(super) fn draw_h_scrollbars(
     }
 }
 
-// draw_tab_drag_overlay removed — drag overlay is now handled by
-// TabGroupController::render() in the ShellApp path.
+// draw_tab_drag_overlay removed — drag overlay is now handled directly in
+// ShellApp::render_content via render::compute_tab_drop_overlay + backend.draw_drop_overlay.
 
 /// GTK tab bar renders via `Backend::draw_tab_bar`.
 ///
