@@ -7220,6 +7220,30 @@ impl quadraui::ShellApp for App {
                 editor: &editor,
             });
             frame.draw(backend);
+
+            // Per-window status bar (when window_status_line=true, which is
+            // the default; global_status_bar is None in that mode).
+            if let Some(ref status) = rw.status_line {
+                let bar_y = rw.rect.y + rw.rect.height - lh;
+                let sb_rect = quadraui::Rect::new(
+                    rw.rect.x as f32,
+                    bar_y as f32,
+                    rw.rect.width as f32,
+                    lh as f32,
+                );
+                let win_bar = render::window_status_line_to_status_bar(
+                    status,
+                    quadraui::WidgetId::new(format!("status:{}", rw.window_id.0)),
+                );
+                let mut frame = QSL::new();
+                frame.push(Surface::StatusBar {
+                    rect: sb_rect,
+                    bar: &win_bar,
+                    hovered: None,
+                    pressed: None,
+                });
+                frame.draw(backend);
+            }
         }
 
         // ── Draw tab bar ──────────────────────────────────────────────────────
@@ -7469,6 +7493,11 @@ impl quadraui::ShellApp for App {
                     }
                     _ => {}
                 }
+                // Mouse clicks always require a redraw (cursor movement, selection,
+                // focus change). draw_needed may already be set by dispatch(), but
+                // set it unconditionally so handle() returns Reaction::Redraw even
+                // when dispatch() takes an early-return path in ShellApp mode.
+                self.draw_needed.set(true);
             }
             UiEvent::DoubleClick { position, .. } => {
                 let main = ctx.layout.main_content_bounds;
@@ -7478,6 +7507,7 @@ impl quadraui::ShellApp for App {
                     width: main.width as f64,
                     height: main.height as f64,
                 });
+                self.draw_needed.set(true);
             }
             UiEvent::MouseMoved { position, buttons } => {
                 self.mouse_pos_cell
@@ -7565,6 +7595,16 @@ impl quadraui::ShellApp for App {
                     .borrow_mut()
                     .app_shell
                     .set_sidebar_width(*new_width);
+            }
+            AppShellEvent::BottomItemClicked { id } => {
+                // The runner treats bottom activity-bar items as action buttons
+                // (not sidebar panels), so it does not change its own sidebar
+                // visibility.  For vimcode, bottom items like "bottom:settings"
+                // represent sidebar panels stored in the engine's AppShell.
+                // Sync the active panel so render_content() draws the correct
+                // content the next time the sidebar is visible.
+                self.engine.borrow_mut().app_shell.show_panel(id);
+                self.draw_needed.set(true);
             }
             _ => {}
         }
@@ -7887,13 +7927,33 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     // panels (including "bottom:settings") in a single `panels()` slice;
     // ShellConfig wants top-pinned panels in its first arg and bottom-pinned
     // items via `with_bottom_items()`, so split on the "bottom:" ID prefix.
-    let (top_panels, bottom_items): (Vec<_>, Vec<_>) = vimcode_app
+    // Fill in activity-bar icons before building ShellConfig.  The engine's
+    // AppShell initialises all PanelDefinition.icon fields to "" because the
+    // engine itself is backend-agnostic; the GTK runner is responsible for
+    // mapping each panel ID to the correct Nerd-Font / fallback glyph.
+    let panels_with_icons: Vec<_> = vimcode_app
         .engine
         .borrow()
         .app_shell
         .panels()
         .iter()
         .cloned()
+        .map(|mut p| {
+            p.icon = match p.id.as_str() {
+                "panel:explorer" => crate::icons::EXPLORER.s().to_string(),
+                "panel:search" => crate::icons::SEARCH_COD.s().to_string(),
+                "panel:debug" => crate::icons::DEBUG.s().to_string(),
+                "panel:git" => crate::icons::GIT_BRANCH.s().to_string(),
+                "panel:extensions" => crate::icons::EXTENSIONS.s().to_string(),
+                "panel:ai" => crate::icons::AI_CHAT.s().to_string(),
+                "bottom:settings" => crate::icons::SETTINGS.s().to_string(),
+                _ => p.icon,
+            };
+            p
+        })
+        .collect();
+    let (top_panels, bottom_items): (Vec<_>, Vec<_>) = panels_with_icons
+        .into_iter()
         .partition(|p| !p.id.as_str().starts_with("bottom:"));
     let config = quadraui::ShellConfig::new("VimCode", top_panels).with_bottom_items(bottom_items);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
