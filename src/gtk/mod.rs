@@ -7411,6 +7411,44 @@ impl quadraui::ShellApp for App {
                 }
             }
         }
+
+        // ── Draw tab drag overlay ─────────────────────────────────────────────
+        // When a tab drag is in progress, paint the drop-zone highlight and
+        // insertion bar on top of all other content.  The overlay uses the
+        // shared render::compute_tab_drop_overlay pipeline (same as TUI).
+        //
+        // Tab slot positions are not available in the ShellApp path (they are
+        // populated by the legacy draw_editor Cairo path that runs only in the
+        // Relm4 branch), so we pass an empty map.  Center and split drop zones
+        // work correctly; tab-reorder insertion bars fall back to group-start X.
+        if self.tab_dragging {
+            let tab_bar_h_f = tab_bar_h as f32;
+            let bounds = render::screen_to_drop_group_bounds(
+                screen,
+                &engine,
+                (x as f32, y as f32),
+                (w as f32, editor_area_h as f32),
+            );
+            let empty_slots =
+                std::collections::HashMap::<usize, Vec<(f32, f32)>>::new();
+            let (groups, eff_tbh) =
+                render::build_tab_drop_groups(&bounds, &engine, tab_bar_h_f, &empty_slots);
+            let (mx, my) = self.mouse_pos_cell.get();
+            if let Some(ov) = render::compute_tab_drop_overlay(
+                &self.tab_drag_drop_zone,
+                &groups,
+                (mx as f32, my as f32),
+                eff_tbh,
+                2.0,
+                lh as f32,
+            ) {
+                backend.draw_drop_overlay(&quadraui::DropOverlay {
+                    highlight: ov.highlight,
+                    insertion_bar: ov.insertion_bar,
+                    ghost_position: Some(ov.ghost_position),
+                });
+            }
+        }
     }
 
     fn handle(
