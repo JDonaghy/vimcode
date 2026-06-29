@@ -7429,8 +7429,7 @@ impl quadraui::ShellApp for App {
                 (x as f32, y as f32),
                 (w as f32, editor_area_h as f32),
             );
-            let empty_slots =
-                std::collections::HashMap::<usize, Vec<(f32, f32)>>::new();
+            let empty_slots = std::collections::HashMap::<usize, Vec<(f32, f32)>>::new();
             let (groups, eff_tbh) =
                 render::build_tab_drop_groups(&bounds, &engine, tab_bar_h_f, &empty_slots);
             let (mx, my) = self.mouse_pos_cell.get();
