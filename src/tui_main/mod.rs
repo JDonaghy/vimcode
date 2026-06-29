@@ -31,6 +31,8 @@ use mouse::*;
 #[allow(unused_imports)]
 use panels::*;
 #[allow(unused_imports)]
+use quadraui::Backend;
+#[allow(unused_imports)]
 use render_impl::*;
 
 // ─── Debug logging ────────────────────────────────────────────────────────────
@@ -977,6 +979,12 @@ fn event_loop(
     let mut tab_drag_start: Option<(u16, u16)> = None;
     // True while a tab drag is actively in progress.
     let mut tab_dragging: bool = false;
+    // Source pane of the active tab drag: (GroupId, tab_index).
+    let mut tui_drag_source: Option<(crate::core::window::GroupId, usize)> = None;
+    // Cursor position during the active tab drag (for ghost label).
+    let mut tui_drag_cursor: Option<(f64, f64)> = None;
+    // Most recently computed drop zone during an active tab drag.
+    let mut tui_tab_drop_zone: crate::core::window::DropZone = crate::core::window::DropZone::None;
 
     // Track unnamed register content so we only write to clipboard on changes.
     let mut last_clipboard_content: Option<String> = None;
@@ -1161,6 +1169,9 @@ fn event_loop(
                             &mut completion_layout,
                             &mut context_menu_layout,
                             &mut backend,
+                            tui_drag_source,
+                            tui_drag_cursor,
+                            &tui_tab_drop_zone,
                         );
                     }
                 })
@@ -1212,6 +1223,9 @@ fn event_loop(
                                     &mut completion_layout,
                                     &mut context_menu_layout,
                                     &mut backend,
+                                    tui_drag_source,
+                                    tui_drag_cursor,
+                                    &tui_tab_drop_zone,
                                 );
                             }
                         })
@@ -2856,6 +2870,9 @@ fn event_loop(
                                 &mut explorer_drag_active,
                                 &mut tab_drag_start,
                                 &mut tab_dragging,
+                                &mut tui_drag_source,
+                                &mut tui_drag_cursor,
+                                &mut tui_tab_drop_zone,
                                 &hover_link_rects,
                                 hover_popup_rect,
                                 editor_hover_popup_rect,
@@ -2903,6 +2920,9 @@ fn event_loop(
                     &mut explorer_drag_active,
                     &mut tab_drag_start,
                     &mut tab_dragging,
+                    &mut tui_drag_source,
+                    &mut tui_drag_cursor,
+                    &mut tui_tab_drop_zone,
                     &hover_link_rects,
                     hover_popup_rect,
                     editor_hover_popup_rect,

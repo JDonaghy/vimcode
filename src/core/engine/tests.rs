@@ -15807,7 +15807,6 @@ fn test_execute_command_uri_unknown_command() {
 
 #[test]
 fn test_tab_drag_reorder_same_group() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15817,12 +15816,9 @@ fn test_tab_drag_reorder_same_group() {
     assert_eq!(e.active_group().tabs.len(), 3);
     assert_eq!(e.active_group().active_tab, 2);
 
-    // Drag tab 2 (ccc) to position 0
+    // Reorder tab 2 (ccc) to position 0
     let gid = e.active_group;
-    e.tab_drag_begin(gid, 2);
-    assert!(e.tab_drag.is_some());
-    e.tab_drag_drop(DropZone::TabReorder(gid, 0));
-    assert!(e.tab_drag.is_none());
+    e.reorder_tab_in_group(gid, 2, 0);
 
     // Now order should be [ccc, aaa, bbb], active tab is 0
     assert_eq!(e.active_group().active_tab, 0);
@@ -15837,7 +15833,6 @@ fn test_tab_drag_reorder_same_group() {
 
 #[test]
 fn test_tab_drag_to_other_group_center() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15851,9 +15846,8 @@ fn test_tab_drag_to_other_group_center() {
     assert_ne!(group1, group2);
     e.buffer_mut().insert(0, "ccc\n");
 
-    // Drag bbb (tab 1 in group1) to group2 center
-    e.tab_drag_begin(group1, 1);
-    e.tab_drag_drop(DropZone::Center(group2));
+    // Move bbb (tab 1 in group1) to group2 center
+    e.move_tab_to_target_group(group1, 1, group2);
 
     // group1 should have 1 tab (aaa), group2 should have 2 tabs
     assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);
@@ -15864,7 +15858,6 @@ fn test_tab_drag_to_other_group_center() {
 
 #[test]
 fn test_tab_drag_to_new_split() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15872,9 +15865,8 @@ fn test_tab_drag_to_new_split() {
     assert_eq!(e.active_group().tabs.len(), 2);
     assert!(e.group_layout.is_single_group());
 
-    // Drag tab 0 (aaa) to create a new split
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::Split(gid, SplitDirection::Vertical, false));
+    // Move tab 0 (aaa) to create a new split
+    e.move_tab_to_new_split(gid, 0, gid, SplitDirection::Vertical, false);
 
     // Should now have 2 groups
     assert!(!e.group_layout.is_single_group());
@@ -15883,25 +15875,19 @@ fn test_tab_drag_to_new_split() {
 
 #[test]
 fn test_tab_drag_cancel() {
+    // With the new controller-based drag, "cancel" is handled by the
+    // controller (TabGroupController::cancel_tab_drag).  Engine state is
+    // not mutated during a drag — cancelling is a no-op at the engine level.
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
-    let gid = e.active_group;
     let tabs_before = e.active_group().tabs.len();
-
-    e.tab_drag_begin(gid, 0);
-    assert!(e.tab_drag.is_some());
-    e.tab_drag_cancel();
-    assert!(e.tab_drag.is_none());
-    assert_eq!(e.tab_drag_mouse, None);
-    assert_eq!(e.tab_drop_zone, DropZone::None);
-    // No state changed
+    // No drag state in engine any more — just verify tabs are unchanged.
     assert_eq!(e.active_group().tabs.len(), tabs_before);
 }
 
 #[test]
 fn test_tab_drag_last_tab_closes_group() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     // Create second group with split
     e.open_editor_group(SplitDirection::Vertical);
@@ -15912,9 +15898,8 @@ fn test_tab_drag_last_tab_closes_group() {
     let group1 = *e.editor_groups.keys().find(|g| **g != group2).unwrap();
     assert_eq!(e.editor_groups.len(), 2);
 
-    // Drag the only tab from group1 to group2
-    e.tab_drag_begin(group1, 0);
-    e.tab_drag_drop(DropZone::Center(group2));
+    // Move the only tab from group1 to group2
+    e.move_tab_to_target_group(group1, 0, group2);
 
     // group1 should be closed, only group2 remains
     assert_eq!(e.editor_groups.len(), 1);
@@ -15924,16 +15909,15 @@ fn test_tab_drag_last_tab_closes_group() {
 
 #[test]
 fn test_tab_drag_drop_none_is_noop() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
-    let gid = e.active_group;
     let tabs_before = e.active_group().tabs.len();
     let active_before = e.active_group().active_tab;
 
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::None);
+    // DropZone::None → no-op (apply_drop_zone branch)
+    // Call engine underlying fn to verify nothing changes when called with same group.
+    e.reorder_tab_in_group(e.active_group, active_before, active_before);
 
     // Nothing changed
     assert_eq!(e.active_group().tabs.len(), tabs_before);
@@ -15942,7 +15926,6 @@ fn test_tab_drag_drop_none_is_noop() {
 
 #[test]
 fn test_tab_drag_reorder_to_other_group_at_index() {
-    use crate::core::window::DropZone;
     let mut e = engine_with_text("aaa\n");
     e.new_tab(None);
     e.buffer_mut().insert(0, "bbb\n");
@@ -15956,9 +15939,8 @@ fn test_tab_drag_reorder_to_other_group_at_index() {
     e.buffer_mut().insert(0, "ddd\n");
     assert_eq!(e.editor_groups.get(&group2).unwrap().tabs.len(), 2);
 
-    // Drag aaa (tab 0 in group1) to group2 at index 1
-    e.tab_drag_begin(group1, 0);
-    e.tab_drag_drop(DropZone::TabReorder(group2, 1));
+    // Move aaa (tab 0 in group1) to group2 at index 1
+    e.move_tab_to_target_group_at(group1, 0, group2, 1);
 
     // group1: [bbb], group2: [ccc, aaa, ddd]
     assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);

@@ -28,8 +28,7 @@ use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, InstallContext};
 use super::view::{FoldRegion, View};
 use super::window::{
-    DropZone, GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout,
-    WindowRect,
+    GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout, WindowRect,
 };
 use quadraui::terminal_engine::TerminalSession;
 use std::borrow::Cow;
@@ -1489,14 +1488,6 @@ pub enum TerminalKeyAction {
     Ignore,
 }
 
-/// State of an in-progress tab drag operation.
-#[derive(Debug, Clone)]
-pub struct TabDragState {
-    pub source_group: GroupId,
-    pub source_tab_index: usize,
-    pub tab_name: String,
-}
-
 // ── Context menu data model ──────────────────────────────────────────────────
 
 /// What the context menu was opened on.
@@ -2356,13 +2347,6 @@ pub struct Engine {
     next_group_id: usize,
     next_window_id: usize,
     next_tab_id: usize,
-    /// Active tab drag-and-drop operation (set by UI on drag start).
-    pub tab_drag: Option<TabDragState>,
-    /// Current mouse position during a tab drag (for rendering ghost/overlay).
-    pub tab_drag_mouse: Option<(f64, f64)>,
-    /// Computed drop zone for the current tab drag (updated each frame).
-    pub tab_drop_zone: DropZone,
-
     // --- Preview mode ---
     /// The buffer currently in preview mode (at most one at a time).
     pub preview_buffer_id: Option<BufferId>,
@@ -3510,9 +3494,6 @@ impl Engine {
             next_group_id: 1,
             next_window_id: 2,
             next_tab_id: 2,
-            tab_drag: None,
-            tab_drag_mouse: None,
-            tab_drop_zone: DropZone::None,
             preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),

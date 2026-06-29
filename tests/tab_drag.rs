@@ -1,43 +1,6 @@
 mod common;
 use common::*;
-use vimcode_core::core::window::{DropZone, SplitDirection};
-
-// ── Tab drag: begin and cancel ──────────────────────────────────────────────
-
-#[test]
-fn tab_drag_begin_sets_state() {
-    let mut e = engine_with("hello\n");
-    let gid = e.active_group;
-    e.tab_drag_begin(gid, 0);
-    assert!(e.tab_drag.is_some());
-    assert_eq!(e.tab_drag.as_ref().unwrap().source_group, gid);
-    assert_eq!(e.tab_drag.as_ref().unwrap().source_tab_index, 0);
-}
-
-#[test]
-fn tab_drag_cancel_clears_state() {
-    let mut e = engine_with("hello\n");
-    let gid = e.active_group;
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_cancel();
-    assert!(e.tab_drag.is_none());
-    assert!(e.tab_drag_mouse.is_none());
-    assert_eq!(e.tab_drop_zone, DropZone::None);
-}
-
-// ── Tab drag: drop to center of same group (no-op) ─────────────────────────
-
-#[test]
-fn tab_drag_drop_center_same_group_is_noop() {
-    let mut e = engine_with("hello\n");
-    exec(&mut e, "tabnew");
-    let gid = e.active_group;
-    let tabs_before = e.active_group().tabs.len();
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::Center(gid));
-    assert_eq!(e.active_group().tabs.len(), tabs_before);
-    assert!(e.tab_drag.is_none());
-}
+use vimcode_core::core::window::SplitDirection;
 
 // ── Tab drag: move tab to another group ─────────────────────────────────────
 
@@ -53,8 +16,7 @@ fn move_tab_to_target_group() {
     assert_ne!(src, dst);
 
     // Move tab 1 from src to dst
-    e.tab_drag_begin(src, 1);
-    e.tab_drag_drop(DropZone::Center(dst));
+    e.move_tab_to_target_group(src, 1, dst);
 
     // dst should now have 2 tabs
     assert_eq!(e.editor_groups.get(&dst).unwrap().tabs.len(), 2);
@@ -75,8 +37,7 @@ fn move_last_tab_closes_source_group() {
     assert!(e.editor_groups.contains_key(&src));
 
     // Move the only tab from src to dst
-    e.tab_drag_begin(src, 0);
-    e.tab_drag_drop(DropZone::Center(dst));
+    e.move_tab_to_target_group(src, 0, dst);
 
     // src should be removed from the layout
     assert!(!e.editor_groups.contains_key(&src));
@@ -95,8 +56,7 @@ fn move_tab_to_new_split_right() {
     let gid = e.active_group;
     let groups_before = e.editor_groups.len();
 
-    e.tab_drag_begin(gid, 1);
-    e.tab_drag_drop(DropZone::Split(gid, SplitDirection::Vertical, false));
+    e.move_tab_to_new_split(gid, 1, gid, SplitDirection::Vertical, false);
 
     // Should have one more group
     assert_eq!(e.editor_groups.len(), groups_before + 1);
@@ -113,8 +73,7 @@ fn move_tab_to_new_split_left() {
     exec(&mut e, "tabnew");
     let gid = e.active_group;
 
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::Split(gid, SplitDirection::Vertical, true));
+    e.move_tab_to_new_split(gid, 0, gid, SplitDirection::Vertical, true);
 
     assert_eq!(e.editor_groups.len(), 2);
     assert!(!e.group_layout.is_single_group());
@@ -126,8 +85,7 @@ fn move_tab_to_new_split_top() {
     exec(&mut e, "tabnew");
     let gid = e.active_group;
 
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::Split(gid, SplitDirection::Horizontal, true));
+    e.move_tab_to_new_split(gid, 0, gid, SplitDirection::Horizontal, true);
 
     assert_eq!(e.editor_groups.len(), 2);
 }
@@ -138,8 +96,7 @@ fn move_tab_to_new_split_bottom() {
     exec(&mut e, "tabnew");
     let gid = e.active_group;
 
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::Split(gid, SplitDirection::Horizontal, false));
+    e.move_tab_to_new_split(gid, 0, gid, SplitDirection::Horizontal, false);
 
     assert_eq!(e.editor_groups.len(), 2);
 }
@@ -154,9 +111,8 @@ fn split_with_last_tab_closes_source_and_creates_new() {
     e.open_editor_group(SplitDirection::Vertical);
     let other = e.active_group;
 
-    // Now drag the sole tab from 'gid' to split right of 'other'
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::Split(other, SplitDirection::Vertical, false));
+    // Drag the sole tab from 'gid' to split right of 'other'
+    e.move_tab_to_new_split(gid, 0, other, SplitDirection::Vertical, false);
 
     // gid should be gone (had only 1 tab)
     assert!(!e.editor_groups.contains_key(&gid));
@@ -189,8 +145,7 @@ fn reorder_tab_via_drag_drop() {
     let gid = e.active_group;
     let tabs_before = e.active_group().tabs.len();
 
-    e.tab_drag_begin(gid, 0);
-    e.tab_drag_drop(DropZone::TabReorder(gid, 2));
+    e.reorder_tab_in_group(gid, 0, 2);
 
     // Same number of tabs, just reordered
     assert_eq!(e.active_group().tabs.len(), tabs_before);
@@ -209,9 +164,8 @@ fn tab_reorder_to_different_group() {
     exec(&mut e, "tabnew");
     // dst now has 2 tabs
 
-    // Drag tab 0 from src to position 1 in dst
-    e.tab_drag_begin(src, 0);
-    e.tab_drag_drop(DropZone::TabReorder(dst, 1));
+    // Move tab 0 from src to position 1 in dst
+    e.move_tab_to_target_group_at(src, 0, dst, 1);
 
     assert_eq!(e.editor_groups.get(&dst).unwrap().tabs.len(), 3);
     assert_eq!(e.editor_groups.get(&src).unwrap().tabs.len(), 1);

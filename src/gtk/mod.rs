@@ -418,6 +418,10 @@ struct App {
     tab_dragging: bool,
     /// Start position of a potential tab drag (set on MouseClick in tab bar).
     tab_drag_start: Option<(f64, f64)>,
+    /// Source of the active tab drag: (group_id, tab_index).  Set when drag starts.
+    tab_drag_source: Option<(core::window::GroupId, usize)>,
+    /// Most recently computed drop zone during an active tab drag.
+    tab_drag_drop_zone: core::window::DropZone,
     /// GTK window handle — set in `ShellApp::setup` once the runner creates the window.
     window: Option<gtk4::Window>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
@@ -1185,6 +1189,8 @@ impl App {
             group_divider_dragging: None,
             tab_dragging: false,
             tab_drag_start: None,
+            tab_drag_source: None,
+            tab_drag_drop_zone: core::window::DropZone::None,
             window: None,
             last_sc_refresh: std::time::Instant::now(),
             last_tree_indicator_update: std::time::Instant::now(),
@@ -1571,6 +1577,7 @@ impl App {
                 // small String) and runtime toggles (`:set nonerdfonts`,
                 // `:set guifont=…`) propagate without a restart.
                 {
+                    use quadraui::Backend;
                     let e = self.engine.borrow();
                     let mut b = self.backend.borrow_mut();
                     b.set_nerd_fonts(e.settings.use_nerd_fonts);
@@ -4397,8 +4404,7 @@ impl App {
         // Tab drag-and-drop handling.
         if self.tab_dragging {
             // Update drop zone while dragging.
-            let mut engine = self.engine.borrow_mut();
-            engine.tab_drag_mouse = Some((x, y));
+            let engine = self.engine.borrow();
             let zone = compute_tab_drop_zone(
                 &engine,
                 x,
@@ -4409,7 +4415,8 @@ impl App {
                 self.cached_char_width,
                 &self.tab_slot_positions.borrow(),
             );
-            engine.tab_drop_zone = zone;
+            drop(engine);
+            self.tab_drag_drop_zone = zone;
             self.draw_needed.set(true);
             return;
         }
@@ -4448,8 +4455,8 @@ impl App {
                         .get(&gid)
                         .map(|g| g.active_tab)
                         .unwrap_or(0);
-                    engine.tab_drag_begin(gid, tidx);
-                    engine.tab_drag_mouse = Some((x, y));
+                    self.tab_drag_source = Some((gid, tidx));
+                    self.tab_drag_drop_zone = core::window::DropZone::None;
                     self.tab_dragging = true;
                     self.tab_drag_start = None;
                     self.draw_needed.set(true);
@@ -4592,9 +4599,16 @@ impl App {
         // Tab drag drop.
         if self.tab_dragging {
             self.tab_dragging = false;
-            let mut engine = self.engine.borrow_mut();
-            let zone = engine.tab_drop_zone;
-            engine.tab_drag_drop(zone);
+            if let Some((src_gid, src_tab_idx)) = self.tab_drag_source.take() {
+                let zone = self.tab_drag_drop_zone;
+                self.tab_drag_drop_zone = core::window::DropZone::None;
+                crate::tab_group_ctrl::apply_drop_zone(
+                    &mut self.engine.borrow_mut(),
+                    src_gid,
+                    src_tab_idx,
+                    zone,
+                );
+            }
             self.draw_needed.set(true);
         }
         self.tab_drag_start = None;

@@ -2041,72 +2041,6 @@ impl Engine {
     // --- Tab drag-and-drop ---
 
     /// Begin dragging a tab from the given group.
-    pub fn tab_drag_begin(&mut self, group_id: GroupId, tab_index: usize) {
-        let name = self
-            .editor_groups
-            .get(&group_id)
-            .and_then(|g| g.tabs.get(tab_index))
-            .and_then(|t| self.windows.get(&t.active_window))
-            .and_then(|w| self.buffer_manager.get(w.buffer_id))
-            .map(|s| s.display_name())
-            .unwrap_or_default();
-        self.tab_drag = Some(TabDragState {
-            source_group: group_id,
-            source_tab_index: tab_index,
-            tab_name: name,
-        });
-        self.tab_drop_zone = DropZone::None;
-    }
-
-    /// Cancel an in-progress tab drag.
-    #[allow(dead_code)]
-    pub fn tab_drag_cancel(&mut self) {
-        self.tab_drag = None;
-        self.tab_drag_mouse = None;
-        self.tab_drop_zone = DropZone::None;
-    }
-
-    /// Execute the drop for the current tab drag.
-    pub fn tab_drag_drop(&mut self, zone: DropZone) {
-        let drag = match self.tab_drag.take() {
-            Some(d) => d,
-            None => return,
-        };
-        self.tab_drag_mouse = None;
-        self.tab_drop_zone = DropZone::None;
-
-        match zone {
-            DropZone::Center(target) => {
-                if target != drag.source_group {
-                    self.move_tab_to_target_group(drag.source_group, drag.source_tab_index, target);
-                }
-            }
-            DropZone::Split(target, direction, new_first) => {
-                self.move_tab_to_new_split(
-                    drag.source_group,
-                    drag.source_tab_index,
-                    target,
-                    direction,
-                    new_first,
-                );
-            }
-            DropZone::TabReorder(group_id, to_idx) => {
-                if group_id == drag.source_group {
-                    self.reorder_tab_in_group(group_id, drag.source_tab_index, to_idx);
-                } else {
-                    // Drag to a specific position in another group
-                    self.move_tab_to_target_group_at(
-                        drag.source_group,
-                        drag.source_tab_index,
-                        group_id,
-                        to_idx,
-                    );
-                }
-            }
-            DropZone::None => {}
-        }
-    }
-
     /// Move a tab from one group to another (appends at end).
     pub fn move_tab_to_target_group(
         &mut self,
@@ -2118,7 +2052,7 @@ impl Engine {
     }
 
     /// Move a tab from one group to another at a specific insertion index.
-    pub(crate) fn move_tab_to_target_group_at(
+    pub fn move_tab_to_target_group_at(
         &mut self,
         src_group: GroupId,
         tab_idx: usize,
@@ -2156,7 +2090,7 @@ impl Engine {
     }
 
     /// Move a tab out of its group into a new split adjacent to `target_group`.
-    pub(crate) fn move_tab_to_new_split(
+    pub fn move_tab_to_new_split(
         &mut self,
         src_group: GroupId,
         tab_idx: usize,
