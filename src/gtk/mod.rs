@@ -3701,6 +3701,11 @@ impl App {
                 };
                 let has_focus = engine.editor_hover_has_focus;
                 drop(engine);
+                if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                    eprintln!(
+                        "[HIT editor_hover] is_some=true on_popup={on_popup} has_focus={has_focus} popup_rect={rect:?}"
+                    );
+                }
                 if on_popup {
                     // Scrollbar hit-test (#215). Track click jumps to that
                     // offset and arms a drag so mouse-move updates the
@@ -3791,6 +3796,9 @@ impl App {
                     self.engine.borrow_mut().dismiss_editor_hover();
                 }
             }
+        }
+        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+            eprintln!("[HIT probe] F: past editor-hover, entering dialog block");
         }
         // Dialog button click — highest z-order element.
         //
