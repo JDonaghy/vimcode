@@ -6,8 +6,6 @@ mod core;
 mod gtk;
 mod icons;
 mod render;
-#[cfg(feature = "gui")]
-mod tab_group_ctrl;
 mod tui_main;
 
 use std::path::PathBuf;
