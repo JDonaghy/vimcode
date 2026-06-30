@@ -147,6 +147,18 @@ fn tab_bar_inner_hit_test(
         cached_layout.tab_bar_hit_regions.as_slice()
     };
 
+    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+        eprintln!(
+            "[HIT tab] group={} local_x={:.1} char_w={:.2} col={} -> {:?} | regions={:?}",
+            group_id.0,
+            local_x,
+            char_width,
+            col,
+            render_mod::resolve_tab_bar_click(regions, col),
+            regions,
+        );
+    }
+
     match render_mod::resolve_tab_bar_click(regions, col) {
         Some(T::Tab(idx)) => {
             engine.goto_tab(idx);
