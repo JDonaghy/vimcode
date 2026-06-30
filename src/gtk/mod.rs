@@ -3798,7 +3798,10 @@ impl App {
             }
         }
         if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-            eprintln!("[HIT probe] F: past editor-hover, entering dialog block");
+            eprintln!(
+                "[HIT probe] F: past editor-hover, entering dialog block (dialog_open={})",
+                self.engine.borrow().dialog.is_some()
+            );
         }
         // Dialog button click — highest z-order element.
         //
