@@ -406,6 +406,13 @@ struct App {
     cached_drop_groups: Rc<RefCell<Vec<render::TabDropGroup>>>,
     /// Effective tab-bar height (px) paired with `cached_drop_groups`.
     cached_drop_tbh: Rc<Cell<f32>>,
+    /// Backend (line_height, char_width) captured at the instant the file
+    /// explorer tree was rendered. The backend's `current_line_height` is mutable
+    /// per-frame state and may differ by click time, which made the explorer
+    /// hit-test resolve the wrong row (it ran `tree_layout` at a different line
+    /// height than `draw_tree` used). Re-applied before hit-testing so draw and
+    /// hit agree. (#540 ShellApp port)
+    cached_explorer_metrics: Rc<Cell<(f64, f64)>>,
     /// Pixel y-offset where the debug toolbar was last drawn.
     debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
@@ -1191,6 +1198,7 @@ impl App {
             cached_screen_layout: Rc::new(RefCell::new(None)),
             cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
             cached_drop_tbh: Rc::new(Cell::new(0.0)),
+            cached_explorer_metrics: Rc::new(Cell::new((16.0, 8.0))),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
             terminal_resize_dragging: false,
@@ -3627,7 +3635,12 @@ impl App {
                             self.engine.borrow_mut().handle_breadcrumb_click(idx);
                             return;
                         }
-                        render::BreadcrumbClickResult::OnBar => return,
+                        render::BreadcrumbClickResult::OnBar => {
+                            if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                                eprintln!("[HIT divert] breadcrumb OnBar consumed click");
+                            }
+                            return;
+                        }
                         render::BreadcrumbClickResult::Miss => {}
                     }
                 }
@@ -4141,6 +4154,11 @@ impl App {
 
                     if engine.is_vscode_mode() {
                         engine.vscode_clear_selection();
+                    }
+                    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                        eprintln!(
+                            "[HIT reached_editor_click] dispatching to pixel_to_click_target"
+                        );
                     }
                     let editor_pl = self.editor_pango_layout(&engine);
                     let (click_result, engine_action) = {
@@ -6350,6 +6368,11 @@ impl App {
                         );
                         let tree_event = {
                             let mut b = self.backend.borrow_mut();
+                            // Re-apply the metrics the tree was drawn with so the
+                            // hit-test row math matches the rendered rows. (#540)
+                            let (lh, cw) = self.cached_explorer_metrics.get();
+                            b.set_current_line_height(lh);
+                            b.set_current_char_width(cw);
                             self.engine
                                 .borrow()
                                 .explorer_tree
@@ -7450,16 +7473,12 @@ impl quadraui::ShellApp for App {
             match active_id.as_str() {
                 PANEL_EXPLORER => {
                     render::populate_explorer_tree_controller(&engine, &theme);
-                    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                        eprintln!(
-                            "[DRAW explorer] q_sb=(x{:.1} y{:.1} w{:.1} h{:.1}) render_line_h={:.2}",
-                            q_sb.x,
-                            q_sb.y,
-                            q_sb.width,
-                            q_sb.height,
-                            backend.line_height()
-                        );
-                    }
+                    // Capture the exact metrics the tree is drawn with so the
+                    // click hit-test (which reads the backend's mutable
+                    // current_line_height at a later, possibly-different time) can
+                    // re-apply them and resolve the correct row. (#540)
+                    self.cached_explorer_metrics
+                        .set((backend.line_height() as f64, backend.char_width() as f64));
                     engine.explorer_tree_rect.set(q_sb);
                     engine.explorer_viewport_rows.set(q_sb.height as usize);
                     engine.explorer_tree.borrow().render(backend, q_sb);
