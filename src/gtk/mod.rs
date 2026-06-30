@@ -3629,27 +3629,45 @@ impl App {
         // Breadcrumb click: shared resolution via cached StatusBarLayout.
         {
             let engine = self.engine.borrow();
+            if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                eprintln!(
+                    "[HIT probe] C: reached breadcrumb block (breadcrumbs={})",
+                    engine.settings.breadcrumbs
+                );
+            }
             if engine.settings.breadcrumbs {
                 let lh = self.cached_line_height.max(1.0);
                 if let Some(ref screen) = *self.cached_screen_layout.borrow() {
-                    match render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh) {
+                    let bc_result = render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh);
+                    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                        let bars: Vec<(f64, f64, f64)> = screen
+                            .breadcrumbs
+                            .iter()
+                            .filter(|b| !b.segments.is_empty())
+                            .map(|b| (b.bounds.x, b.bounds.y, b.bounds.width))
+                            .collect();
+                        eprintln!(
+                            "[HIT breadcrumb] result={:?} click=({x:.1},{y:.1}) lh={lh:.1} \
+                             bars(x,y,w)={bars:?}",
+                            bc_result
+                        );
+                    }
+                    match bc_result {
                         render::BreadcrumbClickResult::Hit(idx) => {
                             drop(engine);
                             self.engine.borrow_mut().handle_breadcrumb_click(idx);
                             return;
                         }
-                        render::BreadcrumbClickResult::OnBar => {
-                            if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                                eprintln!("[HIT divert] breadcrumb OnBar consumed click");
-                            }
-                            return;
-                        }
+                        render::BreadcrumbClickResult::OnBar => return,
                         render::BreadcrumbClickResult::Miss => {}
                     }
                 }
             }
         }
 
+        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+            eprintln!("[HIT probe] D: past breadcrumb, entering debug-toolbar block");
+        }
         // Debug toolbar click: resolve via cached ToolbarLayout on engine (#510).
         {
             let dbg_y = self.debug_toolbar_y_offset.get();
@@ -3668,6 +3686,9 @@ impl App {
             }
         }
 
+        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+            eprintln!("[HIT probe] E: past debug-toolbar, entering editor-hover block");
+        }
         // Editor hover: click on the popup focuses it; click elsewhere dismisses it
         {
             let engine = self.engine.borrow();
