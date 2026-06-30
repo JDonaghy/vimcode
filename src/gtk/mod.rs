@@ -3135,6 +3135,9 @@ impl App {
         // Esc dismisses). Click anywhere dismisses — inside the popup
         // also consumes (no editor cursor-move underneath); outside
         // dismisses + propagates so the editor receives the click.
+        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+            eprintln!("[HIT probe] A: past scroll-surface dispatch");
+        }
         if self.engine.borrow().tab_switcher_open {
             let switcher_id = quadraui::WidgetId::new("tab_switcher");
             let inside = if let Some((px, py, pw, ph)) = self.tab_switcher_popup_rect.get() {
@@ -3951,6 +3954,9 @@ impl App {
             // user explicitly Escapes out of the sidebar. The DAP-only
             // version of this clear was incomplete; tracked all fields via
             // `clear_sidebar_focus()` instead.
+            if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                eprintln!("[HIT probe] B: entering editor section (past modals/breadcrumb/hover)");
+            }
             self.engine.borrow_mut().clear_sidebar_focus();
             // Check if click lands in the terminal panel before general handling.
             // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
