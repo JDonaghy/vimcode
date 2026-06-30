@@ -6353,6 +6353,25 @@ impl App {
                                 .borrow_mut()
                                 .handle(&ev, &mut *b, rect)
                         };
+                        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                            use quadraui::Backend as _;
+                            let p = match &ev {
+                                quadraui::UiEvent::MouseDown { position, .. }
+                                | quadraui::UiEvent::MouseUp { position, .. }
+                                | quadraui::UiEvent::DoubleClick { position, .. }
+                                | quadraui::UiEvent::MouseMoved { position, .. }
+                                | quadraui::UiEvent::Scroll { position, .. } => Some(*position),
+                                _ => None,
+                            };
+                            let lh = self.backend.borrow().line_height();
+                            let scroll =
+                                self.engine.borrow().explorer_tree.borrow().scroll_offset();
+                            eprintln!(
+                                "[HIT explorer] pos={:?} rect=(x{:.1} y{:.1} w{:.1} h{:.1}) \
+                                 line_h={:.2} scroll={} -> {:?}",
+                                p, rect.x, rect.y, rect.width, rect.height, lh, scroll, tree_event
+                            );
+                        }
                         let is_scrollbar =
                             matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
                         if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
