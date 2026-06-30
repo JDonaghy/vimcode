@@ -3075,9 +3075,6 @@ impl App {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
-        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-            eprintln!("[HIT click_msg] x={x:.1} y={y:.1} w={width:.1} h={height:.1}");
-        }
         self.reconcile_editor_hover_modal();
 
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
@@ -3135,9 +3132,6 @@ impl App {
         // Esc dismisses). Click anywhere dismisses — inside the popup
         // also consumes (no editor cursor-move underneath); outside
         // dismisses + propagates so the editor receives the click.
-        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-            eprintln!("[HIT probe] A: past scroll-surface dispatch");
-        }
         if self.engine.borrow().tab_switcher_open {
             let switcher_id = quadraui::WidgetId::new("tab_switcher");
             let inside = if let Some((px, py, pw, ph)) = self.tab_switcher_popup_rect.get() {
@@ -3629,30 +3623,10 @@ impl App {
         // Breadcrumb click: shared resolution via cached StatusBarLayout.
         {
             let engine = self.engine.borrow();
-            if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                eprintln!(
-                    "[HIT probe] C: reached breadcrumb block (breadcrumbs={})",
-                    engine.settings.breadcrumbs
-                );
-            }
             if engine.settings.breadcrumbs {
                 let lh = self.cached_line_height.max(1.0);
                 if let Some(ref screen) = *self.cached_screen_layout.borrow() {
-                    let bc_result = render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh);
-                    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                        let bars: Vec<(f64, f64, f64)> = screen
-                            .breadcrumbs
-                            .iter()
-                            .filter(|b| !b.segments.is_empty())
-                            .map(|b| (b.bounds.x, b.bounds.y, b.bounds.width))
-                            .collect();
-                        eprintln!(
-                            "[HIT breadcrumb] result={:?} click=({x:.1},{y:.1}) lh={lh:.1} \
-                             bars(x,y,w)={bars:?}",
-                            bc_result
-                        );
-                    }
-                    match bc_result {
+                    match render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh) {
                         render::BreadcrumbClickResult::Hit(idx) => {
                             drop(engine);
                             self.engine.borrow_mut().handle_breadcrumb_click(idx);
@@ -3665,9 +3639,6 @@ impl App {
             }
         }
 
-        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-            eprintln!("[HIT probe] D: past breadcrumb, entering debug-toolbar block");
-        }
         // Debug toolbar click: resolve via cached ToolbarLayout on engine (#510).
         {
             let dbg_y = self.debug_toolbar_y_offset.get();
@@ -3686,9 +3657,6 @@ impl App {
             }
         }
 
-        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-            eprintln!("[HIT probe] E: past debug-toolbar, entering editor-hover block");
-        }
         // Editor hover: click on the popup focuses it; click elsewhere dismisses it
         {
             let engine = self.engine.borrow();
@@ -3701,11 +3669,6 @@ impl App {
                 };
                 let has_focus = engine.editor_hover_has_focus;
                 drop(engine);
-                if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                    eprintln!(
-                        "[HIT editor_hover] is_some=true on_popup={on_popup} has_focus={has_focus} popup_rect={rect:?}"
-                    );
-                }
                 if on_popup {
                     // Scrollbar hit-test (#215). Track click jumps to that
                     // offset and arms a drag so mouse-move updates the
@@ -3796,12 +3759,6 @@ impl App {
                     self.engine.borrow_mut().dismiss_editor_hover();
                 }
             }
-        }
-        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-            eprintln!(
-                "[HIT probe] F: past editor-hover, entering dialog block (dialog_open={})",
-                self.engine.borrow().dialog.is_some()
-            );
         }
         // Dialog button click — highest z-order element.
         //
@@ -3986,9 +3943,6 @@ impl App {
             // user explicitly Escapes out of the sidebar. The DAP-only
             // version of this clear was incomplete; tracked all fields via
             // `clear_sidebar_focus()` instead.
-            if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                eprintln!("[HIT probe] B: entering editor section (past modals/breadcrumb/hover)");
-            }
             self.engine.borrow_mut().clear_sidebar_focus();
             // Check if click lands in the terminal panel before general handling.
             // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
@@ -4192,11 +4146,6 @@ impl App {
 
                     if engine.is_vscode_mode() {
                         engine.vscode_clear_selection();
-                    }
-                    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                        eprintln!(
-                            "[HIT reached_editor_click] dispatching to pixel_to_click_target"
-                        );
                     }
                     let editor_pl = self.editor_pango_layout(&engine);
                     let (click_result, engine_action) = {
@@ -6417,25 +6366,6 @@ impl App {
                                 .borrow_mut()
                                 .handle(&ev, &mut *b, rect)
                         };
-                        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-                            use quadraui::Backend as _;
-                            let p = match &ev {
-                                quadraui::UiEvent::MouseDown { position, .. }
-                                | quadraui::UiEvent::MouseUp { position, .. }
-                                | quadraui::UiEvent::DoubleClick { position, .. }
-                                | quadraui::UiEvent::MouseMoved { position, .. }
-                                | quadraui::UiEvent::Scroll { position, .. } => Some(*position),
-                                _ => None,
-                            };
-                            let lh = self.backend.borrow().line_height();
-                            let scroll =
-                                self.engine.borrow().explorer_tree.borrow().scroll_offset();
-                            eprintln!(
-                                "[HIT explorer] pos={:?} rect=(x{:.1} y{:.1} w{:.1} h{:.1}) \
-                                 line_h={:.2} scroll={} -> {:?}",
-                                p, rect.x, rect.y, rect.width, rect.height, lh, scroll, tree_event
-                            );
-                        }
                         let is_scrollbar =
                             matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
                         if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
