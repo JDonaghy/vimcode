@@ -47,12 +47,6 @@ pub(super) fn pixel_to_click_target(
         single_tab_hidden,
         engine.active_group,
     );
-    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-        eprintln!(
-            "[HIT p2ct] x={:.1} y={:.1} tab_bar_h={:.1} zone={:?}",
-            x, y, tab_bar_height, zone
-        );
-    }
     match zone {
         ScreenZone::TabBar {
             group_id,
@@ -153,18 +147,6 @@ fn tab_bar_inner_hit_test(
     } else {
         cached_layout.tab_bar_hit_regions.as_slice()
     };
-
-    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
-        eprintln!(
-            "[HIT tab] group={} local_x={:.1} char_w={:.2} col={} -> {:?} | regions={:?}",
-            group_id.0,
-            local_x,
-            char_width,
-            col,
-            render_mod::resolve_tab_bar_click(regions, col),
-            regions,
-        );
-    }
 
     match render_mod::resolve_tab_bar_click(regions, col) {
         Some(T::Tab(idx)) => {
