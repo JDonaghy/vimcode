@@ -3067,6 +3067,9 @@ impl App {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
+        if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+            eprintln!("[HIT click_msg] x={x:.1} y={y:.1} w={width:.1} h={height:.1}");
+        }
         self.reconcile_editor_hover_modal();
 
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
@@ -7447,6 +7450,16 @@ impl quadraui::ShellApp for App {
             match active_id.as_str() {
                 PANEL_EXPLORER => {
                     render::populate_explorer_tree_controller(&engine, &theme);
+                    if std::env::var("VIMCODE_HIT_DEBUG").is_ok() {
+                        eprintln!(
+                            "[DRAW explorer] q_sb=(x{:.1} y{:.1} w{:.1} h{:.1}) render_line_h={:.2}",
+                            q_sb.x,
+                            q_sb.y,
+                            q_sb.width,
+                            q_sb.height,
+                            backend.line_height()
+                        );
+                    }
                     engine.explorer_tree_rect.set(q_sb);
                     engine.explorer_viewport_rows.set(q_sb.height as usize);
                     engine.explorer_tree.borrow().render(backend, q_sb);
