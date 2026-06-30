@@ -6380,6 +6380,57 @@ impl App {
         }
     }
 
+    /// Forward a pointer event over the sidebar content area to the active panel's
+    /// controller. In ShellApp mode the sidebar has no dedicated per-panel
+    /// `DrawingArea`, so events the Relm4 build delivered straight to the explorer
+    /// DA must be routed here instead. Currently wires the file explorer through
+    /// its shared `quadraui::TreeController` (via `Msg::ExplorerUiEvent`); other
+    /// panels have their own routing or are keyboard-driven. Returns `true` when
+    /// the event was consumed. (#540 ShellApp port)
+    fn try_route_sidebar_mouse_event(
+        &mut self,
+        event: &quadraui::UiEvent,
+        ctx: &quadraui::ShellContext<'_>,
+    ) -> bool {
+        use quadraui::UiEvent;
+
+        let Some(sb) = ctx.layout.sidebar_content_bounds else {
+            return false;
+        };
+        // Intercept only interaction-starting events (press / double-click) and
+        // wheel scroll. MouseMoved/MouseUp are deliberately NOT intercepted so an
+        // editor text-drag that happens to cross into the sidebar still finalizes
+        // through the editor's own mouse-up path.
+        let pos = match event {
+            UiEvent::MouseDown { position, .. }
+            | UiEvent::DoubleClick { position, .. }
+            | UiEvent::Scroll { position, .. } => *position,
+            _ => return false,
+        };
+        if pos.x < sb.x || pos.x >= sb.x + sb.width || pos.y < sb.y || pos.y >= sb.y + sb.height {
+            return false;
+        }
+
+        // Only the file explorer panel is wired through here. When no panel id is
+        // set the explorer is the default (mirrors render_content).
+        let explorer_active = {
+            let engine = self.engine.borrow();
+            engine.ext_panel_active.is_none()
+                && engine
+                    .app_shell
+                    .active_panel_id()
+                    .map(|id| id.as_str() == PANEL_EXPLORER)
+                    .unwrap_or(true)
+        };
+        if !explorer_active {
+            return false;
+        }
+
+        self.dispatch(Msg::ExplorerUiEvent(event.clone()));
+        self.draw_needed.set(true);
+        true
+    }
+
     fn explorer_row_at(&self, y: f64) -> Option<usize> {
         let engine = self.engine.borrow();
         let total = engine.explorer_rows.len();
@@ -7510,6 +7561,19 @@ impl quadraui::ShellApp for App {
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
         use quadraui::{Key, MouseButton, NamedKey, UiEvent};
+
+        // Pointer events over the sidebar content area are forwarded to the active
+        // panel's controller before the editor click path sees them. In ShellApp
+        // mode there is no per-panel DrawingArea, so without this the file explorer
+        // never receives clicks. (#540 ShellApp port)
+        if self.try_route_sidebar_mouse_event(&event, ctx) {
+            return if self.draw_needed.get() {
+                self.draw_needed.set(false);
+                quadraui::Reaction::Redraw
+            } else {
+                quadraui::Reaction::Continue
+            };
+        }
 
         match event {
             UiEvent::KeyPressed { key, modifiers, .. } => {
