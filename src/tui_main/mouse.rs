@@ -1091,7 +1091,7 @@ pub(super) fn handle_mouse(
                 if let Some((src_gid, src_tab_idx)) = tab_drag_source.take() {
                     let zone = *tab_drop_zone;
                     *tab_drop_zone = crate::core::window::DropZone::None;
-                    apply_tui_drop_zone(engine, src_gid, src_tab_idx, zone);
+                    engine.apply_tab_drop_zone(src_gid, src_tab_idx, zone);
                 }
                 *tab_drag_cursor = None;
                 return sidebar_width;
@@ -3096,38 +3096,5 @@ fn status_segment_hit_test(
     match layout.hit_test(click_col as f32, 0.0) {
         quadraui::StatusBarHit::Segment(id) => crate::render::status_action_from_id(id.as_str()),
         quadraui::StatusBarHit::Empty => None,
-    }
-}
-
-// ── Tab drag drop zone application (TUI path) ─────────────────────────────────
-
-/// Apply a `DropZone` to the engine for the TUI tab drag path.
-///
-/// Equivalent to `tab_group_ctrl::apply_drop_zone` but does not require the
-/// `quadraui/gtk` feature, so it is safe to call from TUI code.
-fn apply_tui_drop_zone(
-    engine: &mut Engine,
-    source_gid: crate::core::window::GroupId,
-    source_tab_idx: usize,
-    zone: crate::core::window::DropZone,
-) {
-    use crate::core::window::DropZone;
-    match zone {
-        DropZone::Center(target) => {
-            if target != source_gid {
-                engine.move_tab_to_target_group(source_gid, source_tab_idx, target);
-            }
-        }
-        DropZone::Split(target, direction, new_first) => {
-            engine.move_tab_to_new_split(source_gid, source_tab_idx, target, direction, new_first);
-        }
-        DropZone::TabReorder(group_id, to_idx) => {
-            if group_id == source_gid {
-                engine.reorder_tab_in_group(group_id, source_tab_idx, to_idx);
-            } else {
-                engine.move_tab_to_target_group_at(source_gid, source_tab_idx, group_id, to_idx);
-            }
-        }
-        DropZone::None => {}
     }
 }

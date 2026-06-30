@@ -1594,6 +1594,7 @@ impl App {
                 // small String) and runtime toggles (`:set nonerdfonts`,
                 // `:set guifont=…`) propagate without a restart.
                 {
+                    use quadraui::Backend;
                     let e = self.engine.borrow();
                     let mut b = self.backend.borrow_mut();
                     b.set_nerd_fonts(e.settings.use_nerd_fonts);
@@ -4618,12 +4619,9 @@ impl App {
             if let Some((src_gid, src_tab_idx)) = self.tab_drag_source.take() {
                 let zone = self.tab_drag_drop_zone;
                 self.tab_drag_drop_zone = core::window::DropZone::None;
-                crate::tab_group_ctrl::apply_drop_zone(
-                    &mut self.engine.borrow_mut(),
-                    src_gid,
-                    src_tab_idx,
-                    zone,
-                );
+                self.engine
+                    .borrow_mut()
+                    .apply_tab_drop_zone(src_gid, src_tab_idx, zone);
             }
             self.draw_needed.set(true);
         }

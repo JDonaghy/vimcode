@@ -15952,6 +15952,95 @@ fn test_tab_drag_reorder_to_other_group_at_index() {
     assert!(e.buffer().to_string().starts_with("aaa"));
 }
 
+// ── apply_tab_drop_zone: shared cross-backend drop entry point (#515) ────────
+
+#[test]
+fn test_apply_drop_zone_center_moves_tab() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let group1 = e.active_group;
+    e.open_editor_group(SplitDirection::Vertical);
+    let group2 = e.active_group;
+    assert_ne!(group1, group2);
+
+    // Drop tab 0 of group1 into the center of group2 → merge.
+    e.apply_tab_drop_zone(group1, 0, DropZone::Center(group2));
+    assert_eq!(e.editor_groups.get(&group1).unwrap().tabs.len(), 1);
+    assert_eq!(e.editor_groups.get(&group2).unwrap().tabs.len(), 2);
+    assert_eq!(e.active_group, group2);
+}
+
+#[test]
+fn test_apply_drop_zone_center_same_group_is_noop() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    let before = e.editor_groups.get(&g).unwrap().tabs.len();
+    // Dropping onto its own group's center must not mutate anything.
+    e.apply_tab_drop_zone(g, 0, DropZone::Center(g));
+    assert_eq!(e.editor_groups.get(&g).unwrap().tabs.len(), before);
+}
+
+#[test]
+fn test_apply_drop_zone_split_creates_group() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    assert_eq!(e.editor_groups.len(), 1);
+
+    // Split tab 1 out of the only group into a new vertical split.
+    e.apply_tab_drop_zone(g, 1, DropZone::Split(g, SplitDirection::Vertical, false));
+    assert_eq!(e.editor_groups.len(), 2);
+    assert!(!e.group_layout.is_single_group());
+}
+
+#[test]
+fn test_apply_drop_zone_reorder_within_group() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    // Group has [aaa, bbb]; reorder tab 0 → index 1.
+    e.apply_tab_drop_zone(g, 0, DropZone::TabReorder(g, 1));
+    assert_eq!(e.active_group().active_tab, 1);
+}
+
+#[test]
+fn test_apply_drop_zone_reorder_across_groups() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    let group1 = e.active_group;
+    e.open_editor_group(SplitDirection::Vertical);
+    let group2 = e.active_group;
+    e.buffer_mut().insert(0, "bbb\n");
+    // TabReorder targeting a *different* group routes to move_tab_to_target_group_at.
+    e.apply_tab_drop_zone(group1, 0, DropZone::TabReorder(group2, 0));
+    // group1 had its only tab → collapses; group2 gains it.
+    assert_eq!(e.editor_groups.len(), 1);
+    assert!(e.editor_groups.contains_key(&group2));
+}
+
+#[test]
+fn test_apply_drop_zone_none_is_noop() {
+    use crate::core::window::DropZone;
+    let mut e = engine_with_text("aaa\n");
+    e.new_tab(None);
+    e.buffer_mut().insert(0, "bbb\n");
+    let g = e.active_group;
+    let before = e.editor_groups.get(&g).unwrap().tabs.len();
+    let active_before = e.active_group().active_tab;
+    e.apply_tab_drop_zone(g, 0, DropZone::None);
+    assert_eq!(e.editor_groups.get(&g).unwrap().tabs.len(), before);
+    assert_eq!(e.active_group().active_tab, active_before);
+}
+
 #[test]
 fn test_has_code_actions_on_line_empty() {
     let e = engine_with_text("hello\nworld\n");

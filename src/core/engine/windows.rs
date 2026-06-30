@@ -2126,6 +2126,47 @@ impl Engine {
         }
     }
 
+    /// Apply a resolved tab-drag [`DropZone`] to the engine.
+    ///
+    /// This is the single, backend-agnostic entry point for committing a tab
+    /// drag-and-drop. Both the GTK and TUI backends resolve the drop zone with
+    /// `quadraui::compute_drop_zone` (via `render::compute_tab_drop_zone`) and
+    /// then call this method, so the mutation semantics live in exactly one
+    /// place. `source_gid` / `source_tab_idx` identify the dragged tab, captured
+    /// when the drag started.
+    pub fn apply_tab_drop_zone(
+        &mut self,
+        source_gid: GroupId,
+        source_tab_idx: usize,
+        zone: crate::core::window::DropZone,
+    ) {
+        use crate::core::window::DropZone;
+        match zone {
+            DropZone::Center(target) => {
+                if target != source_gid {
+                    self.move_tab_to_target_group(source_gid, source_tab_idx, target);
+                }
+            }
+            DropZone::Split(target, direction, new_first) => {
+                self.move_tab_to_new_split(
+                    source_gid,
+                    source_tab_idx,
+                    target,
+                    direction,
+                    new_first,
+                );
+            }
+            DropZone::TabReorder(group_id, to_idx) => {
+                if group_id == source_gid {
+                    self.reorder_tab_in_group(group_id, source_tab_idx, to_idx);
+                } else {
+                    self.move_tab_to_target_group_at(source_gid, source_tab_idx, group_id, to_idx);
+                }
+            }
+            DropZone::None => {}
+        }
+    }
+
     /// Reorder a tab within its group.
     pub fn reorder_tab_in_group(&mut self, group_id: GroupId, from_idx: usize, to_idx: usize) {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {
