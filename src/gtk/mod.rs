@@ -63,6 +63,10 @@ type TabCloseMap = HashMap<usize, Vec<Option<(f64, f64)>>>;
 /// so a hover shows the exact box that a click would close. (#515)
 type TabCloseAbsMap = HashMap<usize, (f64, f64, Vec<Option<(f64, f64)>>)>;
 
+/// Absolute visible tab-slot x-ranges per group (`group_id.0` → `[(x0,x1)]`).
+/// See `ShellApp::cached_tab_slots_abs` for the full doc comment. (#515)
+type TabSlotsAbsMap = HashMap<usize, Vec<(f32, f32)>>;
+
 // ── GTK editor-group tab-bar close-glyph metrics ─────────────────────────────
 // The quadraui GTK rasteriser lays each non-compact tab out as
 // `tab_pad | label | tab_inner_gap | × | tab_pad | tab_outer_gap` and reports a
@@ -560,7 +564,7 @@ struct App {
     /// captured in `render_content`. Feeds the tab drop-zone computation so a
     /// short drag inside a group's own tab bar resolves to a `TabReorder` (with
     /// an insertion bar) rather than a new-split overlay. (#515)
-    cached_tab_slots_abs: Rc<RefCell<HashMap<usize, Vec<(f32, f32)>>>>,
+    cached_tab_slots_abs: Rc<RefCell<TabSlotsAbsMap>>,
     /// Pixel-accurate per-group tab-bar hit geometry from the ShellApp
     /// `render_content` pass (via `Backend::tab_bar_layout`). Consumed by the
     /// GTK tab-bar click hit-test instead of the char-cell `hit_regions`, which

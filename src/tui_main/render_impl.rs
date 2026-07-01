@@ -340,24 +340,23 @@ pub(super) fn draw_frame(
         }
         // Draw breadcrumb bars (below each group's tab bar). Hidden while the
         // terminal panel is maximized so it can claim the row. Skip
-        // conditions + rect math come from `render::breadcrumb_draw_targets`,
-        // shared with GTK, so the two backends can't drift apart (#547).
+        // conditions + rect math (including the zero-width fallback filter)
+        // come from `render::breadcrumb_draw_targets`, shared with GTK, so
+        // the two backends can't drift apart (#547).
         for t in render::breadcrumb_draw_targets(
             screen,
             engine.terminal_maximized,
             1.0,
             (editor_area.x as f64, editor_area.y as f64),
         ) {
-            if t.rect.width > 0.0 {
-                let bc_rect = Rect {
-                    x: t.rect.x as u16,
-                    y: t.rect.y as u16,
-                    width: t.rect.width as u16,
-                    height: 1,
-                };
-                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
-                *t.draw_layout.borrow_mut() = Some(layout);
-            }
+            let bc_rect = Rect {
+                x: t.rect.x as u16,
+                y: t.rect.y as u16,
+                width: t.rect.width as u16,
+                height: 1,
+            };
+            let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
+            *t.draw_layout.borrow_mut() = Some(layout);
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
         let sep_fg = rc(theme.separator);
@@ -398,16 +397,14 @@ pub(super) fn draw_frame(
             1.0,
             (editor_area.x as f64, editor_area.y as f64),
         ) {
-            if t.rect.width > 0.0 {
-                let bc_rect = Rect {
-                    x: t.rect.x as u16,
-                    y: t.rect.y as u16,
-                    width: t.rect.width as u16,
-                    height: 1,
-                };
-                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
-                *t.draw_layout.borrow_mut() = Some(layout);
-            }
+            let bc_rect = Rect {
+                x: t.rect.x as u16,
+                y: t.rect.y as u16,
+                width: t.rect.width as u16,
+                height: 1,
+            };
+            let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
+            *t.draw_layout.borrow_mut() = Some(layout);
         }
         render_all_windows(backend, frame, editor_area, &screen.windows, theme);
     }
