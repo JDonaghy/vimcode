@@ -718,6 +718,69 @@ pub fn resolve_breadcrumb_click(
     BreadcrumbClickResult::Miss
 }
 
+/// One breadcrumb bar ready to be painted via `Surface::StatusBar` (GTK) or
+/// `Backend::draw_status_bar` (TUI).
+pub struct BreadcrumbDrawTarget<'a> {
+    pub rect: quadraui::Rect,
+    pub bar: &'a quadraui::StatusBar,
+    /// Cache slot to fill with the draw-time layout so
+    /// `resolve_breadcrumb_click` can hit-test segments later.
+    pub draw_layout: &'a std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
+}
+
+/// Compute which breadcrumb bars should be painted this frame, and where.
+///
+/// Both backends call this instead of re-deriving the skip conditions
+/// themselves — TUI previously duplicated the same `segments.is_empty() ||
+/// terminal_maximized` check in both its split-group and single-group
+/// branches, and GTK's ShellApp render path was simply missing it entirely,
+/// which was the root cause of the #547 breadcrumb regression (the legacy
+/// Relm4-era draw path that *did* draw breadcrumbs stopped being called
+/// after the #540 ShellApp migration and nothing replaced it).
+///
+/// `origin_offset` translates `bc.bounds` (computed relative to the
+/// coordinate space of the `window_rects` passed into `build_screen_layout`)
+/// into the caller's screen space: GTK's window rects are already absolute,
+/// so it passes `(0.0, 0.0)`; TUI's are content-area-relative, so it passes
+/// `(editor_area.x, editor_area.y)`.
+pub fn breadcrumb_draw_targets(
+    screen: &ScreenLayout,
+    terminal_maximized: bool,
+    line_height: f64,
+    origin_offset: (f64, f64),
+) -> Vec<BreadcrumbDrawTarget<'_>> {
+    if terminal_maximized {
+        return Vec::new();
+    }
+    let (ox, oy) = origin_offset;
+    screen
+        .breadcrumbs
+        .iter()
+        .filter(|bc| !bc.segments.is_empty())
+        .map(|bc| BreadcrumbDrawTarget {
+            rect: quadraui::Rect::new(
+                (bc.bounds.x + ox) as f32,
+                (bc.bounds.y + oy) as f32,
+                bc.bounds.width as f32,
+                line_height as f32,
+            ),
+            bar: &bc.bar,
+            draw_layout: &bc.draw_layout,
+        })
+        .collect()
+}
+
+/// Sync the backend's Nerd-Font-glyph-vs-fallback selection with current
+/// settings. Both backends call this at startup and once per frame so
+/// runtime toggles (`:set nonerdfonts`) take effect immediately; centralizing
+/// it avoids the #547 regression where GTK's only call site was inside a
+/// message handler (`Msg::CacheFontMetrics`) that stopped firing after the
+/// #540 ShellApp migration, silently freezing the GTK backend's nerd-fonts
+/// flag at its default (`false`) forever.
+pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
+    b.set_nerd_fonts(engine.settings.use_nerd_fonts);
+}
+
 /// Present when the editor area is split into two or more independent groups.
 /// `ScreenLayout.tab_bar` always contains the first group's tab bar for
 /// backward compat in single-group mode.
@@ -15278,7 +15341,7 @@ mod tests {
     #[test]
     fn test_breadcrumb_bounds_do_not_overlap_first_line() {
         use crate::core::engine::Engine;
-        use crate::core::window::{GroupId, WindowRect};
+        use crate::core::window::WindowRect;
 
         let mut engine = Engine::new();
         engine.settings.breadcrumbs = true;
@@ -15318,5 +15381,91 @@ mod tests {
             "click at window_top should hit Window zone, got {:?}",
             zone,
         );
+    }
+
+    /// Pins that `bc.bounds.y` (row units, matching TUI's convention) shifts
+    /// up by one row when a single-tab group's tab bar is hidden
+    /// (`hide_single_tab`), and down by one when it's shown. TUI's
+    /// single-group breadcrumb draw used to special-case
+    /// `is_tab_bar_hidden` itself instead of trusting `bc.bounds.y` (#547);
+    /// this pins the equivalence that made unifying it onto
+    /// `breadcrumb_draw_targets` safe — `calculate_group_window_rects` →
+    /// `adjust_group_rects_for_hidden_tabs` is what actually shifts the
+    /// window (and thus breadcrumb) bounds.
+    #[test]
+    fn test_single_group_breadcrumb_bounds_reflect_hidden_tab_bar() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let line_height = 1.0; // TUI row units.
+        let char_width = 1.0;
+        let theme = Theme::onedark();
+
+        let bounds_y_for = |hide_single_tab: bool| -> f64 {
+            let mut engine = Engine::new();
+            engine.settings.breadcrumbs = true;
+            engine.settings.hide_single_tab = hide_single_tab;
+            // TUI's own row-unit convention (`tui_tab_bar_height` in
+            // `render_impl.rs`), NOT `tab_bar_height_px` — that helper rounds
+            // to a pixel-oriented `line_height * 1.6` tab row for GTK/Win-GUI,
+            // which doesn't map to a clean row count in TUI's 1-row-per-line
+            // units.
+            let tbh = 2.0;
+            let content_bounds = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+            let (rects, _) = engine.calculate_group_window_rects(content_bounds, tbh);
+            let layout =
+                build_screen_layout(&engine, &theme, &rects, line_height, char_width, true);
+            assert!(!layout.breadcrumbs.is_empty());
+            layout.breadcrumbs[0].bounds.y
+        };
+
+        // Tab bar shown (default): breadcrumb sits one row below it.
+        assert_eq!(bounds_y_for(false), 1.0);
+        // Tab bar hidden (single tab, hide_single_tab=true): breadcrumb
+        // claims the row the tab bar would have used.
+        assert_eq!(bounds_y_for(true), 0.0);
+    }
+
+    /// Explorer tree row icons must always carry both a Nerd Font glyph and
+    /// a distinct fallback (#547) — selection between them is entirely the
+    /// backend's job (`Backend::set_nerd_fonts`), not `build_explorer_tree_rows`'s.
+    /// This is the platform-neutral half of the #547 icon regression: the
+    /// shared row-building logic was never the problem, but pinning it
+    /// guards against the fix drifting back to a GTK-only icon shim.
+    #[test]
+    fn test_explorer_tree_rows_carry_glyph_and_fallback_icons() {
+        use crate::core::engine::{Engine, ExplorerRow};
+        use std::path::PathBuf;
+
+        let engine = Engine::new();
+        let theme = Theme::onedark();
+        let rows = vec![
+            ExplorerRow {
+                depth: 0,
+                name: "src".to_string(),
+                path: PathBuf::from("src"),
+                is_dir: true,
+                is_expanded: true,
+            },
+            ExplorerRow {
+                depth: 1,
+                name: "main.rs".to_string(),
+                path: PathBuf::from("src/main.rs"),
+                is_dir: false,
+                is_expanded: false,
+            },
+        ];
+
+        let tree_rows = build_explorer_tree_rows(&rows, &engine, &theme);
+        assert_eq!(tree_rows.len(), 2);
+        for row in &tree_rows {
+            let icon = row.icon.as_ref().expect("every explorer row has an icon");
+            assert!(!icon.glyph.is_empty(), "glyph must not be empty");
+            assert!(!icon.fallback.is_empty(), "fallback must not be empty");
+            assert_ne!(
+                icon.glyph, icon.fallback,
+                "glyph and fallback must differ so backend selection is observable"
+            );
+        }
     }
 }

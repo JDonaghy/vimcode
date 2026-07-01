@@ -7411,6 +7411,12 @@ impl quadraui::ShellApp for App {
         self.cached_ui_line_height = self.cached_line_height;
         self.line_height_cell.set(self.cached_line_height);
         self.char_width_cell.set(self.cached_char_width);
+        // (#547) Seed the backend's nerd-fonts flag. The only prior call
+        // site was `Msg::CacheFontMetrics`, which stopped firing after the
+        // #540 ShellApp migration, silently freezing quadraui's GTK backend
+        // at its default of `false` — the cause of the explorer treeview
+        // falling back to ASCII icons.
+        render::sync_nerd_fonts(backend, &self.engine.borrow());
 
         // Grab the runner-created GTK window so minimize/maximize/close work.
         let window = gtk4::Window::list_toplevels()
@@ -7435,6 +7441,9 @@ impl quadraui::ShellApp for App {
         let engine = self.engine.borrow();
         let theme = Theme::from_name(&engine.settings.colorscheme);
         backend.set_theme(render::to_quadraui_theme(&theme));
+        // (#547) Re-synced every frame so runtime toggles (`:set
+        // nonerdfonts`) take effect immediately, matching TUI.
+        render::sync_nerd_fonts(backend, &engine);
 
         let lh = self.cached_line_height.max(backend.line_height() as f64);
         let cw = self.cached_char_width.max(backend.char_width() as f64);
@@ -7581,6 +7590,26 @@ impl quadraui::ShellApp for App {
         drop(close_abs);
         drop(slots_abs);
         drop(pixel_hits);
+
+        // ── Draw breadcrumb bar(s) below tab bar(s) ─────────────────────────────
+        // (#547) `render_content` is the active ShellApp draw path since the
+        // #540 Relm4→ShellApp migration; the legacy `draw.rs::draw_editor`
+        // path that used to draw breadcrumbs is dead (no callers) and this
+        // step was never ported over, so breadcrumbs stopped rendering even
+        // though layout space for them was still reserved (`tab_bar_h`
+        // above) and clicks were still hit-tested against them.
+        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, lh, (0.0, 0.0))
+        {
+            let mut frame = QSL::new();
+            frame.push(Surface::StatusBar {
+                rect: t.rect,
+                bar: t.bar,
+                hovered: None,
+                pressed: None,
+            });
+            frame.draw(backend);
+            *t.draw_layout.borrow_mut() = Some(backend.status_bar_layout(t.rect, t.bar));
+        }
 
         // ── Draw global status bar / wildmenu ─────────────────────────────────
         let status_y =
