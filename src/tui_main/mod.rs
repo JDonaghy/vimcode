@@ -939,7 +939,7 @@ fn event_loop(
     // `backend.wait_events()` drives the event loop; accelerators
     // registered here surface as `UiEvent::Accelerator(id, mods)`.
     let mut backend = backend::TuiBackend::new();
-    backend.set_nerd_fonts(engine.settings.use_nerd_fonts);
+    render::sync_nerd_fonts(&mut backend, engine);
     register_panel_accelerators(&mut backend, &engine.settings.panel_keys);
     // Initialize MenuSystem with menu definitions.
     engine
@@ -1103,7 +1103,8 @@ fn event_loop(
                 // `TuiBackend` no longer reads `crate::icons::*` directly
                 // — apps push the flag in via this setter so runtime
                 // toggles (`:set nonerdfonts`) reach the rasterisers.
-                backend.set_nerd_fonts(engine.settings.use_nerd_fonts);
+                // Shared with GTK's equivalent sync point (#547).
+                render::sync_nerd_fonts(&mut backend, engine);
                 let s = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
                 last_layout = Some(s);
                 last_layout.as_ref()

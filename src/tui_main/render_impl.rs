@@ -339,23 +339,24 @@ pub(super) fn draw_frame(
             }
         }
         // Draw breadcrumb bars (below each group's tab bar). Hidden while the
-        // terminal panel is maximized so it can claim the row.
-        for bc in &screen.breadcrumbs {
-            if bc.segments.is_empty() || engine.terminal_maximized {
-                continue;
-            }
-            let bc_x = bc.bounds.x as u16 + editor_area.x;
-            let bc_w = bc.bounds.width as u16;
-            let bc_y = editor_area.y + bc.bounds.y as u16;
-            if bc_w > 0 {
+        // terminal panel is maximized so it can claim the row. Skip
+        // conditions + rect math come from `render::breadcrumb_draw_targets`,
+        // shared with GTK, so the two backends can't drift apart (#547).
+        for t in render::breadcrumb_draw_targets(
+            screen,
+            engine.terminal_maximized,
+            1.0,
+            (editor_area.x as f64, editor_area.y as f64),
+        ) {
+            if t.rect.width > 0.0 {
                 let bc_rect = Rect {
-                    x: bc_x,
-                    y: bc_y,
-                    width: bc_w,
+                    x: t.rect.x as u16,
+                    y: t.rect.y as u16,
+                    width: t.rect.width as u16,
                     height: 1,
                 };
-                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
-                *bc.draw_layout.borrow_mut() = Some(layout);
+                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
+                *t.draw_layout.borrow_mut() = Some(layout);
             }
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
@@ -386,22 +387,26 @@ pub(super) fn draw_frame(
             tab_visible_counts_out.push((engine.active_group, vis));
         }
         // Draw breadcrumb bar for the single group. Hidden while the terminal
-        // panel is maximized.
-        if let Some(bc) = screen.breadcrumbs.first() {
-            if !bc.segments.is_empty() && !engine.terminal_maximized {
-                let bc_y = if engine.is_tab_bar_hidden(engine.active_group) {
-                    editor_area.y
-                } else {
-                    editor_area.y + 1
-                };
+        // panel is maximized. `bc.bounds.y` (via `breadcrumb_draw_targets`)
+        // already accounts for a hidden tab bar — `calculate_group_window_rects`
+        // → `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
+        // therefore the derived breadcrumb bounds) up by one row in that case,
+        // so this no longer needs its own `is_tab_bar_hidden` special case (#547).
+        for t in render::breadcrumb_draw_targets(
+            screen,
+            engine.terminal_maximized,
+            1.0,
+            (editor_area.x as f64, editor_area.y as f64),
+        ) {
+            if t.rect.width > 0.0 {
                 let bc_rect = Rect {
-                    x: editor_area.x,
-                    y: bc_y,
-                    width: editor_area.width,
+                    x: t.rect.x as u16,
+                    y: t.rect.y as u16,
+                    width: t.rect.width as u16,
                     height: 1,
                 };
-                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, &bc.bar, theme);
-                *bc.draw_layout.borrow_mut() = Some(layout);
+                let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
+                *t.draw_layout.borrow_mut() = Some(layout);
             }
         }
         render_all_windows(backend, frame, editor_area, &screen.windows, theme);
