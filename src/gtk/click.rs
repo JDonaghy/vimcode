@@ -26,10 +26,15 @@ pub(super) fn pixel_to_click_target(
     char_width: f64,
     pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
-    // Legacy per-backend pixel maps — no longer consulted for tab-bar clicks
-    // (which now resolve through the shared `hit_regions` path). Kept in the
-    // signature so existing call sites compile unchanged; slated for removal
-    // along with the rest of the pixel-map plumbing. (#515)
+    // Pixel-accurate per-group tab-bar hit geometry captured from the
+    // rasteriser during `render_content` (via `Backend::tab_bar_layout`). GTK
+    // draws tabs with proportional-font Pango widths, so the char-cell
+    // `hit_regions` on `cached_layout` do NOT match the drawn geometry — clicks
+    // must resolve against these actual pixel bounds. (#515)
+    tab_pixel_hits: &TabPixelHitMap,
+    // Legacy per-backend pixel maps — no longer consulted for tab-bar clicks.
+    // Kept in the signature so existing call sites compile unchanged; slated for
+    // removal along with the rest of the pixel-map plumbing. (#515)
     _tab_slot_positions: &TabSlotMap,
     _diff_btn_map: &DiffBtnMap,
     _split_btn_map: &SplitBtnMap,
@@ -54,7 +59,14 @@ pub(super) fn pixel_to_click_target(
             bar_width: _,
         } => {
             engine.active_group = group_id;
-            tab_bar_inner_hit_test(engine, group_id, local_x, char_width, cached_layout)
+            tab_bar_inner_hit_test(
+                engine,
+                group_id,
+                local_x,
+                char_width,
+                cached_layout,
+                tab_pixel_hits,
+            )
         }
         ScreenZone::Window {
             window_id,
@@ -113,27 +125,74 @@ pub(super) fn pixel_to_click_target(
     }
 }
 
-/// Tab bar inner hit-test via the shared, backend-neutral hit regions.
+/// Tab bar inner hit-test.
 ///
-/// `local_x` is pixels relative to the tab bar's left edge; dividing by
-/// `char_width` yields the char-cell column that [`render::resolve_tab_bar_click`]
-/// expects — the same column space the TUI backend uses. This replaces the
-/// legacy per-backend pixel maps (`tab_slot_positions` / `*_btn_map`), which were
-/// populated only by the now-dead Relm4 Cairo draw path. (#515)
+/// `local_x` is pixels relative to the tab bar's left edge. For GTK we resolve
+/// against the pixel-accurate geometry the rasteriser actually drew this frame
+/// (`tab_pixel_hits`, captured in `render_content` via `Backend::tab_bar_layout`).
+/// GTK tabs are laid out with proportional-font Pango widths + fixed pixel
+/// padding, so the char-cell `hit_regions` (correct for the monospace TUI) badly
+/// mis-measure them — clicks in a tab's middle landed on the close button and
+/// clicks near its right edge landed on the next tab (#515 regression). Falls
+/// back to the char-cell path only if no pixel geometry was cached (e.g. a click
+/// arriving before the first paint populated the map).
 fn tab_bar_inner_hit_test(
     engine: &mut Engine,
     group_id: GroupId,
     local_x: f64,
     char_width: f64,
     cached_layout: &render::ScreenLayout,
+    tab_pixel_hits: &TabPixelHitMap,
 ) -> ClickTarget {
+    let target = tab_pixel_hits
+        .get(&group_id.0)
+        .and_then(|ph| resolve_pixel_tab_click(ph, local_x))
+        .or_else(|| resolve_charcell_tab_click(cached_layout, group_id, local_x, char_width));
+
+    dispatch_tab_bar_target(engine, group_id, target)
+}
+
+/// Resolve a tab-bar click against the pixel-accurate drawn geometry.
+///
+/// Close buttons are checked before tab bodies (a close zone is a sub-region of
+/// its tab), then tab bodies, then the disjoint right-segment buttons.
+fn resolve_pixel_tab_click(
+    ph: &TabBarPixelHits,
+    local_x: f64,
+) -> Option<crate::core::engine::TabBarClickTarget> {
     use crate::core::engine::TabBarClickTarget as T;
-    use crate::core::window::SplitDirection;
 
+    let in_range = |(a, b): (f64, f64)| a != b && local_x >= a && local_x < b;
+
+    for (idx, cb) in ph.close.iter().enumerate() {
+        if let Some(&bounds) = cb.as_ref() {
+            if in_range(bounds) {
+                return Some(T::CloseTab(idx));
+            }
+        }
+    }
+    for (idx, &slot) in ph.slots.iter().enumerate() {
+        if in_range(slot) {
+            return Some(T::Tab(idx));
+        }
+    }
+    for &(start, end, target) in &ph.segments {
+        if in_range((start, end)) {
+            return Some(target);
+        }
+    }
+    None
+}
+
+/// Char-cell fallback (matches the TUI monospace layout). Only used before the
+/// first paint has populated the pixel-hit cache.
+fn resolve_charcell_tab_click(
+    cached_layout: &render::ScreenLayout,
+    group_id: GroupId,
+    local_x: f64,
+    char_width: f64,
+) -> Option<crate::core::engine::TabBarClickTarget> {
     let col = (local_x / char_width).floor().max(0.0) as u16;
-
-    // Multi-group: each group carries its own hit regions. Single-group: the
-    // active tab bar's regions live on the ScreenLayout directly.
     let regions: &[(
         crate::core::engine::TabBarHitRegion,
         crate::core::engine::TabBarClickTarget,
@@ -147,8 +206,20 @@ fn tab_bar_inner_hit_test(
     } else {
         cached_layout.tab_bar_hit_regions.as_slice()
     };
+    render_mod::resolve_tab_bar_click(regions, col)
+}
 
-    match render_mod::resolve_tab_bar_click(regions, col) {
+/// Apply the engine-side effect for a resolved tab-bar click target and return
+/// the `ClickTarget` the caller dispatches.
+fn dispatch_tab_bar_target(
+    engine: &mut Engine,
+    group_id: GroupId,
+    target: Option<crate::core::engine::TabBarClickTarget>,
+) -> ClickTarget {
+    use crate::core::engine::TabBarClickTarget as T;
+    use crate::core::window::SplitDirection;
+
+    match target {
         Some(T::Tab(idx)) => {
             engine.goto_tab(idx);
             ClickTarget::TabBar
@@ -225,6 +296,7 @@ pub(super) fn handle_mouse_click(
     char_width: f64,
     pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
+    tab_pixel_hits: &TabPixelHitMap,
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
@@ -239,6 +311,7 @@ pub(super) fn handle_mouse_click(
         char_width,
         pango_layout,
         cached_layout,
+        tab_pixel_hits,
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
@@ -322,6 +395,7 @@ pub(super) fn handle_mouse_double_click(
     char_width: f64,
     pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
+    tab_pixel_hits: &TabPixelHitMap,
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
@@ -336,6 +410,7 @@ pub(super) fn handle_mouse_double_click(
         char_width,
         pango_layout,
         cached_layout,
+        tab_pixel_hits,
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
@@ -356,6 +431,7 @@ pub(super) fn handle_mouse_drag(
     char_width: f64,
     pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
+    tab_pixel_hits: &TabPixelHitMap,
     tab_slot_positions: &TabSlotMap,
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
@@ -370,6 +446,7 @@ pub(super) fn handle_mouse_drag(
         char_width,
         pango_layout,
         cached_layout,
+        tab_pixel_hits,
         tab_slot_positions,
         diff_btn_map,
         split_btn_map,
