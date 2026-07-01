@@ -743,6 +743,13 @@ pub struct BreadcrumbDrawTarget<'a> {
 /// into the caller's screen space: GTK's window rects are already absolute,
 /// so it passes `(0.0, 0.0)`; TUI's are content-area-relative, so it passes
 /// `(editor_area.x, editor_area.y)`.
+///
+/// Targets with zero width (the `min_x == f64::MAX` fallback in
+/// `build_screen_layout` when a group has no matching window rects, e.g.
+/// during a transient group-tree mutation) are filtered out here rather than
+/// left to each caller: TUI's pre-existing call sites already guarded on
+/// `rect.width > 0.0`, but GTK's new one didn't, so centralizing it removes a
+/// footgun instead of asking every backend to remember it independently.
 pub fn breadcrumb_draw_targets(
     screen: &ScreenLayout,
     terminal_maximized: bool,
@@ -756,7 +763,7 @@ pub fn breadcrumb_draw_targets(
     screen
         .breadcrumbs
         .iter()
-        .filter(|bc| !bc.segments.is_empty())
+        .filter(|bc| !bc.segments.is_empty() && bc.bounds.width > 0.0)
         .map(|bc| BreadcrumbDrawTarget {
             rect: quadraui::Rect::new(
                 (bc.bounds.x + ox) as f32,
@@ -15424,6 +15431,98 @@ mod tests {
         // Tab bar hidden (single tab, hide_single_tab=true): breadcrumb
         // claims the row the tab bar would have used.
         assert_eq!(bounds_y_for(true), 0.0);
+    }
+
+    /// Direct unit test for `breadcrumb_draw_targets` itself (#547 review
+    /// finding: the test above only pins the pre-existing `build_screen_layout`
+    /// bounds computation, never the new shared helper). Covers the
+    /// `terminal_maximized` early return, the `origin_offset` translation
+    /// arithmetic, the `segments.is_empty()` filter, and the zero-width
+    /// fallback filter.
+    #[test]
+    fn test_breadcrumb_draw_targets_offset_terminal_maximized_and_filters() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let theme = Theme::onedark();
+
+        let build_screen = || {
+            let mut engine = Engine::new();
+            engine.settings.breadcrumbs = true;
+            // A default `Engine::new()` buffer has no `file_path`, which
+            // produces zero breadcrumb segments (see
+            // `build_breadcrumbs_for_group`) — give it a path so the
+            // non-maximized case below actually has a segment to draw.
+            let buf_id = engine.active_buffer_id();
+            engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
+                Some(std::path::PathBuf::from("src/main.rs"));
+            let tbh = 24.0;
+            let content_bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+            let (rects, _) = engine.calculate_group_window_rects(content_bounds, tbh);
+            build_screen_layout(&engine, &theme, &rects, line_height, char_width, true)
+        };
+
+        let screen = build_screen();
+        assert_eq!(screen.breadcrumbs.len(), 1);
+        assert!(!screen.breadcrumbs[0].segments.is_empty());
+        assert!(screen.breadcrumbs[0].bounds.width > 0.0);
+
+        // `terminal_maximized` short-circuits to empty regardless of offset.
+        let targets = breadcrumb_draw_targets(&screen, true, line_height, (10.0, 20.0));
+        assert!(
+            targets.is_empty(),
+            "terminal_maximized must suppress all breadcrumb targets"
+        );
+
+        // Not maximized: one target, translated by `origin_offset` (TUI's convention).
+        let targets = breadcrumb_draw_targets(&screen, false, line_height, (10.0, 20.0));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].rect.x,
+            (screen.breadcrumbs[0].bounds.x + 10.0) as f32
+        );
+        assert_eq!(
+            targets[0].rect.y,
+            (screen.breadcrumbs[0].bounds.y + 20.0) as f32
+        );
+        assert_eq!(
+            targets[0].rect.width,
+            screen.breadcrumbs[0].bounds.width as f32
+        );
+        assert_eq!(targets[0].rect.height, line_height as f32);
+
+        // Zero offset (GTK's convention): rect matches raw bounds untouched.
+        let targets_zero = breadcrumb_draw_targets(&screen, false, line_height, (0.0, 0.0));
+        assert_eq!(
+            targets_zero[0].rect.x,
+            screen.breadcrumbs[0].bounds.x as f32
+        );
+        assert_eq!(
+            targets_zero[0].rect.y,
+            screen.breadcrumbs[0].bounds.y as f32
+        );
+
+        // Empty segments are filtered out even when not maximized.
+        let mut screen_no_segments = build_screen();
+        screen_no_segments.breadcrumbs[0].segments.clear();
+        let targets = breadcrumb_draw_targets(&screen_no_segments, false, line_height, (0.0, 0.0));
+        assert!(
+            targets.is_empty(),
+            "a breadcrumb bar with no segments must not be drawn"
+        );
+
+        // Zero-width bounds (the `min_x == f64::MAX` fallback for a group with
+        // no matching window rects) are filtered out too, so GTK doesn't need
+        // its own `rect.width > 0.0` guard (unlike TUI's pre-existing one).
+        let mut screen_zero_width = build_screen();
+        screen_zero_width.breadcrumbs[0].bounds.width = 0.0;
+        let targets = breadcrumb_draw_targets(&screen_zero_width, false, line_height, (0.0, 0.0));
+        assert!(
+            targets.is_empty(),
+            "a zero-width breadcrumb bar must not be drawn"
+        );
     }
 
     /// Explorer tree row icons must always carry both a Nerd Font glyph and
