@@ -14350,6 +14350,23 @@ fn test_yyp_linewise_via_clipboard_intercept() {
 // ── Editor group tests ────────────────────────────────────────────────────
 
 #[test]
+fn test_ctrl_backslash_splits_editor_right_both_key_names() {
+    // Regression (#515): the GTK ShellApp key path forwards the raw char "\\"
+    // while the TUI maps it to "backslash". The engine must split on both so
+    // Ctrl+\ works on every backend.
+    for name in ["backslash", "\\"] {
+        let mut engine = Engine::new();
+        assert_eq!(engine.group_layout.leaf_count(), 1);
+        engine.handle_key(name, Some('\\'), true);
+        assert_eq!(
+            engine.group_layout.leaf_count(),
+            2,
+            "Ctrl+\\ via key_name {name:?} should split the editor group to the right"
+        );
+    }
+}
+
+#[test]
 fn test_editor_group_split_commands() {
     let mut engine = Engine::new();
     assert_eq!(engine.group_layout.leaf_count(), 1);
