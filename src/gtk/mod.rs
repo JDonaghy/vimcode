@@ -54,6 +54,52 @@ fn ext_panel_name(id: &str) -> Option<&str> {
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 type TabCloseMap = HashMap<usize, Vec<Option<(f64, f64)>>>;
 
+/// Absolute per-group close-glyph hit rects captured during `render_content`.
+/// Keyed by `group_id.0` → `(bar_y_top, bar_y_bottom, per-tab Some((x0, x1)))`.
+/// All coordinates are in **absolute surface pixels** (same space as the raw
+/// mouse position), so hover hit-testing needs no geometry re-derivation. The
+/// x-ranges are the *tight* close-glyph zone (see [`CLOSE_*` metrics] and
+/// [`tighten_close_bounds`]), matching the × highlight the rasteriser draws —
+/// so a hover shows the exact box that a click would close. (#515)
+type TabCloseAbsMap = HashMap<usize, (f64, f64, Vec<Option<(f64, f64)>>)>;
+
+// ── GTK editor-group tab-bar close-glyph metrics ─────────────────────────────
+// The quadraui GTK rasteriser lays each non-compact tab out as
+// `tab_pad | label | tab_inner_gap | × | tab_pad | tab_outer_gap` and reports a
+// *padded* close-button hit zone spanning `[label_end, tab_right_edge]`. That
+// zone is far wider than the drawn × glyph, so a click well before the glyph
+// used to close the tab with no warning (#515). We trim the padded zone back to
+// the glyph the rasteriser actually painted — plus the same 2px hover halo it
+// draws behind the ×, so the clickable box equals the highlighted box.
+//
+// These mirror the non-compact constants in quadraui's `gtk::backend`
+// (`tab_pad = 14`, `tab_inner_gap = 10`, `tab_outer_gap = 1`) and the 2px hover
+// pad in `gtk::tab_bar`. Editor-group bars are always built with
+// `compact: false` (see `render::build_tab_bar_primitive`). This duplication is
+// the interim until quadraui exposes the tight glyph rect directly
+// (quadraui#395 tracks the API gap); `tighten_close_bounds` is the single place
+// it lives.
+const CLOSE_TAB_INNER_GAP: f64 = 10.0;
+const CLOSE_TAB_PAD: f64 = 14.0;
+const CLOSE_TAB_OUTER_GAP: f64 = 1.0;
+const CLOSE_HOVER_PAD: f64 = 2.0;
+
+/// Trim a *padded* close-button hit zone `(start, end)` — as reported by
+/// `quadraui::Backend::tab_bar_layout` — down to the tight × glyph box the
+/// rasteriser actually draws (including its 2px hover halo). Leading
+/// `tab_inner_gap` and trailing `tab_pad + tab_outer_gap` are dead padding that
+/// should select the tab, not close it. Returns `None` if the padded zone is
+/// degenerate (too small to contain a glyph). (#515)
+fn tighten_close_bounds(start: f64, end: f64) -> Option<(f64, f64)> {
+    let tight_start = start + CLOSE_TAB_INNER_GAP - CLOSE_HOVER_PAD;
+    let tight_end = end - CLOSE_TAB_PAD - CLOSE_TAB_OUTER_GAP + CLOSE_HOVER_PAD;
+    if tight_end > tight_start {
+        Some((tight_start, tight_end))
+    } else {
+        None
+    }
+}
+
 /// Per-group pixel-accurate tab-bar hit geometry recovered from
 /// [`quadraui::Backend::tab_bar_layout`] during the ShellApp `render_content`
 /// pass. All x-ranges are **relative to the group's tab-bar left edge** — the
@@ -106,10 +152,13 @@ fn tab_hits_to_pixel_hits(
             }
         })
         .collect();
+    // Trim the padded close zone the rasteriser reports down to the tight ×
+    // glyph box (relative to the bar's left edge), so clicks/hover only fire on
+    // the drawn glyph — not the ~25px of surrounding tab padding. (#515)
     let close = hits
         .close_bounds
         .iter()
-        .map(|c| c.map(|(a, b)| rel(a, b)))
+        .map(|c| c.and_then(|(a, b)| tighten_close_bounds(a, b).map(|(ta, tb)| rel(ta, tb))))
         .collect();
     let mut segments = Vec::new();
     for (i, seg) in bar.right_segments.iter().enumerate() {
@@ -136,6 +185,36 @@ fn tab_hits_to_pixel_hits(
         close,
         segments,
     }
+}
+
+/// Build the absolute close-glyph hit record for one tab bar from its
+/// bar-relative (already-tightened) close bounds. `bar_left_x` is the bar's
+/// absolute left edge; `y_top`/`y_bot` bracket the tab row. Consumed by
+/// `tab_close_hit_test` for hover. (#515)
+fn abs_close_record(
+    ph_close: &[Option<(f64, f64)>],
+    bar_left_x: f64,
+    y_top: f64,
+    y_bot: f64,
+) -> (f64, f64, Vec<Option<(f64, f64)>>) {
+    let xs = ph_close
+        .iter()
+        .map(|c| c.map(|(a, b)| (a + bar_left_x, b + bar_left_x)))
+        .collect();
+    (y_top, y_bot, xs)
+}
+
+/// Collect the visible tab slots (absolute x-ranges) from a `TabBarHits`,
+/// dropping the `(0.0, 0.0)` sentinels for scrolled-off / non-fitting tabs.
+/// The result is a contiguous run starting at the tab bar's `scroll_offset`,
+/// which the drop-zone reorder logic offsets back to absolute tab indices.
+/// (#515)
+fn abs_visible_slots(hits: &quadraui::TabBarHits) -> Vec<(f32, f32)> {
+    hits.slot_positions
+        .iter()
+        .filter(|&&(a, b)| (a, b) != (0.0, 0.0))
+        .map(|&(a, b)| (a as f32, b as f32))
+        .collect()
 }
 
 /// Cached diff toolbar button positions per group: group_id -> (prev_start, prev_end, next_start, next_end, fold_start, fold_end).
@@ -471,9 +550,17 @@ struct App {
     /// Cached tab slot widths per group, populated during draw_tab_bar for click hit-testing.
     /// Key = group_id.0 (or usize::MAX for single-group mode), Value = cumulative x positions.
     tab_slot_positions: Rc<RefCell<TabSlotMap>>,
-    /// Cached close-button bounds per tab per group, populated during
-    /// draw_tab_bar. Used by `tab_close_hit_test` for hover detection.
-    tab_close_bounds: Rc<RefCell<TabCloseMap>>,
+    /// Absolute tight close-glyph rects captured in `render_content`. Consumed
+    /// by `tab_close_hit_test` (hover) so it hit-tests against the exact drawn
+    /// geometry — including the activity-bar/sidebar x-offset — instead of
+    /// re-deriving group rects from a `(0,0)` content origin (which ignored the
+    /// offset and made hover never fire in ShellApp mode). (#515)
+    cached_tab_close_abs: Rc<RefCell<TabCloseAbsMap>>,
+    /// Absolute visible tab-slot x-ranges per group (`group_id.0` → `[(x0,x1)]`),
+    /// captured in `render_content`. Feeds the tab drop-zone computation so a
+    /// short drag inside a group's own tab bar resolves to a `TabReorder` (with
+    /// an insertion bar) rather than a new-split overlay. (#515)
+    cached_tab_slots_abs: Rc<RefCell<HashMap<usize, Vec<(f32, f32)>>>>,
     /// Pixel-accurate per-group tab-bar hit geometry from the ShellApp
     /// `render_content` pass (via `Backend::tab_bar_layout`). Consumed by the
     /// GTK tab-bar click hit-test instead of the char-cell `hit_regions`, which
@@ -1279,7 +1366,8 @@ impl App {
             h_sb_hovered: false,
             tab_close_hover: None,
             tab_slot_positions: Rc::new(RefCell::new(HashMap::new())),
-            tab_close_bounds: Rc::new(RefCell::new(HashMap::new())),
+            cached_tab_close_abs: Rc::new(RefCell::new(HashMap::new())),
+            cached_tab_slots_abs: Rc::new(RefCell::new(HashMap::new())),
             cached_tab_pixel_hits: Rc::new(RefCell::new(HashMap::new())),
             diff_btn_map: Rc::new(RefCell::new(HashMap::new())),
             split_btn_map: Rc::new(RefCell::new(HashMap::new())),
@@ -2809,13 +2897,13 @@ impl App {
 
                 // Tab close button hover detection + tab tooltip.
                 let engine = self.engine.borrow();
-                let close_bounds_map = self.tab_close_bounds.borrow();
+                let close_abs_map = self.cached_tab_close_abs.borrow();
                 let tab_hover = if mx >= 0.0 && lh > 0.0 {
-                    tab_close_hit_test(&engine, &close_bounds_map, mx, my, da_w, da_h, lh)
+                    tab_close_hit_test(&close_abs_map, mx, my)
                 } else {
                     None
                 };
-                drop(close_bounds_map);
+                drop(close_abs_map);
                 let tooltip = if mx >= 0.0 && lh > 0.0 {
                     tab_tooltip_hit_test(&engine, mx, my, da_w, da_h, lh, cw)
                 } else {
@@ -7433,17 +7521,20 @@ impl quadraui::ShellApp for App {
         // Reset the pixel-accurate hit caches; repopulated per tab bar below so
         // the click / hover hit-tests use the exact drawn geometry (#515).
         let mut pixel_hits = self.cached_tab_pixel_hits.borrow_mut();
-        let mut close_bounds = self.tab_close_bounds.borrow_mut();
+        let mut close_abs = self.cached_tab_close_abs.borrow_mut();
+        let mut slots_abs = self.cached_tab_slots_abs.borrow_mut();
         pixel_hits.clear();
-        close_bounds.clear();
+        close_abs.clear();
+        slots_abs.clear();
         if let Some(ref split) = screen.editor_group_split {
             for gtb in &split.group_tab_bars {
                 if engine.is_tab_bar_hidden(gtb.group_id) {
                     continue;
                 }
+                let bar_top = gtb.bounds.y - tab_bar_h;
                 let tb_rect = quadraui::Rect::new(
                     gtb.bounds.x as f32,
-                    (gtb.bounds.y - tab_bar_h) as f32,
+                    bar_top as f32,
                     gtb.bounds.width as f32,
                     tab_row_h as f32,
                 );
@@ -7461,7 +7552,11 @@ impl quadraui::ShellApp for App {
                 // cache it (relative to the bar's left edge) for hit-testing.
                 let hits = backend.tab_bar_layout(tb_rect, &gtb.bar);
                 let ph = tab_hits_to_pixel_hits(&hits, &gtb.bar, tb_rect.x as f64);
-                close_bounds.insert(gtb.group_id.0, ph.close.clone());
+                close_abs.insert(
+                    gtb.group_id.0,
+                    abs_close_record(&ph.close, gtb.bounds.x, bar_top, bar_top + tab_row_h),
+                );
+                slots_abs.insert(gtb.group_id.0, abs_visible_slots(&hits));
                 pixel_hits.insert(gtb.group_id.0, ph);
             }
         } else if !engine.is_tab_bar_hidden(engine.active_group) {
@@ -7476,10 +7571,15 @@ impl quadraui::ShellApp for App {
             frame.draw(backend);
             let hits = backend.tab_bar_layout(tb_rect, &screen.tab_bar_primitive);
             let ph = tab_hits_to_pixel_hits(&hits, &screen.tab_bar_primitive, tb_rect.x as f64);
-            close_bounds.insert(engine.active_group.0, ph.close.clone());
+            close_abs.insert(
+                engine.active_group.0,
+                abs_close_record(&ph.close, x, y, y + tab_row_h),
+            );
+            slots_abs.insert(engine.active_group.0, abs_visible_slots(&hits));
             pixel_hits.insert(engine.active_group.0, ph);
         }
-        drop(close_bounds);
+        drop(close_abs);
+        drop(slots_abs);
         drop(pixel_hits);
 
         // ── Draw global status bar / wildmenu ─────────────────────────────────
@@ -7649,13 +7749,14 @@ impl quadraui::ShellApp for App {
                 drop_origin,
                 (w as f32, editor_area_h as f32),
             );
-            // Tab-reorder insertion bars need per-tab slot x-positions; those are a
-            // follow-up (empty map ⇒ center/split drop zones work, reorder bar
-            // falls back). Center/split highlighting — the reported regression — is
-            // bounds-only and works without slots.
-            let empty_slots = std::collections::HashMap::<usize, Vec<(f32, f32)>>::new();
+            // Per-tab slot x-positions (absolute) were captured while drawing the
+            // tab bars above. Feeding them here makes a drag inside a group's own
+            // tab bar resolve to a `TabReorder` (insertion bar) instead of falling
+            // through to a new-split/center overlay. (#515)
+            let slots_abs = self.cached_tab_slots_abs.borrow();
             let (groups, eff_tbh) =
-                render::build_tab_drop_groups(&bounds, &engine, tab_bar_h as f32, &empty_slots);
+                render::build_tab_drop_groups(&bounds, &engine, tab_bar_h as f32, &slots_abs);
+            drop(slots_abs);
             *self.cached_drop_groups.borrow_mut() = groups;
             self.cached_drop_tbh.set(eff_tbh);
         }
@@ -8054,52 +8155,25 @@ fn h_scrollbar_hit_test(
 }
 
 /// Hit-test tab close buttons. Returns `Some((group_id.0, tab_idx))` if the
-/// mouse is over a tab's × button, matching the same geometry as the click handler.
-/// Tab-close hover hit-test driven by the rasteriser's cached
-/// `close_bounds`. Each frame the GTK rasteriser publishes the exact
-/// per-tab close-button rectangle (Pango pixel widths, not estimates)
-/// to `App.tab_close_bounds`; this function consults those bounds
-/// rather than re-deriving geometry from `name.chars() * char_width`,
-/// which under-estimates Pango widths and shifts the close zone.
-fn tab_close_hit_test(
-    engine: &Engine,
-    close_bounds_map: &TabCloseMap,
-    mx: f64,
-    my: f64,
-    da_w: f64,
-    da_h: f64,
-    line_height: f64,
-) -> Option<(usize, usize)> {
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
-    let editor_bottom = gtk_editor_bottom(engine, da_w, da_h, line_height);
-    let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
-    let mut group_rects = engine
-        .group_layout
-        .calculate_group_rects(content_bounds, tab_bar_height);
-    engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
-
-    for (gid, grect) in &group_rects {
-        if engine.is_tab_bar_hidden(*gid) {
+/// mouse is over a tab's × glyph.
+///
+/// Consults the **absolute** tight close-glyph rects captured during
+/// `render_content` ([`App::cached_tab_close_abs`]). Those rects already fold in
+/// the activity-bar/sidebar x-offset and the exact drawn Pango geometry, so this
+/// is a plain point-in-rect test — no group-rect re-derivation. The previous
+/// version rebuilt group rects from a `(0,0)` content origin, ignoring the
+/// left-hand chrome offset, so hover never fired once a sidebar was open and the
+/// × highlight silently disappeared (#515). Because the rects match the ×
+/// highlight the rasteriser draws, a hover shows exactly the box a click closes.
+fn tab_close_hit_test(close_abs_map: &TabCloseAbsMap, mx: f64, my: f64) -> Option<(usize, usize)> {
+    for (gid, (y_top, y_bot, xs)) in close_abs_map {
+        if my < *y_top || my >= *y_bot {
             continue;
         }
-        let tab_y = grect.y - tab_bar_height;
-        if my < tab_y || my >= tab_y + tab_row_height || mx < grect.x || mx >= grect.x + grect.width
-        {
-            continue;
-        }
-        let local_x = mx - grect.x;
-        let Some(close_bounds) = close_bounds_map.get(&gid.0) else {
-            continue;
-        };
-        for (i, cb) in close_bounds.iter().enumerate() {
+        for (i, cb) in xs.iter().enumerate() {
             if let Some((cx_start, cx_end)) = cb {
-                if local_x >= *cx_start && local_x < *cx_end {
-                    return Some((gid.0, i));
+                if mx >= *cx_start && mx < *cx_end {
+                    return Some((*gid, i));
                 }
             }
         }
