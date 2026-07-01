@@ -54,6 +54,90 @@ fn ext_panel_name(id: &str) -> Option<&str> {
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 type TabCloseMap = HashMap<usize, Vec<Option<(f64, f64)>>>;
 
+/// Per-group pixel-accurate tab-bar hit geometry recovered from
+/// [`quadraui::Backend::tab_bar_layout`] during the ShellApp `render_content`
+/// pass. All x-ranges are **relative to the group's tab-bar left edge** — the
+/// same space as `render::screen_zone_hit_test`'s `local_x`.
+///
+/// This replaces the char-cell `hit_regions` approximation for GTK tab clicks.
+/// GTK draws tabs with proportional-font Pango widths + fixed pixel padding
+/// (`tab_pad`, `inner_gap`, close-glyph width), so a `name.chars() * char_width`
+/// estimate under-measures every tab — shifting the tab/close boundaries and
+/// making mid-tab clicks land on the close button and right-edge clicks land on
+/// the next tab (#515 regression). The rasteriser reports the exact drawn
+/// geometry, so we hit-test against that. (`hit_regions` stays authoritative for
+/// the monospace TUI backend, whose char-cell layout matches its draw.)
+#[derive(Default, Clone)]
+pub(super) struct TabBarPixelHits {
+    /// `(start_x, end_x)` per tab index; `(0.0, 0.0)` for scrolled-off tabs.
+    pub slots: Vec<(f64, f64)>,
+    /// `Some((start_x, end_x))` close-button zone per tab, or `None`.
+    pub close: Vec<Option<(f64, f64)>>,
+    /// Right-segment hit zones (split / diff / action buttons) as
+    /// `(start_x, end_x, target)`, disjoint from the tab slots.
+    pub segments: Vec<(f64, f64, crate::core::engine::TabBarClickTarget)>,
+}
+
+/// Key = `group_id.0` (single-group mode keys under the active group's id, which
+/// is what `screen_zone_hit_test` reports for it).
+type TabPixelHitMap = HashMap<usize, TabBarPixelHits>;
+
+/// Convert a rasteriser [`quadraui::TabBarHits`] (absolute pixel x, from
+/// `Backend::tab_bar_layout`) plus its source [`quadraui::TabBar`] into a
+/// [`TabBarPixelHits`] with every x-range shifted to be **relative to
+/// `bar_left_x`** (the group tab bar's left edge). Right-segment ids are mapped
+/// to their `TabBarClickTarget` using the same `"tab:*"` ids that
+/// `build_tab_bar_primitive` emits (mirrors `draw::draw_tab_bar`).
+fn tab_hits_to_pixel_hits(
+    hits: &quadraui::TabBarHits,
+    bar: &quadraui::TabBar,
+    bar_left_x: f64,
+) -> TabBarPixelHits {
+    use crate::core::engine::TabBarClickTarget as T;
+    let rel = |a: f64, b: f64| (a - bar_left_x, b - bar_left_x);
+    let slots = hits
+        .slot_positions
+        .iter()
+        .map(|&(a, b)| {
+            if (a, b) == (0.0, 0.0) {
+                (0.0, 0.0) // scrolled-off sentinel — leave as zero-width
+            } else {
+                rel(a, b)
+            }
+        })
+        .collect();
+    let close = hits
+        .close_bounds
+        .iter()
+        .map(|c| c.map(|(a, b)| rel(a, b)))
+        .collect();
+    let mut segments = Vec::new();
+    for (i, seg) in bar.right_segments.iter().enumerate() {
+        let Some((a, b)) = hits.right_segment_bounds.get(i).copied() else {
+            continue;
+        };
+        let Some(ref id) = seg.id else { continue };
+        let target = match id.as_str() {
+            "tab:split_right" => Some(T::SplitRight),
+            "tab:split_down" => Some(T::SplitDown),
+            "tab:diff_prev" => Some(T::DiffPrev),
+            "tab:diff_next" => Some(T::DiffNext),
+            "tab:diff_toggle" => Some(T::DiffToggle),
+            "tab:action_menu" => Some(T::ActionMenu),
+            _ => None,
+        };
+        if let Some(t) = target {
+            let (s, e) = rel(a, b);
+            segments.push((s, e, t));
+        }
+    }
+    TabBarPixelHits {
+        slots,
+        close,
+        segments,
+    }
+}
+
 /// Cached diff toolbar button positions per group: group_id -> (prev_start, prev_end, next_start, next_end, fold_start, fold_end).
 /// Populated during draw_tab_bar, used for click hit-testing.
 type DiffBtnMap = HashMap<usize, (f64, f64, f64, f64, f64, f64)>;
@@ -390,6 +474,11 @@ struct App {
     /// Cached close-button bounds per tab per group, populated during
     /// draw_tab_bar. Used by `tab_close_hit_test` for hover detection.
     tab_close_bounds: Rc<RefCell<TabCloseMap>>,
+    /// Pixel-accurate per-group tab-bar hit geometry from the ShellApp
+    /// `render_content` pass (via `Backend::tab_bar_layout`). Consumed by the
+    /// GTK tab-bar click hit-test instead of the char-cell `hit_regions`, which
+    /// don't match GTK's proportional-font tab layout. (#515)
+    cached_tab_pixel_hits: Rc<RefCell<TabPixelHitMap>>,
     /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
     diff_btn_map: Rc<RefCell<DiffBtnMap>>,
     split_btn_map: Rc<RefCell<SplitBtnMap>>,
@@ -1191,6 +1280,7 @@ impl App {
             tab_close_hover: None,
             tab_slot_positions: Rc::new(RefCell::new(HashMap::new())),
             tab_close_bounds: Rc::new(RefCell::new(HashMap::new())),
+            cached_tab_pixel_hits: Rc::new(RefCell::new(HashMap::new())),
             diff_btn_map: Rc::new(RefCell::new(HashMap::new())),
             split_btn_map: Rc::new(RefCell::new(HashMap::new())),
             action_btn_map: Rc::new(RefCell::new(HashMap::new())),
@@ -1342,6 +1432,7 @@ impl App {
                             self.cached_char_width,
                             &editor_pl,
                             layout,
+                            &self.cached_tab_pixel_hits.borrow(),
                             &self.tab_slot_positions.borrow(),
                             &self.diff_btn_map.borrow(),
                             &self.split_btn_map.borrow(),
@@ -1408,6 +1499,7 @@ impl App {
                                 self.cached_char_width,
                                 &editor_pl,
                                 layout,
+                                &self.cached_tab_pixel_hits.borrow(),
                                 &self.tab_slot_positions.borrow(),
                                 &self.diff_btn_map.borrow(),
                                 &self.split_btn_map.borrow(),
@@ -4161,6 +4253,7 @@ impl App {
                                 self.cached_char_width,
                                 &editor_pl,
                                 layout,
+                                &self.cached_tab_pixel_hits.borrow(),
                                 &self.tab_slot_positions.borrow(),
                                 &self.diff_btn_map.borrow(),
                                 &self.split_btn_map.borrow(),
@@ -4457,6 +4550,7 @@ impl App {
                     self.cached_char_width,
                     &editor_pl,
                     layout,
+                    &self.cached_tab_pixel_hits.borrow(),
                     &self.tab_slot_positions.borrow(),
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
@@ -4575,6 +4669,7 @@ impl App {
                         self.cached_char_width,
                         &editor_pl,
                         layout,
+                        &self.cached_tab_pixel_hits.borrow(),
                         &self.tab_slot_positions.borrow(),
                         &self.diff_btn_map.borrow(),
                         &self.split_btn_map.borrow(),
@@ -7335,6 +7430,12 @@ impl quadraui::ShellApp for App {
         // at the top edge of its own bounds. Single-group draws one full-width
         // bar at the editor top. Previously only the single-group primitive was
         // drawn, so split groups rendered with no tab bar at all. (#515)
+        // Reset the pixel-accurate hit caches; repopulated per tab bar below so
+        // the click / hover hit-tests use the exact drawn geometry (#515).
+        let mut pixel_hits = self.cached_tab_pixel_hits.borrow_mut();
+        let mut close_bounds = self.tab_close_bounds.borrow_mut();
+        pixel_hits.clear();
+        close_bounds.clear();
         if let Some(ref split) = screen.editor_group_split {
             for gtb in &split.group_tab_bars {
                 if engine.is_tab_bar_hidden(gtb.group_id) {
@@ -7356,6 +7457,12 @@ impl quadraui::ShellApp for App {
                     hovered_close: hover,
                 });
                 frame.draw(backend);
+                // Recover the exact pixel geometry the rasteriser just drew and
+                // cache it (relative to the bar's left edge) for hit-testing.
+                let hits = backend.tab_bar_layout(tb_rect, &gtb.bar);
+                let ph = tab_hits_to_pixel_hits(&hits, &gtb.bar, tb_rect.x as f64);
+                close_bounds.insert(gtb.group_id.0, ph.close.clone());
+                pixel_hits.insert(gtb.group_id.0, ph);
             }
         } else if !engine.is_tab_bar_hidden(engine.active_group) {
             let tb_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, tab_row_h as f32);
@@ -7367,7 +7474,13 @@ impl quadraui::ShellApp for App {
                 hovered_close: hover,
             });
             frame.draw(backend);
+            let hits = backend.tab_bar_layout(tb_rect, &screen.tab_bar_primitive);
+            let ph = tab_hits_to_pixel_hits(&hits, &screen.tab_bar_primitive, tb_rect.x as f64);
+            close_bounds.insert(engine.active_group.0, ph.close.clone());
+            pixel_hits.insert(engine.active_group.0, ph);
         }
+        drop(close_bounds);
+        drop(pixel_hits);
 
         // ── Draw global status bar / wildmenu ─────────────────────────────────
         let status_y =
