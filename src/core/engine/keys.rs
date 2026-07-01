@@ -807,8 +807,12 @@ impl Engine {
                     self.lsp_request_definition();
                     return EngineAction::None;
                 }
-                "backslash" => {
-                    // Ctrl+\: Split editor group to the right (VSCode style)
+                "backslash" | "\\" => {
+                    // Ctrl+\: Split editor group to the right (VSCode style).
+                    // TUI maps the raw '\' to "backslash"; the GTK ShellApp key
+                    // path forwards the raw char "\\". Accept both so the split
+                    // fires on every backend (mirrors the "bracketright" | "]"
+                    // dual-match above). (#515)
                     self.open_editor_group(SplitDirection::Vertical);
                     return EngineAction::None;
                 }
