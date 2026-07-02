@@ -618,6 +618,17 @@ struct App {
     tab_drag_drop_zone: core::window::DropZone,
     /// GTK window handle — set in `ShellApp::setup` once the runner creates the window.
     window: Option<gtk4::Window>,
+    /// Menu bar row rect (full content width, `lh` tall) computed in
+    /// `render_content` each frame. Reused by `handle()` so `MenuSystem`'s
+    /// click/key routing tests against the exact rect the bar was drawn
+    /// into. (#552)
+    menu_row_rect: Cell<quadraui::Rect>,
+    /// Rect of the drawn inline window-control buttons (minimize/maximize/
+    /// close), to the right of the menu items within `menu_row_rect`. (#552)
+    title_bar_rect: Cell<quadraui::Rect>,
+    /// Hit-test layout for the window-control buttons from the last draw,
+    /// consumed by `handle()` to route clicks to `Msg::Window*`. (#552)
+    title_bar_hits: RefCell<Option<quadraui::StatusBarLayout>>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     last_sc_refresh: std::time::Instant,
     /// Last time explorer tree indicators (modified/diagnostics) were refreshed.
@@ -1391,6 +1402,9 @@ impl App {
             tab_drag_source: None,
             tab_drag_drop_zone: core::window::DropZone::None,
             window: None,
+            menu_row_rect: Cell::new(quadraui::Rect::default()),
+            title_bar_rect: Cell::new(quadraui::Rect::default()),
+            title_bar_hits: RefCell::new(None),
             last_sc_refresh: std::time::Instant::now(),
             last_tree_indicator_update: std::time::Instant::now(),
             menu_dropdown_da: Rc::new(RefCell::new(None)),
@@ -6578,6 +6592,31 @@ impl App {
         }
     }
 
+    /// Find the runner-created top-level window once it is mapped/visible.
+    /// Returns `None` until then — see `capture_window_and_apply_csd`. (#552)
+    fn find_visible_window() -> Option<gtk4::Window> {
+        gtk4::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|obj| obj.downcast::<gtk4::Window>().ok())
+            .find(|w| w.is_visible())
+    }
+
+    /// Capture the runner's GTK window (if not already captured) and drop
+    /// GTK's server-side WM titlebar in favour of the drawn CSD row from
+    /// `render_content`. Called from both `setup()` (fast path, usually too
+    /// early — the runner hasn't called `window.present()` yet) and `tick()`
+    /// (reliable path — retried every frame until the window is mapped).
+    /// (#552)
+    fn capture_window_and_apply_csd(&mut self) {
+        if self.window.is_some() {
+            return;
+        }
+        if let Some(w) = Self::find_visible_window() {
+            w.set_decorated(false);
+            self.window = Some(w);
+        }
+    }
+
     /// Forward a pointer event over the sidebar content area to the active panel's
     /// controller. In ShellApp mode the sidebar has no dedicated per-panel
     /// `DrawingArea`, so events the Relm4 build delivered straight to the explorer
@@ -7422,12 +7461,26 @@ impl quadraui::ShellApp for App {
         // falling back to ASCII icons.
         render::sync_nerd_fonts(backend, &self.engine.borrow());
 
-        // Grab the runner-created GTK window so minimize/maximize/close work.
-        let window = gtk4::Window::list_toplevels()
-            .into_iter()
-            .filter_map(|obj| obj.downcast::<gtk4::Window>().ok())
-            .find(|w| w.is_visible());
-        self.window = window;
+        // Try to grab the runner-created GTK window now so minimize/maximize/
+        // close work and the server-side WM titlebar is dropped in favour of
+        // the drawn CSD row; `setup()` runs before `run_with_shell`'s runner
+        // calls `window.present()`, so it is very likely not yet mapped and
+        // this lookup finds nothing. `tick()` retries every frame until the
+        // window is mapped, which is the reliable path (#552).
+        self.capture_window_and_apply_csd();
+
+        // GTK draws its own VSCode-style menu bar (File/Edit/View/...) — it
+        // acts as the client-side titlebar, always visible (unlike TUI, which
+        // only shows it in vscode-mode or via Alt). Historical GTK behaviour
+        // pre-#540; menu defs were never re-populated after the ShellApp
+        // migration deleted the Relm4 headerbar wiring. (#552)
+        let is_vscode_mode = self.engine.borrow().is_vscode_mode();
+        self.engine.borrow_mut().menu_bar_visible = true;
+        self.engine
+            .borrow()
+            .menu_system
+            .borrow_mut()
+            .set_menus(render::build_menu_defs(is_vscode_mode));
 
         // Apply initial CSS.
         let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
@@ -7461,6 +7514,44 @@ impl quadraui::ShellApp for App {
         );
         if w < 1.0 || h < 1.0 {
             return;
+        }
+
+        // ── Menu bar row (client-side chrome; #552) ─────────────────────────────
+        // quadraui's `run_with_shell` GTK runner (single-DA architecture, #217)
+        // creates the window undecorated with no native titlebar/menu hosting.
+        // `ShellConfig::with_title_bar()` (set in `run()`) reserves a
+        // full-width band across the top of the *entire* shell — above the
+        // activity bar and sidebar too, not just `main_content_bounds` — so
+        // GTK's drawn menu bar + inline window controls span the whole
+        // window like a real titlebar, and the activity bar/sidebar/main
+        // content the runner hands us below are already shifted down to
+        // make room. Mirrors the pre-#540 Relm4 headerbar and TUI's
+        // identical row (render_impl.rs) via the same shared
+        // `engine.menu_system` / `Backend::draw_menu_bar`.
+        let menu_row_rect = layout.title_bar_bounds.unwrap_or_default();
+        self.menu_row_rect.set(menu_row_rect);
+        if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
+            let bar = engine.menu_system.borrow().menu_bar();
+            let mb_layout = backend.draw_menu_bar(menu_row_rect, &bar);
+            let menu_end = mb_layout
+                .visible_items
+                .last()
+                .map(|vi| menu_row_rect.x + vi.bounds.x + vi.bounds.width)
+                .unwrap_or(menu_row_rect.x);
+            let controls_rect = quadraui::Rect::new(
+                menu_end,
+                menu_row_rect.y,
+                (menu_row_rect.x + menu_row_rect.width - menu_end).max(0.0),
+                menu_row_rect.height,
+            );
+            let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+            let controls_bar = render::window_controls_status_bar(&theme, maximized);
+            let hits = backend.draw_status_bar(controls_rect, &controls_bar, None, None);
+            *self.title_bar_hits.borrow_mut() = Some(hits);
+            self.title_bar_rect.set(controls_rect);
+        } else {
+            *self.title_bar_hits.borrow_mut() = None;
+            self.title_bar_rect.set(quadraui::Rect::default());
         }
 
         // ── Layout ────────────────────────────────────────────────────────────
@@ -7816,6 +7907,13 @@ impl quadraui::ShellApp for App {
                 });
             }
         }
+
+        // ── Menu dropdown overlay ────────────────────────────────────────────
+        // Rendered last so it paints on top of everything else, matching TUI
+        // (render_impl.rs: "dropdown is rendered LAST ... so it draws on top").
+        if engine.menu_bar_visible {
+            engine.menu_system.borrow().render(backend, menu_row_rect);
+        }
     }
 
     fn handle(
@@ -7825,6 +7923,67 @@ impl quadraui::ShellApp for App {
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
         use quadraui::{Key, MouseButton, NamedKey, UiEvent};
+
+        // ── Menu system intercept (#552) ─────────────────────────────────────
+        // GTK's menu bar is always visible (see `ShellApp::setup`) and its
+        // dropdown overlay must intercept keys/clicks before the sidebar or
+        // editor sees them — same precedence TUI uses (mod.rs "MenuSystem
+        // intercept" block) via the identical shared `menu_system.handle()`.
+        let (menu_bar_visible, menu_system) = {
+            let eng = self.engine.borrow();
+            (eng.menu_bar_visible, eng.menu_system.clone())
+        };
+        if menu_bar_visible || menu_system.borrow().is_open() {
+            let bar_rect = self.menu_row_rect.get();
+            let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
+            match menu_event {
+                quadraui::MenuEvent::Activated(id) => {
+                    self.handle_menu_msg(Msg::HandleMenuAction(id.as_str().to_string()));
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+                quadraui::MenuEvent::StateChanged | quadraui::MenuEvent::Consumed => {
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+                quadraui::MenuEvent::Ignored => {}
+            }
+        }
+
+        // ── Inline window-control buttons: minimize/maximize/close (#552) ───
+        // Hit-tested against the `StatusBar` drawn in `render_content` — same
+        // `StatusBarHit::Segment` mechanism already used for the debug
+        // sidebar's action row, just with different action ids.
+        if let UiEvent::MouseDown {
+            button: MouseButton::Left,
+            position,
+            ..
+        } = &event
+        {
+            let rect = self.title_bar_rect.get();
+            if rect.width > 0.0 {
+                let local_x = position.x - rect.x;
+                let local_y = position.y - rect.y;
+                let hit = (local_x >= 0.0 && local_y >= 0.0)
+                    .then(|| {
+                        self.title_bar_hits
+                            .borrow()
+                            .as_ref()
+                            .map(|h| h.hit_test(local_x, local_y))
+                    })
+                    .flatten();
+                if let Some(quadraui::StatusBarHit::Segment(id)) = hit {
+                    match id.as_str() {
+                        render::WINDOW_MINIMIZE_ACTION => self.dispatch(Msg::WindowMinimize),
+                        render::WINDOW_MAXIMIZE_ACTION => self.dispatch(Msg::WindowMaximize),
+                        render::WINDOW_CLOSE_ACTION => self.dispatch(Msg::WindowClose),
+                        _ => {}
+                    }
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+            }
+        }
 
         // Pointer events over the sidebar content area are forwarded to the active
         // panel's controller before the editor click path sees them. In ShellApp
@@ -7991,6 +8150,11 @@ impl quadraui::ShellApp for App {
         self.cached_char_width = backend.char_width() as f64;
         self.line_height_cell.set(self.cached_line_height);
         self.char_width_cell.set(self.cached_char_width);
+
+        // Retry the window capture until the runner has mapped it — see
+        // `capture_window_and_apply_csd` (#552). No-ops once `self.window`
+        // is `Some`.
+        self.capture_window_and_apply_csd();
 
         // Drain messages queued by async GTK callbacks.
         let msgs = self.sender.drain();
@@ -8360,6 +8524,14 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     let (top_panels, bottom_items): (Vec<_>, Vec<_>) = panels_with_icons
         .into_iter()
         .partition(|p| !p.id.as_str().starts_with("bottom:"));
-    let config = quadraui::ShellConfig::new("VimCode", top_panels).with_bottom_items(bottom_items);
+    // (#552) Reserve a full-width title-bar band across the top of the shell
+    // (above activity bar + sidebar + main content, not just main content) —
+    // GTK draws its own client-side menu bar + inline window controls into
+    // it since `run_with_shell` creates an undecorated-chrome-free window.
+    // Always on: GTK's menu bar acts as its titlebar (matches pre-#540
+    // behaviour), unlike TUI where it's optional.
+    let config = quadraui::ShellConfig::new("VimCode", top_panels)
+        .with_bottom_items(bottom_items)
+        .with_title_bar(1.0);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
 }
