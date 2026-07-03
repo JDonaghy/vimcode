@@ -7533,10 +7533,13 @@ impl quadraui::ShellApp for App {
         if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
             let bar = engine.menu_system.borrow().menu_bar();
             let mb_layout = backend.draw_menu_bar(menu_row_rect, &bar);
+            // `vi.bounds.x` is already absolute (quadraui's `MenuBar::layout`
+            // starts its cursor at `bounds.x`, the rect passed to
+            // `draw_menu_bar` above) — do not add `menu_row_rect.x` again.
             let menu_end = mb_layout
                 .visible_items
                 .last()
-                .map(|vi| menu_row_rect.x + vi.bounds.x + vi.bounds.width)
+                .map(|vi| vi.bounds.x + vi.bounds.width)
                 .unwrap_or(menu_row_rect.x);
             let controls_rect = quadraui::Rect::new(
                 menu_end,
@@ -7983,6 +7986,33 @@ impl quadraui::ShellApp for App {
                     return quadraui::Reaction::Redraw;
                 }
             }
+        }
+
+        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
+        // (quadraui#400). Runs after the menu-item intercept and the
+        // window-control-button check above, so both take priority — only a
+        // press/double-click that lands in the title bar band but misses
+        // every interactive segment (menu item, min/max/close button)
+        // reaches here, matching `Backend::begin_window_drag`'s documented
+        // contract. Mirrors quadraui's `full_chrome_demo` reference use of
+        // `ctx.in_title_bar` + `begin_window_drag`/`toggle_window_maximize`
+        // — TUI has no window to drag, so this is GTK-only.
+        match &event {
+            UiEvent::MouseDown {
+                button: MouseButton::Left,
+                position,
+                ..
+            } if ctx.in_title_bar(position.x, position.y) => {
+                backend.begin_window_drag();
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
+            UiEvent::DoubleClick { position, .. } if ctx.in_title_bar(position.x, position.y) => {
+                backend.toggle_window_maximize();
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
+            _ => {}
         }
 
         // Pointer events over the sidebar content area are forwarded to the active
@@ -8534,4 +8564,114 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
         .with_bottom_items(bottom_items)
         .with_title_bar(1.0);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
+}
+
+#[cfg(test)]
+mod chrome_paint_tests {
+    //! Headless pixel-paint regression test for the CSD title bar's inline
+    //! window-control buttons (#552). A round-2 smoke test reported the
+    //! minimize/maximize/close glyphs as completely invisible even though
+    //! their click hit-regions were live. Paints
+    //! `render::window_controls_status_bar` into an in-memory Cairo
+    //! `ImageSurface` (no display required — same pattern quadraui's own
+    //! `gtk/tab_bar.rs` headless paint tests use) and reads back pixels to
+    //! confirm the button glyphs actually paint non-background pixels.
+    use crate::render::{self, Theme};
+    use pangocairo::cairo::{Context, Format, ImageSurface};
+
+    const W: i32 = 400;
+    const ROW_H: i32 = 28;
+    const LINE_H: f64 = 20.0;
+
+    /// Read an RGB triple from an ARgb32 surface at pixel (x, y).
+    fn pixel(data: &[u8], stride: usize, x: i32, y: i32) -> (u8, u8, u8) {
+        let off = y as usize * stride + x as usize * 4;
+        (data[off + 2], data[off + 1], data[off])
+    }
+
+    /// Perceptual (sRGB-weighted) luminance, 0..255.
+    fn luminance((r, g, b): (u8, u8, u8)) -> f64 {
+        0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64
+    }
+
+    /// Paint `render::window_controls_status_bar(theme, false)` into a fresh
+    /// headless surface and return the max luminance delta, against the
+    /// bar's own background fill, found anywhere in the painted row.
+    ///
+    /// A glyph that paints but has near-zero contrast against its own
+    /// background (e.g. white-on-near-white) is exactly as invisible to a
+    /// user as a glyph that paints nothing at all — a plain "differs from
+    /// background" check would pass in both cases, so this measures the
+    /// actual perceptual gap instead.
+    fn max_contrast_delta(theme: &Theme) -> f64 {
+        let bar = render::window_controls_status_bar(theme, false);
+
+        let mut surface =
+            ImageSurface::create(Format::ARgb32, W, ROW_H).expect("create ImageSurface");
+        {
+            let cr = Context::new(&surface).expect("Context::new");
+            // Fill with a color that can't be confused with any themed fg/bg.
+            cr.set_source_rgb(1.0, 0.0, 1.0);
+            cr.paint().ok();
+
+            let pango_layout = pangocairo::functions::create_layout(&cr);
+            quadraui::gtk::draw_status_bar(
+                &cr,
+                &pango_layout,
+                0.0,
+                0.0,
+                W as f64,
+                LINE_H,
+                &bar,
+                &render::to_quadraui_theme(theme),
+                None,
+                None,
+            );
+        }
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface data");
+        let mid_y = ROW_H / 2;
+
+        let bg = {
+            let c = render::to_quadraui_color(theme.tab_bar_bg);
+            (c.r, c.g, c.b)
+        };
+        let bg_lum = luminance(bg);
+        let mut max_delta = 0.0f64;
+        for x in 0..W {
+            let px = pixel(&data, stride, x, mid_y);
+            if px == (255, 0, 255) {
+                continue; // untouched sentinel fill — not part of the bar.
+            }
+            max_delta = max_delta.max((luminance(px) - bg_lum).abs());
+        }
+        max_delta
+    }
+
+    /// #552 round-2 smoke test: the minimize/maximize/close glyphs rendered
+    /// with zero visible pixels. Root cause: `window_controls_status_bar`
+    /// paired its glyph `fg` with `theme.status_fg` (designed to contrast
+    /// against `status_bg`, the *bottom* status line's background) instead
+    /// of a color actually paired with `tab_bar_bg` — the background this
+    /// row uses. The `vs_light` theme (`tab_bar_bg` #ececec, old `status_fg`
+    /// #ffffff) rendered white-on-near-white, which is as good as invisible
+    /// even though pixels technically get painted. Runs across every
+    /// built-in theme (not just the default) so a future contrast
+    /// regression on any one theme fails loudly instead of only surfacing
+    /// in a manual smoke test against a theme nobody happened to try.
+    #[test]
+    fn window_control_buttons_are_visible_against_their_background_in_every_theme() {
+        for name in Theme::available_names() {
+            let theme = Theme::from_name(&name);
+            let delta = max_contrast_delta(&theme);
+            // WCAG-ish floor: anything much below this reads as "same color"
+            // at a glance, which is exactly the bug this test guards against.
+            assert!(
+                delta > 40.0,
+                "theme {name:?}: window-control glyphs have only {delta:.1} \
+                 luminance contrast against tab_bar_bg — effectively invisible"
+            );
+        }
+    }
 }

@@ -2193,7 +2193,16 @@ pub const WINDOW_CLOSE_ACTION: &str = "window:close";
 /// minimize/maximize) — this is GTK-only, called from `src/gtk/mod.rs`.
 pub fn window_controls_status_bar(theme: &Theme, maximized: bool) -> quadraui::StatusBar {
     let bg = to_quadraui_color(theme.tab_bar_bg);
-    let fg = to_quadraui_color(theme.status_fg);
+    // `tab_inactive_fg` — NOT `status_fg` — pairs with `tab_bar_bg` by theme
+    // design (it's what `draw_menu_bar` already uses for the File/Edit/...
+    // labels painted immediately to the left, against this exact
+    // background). `status_fg` is paired with `status_bg` (the bottom
+    // status line's own background) instead; at least one shipped theme
+    // (`vs_light`: `tab_bar_bg` #ececec, `status_fg` #ffffff) renders
+    // near-invisible white-on-near-white glyphs with that mismatched
+    // pairing — a real, reproducible cause of the #552 round-2 "buttons
+    // render with zero visible pixels" report.
+    let fg = to_quadraui_color(theme.tab_inactive_fg);
     let maximize_icon = if maximized {
         icons::WINDOW_RESTORE.s()
     } else {
