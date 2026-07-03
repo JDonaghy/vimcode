@@ -626,9 +626,12 @@ struct App {
     /// Rect of the drawn inline window-control buttons (minimize/maximize/
     /// close), to the right of the menu items within `menu_row_rect`. (#552)
     title_bar_rect: Cell<quadraui::Rect>,
-    /// Hit-test layout for the window-control buttons from the last draw,
-    /// consumed by `handle()` to route clicks to `Msg::Window*`. (#552)
-    title_bar_hits: RefCell<Option<quadraui::StatusBarLayout>>,
+    /// Hover/press/click tracker for the window-control buttons, shared with
+    /// quadraui's own `full_chrome_demo` reference title bar (quadraui#402)
+    /// — replaces a hand-rolled `StatusBarLayout::hit_test` call with the
+    /// same primitive so the buttons get real hover/press highlighting and
+    /// click-on-release semantics instead of firing on press. (#552)
+    title_bar_interaction: RefCell<quadraui::StatusBarInteraction>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     last_sc_refresh: std::time::Instant,
     /// Last time explorer tree indicators (modified/diagnostics) were refreshed.
@@ -1404,7 +1407,7 @@ impl App {
             window: None,
             menu_row_rect: Cell::new(quadraui::Rect::default()),
             title_bar_rect: Cell::new(quadraui::Rect::default()),
-            title_bar_hits: RefCell::new(None),
+            title_bar_interaction: RefCell::new(quadraui::StatusBarInteraction::new()),
             last_sc_refresh: std::time::Instant::now(),
             last_tree_indicator_update: std::time::Instant::now(),
             menu_dropdown_da: Rc::new(RefCell::new(None)),
@@ -7549,11 +7552,17 @@ impl quadraui::ShellApp for App {
             );
             let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
             let controls_bar = render::window_controls_status_bar(&theme, maximized);
-            let hits = backend.draw_status_bar(controls_rect, &controls_bar, None, None);
-            *self.title_bar_hits.borrow_mut() = Some(hits);
+            let interaction = self.title_bar_interaction.borrow();
+            let hits = backend.draw_status_bar(
+                controls_rect,
+                &controls_bar,
+                interaction.hovered_id(),
+                interaction.pressed_id(),
+            );
+            interaction.set_layout(hits);
+            drop(interaction);
             self.title_bar_rect.set(controls_rect);
         } else {
-            *self.title_bar_hits.borrow_mut() = None;
             self.title_bar_rect.set(quadraui::Rect::default());
         }
 
@@ -7954,36 +7963,34 @@ impl quadraui::ShellApp for App {
         }
 
         // ── Inline window-control buttons: minimize/maximize/close (#552) ───
-        // Hit-tested against the `StatusBar` drawn in `render_content` — same
-        // `StatusBarHit::Segment` mechanism already used for the debug
-        // sidebar's action row, just with different action ids.
-        if let UiEvent::MouseDown {
-            button: MouseButton::Left,
-            position,
-            ..
-        } = &event
+        // Shared `StatusBarInteraction` hover/press/click tracker — the same
+        // primitive quadraui's own `full_chrome_demo` reference title bar
+        // uses (quadraui#402) — instead of a hand-rolled `StatusBarHit`
+        // lookup. Gets the buttons real hover/press highlighting for free
+        // and click-on-release semantics (a press that drags off the button
+        // before release no longer fires it), matching native window
+        // controls. Runs on every event (not just MouseDown) so hover state
+        // updates as the pointer moves.
         {
             let rect = self.title_bar_rect.get();
             if rect.width > 0.0 {
-                let local_x = position.x - rect.x;
-                let local_y = position.y - rect.y;
-                let hit = (local_x >= 0.0 && local_y >= 0.0)
-                    .then(|| {
-                        self.title_bar_hits
-                            .borrow()
-                            .as_ref()
-                            .map(|h| h.hit_test(local_x, local_y))
-                    })
-                    .flatten();
-                if let Some(quadraui::StatusBarHit::Segment(id)) = hit {
-                    match id.as_str() {
-                        render::WINDOW_MINIMIZE_ACTION => self.dispatch(Msg::WindowMinimize),
-                        render::WINDOW_MAXIMIZE_ACTION => self.dispatch(Msg::WindowMaximize),
-                        render::WINDOW_CLOSE_ACTION => self.dispatch(Msg::WindowClose),
-                        _ => {}
+                let action = self.title_bar_interaction.borrow_mut().handle(&event, rect);
+                match action {
+                    quadraui::StatusBarAction::Clicked(id) => {
+                        match id.as_str() {
+                            render::WINDOW_MINIMIZE_ACTION => self.dispatch(Msg::WindowMinimize),
+                            render::WINDOW_MAXIMIZE_ACTION => self.dispatch(Msg::WindowMaximize),
+                            render::WINDOW_CLOSE_ACTION => self.dispatch(Msg::WindowClose),
+                            _ => {}
+                        }
+                        self.draw_needed.set(true);
+                        return quadraui::Reaction::Redraw;
                     }
-                    self.draw_needed.set(true);
-                    return quadraui::Reaction::Redraw;
+                    quadraui::StatusBarAction::Redraw => {
+                        self.draw_needed.set(true);
+                        return quadraui::Reaction::Redraw;
+                    }
+                    quadraui::StatusBarAction::Ignored => {}
                 }
             }
         }
