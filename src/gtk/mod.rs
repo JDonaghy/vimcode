@@ -7533,38 +7533,37 @@ impl quadraui::ShellApp for App {
         // `engine.menu_system` / `Backend::draw_menu_bar`.
         let menu_row_rect = layout.title_bar_bounds.unwrap_or_default();
         self.menu_row_rect.set(menu_row_rect);
-        if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
+        // Compute where the menu labels end so the inline window controls can
+        // sit to their right. This is layout-only (`menu_bar_layout`, no draw):
+        // the menu bar itself — and the whole `menu_row_rect` band — is painted
+        // by `menu_system.render()` near the end of this method. Drawing the
+        // controls *here* (as this used to) is pointless because that later
+        // `render()` repaints `draw_menu_bar` across the entire band and erases
+        // them (#552 round-2/3 "buttons render blank"). So we only stash the
+        // target rect now and paint the buttons *after* `render()` below.
+        let controls_rect = if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
             let bar = engine.menu_system.borrow().menu_bar();
-            let mb_layout = backend.draw_menu_bar(menu_row_rect, &bar);
+            let mb_layout = backend.menu_bar_layout(menu_row_rect, &bar);
             // `vi.bounds.x` is already absolute (quadraui's `MenuBar::layout`
-            // starts its cursor at `bounds.x`, the rect passed to
-            // `draw_menu_bar` above) — do not add `menu_row_rect.x` again.
+            // starts its cursor at `bounds.x`, the rect passed above) — do not
+            // add `menu_row_rect.x` again.
             let menu_end = mb_layout
                 .visible_items
                 .last()
                 .map(|vi| vi.bounds.x + vi.bounds.width)
                 .unwrap_or(menu_row_rect.x);
-            let controls_rect = quadraui::Rect::new(
+            let rect = quadraui::Rect::new(
                 menu_end,
                 menu_row_rect.y,
                 (menu_row_rect.x + menu_row_rect.width - menu_end).max(0.0),
                 menu_row_rect.height,
             );
-            let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
-            let controls_bar = render::window_controls_status_bar(&theme, maximized);
-            let interaction = self.title_bar_interaction.borrow();
-            let hits = backend.draw_status_bar(
-                controls_rect,
-                &controls_bar,
-                interaction.hovered_id(),
-                interaction.pressed_id(),
-            );
-            interaction.set_layout(hits);
-            drop(interaction);
-            self.title_bar_rect.set(controls_rect);
+            self.title_bar_rect.set(rect);
+            Some(rect)
         } else {
             self.title_bar_rect.set(quadraui::Rect::default());
-        }
+            None
+        };
 
         // ── Layout ────────────────────────────────────────────────────────────
         let tab_row_h = (lh * 1.6).ceil();
@@ -7925,6 +7924,26 @@ impl quadraui::ShellApp for App {
         // (render_impl.rs: "dropdown is rendered LAST ... so it draws on top").
         if engine.menu_bar_visible {
             engine.menu_system.borrow().render(backend, menu_row_rect);
+        }
+
+        // ── Inline window controls (min/max/close) — draw LAST (#552) ─────────
+        // `menu_system.render()` above repaints `draw_menu_bar` across the full
+        // `menu_row_rect` band, so the controls must be painted *after* it or
+        // they get erased (the round-2/3 "buttons render blank" regression).
+        // The controls sit in the title-bar band, to the right of the menu
+        // labels; the dropdown body drops *below* the band, so painting here
+        // never covers an open dropdown.
+        if let Some(controls_rect) = controls_rect {
+            let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+            let controls_bar = render::window_controls_status_bar(&theme, maximized);
+            let interaction = self.title_bar_interaction.borrow();
+            let hits = backend.draw_status_bar(
+                controls_rect,
+                &controls_bar,
+                interaction.hovered_id(),
+                interaction.pressed_id(),
+            );
+            interaction.set_layout(hits);
         }
     }
 
