@@ -8014,15 +8014,37 @@ impl quadraui::ShellApp for App {
             }
         }
 
+        // ── Outer window border: edge-resize cursor hint (quadraui#406) ──
+        // Pure side effect on hover — hint the resize pointer over the outer
+        // window border, default everywhere else (including the non-resizable
+        // full-width CSD title bar, which owns the top edge). Falls through so
+        // the editor/sidebar hover handling below still runs. Mirrors
+        // `full_chrome_demo`'s `MouseMoved` arm. GTK-only; TUI `set_cursor`
+        // is a documented no-op.
+        if let UiEvent::MouseMoved { position, .. } = &event {
+            let shape = if ctx.in_title_bar(position.x, position.y) {
+                quadraui::PointerShape::Default
+            } else {
+                match ctx.window_edge(position.x, position.y, backend.line_height()) {
+                    Some(edge) => quadraui::PointerShape::Resize(edge),
+                    None => quadraui::PointerShape::Default,
+                }
+            };
+            backend.set_cursor(shape);
+        }
+
         // ── CSD titlebar background: drag-to-move / double-click-maximize ──
-        // (quadraui#400). Runs after the menu-item intercept and the
-        // window-control-button check above, so both take priority — only a
-        // press/double-click that lands in the title bar band but misses
-        // every interactive segment (menu item, min/max/close button)
-        // reaches here, matching `Backend::begin_window_drag`'s documented
-        // contract. Mirrors quadraui's `full_chrome_demo` reference use of
-        // `ctx.in_title_bar` + `begin_window_drag`/`toggle_window_maximize`
-        // — TUI has no window to drag, so this is GTK-only.
+        // (quadraui#400) + outer window border: edge-resize (quadraui#406).
+        // Runs after the menu-item intercept and the window-control-button
+        // check above, so both take priority — only a press/double-click that
+        // lands in the title bar band but misses every interactive segment
+        // (menu item, min/max/close button) reaches here, matching
+        // `Backend::begin_window_drag`'s documented contract. The title bar
+        // takes priority over the top window edge (a full-width CSD header
+        // owns it), so `in_title_bar` is checked before `window_edge` —
+        // mirrors quadraui's `full_chrome_demo` reference. TUI has no window,
+        // so `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
+        // are all documented no-ops there; this path is GTK-only.
         match &event {
             UiEvent::MouseDown {
                 button: MouseButton::Left,
@@ -8037,6 +8059,17 @@ impl quadraui::ShellApp for App {
                 backend.toggle_window_maximize();
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
+            }
+            UiEvent::MouseDown {
+                button: MouseButton::Left,
+                position,
+                ..
+            } => {
+                if let Some(edge) = ctx.window_edge(position.x, position.y, backend.line_height()) {
+                    backend.begin_window_resize(edge);
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
             }
             _ => {}
         }
