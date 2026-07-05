@@ -3788,6 +3788,58 @@ pub fn context_menu_panel_to_quadraui_context_menu(
     }
 }
 
+/// Compute a backend-agnostic [`quadraui::ContextMenuLayout`] for a
+/// `ContextMenuPanel` from just `char_width`/`line_height`. Ports the
+/// char-count width budget both GTK's (formerly dead-code-only)
+/// `draw_context_menu_popup` and TUI's `draw_frame` independently
+/// duplicated, now shared so both backends derive their click geometry
+/// from the same formula (#546).
+///
+/// `border_chrome_inset` shrinks the computed width by `2 * inset` (in
+/// `char_width` units) to account for a border the rasteriser draws
+/// *outside* `layout.bounds` rather than inside it — TUI's ASCII box-drawing
+/// border is external, so it passes `1.0` (matching its pre-#546 inline
+/// `outer_width - 2.0`); GTK draws its border/padding inside the bounds via
+/// the primitive itself, so it passes `0.0`.
+pub fn context_menu_generic_layout(
+    panel: &ContextMenuPanel,
+    viewport: quadraui::Rect,
+    char_width: f64,
+    line_height: f64,
+    border_chrome_inset: f64,
+) -> (quadraui::ContextMenu, quadraui::ContextMenuLayout) {
+    let menu = context_menu_panel_to_quadraui_context_menu(panel);
+
+    let max_label = panel.items.iter().map(|i| i.label.len()).max().unwrap_or(4);
+    let max_sc = panel
+        .items
+        .iter()
+        .map(|i| i.shortcut.len())
+        .max()
+        .unwrap_or(0);
+    let content_cols = (max_label + max_sc + 6).clamp(20, 50);
+    let menu_w =
+        (content_cols as f64 * char_width - 2.0 * border_chrome_inset * char_width).max(char_width);
+
+    let anchor_x = panel.screen_col as f64 * char_width;
+    let anchor_y = panel.screen_row as f64 * line_height;
+    let trigger_height_px = panel.trigger_height as f64 * line_height;
+    let item_height = |_i: usize| quadraui::ContextMenuItemMeasure::new(line_height as f32);
+
+    let layout = menu.layout_at(
+        quadraui::Rect::new(
+            anchor_x as f32,
+            anchor_y as f32,
+            0.0,
+            trigger_height_px as f32,
+        ),
+        viewport,
+        menu_w as f32,
+        item_height,
+    );
+    (menu, layout)
+}
+
 /// Convert the menu-bar dropdown state into a `quadraui::ContextMenu`.
 /// Build a `quadraui::CommandCenter` descriptor from engine state.
 pub fn build_command_center_view(
@@ -3872,6 +3924,91 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
 pub struct DialogInputPanel {
     /// Display text (masked for passwords).
     pub display: String,
+}
+
+/// Compute a backend-agnostic [`quadraui::DialogLayout`] for a `DialogPanel`
+/// from just `char_width`/`line_height` — no text-measurement backend access
+/// required. Ports the char-cell approximation formula TUI's `draw_frame`
+/// used inline (`char_width == line_height == 1.0` there, one screen cell),
+/// scaled by real pixel metrics for GTK (#546).
+///
+/// Both backends call this (TUI at render time; GTK at render time, since
+/// its ShellApp `render_content` only has generic `&mut dyn Backend`
+/// metrics, not raw Pango) so a dialog's clickable geometry is always
+/// derived from the exact same math the renderer used to paint it — no
+/// more per-backend hand-rolled dialog sizing that can silently drift from
+/// what was actually drawn (previously TUI recomputed a *second*,
+/// independently-formulated copy of this at click time in `mouse.rs`; see
+/// that call site for the follow-up that now reuses this `DialogLayout`
+/// directly via `hit_test` instead).
+pub fn dialog_generic_layout(
+    panel: &DialogPanel,
+    viewport: quadraui::Rect,
+    char_width: f64,
+    line_height: f64,
+) -> (quadraui::Dialog, quadraui::DialogLayout) {
+    let dialog = dialog_panel_to_quadraui_dialog(panel);
+
+    let body_max = panel
+        .body
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let btn_max_label = panel
+        .buttons
+        .iter()
+        .map(|(lbl, _)| lbl.chars().count() + 4)
+        .max()
+        .unwrap_or(0);
+    let btn_row_len: usize = if panel.vertical_buttons {
+        btn_max_label + 2
+    } else {
+        panel
+            .buttons
+            .iter()
+            .map(|(lbl, _)| lbl.chars().count() + 4)
+            .sum::<usize>()
+            + 2
+    };
+    let content_width = body_max
+        .max(panel.title.chars().count() + 4)
+        .max(btn_row_len);
+    let min_w = 40.0 * char_width;
+    let max_w = (viewport.width as f64 - 4.0 * char_width).max(min_w);
+    let width = ((content_width as f64 + 4.0) * char_width).clamp(min_w, max_w);
+
+    let n_buttons = panel.buttons.len().max(1) as f64;
+    let inner = width - 2.0 * char_width;
+    let capped_btn_w = if panel.vertical_buttons {
+        btn_max_label as f64 * char_width
+    } else {
+        (btn_max_label as f64 * char_width).min(inner / n_buttons)
+    };
+
+    let measure = quadraui::DialogMeasure {
+        width: width as f32,
+        title_height: line_height as f32,
+        body_height: (panel.body.len() as f64 * line_height) as f32,
+        input_height: if panel.input.is_some() {
+            (2.0 * line_height) as f32
+        } else {
+            0.0
+        },
+        button_row_height: (if panel.vertical_buttons {
+            panel.buttons.len() as f64
+        } else {
+            1.0
+        } * line_height) as f32,
+        button_width: capped_btn_w as f32,
+        button_gap: 0.0,
+        padding: line_height as f32,
+        table_height: 0.0,
+    };
+    let layout = dialog.layout(viewport, measure, |_| {
+        quadraui::ToolbarItemMeasure::new(0.0)
+    });
+    (dialog, layout)
 }
 
 // Re-export hit-test types and functions from engine so backends can use `render::*`.

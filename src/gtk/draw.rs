@@ -51,7 +51,7 @@ pub(super) fn draw_editor(
     diff_btn_map_out: &Rc<RefCell<DiffBtnMap>>,
     split_btn_map_out: &Rc<RefCell<SplitBtnMap>>,
     action_btn_map_out: &Rc<RefCell<ActionBtnMap>>,
-    dialog_btn_rects_out: &Rc<RefCell<DialogBtnRects>>,
+    dialog_btn_rects_out: &Rc<RefCell<Vec<(f64, f64, f64, f64)>>>,
     dialog_popup_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     editor_hover_rect_out: &Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     completion_layout_out: &Rc<RefCell<Option<quadraui::CompletionsLayout>>>,

@@ -27529,49 +27529,6 @@ fn test_context_menu_disabled_item() {
     );
 }
 
-// --- Dialog hit regions ---
-
-#[test]
-fn test_dialog_click_button() {
-    use crate::core::engine::{resolve_dialog_click, DialogButton, DialogClickResult};
-    let buttons = vec![
-        DialogButton {
-            label: "Cancel".to_string(),
-            hotkey: 'c',
-            action: "cancel".to_string(),
-        },
-        DialogButton {
-            label: "OK".to_string(),
-            hotkey: 'o',
-            action: "ok".to_string(),
-        },
-    ];
-    // Dialog at (20, 10), width 40, height 6, buttons on row 14
-    let layout = DialogLayout {
-        x: 20,
-        y: 10,
-        width: 40,
-        height: 6,
-        btn_y: 14,
-    };
-    let fmt = |label: &str, _hotkey: char| label.to_string();
-    // Button 0 "Cancel" starts at col 22 (layout.x + 2), width ~10
-    assert_eq!(
-        resolve_dialog_click(&buttons, &layout, 23, 14, &fmt),
-        DialogClickResult::Button(0)
-    );
-    // Outside dialog
-    assert_eq!(
-        resolve_dialog_click(&buttons, &layout, 0, 0, &fmt),
-        DialogClickResult::Outside
-    );
-    // Inside but not on buttons
-    assert_eq!(
-        resolve_dialog_click(&buttons, &layout, 30, 12, &fmt),
-        DialogClickResult::InsideDialog
-    );
-}
-
 // ─── Bare-URL hover link tests ────────────────────────────────────────────────
 
 #[test]

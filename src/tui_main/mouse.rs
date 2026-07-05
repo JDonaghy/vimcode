@@ -166,6 +166,7 @@ pub(super) fn handle_mouse(
     fr_input_dragging: &mut bool,
     completion_layout: Option<&quadraui::CompletionsLayout>,
     context_menu_layout: Option<&quadraui::ContextMenuLayout>,
+    dialog_layout: Option<&quadraui::DialogLayout>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -420,57 +421,43 @@ pub(super) fn handle_mouse(
     }
 
     // ── Dialog popup click handling ─────────────────────────────────────────────
+    // #546: resolve clicks via the `DialogLayout` cached from the render step
+    // (`render::dialog_generic_layout`, called once in `draw_frame`) instead
+    // of recomputing an independently-formulated layout here — the two
+    // copies could (and did, subtly: `.len()` byte count vs `.chars().count()`)
+    // drift apart. Mirrors the context-menu handling just below, which
+    // already consumes its render-cached layout the same way.
     if engine.dialog.is_some() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
-            let dialog = engine.dialog.as_ref().unwrap();
-            // Compute dialog layout (same formula as render_dialog_popup)
-            let body_max = dialog.body.iter().map(|l| l.len()).max().unwrap_or(0);
-            let btn_row_len: usize = dialog
-                .buttons
-                .iter()
-                .map(|b| render::format_button_label(&b.label, b.hotkey).len() + 4)
-                .sum::<usize>()
-                + 2;
-            let content_width = body_max.max(dialog.title.len() + 4).max(btn_row_len);
-            let width = (content_width as u16 + 4).clamp(40, term_cols.saturating_sub(4));
-            let height = (3 + dialog.body.len() as u16 + 2 + 1).min(term_height.saturating_sub(4));
-            let px = (term_cols.saturating_sub(width)) / 2;
-            let py = (term_height.saturating_sub(height)) / 2;
-            let btn_y = py + height - 2;
-
-            let layout = crate::core::engine::DialogLayout {
-                x: px,
-                y: py,
-                width,
-                height,
-                btn_y,
-            };
-            let result = crate::core::engine::resolve_dialog_click(
-                &dialog.buttons,
-                &layout,
-                col,
-                row,
-                &|label, hotkey| render::format_button_label(label, hotkey),
-            );
-            use crate::core::engine::DialogClickResult;
-            match result {
-                DialogClickResult::Button(idx) => {
-                    let action = engine.dialog_click_button(idx);
-                    if engine.explorer_needs_refresh {
-                        engine.explorer_needs_refresh = false;
-                        engine.explorer_rebuild_rows();
+            // No cached layout yet (dialog opened this frame, not yet
+            // painted) — treat as an inside/no-op click rather than risk
+            // dismissing a dialog the user hasn't even seen painted.
+            let hit = dialog_layout
+                .map(|dl| dl.hit_test(col as f32, row as f32))
+                .unwrap_or(quadraui::DialogHit::Body);
+            match hit {
+                quadraui::DialogHit::Button(id) => {
+                    if let Some(idx) = id
+                        .as_str()
+                        .strip_prefix("dialog:btn:")
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        let action = engine.dialog_click_button(idx);
+                        if engine.explorer_needs_refresh {
+                            engine.explorer_needs_refresh = false;
+                            engine.explorer_rebuild_rows();
+                        }
+                        if handle_action(engine, action) {
+                            *should_quit = true;
+                        }
+                        return sidebar_width;
                     }
-                    if handle_action(engine, action) {
-                        *should_quit = true;
-                    }
-                    return sidebar_width;
                 }
-                DialogClickResult::Outside => {
+                quadraui::DialogHit::BodyToolbarButton(_) | quadraui::DialogHit::Body => {}
+                quadraui::DialogHit::Outside => {
                     engine.dialog = None;
                     engine.pending_move = None;
                 }
-                DialogClickResult::InsideDialog => {}
             }
         }
         return sidebar_width;

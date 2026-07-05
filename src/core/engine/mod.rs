@@ -1283,62 +1283,6 @@ pub fn resolve_context_menu_click(
     ContextMenuClickResult::InsidePopup
 }
 
-// ── Dialog hit regions ──────────────────────────────────────────────────────
-
-/// Result of resolving a click against a modal dialog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DialogClickResult {
-    /// Click on a button at this index.
-    Button(usize),
-    /// Click inside the dialog but not on a button.
-    InsideDialog,
-    /// Click outside the dialog — should dismiss.
-    Outside,
-}
-
-/// Pre-computed dialog layout bounds (in char-cell units, absolute screen position).
-pub struct DialogLayout {
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-    /// Row containing the buttons (absolute screen row).
-    pub btn_y: u16,
-}
-
-/// Resolve a click position against a dialog popup.
-pub fn resolve_dialog_click(
-    buttons: &[DialogButton],
-    layout: &DialogLayout,
-    click_col: u16,
-    click_row: u16,
-    format_label: &dyn Fn(&str, char) -> String,
-) -> DialogClickResult {
-    // Outside dialog?
-    if click_col < layout.x
-        || click_col >= layout.x + layout.width
-        || click_row < layout.y
-        || click_row >= layout.y + layout.height
-    {
-        return DialogClickResult::Outside;
-    }
-
-    // Check button row
-    if click_row == layout.btn_y {
-        let mut col_offset = layout.x + 2; // left padding
-        for (i, btn) in buttons.iter().enumerate() {
-            let label = format_label(&btn.label, btn.hotkey);
-            let btn_w = label.len() as u16 + 4;
-            if click_col >= col_offset && click_col < col_offset + btn_w {
-                return DialogClickResult::Button(i);
-            }
-            col_offset += btn_w;
-        }
-    }
-
-    DialogClickResult::InsideDialog
-}
-
 /// Represents a change operation that can be repeated with `.`
 #[derive(Debug, Clone)]
 struct Change {
