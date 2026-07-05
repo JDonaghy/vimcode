@@ -7721,57 +7721,36 @@ impl quadraui::ShellApp for App {
         pixel_hits.clear();
         close_abs.clear();
         slots_abs.clear();
-        if let Some(ref split) = screen.editor_group_split {
-            for gtb in &split.group_tab_bars {
-                if engine.is_tab_bar_hidden(gtb.group_id) {
-                    continue;
-                }
-                let bar_top = gtb.bounds.y - tab_bar_h;
-                let tb_rect = quadraui::Rect::new(
-                    gtb.bounds.x as f32,
-                    bar_top as f32,
-                    gtb.bounds.width as f32,
-                    tab_row_h as f32,
-                );
-                let hover = self
-                    .tab_close_hover
-                    .and_then(|(gid, i)| (gid == gtb.group_id.0).then_some(i));
-                let mut frame = QSL::new();
-                frame.push(Surface::TabBar {
-                    rect: tb_rect,
-                    bar: &gtb.bar,
-                    hovered_close: hover,
-                });
-                frame.draw(backend);
-                // Recover the exact pixel geometry the rasteriser just drew and
-                // cache it (relative to the bar's left edge) for hit-testing.
-                let hits = backend.tab_bar_layout(tb_rect, &gtb.bar);
-                let ph = tab_hits_to_pixel_hits(&hits, &gtb.bar, tb_rect.x as f64);
-                close_abs.insert(
-                    gtb.group_id.0,
-                    abs_close_record(&ph.close, gtb.bounds.x, bar_top, bar_top + tab_row_h),
-                );
-                slots_abs.insert(gtb.group_id.0, abs_visible_slots(&hits));
-                pixel_hits.insert(gtb.group_id.0, ph);
-            }
-        } else if !engine.is_tab_bar_hidden(engine.active_group) {
-            let tb_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, tab_row_h as f32);
-            let hover = self.tab_close_hover.map(|(_, i)| i);
+        for target in render::tab_bar_draw_targets(
+            &engine,
+            screen,
+            tab_row_h,
+            tab_bar_h,
+            (0.0, 0.0),
+            (x, y, w),
+        ) {
+            let tb_rect = target.rect;
+            let hover = self
+                .tab_close_hover
+                .and_then(|(gid, i)| (gid == target.group_id.0).then_some(i));
             let mut frame = QSL::new();
             frame.push(Surface::TabBar {
                 rect: tb_rect,
-                bar: &screen.tab_bar_primitive,
+                bar: target.bar,
                 hovered_close: hover,
             });
             frame.draw(backend);
-            let hits = backend.tab_bar_layout(tb_rect, &screen.tab_bar_primitive);
-            let ph = tab_hits_to_pixel_hits(&hits, &screen.tab_bar_primitive, tb_rect.x as f64);
+            // Recover the exact pixel geometry the rasteriser just drew and
+            // cache it (relative to the bar's left edge) for hit-testing.
+            let hits = backend.tab_bar_layout(tb_rect, target.bar);
+            let ph = tab_hits_to_pixel_hits(&hits, target.bar, tb_rect.x as f64);
+            let bar_top = tb_rect.y as f64;
             close_abs.insert(
-                engine.active_group.0,
-                abs_close_record(&ph.close, x, y, y + tab_row_h),
+                target.group_id.0,
+                abs_close_record(&ph.close, tb_rect.x as f64, bar_top, bar_top + tab_row_h),
             );
-            slots_abs.insert(engine.active_group.0, abs_visible_slots(&hits));
-            pixel_hits.insert(engine.active_group.0, ph);
+            slots_abs.insert(target.group_id.0, abs_visible_slots(&hits));
+            pixel_hits.insert(target.group_id.0, ph);
         }
         drop(close_abs);
         drop(slots_abs);

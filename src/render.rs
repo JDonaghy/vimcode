@@ -788,6 +788,89 @@ pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
     b.set_nerd_fonts(engine.settings.use_nerd_fonts);
 }
 
+/// One tab bar ready to be painted via `Surface::TabBar` (GTK) or
+/// `render_tab_bar` (TUI).
+pub struct TabBarDrawTarget<'a> {
+    pub rect: quadraui::Rect,
+    pub bar: &'a quadraui::TabBar,
+    /// Group this tab bar belongs to — the active (and only) group in
+    /// single-group mode.
+    pub group_id: GroupId,
+}
+
+/// Compute which tab bar(s) should be painted this frame, and where.
+///
+/// Both backends previously re-derived the same skip-condition + rect math
+/// independently in their `if let Some(split) = screen.editor_group_split
+/// { .. } else { .. }` blocks (#549, follow-up from the #547 breadcrumb
+/// unification which deliberately left this one out to keep that PR scoped).
+/// Each backend still does its own drawing + hit-test-geometry recovery
+/// afterwards (GTK caches pixel hit-tests into `Rc<RefCell<...>>` maps, TUI
+/// tracks visible tab counts) — that part isn't shareable and stays inline
+/// at each call site.
+///
+/// `tab_row_h` is the height of the tab row itself (GTK: `lh * 1.6` in
+/// pixels; TUI: `1.0` row). `reserved_h` is the *total* space reserved above
+/// the group's window content — the tab row plus, when breadcrumbs are on,
+/// the breadcrumb row too (GTK: `tab_bar_height_px`; TUI: `tui_tbh`, 1 or
+/// 2 rows) — used to recover the tab row's own top edge from
+/// `GroupTabBar::bounds.y`, which is the *window* content's top edge.
+///
+/// `origin_offset` translates `bounds` (relative to the coordinate space of
+/// the `window_rects` passed into `build_screen_layout`) into the caller's
+/// screen space, same convention as `breadcrumb_draw_targets`: GTK's window
+/// rects are already absolute, so it passes `(0.0, 0.0)`; TUI's are
+/// content-area-relative, so it passes `(editor_area.x, editor_area.y)`.
+///
+/// `single_group_rect` is `(x, y, width)` for the single-group tab bar,
+/// already in the caller's output coordinate space (there is no per-group
+/// `bounds` to derive it from in single-group mode — both backends already
+/// compute this exact rect today: GTK's `main_content_bounds` origin, TUI's
+/// `editor_area` origin).
+///
+/// Split-group targets with zero-width bounds (the `min_x == f64::MAX`
+/// fallback in `build_screen_layout` when a group has no matching window
+/// rects, e.g. during a transient group-tree mutation) are filtered out here,
+/// same as `breadcrumb_draw_targets` — TUI's pre-existing call site already
+/// guarded on `tab_w > 0`, but GTK's didn't, so centralizing it removes a
+/// footgun instead of asking every backend to remember it independently.
+pub fn tab_bar_draw_targets<'a>(
+    engine: &Engine,
+    screen: &'a ScreenLayout,
+    tab_row_h: f64,
+    reserved_h: f64,
+    origin_offset: (f64, f64),
+    single_group_rect: (f64, f64, f64),
+) -> Vec<TabBarDrawTarget<'a>> {
+    let (ox, oy) = origin_offset;
+    if let Some(ref split) = screen.editor_group_split {
+        split
+            .group_tab_bars
+            .iter()
+            .filter(|gtb| !engine.is_tab_bar_hidden(gtb.group_id) && gtb.bounds.width > 0.0)
+            .map(|gtb| TabBarDrawTarget {
+                rect: quadraui::Rect::new(
+                    (gtb.bounds.x + ox) as f32,
+                    (gtb.bounds.y - reserved_h + oy) as f32,
+                    gtb.bounds.width as f32,
+                    tab_row_h as f32,
+                ),
+                bar: &gtb.bar,
+                group_id: gtb.group_id,
+            })
+            .collect()
+    } else if engine.is_tab_bar_hidden(engine.active_group) {
+        Vec::new()
+    } else {
+        let (sx, sy, sw) = single_group_rect;
+        vec![TabBarDrawTarget {
+            rect: quadraui::Rect::new(sx as f32, sy as f32, sw as f32, tab_row_h as f32),
+            bar: &screen.tab_bar_primitive,
+            group_id: engine.active_group,
+        }]
+    }
+}
+
 /// Present when the editor area is split into two or more independent groups.
 /// `ScreenLayout.tab_bar` always contains the first group's tab bar for
 /// backward compat in single-group mode.
@@ -15813,6 +15896,142 @@ mod tests {
         assert!(
             targets.is_empty(),
             "a zero-width breadcrumb bar must not be drawn"
+        );
+    }
+
+    /// Direct unit test for `tab_bar_draw_targets` (#549, follow-up to
+    /// #547's `breadcrumb_draw_targets`). Covers the single-group rect
+    /// pass-through, the split-group `reserved_h` subtraction +
+    /// `origin_offset` translation, the `is_tab_bar_hidden` filter in both
+    /// modes, and the zero-width fallback filter in split mode.
+    #[test]
+    fn test_tab_bar_draw_targets_single_and_split() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let theme = Theme::onedark();
+        let tab_row_h = 32.0; // lh * 1.6
+        let reserved_h = 32.0; // no breadcrumbs: reserved == tab row height
+
+        // ── Single-group mode ───────────────────────────────────────────
+        let mut engine = Engine::new();
+        let content_bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, reserved_h);
+        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        assert!(screen.editor_group_split.is_none());
+
+        let targets = tab_bar_draw_targets(
+            &engine,
+            &screen,
+            tab_row_h,
+            reserved_h,
+            (0.0, 0.0),
+            (10.0, 20.0, 800.0),
+        );
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].rect.x, 10.0);
+        assert_eq!(targets[0].rect.y, 20.0);
+        assert_eq!(targets[0].rect.width, 800.0);
+        assert_eq!(targets[0].rect.height, tab_row_h as f32);
+        assert_eq!(targets[0].group_id, engine.active_group);
+
+        // Hiding the single group's tab bar suppresses the target entirely.
+        engine.settings.hide_single_tab = true;
+        let screen_hidden =
+            build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let targets = tab_bar_draw_targets(
+            &engine,
+            &screen_hidden,
+            tab_row_h,
+            reserved_h,
+            (0.0, 0.0),
+            (10.0, 20.0, 800.0),
+        );
+        assert!(
+            targets.is_empty(),
+            "a hidden single-group tab bar must not be drawn"
+        );
+
+        // ── Split-group mode ────────────────────────────────────────────
+        let mut engine = Engine::new();
+        engine.execute_command("EditorGroupSplit");
+        assert_eq!(engine.group_layout.leaf_count(), 2);
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, reserved_h);
+        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let split = screen
+            .editor_group_split
+            .as_ref()
+            .expect("2 groups must produce Some(editor_group_split)");
+        assert_eq!(split.group_tab_bars.len(), 2);
+
+        // Zero offset (GTK's convention): rect derived from bounds.y - reserved_h.
+        let targets = tab_bar_draw_targets(
+            &engine,
+            &screen,
+            tab_row_h,
+            reserved_h,
+            (0.0, 0.0),
+            (0.0, 0.0, 0.0), // unused in split mode
+        );
+        assert_eq!(targets.len(), 2);
+        for (target, gtb) in targets.iter().zip(split.group_tab_bars.iter()) {
+            assert_eq!(target.group_id, gtb.group_id);
+            assert_eq!(target.rect.x, gtb.bounds.x as f32);
+            assert_eq!(target.rect.y, (gtb.bounds.y - reserved_h) as f32);
+            assert_eq!(target.rect.width, gtb.bounds.width as f32);
+            assert_eq!(target.rect.height, tab_row_h as f32);
+        }
+
+        // Non-zero offset (TUI's convention): translated by origin_offset.
+        let targets = tab_bar_draw_targets(
+            &engine,
+            &screen,
+            tab_row_h,
+            reserved_h,
+            (5.0, 7.0),
+            (0.0, 0.0, 0.0),
+        );
+        assert_eq!(
+            targets[0].rect.x,
+            (split.group_tab_bars[0].bounds.x + 5.0) as f32
+        );
+        assert_eq!(
+            targets[0].rect.y,
+            (split.group_tab_bars[0].bounds.y - reserved_h + 7.0) as f32
+        );
+
+        // Note: `is_tab_bar_hidden` only ever returns true in single-group
+        // mode (`hide_single_tab` + `leaf_count() <= 1`, see
+        // `Engine::is_tab_bar_hidden`), so there's no reachable per-group
+        // "hidden" state to exercise here in split mode — the split arm's
+        // `is_tab_bar_hidden` check is defensive, matching what the
+        // pre-existing per-backend loops did.
+
+        // Zero-width bounds (the `min_x == f64::MAX` fallback) are filtered
+        // out in split mode too, mirroring `breadcrumb_draw_targets`.
+        let mut screen_zero_width =
+            build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        screen_zero_width
+            .editor_group_split
+            .as_mut()
+            .unwrap()
+            .group_tab_bars[0]
+            .bounds
+            .width = 0.0;
+        let targets = tab_bar_draw_targets(
+            &engine,
+            &screen_zero_width,
+            tab_row_h,
+            reserved_h,
+            (0.0, 0.0),
+            (0.0, 0.0, 0.0),
+        );
+        assert_eq!(
+            targets.len(),
+            1,
+            "a zero-width group tab bar must not be drawn"
         );
     }
 

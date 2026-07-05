@@ -290,6 +290,32 @@ pub(super) fn draw_frame(
     }
 
     // ── Render editor ─────────────────────────────────────────────────────────
+    // Skip-condition + rect math (including the zero-width fallback filter
+    // and the reserved-height subtraction that recovers the tab row's own
+    // top edge from `GroupTabBar::bounds.y`) come from
+    // `render::tab_bar_draw_targets`, shared with GTK, so the two backends
+    // can't drift apart (#549, follow-up to #547's `breadcrumb_draw_targets`).
+    // Each arm below still does its own draw call + `tab_visible_counts_out`
+    // bookkeeping, and picks where in the window-render order to draw (split
+    // draws windows first so tab bars paint on top at group boundaries;
+    // single draws the tab bar first then windows below it).
+    let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
+        2.0
+    } else {
+        1.0
+    };
+    let tab_bar_targets = render::tab_bar_draw_targets(
+        engine,
+        screen,
+        1.0,
+        tui_tbh,
+        (editor_area.x as f64, editor_area.y as f64),
+        (
+            editor_area.x as f64,
+            editor_area.y as f64,
+            editor_area.width as f64,
+        ),
+    );
     if let Some(ref split) = screen.editor_group_split {
         debug_log!(
             "draw_frame split: editor_area=({},{},{}x{}) groups={}",
@@ -316,28 +342,15 @@ pub(super) fn draw_frame(
         render_all_windows(backend, frame, editor_area, &screen.windows, theme);
         // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
         // the group's window content (bounds.y - tab_bar_height).
-        let tui_tbh: u16 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
-            2
-        } else {
-            1
-        };
-        for gtb in split.group_tab_bars.iter() {
-            if engine.is_tab_bar_hidden(gtb.group_id) {
-                continue;
-            }
-            let tab_x = gtb.bounds.x as u16 + editor_area.x;
-            let tab_w = gtb.bounds.width as u16;
-            if tab_w > 0 {
-                let bar_y = editor_area.y + (gtb.bounds.y as u16).saturating_sub(tui_tbh);
-                let g_tab = Rect {
-                    x: tab_x,
-                    y: bar_y,
-                    width: tab_w,
-                    height: 1,
-                };
-                let vis = render_tab_bar(backend, frame, g_tab, &gtb.bar, theme);
-                tab_visible_counts_out.push((gtb.group_id, vis));
-            }
+        for target in &tab_bar_targets {
+            let g_tab = Rect {
+                x: target.rect.x as u16,
+                y: target.rect.y as u16,
+                width: target.rect.width as u16,
+                height: 1,
+            };
+            let vis = render_tab_bar(backend, frame, g_tab, target.bar, theme);
+            tab_visible_counts_out.push((target.group_id, vis));
         }
         // Draw breadcrumb bars (below each group's tab bar). Hidden while the
         // terminal panel is maximized so it can claim the row. Skip
@@ -376,15 +389,15 @@ pub(super) fn draw_frame(
         }
     } else {
         // Single group: tab bar at row 0 of editor_area, windows at row 1+.
-        if !engine.is_tab_bar_hidden(engine.active_group) {
+        for target in &tab_bar_targets {
             let tab_rect = Rect {
-                x: editor_area.x,
-                y: editor_area.y,
-                width: editor_area.width,
+                x: target.rect.x as u16,
+                y: target.rect.y as u16,
+                width: target.rect.width as u16,
                 height: 1,
             };
-            let vis = render_tab_bar(backend, frame, tab_rect, &screen.tab_bar_primitive, theme);
-            tab_visible_counts_out.push((engine.active_group, vis));
+            let vis = render_tab_bar(backend, frame, tab_rect, target.bar, theme);
+            tab_visible_counts_out.push((target.group_id, vis));
         }
         // Draw breadcrumb bar for the single group. Hidden while the terminal
         // panel is maximized. `bc.bounds.y` (via `breadcrumb_draw_targets`)
