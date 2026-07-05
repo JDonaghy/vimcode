@@ -2172,6 +2172,66 @@ pub fn is_debug_sidebar_action(id: &quadraui::WidgetId) -> bool {
     id.as_str() == "debug_sidebar:action"
 }
 
+/// `action_id` for each inline window-control button drawn by
+/// [`window_controls_status_bar`]. Shared with the GTK click handler so the
+/// two sides can't drift.
+pub const WINDOW_MINIMIZE_ACTION: &str = "window:minimize";
+pub const WINDOW_MAXIMIZE_ACTION: &str = "window:maximize";
+pub const WINDOW_CLOSE_ACTION: &str = "window:close";
+
+/// Build the inline minimize/maximize/close window-control buttons for the
+/// GTK client-side titlebar (#552).
+///
+/// quadraui's `run_with_shell` GTK runner creates an undecorated-chrome-free
+/// window with no native titlebar hosting (single-DA architecture, #217) —
+/// GTK draws its own CSD-style controls at the right edge of the menu-bar
+/// row using the same `StatusBar` primitive already used for the debug
+/// sidebar's action row, so the click hit-testing reuses the existing
+/// `StatusBarHit::Segment` mechanism rather than any new backend API.
+///
+/// TUI has no window-chrome equivalent (a terminal has no window to
+/// minimize/maximize) — this is GTK-only, called from `src/gtk/mod.rs`.
+pub fn window_controls_status_bar(theme: &Theme, maximized: bool) -> quadraui::StatusBar {
+    let bg = to_quadraui_color(theme.tab_bar_bg);
+    // `tab_inactive_fg` — NOT `status_fg` — pairs with `tab_bar_bg` by theme
+    // design (it's what `draw_menu_bar` already uses for the File/Edit/...
+    // labels painted immediately to the left, against this exact
+    // background). `status_fg` is paired with `status_bg` (the bottom
+    // status line's own background) instead; at least one shipped theme
+    // (`vs_light`: `tab_bar_bg` #ececec, `status_fg` #ffffff) renders
+    // near-invisible white-on-near-white glyphs with that mismatched
+    // pairing — a real, reproducible cause of the #552 round-2 "buttons
+    // render with zero visible pixels" report.
+    let fg = to_quadraui_color(theme.tab_inactive_fg);
+    let maximize_icon = if maximized {
+        icons::WINDOW_RESTORE.s()
+    } else {
+        icons::WINDOW_MAXIMIZE.s()
+    };
+    let seg = |text: String, action: &str| quadraui::StatusBarSegment {
+        text,
+        fg,
+        bg,
+        bold: false,
+        action_id: Some(quadraui::WidgetId::new(action)),
+    };
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("window_controls"),
+        left_segments: Vec::new(),
+        right_segments: vec![
+            seg(
+                format!("  {}  ", icons::WINDOW_MINIMIZE.s()),
+                WINDOW_MINIMIZE_ACTION,
+            ),
+            seg(format!("  {maximize_icon}  "), WINDOW_MAXIMIZE_ACTION),
+            seg(
+                format!("  {}  ", icons::WINDOW_CLOSE.s()),
+                WINDOW_CLOSE_ACTION,
+            ),
+        ],
+    }
+}
+
 /// Build a `TextDisplay` for the debug output panel.
 pub fn debug_output_to_text_display(
     output_lines: &[String],

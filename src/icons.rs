@@ -132,6 +132,16 @@ pub const FIND_REPLACE_ALL: Icon = Icon::new("\u{eb3d}", "R*"); // nf-cod-replac
 pub const FIND_IN_SEL: Icon = Icon::new("\u{eb54}", "\u{2261}"); // ≡ nf-cod-selection
 pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-close
 
+// ─── Window Controls (GTK client-side titlebar, #552) ───────────────────────
+// Plain Unicode glyphs — deliberately no nerd-font-only variant since these
+// draw at the very top of the window before any font capability probing is
+// meaningful, and the shapes read fine as monospace fallback text too.
+
+pub const WINDOW_MINIMIZE: Icon = Icon::new("\u{2500}", "\u{2500}"); // ─
+pub const WINDOW_MAXIMIZE: Icon = Icon::new("\u{25a1}", "\u{25a1}"); // □
+pub const WINDOW_RESTORE: Icon = Icon::new("\u{29c9}", "\u{29c9}"); // ⧉
+pub const WINDOW_CLOSE: Icon = Icon::new("\u{2715}", "\u{00d7}"); // ✕ / ×
+
 // ─── Tab Bar / Split Buttons (wide glyphs, TUI) ─────────────────────────────
 
 pub const DIFF_PREV: Icon = Icon::new("\u{F0143}", "<");
