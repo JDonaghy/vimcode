@@ -3266,6 +3266,144 @@ impl App {
         layout
     }
 
+    /// Route a left-click against the currently open engine-drawn context
+    /// menu — `engine.context_menu` is shared by the editor, tab-bar, and
+    /// explorer sources, so this applies uniformly regardless of which one
+    /// opened it. Mirrors the modal-stack arbitration
+    /// (`quadraui::dispatch_mouse_down` for outside-click dismissal,
+    /// `ContextMenuLayout::hit_test` for inner row resolution) that used to
+    /// live inline in `handle_mouse_click_msg` (Phase B.5b Stage 4).
+    ///
+    /// Returns `true` iff a menu was open and this call consumed the click
+    /// (dismissed it, fired an item, or kept it open on an inert row) — the
+    /// caller should treat that as "handled, stop routing". Returns `false`
+    /// when no menu was open, after defensively popping any stale
+    /// modal-stack entry left by an Esc/Enter close the click handler never
+    /// saw; the caller should then proceed with its own routing.
+    ///
+    /// Callable from both `handle_mouse_click_msg` (main-content clicks) and
+    /// `try_route_sidebar_mouse_event` (#546 FAILED-2: an explorer-sourced
+    /// menu typically renders inside the sidebar's own content bounds, so
+    /// without giving it priority there too, clicks on it fell straight
+    /// through to `TreeController`'s row hit-test underneath instead of
+    /// firing the menu action or dismissing it).
+    fn dispatch_context_menu_click(&mut self, x: f64, y: f64) -> bool {
+        if self.engine.borrow().context_menu.is_some() {
+            let cm_id = quadraui::WidgetId::new("context_menu");
+
+            let menu_layout = self.context_menu_layout.borrow().clone();
+
+            let Some(menu_layout) = menu_layout else {
+                // Empty items list — close defensively.
+                self.engine.borrow_mut().close_context_menu();
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&cm_id);
+                self.draw_needed.set(true);
+                return true;
+            };
+
+            // Push the menu's resolved bounds to the modal stack so
+            // any other modal that might be open (picker, dialog) is
+            // arbitrated against the menu by `dispatch_mouse_down`.
+            self.backend
+                .borrow()
+                .modal_stack_handle()
+                .borrow_mut()
+                .push(cm_id.clone(), menu_layout.bounds);
+
+            let stack_events = {
+                let stack_rc = self.backend.borrow().modal_stack_handle();
+                let stack = stack_rc.borrow();
+                quadraui::dispatch_mouse_down(
+                    &stack,
+                    quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                    quadraui::MouseButton::Left,
+                    quadraui::Modifiers::default(),
+                )
+            };
+            let dismissed = stack_events.iter().any(|ev| {
+                matches!(
+                    ev,
+                    quadraui::UiEvent::Palette(id, _) if *id == cm_id
+                )
+            });
+
+            if dismissed {
+                self.engine.borrow_mut().close_context_menu();
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&cm_id);
+            } else {
+                // Inner hit. `hit_test` returns Item(id) for clickable
+                // rows, Inert for separators / disabled rows, Empty
+                // for outside (unreachable here since the dispatcher
+                // already routed that case to `dismissed`).
+                match menu_layout.hit_test(x as f32, y as f32) {
+                    quadraui::ContextMenuHit::Item(id) => {
+                        // Item ids are synthesised as `"context:N"`
+                        // where N is the engine-side item index. Parse
+                        // back to the engine index so
+                        // `context_menu_confirm` fires the right action.
+                        let engine_idx = id
+                            .as_str()
+                            .strip_prefix("context:")
+                            .and_then(|s| s.parse::<usize>().ok());
+                        if let Some(idx) = engine_idx {
+                            let mut engine = self.engine.borrow_mut();
+                            if let Some(ref mut cm) = engine.context_menu {
+                                cm.selected = idx;
+                            }
+                            let _act = engine.context_menu_confirm();
+                            let needs_tree_refresh = engine.explorer_needs_refresh;
+                            if needs_tree_refresh {
+                                engine.explorer_needs_refresh = false;
+                            }
+                            drop(engine);
+                            self.backend
+                                .borrow()
+                                .modal_stack_handle()
+                                .borrow_mut()
+                                .pop(&cm_id);
+                            if needs_tree_refresh {
+                                self.dispatch(Msg::RefreshFileTree);
+                            }
+                        }
+                    }
+                    quadraui::ContextMenuHit::Inert => {
+                        // Separator or disabled item — keep menu open.
+                    }
+                    quadraui::ContextMenuHit::Empty => {
+                        // Defensive: dispatcher should have caught this.
+                        self.engine.borrow_mut().close_context_menu();
+                        self.backend
+                            .borrow()
+                            .modal_stack_handle()
+                            .borrow_mut()
+                            .pop(&cm_id);
+                    }
+                }
+            }
+            self.draw_needed.set(true);
+            return true;
+        }
+        // Defensive cleanup: context menu may have closed via Esc/Enter
+        // while no click was seen by us. Pop any stale entry.
+        self.backend
+            .borrow()
+            .modal_stack_handle()
+            .borrow_mut()
+            .pop(&quadraui::WidgetId::new("context_menu"));
+        false
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
         self.reconcile_editor_hover_modal();
@@ -3407,130 +3545,15 @@ impl App {
 
         // ── Context menu click handling (engine-drawn) ──
         //
-        // Phase B.5b Stage 4: routed through `ModalStack` +
-        // `quadraui::dispatch_mouse_down` for outside arbitration, and
-        // through `quadraui::ContextMenuLayout::hit_test` for inner
-        // row-level refinement — the SAME hit-test the renderer
-        // (`draw.rs::draw_context_menu_popup`) uses for hover. The
-        // legacy `resolve_context_menu_click` was off-by-one for items
-        // below a separator (#251) because the renderer was migrated
-        // to `quadraui::ContextMenu::layout` (no top/bottom border
-        // padding) but the click hit-test still assumed the old
-        // "+1 row top border" layout. Driving both off the same
-        // `ContextMenuLayout` eliminates drift by construction.
-        if self.engine.borrow().context_menu.is_some() {
-            let cm_id = quadraui::WidgetId::new("context_menu");
-
-            let menu_layout = self.context_menu_layout.borrow().clone();
-
-            let Some(menu_layout) = menu_layout else {
-                // Empty items list — close defensively.
-                self.engine.borrow_mut().close_context_menu();
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&cm_id);
-                self.draw_needed.set(true);
-                return;
-            };
-
-            // Push the menu's resolved bounds to the modal stack so
-            // any other modal that might be open (picker, dialog) is
-            // arbitrated against the menu by `dispatch_mouse_down`.
-            self.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .push(cm_id.clone(), menu_layout.bounds);
-
-            let stack_events = {
-                let stack_rc = self.backend.borrow().modal_stack_handle();
-                let stack = stack_rc.borrow();
-                quadraui::dispatch_mouse_down(
-                    &stack,
-                    quadraui::Point {
-                        x: x as f32,
-                        y: y as f32,
-                    },
-                    quadraui::MouseButton::Left,
-                    quadraui::Modifiers::default(),
-                )
-            };
-            let dismissed = stack_events.iter().any(|ev| {
-                matches!(
-                    ev,
-                    quadraui::UiEvent::Palette(id, _) if *id == cm_id
-                )
-            });
-
-            if dismissed {
-                self.engine.borrow_mut().close_context_menu();
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&cm_id);
-            } else {
-                // Inner hit. `hit_test` returns Item(id) for clickable
-                // rows, Inert for separators / disabled rows, Empty
-                // for outside (unreachable here since the dispatcher
-                // already routed that case to `dismissed`).
-                match menu_layout.hit_test(x as f32, y as f32) {
-                    quadraui::ContextMenuHit::Item(id) => {
-                        // Item ids are synthesised as `"context:N"`
-                        // where N is the engine-side item index. Parse
-                        // back to the engine index so
-                        // `context_menu_confirm` fires the right action.
-                        let engine_idx = id
-                            .as_str()
-                            .strip_prefix("context:")
-                            .and_then(|s| s.parse::<usize>().ok());
-                        if let Some(idx) = engine_idx {
-                            let mut engine = self.engine.borrow_mut();
-                            if let Some(ref mut cm) = engine.context_menu {
-                                cm.selected = idx;
-                            }
-                            let _act = engine.context_menu_confirm();
-                            let needs_tree_refresh = engine.explorer_needs_refresh;
-                            if needs_tree_refresh {
-                                engine.explorer_needs_refresh = false;
-                            }
-                            drop(engine);
-                            self.backend
-                                .borrow()
-                                .modal_stack_handle()
-                                .borrow_mut()
-                                .pop(&cm_id);
-                            if needs_tree_refresh {
-                                self.dispatch(Msg::RefreshFileTree);
-                            }
-                        }
-                    }
-                    quadraui::ContextMenuHit::Inert => {
-                        // Separator or disabled item — keep menu open.
-                    }
-                    quadraui::ContextMenuHit::Empty => {
-                        // Defensive: dispatcher should have caught this.
-                        self.engine.borrow_mut().close_context_menu();
-                        self.backend
-                            .borrow()
-                            .modal_stack_handle()
-                            .borrow_mut()
-                            .pop(&cm_id);
-                    }
-                }
-            }
-            self.draw_needed.set(true);
+        // Extracted into `dispatch_context_menu_click` (#546 FAILED-2) so
+        // `try_route_sidebar_mouse_event` can give an open menu first right
+        // of refusal on sidebar-bound clicks too — an explorer-sourced menu
+        // typically renders inside the sidebar's own content bounds, and
+        // without this it fell straight through to `TreeController`'s row
+        // hit-test underneath instead of firing the menu action.
+        if self.dispatch_context_menu_click(x, y) {
             return;
         }
-        // Defensive cleanup: context menu may have closed via Esc/Enter
-        // while no click was seen by us. Pop any stale entry.
-        self.backend
-            .borrow()
-            .modal_stack_handle()
-            .borrow_mut()
-            .pop(&quadraui::WidgetId::new("context_menu"));
 
         // ── Find/replace overlay click handling (using shared hit regions) ──
         //
@@ -6683,6 +6706,31 @@ impl App {
             return false;
         }
 
+        // An engine-drawn context menu (editor / tab-bar / explorer — they
+        // all share `engine.context_menu`) takes priority over the sidebar's
+        // own click routing. An explorer-sourced menu typically renders
+        // inside these same sidebar bounds, so without this a click on it —
+        // an item, or an outside-click meant to dismiss it — fell straight
+        // through to `TreeController`'s row hit-test underneath: the menu
+        // *looked* interactive but every click acted on the tree row instead
+        // (#546 FAILED-2). Only a left press drives the menu's own
+        // hit-test/dismissal (mirrors `handle_mouse_click_msg`); any other
+        // press/double-click/scroll while a menu is open is swallowed here
+        // rather than leaking through to the tree underneath it.
+        if self.engine.borrow().context_menu.is_some() {
+            if matches!(
+                event,
+                UiEvent::MouseDown {
+                    button: quadraui::MouseButton::Left,
+                    ..
+                }
+            ) {
+                self.dispatch_context_menu_click(pos.x as f64, pos.y as f64);
+            }
+            self.draw_needed.set(true);
+            return true;
+        }
+
         // Only the file explorer panel is wired through here. When no panel id is
         // set the explorer is the default (mirrors render_content).
         let explorer_active = {
@@ -8247,10 +8295,41 @@ impl quadraui::ShellApp for App {
                         });
                     }
                     MouseButton::Right => {
-                        self.dispatch(Msg::EditorRightClick {
-                            x: position.x as f64,
-                            y: position.y as f64,
-                        });
+                        // #546 FAILED-1: this used to unconditionally build
+                        // `EditorRightClick`, so right-clicking a tab opened
+                        // the *editor's* context menu (identical item list to
+                        // right-clicking in the buffer) instead of a
+                        // tab-specific one. Resolve the click against the
+                        // last-painted tab-bar geometry first — read-only, no
+                        // engine mutation — and only fall back to the editor
+                        // menu when it isn't over a tab.
+                        let rx = position.x as f64;
+                        let ry = position.y as f64;
+                        let tab_target = {
+                            let engine = self.engine.borrow();
+                            let layout_ref = self.cached_screen_layout.borrow();
+                            layout_ref.as_ref().and_then(|layout| {
+                                resolve_tab_right_click(
+                                    &engine,
+                                    rx,
+                                    ry,
+                                    self.cached_line_height,
+                                    self.cached_char_width,
+                                    layout,
+                                    &self.cached_tab_pixel_hits.borrow(),
+                                )
+                            })
+                        };
+                        if let Some((group_id, tab_idx)) = tab_target {
+                            self.dispatch(Msg::TabRightClick {
+                                group_id,
+                                tab_idx,
+                                x: rx,
+                                y: ry,
+                            });
+                        } else {
+                            self.dispatch(Msg::EditorRightClick { x: rx, y: ry });
+                        }
                     }
                     _ => {}
                 }

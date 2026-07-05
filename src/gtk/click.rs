@@ -209,6 +209,54 @@ fn resolve_charcell_tab_click(
     render_mod::resolve_tab_bar_click(regions, col)
 }
 
+/// Resolve which tab (if any) a right-click landed on, without any of the
+/// left-click side effects `tab_bar_inner_hit_test`/`dispatch_tab_bar_target`
+/// apply (selecting the tab, closing it, opening a split, ...).
+///
+/// Right-clicks reach `ShellApp::handle` via a dedicated `MouseButton::Right`
+/// branch that historically only ever built `Msg::EditorRightClick` — there
+/// was no tab-bar-aware routing at all, so right-clicking a tab always opened
+/// the *editor's* context menu instead of a tab-specific one (#546 FAILED-1).
+/// This mirrors `pixel_to_click_target`'s zone resolution (read-only) so the
+/// caller can tell a tab-bar right-click apart from an editor right-click
+/// before deciding which `Msg` to dispatch.
+pub(super) fn resolve_tab_right_click(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    line_height: f64,
+    char_width: f64,
+    cached_layout: &render::ScreenLayout,
+    tab_pixel_hits: &TabPixelHitMap,
+) -> Option<(GroupId, usize)> {
+    use crate::core::engine::TabBarClickTarget as T;
+
+    let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
+    let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
+    let zone = render_mod::screen_zone_hit_test(
+        cached_layout,
+        x,
+        y,
+        tab_bar_height,
+        single_tab_hidden,
+        engine.active_group,
+    );
+    let ScreenZone::TabBar {
+        group_id, local_x, ..
+    } = zone
+    else {
+        return None;
+    };
+    let target = tab_pixel_hits
+        .get(&group_id.0)
+        .and_then(|ph| resolve_pixel_tab_click(ph, local_x))
+        .or_else(|| resolve_charcell_tab_click(cached_layout, group_id, local_x, char_width));
+    match target {
+        Some(T::Tab(idx)) | Some(T::CloseTab(idx)) => Some((group_id, idx)),
+        _ => None,
+    }
+}
+
 /// Apply the engine-side effect for a resolved tab-bar click target and return
 /// the `ClickTarget` the caller dispatches.
 fn dispatch_tab_bar_target(
