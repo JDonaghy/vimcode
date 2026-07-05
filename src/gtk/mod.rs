@@ -232,9 +232,6 @@ type SplitBtnMap = HashMap<usize, (f64, f64)>;
 /// Cached action menu button pixel range per group: group_id -> (start_x, end_x).
 type ActionBtnMap = HashMap<usize, (f64, f64)>;
 
-/// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
-type DialogBtnRects = Vec<(f64, f64, f64, f64)>;
-
 /// Cached per-window status segment hit zones: window_id -> Vec<(start_x, end_x, action)>.
 /// Populated by draw_window_status_bar, consumed by click hit-testing.
 type StatusSegmentMap = HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
@@ -524,8 +521,11 @@ struct App {
     /// Cached line height for the UI font (sidebars, panels).
     /// Computed alongside `cached_line_height` in `CacheFontMetrics`.
     cached_ui_line_height: f64,
-    /// Cached dialog button hit rects: Vec<(x, y, w, h)> populated by draw_dialog_popup.
-    dialog_btn_rects: Rc<RefCell<DialogBtnRects>>,
+    /// Cached dialog layout from the last `render_content` paint (#546) —
+    /// mirrors `context_menu_layout` below. Button-click and outside-click
+    /// hit-testing both read `DialogLayout::hit_test` off this instead of a
+    /// hand-rolled per-backend rect cache.
+    dialog_layout: Rc<RefCell<Option<quadraui::DialogLayout>>>,
     /// Shared with the drawing-area resize callback so scrollbars can be
     /// repositioned synchronously (before each frame) without going through
     /// Relm4's async message queue.
@@ -661,14 +661,6 @@ struct App {
     /// handler. (B.5b Stage 7.)
     #[allow(clippy::type_complexity)]
     tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
-    /// Dialog popup bounding rect (x, y, w, h) — set during draw
-    /// from the resolved `quadraui::DialogLayout::bounds`. Used for
-    /// `ModalStack` registration in the click handler. The pre-fix
-    /// `dialog_btn_rects`-derived inline calc overshot the actual
-    /// popup width on small dialogs (`:about`), causing
-    /// click-outside-to-dismiss to fail.
-    #[allow(clippy::type_complexity)]
-    dialog_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
     #[allow(clippy::type_complexity)]
     editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
@@ -1370,7 +1362,7 @@ impl App {
             cached_char_width: 9.0,
             last_editor_pointer: Rc::new(Cell::new(None)),
             cached_ui_line_height: 20.0,
-            dialog_btn_rects: Rc::new(RefCell::new(Vec::new())),
+            dialog_layout: Rc::new(RefCell::new(None)),
             line_height_cell: Rc::new(Cell::new(24.0)),
             char_width_cell: Rc::new(Cell::new(9.0)),
             mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
@@ -1418,7 +1410,6 @@ impl App {
             completion_layout: Rc::new(RefCell::new(None)),
             context_menu_layout: Rc::new(RefCell::new(None)),
             tab_switcher_popup_rect: Rc::new(Cell::new(None)),
-            dialog_popup_rect: Rc::new(Cell::new(None)),
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
             menu_dd_line_height: Rc::new(Cell::new(24.0)),
@@ -3972,41 +3963,37 @@ impl App {
         // dialog closes (here, after a button click or outside-click
         // dismiss; or in the `else` branch below if the engine
         // closed it via Esc/Enter without the click handler seeing).
-        // Inner button hit-testing stays per-backend (uses GTK
-        // pixel-level `dialog_btn_rects` from the last draw).
+        // Button hit-testing now goes through the resolved
+        // `quadraui::DialogLayout` cached from the last `render_content`
+        // paint (#546) — `DialogLayout::hit_test` instead of a hand-rolled
+        // per-backend rect scan, mirroring the context-menu block below.
         if self.engine.borrow().dialog.is_some() {
-            let btn_rects = self.dialog_btn_rects.borrow().clone();
+            let dialog_layout = self.dialog_layout.borrow().clone();
 
-            // Use actual button rects from the last draw_dialog_popup call.
-            let mut clicked_btn: Option<usize> = None;
-            for (idx, &(bx, by, bw, bh)) in btn_rects.iter().enumerate() {
-                if x >= bx && x < bx + bw && y >= by && y < by + bh {
-                    clicked_btn = Some(idx);
-                    break;
-                }
-            }
+            let clicked_btn: Option<usize> =
+                dialog_layout
+                    .as_ref()
+                    .and_then(|dl| match dl.hit_test(x as f32, y as f32) {
+                        quadraui::DialogHit::Button(id) => id
+                            .as_str()
+                            .strip_prefix("dialog:btn:")
+                            .and_then(|s| s.parse::<usize>().ok()),
+                        _ => None,
+                    });
 
-            // Pull the resolved popup bounds from the last draw_dialog_popup
-            // call (cached in `dialog_popup_rect`). Earlier the bounds were
-            // derived from `btn_rects` with a 350px-min fudge that overshot
-            // the actual popup width on small dialogs (`:about`), so
-            // `dispatch_mouse_down` would mis-classify outside clicks as
-            // inside and the dismiss path never fired.
+            // Pull the resolved popup bounds from the cached `DialogLayout`.
+            // Earlier the bounds were derived from `btn_rects` with a
+            // 350px-min fudge that overshot the actual popup width on small
+            // dialogs (`:about`), so `dispatch_mouse_down` would
+            // mis-classify outside clicks as inside and the dismiss path
+            // never fired.
             let dialog_id = quadraui::WidgetId::new("dialog");
-            if let Some((px, py, pw, ph)) = self.dialog_popup_rect.get() {
+            if let Some(dl) = &dialog_layout {
                 self.backend
                     .borrow()
                     .modal_stack_handle()
                     .borrow_mut()
-                    .push(
-                        dialog_id.clone(),
-                        quadraui::Rect {
-                            x: px as f32,
-                            y: py as f32,
-                            width: pw as f32,
-                            height: ph as f32,
-                        },
-                    );
+                    .push(dialog_id.clone(), dl.bounds);
             }
 
             // Run the shared dispatch to learn whether this click
@@ -6568,6 +6555,51 @@ impl App {
                                 .borrow_mut()
                                 .handle(&ev, &mut *b, rect)
                         };
+                        // #546: a right-click MouseDown lands here too (this
+                        // arm doesn't filter by button — `try_route_sidebar_
+                        // mouse_event` forwards ALL MouseDown in the sidebar
+                        // bounds), and `TreeController::handle()` already
+                        // resolves it to `ContextMenuRequested{path, position}`
+                        // with the correct target row. But
+                        // `dispatch_explorer_tree_event`'s catch-all silently
+                        // dropped that variant, so explorer right-click did
+                        // nothing at all — independent of the render gap
+                        // this issue otherwise fixes. Editor/tab-bar
+                        // right-click are unaffected (dedicated
+                        // `MouseButton::Right` branches before generic
+                        // routing); TUI is unaffected too (it intercepts
+                        // right-clicks at the raw crossterm layer, before
+                        // UiEvent translation, so it never reaches
+                        // `ContextMenuRequested`). `position` is in the same
+                        // absolute pixel space `TreeController` just used for
+                        // its own hit-test, so convert with the same
+                        // `(lh, cw)` metrics used above.
+                        if let quadraui::TreeControllerEvent::ContextMenuRequested {
+                            path,
+                            position,
+                        } = &tree_event
+                        {
+                            if let Some(&row_idx) = path.first() {
+                                let idx = row_idx as usize;
+                                let target_info = {
+                                    let eng = self.engine.borrow();
+                                    eng.explorer_rows
+                                        .get(idx)
+                                        .map(|row| (row.path.clone(), row.is_dir))
+                                };
+                                if let Some((target, is_dir)) = target_info {
+                                    let (lh, cw) = self.cached_explorer_metrics.get();
+                                    let cx = (position.x / (cw.max(1.0) as f32)) as u16;
+                                    let cy = (position.y / (lh.max(1.0) as f32)) as u16;
+                                    self.engine
+                                        .borrow_mut()
+                                        .open_explorer_context_menu(target, is_dir, cx, cy);
+                                }
+                            }
+                            self.queue_explorer_draw();
+                            self.draw_needed.set(true);
+                            return;
+                        }
                         let is_scrollbar =
                             matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
                         if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
@@ -7924,6 +7956,55 @@ impl quadraui::ShellApp for App {
         // (render_impl.rs: "dropdown is rendered LAST ... so it draws on top").
         if engine.menu_bar_visible {
             engine.menu_system.borrow().render(backend, menu_row_rect);
+        }
+
+        // ── Dialog + context-menu popups (#546) ───────────────────────────────
+        // The ShellApp render path never painted `screen.dialog` /
+        // `screen.context_menu` at all — their draw + click-geometry caches
+        // were populated only by the dead legacy `draw_editor` Cairo path
+        // (src/gtk/draw.rs), which has zero live callers under ShellApp. That
+        // left right-click menus invisible/unclickable and dialogs
+        // (":about", Unsaved-Changes on tab close, etc.) invisible AND
+        // undismissable by mouse — `dialog.is_some()` stayed true forever and
+        // `handle_mouse_click_msg`'s dialog block swallowed all subsequent
+        // clicks. Drawn here — after the menu dropdown, before the always-
+        // on-top window controls — using only generic `Backend` metrics
+        // (`render::dialog_generic_layout` / `context_menu_generic_layout`,
+        // shared with TUI) since this fn has no raw Pango/Cairo access.
+        // Resolved geometry is cached into `dialog_layout` /
+        // `context_menu_layout` — the exact caches `handle_mouse_click_msg`
+        // already reads (and was simply never being fed).
+        let popup_vp = backend.viewport();
+        let popup_viewport = quadraui::Rect::new(0.0, 0.0, popup_vp.width, popup_vp.height);
+        if let Some(ref panel) = screen.dialog {
+            let (dialog, dlayout) = render::dialog_generic_layout(panel, popup_viewport, cw, lh);
+            let mut frame = QSL::new();
+            frame.push(Surface::Dialog {
+                dialog: &dialog,
+                layout: &dlayout,
+            });
+            frame.draw(backend);
+            *self.dialog_layout.borrow_mut() = Some(dlayout);
+        } else {
+            *self.dialog_layout.borrow_mut() = None;
+        }
+
+        if let Some(ref panel) = screen.context_menu {
+            if panel.items.is_empty() {
+                *self.context_menu_layout.borrow_mut() = None;
+            } else {
+                let (menu, mlayout) =
+                    render::context_menu_generic_layout(panel, popup_viewport, cw, lh, 0.0);
+                let mut frame = QSL::new();
+                frame.push(Surface::ContextMenu {
+                    menu: &menu,
+                    layout: &mlayout,
+                });
+                frame.draw(backend);
+                *self.context_menu_layout.borrow_mut() = Some(mlayout);
+            }
+        } else {
+            *self.context_menu_layout.borrow_mut() = None;
         }
 
         // ── Inline window controls (min/max/close) — draw LAST (#552) ─────────

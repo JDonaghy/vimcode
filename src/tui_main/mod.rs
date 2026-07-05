@@ -1008,6 +1008,11 @@ fn event_loop(
     let mut completion_layout: Option<quadraui::CompletionsLayout> = None;
     // Cached context menu layout for mouse hit-testing (#210).
     let mut context_menu_layout: Option<quadraui::ContextMenuLayout> = None;
+    // Cached dialog layout for mouse hit-testing (#546) — populated at
+    // render time from the same `render::dialog_generic_layout` call the
+    // paint step uses, so a button click resolves via `DialogLayout::hit_test`
+    // instead of a second, independently-formulated recompute.
+    let mut dialog_layout: Option<quadraui::DialogLayout> = None;
     // Track last draw time to cap frame rate at ~60 fps and keep CPU low.
     let min_frame = Duration::from_millis(16);
     let mut last_draw = Instant::now()
@@ -1169,6 +1174,7 @@ fn event_loop(
                             &mut debug_toolbar_rect,
                             &mut completion_layout,
                             &mut context_menu_layout,
+                            &mut dialog_layout,
                             &mut backend,
                             tui_drag_source,
                             tui_drag_cursor,
@@ -1223,6 +1229,7 @@ fn event_loop(
                                     &mut debug_toolbar_rect,
                                     &mut completion_layout,
                                     &mut context_menu_layout,
+                                    &mut dialog_layout,
                                     &mut backend,
                                     tui_drag_source,
                                     tui_drag_cursor,
@@ -2883,6 +2890,7 @@ fn event_loop(
                                 &mut fr_input_dragging,
                                 completion_layout.as_ref(),
                                 context_menu_layout.as_ref(),
+                                dialog_layout.as_ref(),
                             );
 
                             if mouse_should_quit {
@@ -2933,6 +2941,7 @@ fn event_loop(
                     &mut fr_input_dragging,
                     completion_layout.as_ref(),
                     context_menu_layout.as_ref(),
+                    dialog_layout.as_ref(),
                 );
 
                 if mouse_should_quit {

@@ -109,6 +109,7 @@ pub(super) fn draw_frame(
     debug_toolbar_rect_out: &mut quadraui::Rect,
     completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
     context_menu_layout_out: &mut Option<quadraui::ContextMenuLayout>,
+    dialog_layout_out: &mut Option<quadraui::DialogLayout>,
     // Phase B.4 Stage 2: backend handle for migrated `draw_*` calls.
     // Set once per frame by the caller (cached theme); the migrated
     // call sites wrap their access in `backend.enter_frame_scope`.
@@ -944,114 +945,43 @@ pub(super) fn draw_frame(
 
     // ── Context menu popup (above status/command line) ─────────────────────
     if let Some(ref ctx_menu) = screen.context_menu {
-        // Per D6: build quadraui::ContextMenu, ask for layout, rasterise.
-        // The layout describes the INNER items region; the rasteriser
-        // draws a 1-cell box border around it, so we inset the anchor
-        // by (1, 1) and shrink the menu_width by 2.
-        let menu = render::context_menu_panel_to_quadraui_context_menu(ctx_menu);
-        // Shrink the viewport by 1 on each side so layout clamping
-        // accounts for the 1-cell border chrome the rasteriser draws
-        // outside layout.bounds — otherwise the right/bottom border
-        // can extend past the screen on narrow windows.
+        // The layout describes the INNER items region; the rasteriser draws
+        // a 1-cell box border around it, so the anchor/viewport passed to
+        // `context_menu_generic_layout` are inset by (1, 1) and shrunk by 2 —
+        // otherwise the right/bottom border can extend past the screen on
+        // narrow windows. `char_width`/`line_height` are both 1.0 (one
+        // screen cell) on TUI; GTK's ShellApp `render_content` passes its
+        // real pixel metrics through the same shared function (#546).
         let inner_viewport = quadraui::Rect::new(
             (area.x + 1) as f32,
             (area.y + 1) as f32,
             area.width.saturating_sub(2) as f32,
             area.height.saturating_sub(2) as f32,
         );
-        let max_label = ctx_menu
-            .items
-            .iter()
-            .map(|i| i.label.len())
-            .max()
-            .unwrap_or(4);
-        let max_shortcut = ctx_menu
-            .items
-            .iter()
-            .map(|i| i.shortcut.len())
-            .max()
-            .unwrap_or(0);
-        let outer_width = (max_label + max_shortcut + 6).clamp(20, 50) as f32;
-        let inner_width = (outer_width - 2.0).max(1.0);
-        let layout = menu.layout_at(
-            quadraui::Rect::new(
-                ctx_menu.screen_col as f32 + 1.0,
-                ctx_menu.screen_row as f32 + 1.0,
-                0.0,
-                ctx_menu.trigger_height,
-            ),
-            inner_viewport,
-            inner_width,
-            |_| quadraui::ContextMenuItemMeasure::new(1.0),
-        );
+        let inset_panel = render::ContextMenuPanel {
+            screen_col: ctx_menu.screen_col + 1,
+            screen_row: ctx_menu.screen_row + 1,
+            ..ctx_menu.clone()
+        };
+        let (menu, layout) =
+            render::context_menu_generic_layout(&inset_panel, inner_viewport, 1.0, 1.0, 1.0);
         super::quadraui_tui::draw_context_menu(frame.buffer_mut(), &menu, &layout, theme);
         *context_menu_layout_out = Some(layout);
     }
 
     // ── Modal dialog (highest z-order after quit confirm) ────────────────────
     if let Some(ref dialog) = screen.dialog {
-        // Per D6: build quadraui::Dialog primitive, ask it for a layout,
-        // then hand both to the rasteriser.
-        let q_dialog = render::dialog_panel_to_quadraui_dialog(dialog);
         let viewport = quadraui::Rect::new(
             area.x as f32,
             area.y as f32,
             area.width as f32,
             area.height as f32,
         );
-        // Compute dimensions the same way the legacy draw did.
-        let body_max = dialog
-            .body
-            .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(0);
-        let btn_max_label = dialog
-            .buttons
-            .iter()
-            .map(|(lbl, _)| lbl.chars().count() + 4)
-            .max()
-            .unwrap_or(0);
-        let btn_row_len: usize = if dialog.vertical_buttons {
-            btn_max_label + 2
-        } else {
-            dialog
-                .buttons
-                .iter()
-                .map(|(lbl, _)| lbl.chars().count() + 4)
-                .sum::<usize>()
-                + 2
-        };
-        let content_width = body_max
-            .max(dialog.title.chars().count() + 4)
-            .max(btn_row_len);
-        let width = (content_width as u16 + 4).clamp(40, area.width.saturating_sub(4)) as f32;
-        let n_buttons = dialog.buttons.len().max(1) as f32;
-        let inner = width - 2.0;
-        let capped_btn_w = if dialog.vertical_buttons {
-            btn_max_label as f32
-        } else {
-            (btn_max_label as f32).min(inner / n_buttons)
-        };
-        let measure = quadraui::DialogMeasure {
-            width,
-            title_height: 1.0,
-            body_height: dialog.body.len() as f32,
-            input_height: if dialog.input.is_some() { 2.0 } else { 0.0 },
-            button_row_height: if dialog.vertical_buttons {
-                dialog.buttons.len() as f32
-            } else {
-                1.0
-            },
-            button_width: capped_btn_w,
-            button_gap: 0.0,
-            padding: 1.0,
-            table_height: 0.0,
-        };
-        let layout = q_dialog.layout(viewport, measure, |_| {
-            quadraui::ToolbarItemMeasure::new(0.0)
-        });
+        let (q_dialog, layout) = render::dialog_generic_layout(dialog, viewport, 1.0, 1.0);
         super::quadraui_tui::draw_dialog(frame.buffer_mut(), &q_dialog, &layout, theme);
+        *dialog_layout_out = Some(layout);
+    } else {
+        *dialog_layout_out = None;
     }
 
     // ── Menu dropdown — rendered last so it draws on top of everything ────────
@@ -1756,6 +1686,7 @@ mod tests {
         let mut dbg_toolbar_rect = quadraui::Rect::default();
         let mut completion_layout = None;
         let mut context_menu_layout = None;
+        let mut dialog_layout = None;
         let mut backend = super::backend::TuiBackend::new();
 
         terminal
@@ -1780,6 +1711,7 @@ mod tests {
                     &mut dbg_toolbar_rect,
                     &mut completion_layout,
                     &mut context_menu_layout,
+                    &mut dialog_layout,
                     &mut backend,
                     None,                                 // tab_drag_source
                     None,                                 // tab_drag_cursor
