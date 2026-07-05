@@ -12297,17 +12297,36 @@ pub fn screen_zone_hit_test(
                 };
             }
         }
-    } else if !single_tab_hidden && y >= 0.0 && y < tab_bar_height && !layout.tab_bar.is_empty() {
-        let bar_width = layout
+    } else if !single_tab_hidden && !layout.tab_bar.is_empty() && !layout.windows.is_empty() {
+        // Derive the bar's bounds from the window rects it sits above —
+        // the same source of truth the multi-group branch above uses via
+        // `GroupTabBar::bounds` — instead of assuming the bar starts at
+        // the coordinate-system origin. `x`/`y` and every window rect
+        // here live in whatever space the caller built `ScreenLayout` in;
+        // TUI's is content-relative (window rects start at `tab_bar_height`,
+        // so this is equivalent to the old `y >= 0.0` shortcut), but GTK's
+        // is absolute screen space (`editor_bounds` is anchored at
+        // `main_content_bounds.x/y`, which is only `(0, 0)` when there is
+        // no chrome above the editor). Since #552 gave GTK a persistent
+        // menu/title-bar band, `main_content_bounds.y` is routinely > 0,
+        // so the old hardcoded-origin check silently stopped matching any
+        // real click — the single-group tab bar (and its close button)
+        // went dead while the multi-group path kept working (#546 FAILED-3).
+        let min_x = layout.windows.iter().map(|w| w.rect.x).fold(f64::MAX, f64::min);
+        let min_y = layout.windows.iter().map(|w| w.rect.y).fold(f64::MAX, f64::min);
+        let max_x = layout
             .windows
-            .first()
+            .iter()
             .map(|w| w.rect.x + w.rect.width)
-            .unwrap_or(0.0);
-        return ScreenZone::TabBar {
-            group_id: active_group,
-            local_x: x,
-            bar_width,
-        };
+            .fold(f64::MIN, f64::max);
+        let tab_y = min_y - tab_bar_height;
+        if y >= tab_y && y < tab_y + tab_bar_height && x >= min_x && x < max_x {
+            return ScreenZone::TabBar {
+                group_id: active_group,
+                local_x: x - min_x,
+                bar_width: max_x - min_x,
+            };
+        }
     }
 
     // 2. Breadcrumbs — sit within the tab-bar area, below the tab row.
@@ -15584,6 +15603,81 @@ mod tests {
             matches!(zone, ScreenZone::Window { .. }),
             "click at window_top should hit Window zone, got {:?}",
             zone,
+        );
+    }
+
+    /// #546 FAILED-3 regression: GTK's `main_content_bounds` gained a
+    /// persistent nonzero `(x, y)` offset once the always-visible
+    /// menu/title-bar chrome band landed (#552) — every window rect (and
+    /// every click coordinate) GTK builds lives in that same absolute
+    /// space, not one that starts at `(0, 0)`. The single-group branch of
+    /// `screen_zone_hit_test` used to hardcode `y >= 0.0` as the tab row's
+    /// top, so a click on the actually-rendered (offset) tab bar — e.g. a
+    /// tab's close button — was silently misclassified as a `Window` hit
+    /// instead of `TabBar`, and the click just moved the cursor instead of
+    /// closing the tab. This pins the fix: derive the bar's bounds from the
+    /// real (possibly-offset) window rects, exactly like the multi-group
+    /// branch above already does via `GroupTabBar::bounds`.
+    #[test]
+    fn test_single_group_tab_bar_hit_test_with_editor_offset() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let engine = Engine::new();
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let tbh = tab_bar_height_px(line_height, false);
+
+        // Simulate a chrome-shifted `main_content_bounds`: editor content
+        // starts at (50, 100), not (0, 0).
+        let content_x = 50.0;
+        let content_y = 100.0;
+        let wid = engine.active_window_id();
+        let rects = vec![(
+            wid,
+            WindowRect::new(content_x, content_y + tbh, 800.0, 600.0),
+        )];
+        let theme = Theme::onedark();
+        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
+
+        // A click at the tab row's actual (offset) position must resolve to
+        // TabBar, not fall through to a Window hit underneath.
+        let zone = screen_zone_hit_test(
+            &layout,
+            content_x + 5.0,
+            content_y + 2.0,
+            tbh,
+            single_tab_hidden,
+            engine.active_group,
+        );
+        match zone {
+            ScreenZone::TabBar {
+                group_id, local_x, ..
+            } => {
+                assert_eq!(group_id, engine.active_group);
+                assert!(
+                    (local_x - 5.0).abs() < f64::EPSILON,
+                    "local_x should be relative to the bar's left edge, got {local_x}"
+                );
+            }
+            other => panic!("expected TabBar zone, got {other:?}"),
+        }
+
+        // A click below the tab bar, inside the window, must still resolve
+        // to Window — the offset derivation shouldn't just widen the band
+        // indefinitely.
+        let zone = screen_zone_hit_test(
+            &layout,
+            content_x + 5.0,
+            content_y + tbh + 5.0,
+            tbh,
+            single_tab_hidden,
+            engine.active_group,
+        );
+        assert!(
+            matches!(zone, ScreenZone::Window { .. }),
+            "click below the tab bar should hit Window zone, got {zone:?}"
         );
     }
 
