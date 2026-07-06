@@ -7663,27 +7663,19 @@ impl quadraui::ShellApp for App {
         // `quadraui::gtk::editor_col_at_x`'s exact per-glyph `xy_to_index` path.
         // Rebuilt each frame so runtime font changes (`:set guifont`) take
         // effect immediately.
-        {
-            let font_desc = pango::FontDescription::from_string(&format!(
-                "{} {}",
-                engine.settings.font_family, engine.settings.font_size
-            ));
-            // A 1×1 throwaway surface yields a PangoCairo context whose font
-            // map + resolution match the real paint pipeline (`gtk::run` builds
-            // its paint context the same way, via `pangocairo::create_context`),
-            // so click-time glyph advances line up with painted glyph positions.
-            // NB: within this module `pangocairo` is aliased to
-            // `pangocairo::functions` (see the top-of-file `use`), so cairo
-            // types are reached through `gtk4::cairo`.
-            if let Ok(surface) =
-                gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 1, 1)
-            {
-                if let Ok(cr) = gtk4::cairo::Context::new(&surface) {
-                    let click_ctx = pangocairo::create_context(&cr);
-                    click_ctx.set_font_description(Some(&font_desc));
-                    self.backend.borrow_mut().set_pango_context(click_ctx);
-                }
-            }
+        //
+        // CRITICAL: the context must reproduce the *painted* font's glyph
+        // advances, NOT `settings.font_*`. The runner paints the editor with a
+        // hardcoded "Monospace 11" (see `quadraui::gtk::run`), ignoring
+        // `settings.font_family`/`font_size`; `cw` (== `backend.char_width()`)
+        // is that painted cell width, and `build_screen_layout` above used it.
+        // Fonting this context from `settings.font_size` (14) while the paint
+        // ran at 11 was the #560 iteration-3 smoke failure: `xy_to_index`
+        // scaled columns by the wrong cell width and drifted left, the drift
+        // growing with `x`, on plain/bold/italic/scrolled lines alike.
+        // `build_editor_click_context` matches by measuring against `cw`.
+        if let Some(click_ctx) = click::build_editor_click_context(cw) {
+            self.backend.borrow_mut().set_pango_context(click_ctx);
         }
 
         // ── Draw editor windows ───────────────────────────────────────────────
