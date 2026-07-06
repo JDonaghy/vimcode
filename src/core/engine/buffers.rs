@@ -2500,8 +2500,9 @@ impl Engine {
         EngineAction::None
     }
 
-    /// Internal: compute the LCS diff between the two diff windows and store
-    /// results in `self.diff_results`.
+    /// Internal: compute the diff between the two diff windows (via
+    /// `quadraui::compute_hunks`) and store results in `self.diff_results`
+    /// / `self.diff_aligned`.
     pub(crate) fn compute_diff(&mut self) {
         let (a_win, b_win) = match self.diff_window_pair {
             Some(pair) => pair,
@@ -2529,18 +2530,26 @@ impl Engine {
                 vec![]
             }
         };
-        let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
-        let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
-        let (mut da, mut db) = lcs_diff(&a_refs, &b_refs);
+        // `content.lines()` yields each line WITH its trailing '\n' already
+        // included (unlike `str::lines()`), so concatenating with no
+        // separator reproduces the original buffer text byte-for-byte.
+        // `compute_hunks` then re-splits on '\n' internally, reproducing the
+        // exact same line partition — critical for `diff_state_from_hunks`
+        // below, which indexes hunk rows against `a_lines`/`b_lines`.
+        let a_text = a_lines.concat();
+        let b_text = b_lines.concat();
+        let hunks = quadraui::compute_hunks(&a_text, &b_text);
+        let (mut da, mut db, aligned_a, aligned_b) =
+            diff_state_from_hunks(&hunks, a_lines.len(), b_lines.len());
         // Post-process: short runs of Same lines sandwiched between changes
         // (blank lines, common braces, shared imports) fragment what the user
         // perceives as a single edit.  Re-classify runs of up to N Same lines
-        // so the coloured block stays contiguous.
+        // so the coloured block stays contiguous. This is a vimcode-owned
+        // visual preference layered on top of quadraui's hunk classification,
+        // not a re-implementation of the diff algorithm itself.
         merge_short_same_runs(&mut da, DiffLine::Removed);
         merge_short_same_runs(&mut db, DiffLine::Added);
 
-        // Build aligned sequences with padding for visual alignment.
-        let (aligned_a, aligned_b) = build_aligned_diff(&da, &db);
         self.diff_aligned.insert(a_win, aligned_a);
         self.diff_aligned.insert(b_win, aligned_b);
 
