@@ -12415,8 +12415,16 @@ pub fn screen_zone_hit_test(
         // so the old hardcoded-origin check silently stopped matching any
         // real click — the single-group tab bar (and its close button)
         // went dead while the multi-group path kept working (#546 FAILED-3).
-        let min_x = layout.windows.iter().map(|w| w.rect.x).fold(f64::MAX, f64::min);
-        let min_y = layout.windows.iter().map(|w| w.rect.y).fold(f64::MAX, f64::min);
+        let min_x = layout
+            .windows
+            .iter()
+            .map(|w| w.rect.x)
+            .fold(f64::MAX, f64::min);
+        let min_y = layout
+            .windows
+            .iter()
+            .map(|w| w.rect.y)
+            .fold(f64::MAX, f64::min);
         let max_x = layout
             .windows
             .iter()

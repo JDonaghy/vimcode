@@ -511,3 +511,112 @@ pub(super) fn handle_mouse_drag(
         engine.mouse_drag(wid, line, col);
     }
 }
+
+#[cfg(test)]
+mod emoji_click_column_tests {
+    //! #560 regression: a manual smoke test on the shared-quadraui-inverse
+    //! fix reported clicks landing one column to the right of the intended
+    //! glyph on markdown lines containing emoji (✅ 🟡 ❌ ⏭️), with the
+    //! drift compounding for every wide/multi-byte glyph preceding the
+    //! click point on the line. Root-cause investigation (see the vimcode
+    //! issue #560 durable-findings log) reproduced the *exact* symptom
+    //! shape — perfect on plain monospace text, growing drift after each
+    //! emoji — only when `GtkBackend::editor_col_at_x` falls back to
+    //! `EditorLayout::col_at_x`'s uniform-monospace division (the TUI path,
+    //! which assumes every glyph is exactly one `cell_width` wide). That
+    //! fallback fires when no Pango layout is available; the real
+    //! per-glyph `quadraui::gtk::editor_col_at_x` (Pango `xy_to_index`)
+    //! path was verified byte-exact for this same string (base emoji,
+    //! astral-plane emoji, and a variation-selector emoji) in isolation.
+    //!
+    //! This test pins the production pipeline end to end — real
+    //! `md_inline_spans` bold-span byte offsets via `build_screen_layout`,
+    //! then `render::editor_text_layout` + `quadraui::gtk::editor_col_at_x`
+    //! — against a headless Pango layout, so a future regression that
+    //! silently reintroduces the naive fallback (or corrupts the
+    //! span byte-offset pipeline feeding Pango's attributes) fails a
+    //! `cargo test`, not just a manual click in the running app.
+    use super::*;
+    use ::pangocairo::cairo::{Context, Format, ImageSurface};
+
+    fn headless_pango_layout() -> pango::Layout {
+        let surface = ImageSurface::create(Format::ARgb32, 900, 60).expect("create ImageSurface");
+        let cr = Context::new(&surface).expect("Context::new");
+        let ctx = pangocairo::create_context(&cr);
+        ctx.set_font_description(Some(&pango::FontDescription::from_string("Monospace 12")));
+        pango::Layout::new(&ctx)
+    }
+
+    #[test]
+    fn click_resolves_exact_column_on_emoji_markdown_line() {
+        let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, text);
+        let buf_id = engine.active_buffer_id();
+        engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
+            Some(std::path::PathBuf::from("notes.md"));
+
+        let char_width = 9.0;
+        let line_height = 18.0;
+        let theme = Theme::onedark();
+        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, 24.0);
+        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, true);
+        let rw = &layout.windows[0];
+        assert_eq!(
+            rw.lines[0].raw_text, text,
+            "line should not wrap in an 800px window"
+        );
+
+        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
+        let line = &editor.lines[0];
+
+        // `editor_col_at_x` unconditionally `set_text`/`set_attributes`es
+        // its layout argument from `line` before hit-testing, so a single
+        // throwaway call (the same one every real click makes) leaves
+        // `measure_layout` holding the exact attributed text `draw_editor`
+        // paints — real bold-run glyph widths included — without vimcode
+        // reimplementing quadraui's private `build_pango_attrs`. Reusing
+        // this one layout for both measuring and resolving throughout
+        // mirrors production, which caches and reuses a single
+        // `last_editor_pango_layout` across an entire click.
+        let measure_layout = headless_pango_layout();
+        let _ = quadraui::gtk::editor_col_at_x(&measure_layout, line, &editor_layout, 0.0);
+
+        let char_count = text.chars().count();
+        let mut prev_pos: Option<(i32, i32)> = None;
+        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
+            let pos = measure_layout.index_to_pos(byte_idx as i32);
+            // A zero-width combining mark (e.g. the U+FE0F variation
+            // selector on "⏭️") shares its base character's glyph cluster
+            // — Pango reports the *identical* (x, width) rect for both
+            // byte offsets, since there is no distinct on-screen pixel
+            // region for the combining mark alone. A click can only ever
+            // land on the cluster as a whole, so such chars have no
+            // resolvable column of their own to assert against — skip
+            // them rather than asserting an unreachable identity.
+            if prev_pos == Some((pos.x(), pos.width())) {
+                continue;
+            }
+            prev_pos = Some((pos.x(), pos.width()));
+
+            let glyph_left_x =
+                editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
+            let glyph_width = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
+            let click_x = glyph_left_x + glyph_width * 0.25;
+
+            let resolved = quadraui::gtk::editor_col_at_x(
+                &measure_layout,
+                line,
+                &editor_layout,
+                click_x as f32,
+            );
+            assert_eq!(
+                resolved, char_idx,
+                "clicking char {char_idx} ({ch:?}) resolved to col {resolved}, not {char_idx} \
+                 — the paint↔click column inverse has drifted for this glyph"
+            );
+        }
+        assert_eq!(char_count, text.chars().count());
+    }
+}
