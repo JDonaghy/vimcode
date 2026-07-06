@@ -1523,14 +1523,13 @@ impl App {
                 if let Some(ref layout) = *layout_ref {
                     let mut engine = self.engine.borrow_mut();
                     if !engine.picker_open {
-                        let editor_pl = self.editor_pango_layout(&engine);
                         if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
                             &mut engine,
+                            &self.backend,
                             x,
                             y,
                             self.cached_line_height,
                             self.cached_char_width,
-                            &editor_pl,
                             layout,
                             &self.cached_tab_pixel_hits.borrow(),
                             &self.tab_slot_positions.borrow(),
@@ -1588,16 +1587,15 @@ impl App {
                         }
                     }
                     if !bc_handled {
-                        let editor_pl = self.editor_pango_layout(&engine);
                         let layout_ref = self.cached_screen_layout.borrow();
                         if let Some(ref layout) = *layout_ref {
                             handle_mouse_double_click(
                                 &mut engine,
+                                &self.backend,
                                 x,
                                 y,
                                 self.cached_line_height,
                                 self.cached_char_width,
-                                &editor_pl,
                                 layout,
                                 &self.cached_tab_pixel_hits.borrow(),
                                 &self.tab_slot_positions.borrow(),
@@ -3239,33 +3237,6 @@ impl App {
         }
     }
 
-    fn editor_pango_layout(&self, engine: &Engine) -> pango::Layout {
-        // The old Relm4 path stored a per-App DrawingArea so we could always
-        // get a PangoContext from it.  Under the quadraui ShellApp runner the
-        // single DrawingArea is owned by the runner and `self.drawing_area` is
-        // never populated, so fall back to the runner-created Window (grabbed
-        // in `setup()`) or, as a last resort, the default Pango/Cairo font map.
-        // `pangocairo` is aliased to `pangocairo::functions` at the top of this
-        // file, so use the fully-qualified path `::pangocairo::FontMap` to reach
-        // the `FontMap` type from the crate root.
-        let ctx = if let Some(ref da) = *self.drawing_area.borrow() {
-            da.pango_context()
-        } else if let Some(ref win) = self.window {
-            win.pango_context()
-        } else {
-            // Last resort: GTK must be initialized at this point (enforced in
-            // run()) so the default PangoCairo font map is available.
-            ::pangocairo::FontMap::new().create_context()
-        };
-        let layout = pango::Layout::new(&ctx);
-        let font_desc = FontDescription::from_string(&format!(
-            "{} {}",
-            engine.settings.font_family, engine.settings.font_size
-        ));
-        layout.set_font_description(Some(&font_desc));
-        layout
-    }
-
     /// Route a left-click against the currently open engine-drawn context
     /// menu — `engine.context_menu` is shared by the editor, tab-bar, and
     /// explorer sources, so this applies uniformly regardless of which one
@@ -4359,18 +4330,17 @@ impl App {
                     if engine.is_vscode_mode() {
                         engine.vscode_clear_selection();
                     }
-                    let editor_pl = self.editor_pango_layout(&engine);
                     let (click_result, engine_action) = {
                         let layout_ref = self.cached_screen_layout.borrow();
                         if let Some(ref layout) = *layout_ref {
                             handle_mouse_click(
                                 &mut engine,
+                                &self.backend,
                                 x,
                                 y,
                                 alt,
                                 self.cached_line_height,
                                 self.cached_char_width,
-                                &editor_pl,
                                 layout,
                                 &self.cached_tab_pixel_hits.borrow(),
                                 &self.tab_slot_positions.borrow(),
@@ -4660,14 +4630,13 @@ impl App {
                     return;
                 };
                 let mut engine = self.engine.borrow_mut();
-                let editor_pl = self.editor_pango_layout(&engine);
                 let target = pixel_to_click_target(
                     &mut engine,
+                    &self.backend,
                     sx,
                     sy,
                     self.cached_line_height,
                     self.cached_char_width,
-                    &editor_pl,
                     layout,
                     &self.cached_tab_pixel_hits.borrow(),
                     &self.tab_slot_positions.borrow(),
@@ -4779,14 +4748,13 @@ impl App {
                 let layout_ref = self.cached_screen_layout.borrow();
                 if let Some(ref layout) = *layout_ref {
                     let mut engine = self.engine.borrow_mut();
-                    let editor_pl = self.editor_pango_layout(&engine);
                     handle_mouse_drag(
                         &mut engine,
+                        &self.backend,
                         x,
                         y,
                         self.cached_line_height,
                         self.cached_char_width,
-                        &editor_pl,
                         layout,
                         &self.cached_tab_pixel_hits.borrow(),
                         &self.tab_slot_positions.borrow(),
