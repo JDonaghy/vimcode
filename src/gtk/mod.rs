@@ -7640,6 +7640,52 @@ impl quadraui::ShellApp for App {
         let screen_ref = self.cached_screen_layout.borrow();
         let screen = screen_ref.as_ref().unwrap();
 
+        // #560: give the *click* backend a correctly-fonted editor Pango
+        // context so mouse clicks resolve columns via the per-glyph Pango
+        // inverse rather than a naive uniform-cell division.
+        //
+        // vimcode keeps a SEPARATE `GtkBackend` (`self.backend`) for click-time
+        // hit-testing than the one quadraui's ShellApp runner creates and
+        // paints with (`quadraui::gtk::run` owns the single DrawingArea and its
+        // backend; see the `self.drawing_area` note in `tick`). The runner's
+        // backend is the one that stashes `last_editor_pango_layout` during the
+        // `frame.draw(backend)` calls below and is handed to `render_content`
+        // as `backend` — but it is NOT `self.backend`, and the trait exposes no
+        // way to copy its Pango context across. So `self.backend`, used by
+        // `pixel_to_click_target -> editor_col_at_x`, had neither a stashed
+        // editor layout nor a Pango context of its own and fell through to
+        // `EditorLayout::col_at_x`'s uniform per-cell division: exact for
+        // monospace glyphs, but drifting +1 column for every preceding wide
+        // glyph (emoji ✅/🟡/❌/⏭, CJK) — the reported #560 symptom. Mirroring
+        // what the runner does for its own backend (`gtk::run` sets the
+        // DrawingArea's Pango context), we hand the click backend an
+        // editor-fonted PangoCairo context, so `editor_col_at_x` resolves via
+        // `quadraui::gtk::editor_col_at_x`'s exact per-glyph `xy_to_index` path.
+        // Rebuilt each frame so runtime font changes (`:set guifont`) take
+        // effect immediately.
+        {
+            let font_desc = pango::FontDescription::from_string(&format!(
+                "{} {}",
+                engine.settings.font_family, engine.settings.font_size
+            ));
+            // A 1×1 throwaway surface yields a PangoCairo context whose font
+            // map + resolution match the real paint pipeline (`gtk::run` builds
+            // its paint context the same way, via `pangocairo::create_context`),
+            // so click-time glyph advances line up with painted glyph positions.
+            // NB: within this module `pangocairo` is aliased to
+            // `pangocairo::functions` (see the top-of-file `use`), so cairo
+            // types are reached through `gtk4::cairo`.
+            if let Ok(surface) =
+                gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 1, 1)
+            {
+                if let Ok(cr) = gtk4::cairo::Context::new(&surface) {
+                    let click_ctx = pangocairo::create_context(&cr);
+                    click_ctx.set_font_description(Some(&font_desc));
+                    self.backend.borrow_mut().set_pango_context(click_ctx);
+                }
+            }
+        }
+
         // ── Draw editor windows ───────────────────────────────────────────────
         for rw in &screen.windows {
             let editor = render::to_q_editor(rw);

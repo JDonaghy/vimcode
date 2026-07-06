@@ -619,4 +619,146 @@ mod emoji_click_column_tests {
         }
         assert_eq!(char_count, text.chars().count());
     }
+
+    /// #560 iteration 2: the test above calls `quadraui::gtk::editor_col_at_x`
+    /// *directly* with a hand-built, correctly-fonted layout — it verifies the
+    /// per-glyph Pango inverse but **bypasses** `GtkBackend::editor_col_at_x`'s
+    /// runtime branch-selection (`current_frame_refs()` → `last_editor_pango_layout`
+    /// → `pango_ctx` → naive `EditorLayout::col_at_x`). A live mouse click goes
+    /// through the *trait* method, outside any frame scope, so it depends on the
+    /// backend having stashed a correctly-fonted layout during paint. This test
+    /// drives exactly that path: paint the editor through the trait (as
+    /// `draw_window` does), then resolve clicks through
+    /// `GtkBackend::editor_col_at_x` (as `pixel_to_click_target` does) — so a
+    /// regression that makes live clicks fall through to the naive uniform-cell
+    /// division (perfect on plain text, +1 col per preceding wide glyph on emoji
+    /// lines — the exact reported symptom) fails here.
+    /// #560 iteration 2 robustness: build the `Engine`/`Editor`/`EditorLayout`
+    /// for the emoji markdown line and the pixel-`x` click for every glyph,
+    /// then resolve each through `GtkBackend::editor_col_at_x` under the exact
+    /// backend state named by `set_pango_context`. `paint_first` selects which
+    /// fallback branch the trait method takes:
+    ///
+    /// * `true`  → an editor paint runs through the trait first, so
+    ///   `last_editor_pango_layout` is stashed (the steady-state live path
+    ///   after frame 1).
+    /// * `false` → NO paint, but `set_pango_context` has stored a
+    ///   correctly-fonted editor context (what `draw::draw_editor` now does
+    ///   every frame), so the trait method resolves via the `pango_ctx`
+    ///   fallback instead of the naive `EditorLayout::col_at_x` division.
+    ///
+    /// Both must land every click on its own glyph. Emoji here render 1.7–2.3×
+    /// the cell width (see the sibling paint test's provenance), so a naive
+    /// uniform-cell division would drift +1 column per preceding wide glyph and
+    /// fail — this is what pins that neither branch degrades to it.
+    fn assert_emoji_columns_resolve(paint_first: bool) {
+        use quadraui::{Backend as _, ScreenLayout as QScreenLayout, Surface};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, text);
+        let buf_id = engine.active_buffer_id();
+        engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
+            Some(std::path::PathBuf::from("notes.md"));
+
+        let surface = ImageSurface::create(Format::ARgb32, 1000, 200).expect("ImageSurface");
+        let cr = Context::new(&surface).expect("Context::new");
+        let pango_ctx = pangocairo::create_context(&cr);
+        let font_desc = pango::FontDescription::from_string("Monospace 12");
+        pango_ctx.set_font_description(Some(&font_desc));
+        let layout = pango::Layout::new(&pango_ctx);
+        layout.set_font_description(Some(&font_desc));
+        let metrics = pango_ctx.metrics(Some(&font_desc), None);
+        let line_height =
+            (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
+        layout.set_text("0");
+        let char_width = layout.pixel_size().0 as f64;
+
+        let theme = Theme::onedark();
+        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
+        let screen =
+            build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let rw = &screen.windows[0];
+        assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
+
+        let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
+        // Mirror `App::render_content`: hand the click backend an editor-fonted
+        // PangoCairo context (built from a throwaway surface, NOT the paint
+        // layout) so the click-time fallback is per-glyph accurate.
+        {
+            let click_surface =
+                ImageSurface::create(Format::ARgb32, 1, 1).expect("click ImageSurface");
+            let click_cr = Context::new(&click_surface).expect("click Context");
+            let click_ctx = pangocairo::create_context(&click_cr);
+            click_ctx.set_font_description(Some(&font_desc));
+            backend.borrow_mut().set_pango_context(click_ctx);
+        }
+
+        if paint_first {
+            let editor = render::to_q_editor(rw);
+            let rect = editor.rect;
+            let mut b = backend.borrow_mut();
+            b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+            b.set_current_line_height(line_height);
+            b.set_current_char_width(char_width);
+            b.enter_frame_scope(&cr, &layout, |b| {
+                let mut frame = QScreenLayout::new();
+                frame.push(Surface::Editor {
+                    rect,
+                    editor: &editor,
+                });
+                frame.draw(b);
+            });
+        }
+
+        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
+        let measure = pango::Layout::new(&pango_ctx);
+        measure.set_font_description(Some(&font_desc));
+        measure.set_text(text);
+
+        let mut prev_pos: Option<(i32, i32)> = None;
+        for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
+            let pos = measure.index_to_pos(byte_idx as i32);
+            if prev_pos == Some((pos.x(), pos.width())) {
+                continue;
+            }
+            prev_pos = Some((pos.x(), pos.width()));
+
+            let glyph_left_x =
+                editor_layout.text_bounds.x as f64 + pos.x() as f64 / pango::SCALE as f64;
+            let glyph_width = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
+            let click_x = glyph_left_x + glyph_width * 0.25;
+
+            let resolved =
+                backend
+                    .borrow()
+                    .editor_col_at_x(&editor_layout, &editor, 0, click_x as f32);
+            assert_eq!(
+                resolved, char_idx,
+                "paint_first={paint_first}: clicking char {char_idx} ({ch:?}) resolved to \
+                 col {resolved} — GtkBackend::editor_col_at_x degraded to the naive \
+                 uniform-cell division instead of a per-glyph Pango layout"
+            );
+        }
+    }
+
+    /// Live steady-state: `last_editor_pango_layout` stashed by a real paint.
+    #[test]
+    fn live_trait_editor_col_at_x_resolves_exact_column_after_paint() {
+        assert_emoji_columns_resolve(true);
+    }
+
+    /// #560 robustness: even with NO stashed layout, the editor-fonted
+    /// `pango_ctx` (now set every frame by `draw::draw_editor`) keeps the
+    /// resolution on the per-glyph Pango path instead of the naive division —
+    /// so a build that hasn't painted yet, or a quadraui lacking the stash,
+    /// still resolves emoji clicks exactly.
+    #[test]
+    fn editor_col_at_x_falls_back_to_editor_font_context_not_naive_division() {
+        assert_emoji_columns_resolve(false);
+    }
+
 }
