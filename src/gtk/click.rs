@@ -14,17 +14,18 @@ pub(super) use render_mod::ClickTarget;
 /// Tab bar inner hit-testing (which specific tab/button) stays here because it
 /// uses Pango-measured pixel slot positions from `draw_tab_bar`.
 ///
-/// `pango_layout` must be configured with the editor monospace font — it is
-/// used by `xy_to_index` to convert pixel offsets to character columns,
-/// matching the same glyph positioning the paint code uses (#352).
+/// The text-area column is resolved via `backend.editor_col_at_x` (quadraui,
+/// #420/#560) — the same Pango layout + attributes `draw_editor` painted
+/// with — instead of a bespoke `xy_to_index` reconstruction, so paint and
+/// click can never drift apart again.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pixel_to_click_target(
     engine: &mut Engine,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
     y: f64,
     line_height: f64,
     char_width: f64,
-    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     // Pixel-accurate per-group tab-bar hit geometry captured from the
     // rasteriser during `render_content` (via `Backend::tab_bar_layout`). GTK
@@ -99,23 +100,29 @@ pub(super) fn pixel_to_click_target(
                     ClickTarget::Gutter
                 }
                 WindowZone::TextArea {
-                    view_row,
-                    buf_line,
-                    seg_col_offset,
-                    text_rel_x,
+                    view_row, buf_line, ..
                 } => {
-                    let raw_text = rw
-                        .lines
-                        .get(view_row)
-                        .map(|rl| rl.raw_text.as_str())
-                        .unwrap_or("");
-                    pango_layout.set_text(raw_text);
-                    pango_layout.set_attributes(None);
-                    let scroll_px = rw.scroll_left as f64 * char_width;
-                    let x_pango = ((text_rel_x + scroll_px).max(0.0) * pango::SCALE as f64) as i32;
-                    let (_inside, byte_index, _trailing) = pango_layout.xy_to_index(x_pango, 0);
-                    let clamped = (byte_index as usize).min(raw_text.len());
-                    let col = raw_text[..clamped].chars().count() + seg_col_offset;
+                    // #560: resolve the exact column via the shared
+                    // quadraui text-layout inverse instead of a
+                    // separately-built, attribute-less Pango layout —
+                    // `editor_col_at_x` re-runs `xy_to_index` against the
+                    // same per-span-attributed layout `draw_editor`
+                    // painted with (or the cached last-painted clone when
+                    // called outside a frame scope), so it can't drift
+                    // from the glyphs actually drawn on screen. `x`/`y`
+                    // are absolute surface coordinates, matching
+                    // `editor.rect`'s coordinate space (`rw.rect` here),
+                    // so the original click `x` is passed straight
+                    // through — no gutter/scroll reconstruction needed.
+                    let (editor, editor_layout) =
+                        render_mod::editor_text_layout(rw, char_width, line_height);
+                    use quadraui::Backend as _;
+                    let col = backend.borrow().editor_col_at_x(
+                        &editor_layout,
+                        &editor,
+                        view_row,
+                        x as f32,
+                    );
                     ClickTarget::BufferPos(window_id, buf_line, col)
                 }
                 _ => ClickTarget::None,
@@ -337,12 +344,12 @@ fn execute_gutter_action(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_click(
     engine: &mut Engine,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
     y: f64,
     alt: bool,
     line_height: f64,
     char_width: f64,
-    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
     tab_slot_positions: &TabSlotMap,
@@ -353,11 +360,11 @@ pub(super) fn handle_mouse_click(
 ) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
+        backend,
         x,
         y,
         line_height,
         char_width,
-        pango_layout,
         cached_layout,
         tab_pixel_hits,
         tab_slot_positions,
@@ -437,11 +444,11 @@ pub(super) fn handle_mouse_click(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_double_click(
     engine: &mut Engine,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
     y: f64,
     line_height: f64,
     char_width: f64,
-    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
     tab_slot_positions: &TabSlotMap,
@@ -452,11 +459,11 @@ pub(super) fn handle_mouse_double_click(
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
+        backend,
         x,
         y,
         line_height,
         char_width,
-        pango_layout,
         cached_layout,
         tab_pixel_hits,
         tab_slot_positions,
@@ -473,11 +480,11 @@ pub(super) fn handle_mouse_double_click(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_drag(
     engine: &mut Engine,
+    backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
     y: f64,
     line_height: f64,
     char_width: f64,
-    pango_layout: &pango::Layout,
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
     tab_slot_positions: &TabSlotMap,
@@ -488,11 +495,11 @@ pub(super) fn handle_mouse_drag(
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
+        backend,
         x,
         y,
         line_height,
         char_width,
-        pango_layout,
         cached_layout,
         tab_pixel_hits,
         tab_slot_positions,

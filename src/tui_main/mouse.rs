@@ -993,13 +993,16 @@ pub(super) fn handle_mouse(
                             1.0,
                         );
                         if let render::WindowZone::TextArea {
-                            buf_line,
-                            seg_col_offset,
-                            text_rel_x,
-                            ..
+                            view_row, buf_line, ..
                         } = zone
                         {
-                            let col_in_text = text_rel_x as usize + rw.scroll_left + seg_col_offset;
+                            // #560: resolve via the shared quadraui
+                            // text-layout inverse (`EditorLayout::col_at_x`)
+                            // instead of hand-rolled cell math, so TUI and
+                            // GTK column resolution can never diverge.
+                            let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
+                            let col_in_text =
+                                editor_layout.col_at_x(&editor, view_row, rel_col as f32);
                             engine.mouse_drag(rw.window_id, buf_line, col_in_text);
                             *mouse_text_drag = true;
                             return sidebar_width;
@@ -1768,13 +1771,13 @@ pub(super) fn handle_mouse(
                     1.0,
                 );
                 if let render::WindowZone::TextArea {
-                    buf_line,
-                    seg_col_offset,
-                    text_rel_x,
-                    ..
+                    view_row, buf_line, ..
                 } = zone
                 {
-                    let text_col = text_rel_x as usize + rw.scroll_left + seg_col_offset;
+                    // #560: shared quadraui text-layout inverse (see the
+                    // drag handler above for the full rationale).
+                    let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
+                    let text_col = editor_layout.col_at_x(&editor, view_row, rel_col as f32);
                     engine.editor_hover_mouse_move(buf_line, text_col, mouse_on_editor_hover);
                     found = true;
                 }
@@ -3023,10 +3026,14 @@ pub(super) fn handle_mouse(
                 let buf_line = clicked_rl
                     .map(|l| l.line_idx)
                     .unwrap_or_else(|| rw.scroll_top + view_row);
-                // For wrapped lines, add segment_col_offset so the click
-                // targets the correct column within the full buffer line.
-                let seg_offset = clicked_rl.map(|l| l.segment_col_offset).unwrap_or(0);
-                let col_in_text = (rel_col - wx - gutter) as usize + rw.scroll_left + seg_offset;
+                // #560: resolve the column via the shared quadraui
+                // text-layout inverse (`EditorLayout::col_at_x`, which
+                // folds in `scroll_left` and wrap `segment_col_offset`
+                // itself) instead of hand-rolled cell math — the same
+                // function GTK's `Backend::editor_col_at_x` falls back to,
+                // so both backends' click math derives from one source.
+                let (editor, editor_layout) = crate::render::editor_text_layout(rw, 1.0, 1.0);
+                let col_in_text = editor_layout.col_at_x(&editor, view_row, rel_col as f32);
 
                 // Double-click detection
                 let now = Instant::now();

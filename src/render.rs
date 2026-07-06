@@ -11956,6 +11956,26 @@ fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui:
 // `gtk/click.rs`, which is why we adapt at the boundary rather than
 // retargeting the builder).
 
+/// Build the [`quadraui::Editor`] + [`quadraui::EditorLayout`] pair for a
+/// window using **exactly** the same construction paint uses
+/// (`to_q_editor` + `Editor::layout(editor.rect, ...)`), so click-column
+/// resolution and paint derive from one shared geometry computation
+/// instead of two independently reconstructed ones (#560). Callers pass
+/// the resulting `&Editor`/`&EditorLayout` straight into
+/// `quadraui::Backend::editor_col_at_x` (GTK: exact Pango `xy_to_index`
+/// against the same per-span-attributed layout `draw_editor` painted
+/// with; TUI: `EditorLayout::col_at_x`'s uniform monospace division) —
+/// neither backend hand-rolls its own text-column inverse anymore.
+pub fn editor_text_layout(
+    rw: &RenderedWindow,
+    char_width: f64,
+    line_height: f64,
+) -> (quadraui::Editor, quadraui::EditorLayout) {
+    let editor = to_q_editor(rw);
+    let layout = editor.layout(editor.rect, char_width as f32, line_height as f32);
+    (editor, layout)
+}
+
 /// Build a [`quadraui::Editor`] from a [`RenderedWindow`]. The
 /// per-window status line is **not** included — the caller paints
 /// it after calling `draw_editor` (status-line lift was Session 241).
