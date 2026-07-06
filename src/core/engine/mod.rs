@@ -4576,10 +4576,12 @@ fn rust_debug_binary(cwd: &std::path::Path) -> Result<String, String> {
 }
 
 // =============================================================================
-// LCS-based two-way line diff
+// Two-way line diff — algorithm delegated to `quadraui::compute_hunks`;
+// this module only adapts hunks back into vimcode's own per-line/aligned-row
+// interchange types (`DiffLine` / `AlignedDiffEntry`), which drive rendering,
+// folding, and navigation. See `Engine::compute_diff` in `buffers.rs`.
 // =============================================================================
 
-/// Compute per-line diff status for two sequences of lines using a standard
 /// Maximum number of consecutive `Same` lines between two changed regions
 /// that will be absorbed into the surrounding change for visual continuity.
 /// Short "islands" of matching lines in the middle of an edit are typically
@@ -4587,7 +4589,7 @@ fn rust_debug_binary(cwd: &std::path::Path) -> Result<String, String> {
 /// coloured block around them is confusing.
 const DIFF_MERGE_SAME_THRESHOLD: usize = 1;
 
-/// Post-process LCS diff results: short runs of `Same` lines (up to
+/// Post-process per-line diff results: short runs of `Same` lines (up to
 /// [`DIFF_MERGE_SAME_THRESHOLD`]) that sit between two non-Same regions
 /// are re-classified to `fill`, preventing visual fragmentation of what
 /// the user perceives as a single edit.
@@ -4614,24 +4616,6 @@ fn merge_short_same_runs(results: &mut [DiffLine], fill: DiffLine) {
     }
 }
 
-/// Myers diff algorithm — finds the Shortest Edit Script (SES) between two
-/// sequences of lines.  Complexity is O((N+M)·D) where D is the edit distance,
-/// which is much faster than O(N×M) LCS when the files are large but the
-/// diff is small (the common case).
-///
-/// Returns `(status_a, status_b)` where each element corresponds to one line
-/// of the respective input sequence:
-/// - `DiffLine::Same`    — line is shared by both sides.
-/// - `DiffLine::Removed` — line exists in `a` but not `b`.
-/// - `DiffLine::Added`   — line exists in `b` but not `a`.
-///
-/// Build aligned diff sequences with padding so that Same lines appear at the
-/// same visual row.  Walks the raw per-file diff status arrays (one entry per
-/// buffer line) with two pointers and inserts `DiffLine::Padding` entries on
-/// the opposite side whenever one side has Removed/Added lines that the other
-/// does not.
-///
-/// Returns `(aligned_a, aligned_b)` — both the same length.
 impl Engine {
     /// Drop all aligned-diff state and reset every window's
     /// `aligned_top` pin. Use this anywhere `diff_aligned.clear()`
@@ -4646,202 +4630,122 @@ impl Engine {
     }
 }
 
-pub fn build_aligned_diff(
-    da: &[DiffLine],
-    db: &[DiffLine],
-) -> (Vec<AlignedDiffEntry>, Vec<AlignedDiffEntry>) {
-    let mut aligned_a = Vec::new();
-    let mut aligned_b = Vec::new();
-    let mut i = 0; // pointer into da (side A)
-    let mut j = 0; // pointer into db (side B)
-
-    while i < da.len() || j < db.len() {
-        // Both sides have Same — they correspond to each other.
-        if i < da.len() && j < db.len() && da[i] == DiffLine::Same && db[j] == DiffLine::Same {
+/// Rebuild vimcode's per-real-line diff status (`DiffLine`, one entry per
+/// buffer line) and visually-aligned row mapping (`AlignedDiffEntry`, padded
+/// so matching content lines up across both panes) from a
+/// [`quadraui::DiffHunk`] list produced by `quadraui::compute_hunks`.
+///
+/// `compute_hunks` only returns rows within `CONTEXT_LINES` of an actual
+/// change (see quadraui's `diff::mod`), so any real line *not* covered by a
+/// hunk is guaranteed to be an unchanged `Same` line that lines up 1:1 with
+/// its counterpart on the other side — that's precisely why it wasn't
+/// included in a hunk. This walks the hunks in order, filling the gaps
+/// before/between/after them with straight `Same` pairs, and expands each
+/// hunk's rows into per-side `DiffLine`/`AlignedDiffEntry` entries using the
+/// hunk's `left_start`/`right_start` (both 1-based) as running line counters.
+pub(crate) fn diff_state_from_hunks(
+    hunks: &[quadraui::DiffHunk],
+    a_len: usize,
+    b_len: usize,
+) -> (
+    Vec<DiffLine>,
+    Vec<DiffLine>,
+    Vec<AlignedDiffEntry>,
+    Vec<AlignedDiffEntry>,
+) {
+    /// Emit `Same`-Same aligned pairs for the unchanged gap between
+    /// `next_a..end_a` and `next_b..end_b`. Returns the advanced cursors.
+    fn push_same_gap(
+        aligned_a: &mut Vec<AlignedDiffEntry>,
+        aligned_b: &mut Vec<AlignedDiffEntry>,
+        next_a: usize,
+        next_b: usize,
+        end_a: usize,
+        end_b: usize,
+    ) -> (usize, usize) {
+        let gap = end_a
+            .saturating_sub(next_a)
+            .min(end_b.saturating_sub(next_b));
+        for k in 0..gap {
             aligned_a.push(AlignedDiffEntry {
-                source_line: Some(i),
+                source_line: Some(next_a + k),
             });
             aligned_b.push(AlignedDiffEntry {
-                source_line: Some(j),
+                source_line: Some(next_b + k),
             });
-            i += 1;
-            j += 1;
-            continue;
         }
-
-        // Collect a change hunk: consume all non-Same lines from both sides.
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
-        while i < da.len() && da[i] != DiffLine::Same {
-            removed.push(i);
-            i += 1;
-        }
-        while j < db.len() && db[j] != DiffLine::Same {
-            added.push(j);
-            j += 1;
-        }
-
-        // If both sides hit Same (or end) without consuming anything,
-        // treat remaining Same lines on either side as unmatched to avoid
-        // an infinite loop.
-        if removed.is_empty() && added.is_empty() {
-            if i < da.len() {
-                aligned_a.push(AlignedDiffEntry {
-                    source_line: Some(i),
-                });
-                aligned_b.push(AlignedDiffEntry { source_line: None });
-                i += 1;
-            }
-            if j < db.len() {
-                aligned_a.push(AlignedDiffEntry { source_line: None });
-                aligned_b.push(AlignedDiffEntry {
-                    source_line: Some(j),
-                });
-                j += 1;
-            }
-            continue;
-        }
-
-        // Pair up removed/added lines, padding the shorter side.
-        let max_len = removed.len().max(added.len());
-        for k in 0..max_len {
-            if k < removed.len() {
-                aligned_a.push(AlignedDiffEntry {
-                    source_line: Some(removed[k]),
-                });
-            } else {
-                aligned_a.push(AlignedDiffEntry { source_line: None });
-            }
-            if k < added.len() {
-                aligned_b.push(AlignedDiffEntry {
-                    source_line: Some(added[k]),
-                });
-            } else {
-                aligned_b.push(AlignedDiffEntry { source_line: None });
-            }
-        }
+        (next_a + gap, next_b + gap)
     }
 
-    (aligned_a, aligned_b)
-}
+    let mut da = vec![DiffLine::Same; a_len];
+    let mut db = vec![DiffLine::Same; b_len];
+    let mut aligned_a = Vec::new();
+    let mut aligned_b = Vec::new();
+    let mut next_a = 0usize;
+    let mut next_b = 0usize;
 
-/// Falls back to all-Same if the edit distance exceeds `MAX_EDIT_DIST` (to
-/// avoid pathological runtime on completely unrelated files).
-pub fn lcs_diff(a: &[&str], b: &[&str]) -> (Vec<DiffLine>, Vec<DiffLine>) {
-    let n = a.len();
-    let m = b.len();
-    if n == 0 && m == 0 {
-        return (vec![], vec![]);
-    }
-    if n == 0 {
-        return (vec![], vec![DiffLine::Added; m]);
-    }
-    if m == 0 {
-        return (vec![DiffLine::Removed; n], vec![]);
-    }
+    for hunk in hunks {
+        // `left_start`/`right_start` are 1-based; convert to 0-based indices.
+        let hunk_a = hunk.left_start.saturating_sub(1);
+        let hunk_b = hunk.right_start.saturating_sub(1);
+        let (ga, gb) = push_same_gap(
+            &mut aligned_a,
+            &mut aligned_b,
+            next_a,
+            next_b,
+            hunk_a,
+            hunk_b,
+        );
+        // Defensive: gap sizes should always match (see doc comment above);
+        // snap forward to the hunk start in case they don't, rather than panic.
+        next_a = ga.max(hunk_a);
+        next_b = gb.max(hunk_b);
 
-    // Maximum edit distance we're willing to explore.
-    // Myers diff is O(N·D) in time and O(D²) in memory where D = edit distance.
-    // For large files with small diffs (the common case), D is small so this is
-    // fast regardless of file size.  The MAX_EDIT_DIST cap prevents blow-up when
-    // two files are extremely different.
-    const MAX_EDIT_DIST: usize = 2_000;
-    let max_d = (n + m).min(MAX_EDIT_DIST);
-
-    // V array indexed by k = x - y, offset so k=0 maps to index `offset`.
-    let offset = max_d;
-    let v_size = 2 * max_d + 1;
-    let mut v = vec![0usize; v_size];
-
-    // Store the trace of V snapshots for backtracking.
-    let mut trace: Vec<Vec<usize>> = Vec::with_capacity(max_d);
-
-    let mut found_d = None;
-    'outer: for d in 0..=max_d {
-        trace.push(v.clone());
-
-        for k in (-(d as isize)..=(d as isize)).step_by(2) {
-            let ki = (k + offset as isize) as usize;
-
-            let mut x = if d == 0 {
-                0
-            } else if k == -(d as isize) || (k != d as isize && v[ki - 1] < v[ki + 1]) {
-                v[ki + 1] // move down (insert)
-            } else {
-                v[ki - 1] + 1 // move right (delete)
-            };
-
-            let mut y = (x as isize - k) as usize;
-
-            // Follow diagonal (matching lines)
-            while x < n && y < m && a[x] == b[y] {
-                x += 1;
-                y += 1;
+        let mut la = next_a;
+        let mut lb = next_b;
+        for row in &hunk.rows {
+            let left_idx = row.left.as_ref().map(|_| {
+                let i = la;
+                la += 1;
+                i
+            });
+            let right_idx = row.right.as_ref().map(|_| {
+                let i = lb;
+                lb += 1;
+                i
+            });
+            aligned_a.push(AlignedDiffEntry {
+                source_line: left_idx,
+            });
+            aligned_b.push(AlignedDiffEntry {
+                source_line: right_idx,
+            });
+            if let Some(i) = left_idx {
+                if i < da.len() {
+                    da[i] = if row.kind == quadraui::DiffRowKind::Same {
+                        DiffLine::Same
+                    } else {
+                        DiffLine::Removed
+                    };
+                }
             }
-
-            v[ki] = x;
-
-            if x >= n && y >= m {
-                found_d = Some(d);
-                break 'outer;
+            if let Some(i) = right_idx {
+                if i < db.len() {
+                    db[i] = if row.kind == quadraui::DiffRowKind::Same {
+                        DiffLine::Same
+                    } else {
+                        DiffLine::Added
+                    };
+                }
             }
         }
+        next_a = la;
+        next_b = lb;
     }
 
-    if found_d.is_none() {
-        // Edit distance exceeded limit — fall back to all-Same.
-        return (vec![DiffLine::Same; n], vec![DiffLine::Same; m]);
-    }
-    let d = found_d.unwrap();
+    push_same_gap(&mut aligned_a, &mut aligned_b, next_a, next_b, a_len, b_len);
 
-    // Backtrack through the trace to build an edit script.
-    // Each edit is either Insert(y_idx) or Delete(x_idx), in reverse order.
-    #[derive(Clone, Copy)]
-    enum Edit {
-        Insert(usize), // b[y] was inserted
-        Delete(usize), // a[x] was deleted
-    }
-    let mut edits: Vec<Edit> = Vec::with_capacity(d);
-    let mut cx = n;
-    let mut cy = m;
-
-    for d_step in (1..=d).rev() {
-        let v_d = &trace[d_step];
-        let k = cx as isize - cy as isize;
-        let ki = (k + offset as isize) as usize;
-
-        let is_insert =
-            k == -(d_step as isize) || (k != d_step as isize && v_d[ki - 1] < v_d[ki + 1]);
-
-        let prev_k = if is_insert { k + 1 } else { k - 1 };
-        let prev_ki = (prev_k + offset as isize) as usize;
-        let prev_x = v_d[prev_ki];
-        let prev_y = (prev_x as isize - prev_k) as usize;
-
-        if is_insert {
-            // y stepped from prev_y to prev_y+1, then diagonal to (cx, cy).
-            edits.push(Edit::Insert(prev_y));
-        } else {
-            // x stepped from prev_x to prev_x+1, then diagonal to (cx, cy).
-            edits.push(Edit::Delete(prev_x));
-        }
-
-        cx = prev_x;
-        cy = prev_y;
-    }
-    edits.reverse();
-
-    // Build per-line status arrays from the edit script.
-    let mut da = vec![DiffLine::Same; n];
-    let mut db = vec![DiffLine::Same; m];
-    for edit in &edits {
-        match *edit {
-            Edit::Delete(x) => da[x] = DiffLine::Removed,
-            Edit::Insert(y) => db[y] = DiffLine::Added,
-        }
-    }
-
-    (da, db)
+    (da, db, aligned_a, aligned_b)
 }
 
 mod accessors;

@@ -11194,190 +11194,145 @@ fn test_move_file_updates_buffer_path() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-// ─── LCS diff tests ───────────────────────────────────────────────────────
+// ─── diff_state_from_hunks tests ──────────────────────────────────────────
+//
+// The Myers-diff/alignment algorithm itself is now `quadraui::compute_hunks`
+// (tested in quadraui's own suite). These tests cover the vimcode-owned
+// adapter that reconstructs per-line `DiffLine` status and padded
+// `AlignedDiffEntry` rows from quadraui's hunk list — including gap-filling
+// for the unchanged regions `compute_hunks` doesn't return rows for.
 
 #[test]
-fn test_lcs_diff_same_content() {
-    let a = &["alpha", "beta", "gamma"];
-    let b = &["alpha", "beta", "gamma"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_identical_files() {
+    let hunks = quadraui::compute_hunks("alpha\nbeta\ngamma", "alpha\nbeta\ngamma");
+    assert!(hunks.is_empty(), "identical texts produce no hunks");
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 3, 3);
     assert!(da.iter().all(|s| *s == DiffLine::Same));
     assert!(db.iter().all(|s| *s == DiffLine::Same));
-    assert_eq!(da.len(), 3);
-    assert_eq!(db.len(), 3);
+    // The whole file should be reconstructed as a same-same aligned gap.
+    assert_eq!(aligned_a.len(), 3);
+    assert_eq!(aligned_b.len(), 3);
+    for i in 0..3 {
+        assert_eq!(aligned_a[i].source_line, Some(i));
+        assert_eq!(aligned_b[i].source_line, Some(i));
+    }
 }
 
 #[test]
-fn test_lcs_diff_added_line() {
-    let a = &["alpha", "gamma"];
-    let b = &["alpha", "beta", "gamma"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_added_line() {
+    let a = "alpha\ngamma";
+    let b = "alpha\nbeta\ngamma";
+    let hunks = quadraui::compute_hunks(a, b);
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 2, 3);
     assert!(da.iter().all(|s| *s == DiffLine::Same));
     assert_eq!(db[0], DiffLine::Same);
     assert_eq!(db[1], DiffLine::Added);
     assert_eq!(db[2], DiffLine::Same);
+    assert_eq!(aligned_a.len(), aligned_b.len());
+    // The added line has no left-side counterpart (padding).
+    let added_row = aligned_b
+        .iter()
+        .position(|e| e.source_line == Some(1))
+        .expect("aligned row for added line");
+    assert_eq!(aligned_a[added_row].source_line, None);
 }
 
 #[test]
-fn test_lcs_diff_removed_line() {
-    let a = &["alpha", "beta", "gamma"];
-    let b = &["alpha", "gamma"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_removed_line() {
+    let a = "alpha\nbeta\ngamma";
+    let b = "alpha\ngamma";
+    let hunks = quadraui::compute_hunks(a, b);
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 3, 2);
     assert_eq!(da[0], DiffLine::Same);
     assert_eq!(da[1], DiffLine::Removed);
     assert_eq!(da[2], DiffLine::Same);
     assert!(db.iter().all(|s| *s == DiffLine::Same));
+    assert_eq!(aligned_a.len(), aligned_b.len());
 }
 
 #[test]
-fn test_myers_diff_two_change_blocks() {
-    // Mirrors the README vs README2 scenario: two distinct change blocks
-    // separated by 2 unchanged lines — must NOT merge into one block.
-    let a = &[
-        "# DemoConsoleGame",
-        "Simple demo game",
-        "",
-        "In the end he did get a degree",
-        "",
-        "Now he's doing a masters",
-        "",
-        "So, now the only point",
-    ];
-    let b = &[
-        "# DemoConsoleGame",
-        "Simple demo game",
-        "",
-        "In the end he did ge asdfadt a degree",
-        "",
-        "",
-        "asds",
-        "",
-        "zdxfasd",
-        "",
-        "",
-        "Now he's doing a masters",
-        "",
-        "asdfsd",
-        "",
-        "So, now the only point",
-    ];
-    let (da, db) = lcs_diff(a, b);
-    // Line 3 of a should be Removed, line 3 of b should be Added (changed line).
-    assert_eq!(da[3], DiffLine::Removed);
-    assert_eq!(db[3], DiffLine::Added);
-    // Lines 5-10 of b should be Added (inserted block).
-    for i in 5..11 {
-        assert_eq!(db[i], DiffLine::Added, "b[{}] should be Added", i);
-    }
-    // a[5] "Now he's doing..." should be Same (not merged).
-    assert_eq!(da[5], DiffLine::Same);
-    assert_eq!(db[11], DiffLine::Same);
-    // b[13] "asdfsd" should be Added (second change block).
-    assert_eq!(db[13], DiffLine::Added);
-}
-
-#[test]
-fn test_lcs_diff_changed_line() {
-    let a = &["hello world"];
-    let b = &["hello rust"];
-    let (da, db) = lcs_diff(a, b);
+fn test_diff_state_from_hunks_changed_line() {
+    let hunks = quadraui::compute_hunks("hello world", "hello rust");
+    let (da, db, _aligned_a, _aligned_b) = diff_state_from_hunks(&hunks, 1, 1);
     assert_eq!(da[0], DiffLine::Removed);
     assert_eq!(db[0], DiffLine::Added);
 }
 
 #[test]
-fn test_lcs_diff_empty() {
-    let (da, db) = lcs_diff(&[], &[]);
-    assert!(da.is_empty());
-    assert!(db.is_empty());
+fn test_diff_state_from_hunks_empty() {
+    let hunks = quadraui::compute_hunks("", "");
+    let (da, db, aligned_a, aligned_b) = diff_state_from_hunks(&hunks, 1, 1);
+    // A single empty line on each side, unchanged.
+    assert_eq!(da, vec![DiffLine::Same]);
+    assert_eq!(db, vec![DiffLine::Same]);
+    assert_eq!(aligned_a.len(), 1);
+    assert_eq!(aligned_b.len(), 1);
+}
+
+#[test]
+fn test_diff_state_from_hunks_two_change_blocks() {
+    // Mirrors the README vs README2 scenario: two distinct change blocks
+    // separated by unchanged lines far enough apart that `compute_hunks`
+    // must return two separate hunks — the gap between them must be
+    // reconstructed here as straight Same-Same pairs.
+    let a = "s0\ns1\ns2\ns3\nold1\ns4\ns5\ns6\ns7\ns8\ns9\ns10\nold2\ns11\ns12";
+    let b = "s0\ns1\ns2\ns3\nnew1\ns4\ns5\ns6\ns7\ns8\ns9\ns10\nnew2\ns11\ns12";
+    let hunks = quadraui::compute_hunks(a, b);
+    assert!(
+        hunks.len() >= 2,
+        "two well-separated changes should stay as separate hunks, got {hunks:?}"
+    );
+    let a_lines: Vec<&str> = a.split('\n').collect();
+    let b_lines: Vec<&str> = b.split('\n').collect();
+    let (da, db, aligned_a, aligned_b) =
+        diff_state_from_hunks(&hunks, a_lines.len(), b_lines.len());
+    assert_eq!(da[4], DiffLine::Removed, "old1");
+    assert_eq!(db[4], DiffLine::Added, "new1");
+    assert_eq!(da[12], DiffLine::Removed, "old2");
+    assert_eq!(db[12], DiffLine::Added, "new2");
+    // The long unchanged run between the two changes must reconstruct as Same.
+    for i in 5..12 {
+        assert_eq!(
+            da[i],
+            DiffLine::Same,
+            "da[{i}] should be Same (inter-hunk gap)"
+        );
+        assert_eq!(
+            db[i],
+            DiffLine::Same,
+            "db[{i}] should be Same (inter-hunk gap)"
+        );
+    }
+    assert_eq!(aligned_a.len(), aligned_b.len());
 }
 
 #[test]
 fn test_merge_short_same_runs_blank_lines() {
     // Blank lines inside an added block should not fragment it.
-    let a = &["header", "old", "footer"];
-    let b = &["header", "new1", "", "new2", "", "new3", "footer"];
-    let (da, mut db) = lcs_diff(a, b);
-    merge_short_same_runs(&mut db, DiffLine::Added);
-    // All lines between header and footer should be Added on the b side.
-    assert_eq!(db[0], DiffLine::Same, "header");
+    // (Constructed directly rather than via a Myers diff — this tests
+    // vimcode's own post-processing heuristic, not the diff algorithm.)
+    use DiffLine::*;
+    let mut db = vec![Same, Added, Same, Added, Same, Added, Same];
+    merge_short_same_runs(&mut db, Added);
+    assert_eq!(db[0], Same, "header");
     for i in 1..6 {
-        assert_eq!(db[i], DiffLine::Added, "line {i} should be Added");
+        assert_eq!(db[i], Added, "line {i} should be Added");
     }
-    assert_eq!(db[6], DiffLine::Same, "footer");
-    // A side should still have Removed for 'old'.
-    assert_eq!(da[0], DiffLine::Same);
-    assert_eq!(da[1], DiffLine::Removed);
-    assert_eq!(da[2], DiffLine::Same);
+    assert_eq!(db[6], Same, "footer");
 }
 
 #[test]
 fn test_merge_short_same_runs_common_lines() {
     // Short runs of common lines (braces, imports) between changes should
     // be absorbed into the surrounding change region.
-    let a = &["header", "}", "footer"];
-    let b = &["header", "new1", "}", "new2", "footer"];
-    let (_da, mut db) = lcs_diff(a, b);
-    merge_short_same_runs(&mut db, DiffLine::Added);
-    assert_eq!(db[0], DiffLine::Same, "header");
-    // "new1", "}", "new2" should all be Added (} is a short Same island).
+    use DiffLine::*;
+    let mut db = vec![Same, Added, Same, Added, Same];
+    merge_short_same_runs(&mut db, Added);
+    assert_eq!(db[0], Same, "header");
     for i in 1..4 {
-        assert_eq!(db[i], DiffLine::Added, "line {i} should be Added");
+        assert_eq!(db[i], Added, "line {i} should be Added");
     }
-    assert_eq!(db[4], DiffLine::Same, "footer");
-}
-
-#[test]
-fn test_build_aligned_diff_unequal_same_tails() {
-    // Regression: when one side has more Same lines than the other,
-    // build_aligned_diff must not loop forever.
-    use DiffLine::*;
-    let da = vec![Same, Same, Removed, Same, Same];
-    let db = vec![Same, Same, Same];
-    // This used to hang — the fix ensures progress when one side is
-    // exhausted while the other still has Same lines.
-    let (aa, ab) = build_aligned_diff(&da, &db);
-    assert_eq!(aa.len(), ab.len());
-}
-
-#[test]
-fn test_build_aligned_diff_basic() {
-    use DiffLine::*;
-    let da = vec![Same, Removed, Same];
-    let db = vec![Same, Added, Same];
-    let (aa, ab) = build_aligned_diff(&da, &db);
-    assert_eq!(aa.len(), ab.len());
-    // First and last should map to source lines.
-    assert!(aa[0].source_line.is_some());
-    assert!(ab[0].source_line.is_some());
-}
-
-#[test]
-fn test_lcs_diff_large_files_with_small_diff() {
-    // Regression: files >5000 lines used to return all-Same due to MAX_LINES guard.
-    let mut a_lines: Vec<String> = (0..8000).map(|i| format!("line {i}")).collect();
-    let mut b_lines = a_lines.clone();
-    // Insert 3 new lines in the middle of b.
-    b_lines.insert(4000, "new line 1".to_string());
-    b_lines.insert(4001, "new line 2".to_string());
-    b_lines.insert(4002, "new line 3".to_string());
-    // Also change one line.
-    a_lines[100] = "original line 100".to_string();
-    b_lines[100] = "modified line 100".to_string();
-
-    let a_refs: Vec<&str> = a_lines.iter().map(String::as_str).collect();
-    let b_refs: Vec<&str> = b_lines.iter().map(String::as_str).collect();
-    let (da, db) = lcs_diff(&a_refs, &b_refs);
-
-    // Should detect actual changes, not return all-Same.
-    let a_changes = da.iter().filter(|d| **d != DiffLine::Same).count();
-    let b_changes = db.iter().filter(|d| **d != DiffLine::Same).count();
-    assert!(
-        a_changes > 0 || b_changes > 0,
-        "diff should detect changes in large files"
-    );
-    // Specifically: b should have 3 Added lines + 1 changed line.
-    assert!(b_changes >= 3, "b should have at least 3 Added lines");
+    assert_eq!(db[4], Same, "footer");
 }
 
 // ─── cmd_diffthis / cmd_diffoff / cmd_diffsplit tests ─────────────────────
