@@ -11405,6 +11405,63 @@ fn test_diffsplit_command() {
     assert!(!engine.diff_results.is_empty());
 }
 
+#[test]
+fn test_diffsplit_trailing_newline_aligned_length_matches_buffer() {
+    // Regression test (#512 review finding 1): `compute_diff` used to build
+    // `a_lines`/`b_lines` from raw `content.lines()` (ropey's `Rope::lines`),
+    // which — unlike `Buffer::len_lines()` — counts a trailing '\n' as
+    // starting a new, empty final line. So for a buffer ending in '\n'
+    // (i.e. almost every real file), `a_lines`/`b_lines` had one MORE
+    // element than the rest of the engine (window rendering, cursor bounds)
+    // considers the buffer's real line count. That phantom trailing line
+    // then made `aligned_a`/`aligned_b` — indexed against `a_lines.len()` —
+    // one entry longer than the real buffer. Fixed by truncating
+    // `a_lines`/`b_lines` to `buffer.len_lines()` and stripping the matching
+    // trailing '\n' before handing text to `quadraui::compute_hunks` (which
+    // re-splits on '\n' internally and would otherwise reproduce the same
+    // phantom element). This test uses single-line files with a real change
+    // on the last (only) line, mirroring the review's minimal repro.
+    let dir = std::env::temp_dir().join("vimcode_diffsplit_trailing_nl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f1 = dir.join("hello.txt");
+    let f2 = dir.join("world.txt");
+    std::fs::write(&f1, "hello\n").unwrap();
+    std::fs::write(&f2, "world\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&f1, OpenMode::Permanent)
+        .unwrap();
+    engine.execute_command(&format!("diffsplit {}", f2.display()));
+
+    let (a_win, b_win) = engine
+        .diff_window_pair
+        .expect("diffsplit should set a window pair");
+    let aligned_a = engine.diff_aligned.get(&a_win).cloned().unwrap_or_default();
+    let aligned_b = engine.diff_aligned.get(&b_win).cloned().unwrap_or_default();
+
+    // Both files are exactly one line — the aligned rows must not grow
+    // past that, even though the raw text (with trailing '\n') would
+    // re-split into two pieces via `str::split('\n')`.
+    assert_eq!(
+        aligned_a.len(),
+        1,
+        "aligned_a should have exactly one entry for a one-line buffer, got {aligned_a:?}"
+    );
+    assert_eq!(
+        aligned_b.len(),
+        1,
+        "aligned_b should have exactly one entry for a one-line buffer, got {aligned_b:?}"
+    );
+    assert_eq!(aligned_a[0].source_line, Some(0));
+    assert_eq!(aligned_b[0].source_line, Some(0));
+
+    let da = engine.diff_results.get(&a_win).cloned().unwrap_or_default();
+    let db = engine.diff_results.get(&b_win).cloned().unwrap_or_default();
+    assert_eq!(da, vec![DiffLine::Removed]);
+    assert_eq!(db, vec![DiffLine::Added]);
+}
+
 // ── Diff toolbar + navigation tests ──────────────────────────────────────
 
 #[test]
