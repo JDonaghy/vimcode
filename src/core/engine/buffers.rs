@@ -2508,10 +2508,27 @@ impl Engine {
             Some(pair) => pair,
             None => return,
         };
+        // NOTE: raw `content.lines()` (ropey's `Rope::lines()`) yields one
+        // MORE element than `Buffer::len_lines()` whenever the buffer ends
+        // in '\n' — ropey treats a trailing '\n' as starting a new, empty
+        // final line (see `Buffer::len_lines()`'s doc comment), but that
+        // phantom empty line is not a "real" line anywhere else in the
+        // engine (window rendering, cursor bounds, etc. all key off
+        // `buffer.len_lines()`). We must `.take(len_lines())` here so
+        // `a_lines`/`b_lines` — and therefore the `a_len`/`b_len` passed to
+        // `diff_state_from_hunks` below — match the same logical line count
+        // the rest of the engine uses. Skipping this step used to silently
+        // grow `aligned_a`/`aligned_b` by one phantom entry per file ending
+        // in '\n' (i.e. on almost every real diff).
         let a_lines: Vec<String> = {
             if let Some(w) = self.windows.get(&a_win) {
                 if let Some(s) = self.buffer_manager.get(w.buffer_id) {
-                    s.buffer.content.lines().map(|l| l.to_string()).collect()
+                    s.buffer
+                        .content
+                        .lines()
+                        .take(s.buffer.len_lines())
+                        .map(|l| l.to_string())
+                        .collect()
                 } else {
                     vec![]
                 }
@@ -2522,7 +2539,12 @@ impl Engine {
         let b_lines: Vec<String> = {
             if let Some(w) = self.windows.get(&b_win) {
                 if let Some(s) = self.buffer_manager.get(w.buffer_id) {
-                    s.buffer.content.lines().map(|l| l.to_string()).collect()
+                    s.buffer
+                        .content
+                        .lines()
+                        .take(s.buffer.len_lines())
+                        .map(|l| l.to_string())
+                        .collect()
                 } else {
                     vec![]
                 }
@@ -2532,13 +2554,23 @@ impl Engine {
         };
         // `content.lines()` yields each line WITH its trailing '\n' already
         // included (unlike `str::lines()`), so concatenating with no
-        // separator reproduces the original buffer text byte-for-byte.
-        // `compute_hunks` then re-splits on '\n' internally, reproducing the
-        // exact same line partition — critical for `diff_state_from_hunks`
-        // below, which indexes hunk rows against `a_lines`/`b_lines`.
+        // separator reproduces the buffer's logical text (the last line's
+        // own trailing '\n', if the buffer has one, is still included).
+        // `compute_hunks` then re-splits on '\n' internally to reproduce the
+        // same line partition — critical for `diff_state_from_hunks` below,
+        // which indexes hunk rows against `a_lines`/`b_lines`. But
+        // `str::split('\n')` (used inside `compute_hunks`) yields one extra
+        // trailing empty-string element whenever the text it's given ends in
+        // '\n'. Since the concatenation above still carries that final '\n'
+        // when the buffer has one, we strip exactly one trailing '\n' here
+        // — mirroring the same adjustment `Buffer::len_lines()` already
+        // makes — so `compute_hunks`'s re-split partition matches
+        // `a_lines.len()` / `b_lines.len()` exactly, with no phantom row.
         let a_text = a_lines.concat();
         let b_text = b_lines.concat();
-        let hunks = quadraui::compute_hunks(&a_text, &b_text);
+        let a_text = a_text.strip_suffix('\n').unwrap_or(&a_text);
+        let b_text = b_text.strip_suffix('\n').unwrap_or(&b_text);
+        let hunks = quadraui::compute_hunks(a_text, b_text);
         let (mut da, mut db, aligned_a, aligned_b) =
             diff_state_from_hunks(&hunks, a_lines.len(), b_lines.len());
         // Post-process: short runs of Same lines sandwiched between changes
