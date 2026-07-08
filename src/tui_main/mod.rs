@@ -568,157 +568,39 @@ fn dir_fuzzy_score(path: &str, query: &str) -> Option<i32> {
 }
 
 // =============================================================================
-// Stderr suppression (prevents "Can't open display" from corrupting TUI)
-// =============================================================================
-
-/// RAII guard that redirects stderr to /dev/null and restores on drop.
-struct StderrGuard {
-    saved_fd: i32,
-}
-
-/// Temporarily suppress stderr output. Returns `None` if the operation fails.
-fn suppress_stderr() -> Option<StderrGuard> {
-    unsafe {
-        let saved = libc::dup(2);
-        if saved < 0 {
-            return None;
-        }
-        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-        if devnull < 0 {
-            libc::close(saved);
-            return None;
-        }
-        libc::dup2(devnull, 2);
-        libc::close(devnull);
-        Some(StderrGuard { saved_fd: saved })
-    }
-}
-
-impl Drop for StderrGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::dup2(self.saved_fd, 2);
-            libc::close(self.saved_fd);
-        }
-    }
-}
-
-// =============================================================================
 // Clipboard setup helpers
 // =============================================================================
 
-/// Check if a binary exists on PATH.
-fn has_binary(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Find the first available clipboard write command (program + args).
-fn find_clipboard_write_cmd() -> Option<(&'static str, &'static [&'static str])> {
-    let candidates: &[(&str, &[&str])] = &[
-        #[cfg(target_os = "windows")]
-        ("clip.exe", &[]),
-        #[cfg(target_os = "windows")]
-        (
-            "powershell.exe",
-            &["-Command", "Set-Clipboard -Value $input"],
-        ),
-        ("xclip", &["-selection", "clipboard"]),
-        ("xsel", &["--clipboard", "--input"]),
-        ("wl-copy", &[]),
-        #[cfg(target_os = "macos")]
-        ("pbcopy", &[]),
-    ];
-    for &(prog, args) in candidates {
-        if has_binary(prog) {
-            return Some((prog, args));
-        }
-    }
-    None
-}
-
-/// Find the first available clipboard read command (program + args).
-fn find_clipboard_read_cmd() -> Option<(&'static str, &'static [&'static str])> {
-    let candidates: &[(&str, &[&str])] = &[
-        #[cfg(target_os = "windows")]
-        ("powershell.exe", &["-Command", "Get-Clipboard"]),
-        ("xclip", &["-selection", "clipboard", "-o"]),
-        ("xsel", &["--clipboard", "--output"]),
-        ("wl-paste", &[]),
-        #[cfg(target_os = "macos")]
-        ("pbpaste", &[]),
-    ];
-    for &(prog, args) in candidates {
-        if has_binary(prog) {
-            return Some((prog, args));
-        }
-    }
-    None
-}
-
-/// Set up system clipboard callbacks on the engine.
+/// Set up system clipboard callbacks on the engine, delegating entirely to
+/// `quadraui::tui::TuiPlatformServices` (#508 — quadraui#269/#283).
 ///
-/// Spawns xclip/xsel/wl-copy/wl-paste/pbcopy/pbpaste directly rather than
-/// using copypasta_ext, which has a bug where it doesn't close the child's
-/// stdin pipe before calling wait() — causing xclip to exit with status 1
-/// under crossterm raw mode.
+/// The old TUI clipboard spawned xclip/xsel/wl-copy/wl-paste directly (with a
+/// stderr-suppression + `DISPLAY=:0` hack and a manual stdin-EOF dance to
+/// route around a copypasta_ext bug). All of that lived only to reach the
+/// clipboard over SSH/tmux where a local desktop clipboard tool isn't always
+/// reachable. `TuiPlatformServices` now covers the same ground upstream in
+/// quadraui: arboard for the local desktop clipboard, OSC 52 (written to
+/// both stdout and `/dev/tty`, with tmux DCS-passthrough) for SSH/tmux, and
+/// a native-tool fallback leg for local-X11-inside-tmux — see
+/// `quadraui::tui::services` for the full writeup. Reads stay arboard-only
+/// (OSC 52 read is disabled in most terminals for security reasons).
 fn setup_tui_clipboard(engine: &mut Engine) {
-    // Ensure DISPLAY is set for xclip/xsel — TUI sessions (e.g. tmux, SSH)
-    // may not inherit it even when an X server is running on :0.
-    #[cfg(not(target_os = "windows"))]
-    if std::env::var("DISPLAY").unwrap_or_default().is_empty() {
-        unsafe { std::env::set_var("DISPLAY", ":0") };
-    }
-    if let Some((prog, args)) = find_clipboard_read_cmd() {
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        engine.clipboard_read = Some(Box::new(move || {
-            let _guard = suppress_stderr();
-            let output = std::process::Command::new(prog)
-                .args(&args)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .map_err(|e| format!("clipboard read: {e}"))?;
-            if !output.status.success() {
-                return Err(format!("{} exited with status {}", prog, output.status));
-            }
-            String::from_utf8(output.stdout).map_err(|e| format!("clipboard: {e}"))
-        }));
-    }
+    use quadraui::PlatformServices;
 
-    if let Some((prog, args)) = find_clipboard_write_cmd() {
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        engine.clipboard_write = Some(Box::new(move |text: &str| {
-            let _guard = suppress_stderr();
-            let mut child = std::process::Command::new(prog)
-                .args(&args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("clipboard write: {e}"))?;
-            // Write text then DROP stdin to send EOF — critical for xclip.
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(text.as_bytes());
-                // stdin dropped here, pipe closed, xclip sees EOF
-            }
-            let status = child.wait().map_err(|e| format!("clipboard: {e}"))?;
-            if !status.success() {
-                return Err(format!("{} exited with status {}", prog, status));
-            }
-            Ok(())
-        }));
-    }
+    let services = std::rc::Rc::new(quadraui::tui::TuiPlatformServices::new());
 
-    if engine.clipboard_write.is_none() && engine.clipboard_read.is_none() {
-        engine.message = "Clipboard unavailable — install xclip or xsel".to_string();
-    }
+    let read_services = services.clone();
+    engine.clipboard_read = Some(Box::new(move || {
+        read_services
+            .clipboard()
+            .read_text()
+            .ok_or_else(|| "clipboard empty or unavailable".to_string())
+    }));
+
+    engine.clipboard_write = Some(Box::new(move |text: &str| {
+        services.clipboard().write_text(text);
+        Ok(())
+    }));
 }
 
 /// Copy text to the system clipboard and show a status message.
