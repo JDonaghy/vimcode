@@ -27,6 +27,31 @@ The principle: **a vimcode primitive migration must collapse paint code on every
 
 **Once Win-GUI gets rebuilt on quadraui,** the rule grows to include `quadraui::win_gui::*` rasterisers and harnesses. Same for macOS later.
 
+## Terminal selection stays on `TerminalSelection`, not `TextRegion` (#564)
+
+Not every quadraui-owned type is the *generic* one, and picking the wrong
+quadraui abstraction is still a mistake even though it's "quadraui" either
+way. The integrated terminal panel's click-drag text selection is already
+fully delegated to quadraui — but through `quadraui::terminal_engine`
+(`TerminalSelection`, `TerminalSession::forward_mouse` /
+`mouse_reporting_enabled`, `selected_text()`, and `Backend::draw_terminal`
+for highlight painting), **not** through the generic selectable-region
+pipeline (`dispatch::TextRegion` / `DragTarget::TextSelection` /
+`Backend::register_text_region`, as demoed in
+`examples/common/selection_app.rs`).
+
+Don't re-litigate this without new information: the generic pipeline has no
+concept of scrollback (its `TextRegion` is a fixed-bounds rect of
+currently-painted `lines`), while `TerminalSelection` already operates in
+display-row space that's scrollback-aware by construction. Re-routing would
+add a `Point`↔row/col translation layer around a type that already fits,
+for zero behavioral gain. Quadraui's own canonical terminal example
+(`examples/common/terminal_app.rs`) doesn't use `TextRegion` for terminal
+selection either — see the design note atop
+`src/core/engine/terminal_ops.rs` for the full reasoning. `TextRegion` is
+still the right call for plain non-PTY selectable text panels; it's just
+not this one.
+
 ## Cross-backend rendering algorithms
 
 Any "fit X within Y" / "where does Z scroll to" / "which slice fits in N units" logic shared across backends MUST be parameterised over a measurement closure — never hardcode a unit (chars vs pixels). Put the algorithm in `quadraui` as `fn ...<F: Fn(...) -> usize>(..., measure: F)`. Each backend supplies its native measurer (TUI: `chars().count()`, GTK: Pango pixel widths, Win-GUI: DirectWrite, macOS: Core Text). Established examples: `quadraui::StatusBar::fit_right_start` and `quadraui::TabBar::fit_active_scroll_offset`. **When debugging a layout bug present in one backend but not another, suspect units before timing** — see [`quadraui/docs/NATIVE_GUI_LESSONS.md`](https://github.com/JDonaghy/quadraui/blob/main/quadraui/docs/NATIVE_GUI_LESSONS.md) §12, §13, §14.

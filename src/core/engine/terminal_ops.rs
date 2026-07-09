@@ -1,3 +1,64 @@
+//! Integrated-terminal engine operations (panes, tabs, mouse, selection).
+//!
+//! ## Design note (#564): why terminal selection does *not* use
+//! `quadraui::dispatch::TextRegion` / `DragTarget::TextSelection`
+//!
+//! #564 asked whether the integrated terminal's click-drag text selection
+//! should be re-routed through quadraui's generic selectable-region
+//! pipeline (`Backend::register_text_region` +
+//! `dispatch::{dispatch_click, dispatch_mouse_drag}` +
+//! `DragTarget::TextSelection` + `UiEvent::TextSelectionChanged` /
+//! `TextCopied`, as demoed in `examples/common/selection_app.rs`). After
+//! reviewing that pipeline against what's already here, the answer is no —
+//! this pane already delegates the exact same responsibility to a
+//! **better-fitted** quadraui abstraction:
+//!
+//! - Selection state is [`TermSelection`], a re-export of
+//!   `quadraui::terminal_engine::TerminalSelection` — already a
+//!   quadraui-owned type, not a bespoke vimcode one.
+//! - The forward-vs-select gate (`mouse_reporting_enabled` /
+//!   `should_forward_mouse` / `forward_mouse`) is entirely inside
+//!   `quadraui::terminal_engine::TerminalSession` — this file only calls
+//!   it, per the doc comments below.
+//! - Selection highlight painting and text extraction
+//!   (`selected_text()`/`build_rows()`) are done in quadraui's
+//!   `terminal_engine`, using **display-row** coordinates that already
+//!   account for scrollback (`scroll_offset`) — both backends reach them
+//!   only through `Backend::draw_terminal`, so there is zero paint code
+//!   here or in `src/gtk/` / `src/tui_main/` for this.
+//!
+//! The generic `TextRegion` mechanism models a *fixed-bounds, currently
+//! painted* rectangle of `lines: Vec<String>` with anchor/focus expressed
+//! as screen `Point`s — it has no notion of scrollback. Routing terminal
+//! selection through it would mean translating `Point` anchor/focus back
+//! into `TerminalSelection`'s row/col space on every drag update (the
+//! `Point` round-trip `text_selection_line_range` produces would need to be
+//! re-mapped through `scroll_offset` anyway), for no behavioral gain — it
+//! would only add an indirection layer around a type that already fits.
+//! Confirming this isn't a vimcode-only view: quadraui's own canonical
+//! terminal reference (`examples/common/terminal_app.rs`, cited below as
+//! the gold standard these methods mirror) does not use `TextRegion` for
+//! terminal selection either — it only uses the generic dispatch pipeline
+//! for its scrollbar drag, and leaves PTY forwarding / local selection to
+//! `TerminalSession` directly, exactly as this file does.
+//!
+//! `TextRegion` *is* the right tool where a panel is a plain, non-scrolling
+//! text surface unrelated to a PTY (see `selection_app.rs`); the doc
+//! comment on [`Backend::cancel_text_selection_drag`] in quadraui even
+//! covers the composability case of such a panel sitting *next to* an
+//! embedded terminal. That's not this pane's situation — the terminal's
+//! own screen is the selectable surface, and it already has a
+//! purpose-built quadraui type for that. See also
+//! `docs/QUADRAUI_GUIDE.md` § "Terminal selection stays on
+//! `TerminalSelection`, not `TextRegion` (#564)".
+//!
+//! No quadraui-side gap exists here, so no quadraui issue was filed for
+//! this half of #508's follow-up work. #565 (routing the *editor's*
+//! visual-selection drag-origin arbitration through `DragTarget`) is a
+//! different, still-open question — that one is about document-model
+//! drag state across split windows, not terminal cell selection, and is
+//! unaffected by this note.
+
 use super::*;
 use crate::core::terminal::TermSelection;
 
