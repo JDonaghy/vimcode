@@ -590,11 +590,19 @@ struct App {
     /// breadcrumb/divider zones (which have no `FrameZone` equivalent) and
     /// for the brief window before the first paint populates this cache.
     cached_frame_hit_map: Rc<RefCell<Option<quadraui::FrameHitMap>>>,
-    /// Parallel table for resolving `FrameZone::TabBar { idx }`: `idx`
-    /// indexes this Vec in the same order tab bars were pushed into
-    /// `cached_frame_hit_map`, recovering the owning `GroupId` and drawn
-    /// rect that `FrameZone` itself doesn't carry.
-    cached_tab_bar_zones: Rc<RefCell<Vec<(core::window::GroupId, quadraui::Rect)>>>,
+    /// Parallel table for resolving `FrameZone::TabBar { idx }`, keyed by the
+    /// *global* surface index `FrameZone::TabBar { idx }` actually carries —
+    /// `ScreenLayout::zone_for`'s `idx` enumerates ALL surfaces pushed into
+    /// `cached_frame_hit_map` (editors THEN tab bars), not a per-tab-bar
+    /// count, so a tab bar's global index is offset by however many editor
+    /// surfaces were pushed before it. A plain `Vec` indexed 0.. (the
+    /// original #449 shape) silently mismatched by that offset and made
+    /// every `FrameZone::TabBar` lookup miss whenever at least one editor
+    /// window was on screen — i.e. always — falling back to
+    /// `screen_zone_hit_test` without ever exercising the new path. Keying
+    /// by the real global `idx` instead of position fixes that regardless
+    /// of how many editor windows precede the tab bars.
+    cached_tab_bar_zones: Rc<RefCell<HashMap<usize, (core::window::GroupId, quadraui::Rect)>>>,
     /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
     /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
     /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
@@ -1401,7 +1409,7 @@ impl App {
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             cached_screen_layout: Rc::new(RefCell::new(None)),
             cached_frame_hit_map: Rc::new(RefCell::new(None)),
-            cached_tab_bar_zones: Rc::new(RefCell::new(Vec::new())),
+            cached_tab_bar_zones: Rc::new(RefCell::new(HashMap::new())),
             cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
             cached_drop_tbh: Rc::new(Cell::new(0.0)),
             cached_explorer_metrics: Rc::new(Cell::new((16.0, 8.0))),
@@ -7780,19 +7788,24 @@ impl quadraui::ShellApp for App {
         pixel_hits.clear();
         close_abs.clear();
         slots_abs.clear();
-        // Parallel table for `FrameZone::TabBar { idx }` resolution (#449) —
-        // `idx` indexes this Vec in the same order tab bars are pushed into
-        // `hit_frame` below, recovering the `GroupId`/rect `FrameZone` itself
-        // doesn't carry. See `cached_tab_bar_zones`'s doc comment.
-        let mut tab_bar_zones: Vec<(core::window::GroupId, quadraui::Rect)> = Vec::new();
-        for target in render::tab_bar_draw_targets(
-            &engine,
-            screen,
-            tab_row_h,
-            tab_bar_h,
-            (0.0, 0.0),
-            (x, y, w),
-        ) {
+        // Parallel table for `FrameZone::TabBar { idx }` resolution (#449),
+        // keyed by the *global* surface index — `hit_frame` already has
+        // `window_editors.len()` `Surface::Editor`s pushed into it above, so
+        // the first tab bar's `FrameZone::TabBar { idx }` is
+        // `window_editors.len()`, not `0`. See `cached_tab_bar_zones`'s doc
+        // comment for why a plain `Vec` indexed from 0 was wrong.
+        let mut tab_bar_zones: HashMap<usize, (core::window::GroupId, quadraui::Rect)> =
+            HashMap::new();
+        for (next_surface_idx, target) in
+            (window_editors.len()..).zip(render::tab_bar_draw_targets(
+                &engine,
+                screen,
+                tab_row_h,
+                tab_bar_h,
+                (0.0, 0.0),
+                (x, y, w),
+            ))
+        {
             let tb_rect = target.rect;
             let hover = self
                 .tab_close_hover
@@ -7811,7 +7824,7 @@ impl quadraui::ShellApp for App {
                 bar: target.bar,
                 hovered_close: hover,
             });
-            tab_bar_zones.push((target.group_id, tb_rect));
+            tab_bar_zones.insert(next_surface_idx, (target.group_id, tb_rect));
             // Recover the exact pixel geometry the rasteriser just drew and
             // cache it (relative to the bar's left edge) for hit-testing.
             let hits = backend.tab_bar_layout(tb_rect, target.bar);
