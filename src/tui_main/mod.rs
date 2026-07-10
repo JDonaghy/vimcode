@@ -846,8 +846,6 @@ fn event_loop(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
     let mut last_click_pos: (u16, u16) = (0, 0);
-    // Whether a mouse text drag is active (not scrollbar drag)
-    let mut mouse_text_drag = false;
     // Command-line mouse text selection: (start_col, end_col) in the rendered row.
     let mut cmd_sel: Option<(usize, usize)> = None;
     let mut cmd_dragging = false;
@@ -2751,7 +2749,6 @@ fn event_loop(
                                 last_layout.as_ref(),
                                 &mut last_click_time,
                                 &mut last_click_pos,
-                                &mut mouse_text_drag,
                                 &mut folder_picker,
                                 &mut cmd_sel,
                                 &mut cmd_dragging,
@@ -2802,7 +2799,6 @@ fn event_loop(
                     last_layout.as_ref(),
                     &mut last_click_time,
                     &mut last_click_pos,
-                    &mut mouse_text_drag,
                     &mut folder_picker,
                     &mut cmd_sel,
                     &mut cmd_dragging,
