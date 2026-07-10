@@ -1537,6 +1537,7 @@ impl App {
                             &self.split_btn_map.borrow(),
                             &self.action_btn_map.borrow(),
                             &self.status_segment_map.borrow(),
+                            true, // real click: focus/tab/gutter side effects are intended
                         ) {
                             engine.add_cursor_at_pos(line, col);
                         }
@@ -4644,6 +4645,7 @@ impl App {
                     &self.split_btn_map.borrow(),
                     &self.action_btn_map.borrow(),
                     &self.status_segment_map.borrow(),
+                    true, // resolving the original tab-bar mouse-down; switching tabs is intended
                 );
                 if let ClickTarget::TabBar = target {
                     // The tab was already switched by pixel_to_click_target.

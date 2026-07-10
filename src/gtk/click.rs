@@ -18,6 +18,19 @@ pub(super) use render_mod::ClickTarget;
 /// #420/#560) — the same Pango layout + attributes `draw_editor` painted
 /// with — instead of a bespoke `xy_to_index` reconstruction, so paint and
 /// click can never drift apart again.
+///
+/// `mutate_focus` gates every side effect this function performs purely as a
+/// byproduct of resolving a pixel position — flipping `active_group`/the
+/// active tab, and executing a gutter action (e.g. toggling a breakpoint).
+/// Real clicks (`handle_mouse_click`, `handle_mouse_double_click`, Ctrl+click,
+/// tab-drag-start detection) pass `true`, since landing on a pane or tab
+/// should focus it. `handle_mouse_drag` passes `false`: while a text-selection
+/// drag is held down, the mouse sweeping over a *different* split's tab bar or
+/// gutter must not steal focus or fire actions there — `Engine::mouse_drag`'s
+/// origin-window lock already keeps the selection pinned to the split the
+/// drag started in (#568), but only if this hit-test stays a pure query
+/// during a drag, matching how TUI's drag path (`src/tui_main/mouse.rs`)
+/// never mutates engine focus state either.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pixel_to_click_target(
     engine: &mut Engine,
@@ -41,6 +54,7 @@ pub(super) fn pixel_to_click_target(
     _split_btn_map: &SplitBtnMap,
     _action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
+    mutate_focus: bool,
 ) -> ClickTarget {
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
@@ -59,6 +73,11 @@ pub(super) fn pixel_to_click_target(
             local_x,
             bar_width: _,
         } => {
+            if !mutate_focus {
+                // A drag sweeping over another split's tab bar must not
+                // switch tabs/focus there (#568) — treat it as a miss.
+                return ClickTarget::None;
+            }
             engine.active_group = group_id;
             tab_bar_inner_hit_test(
                 engine,
@@ -75,7 +94,9 @@ pub(super) fn pixel_to_click_target(
             rel_x,
             rel_y,
         } => {
-            engine.activate_group_for_window(window_id);
+            if mutate_focus {
+                engine.activate_group_for_window(window_id);
+            }
 
             let Some(rw) = cached_layout.windows.get(window_idx) else {
                 return ClickTarget::None;
@@ -96,6 +117,12 @@ pub(super) fn pixel_to_click_target(
                     gutter_col,
                     ..
                 } => {
+                    if !mutate_focus {
+                        // A drag sweeping over another split's gutter must
+                        // not fire gutter actions (e.g. toggle a breakpoint)
+                        // there (#568).
+                        return ClickTarget::None;
+                    }
                     execute_gutter_action(engine, rw, window_id, line_idx, gutter_col);
                     ClickTarget::Gutter
                 }
@@ -421,6 +448,7 @@ pub(super) fn handle_mouse_click(
         split_btn_map,
         action_btn_map,
         status_segment_map,
+        true, // real click: focus/tab/gutter side effects are intended
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
             // Alt+Click in VSCode mode → add cursor at position
@@ -520,12 +548,20 @@ pub(super) fn handle_mouse_double_click(
         split_btn_map,
         action_btn_map,
         status_segment_map,
+        true, // real click: focus/tab/gutter side effects are intended
     ) {
         engine.mouse_double_click(wid, line, col);
     }
 }
 
 /// Handle mouse drag — extend visual selection.
+///
+/// #568: this only ever fires while a mouse button is held (drag
+/// continuation), so it resolves the hit as a pure query (`mutate_focus:
+/// false`) — the mouse sweeping over a different split's tab bar/gutter
+/// while the drag is held must not steal focus or fire actions there.
+/// `Engine::mouse_drag`'s origin-window lock then keeps the selection itself
+/// pinned to the split the drag started in.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_drag(
     engine: &mut Engine,
@@ -556,6 +592,7 @@ pub(super) fn handle_mouse_drag(
         split_btn_map,
         action_btn_map,
         status_segment_map,
+        false, // drag continuation: pure query, no focus/tab/gutter side effects
     ) {
         engine.mouse_drag(wid, line, col);
     }
@@ -912,5 +949,168 @@ mod emoji_click_column_tests {
             "a size-mismatched click context (the pre-fix bug) must drift on this line, \
              else the test can't prove the width-match is what fixes it"
         );
+    }
+}
+
+#[cfg(test)]
+mod cross_split_drag_focus_tests {
+    //! #568 regression: dragging a text selection in one editor group (a
+    //! GTK split pane created via the tab bar's split button /
+    //! `Engine::open_editor_group`, i.e. VS Code-style side-by-side panes)
+    //! must not steal focus to a neighboring group's window merely because
+    //! the mouse passes over it while the button is held.
+    //!
+    //! `Engine::mouse_drag`'s origin-window lock (`mouse_drag_origin_window`)
+    //! already keeps the selection *data* pinned to the originating window
+    //! — see the core-level `test_mouse_drag_locked_to_origin_window`. But
+    //! GTK's `pixel_to_click_target` used to call
+    //! `engine.activate_group_for_window(window_id)` unconditionally, as a
+    //! side effect of resolving ANY pixel position — including drag
+    //! continuation. That flipped `engine.active_group` (and therefore
+    //! `active_window_id()`) to the neighboring pane just from hovering over
+    //! it mid-drag, which made `render::build_selection`'s `is_active` gate
+    //! light up the wrong pane's selection overlay even though the
+    //! underlying selection state never actually changed. This pins that a
+    //! drag-continuation hit-test (`mutate_focus: false`) leaves
+    //! `active_group`/`active_window_id()` untouched, while a genuine click
+    //! (`mutate_focus: true`) still focuses the pane it lands in.
+    use super::*;
+
+    fn empty_maps() -> (
+        TabPixelHitMap,
+        TabSlotMap,
+        DiffBtnMap,
+        SplitBtnMap,
+        ActionBtnMap,
+        StatusSegmentMap,
+    ) {
+        (
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    #[test]
+    fn drag_continuation_does_not_steal_focus_to_neighboring_group() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        let wid_a = engine.active_window_id();
+        let group_a = engine.active_group;
+
+        // Open a second editor group side-by-side — GTK's split-pane
+        // feature (bound to the tab bar's split button). `open_editor_group`
+        // makes the new group/window active.
+        engine.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        let group_b = engine.active_group;
+        let wid_b = engine.active_window_id();
+        assert_ne!(group_a, group_b);
+        assert_ne!(wid_a, wid_b);
+
+        // Simulate the user clicking back into the left pane to start the drag.
+        engine.mouse_click(wid_a, 0, 1);
+        assert_eq!(engine.active_group, group_a);
+        assert_eq!(engine.active_window_id(), wid_a);
+        engine.mouse_drag(wid_a, 0, 4);
+        assert!(engine.mouse_drag_active);
+        assert_eq!(engine.mouse_drag_origin_window, Some(wid_a));
+
+        // Lay out both panes side by side and locate each window's rect.
+        let theme = Theme::onedark();
+        let bounds = core::WindowRect::new(0.0, 0.0, 1600.0, 400.0);
+        let line_height: f64 = 18.0;
+        let char_width: f64 = 9.0;
+        let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
+        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let rw_b = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == wid_b)
+            .expect("window B should be laid out");
+        // A pixel comfortably inside window B's text area (below its tab bar).
+        let x_in_b = rw_b.rect.x + char_width * 2.0;
+        let y_in_b = rw_b.rect.y + line_height * 2.0;
+
+        let backend = Rc::new(RefCell::new(super::super::backend::GtkBackend::new()));
+        let (
+            tab_pixel_hits,
+            tab_slot_positions,
+            diff_btn_map,
+            split_btn_map,
+            action_btn_map,
+            status_segment_map,
+        ) = empty_maps();
+
+        // Drag continuation: the mouse is over window B's pixels, but this
+        // must resolve as a pure hit-test — no focus/group side effects.
+        let target = pixel_to_click_target(
+            &mut engine,
+            &backend,
+            x_in_b,
+            y_in_b,
+            line_height,
+            char_width,
+            &screen,
+            &tab_pixel_hits,
+            &tab_slot_positions,
+            &diff_btn_map,
+            &split_btn_map,
+            &action_btn_map,
+            &status_segment_map,
+            false, // mutate_focus: drag continuation
+        );
+        assert_eq!(
+            engine.active_group, group_a,
+            "a held drag sweeping over the neighboring group must not steal active_group"
+        );
+        assert_eq!(
+            engine.active_window_id(),
+            wid_a,
+            "a held drag sweeping over the neighboring group must not steal active_window_id \
+             (render::build_selection's is_active gate keys off this)"
+        );
+        match target {
+            ClickTarget::BufferPos(wid, _, _) => {
+                assert_eq!(
+                    wid, wid_b,
+                    "the hit-test should still resolve the real window under the cursor"
+                )
+            }
+            other => panic!("expected a BufferPos hit in window B's text area, got {other:?}"),
+        }
+        // The engine-level origin lock (already covered by
+        // `test_mouse_drag_locked_to_origin_window`) rejects this mismatched
+        // window_id, so the selection itself stays anchored to window A.
+        engine.mouse_drag(wid_b, 0, 8);
+        assert_eq!(engine.mouse_drag_origin_window, Some(wid_a));
+
+        // Contrast: a genuine click landing in window B (mutate_focus: true)
+        // — as a real MouseClick/DoubleClick event would — SHOULD focus it.
+        // This proves the flag actually gates behavior rather than being a
+        // no-op, and that real clicks keep working as before.
+        let click_target = pixel_to_click_target(
+            &mut engine,
+            &backend,
+            x_in_b,
+            y_in_b,
+            line_height,
+            char_width,
+            &screen,
+            &tab_pixel_hits,
+            &tab_slot_positions,
+            &diff_btn_map,
+            &split_btn_map,
+            &action_btn_map,
+            &status_segment_map,
+            true, // mutate_focus: genuine click
+        );
+        assert_eq!(
+            engine.active_group, group_b,
+            "a genuine click must still focus the pane it lands in"
+        );
+        assert!(matches!(click_target, ClickTarget::BufferPos(wid, _, _) if wid == wid_b));
     }
 }
