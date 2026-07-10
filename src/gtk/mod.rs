@@ -495,8 +495,6 @@ struct App {
     ext_dyn_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     sidebar_inner_sw: Rc<RefCell<Option<gtk4::ScrolledWindow>>>,
-    /// Direct ref to the sidebar Revealer for programmatic open/close.
-    sidebar_revealer: Rc<RefCell<Option<gtk4::Revealer>>>,
     /// Direct refs to each panel's outer Box for programmatic show/hide.
     explorer_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
     search_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -1371,7 +1369,6 @@ impl App {
             ext_dyn_panel_box: Rc::new(RefCell::new(None)),
             ai_sidebar_da_ref: Rc::new(RefCell::new(None)),
             sidebar_inner_sw: Rc::new(RefCell::new(None)),
-            sidebar_revealer: Rc::new(RefCell::new(None)),
             explorer_panel_box: Rc::new(RefCell::new(None)),
             search_sidebar_da_ref: Rc::new(RefCell::new(None)),
             debug_panel_box: Rc::new(RefCell::new(None)),
@@ -6186,7 +6183,7 @@ impl App {
         self.sync_sidebar_widgets();
     }
 
-    /// Update GTK widget visibility (revealer + panel boxes), grab focus on
+    /// Update GTK widget visibility (panel boxes), grab focus on
     /// the active panel DA, and queue an activity bar redraw. Reads
     /// effective state from `engine.app_shell` via the `current_*` helpers.
     fn sync_sidebar_widgets(&mut self) {
@@ -6194,9 +6191,6 @@ impl App {
         let id = self.current_active_panel_id();
         let is_ext = is_ext_panel_id(&id);
 
-        if let Some(ref r) = *self.sidebar_revealer.borrow() {
-            r.set_reveal_child(show);
-        }
         let panel_boxes: [(&str, &Rc<RefCell<Option<gtk4::Box>>>); 6] = [
             (PANEL_EXPLORER, &self.explorer_panel_box),
             (PANEL_DEBUG, &self.debug_panel_box),
