@@ -127,6 +127,28 @@ fn apply_scrollbar_drag(
     handled
 }
 
+/// Encode a text-drag `WidgetId` for the given editor window, following
+/// the `tui:editor:<window_id>:<vsb|hsb>` scrollbar convention above (see
+/// `apply_scrollbar_drag`). Used to arm a [`quadraui::DragTarget::TextSelection`]
+/// at mouse-down so the subsequent `Drag` events can recover which window
+/// "owns" the in-progress visual-selection drag (#565).
+fn text_drag_widget_id(window_id: crate::core::WindowId) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("tui:editor:{}:text", window_id.0))
+}
+
+/// Inverse of [`text_drag_widget_id`]: recover the origin window id from a
+/// `DragTarget::TextSelection` region, if it matches the expected format.
+/// Returns `None` for anything else (defensive — falls back to the
+/// engine's own `mouse_drag_origin_window` guard in that case).
+fn text_drag_origin_window(region: &quadraui::WidgetId) -> Option<crate::core::WindowId> {
+    region
+        .as_str()
+        .strip_prefix("tui:editor:")
+        .and_then(|rest| rest.strip_suffix(":text"))
+        .and_then(|wid_str| wid_str.parse::<usize>().ok())
+        .map(crate::core::WindowId)
+}
+
 // ─── Mouse handling ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -145,7 +167,6 @@ pub(super) fn handle_mouse(
     last_layout: Option<&render::ScreenLayout>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
-    mouse_text_drag: &mut bool,
     folder_picker: &mut Option<FolderPickerState>,
     cmd_sel: &mut Option<(usize, usize)>,
     cmd_dragging: &mut bool,
@@ -975,7 +996,25 @@ pub(super) fn handle_mouse(
             // via `tui:editor:N:vsb` / `tui:editor:N:hsb` widget ids. The
             // legacy `dragging_scrollbar` local + `ScrollDragState` are
             // gone.
-            // Text drag-to-select — find window under cursor and extend visual selection
+            // Text drag-to-select — find window under cursor and extend visual
+            // selection. #565: the drag-origin arbitration (which window this
+            // gesture "belongs to", so a drag can't leak into or be hijacked
+            // by another split) now flows through the `DragTarget::TextSelection`
+            // armed at mouse-down, mirroring how scrollbar drags carry their
+            // owning widget id — replacing the old bespoke `mouse_text_drag`
+            // bool. The document-model hit-testing below
+            // (`window_zone_hit_test` → `buf_line`/`col` → `engine.mouse_drag`)
+            // is unchanged.
+            let text_drag_origin = match drag_state.target() {
+                Some(quadraui::DragTarget::TextSelection { region, .. }) => {
+                    text_drag_origin_window(region)
+                }
+                _ => None,
+            };
+            let text_drag_armed = matches!(
+                drag_state.target(),
+                Some(quadraui::DragTarget::TextSelection { .. })
+            );
             if col >= editor_left {
                 if let Some(layout) = last_layout {
                     let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
@@ -996,22 +1035,30 @@ pub(super) fn handle_mouse(
                             view_row, buf_line, ..
                         } = zone
                         {
-                            // #560: resolve via the shared quadraui
-                            // text-layout inverse (`EditorLayout::col_at_x`)
-                            // instead of hand-rolled cell math, so TUI and
-                            // GTK column resolution can never diverge.
-                            let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
-                            let col_in_text =
-                                editor_layout.col_at_x(&editor, view_row, rel_col as f32);
-                            engine.mouse_drag(rw.window_id, buf_line, col_in_text);
-                            *mouse_text_drag = true;
+                            // Cross-split guard: if this drag started in a
+                            // different window, ignore it here — matches the
+                            // engine's own `mouse_drag_origin_window` guard
+                            // (kept as defense-in-depth) but decided earlier,
+                            // from the arbitrated drag target.
+                            let cross_split = text_drag_origin.is_some_and(|w| w != rw.window_id);
+                            if !cross_split {
+                                // #560: resolve via the shared quadraui
+                                // text-layout inverse (`EditorLayout::col_at_x`)
+                                // instead of hand-rolled cell math, so TUI and
+                                // GTK column resolution can never diverge.
+                                let (editor, editor_layout) =
+                                    render::editor_text_layout(rw, 1.0, 1.0);
+                                let col_in_text =
+                                    editor_layout.col_at_x(&editor, view_row, rel_col as f32);
+                                engine.mouse_drag(rw.window_id, buf_line, col_in_text);
+                            }
                             return sidebar_width;
                         }
                     }
                 }
                 // Editor drag moved outside all windows (e.g. into terminal area) —
                 // stop processing so it doesn't bleed into other panels.
-                if *mouse_text_drag {
+                if text_drag_armed {
                     return sidebar_width;
                 }
             }
@@ -1111,7 +1158,9 @@ pub(super) fn handle_mouse(
             *dragging_sidebar = false;
             // Stage 5c+5d: scrollbar drags (search, settings, debug-sidebar,
             // terminal, debug-output, editor v/h scrollbars) clear via
-            // `drag_state.end()` — single source of truth.
+            // `drag_state.end()` — single source of truth. #565: text-selection
+            // drags (`DragTarget::TextSelection`) clear here too, replacing the
+            // old separate `mouse_text_drag = false` reset.
             drag_state.end();
             *dragging_group_divider = None;
             *cmd_dragging = false;
@@ -1135,7 +1184,6 @@ pub(super) fn handle_mouse(
                     engine.terminal_split_finalize_drag(left_cols, right_cols, rows);
                 }
             }
-            *mouse_text_drag = false;
             engine.mouse_drag_active = false;
             engine.mouse_drag_origin_window = None;
             // #533: auto-copy terminal selection to clipboard on
@@ -3048,12 +3096,34 @@ pub(super) fn handle_mouse(
                     engine.add_cursor_at_pos(buf_line, col_in_text);
                 } else if is_double {
                     engine.mouse_double_click(rw.window_id, buf_line, col_in_text);
+                    // #565: arm the drag-origin so a following drag (extend
+                    // word-wise selection) is arbitrated the same way a
+                    // plain click-drag is — see the single-click branch below.
+                    drag_state.begin(quadraui::DragTarget::TextSelection {
+                        region: text_drag_widget_id(rw.window_id),
+                        anchor: quadraui::Point {
+                            x: col as f32,
+                            y: row as f32,
+                        },
+                    });
                 } else {
                     // Clear selection on click in VSCode mode.
                     if engine.is_vscode_mode() {
                         engine.vscode_clear_selection();
                     }
                     engine.mouse_click(rw.window_id, buf_line, col_in_text);
+                    // #565: arm a DragTarget::TextSelection so a following
+                    // Drag event can recover which window this gesture
+                    // belongs to (see the drag-origin arbitration in the
+                    // `MouseEventKind::Drag(Left)` handler above), replacing
+                    // the old bespoke `mouse_text_drag` bool.
+                    drag_state.begin(quadraui::DragTarget::TextSelection {
+                        region: text_drag_widget_id(rw.window_id),
+                        anchor: quadraui::Point {
+                            x: col as f32,
+                            y: row as f32,
+                        },
+                    });
                 }
                 // Fire cursor_move hook so plugins (e.g. git-insights blame) see
                 // the new cursor position after a mouse click on a buffer line.
@@ -3090,5 +3160,41 @@ fn status_segment_hit_test(
     match layout.hit_test(click_col as f32, 0.0) {
         quadraui::StatusBarHit::Segment(id) => crate::render::status_action_from_id(id.as_str()),
         quadraui::StatusBarHit::Empty => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_drag_widget_id_round_trips_through_origin_window() {
+        let wid = crate::core::WindowId(7);
+        let region = text_drag_widget_id(wid);
+        assert_eq!(region.as_str(), "tui:editor:7:text");
+        assert_eq!(text_drag_origin_window(&region), Some(wid));
+    }
+
+    #[test]
+    fn text_drag_widget_id_distinguishes_windows() {
+        let a = text_drag_widget_id(crate::core::WindowId(0));
+        let b = text_drag_widget_id(crate::core::WindowId(1));
+        assert_ne!(a, b);
+        assert_eq!(text_drag_origin_window(&a), Some(crate::core::WindowId(0)));
+        assert_eq!(text_drag_origin_window(&b), Some(crate::core::WindowId(1)));
+    }
+
+    #[test]
+    fn text_drag_origin_window_rejects_unrelated_widget_ids() {
+        // Scrollbar ids use the same `tui:editor:` prefix but a different
+        // suffix — must not be misparsed as a text-drag origin.
+        let scrollbar = quadraui::WidgetId::new("tui:editor:3:vsb");
+        assert_eq!(text_drag_origin_window(&scrollbar), None);
+
+        let unrelated = quadraui::WidgetId::new("explorer:sb");
+        assert_eq!(text_drag_origin_window(&unrelated), None);
+
+        let garbage = quadraui::WidgetId::new("tui:editor::text");
+        assert_eq!(text_drag_origin_window(&garbage), None);
     }
 }
