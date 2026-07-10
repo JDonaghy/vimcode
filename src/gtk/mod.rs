@@ -579,6 +579,22 @@ struct App {
     /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
     /// read this instead of recomputing geometry from engine state (#344).
     cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
+    /// Accumulated `quadraui::FrameHitMap` covering the `Editor`/`TabBar`
+    /// zones painted in `render_content` (#449). Built via
+    /// `quadraui::ScreenLayout::hit_map()` (quadraui#425): pushes the SAME
+    /// `Editor`/`TabBar` objects and rects already painted at their existing
+    /// call sites, purely for hit-testing, so it can never reorder or
+    /// duplicate real painting. `click::pixel_to_click_target` consults this
+    /// first to resolve the top-level Editor/TabBar zone, falling back to
+    /// `render::screen_zone_hit_test`'s manual rect-walk for
+    /// breadcrumb/divider zones (which have no `FrameZone` equivalent) and
+    /// for the brief window before the first paint populates this cache.
+    cached_frame_hit_map: Rc<RefCell<Option<quadraui::FrameHitMap>>>,
+    /// Parallel table for resolving `FrameZone::TabBar { idx }`: `idx`
+    /// indexes this Vec in the same order tab bars were pushed into
+    /// `cached_frame_hit_map`, recovering the owning `GroupId` and drawn
+    /// rect that `FrameZone` itself doesn't carry.
+    cached_tab_bar_zones: Rc<RefCell<Vec<(core::window::GroupId, quadraui::Rect)>>>,
     /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
     /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
     /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
@@ -1384,6 +1400,8 @@ impl App {
             action_btn_map: Rc::new(RefCell::new(HashMap::new())),
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             cached_screen_layout: Rc::new(RefCell::new(None)),
+            cached_frame_hit_map: Rc::new(RefCell::new(None)),
+            cached_tab_bar_zones: Rc::new(RefCell::new(Vec::new())),
             cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
             cached_drop_tbh: Rc::new(Cell::new(0.0)),
             cached_explorer_metrics: Rc::new(Cell::new((16.0, 8.0))),
@@ -1537,6 +1555,8 @@ impl App {
                             &self.split_btn_map.borrow(),
                             &self.action_btn_map.borrow(),
                             &self.status_segment_map.borrow(),
+                            self.cached_frame_hit_map.borrow().as_ref(),
+                            &self.cached_tab_bar_zones.borrow(),
                             true, // real click: focus/tab/gutter side effects are intended
                         ) {
                             engine.add_cursor_at_pos(line, col);
@@ -1604,6 +1624,8 @@ impl App {
                                 &self.split_btn_map.borrow(),
                                 &self.action_btn_map.borrow(),
                                 &self.status_segment_map.borrow(),
+                                self.cached_frame_hit_map.borrow().as_ref(),
+                                &self.cached_tab_bar_zones.borrow(),
                             );
                         }
                     }
@@ -4349,6 +4371,8 @@ impl App {
                                 &self.split_btn_map.borrow(),
                                 &self.action_btn_map.borrow(),
                                 &self.status_segment_map.borrow(),
+                                self.cached_frame_hit_map.borrow().as_ref(),
+                                &self.cached_tab_bar_zones.borrow(),
                             )
                         } else {
                             (None, None)
@@ -4645,6 +4669,8 @@ impl App {
                     &self.split_btn_map.borrow(),
                     &self.action_btn_map.borrow(),
                     &self.status_segment_map.borrow(),
+                    self.cached_frame_hit_map.borrow().as_ref(),
+                    &self.cached_tab_bar_zones.borrow(),
                     true, // resolving the original tab-bar mouse-down; switching tabs is intended
                 );
                 if let ClickTarget::TabBar = target {
@@ -4764,6 +4790,8 @@ impl App {
                         &self.split_btn_map.borrow(),
                         &self.action_btn_map.borrow(),
                         &self.status_segment_map.borrow(),
+                        self.cached_frame_hit_map.borrow().as_ref(),
+                        &self.cached_tab_bar_zones.borrow(),
                     );
                 }
                 self.draw_needed.set(true);
@@ -7681,6 +7709,11 @@ impl quadraui::ShellApp for App {
         }
 
         // ── Draw editor windows ───────────────────────────────────────────────
+        // `window_editors` stashes each window's owned `quadraui::Editor`
+        // past the loop (#449) so the FrameHitMap built just below can
+        // reference the SAME objects just painted, instead of constructing
+        // a second copy that could drift from what's on screen.
+        let mut window_editors: Vec<quadraui::Editor> = Vec::with_capacity(screen.windows.len());
         for rw in &screen.windows {
             let editor = render::to_q_editor(rw);
             let rect = editor.rect;
@@ -7690,6 +7723,7 @@ impl quadraui::ShellApp for App {
                 editor: &editor,
             });
             frame.draw(backend);
+            window_editors.push(editor);
 
             // Per-window status bar (when window_status_line=true, which is
             // the default; global_status_bar is None in that mode).
@@ -7716,6 +7750,23 @@ impl quadraui::ShellApp for App {
             }
         }
 
+        // ── Recover a FrameHitMap for Editor/TabBar zone detection (#449) ──────
+        // Pure `.push()` accumulation into a *separate* `ScreenLayout`, built
+        // from the same `Editor` objects just painted above (`window_editors`,
+        // same order as `screen.windows` so `FrameZone::Editor { idx }` maps
+        // straight back to `cached_layout.windows[idx]`) plus the `TabBar`
+        // surfaces pushed in the loop just below. `ScreenLayout::hit_map()`
+        // (quadraui#425) makes no `backend.draw_*()` calls, so accumulating
+        // into it can never reorder or repeat the real painting done above —
+        // see `click::pixel_to_click_target` for the consumer side.
+        let mut hit_frame = QSL::new();
+        for editor in &window_editors {
+            hit_frame.push(Surface::Editor {
+                rect: editor.rect,
+                editor,
+            });
+        }
+
         // ── Draw tab bar(s) — one per editor group ────────────────────────────
         // Multi-group (post-split) layouts have a tab bar per group, each drawn
         // at the top edge of its own bounds. Single-group draws one full-width
@@ -7729,6 +7780,11 @@ impl quadraui::ShellApp for App {
         pixel_hits.clear();
         close_abs.clear();
         slots_abs.clear();
+        // Parallel table for `FrameZone::TabBar { idx }` resolution (#449) —
+        // `idx` indexes this Vec in the same order tab bars are pushed into
+        // `hit_frame` below, recovering the `GroupId`/rect `FrameZone` itself
+        // doesn't carry. See `cached_tab_bar_zones`'s doc comment.
+        let mut tab_bar_zones: Vec<(core::window::GroupId, quadraui::Rect)> = Vec::new();
         for target in render::tab_bar_draw_targets(
             &engine,
             screen,
@@ -7748,6 +7804,14 @@ impl quadraui::ShellApp for App {
                 hovered_close: hover,
             });
             frame.draw(backend);
+            // `target.bar` borrows from `screen` (function-scoped), so this
+            // can push directly into `hit_frame` without hoisting (#449).
+            hit_frame.push(Surface::TabBar {
+                rect: tb_rect,
+                bar: target.bar,
+                hovered_close: hover,
+            });
+            tab_bar_zones.push((target.group_id, tb_rect));
             // Recover the exact pixel geometry the rasteriser just drew and
             // cache it (relative to the bar's left edge) for hit-testing.
             let hits = backend.tab_bar_layout(tb_rect, target.bar);
@@ -7763,6 +7827,8 @@ impl quadraui::ShellApp for App {
         drop(close_abs);
         drop(slots_abs);
         drop(pixel_hits);
+        *self.cached_frame_hit_map.borrow_mut() = Some(hit_frame.hit_map());
+        *self.cached_tab_bar_zones.borrow_mut() = tab_bar_zones;
 
         // ── Draw breadcrumb bar(s) below tab bar(s) ─────────────────────────────
         // (#547) `render_content` is the active ShellApp draw path since the
@@ -8304,6 +8370,8 @@ impl quadraui::ShellApp for App {
                                     self.cached_char_width,
                                     layout,
                                     &self.cached_tab_pixel_hits.borrow(),
+                                    self.cached_frame_hit_map.borrow().as_ref(),
+                                    &self.cached_tab_bar_zones.borrow(),
                                 )
                             })
                         };

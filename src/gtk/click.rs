@@ -54,19 +54,33 @@ pub(super) fn pixel_to_click_target(
     _split_btn_map: &SplitBtnMap,
     _action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
+    // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
+    // painted this frame (#449), plus the parallel `(GroupId, rect)` table
+    // for resolving `FrameZone::TabBar { idx }`. `None` before the first
+    // paint. See `frame_zone_to_screen_zone` for how these replace
+    // `screen_zone_hit_test`'s manual Window/TabBar rect-walk.
+    frame_hit_map: Option<&quadraui::FrameHitMap>,
+    tab_bar_zones: &[(GroupId, quadraui::Rect)],
     mutate_focus: bool,
 ) -> ClickTarget {
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
 
-    let zone = render_mod::screen_zone_hit_test(
-        cached_layout,
-        x,
-        y,
-        tab_bar_height,
-        single_tab_hidden,
-        engine.active_group,
-    );
+    let zone = frame_hit_map
+        .and_then(|hit_map| {
+            let z = frame_zone_to_screen_zone(hit_map, tab_bar_zones, cached_layout, x, y);
+            (!matches!(z, ScreenZone::None)).then_some(z)
+        })
+        .unwrap_or_else(|| {
+            render_mod::screen_zone_hit_test(
+                cached_layout,
+                x,
+                y,
+                tab_bar_height,
+                single_tab_hidden,
+                engine.active_group,
+            )
+        });
     match zone {
         ScreenZone::TabBar {
             group_id,
@@ -157,6 +171,47 @@ pub(super) fn pixel_to_click_target(
         }
         _ => ClickTarget::None,
     }
+}
+
+/// Resolve the top-level `ScreenZone` using the cached `quadraui::FrameHitMap`
+/// (#449), which covers exactly the `Editor`/`TabBar` surfaces painted in
+/// `App::render_content` via `quadraui::ScreenLayout::hit_map()`
+/// (quadraui#425) — pushed from the SAME objects/rects already painted, so
+/// this can never drift from what's on screen. Returns `ScreenZone::None`
+/// when the point isn't in an Editor/TabBar zone (including breadcrumb/
+/// divider pixels, which have no `FrameZone` equivalent — the caller falls
+/// back to `render_mod::screen_zone_hit_test` for those).
+fn frame_zone_to_screen_zone(
+    hit_map: &quadraui::FrameHitMap,
+    tab_bar_zones: &[(GroupId, quadraui::Rect)],
+    cached_layout: &render::ScreenLayout,
+    x: f64,
+    y: f64,
+) -> ScreenZone {
+    match hit_map.hit_test(x as f32, y as f32) {
+        quadraui::FrameZone::TabBar { idx } => {
+            if let Some((group_id, rect)) = tab_bar_zones.get(idx) {
+                return ScreenZone::TabBar {
+                    group_id: *group_id,
+                    local_x: x - rect.x as f64,
+                    bar_width: rect.width as f64,
+                };
+            }
+        }
+        quadraui::FrameZone::Editor { idx } => {
+            if let Some(rw) = cached_layout.windows.get(idx) {
+                let r = &rw.rect;
+                return ScreenZone::Window {
+                    window_id: rw.window_id,
+                    window_idx: idx,
+                    rel_x: x - r.x,
+                    rel_y: y - r.y,
+                };
+            }
+        }
+        _ => {}
+    }
+    ScreenZone::None
 }
 
 /// Build the Pango context the *click* backend uses to resolve editor
@@ -303,6 +358,7 @@ fn resolve_charcell_tab_click(
 /// This mirrors `pixel_to_click_target`'s zone resolution (read-only) so the
 /// caller can tell a tab-bar right-click apart from an editor right-click
 /// before deciding which `Msg` to dispatch.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_tab_right_click(
     engine: &Engine,
     x: f64,
@@ -311,19 +367,28 @@ pub(super) fn resolve_tab_right_click(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
+    frame_hit_map: Option<&quadraui::FrameHitMap>,
+    tab_bar_zones: &[(GroupId, quadraui::Rect)],
 ) -> Option<(GroupId, usize)> {
     use crate::core::engine::TabBarClickTarget as T;
 
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
-    let zone = render_mod::screen_zone_hit_test(
-        cached_layout,
-        x,
-        y,
-        tab_bar_height,
-        single_tab_hidden,
-        engine.active_group,
-    );
+    let zone = frame_hit_map
+        .and_then(|hit_map| {
+            let z = frame_zone_to_screen_zone(hit_map, tab_bar_zones, cached_layout, x, y);
+            (!matches!(z, ScreenZone::None)).then_some(z)
+        })
+        .unwrap_or_else(|| {
+            render_mod::screen_zone_hit_test(
+                cached_layout,
+                x,
+                y,
+                tab_bar_height,
+                single_tab_hidden,
+                engine.active_group,
+            )
+        });
     let ScreenZone::TabBar {
         group_id, local_x, ..
     } = zone
@@ -433,6 +498,8 @@ pub(super) fn handle_mouse_click(
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
+    frame_hit_map: Option<&quadraui::FrameHitMap>,
+    tab_bar_zones: &[(GroupId, quadraui::Rect)],
 ) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
@@ -448,6 +515,8 @@ pub(super) fn handle_mouse_click(
         split_btn_map,
         action_btn_map,
         status_segment_map,
+        frame_hit_map,
+        tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
     ) {
         ClickTarget::BufferPos(wid, line, col) => {
@@ -533,6 +602,8 @@ pub(super) fn handle_mouse_double_click(
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
+    frame_hit_map: Option<&quadraui::FrameHitMap>,
+    tab_bar_zones: &[(GroupId, quadraui::Rect)],
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -548,6 +619,8 @@ pub(super) fn handle_mouse_double_click(
         split_btn_map,
         action_btn_map,
         status_segment_map,
+        frame_hit_map,
+        tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
     ) {
         engine.mouse_double_click(wid, line, col);
@@ -577,6 +650,8 @@ pub(super) fn handle_mouse_drag(
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
+    frame_hit_map: Option<&quadraui::FrameHitMap>,
+    tab_bar_zones: &[(GroupId, quadraui::Rect)],
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -592,6 +667,8 @@ pub(super) fn handle_mouse_drag(
         split_btn_map,
         action_btn_map,
         status_segment_map,
+        frame_hit_map,
+        tab_bar_zones,
         false, // drag continuation: pure query, no focus/tab/gutter side effects
     ) {
         engine.mouse_drag(wid, line, col);
@@ -757,16 +834,14 @@ mod emoji_click_column_tests {
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_font_description(Some(&font_desc));
         let metrics = pango_ctx.metrics(Some(&font_desc), None);
-        let line_height =
-            (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
+        let line_height = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
         layout.set_text("0");
         let char_width = layout.pixel_size().0 as f64;
 
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen =
-            build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
         let rw = &screen.windows[0];
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
@@ -878,8 +953,7 @@ mod emoji_click_column_tests {
         probe.set_text("0");
         let paint_cw = probe.pixel_size().0 as f64;
         let metrics = pctx.metrics(Some(&paint_font), None);
-        let line_height =
-            (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
+        let line_height = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
 
         // ── The click context production actually builds, matched to the
         //    painted char width — NOT to any `settings.font_size`. ──
@@ -917,8 +991,7 @@ mod emoji_click_column_tests {
         let good_layout = pango::Layout::new(&click_ctx);
 
         // The pre-fix bug: font the resolver from `settings.font_size` (14).
-        let bad_surface =
-            ImageSurface::create(Format::ARgb32, 1, 1).expect("bad ImageSurface");
+        let bad_surface = ImageSurface::create(Format::ARgb32, 1, 1).expect("bad ImageSurface");
         let bad_cr = Context::new(&bad_surface).expect("bad Context");
         let bad_ctx = pangocairo::create_context(&bad_cr);
         bad_ctx.set_font_description(Some(&pango::FontDescription::from_string("Monospace 14")));
@@ -1060,6 +1133,9 @@ mod cross_split_drag_focus_tests {
             &split_btn_map,
             &action_btn_map,
             &status_segment_map,
+            None, // no cached FrameHitMap in this test — exercises the
+            // `screen_zone_hit_test` fallback path (#449)
+            &[],
             false, // mutate_focus: drag continuation
         );
         assert_eq!(
@@ -1105,6 +1181,8 @@ mod cross_split_drag_focus_tests {
             &split_btn_map,
             &action_btn_map,
             &status_segment_map,
+            None,
+            &[],
             true, // mutate_focus: genuine click
         );
         assert_eq!(
