@@ -55,12 +55,15 @@ pub(super) fn pixel_to_click_target(
     _action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
     // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
-    // painted this frame (#449), plus the parallel `(GroupId, rect)` table
-    // for resolving `FrameZone::TabBar { idx }`. `None` before the first
-    // paint. See `frame_zone_to_screen_zone` for how these replace
-    // `screen_zone_hit_test`'s manual Window/TabBar rect-walk.
+    // painted this frame (#449), plus a `FrameZone::TabBar { idx } -> (GroupId,
+    // rect)` table keyed by the tab bar's *global* surface index (editors are
+    // pushed into the same `ScreenLayout` before any tab bar, so a tab bar's
+    // `idx` is offset by however many editor surfaces preceded it — a plain
+    // 0-based `Vec` here would look up the wrong entry, or none at all).
+    // `None` before the first paint. See `frame_zone_to_screen_zone` for how
+    // these replace `screen_zone_hit_test`'s manual Window/TabBar rect-walk.
     frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &[(GroupId, quadraui::Rect)],
+    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     mutate_focus: bool,
 ) -> ClickTarget {
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
@@ -183,14 +186,17 @@ pub(super) fn pixel_to_click_target(
 /// back to `render_mod::screen_zone_hit_test` for those).
 fn frame_zone_to_screen_zone(
     hit_map: &quadraui::FrameHitMap,
-    tab_bar_zones: &[(GroupId, quadraui::Rect)],
+    // Keyed by `FrameZone::TabBar { idx }`'s global surface index, NOT a
+    // per-tab-bar position — see the doc comment on `pixel_to_click_target`'s
+    // `tab_bar_zones` parameter.
+    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     cached_layout: &render::ScreenLayout,
     x: f64,
     y: f64,
 ) -> ScreenZone {
     match hit_map.hit_test(x as f32, y as f32) {
         quadraui::FrameZone::TabBar { idx } => {
-            if let Some((group_id, rect)) = tab_bar_zones.get(idx) {
+            if let Some((group_id, rect)) = tab_bar_zones.get(&idx) {
                 return ScreenZone::TabBar {
                     group_id: *group_id,
                     local_x: x - rect.x as f64,
@@ -368,7 +374,7 @@ pub(super) fn resolve_tab_right_click(
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &[(GroupId, quadraui::Rect)],
+    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) -> Option<(GroupId, usize)> {
     use crate::core::engine::TabBarClickTarget as T;
 
@@ -499,7 +505,7 @@ pub(super) fn handle_mouse_click(
     action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &[(GroupId, quadraui::Rect)],
+    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) -> (Option<bool>, Option<EngineAction>) {
     match pixel_to_click_target(
         engine,
@@ -603,7 +609,7 @@ pub(super) fn handle_mouse_double_click(
     action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &[(GroupId, quadraui::Rect)],
+    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -651,7 +657,7 @@ pub(super) fn handle_mouse_drag(
     action_btn_map: &ActionBtnMap,
     status_segment_map: &StatusSegmentMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
-    tab_bar_zones: &[(GroupId, quadraui::Rect)],
+    tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
@@ -1135,7 +1141,7 @@ mod cross_split_drag_focus_tests {
             &status_segment_map,
             None, // no cached FrameHitMap in this test — exercises the
             // `screen_zone_hit_test` fallback path (#449)
-            &[],
+            &HashMap::new(),
             false, // mutate_focus: drag continuation
         );
         assert_eq!(
@@ -1182,7 +1188,7 @@ mod cross_split_drag_focus_tests {
             &action_btn_map,
             &status_segment_map,
             None,
-            &[],
+            &HashMap::new(),
             true, // mutate_focus: genuine click
         );
         assert_eq!(
@@ -1190,5 +1196,202 @@ mod cross_split_drag_focus_tests {
             "a genuine click must still focus the pane it lands in"
         );
         assert!(matches!(click_target, ClickTarget::BufferPos(wid, _, _) if wid == wid_b));
+    }
+}
+
+#[cfg(test)]
+mod frame_hit_map_tests {
+    //! #449 regression: `frame_zone_to_screen_zone` and the `frame_hit_map`
+    //! branch of `pixel_to_click_target` are the actual mechanism this issue
+    //! introduced — mapping `quadraui::FrameZone::TabBar { idx }` /
+    //! `FrameZone::Editor { idx }` back to `render::ScreenZone`. These tests
+    //! build a *real* `quadraui::FrameHitMap` via `ScreenLayout::hit_map()`
+    //! (quadraui#425, landed as `c316f15`) from the same `Surface::Editor` /
+    //! `Surface::TabBar` construction `App::render_content` uses
+    //! (`src/gtk/mod.rs` ~7712-7830), instead of exercising only the
+    //! pre-existing `screen_zone_hit_test` fallback (as the two tests in
+    //! `cross_split_drag_focus_tests` above do by passing `None, &[]`).
+    use super::*;
+    use quadraui::{ScreenLayout as QSL, Surface};
+
+    /// Lay out a single window / single (unsplit) tab bar and build the
+    /// `FrameHitMap` + `tab_bar_zones` table the way `render_content` does
+    /// (`src/gtk/mod.rs` ~7712-7839), so these tests exercise the production
+    /// construction, not a hand-rolled stand-in — crucially including the
+    /// same "editors pushed first, tab bars after" ordering, since
+    /// `FrameZone::TabBar { idx }` carries the *global* surface index across
+    /// that whole `ScreenLayout`, not a per-tab-bar position. `tab_bar_zones`
+    /// must therefore be keyed by that same global index, not `0..`.
+    fn build_hit_map(
+        engine: &Engine,
+        theme: &Theme,
+        line_height: f64,
+        char_width: f64,
+    ) -> (
+        render::ScreenLayout,
+        quadraui::FrameHitMap,
+        HashMap<usize, (GroupId, quadraui::Rect)>,
+    ) {
+        let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
+        let screen = build_screen_layout(engine, theme, &rects, line_height, char_width, false);
+
+        let window_editors: Vec<quadraui::Editor> =
+            screen.windows.iter().map(render_mod::to_q_editor).collect();
+        let mut hit_frame = QSL::new();
+        for editor in &window_editors {
+            hit_frame.push(Surface::Editor {
+                rect: editor.rect,
+                editor,
+            });
+        }
+
+        let tab_row_h = render_mod::tab_row_height_px(line_height);
+        let tab_bar_h = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
+        let mut tab_bar_zones: HashMap<usize, (GroupId, quadraui::Rect)> = HashMap::new();
+        for (next_surface_idx, target) in
+            (window_editors.len()..).zip(render_mod::tab_bar_draw_targets(
+                engine,
+                &screen,
+                tab_row_h,
+                tab_bar_h,
+                (0.0, 0.0),
+                (0.0, 0.0, 800.0),
+            ))
+        {
+            hit_frame.push(Surface::TabBar {
+                rect: target.rect,
+                bar: target.bar,
+                hovered_close: None,
+            });
+            tab_bar_zones.insert(next_surface_idx, (target.group_id, target.rect));
+        }
+
+        let hit_map = hit_frame.hit_map();
+        (screen, hit_map, tab_bar_zones)
+    }
+
+    #[test]
+    fn frame_zone_to_screen_zone_resolves_editor_point() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        let wid = engine.active_window_id();
+        let theme = Theme::onedark();
+        let line_height = 18.0;
+        let char_width = 9.0;
+
+        let (screen, hit_map, tab_bar_zones) =
+            build_hit_map(&engine, &theme, line_height, char_width);
+        let rw = screen
+            .windows
+            .first()
+            .expect("single window should be laid out");
+        let x = rw.rect.x + char_width * 2.0;
+        let y = rw.rect.y + line_height * 2.0;
+
+        let zone = frame_zone_to_screen_zone(&hit_map, &tab_bar_zones, &screen, x, y);
+        match zone {
+            ScreenZone::Window {
+                window_id,
+                window_idx,
+                ..
+            } => {
+                assert_eq!(window_id, wid);
+                assert_eq!(window_idx, 0);
+            }
+            other => panic!("expected ScreenZone::Window from the FrameHitMap path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn frame_zone_to_screen_zone_resolves_tab_bar_point() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        let group_id = engine.active_group;
+        let theme = Theme::onedark();
+        let line_height = 18.0;
+        let char_width = 9.0;
+
+        let (screen, hit_map, tab_bar_zones) =
+            build_hit_map(&engine, &theme, line_height, char_width);
+        assert!(
+            !tab_bar_zones.is_empty(),
+            "single-group mode should still push one tab bar surface"
+        );
+        let (zone_group, rect) = *tab_bar_zones
+            .values()
+            .next()
+            .expect("just asserted tab_bar_zones is non-empty");
+        assert_eq!(zone_group, group_id);
+        let x = rect.x as f64 + 2.0;
+        let y = rect.y as f64 + 2.0;
+
+        let zone = frame_zone_to_screen_zone(&hit_map, &tab_bar_zones, &screen, x, y);
+        match zone {
+            ScreenZone::TabBar {
+                group_id: resolved, ..
+            } => assert_eq!(resolved, group_id),
+            other => {
+                panic!("expected ScreenZone::TabBar from the FrameHitMap path, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_to_click_target_consults_the_cached_frame_hit_map_for_editor_clicks() {
+        // Proves `pixel_to_click_target` actually takes the `frame_hit_map`
+        // branch (not silently falling through to `screen_zone_hit_test`)
+        // when a real `Some(&FrameHitMap)` is supplied — the production
+        // `Some` path exercised by `render_content`'s cached hit map, as
+        // opposed to the `None` fallback path already covered by
+        // `cross_split_drag_focus_tests`.
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "hello world");
+        let wid = engine.active_window_id();
+        let theme = Theme::onedark();
+        let line_height = 18.0;
+        let char_width = 9.0;
+
+        let (screen, hit_map, tab_bar_zones) =
+            build_hit_map(&engine, &theme, line_height, char_width);
+        let rw = screen
+            .windows
+            .first()
+            .expect("single window should be laid out");
+        let x = rw.rect.x + char_width * 2.0;
+        let y = rw.rect.y + line_height * 2.0;
+
+        let backend = Rc::new(RefCell::new(super::super::backend::GtkBackend::new()));
+        let empty_pixel_hits: TabPixelHitMap = HashMap::new();
+        let empty_slots: TabSlotMap = HashMap::new();
+        let empty_diff: DiffBtnMap = HashMap::new();
+        let empty_split: SplitBtnMap = HashMap::new();
+        let empty_action: ActionBtnMap = HashMap::new();
+        let empty_status: StatusSegmentMap = HashMap::new();
+
+        let target = pixel_to_click_target(
+            &mut engine,
+            &backend,
+            x,
+            y,
+            line_height,
+            char_width,
+            &screen,
+            &empty_pixel_hits,
+            &empty_slots,
+            &empty_diff,
+            &empty_split,
+            &empty_action,
+            &empty_status,
+            Some(&hit_map),
+            &tab_bar_zones,
+            true,
+        );
+        match target {
+            ClickTarget::BufferPos(id, _, _) => assert_eq!(id, wid),
+            other => panic!(
+                "expected a BufferPos hit resolved via the cached FrameHitMap, got {other:?}"
+            ),
+        }
     }
 }
