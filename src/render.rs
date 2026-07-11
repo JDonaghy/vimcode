@@ -12898,11 +12898,30 @@ pub fn build_tab_drop_groups(
 /// Build [`DropGroupBounds`] from a `ScreenLayout`, applying an
 /// editor-area offset. Both TUI and GTK call this when the
 /// `ScreenLayout` is available (draw path, or TUI's cached layout).
+///
+/// `editor_origin` / `editor_size` describe the *whole* editor region as
+/// callers naturally have it on hand — top-left at the single global tab
+/// bar's row/pixel (see e.g. the TUI comment "tab bar at row 0 of
+/// editor_area, windows at row 1+"), full height including that bar.
+///
+/// [`DropGroupBounds`] (and `build_tab_drop_groups`, which reconstructs
+/// the tab-bar band by subtracting `tab_bar_height` back out) expects
+/// **content-area** bounds — i.e. already past the tab bar — matching
+/// what the multi-group branch below gets for free from each
+/// `GroupTabBar::bounds` (documented as "content area of this group;
+/// tab bar drawn at top edge"). The single-group branch has no such
+/// per-group content rect to draw from, so it must derive one by
+/// skipping `tab_bar_height` off the top of the whole-region origin/size
+/// itself (#477 fix iteration 1: omitting this produced a negative
+/// `bounds.y` that put the cursor's tab-bar row just *above* the
+/// computed tab-bar band, so drops always fell through to the
+/// Split(Top) branch instead of TabReorder).
 pub fn screen_to_drop_group_bounds(
     screen: &ScreenLayout,
     engine: &crate::core::engine::Engine,
     editor_origin: (f32, f32),
     editor_size: (f32, f32),
+    tab_bar_height: f32,
 ) -> Vec<DropGroupBounds> {
     if let Some(ref split) = screen.editor_group_split {
         split
@@ -12921,9 +12940,9 @@ pub fn screen_to_drop_group_bounds(
         vec![DropGroupBounds {
             group_id: engine.active_group,
             x: editor_origin.0,
-            y: editor_origin.1,
+            y: editor_origin.1 + tab_bar_height,
             width: editor_size.0,
-            content_height: editor_size.1,
+            content_height: (editor_size.1 - tab_bar_height).max(0.0),
             tab_scroll_offset: screen.tab_scroll_offset,
         }]
     }
