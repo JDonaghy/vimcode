@@ -3410,6 +3410,25 @@ impl App {
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
         self.reconcile_editor_hover_modal();
 
+        // ── Toast hit dispatch (#454) ─────────────────────────────────────
+        // Before any other handler so clicking × dismisses the toast
+        // instead of falling through to whatever sits underneath.
+        {
+            let toast_hit = self
+                .engine
+                .borrow()
+                .toast_layout
+                .borrow()
+                .as_ref()
+                .map(|l| l.hit_test(x as f32, y as f32));
+            if let Some(hit) = toast_hit {
+                if self.engine.borrow_mut().handle_toast_hit(hit) {
+                    self.draw_needed.set(true);
+                    return;
+                }
+            }
+        }
+
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
         {
             let surfaces = self.engine.borrow().scroll_surfaces.borrow().clone();
@@ -7343,10 +7362,8 @@ impl App {
                     if let Some(ref w) = self.window {
                         w.unmaximize();
                     }
-                } else {
-                    if let Some(ref w) = self.window {
-                        w.maximize();
-                    }
+                } else if let Some(ref w) = self.window {
+                    w.maximize();
                 }
             }
             Msg::WindowClose => {
@@ -8139,6 +8156,23 @@ impl quadraui::ShellApp for App {
                 interaction.pressed_id(),
             );
             interaction.set_layout(hits);
+        }
+
+        // ── Toast overlay (#454) — drawn LAST so it sits on top of ─────────────
+        // everything, including the window controls above. Anchored to the
+        // full window viewport (matches TUI's `frame.area()` in
+        // render_impl.rs), not just `main_content_bounds`, so it sits in the
+        // bottom-right corner of the whole app like the TUI/VSCode toasts.
+        // `Backend::draw_toast_stack` does its own pango measurement
+        // internally (unlike `dialog`/`context_menu` above, whose generic
+        // layout is computed vimcode-side), so its returned layout is the
+        // only source of truth — cache it for `handle_mouse_click_msg`'s
+        // hit-test → `handle_toast_hit` dispatch.
+        if let Some(stack) = render::build_toast_stack(&engine) {
+            let toast_layout = backend.draw_toast_stack(popup_viewport, &stack);
+            engine.toast_layout.replace(Some(toast_layout));
+        } else {
+            engine.toast_layout.replace(None);
         }
     }
 
