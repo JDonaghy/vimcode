@@ -251,6 +251,20 @@ pub(super) fn handle_mouse(
         }
     }
 
+    // Reconcile context menu with modal stack (#459).
+    // Push the menu's outer bounds whenever a context menu is open so
+    // panel intercepts in mod.rs can call modal_stack.hit_test() instead
+    // of the per-backend engine.context_menu.is_none() gate.
+    {
+        let ctx_menu_id = quadraui::WidgetId::new("context_menu");
+        match context_menu_layout {
+            Some(layout) => modal_stack.push(ctx_menu_id, layout.bounds),
+            None => {
+                modal_stack.pop(&ctx_menu_id);
+            }
+        }
+    }
+
     // Reconcile stale picker modal: if the picker closed (keyboard
     // Escape / confirm) without a backdrop-dismiss click, the "picker"
     // entry lingers on the stack and swallows all dispatch_scroll events.
