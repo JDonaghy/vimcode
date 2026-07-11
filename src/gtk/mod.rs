@@ -3958,7 +3958,7 @@ impl App {
                         .cloned();
                     if let Some((_, _, _, _, url)) = link_hit {
                         if url.starts_with("command:") {
-                            self.engine.borrow_mut().execute_command_uri(&url);
+                            self.engine.borrow_mut().execute_hover_goto(&url);
                         } else {
                             open_url(&url);
                         }
