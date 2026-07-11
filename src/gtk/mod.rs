@@ -8046,6 +8046,7 @@ impl quadraui::ShellApp for App {
                 &engine,
                 drop_origin,
                 (w as f32, editor_area_h as f32),
+                tab_bar_h as f32,
             );
             // Per-tab slot x-positions (absolute) were captured while drawing the
             // tab bars above. Feeding them here makes a drag inside a group's own

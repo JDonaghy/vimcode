@@ -1243,6 +1243,7 @@ pub(super) fn render_tab_drag_overlay(
         engine,
         (editor_area.x as f32, editor_area.y as f32),
         (editor_area.width as f32, editor_area.height as f32),
+        tbh_f,
     );
     let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
     let cursor = tab_drag_cursor
@@ -1355,6 +1356,7 @@ pub(super) fn compute_tui_tab_drop_zone(
         engine,
         (editor_left as f32, menu_rows as f32),
         (editor_w as f32, editor_h as f32),
+        tbh_f,
     );
     let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
     render::compute_tab_drop_zone(col as f32, row as f32, &groups, tbh)
@@ -1798,6 +1800,79 @@ mod tests {
 
         let has_second = lines.iter().any(|l| l.contains("Second line"));
         assert!(has_second, "rendered output should contain second line");
+    }
+
+    /// #477 fix iteration 1 regression test: dragging a tab within a single
+    /// (unsplit) tab group and dropping it over the tab bar must resolve to
+    /// a same-group `TabReorder`, never a `Split`.
+    ///
+    /// Root cause was in `render::screen_to_drop_group_bounds`'s no-split
+    /// branch: it passed the whole-editor origin/size (top-left at the
+    /// global tab bar's row, per the "tab bar at row 0 of editor_area"
+    /// convention) straight through as `DropGroupBounds` content bounds,
+    /// which `build_tab_drop_groups` then shifted *up* by `tab_bar_height`
+    /// again to reconstruct the full rect. That double-shift made the
+    /// computed tab-bar band sit one row above the screen (`bounds.y`
+    /// negative), so a cursor sitting on the real tab-bar row (row 0)
+    /// tested as being *above* the bar — landing in the `Split(Top)`
+    /// branch of `quadraui::compute_drop_zone` instead of `TabReorder`.
+    #[test]
+    fn test_tui_single_group_tab_drag_reorder_not_split_477() {
+        let mut e = test_engine("content\n");
+        e.new_tab(None);
+        e.new_tab(None);
+        e.new_tab(None);
+        assert_eq!(e.active_group().tabs.len(), 4);
+        assert_eq!(
+            e.editor_groups.len(),
+            1,
+            "test setup must stay a single tab group"
+        );
+
+        let theme = crate::render::Theme::onedark();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let screen = build_screen_for_tui(&e, &theme, area, &sidebar, 0);
+        assert!(
+            screen.editor_group_split.is_none(),
+            "test setup must stay a single tab group"
+        );
+
+        let slots = build_tui_tab_slots(&screen, &e, 0.0);
+        let group_slots = slots
+            .get(&e.active_group.0)
+            .expect("single-group tab slots must be keyed by the active group id");
+        assert_eq!(group_slots.len(), 4, "expected 4 visible tab slots");
+
+        // Cursor over the middle of tab index 2 (3rd tab), row 0 — the tab
+        // bar's own row. A drop here reorders within the group; it must
+        // never be resolved as a split.
+        let (s2, e2) = group_slots[2];
+        let cursor_col = ((s2 + e2) / 2.0).round() as u16;
+        let zone = compute_tui_tab_drop_zone(
+            &e,
+            cursor_col,
+            0,
+            0,
+            Some(&screen),
+            Some(Size {
+                width: 80,
+                height: 24,
+            }),
+        );
+        match zone {
+            crate::core::window::DropZone::TabReorder(gid, _) => {
+                assert_eq!(gid, e.active_group, "reorder must target the source group");
+            }
+            other => {
+                panic!("expected DropZone::TabReorder for a drop on the tab bar, got {other:?}")
+            }
+        }
     }
 
     #[test]
