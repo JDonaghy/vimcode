@@ -1365,12 +1365,33 @@ fn event_loop(
             }
         }
 
+        // #459: Hit-test the modal stack to check whether this event lands
+        // inside a floating modal (e.g. a context menu). The reconcile
+        // happens in mouse.rs at the top of handle_mouse; by the time a
+        // quadraui::UiEvent reaches here the stack reflects the state from
+        // the most recent crossterm mouse event. When the event position
+        // falls inside a modal the panel intercepts below must yield —
+        // the same priority rule that native z-ordering gives GTK for free.
+        let ctx_blocks_event = {
+            let event_pos: Option<quadraui::Point> = match &ui_event {
+                quadraui::UiEvent::Scroll { position, .. }
+                | quadraui::UiEvent::MouseDown { position, .. }
+                | quadraui::UiEvent::MouseUp { position, .. }
+                | quadraui::UiEvent::MouseMoved { position, .. }
+                | quadraui::UiEvent::DoubleClick { position, .. } => Some(*position),
+                _ => None,
+            };
+            let (_, modal_stack) = backend.drag_and_modal_mut();
+            event_pos.is_some_and(|p| modal_stack.hit_test(p).is_some())
+        };
+
         // ── SidebarSystem intercept for mouse/scroll in debug sidebar ──
-        // #456: skip when a context menu is open — the menu floats above
+        // #459: skip when the modal stack reports this event lands inside a
+        // floating modal (e.g. an open context menu) — the modal floats above
         // any panel and must intercept clicks before the panel below sees
         // them. The legacy mouse handler in `mouse.rs` has the matching
         // ctx-menu intercept at line ~1542.
-        if engine.context_menu.is_none()
+        if !ctx_blocks_event
             && engine.app_shell.sidebar_visible()
             && engine.active_panel_is(PANEL_DEBUG)
         {
@@ -1402,8 +1423,8 @@ fn event_loop(
         }
 
         // ── SidebarSystem intercept for mouse/scroll in extensions sidebar ──
-        // #456: same priority rule as the debug sidebar above.
-        if engine.context_menu.is_none()
+        // #459: same priority rule as the debug sidebar above.
+        if !ctx_blocks_event
             && engine.app_shell.sidebar_visible()
             && engine.active_panel_is(PANEL_EXTENSIONS)
         {
@@ -1429,11 +1450,9 @@ fn event_loop(
         }
 
         // ── Debug toolbar hover/press via ToolbarLayout hit-test (#510) ──
-        // Skip when a context menu is open.
-        if engine.context_menu.is_none()
-            && engine.debug_toolbar_visible
-            && debug_toolbar_rect.width > 0.0
-        {
+        // #459: skip when the modal stack reports this event lands inside a
+        // floating modal (e.g. an open context menu).
+        if !ctx_blocks_event && engine.debug_toolbar_visible && debug_toolbar_rect.width > 0.0 {
             match &ui_event {
                 quadraui::UiEvent::MouseDown { position, .. } => {
                     let p = *position;
@@ -1481,16 +1500,17 @@ fn event_loop(
         // MouseDown/DoubleClick for row selection; MouseMoved (left held)
         // and MouseUp for scrollbar drag lifecycle.
         //
-        // #456: skip the tree intercept entirely when an explorer context
-        // menu is open. The menu floats above the tree; clicks on a menu
-        // item must reach the legacy ctx-menu intercept in `mouse.rs`,
-        // not get consumed as a tree row activation underneath.
+        // #459: skip the tree intercept entirely when the modal stack
+        // reports this event lands inside a floating modal (e.g. an open
+        // explorer context menu). The menu floats above the tree; clicks on
+        // a menu item must reach the legacy ctx-menu intercept in
+        // `mouse.rs`, not get consumed as a tree row activation underneath.
         {
             let is_explorer_event = match &ui_event {
                 quadraui::UiEvent::MouseDown { position, .. }
                 | quadraui::UiEvent::DoubleClick { position, .. } => {
                     let rect = engine.explorer_tree_rect.get();
-                    engine.context_menu.is_none()
+                    !ctx_blocks_event
                         && engine.app_shell.sidebar_visible()
                         && engine.active_panel_is(PANEL_EXPLORER)
                         && rect.width > 0.0
