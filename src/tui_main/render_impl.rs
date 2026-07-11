@@ -1115,7 +1115,10 @@ fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> q
 /// Terminal columns used by each tab's close button (the × itself + trailing space).
 /// The glyph itself lives in `quadraui::tui::TAB_CLOSE_CHAR` since the public
 /// rasteriser owns the painting.
-pub(super) const TAB_CLOSE_COLS: u16 = 2;
+///
+/// #477: re-export of `render::TAB_CLOSE_COLS` — was a duplicate literal
+/// here, now the shared constant is the single source of truth.
+pub(super) use render::TAB_CLOSE_COLS;
 
 /// Given a column within a group's tab bar, return the shortened file path of
 /// the tab at that column, or `None` if the column doesn't hit a tab with a file.
@@ -1150,7 +1153,46 @@ pub(super) fn tab_tooltip_at_col(
     None
 }
 
-/// Draw the tab drag-and-drop overlay (highlight drop zone + ghost label).
+/// Extract per-tab drag-and-drop slot bounds — `(x_start, x_end)` pairs in
+/// absolute screen-column units, ordered by tab index — from a tab bar's
+/// hit regions. `base_x` is the absolute left edge the region columns are
+/// relative to (bar left edge = column 0).
+///
+/// #477: hit regions are the single source of truth already used for mouse
+/// click routing (`render::resolve_tab_bar_click`); this just re-slices
+/// them into the `(f32, f32)` shape the drag overlay / drop-zone geometry
+/// expects, instead of hand-rolling `name.chars().count() + TAB_CLOSE_COLS`
+/// per tab (which had drifted from the real per-tab close-button width and
+/// from an obsolete "+2 for the scroll indicator" adjustment that the
+/// quadraui TUI tab bar rasteriser doesn't actually reserve space for).
+fn tab_drag_slots_from_hit_regions(
+    hit_regions: &[(
+        crate::core::engine::TabBarHitRegion,
+        crate::core::engine::TabBarClickTarget,
+    )],
+    base_x: f32,
+) -> Vec<(f32, f32)> {
+    use crate::core::engine::TabBarClickTarget;
+    let mut tabs: Vec<(usize, f32, f32)> = hit_regions
+        .iter()
+        .filter_map(|(region, target)| match target {
+            TabBarClickTarget::Tab(idx) => {
+                let start = base_x + region.col as f32;
+                Some((*idx, start, start + region.width as f32))
+            }
+            _ => None,
+        })
+        .collect();
+    tabs.sort_unstable_by_key(|(idx, ..)| *idx);
+    tabs.into_iter().map(|(_, s, e)| (s, e)).collect()
+}
+
+/// Build the per-group tab-drag slot map consumed by the drag overlay and
+/// drop-zone hit testing. Both branches reuse hit regions already cached on
+/// `ScreenLayout` by `render::build_screen_layout()` (from
+/// `compute_tab_bar_hit_regions()`) instead of recomputing tab positions:
+/// multi-group splits use each group's `GroupTabBar::hit_regions`, and the
+/// single-group bar uses `ScreenLayout::tab_bar_hit_regions` (#515).
 fn build_tui_tab_slots(
     screen: &render::ScreenLayout,
     engine: &Engine,
@@ -1160,34 +1202,16 @@ fn build_tui_tab_slots(
     if let Some(ref split) = screen.editor_group_split {
         for gtb in &split.group_tab_bars {
             let abs_x = editor_x + gtb.bounds.x as f32;
-            let ov = if gtb.tab_scroll_offset > 0 {
-                2.0f32
-            } else {
-                0.0
-            };
-            let mut x = abs_x + ov;
-            let mut slots = Vec::new();
-            for tab in gtb.tabs.iter().skip(gtb.tab_scroll_offset) {
-                let tw = tab.name.chars().count() as f32 + TAB_CLOSE_COLS as f32;
-                slots.push((x, x + tw));
-                x += tw;
-            }
-            map.insert(gtb.group_id.0, slots);
+            map.insert(
+                gtb.group_id.0,
+                tab_drag_slots_from_hit_regions(&gtb.hit_regions, abs_x),
+            );
         }
     } else {
-        let ov = if screen.tab_scroll_offset > 0 {
-            2.0f32
-        } else {
-            0.0
-        };
-        let mut x = editor_x + ov;
-        let mut slots = Vec::new();
-        for tab in screen.tab_bar.iter().skip(screen.tab_scroll_offset) {
-            let tw = tab.name.chars().count() as f32 + TAB_CLOSE_COLS as f32;
-            slots.push((x, x + tw));
-            x += tw;
-        }
-        map.insert(engine.active_group.0, slots);
+        map.insert(
+            engine.active_group.0,
+            tab_drag_slots_from_hit_regions(&screen.tab_bar_hit_regions, editor_x),
+        );
     }
     map
 }
