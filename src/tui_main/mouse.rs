@@ -3335,4 +3335,86 @@ mod tests {
             "right-click in the Explorer panel must still open its context menu"
         );
     }
+
+    // ── #575 Bug 2: File-menu dropdown dismiss on outside click ────────────
+
+    /// Regression test for quadraui#429: an outside `MouseUp(Left)` must
+    /// close an open dropdown even when `MouseDown(Left)` was never
+    /// delivered — the Alacritty+tmux / some gnome-terminal quirk that
+    /// drops `Down(Left)` and only delivers `Up(Left)` for a click (same
+    /// class of terminal quirk as the documented `Down(Right)` drop this
+    /// file's #451 comments cover). Before quadraui#429, `MenuSystem::handle`
+    /// had no `MouseUp` arm at all, so the dropdown never dismissed on those
+    /// terminals.
+    ///
+    /// Exercises the exact wiring vimcode's TUI event loop uses (mod.rs's
+    /// "MenuSystem intercept" block, ~line 1293-1300): `render::build_menu_defs`
+    /// feeds a real `quadraui::MenuSystem`, driven through a real `TuiBackend`.
+    #[test]
+    fn file_menu_dropdown_closes_on_outside_mouse_up() {
+        use quadraui::Backend as _;
+
+        let menus = crate::render::build_menu_defs(false);
+        let mut menu_system = quadraui::MenuSystem::new(menus);
+        let mut backend = super::backend::TuiBackend::default();
+        let bar_rect = quadraui::Rect::new(0.0, 0.0, 120.0, 1.0);
+
+        // Open the first bar menu ("File") via MouseDown, as the normal
+        // click-to-open path would.
+        let bar = menu_system.menu_bar();
+        let bar_layout = backend.menu_bar_layout(bar_rect, &bar);
+        let file_item = bar_layout
+            .visible_items
+            .first()
+            .expect("menu bar must have at least one item");
+        let open_x = file_item.bounds.x + 1.0;
+
+        let open_event = quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(open_x, 0.0),
+            modifiers: quadraui::Modifiers::default(),
+        };
+        let opened = menu_system.handle(&open_event, &mut backend, bar_rect);
+        assert_eq!(opened, quadraui::MenuEvent::StateChanged);
+        assert!(
+            menu_system.is_open(),
+            "File menu must be open after MouseDown"
+        );
+
+        // Simulate a terminal that drops MouseDown(Left) and only delivers
+        // MouseUp(Left), landing well outside the bar and the open dropdown.
+        let outside_event = quadraui::UiEvent::MouseUp {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(100.0, 30.0),
+        };
+        let closed = menu_system.handle(&outside_event, &mut backend, bar_rect);
+        assert_eq!(closed, quadraui::MenuEvent::StateChanged);
+        assert!(
+            !menu_system.is_open(),
+            "outside MouseUp must close the open File menu dropdown"
+        );
+    }
+
+    /// Sanity counterpart: an outside `MouseUp(Left)` with no menu open must
+    /// be a no-op — it must not spuriously report `StateChanged` on every
+    /// idle click.
+    #[test]
+    fn outside_mouse_up_with_no_menu_open_is_ignored() {
+        let menus = crate::render::build_menu_defs(false);
+        let mut menu_system = quadraui::MenuSystem::new(menus);
+        let mut backend = super::backend::TuiBackend::default();
+        let bar_rect = quadraui::Rect::new(0.0, 0.0, 120.0, 1.0);
+
+        assert!(!menu_system.is_open());
+
+        let outside_event = quadraui::UiEvent::MouseUp {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(100.0, 30.0),
+        };
+        let result = menu_system.handle(&outside_event, &mut backend, bar_rect);
+        assert_eq!(result, quadraui::MenuEvent::Ignored);
+    }
 }
