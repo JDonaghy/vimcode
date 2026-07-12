@@ -1436,15 +1436,23 @@ pub(super) fn handle_mouse(
         let menu_rows = if engine.menu_bar_visible { 1_u16 } else { 0 };
 
         // Right-click on explorer sidebar → open explorer context menu.
-        // #451: relaxed the panel gate. The original `active_panel_is(PANEL_EXPLORER)`
-        // check meant clicks in the sidebar area silently did nothing whenever
-        // the active panel wasn't the explorer. Now: if the explorer is showing
-        // (rows present) we hit-test against its rows; otherwise no-op. Either
-        // way clicks in sidebar always consume here.
+        // #575: strictly gate on the Explorer actually being the active
+        // panel. #451 relaxed this to `active_panel_is(PANEL_EXPLORER) ||
+        // has_rows` on the theory that `explorer_rows` being non-empty meant
+        // "the explorer is showing" — but `explorer_rows` is populated by
+        // `explorer_rebuild_rows()` on workspace-open and a 2s auto-refresh
+        // timer, and is never cleared on panel switch. So once a folder is
+        // open, `has_rows` stays true forever, and this hijacked every
+        // right-click in the sidebar column range for Debug/Search/Git —
+        // wrong menu opened instead of no menu / a panel-appropriate one.
+        // #451's actual root cause (confirmed via its issue history) was the
+        // separate Up(Right)-only terminal quirk handled above, not this
+        // gate — reverting the relaxation is safe. Clicks in the sidebar
+        // still consume here (no-op) for non-Explorer panels, matching the
+        // pre-#451 behavior and issue #575's "or no menu, if one isn't
+        // implemented yet for that panel" expectation.
         if sb_visible && col >= ab_width && col < ab_width + sidebar_width {
-            let explorer_active = engine.active_panel_is(PANEL_EXPLORER);
-            let has_rows = !engine.explorer_rows.is_empty();
-            if explorer_active || has_rows {
+            if engine.active_panel_is(PANEL_EXPLORER) {
                 let sidebar_row = row.saturating_sub(menu_rows);
                 let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
                 if tree_row < engine.explorer_rows.len() {
@@ -3210,5 +3218,121 @@ mod tests {
 
         let garbage = quadraui::WidgetId::new("tui:editor::text");
         assert_eq!(text_drag_origin_window(&garbage), None);
+    }
+
+    // ── #575: right-click sidebar panel routing ────────────────────────────
+
+    /// Dispatch a single right-click `MouseEvent` at `(col, row)` through
+    /// `handle_mouse` with every non-relevant parameter at its idle default.
+    /// Mirrors the call site in `event_loop` (mod.rs) but with no drag/hover/
+    /// popup state in flight, since these tests only exercise the right-click
+    /// sidebar-panel gate.
+    fn dispatch_right_click(engine: &mut Engine, col: u16, row: u16) {
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut last_click_time = Instant::now();
+        let mut last_click_pos: (u16, u16) = (0, 0);
+        let mut should_quit = false;
+
+        handle_mouse(
+            ev,
+            &mut sidebar,
+            engine,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut None,
+            &mut drag_state,
+            &mut modal_stack,
+            None,
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut crate::core::window::DropZone::None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// #575 Bug 1: right-clicking in the Debug sidebar must not open the
+    /// Explorer's file context menu. `explorer_rows` is never cleared when
+    /// the active panel switches away from Explorer (it's only refreshed on
+    /// workspace-open and a periodic timer), so a right-click gate that
+    /// falls back to "rows present" instead of strictly checking the active
+    /// panel hijacks every sidebar right-click for whichever panel is
+    /// showing. Regression test for the `explorer_active || has_rows` gate
+    /// reverted in this fix.
+    #[test]
+    fn right_click_in_debug_panel_does_not_open_explorer_context_menu() {
+        let mut engine = Engine::new();
+        engine.focus_sidebar_panel(PANEL_DEBUG);
+        engine.explorer_rows.push(crate::core::engine::ExplorerRow {
+            depth: 0,
+            name: "foo.txt".into(),
+            path: std::path::PathBuf::from("/tmp/foo.txt"),
+            is_dir: false,
+            is_expanded: false,
+        });
+        assert!(engine.active_panel_is(PANEL_DEBUG));
+
+        dispatch_right_click(&mut engine, ACTIVITY_BAR_WIDTH + 1, 0);
+
+        assert!(
+            engine.context_menu.is_none(),
+            "right-click in the Debug panel must not open the Explorer context menu"
+        );
+    }
+
+    /// Sanity counterpart: right-clicking a populated Explorer sidebar still
+    /// opens the Explorer context menu (the gate must not become a no-op
+    /// entirely — only non-Explorer panels should be excluded).
+    #[test]
+    fn right_click_in_explorer_panel_opens_explorer_context_menu() {
+        let mut engine = Engine::new();
+        engine.focus_sidebar_panel(PANEL_EXPLORER);
+        engine.explorer_rows.push(crate::core::engine::ExplorerRow {
+            depth: 0,
+            name: "foo.txt".into(),
+            path: std::path::PathBuf::from("/tmp/foo.txt"),
+            is_dir: false,
+            is_expanded: false,
+        });
+        assert!(engine.active_panel_is(PANEL_EXPLORER));
+
+        dispatch_right_click(&mut engine, ACTIVITY_BAR_WIDTH + 1, 0);
+
+        assert!(
+            engine.context_menu.is_some(),
+            "right-click in the Explorer panel must still open its context menu"
+        );
     }
 }
