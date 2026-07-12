@@ -383,16 +383,20 @@ pub(super) fn draw_frame(
                 for y in y_start..y_end {
                     if div_x < editor_area.x + editor_area.width {
                         // #481: the window immediately to the left already
-                        // renders its own vertical scrollbar (via
-                        // `quadraui::tui::draw_editor`) in the column right
-                        // before the divider. That scrollbar column doubles
-                        // as the group separator, so painting a divider glyph
-                        // beside it produces a phantom "duplicate scrollbar"
-                        // bar in multi-tab-group layouts. Skip the divider on
-                        // rows where a scrollbar already occupies `div_x - 1`.
+                        // renders its own separator in the column right before
+                        // the divider (`div_x - 1`) — either its vertical
+                        // scrollbar (via `quadraui::tui::draw_editor`, glyphs
+                        // `█`/`░`) when it overflows, or a plain divider line
+                        // (`│`, painted by `render_separators`) when it does
+                        // not. Either way that column already visually
+                        // separates the two groups, so painting a second
+                        // divider glyph beside it produces a phantom
+                        // "duplicate scrollbar"/double-line bar in multi-tab-
+                        // group layouts. Skip the divider on rows where such a
+                        // separator already occupies `div_x - 1`.
                         if div_x > editor_area.x {
                             let left = frame.buffer_mut()[(div_x - 1, y)].symbol();
-                            if left == "█" || left == "░" {
+                            if left == "█" || left == "░" || left == "│" {
                                 continue;
                             }
                         }
@@ -1582,8 +1586,7 @@ pub(super) fn render_separators(
             let b = &windows[j];
 
             // Vertical separator: window a is the left pane, b is the right pane.
-            // The separator is drawn in the last column of a. We draw scrollbar
-            // chars there so the user can see and interact with a's scroll position.
+            // The boundary sits in the last column of a (`sep_x - 1`).
             // Also require vertical overlap — windows from different groups may
             // share an x edge but not overlap in y (e.g. 2×2 grid).
             let v_overlap =
@@ -1593,27 +1596,35 @@ pub(super) fn render_separators(
                 let y_start = editor_area.y + a.rect.y.max(b.rect.y) as u16;
                 let y_end =
                     editor_area.y + (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
-                let track_h = y_end.saturating_sub(y_start) as usize;
-                let viewport_lines = a.rect.height as usize;
-                let has_scroll = a.total_lines > viewport_lines && track_h > 0;
 
-                if has_scroll {
-                    let q_theme = super::quadraui_tui::q_theme(theme);
-                    let sb = quadraui::Scrollbar::vertical(
-                        "sep_sb",
-                        quadraui::Rect::new(
-                            sep_x.saturating_sub(1) as f32,
-                            y_start as f32,
-                            1.0,
-                            track_h as f32,
-                        ),
-                        a.scroll_top as f32,
-                        a.total_lines as f32,
-                        viewport_lines as f32,
-                        1.0,
-                    );
-                    quadraui::tui::draw_scrollbar(buf, &sb, &q_theme, q_theme.background);
-                } else {
+                // #481 (iter4): `quadraui::tui::draw_editor` already paints
+                // window `a`'s own vertical scrollbar in this exact column
+                // (its last column) whenever it overflows — see
+                // `render_window` → `draw_editor`, which runs for every window
+                // *before* this pass. Re-drawing a second scrollbar here was
+                // pure redundancy AND buggy: this pass computed the track from
+                // `a.rect.height` (which includes the per-window status-line
+                // row) whereas `draw_editor` reserves that row, so the repaint
+                // came out one row taller and bled a stray track glyph onto the
+                // status bar — reading as a slightly-longer "duplicate"
+                // scrollbar jammed against the real one at tab-group
+                // boundaries. Let `draw_editor`'s scrollbar own the column; it
+                // doubles as the visual separator. Only when the left window
+                // has NO scrollbar do we draw a plain divider line.
+                //
+                // Match `draw_editor`'s overflow test exactly (it reserves the
+                // status-line row from the viewport) so we draw the '│' in
+                // precisely the cases where it drew no scrollbar.
+                let text_rows = (a.rect.height as usize).saturating_sub(
+                    if a.status_line.is_some() && a.rect.height > 1.0 {
+                        1
+                    } else {
+                        0
+                    },
+                );
+                let has_scroll = a.total_lines > text_rows && y_end > y_start;
+
+                if !has_scroll {
                     for dy in 0..y_end.saturating_sub(y_start) {
                         let y = y_start + dy;
                         set_cell(buf, sep_x.saturating_sub(1), y, '│', sep_fg, sep_bg);
@@ -1894,6 +1905,149 @@ mod tests {
             .iter()
             .any(|l| l.contains("NORMAL") || l.contains("NOR"));
         assert!(has_normal, "status bar should show normal mode");
+    }
+
+    /// Render a full frame and return the raw `Buffer` so tests can inspect
+    /// individual cells (symbol / column) at the tab-group boundary.
+    fn render_tui_buffer(engine: &Engine, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = crate::render::Theme::onedark();
+        let mut sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let screen = build_screen_for_tui(engine, &theme, area, &sidebar, 0);
+        let mut hlr = Vec::new();
+        let mut hpr = None;
+        let mut ehpr = None;
+        let mut ehlr = Vec::new();
+        let mut ehs = None;
+        let mut tvc: Vec<(GroupId, usize)> = Vec::new();
+        let mut dtr = quadraui::Rect::default();
+        let mut cl = None;
+        let mut cml = None;
+        let mut dl = None;
+        let mut backend2 = super::backend::TuiBackend::new();
+        terminal
+            .draw(|frame| {
+                draw_frame(
+                    frame,
+                    &screen,
+                    &theme,
+                    &mut sidebar,
+                    engine,
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    &mut hlr,
+                    &mut hpr,
+                    &mut ehpr,
+                    &mut ehlr,
+                    &mut ehs,
+                    &mut tvc,
+                    &mut dtr,
+                    &mut cl,
+                    &mut cml,
+                    &mut dl,
+                    &mut backend2,
+                    None,
+                    None,
+                    &crate::core::window::DropZone::None,
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// #481 iteration 4 regression: two vertically-split tab groups whose
+    /// windows both overflow (so each shows a scrollbar) must render exactly
+    /// ONE vertical bar at the group boundary — the left window's own
+    /// `draw_editor` scrollbar. The pre-fix `render_separators` redundantly
+    /// repainted a second scrollbar in the same column using `a.rect.height`
+    /// (which includes the per-window status-line row) as the track height,
+    /// so the repaint ran one row taller and bled a stray track glyph onto
+    /// the status bar — the operator saw this as a slightly-longer "duplicate"
+    /// scrollbar jammed against the real one.
+    #[test]
+    fn test_tui_two_groups_single_boundary_scrollbar_481() {
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        let mut e = test_engine(&text);
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        // Operator flow: scroll the LEFT group down, the RIGHT group to a
+        // different position, so both windows overflow and show scrollbars.
+        e.focus_window_direction(crate::core::window::SplitDirection::Vertical, false);
+        e.handle_key("G", Some('G'), false);
+        e.focus_window_direction(crate::core::window::SplitDirection::Vertical, true);
+        e.handle_key("g", Some('g'), false);
+        e.handle_key("g", Some('g'), false);
+
+        let width = 80u16;
+        let height = 24u16;
+        let buf = render_tui_buffer(&e, width, height);
+
+        // Recover the boundary column: the left window's last column, where
+        // `draw_editor` paints its scrollbar. Locate the single boundary by
+        // scanning for a column that is entirely scrollbar glyphs across the
+        // editor body (rows 2..21 in this fixture) and is NOT the far-right
+        // scrollbar of the right pane.
+        let scroll_glyph = |s: &str| s == "█" || s == "░";
+        let mut boundary_cols: Vec<u16> = Vec::new();
+        for x in 0..width {
+            let mut scroll_rows = 0;
+            for y in 2..22u16 {
+                if scroll_glyph(buf[(x, y)].symbol()) {
+                    scroll_rows += 1;
+                }
+            }
+            // A scrollbar column is (nearly) all scroll glyphs down the body.
+            if scroll_rows >= 18 {
+                boundary_cols.push(x);
+            }
+        }
+        // Exactly two scrollbar columns overall: the left pane's (at the group
+        // boundary) and the right pane's (far right edge). Crucially they must
+        // not be adjacent — no "two jammed together" at the boundary.
+        assert_eq!(
+            boundary_cols.len(),
+            2,
+            "expected exactly 2 scrollbar columns (one per pane), got {boundary_cols:?}"
+        );
+        assert!(
+            boundary_cols[1] - boundary_cols[0] > 2,
+            "the two panes' scrollbars must be far apart, not jammed together: {boundary_cols:?}"
+        );
+
+        // The group-boundary scrollbar column must not have an adjacent
+        // second vertical bar (scrollbar glyph or '│') immediately to its
+        // right — that was the duplicate the operator reported.
+        let sep_col = boundary_cols[0];
+        for y in 2..22u16 {
+            let right = buf[(sep_col + 1, y)].symbol();
+            assert!(
+                !(scroll_glyph(right) || right == "│"),
+                "row {y}: found a duplicate separator glyph {right:?} at col {} right beside the boundary scrollbar",
+                sep_col + 1
+            );
+        }
+
+        // The boundary scrollbar must NOT bleed onto the per-window status
+        // row (row 22): `draw_editor` reserves that row, and the old
+        // `render_separators` repaint (one row too tall) painted a stray
+        // track glyph there.
+        let status_row = 22u16;
+        assert!(
+            !scroll_glyph(buf[(sep_col, status_row)].symbol()),
+            "boundary scrollbar bled a glyph onto the status row at ({sep_col}, {status_row})"
+        );
     }
 
     #[test]
