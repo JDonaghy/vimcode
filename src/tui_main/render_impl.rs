@@ -382,6 +382,20 @@ pub(super) fn draw_frame(
                 let y_end = y_start + div.cross_size as u16;
                 for y in y_start..y_end {
                     if div_x < editor_area.x + editor_area.width {
+                        // #481: the window immediately to the left already
+                        // renders its own vertical scrollbar (via
+                        // `quadraui::tui::draw_editor`) in the column right
+                        // before the divider. That scrollbar column doubles
+                        // as the group separator, so painting a divider glyph
+                        // beside it produces a phantom "duplicate scrollbar"
+                        // bar in multi-tab-group layouts. Skip the divider on
+                        // rows where a scrollbar already occupies `div_x - 1`.
+                        if div_x > editor_area.x {
+                            let left = frame.buffer_mut()[(div_x - 1, y)].symbol();
+                            if left == "█" || left == "░" {
+                                continue;
+                            }
+                        }
                         set_cell(frame.buffer_mut(), div_x, y, '│', sep_fg, sep_bg);
                     }
                 }
@@ -1965,6 +1979,59 @@ mod tests {
         // Should NOT show "line 50" (too far down)
         let has_line50 = lines.iter().any(|l| l.contains("line 50"));
         assert!(!has_line50, "should not show line 50 in 15-row viewport");
+    }
+
+    /// #481 regression: in multi-tab-group vertical layouts, a group whose
+    /// left window overflows renders that window's scrollbar in the column
+    /// immediately before the group divider. The divider glyph must NOT be
+    /// painted next to that scrollbar — doing so produced a phantom
+    /// "duplicate scrollbar" bar. The scrollbar column doubles as the group
+    /// separator, so no `│` may sit immediately to the right of a scrollbar
+    /// glyph anywhere in the grid.
+    #[test]
+    fn test_tui_no_phantom_divider_beside_scrollbar_481() {
+        let content: String = (1..=200).map(|i| format!("line {i}\n")).collect();
+        let mut e = test_engine(&content);
+        // Two tab groups side by side; scroll the right one so it overflows.
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        e.active_window_mut().view.scroll_top = 40;
+        e.active_window_mut().view.cursor.line = 45;
+        // A third group, scrolled to yet another position.
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        e.active_window_mut().view.scroll_top = 80;
+        e.active_window_mut().view.cursor.line = 85;
+
+        let lines = render_tui(&e, 80, 24);
+        for (y, l) in lines.iter().enumerate() {
+            let chars: Vec<char> = l.chars().collect();
+            for x in 1..chars.len() {
+                let left = chars[x - 1];
+                let cur = chars[x];
+                if (left == '█' || left == '░') && cur == '│' {
+                    panic!(
+                        "phantom divider '│' at row {y}, col {x} sits immediately \
+                         right of scrollbar glyph '{left}' — duplicate-scrollbar bug (#481)\n\
+                         row: {l}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// #481 guard: a group divider is still drawn between groups when the
+    /// left window does NOT overflow (no scrollbar to double as separator).
+    #[test]
+    fn test_tui_divider_present_without_scrollbar_481() {
+        // Short file: no overflow, so no per-window scrollbar.
+        let content = "a\nb\nc\n";
+        let mut e = test_engine(content);
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        let lines = render_tui(&e, 80, 24);
+        let has_divider = lines.iter().any(|l| l.contains('│'));
+        assert!(
+            has_divider,
+            "vertical group divider '│' must be drawn when the left window has no scrollbar"
+        );
     }
 
     // ── Snapshot tests (golden reference) ────────────────────────────────
