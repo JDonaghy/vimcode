@@ -1242,8 +1242,6 @@ pub(super) fn render_panel_hover_popup(
     Vec<(u16, u16, u16, u16, String)>,
     Option<(u16, u16, u16, u16)>,
 ) {
-    use crate::core::markdown::MdStyle;
-
     let Some(ref ph) = screen.panel_hover else {
         return (vec![], None);
     };
@@ -1252,18 +1250,18 @@ pub(super) fn render_panel_hover_popup(
     if lines.is_empty() {
         return (vec![], None);
     }
-    const MAX_HEIGHT: u16 = 20;
 
-    let num_lines = lines.len().min(MAX_HEIGHT as usize) as u16;
     let max_len = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
     // Available width to the right of the sidebar.
     let avail_w = term_area.width.saturating_sub(sidebar_right_x);
     if avail_w < 10 {
         return (vec![], None);
     }
-    // +4 for left/right border + padding; +2 for top/bottom border rows.
-    let width = (max_len as u16 + 4).clamp(12, avail_w);
-    let height = num_lines + 2; // content rows + top/bottom border
+    // Content width (excludes the 1-cell border on each side): matches
+    // the legacy total-box-width clamp of `(max_len+4).clamp(12, avail_w)`.
+    let content_w = ((max_len + 2) as f32)
+        .max(10.0)
+        .min((avail_w as f32 - 2.0).max(10.0));
 
     // Vertically align with the hovered item.
     let item_row = if ph.panel_name == "source_control" {
@@ -1282,165 +1280,75 @@ pub(super) fn render_panel_hover_popup(
         ph.item_index as u16 + 1
     };
     let raw_y = sidebar_y + item_row;
-
-    let x = sidebar_right_x;
-    let y = raw_y.min(
+    // Same secondary clamp the legacy renderer applied: don't let the
+    // popup's top row start past the terminal or sidebar bottom edge.
+    // (`height` here is an upper-bound estimate; the shared layout
+    // engine reclamps precisely against the viewport below.)
+    let est_height = (lines.len().min(render::PANEL_HOVER_MAX_ROWS) as u16) + 2;
+    let top_row = raw_y.min(
         term_area
             .height
-            .saturating_sub(height)
+            .saturating_sub(est_height)
             .min(sidebar_y + sidebar_height.saturating_sub(1)),
     );
 
-    let bg = rc(theme.hover_bg);
-    let fg = rc(theme.hover_fg);
-    let border = rc(theme.hover_border);
-    let h1_fg = rc(theme.md_heading1);
-    let h2_fg = rc(theme.md_heading2);
-    let h3_fg = rc(theme.md_heading3);
-    let code_fg = rc(theme.md_code);
-    let link_fg = rc(theme.md_link);
+    let popup = render::panel_hover_to_quadraui_rich_text(ph, theme);
+    let viewport = quadraui::Rect::new(
+        term_area.x as f32,
+        term_area.y as f32,
+        term_area.width as f32,
+        term_area.height as f32,
+    );
+    let measure = quadraui::RichTextPopupMeasure::new(content_w, 1.0);
+    // Placement::Below adds one row height to anchor_y, so subtract it
+    // here to land the box's top border exactly on `top_row`.
+    let layout = popup.layout(
+        sidebar_right_x as f32,
+        top_row as f32 - 1.0,
+        viewport,
+        measure,
+        |line_idx, start_byte, end_byte| {
+            popup
+                .line_text
+                .get(line_idx)
+                .map(|t| {
+                    t[start_byte.min(t.len())..end_byte.min(t.len())]
+                        .chars()
+                        .count() as f32
+                })
+                .unwrap_or(0.0)
+        },
+    );
 
-    let buf = frame.buffer_mut();
+    super::quadraui_tui::draw_rich_text_popup(frame.buffer_mut(), &popup, &layout, theme);
 
-    // ── Top border ───────────────────────────────────────────────────────────
-    let top_y = y;
-    if top_y < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx >= term_area.width {
-                break;
-            }
-            let ch = if col == 0 {
-                '┌'
-            } else if col == width - 1 {
-                '┐'
-            } else {
-                '─'
-            };
-            let cell = &mut buf[(cx, top_y)];
-            cell.set_char(ch).set_fg(border).set_bg(bg);
-        }
-    }
+    let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
+        .link_hit_regions
+        .iter()
+        .map(|(rect, idx)| {
+            let url = popup
+                .links
+                .get(*idx)
+                .map(|l| l.url.clone())
+                .unwrap_or_default();
+            (
+                rect.x.round() as u16,
+                rect.y.round() as u16,
+                rect.width.round() as u16,
+                rect.height.round() as u16,
+                url,
+            )
+        })
+        .collect();
 
-    // ── Content rows ─────────────────────────────────────────────────────────
-    for (li, text_line) in lines.iter().enumerate().take(num_lines as usize) {
-        let row_y = y + 1 + li as u16; // +1 for top border
-        if row_y >= term_area.height {
-            break;
-        }
+    let popup_rect = Some((
+        layout.bounds.x.round() as u16,
+        layout.bounds.y.round() as u16,
+        layout.bounds.width.round() as u16,
+        layout.bounds.height.round() as u16,
+    ));
 
-        // Fill row background with left/right borders.
-        for col in 0..width {
-            let cx = x + col;
-            if cx >= term_area.width {
-                break;
-            }
-            let cell = &mut buf[(cx, row_y)];
-            cell.set_bg(bg);
-            let ch = if col == 0 || col == width - 1 {
-                '│'
-            } else {
-                ' '
-            };
-            cell.set_char(ch).set_fg(border);
-        }
-
-        // Render styled text inside the border.
-        let line_spans = ph.rendered.spans.get(li);
-        let code_hl = ph.rendered.code_highlights.get(li);
-        let has_code_hl = code_hl.is_some_and(|h| !h.is_empty());
-        let display_text = format!(" {}", text_line);
-
-        let mut col_x: u16 = 1; // inside left border
-        let mut byte_pos: usize = 0;
-        for ch in display_text.chars() {
-            let ch_len = ch.len_utf8();
-            let adj_byte = byte_pos.saturating_sub(1);
-            let (ch_fg, bold) = if has_code_hl && byte_pos > 0 {
-                // Use tree-sitter syntax highlighting for code block lines.
-                code_hl
-                    .unwrap()
-                    .iter()
-                    .find(|h| adj_byte >= h.start_byte && adj_byte < h.end_byte)
-                    .map(|h| (rc(theme.scope_color(&h.scope)), false))
-                    .unwrap_or((code_fg, false))
-            } else if let Some(spans) = line_spans {
-                spans
-                    .iter()
-                    .find(|sp| byte_pos > 0 && adj_byte >= sp.start_byte && adj_byte < sp.end_byte)
-                    .map(|sp| match sp.style {
-                        MdStyle::Heading(1) => (h1_fg, true),
-                        MdStyle::Heading(2) => (h2_fg, true),
-                        MdStyle::Heading(_) => (h3_fg, true),
-                        MdStyle::Bold => (fg, true),
-                        MdStyle::Italic => (fg, false),
-                        MdStyle::BoldItalic => (fg, true),
-                        MdStyle::Code | MdStyle::CodeBlock => (code_fg, false),
-                        MdStyle::Link => (link_fg, false),
-                        MdStyle::LinkUrl => (link_fg, false),
-                        MdStyle::BlockQuote => (h3_fg, false),
-                        MdStyle::ListBullet => (h1_fg, true),
-                        _ => (fg, false),
-                    })
-                    .unwrap_or((fg, false))
-            } else {
-                (fg, false)
-            };
-
-            let cx = x + col_x;
-            if col_x + 1 < width && cx < term_area.width {
-                let cell = &mut buf[(cx, row_y)];
-                cell.set_char(ch).set_fg(ch_fg).set_bg(bg);
-                if bold {
-                    cell.set_style(cell.style().add_modifier(ratatui::style::Modifier::BOLD));
-                }
-            }
-
-            byte_pos += ch_len;
-            col_x += 1;
-        }
-    }
-
-    // ── Bottom border ────────────────────────────────────────────────────────
-    let bot_y = y + 1 + num_lines;
-    if bot_y < term_area.height {
-        for col in 0..width {
-            let cx = x + col;
-            if cx >= term_area.width {
-                break;
-            }
-            let ch = if col == 0 {
-                '└'
-            } else if col == width - 1 {
-                '┘'
-            } else {
-                '─'
-            };
-            let cell = &mut buf[(cx, bot_y)];
-            cell.set_char(ch).set_fg(border).set_bg(bg);
-        }
-    }
-
-    // ── Compute link hit rects ───────────────────────────────────────────────
-    let mut link_rects = Vec::new();
-    for &(line_idx, start_byte, end_byte, ref url) in &ph.links {
-        if line_idx >= num_lines as usize {
-            continue;
-        }
-        if let Some(line_text) = lines.get(line_idx) {
-            // Count characters before start_byte and between start/end to get column range.
-            // The display has a 1-char " " prefix inside the left border.
-            let prefix_chars = line_text[..start_byte.min(line_text.len())].chars().count() as u16;
-            let link_chars = line_text
-                [start_byte.min(line_text.len())..end_byte.min(line_text.len())]
-                .chars()
-                .count() as u16;
-            let row = y + 1 + line_idx as u16; // +1 for top border
-            let col_start = x + 2 + prefix_chars; // +2 for border + space prefix
-            link_rects.push((col_start, row, link_chars, 1, url.clone()));
-        }
-    }
-    (link_rects, Some((x, y, width, height)))
+    (link_rects, popup_rect)
 }
 
 // ─── Editor hover popup ─────────────────────────────────────────────────────

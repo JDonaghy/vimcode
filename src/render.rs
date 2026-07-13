@@ -1189,20 +1189,19 @@ pub struct PopupScrollbarHit {
     pub total: usize,
 }
 
-/// Convert an `EditorHoverPopupData` into a `quadraui::RichTextPopup`
-/// for the D6 layout pipeline. Markdown style spans + tree-sitter code
-/// highlights collapse into per-character `StyledSpan`s in
-/// `quadraui::StyledText`; selection, focus, scroll, and link state
-/// transfer 1:1.
-pub fn editor_hover_to_quadraui_rich_text(
-    eh: &EditorHoverPopupData,
+/// Flatten a `MdRendered` block into per-line `quadraui::StyledText` +
+/// per-line heading font scale. Shared by every rich-text hover/popup
+/// builder (editor hover, panel-item hover) so markdown → styled-span
+/// conversion lives in exactly one place.
+fn markdown_rendered_to_quadraui_lines(
+    rendered: &crate::core::markdown::MdRendered,
     theme: &Theme,
-) -> quadraui::RichTextPopup {
-    let mut q_lines: Vec<quadraui::StyledText> = Vec::with_capacity(eh.rendered.lines.len());
-    let mut line_scales: Vec<f32> = Vec::with_capacity(eh.rendered.lines.len());
-    for (line_idx, line_text) in eh.rendered.lines.iter().enumerate() {
-        let md_spans = eh.rendered.spans.get(line_idx);
-        let code_hl = eh.rendered.code_highlights.get(line_idx);
+) -> (Vec<quadraui::StyledText>, Vec<f32>) {
+    let mut q_lines: Vec<quadraui::StyledText> = Vec::with_capacity(rendered.lines.len());
+    let mut line_scales: Vec<f32> = Vec::with_capacity(rendered.lines.len());
+    for (line_idx, line_text) in rendered.lines.iter().enumerate() {
+        let md_spans = rendered.spans.get(line_idx);
+        let code_hl = rendered.code_highlights.get(line_idx);
         q_lines.push(hover_line_to_styled_text(
             line_text,
             md_spans.map(|v| v.as_slice()).unwrap_or(&[]),
@@ -1227,9 +1226,16 @@ pub fn editor_hover_to_quadraui_rich_text(
         };
         line_scales.push(scale);
     }
+    (q_lines, line_scales)
+}
 
-    let q_links: Vec<quadraui::RichTextLink> = eh
-        .links
+/// Convert `(line, start_byte, end_byte, url)` link tuples (the shape
+/// shared by `EditorHoverPopupData` and `PanelHoverPopupData`) into
+/// `quadraui::RichTextLink`s.
+fn md_links_to_quadraui_rich_text_links(
+    links: &[(usize, usize, usize, String)],
+) -> Vec<quadraui::RichTextLink> {
+    links
         .iter()
         .map(|(line, s, e, url)| quadraui::RichTextLink {
             line: *line,
@@ -1237,7 +1243,20 @@ pub fn editor_hover_to_quadraui_rich_text(
             end_byte: *e,
             url: url.clone(),
         })
-        .collect();
+        .collect()
+}
+
+/// Convert an `EditorHoverPopupData` into a `quadraui::RichTextPopup`
+/// for the D6 layout pipeline. Markdown style spans + tree-sitter code
+/// highlights collapse into per-character `StyledSpan`s in
+/// `quadraui::StyledText`; selection, focus, scroll, and link state
+/// transfer 1:1.
+pub fn editor_hover_to_quadraui_rich_text(
+    eh: &EditorHoverPopupData,
+    theme: &Theme,
+) -> quadraui::RichTextPopup {
+    let (q_lines, line_scales) = markdown_rendered_to_quadraui_lines(&eh.rendered, theme);
+    let q_links = md_links_to_quadraui_rich_text_links(&eh.links);
 
     let q_selection = eh
         .selection
@@ -1829,6 +1848,44 @@ pub struct PanelHoverPopupData {
     pub item_index: usize,
     /// The panel this hover belongs to (e.g. "source_control", ext panel name).
     pub panel_name: String,
+}
+
+/// Maximum number of sidebar-item hover popup rows shown at once
+/// (matches the legacy `MAX_HEIGHT` constant it replaces — no
+/// scrolling for this popup, content beyond this is truncated).
+pub const PANEL_HOVER_MAX_ROWS: usize = 20;
+
+/// Convert a `PanelHoverPopupData` into a `quadraui::RichTextPopup` for
+/// the D6 layout pipeline, mirroring `editor_hover_to_quadraui_rich_text`.
+/// The sidebar-item hover is read-only (no scroll, focus, selection, or
+/// keyboard-link-nav state), so those fields are fixed defaults.
+///
+/// Placement is `Below`: callers pass `anchor_y = desired_top_row -
+/// 1.0` (one row height) so the popup's top border lands exactly on
+/// the row the legacy hand-rolled renderer used.
+pub fn panel_hover_to_quadraui_rich_text(
+    ph: &PanelHoverPopupData,
+    theme: &Theme,
+) -> quadraui::RichTextPopup {
+    let (q_lines, line_scales) = markdown_rendered_to_quadraui_lines(&ph.rendered, theme);
+    let q_links = md_links_to_quadraui_rich_text_links(&ph.links);
+
+    quadraui::RichTextPopup {
+        id: quadraui::WidgetId::new("panel_hover"),
+        lines: q_lines,
+        line_text: ph.rendered.lines.clone(),
+        line_scales,
+        scroll_top: 0,
+        max_visible_rows: PANEL_HOVER_MAX_ROWS,
+        has_focus: false,
+        selection: None,
+        links: q_links,
+        focused_link: None,
+        placement: quadraui::PopupPlacement::Below,
+        padding: 0.0,
+        fg: Some(to_quadraui_color(theme.hover_fg)),
+        bg: Some(to_quadraui_color(theme.hover_bg)),
+    }
 }
 
 // ─── AiPanelData ─────────────────────────────────────────────────────────────
