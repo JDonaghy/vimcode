@@ -315,10 +315,19 @@ pub(super) fn handle_mouse(
             let row_count: u16 = if panel.show_replace { 2 } else { 1 };
             let panel_h: u16 = row_count + 2; // +2 for borders
 
-            // Compute panel screen position from group_bounds
+            // Compute panel screen position from group_bounds. #550:
+            // `group_bounds` is already absolute terminal-screen space (see
+            // the matching comment at the `draw_find_replace` call site in
+            // render_impl.rs, which now passes `editor_left=0` into
+            // quadraui's rasteriser since the offset is baked into
+            // `group_bounds` already). This hit-test math must mirror that
+            // paint math exactly (mismatched math here is the "column drift
+            // bug" class this overlay's doc comment warns about) — so no
+            // `editor_left +`/`.max(editor_left)` here either, matching
+            // quadraui's now-effectively-zero clamp.
             let gb = &panel.group_bounds;
-            let gb_right = editor_left + gb.x as u16 + gb.width as u16;
-            let panel_x = gb_right.saturating_sub(panel_w + 1).max(editor_left);
+            let gb_right = gb.x as u16 + gb.width as u16;
+            let panel_x = gb_right.saturating_sub(panel_w + 1);
             let panel_y = (gb.y as u16).max(1);
             let content_x = panel_x + 1; // inside left border
             let find_y = panel_y + 1; // first content row
@@ -972,12 +981,12 @@ pub(super) fn handle_mouse(
                 if let Some(split) = last_layout.and_then(|l| l.editor_group_split.as_ref()) {
                     if let Some(div) = split.dividers.iter().find(|d| d.split_index == split_index)
                     {
-                        let mr: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                        let editor_row = row.saturating_sub(mr);
-                        let rel_col = col.saturating_sub(editor_left);
+                        // #550: `div.axis_start`/`.axis_size` are already
+                        // absolute terminal-screen coordinates, so `col`/`row`
+                        // compare directly with no editor-origin subtraction.
                         let mouse_pos = match div.direction {
-                            crate::core::window::SplitDirection::Vertical => rel_col as f64,
-                            crate::core::window::SplitDirection::Horizontal => editor_row as f64,
+                            crate::core::window::SplitDirection::Vertical => col as f64,
+                            crate::core::window::SplitDirection::Horizontal => row as f64,
                         };
                         let new_ratio = (mouse_pos - div.axis_start) / div.axis_size;
                         engine
@@ -1031,17 +1040,17 @@ pub(super) fn handle_mouse(
             );
             if col >= editor_left {
                 if let Some(layout) = last_layout {
-                    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                    let editor_row = row.saturating_sub(menu_rows);
-                    let rel_col = col - editor_left;
-                    if let Some(idx) =
-                        render::find_window_at(layout, rel_col as f64, editor_row as f64)
-                    {
+                    // #550: `rw.rect` (and everything `find_window_at`/
+                    // `window_zone_hit_test` compare it against) is already
+                    // absolute terminal-screen space, so the raw event
+                    // `col`/`row` are used directly — no editor-area-relative
+                    // translation.
+                    if let Some(idx) = render::find_window_at(layout, col as f64, row as f64) {
                         let rw = &layout.windows[idx];
                         let zone = render::window_zone_hit_test(
                             rw,
-                            (rel_col as f64) - rw.rect.x,
-                            (editor_row as f64) - rw.rect.y,
+                            (col as f64) - rw.rect.x,
+                            (row as f64) - rw.rect.y,
                             1.0,
                             1.0,
                         );
@@ -1060,10 +1069,13 @@ pub(super) fn handle_mouse(
                                 // text-layout inverse (`EditorLayout::col_at_x`)
                                 // instead of hand-rolled cell math, so TUI and
                                 // GTK column resolution can never diverge.
+                                // `col_at_x` takes an absolute x matching
+                                // `editor.rect`'s space (mirrors GTK's
+                                // `editor_col_at_x` call, see gtk/click.rs).
                                 let (editor, editor_layout) =
                                     render::editor_text_layout(rw, 1.0, 1.0);
                                 let col_in_text =
-                                    editor_layout.col_at_x(&editor, view_row, rel_col as f32);
+                                    editor_layout.col_at_x(&editor, view_row, col as f32);
                                 engine.mouse_drag(rw.window_id, buf_line, col_in_text);
                             }
                             return sidebar_width;
@@ -1359,17 +1371,12 @@ pub(super) fn handle_mouse(
                                 return sidebar_width;
                             }
                             "tui:editor_viewport" => {
-                                let scroll_menu_rows: u16 =
-                                    if engine.menu_bar_visible { 1 } else { 0 };
-                                let editor_row = row.saturating_sub(scroll_menu_rows);
-                                let rel_col = col.saturating_sub(editor_left);
+                                // #550: `find_window_at` compares against
+                                // already-absolute `rw.rect`, so the raw
+                                // event `col`/`row` are used directly.
                                 let target = last_layout.and_then(|layout| {
-                                    render::find_window_at(
-                                        layout,
-                                        rel_col as f64,
-                                        editor_row as f64,
-                                    )
-                                    .map(|idx| &layout.windows[idx])
+                                    render::find_window_at(layout, col as f64, row as f64)
+                                        .map(|idx| &layout.windows[idx])
                                 });
                                 if let Some(rw) = target {
                                     let dir = if down { 1 } else { -1 };
@@ -1483,12 +1490,15 @@ pub(super) fn handle_mouse(
                 if let Some(ref split) = layout.editor_group_split {
                     let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
                     for gtb in split.group_tab_bars.iter() {
-                        let tab_bar_row =
-                            menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
+                        // #550: `gtb.bounds` is already absolute
+                        // terminal-screen space, so no `menu_rows`/
+                        // `editor_left` offset addition — compare directly
+                        // against the raw event `col`/`row`.
+                        let tab_bar_row = (gtb.bounds.y as u16).saturating_sub(click_tbh);
                         let gx = gtb.bounds.x as u16;
                         let gw = gtb.bounds.width as u16;
-                        if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
-                            let local_col = rel_col - gx;
+                        if row == tab_bar_row && col >= gx && col < gx + gw {
+                            let local_col = col - gx;
                             let bar = render::build_tab_bar_primitive(
                                 &gtb.tabs,
                                 false,
@@ -1783,12 +1793,13 @@ pub(super) fn handle_mouse(
                 if let Some(ref split) = layout.editor_group_split {
                     let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
                     for gtb in split.group_tab_bars.iter() {
-                        let tab_bar_row =
-                            menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
+                        // #550: `gtb.bounds` is already absolute — compare
+                        // against raw `col`, not `rel_col`/`menu_rows`.
+                        let tab_bar_row = (gtb.bounds.y as u16).saturating_sub(click_tbh);
                         let gx = gtb.bounds.x as u16;
                         let gw = gtb.bounds.width as u16;
-                        if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
-                            let local_col = rel_col - gx;
+                        if row == tab_bar_row && col >= gx && col < gx + gw {
+                            let local_col = col - gx;
                             tooltip = tab_tooltip_at_col(
                                 engine,
                                 gtb.group_id,
@@ -1827,16 +1838,14 @@ pub(super) fn handle_mouse(
         ) || engine.is_vscode_mode())
     {
         if let Some(layout) = last_layout {
-            let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-            let editor_row = row.saturating_sub(menu_rows);
-            let rel_col = col - editor_left;
+            // #550: `rw.rect` is already absolute — use raw `col`/`row`.
             let mut found = false;
-            if let Some(idx) = render::find_window_at(layout, rel_col as f64, editor_row as f64) {
+            if let Some(idx) = render::find_window_at(layout, col as f64, row as f64) {
                 let rw = &layout.windows[idx];
                 let zone = render::window_zone_hit_test(
                     rw,
-                    (rel_col as f64) - rw.rect.x,
-                    (editor_row as f64) - rw.rect.y,
+                    (col as f64) - rw.rect.x,
+                    (row as f64) - rw.rect.y,
                     1.0,
                     1.0,
                 );
@@ -1847,7 +1856,7 @@ pub(super) fn handle_mouse(
                     // #560: shared quadraui text-layout inverse (see the
                     // drag handler above for the full rationale).
                     let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
-                    let text_col = editor_layout.col_at_x(&editor, view_row, rel_col as f32);
+                    let text_col = editor_layout.col_at_x(&editor, view_row, col as f32);
                     engine.editor_hover_mouse_move(buf_line, text_col, mouse_on_editor_hover);
                     found = true;
                 }
@@ -2606,8 +2615,9 @@ pub(super) fn handle_mouse(
     // ── Breadcrumb click ────────────────────────────────────────────────────
     if engine.settings.breadcrumbs {
         if let Some(layout) = last_layout {
-            let bc_x = (col - editor_left) as f64;
-            let bc_y = (row - menu_rows) as f64;
+            // #550: `layout.breadcrumbs[..].bounds` is already absolute.
+            let bc_x = col as f64;
+            let bc_y = row as f64;
             match render::resolve_breadcrumb_click(&layout.breadcrumbs, bc_x, bc_y, 1.0) {
                 render::BreadcrumbClickResult::Hit(idx) => {
                     if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -2638,14 +2648,16 @@ pub(super) fn handle_mouse(
                 if engine.is_tab_bar_hidden(gtb.group_id) {
                     continue;
                 }
-                let tab_bar_row = menu_rows + (gtb.bounds.y as u16).saturating_sub(click_tbh);
+                // #550: `gtb.bounds` is already absolute — no `menu_rows`/
+                // `editor_left` offset addition, compare against raw `col`/`row`.
+                let tab_bar_row = (gtb.bounds.y as u16).saturating_sub(click_tbh);
                 let gx = gtb.bounds.x as u16;
                 let gw = gtb.bounds.width as u16;
-                if row == tab_bar_row && rel_col >= gx && rel_col < gx + gw {
+                if row == tab_bar_row && col >= gx && col < gx + gw {
                     let was_active = gtb.group_id == split.active_group;
                     matched_group = Some((
                         gtb.group_id,
-                        rel_col - gx,
+                        col - gx,
                         gw,
                         &gtb.tabs,
                         gtb.diff_toolbar.as_ref(),
@@ -2796,11 +2808,10 @@ pub(super) fn handle_mouse(
         }
     }
 
-    let rel_col = col - editor_left;
-    // editor_row is 0-indexed relative to the editor content area.
-    // Window rects already include the tab_bar_height offset (y >= 1),
-    // so we only subtract menu_rows here (not the tab bar row).
-    let editor_row = row.saturating_sub(menu_rows);
+    // #550: `rw.rect`/`div.position`/`.cross_start` etc. below are all
+    // already absolute terminal-screen coordinates, so the raw event
+    // `col`/`row` are used directly throughout this block — no
+    // editor-area-relative translation needed.
 
     // ── Group divider click — start drag ──────────────────────────────────────
     // #452: must use the same float-to-int conversion as the divider
@@ -2818,16 +2829,16 @@ pub(super) fn handle_mouse(
                 let hit = match div.direction {
                     crate::core::window::SplitDirection::Vertical => {
                         let div_col = div.position as u16;
-                        rel_col == div_col
-                            && (editor_row as f64) >= div.cross_start
-                            && (editor_row as f64) < div.cross_start + div.cross_size
+                        col == div_col
+                            && (row as f64) >= div.cross_start
+                            && (row as f64) < div.cross_start + div.cross_size
                     }
                     crate::core::window::SplitDirection::Horizontal => {
                         let div_row = div.position as u16;
-                        editor_row >= div_row
-                            && editor_row < div_row + tab_bar_rows
-                            && (rel_col as f64) >= div.cross_start
-                            && (rel_col as f64) < div.cross_start + div.cross_size
+                        row >= div_row
+                            && row < div_row + tab_bar_rows
+                            && (col as f64) >= div.cross_start
+                            && (col as f64) < div.cross_start + div.cross_size
                     }
                 };
                 if hit {
@@ -2845,11 +2856,11 @@ pub(super) fn handle_mouse(
             let ww = rw.rect.width as u16;
             let wh = rw.rect.height as u16;
 
-            if rel_col >= wx && rel_col < wx + ww && editor_row >= wy && editor_row < wy + wh {
+            if col >= wx && col < wx + ww && row >= wy && row < wy + wh {
                 // Per-window status bar click — hit-test segments for actions.
-                if rw.status_line.is_some() && wh > 1 && editor_row == wy + wh - 1 {
+                if rw.status_line.is_some() && wh > 1 && row == wy + wh - 1 {
                     if let Some(ref status) = rw.status_line {
-                        let click_col = (rel_col - wx) as usize;
+                        let click_col = (col - wx) as usize;
                         if let Some(action) =
                             status_segment_hit_test(status, ww as usize, click_col)
                         {
@@ -2894,9 +2905,10 @@ pub(super) fn handle_mouse(
                 let has_h_scrollbar = rw.max_col > viewport_cols && content_height > 1;
 
                 // Vertical scrollbar click/drag-start (rightmost column)
-                if has_v_scrollbar && rel_col == wx + ww - 1 {
-                    // menu_rows = menu bar offset; wy already includes tab_bar_height
-                    let track_abs_start = menu_rows + wy;
+                if has_v_scrollbar && col == wx + ww - 1 {
+                    // #550: `wy` is already absolute (includes both the menu
+                    // bar offset and tab_bar_height), so no `menu_rows +`.
+                    let track_abs_start = wy;
                     // V-track loses 1 row to each of: per-window status line,
                     // horizontal scrollbar (if either present).
                     let track_len =
@@ -2983,11 +2995,12 @@ pub(super) fn handle_mouse(
                 } else {
                     wy + wh - 1
                 };
-                if has_h_scrollbar && editor_row == h_sb_row {
+                if has_h_scrollbar && row == h_sb_row {
                     let track_x = wx + gutter;
                     let track_w = ww.saturating_sub(gutter + if has_v_scrollbar { 1 } else { 0 });
-                    if rel_col >= track_x && rel_col < track_x + track_w && track_w > 0 {
-                        let track_abs_start = editor_left + track_x;
+                    if col >= track_x && col < track_x + track_w && track_w > 0 {
+                        // #550: `track_x` (derived from `wx`) is already absolute.
+                        let track_abs_start = track_x;
                         let track_visible = viewport_cols;
                         // Track-click vs thumb-click: page-jump on the
                         // empty track, drag-start on the thumb (mirrors
@@ -3048,10 +3061,10 @@ pub(super) fn handle_mouse(
                 }
 
                 // Check gutter area — shared resolution via render::resolve_gutter_action (#344).
-                let view_row = (editor_row - wy) as usize;
-                if gutter > 0 && rel_col >= wx && rel_col < wx + gutter {
+                let view_row = (row - wy) as usize;
+                if gutter > 0 && col >= wx && col < wx + gutter {
                     if let Some(rl) = rw.lines.get(view_row) {
-                        let gutter_col = (rel_col - wx) as usize;
+                        let gutter_col = (col - wx) as usize;
                         use crate::render::GutterAction;
                         match crate::render::resolve_gutter_action(rw, rl.line_idx, gutter_col) {
                             Some(GutterAction::ToggleBreakpoint(line)) => {
@@ -3103,7 +3116,7 @@ pub(super) fn handle_mouse(
                 // function GTK's `Backend::editor_col_at_x` falls back to,
                 // so both backends' click math derives from one source.
                 let (editor, editor_layout) = crate::render::editor_text_layout(rw, 1.0, 1.0);
-                let col_in_text = editor_layout.col_at_x(&editor, view_row, rel_col as f32);
+                let col_in_text = editor_layout.col_at_x(&editor, view_row, col as f32);
 
                 // Double-click detection
                 let now = Instant::now();
@@ -3416,5 +3429,264 @@ mod tests {
         };
         let result = menu_system.handle(&outside_event, &mut backend, bar_rect);
         assert_eq!(result, quadraui::MenuEvent::Ignored);
+    }
+
+    // ── #550: absolute window-rect coordinate convention ────────────────────
+    //
+    // These tests build a *real* `ScreenLayout` via `build_screen_for_tui`
+    // (the same production function `draw_frame` uses to paint) with the
+    // sidebar and menu bar both visible, so `window_rects` carry a non-zero
+    // origin. They then dispatch a click through `handle_mouse` at a
+    // coordinate read straight off that `ScreenLayout` (not re-derived by
+    // hand) and assert the click resolves correctly. Before #550, TUI's
+    // window rects were content-area-relative and every click site
+    // re-added `editor_left`/`menu_rows` on top of them — a bug reintroduced
+    // in either the paint or the click math would show up here as a
+    // click/paint coordinate mismatch (wrong group hit, or no hit at all).
+
+    /// Build a hermetic engine with a vertical group split, sidebar visible,
+    /// and the menu bar visible — the scenario with the largest non-zero
+    /// `(x, y)` editor-area origin, to maximize the chance of catching an
+    /// offset regression.
+    fn split_engine_with_sidebar_and_menu() -> Engine {
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.mode = crate::core::Mode::Normal;
+        e.menu_bar_visible = true;
+        if !e.app_shell.sidebar_visible() {
+            e.toggle_sidebar();
+        }
+        e.open_editor_group(crate::core::window::SplitDirection::Vertical);
+        e
+    }
+
+    fn dispatch_left_click(
+        engine: &mut Engine,
+        col: u16,
+        row: u16,
+        last_layout: Option<&render::ScreenLayout>,
+        dragging_group_divider: &mut Option<usize>,
+    ) {
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut last_click_time = Instant::now();
+        let mut last_click_pos: (u16, u16) = (0, 0);
+        let mut should_quit = false;
+
+        handle_mouse(
+            ev,
+            &mut sidebar,
+            engine,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            dragging_group_divider,
+            &mut drag_state,
+            &mut modal_stack,
+            last_layout,
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut crate::core::window::DropZone::None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// A click exactly on a group divider (per the freshly-painted
+    /// `ScreenLayout`) must start the divider drag, and a click one column
+    /// off it must not. With the sidebar (30 cols) + activity bar (3 cols) +
+    /// menu bar (1 row) all visible, the divider's absolute column sits well
+    /// past both the old content-relative value AND a "double-counted
+    /// offset" value would — pinning it via the real painted position (not a
+    /// hand-derived formula) means either regression breaks this test.
+    #[test]
+    fn group_divider_click_matches_painted_divider_position() {
+        let engine = split_engine_with_sidebar_and_menu();
+        let theme = crate::render::Theme::onedark();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let screen = super::render_impl::build_screen_for_tui(
+            &engine,
+            &theme,
+            area,
+            &sidebar,
+            SIDEBAR_WIDTH,
+        );
+        let split = screen
+            .editor_group_split
+            .as_ref()
+            .expect("vertical split must produce Some(editor_group_split)");
+        let div = split
+            .dividers
+            .first()
+            .expect("a vertical split has exactly one divider");
+        assert_eq!(div.direction, crate::core::window::SplitDirection::Vertical);
+
+        // Sanity: this is genuinely testing a non-trivial offset, not a
+        // degenerate zero-origin case.
+        let editor_left = ACTIVITY_BAR_WIDTH + SIDEBAR_WIDTH + 1;
+        assert!(
+            (div.position as u16) > editor_left,
+            "divider column {} should sit inside the editor area (left edge {editor_left})",
+            div.position
+        );
+
+        let col = div.position as u16;
+        let row = (div.cross_start + 1.0) as u16;
+
+        let mut engine_hit = split_engine_with_sidebar_and_menu();
+        let mut dragging = None;
+        dispatch_left_click(&mut engine_hit, col, row, Some(&screen), &mut dragging);
+        assert_eq!(
+            dragging,
+            Some(div.split_index),
+            "click at the painted divider column ({col}, {row}) must start the divider drag"
+        );
+
+        // One column off must NOT hit the divider.
+        let mut engine_miss = split_engine_with_sidebar_and_menu();
+        let mut dragging_miss = None;
+        dispatch_left_click(
+            &mut engine_miss,
+            col - 1,
+            row,
+            Some(&screen),
+            &mut dragging_miss,
+        );
+        assert_eq!(
+            dragging_miss, None,
+            "click one column off the divider must not start a drag"
+        );
+    }
+
+    /// Right-clicking a split group's tab bar at its painted absolute
+    /// position must open that group's tab context menu. Exercises the
+    /// same `gtb.bounds`-vs-`editor_left`/`menu_rows` arithmetic as the
+    /// divider test above, via the right-click path instead of the
+    /// left-click path.
+    #[test]
+    fn split_group_tab_bar_right_click_matches_painted_position() {
+        let mut engine = split_engine_with_sidebar_and_menu();
+        let theme = crate::render::Theme::onedark();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let screen = super::render_impl::build_screen_for_tui(
+            &engine,
+            &theme,
+            area,
+            &sidebar,
+            SIDEBAR_WIDTH,
+        );
+        let split = screen
+            .editor_group_split
+            .as_ref()
+            .expect("vertical split must produce Some(editor_group_split)");
+        let gtb = split
+            .group_tab_bars
+            .first()
+            .expect("a 2-group split has two group tab bars");
+        let tab_bar_row = (gtb.bounds.y as u16).saturating_sub(1);
+        let col = gtb.bounds.x as u16 + 1;
+
+        assert!(engine.context_menu.is_none());
+
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: col,
+            row: tab_bar_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar_state = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut last_click_time = Instant::now();
+        let mut last_click_pos: (u16, u16) = (0, 0);
+        let mut should_quit = false;
+
+        handle_mouse(
+            ev,
+            &mut sidebar_state,
+            &mut engine,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut None,
+            &mut drag_state,
+            &mut modal_stack,
+            Some(&screen),
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut crate::core::window::DropZone::None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            engine.context_menu.is_some(),
+            "right-click at the painted tab-bar position ({col}, {tab_bar_row}) must open the tab context menu"
+        );
     }
 }
