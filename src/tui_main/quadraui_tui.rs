@@ -156,10 +156,16 @@ pub(super) fn draw_activity_bar(
 /// drift bugs (the same class fixed for debug toolbar + breadcrumb)
 /// can't recur on this overlay.
 ///
-/// `editor_left` is the absolute screen column of the editor area's
-/// left edge (after activity bar + sidebar). `panel.group_bounds.x/y`
-/// are content-relative; the overlay anchors at the top-right of the
-/// active editor group.
+/// `panel.group_bounds.x/y` is already absolute terminal-screen space
+/// (#550 — it's derived from `window_rects`, which TUI now feeds in
+/// absolute coordinates like GTK, rather than content-area-relative). The
+/// underlying `quadraui::tui::draw_find_replace` rasteriser still takes an
+/// `editor_left` translation param (it's TUI-only — GTK never calls this
+/// path — and quadraui's signature can't be changed from here); this
+/// wrapper always passes `0` so that internal translation is a no-op
+/// instead of double-counting the origin already baked into
+/// `group_bounds`. The click-hit-test mirroring this paint math is in
+/// `mouse.rs`'s find/replace handler — keep the two in sync.
 ///
 /// Painting that the hit-region list doesn't directly cover —
 /// borders, the match-count text (a non-clickable status string), and
@@ -170,9 +176,8 @@ pub(super) fn draw_find_replace(
     area: Rect,
     panel: &crate::render::FindReplacePanel,
     theme: &Theme,
-    editor_left: u16,
 ) {
-    quadraui::tui::draw_find_replace(buf, area, panel, &q_theme(theme), editor_left);
+    quadraui::tui::draw_find_replace(buf, area, panel, &q_theme(theme), 0);
 }
 
 /// Draw a `quadraui::RichTextPopup` into the buffer via the lifted

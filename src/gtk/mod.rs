@@ -7813,16 +7813,9 @@ impl quadraui::ShellApp for App {
         // comment for why a plain `Vec` indexed from 0 was wrong.
         let mut tab_bar_zones: HashMap<usize, (core::window::GroupId, quadraui::Rect)> =
             HashMap::new();
-        for (next_surface_idx, target) in
-            (window_editors.len()..).zip(render::tab_bar_draw_targets(
-                &engine,
-                screen,
-                tab_row_h,
-                tab_bar_h,
-                (0.0, 0.0),
-                (x, y, w),
-            ))
-        {
+        for (next_surface_idx, target) in (window_editors.len()..).zip(
+            render::tab_bar_draw_targets(&engine, screen, tab_row_h, tab_bar_h, (x, y, w)),
+        ) {
             let tb_rect = target.rect;
             let hover = self
                 .tab_close_hover
@@ -7867,8 +7860,7 @@ impl quadraui::ShellApp for App {
         // step was never ported over, so breadcrumbs stopped rendering even
         // though layout space for them was still reserved (`tab_bar_h`
         // above) and clicks were still hit-tested against them.
-        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, lh, (0.0, 0.0))
-        {
+        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, lh) {
             let mut frame = QSL::new();
             frame.push(Surface::StatusBar {
                 rect: t.rect,

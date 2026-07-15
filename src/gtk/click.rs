@@ -1255,7 +1255,6 @@ mod frame_hit_map_tests {
                 &screen,
                 tab_row_h,
                 tab_bar_h,
-                (0.0, 0.0),
                 (0.0, 0.0, 800.0),
             ))
         {

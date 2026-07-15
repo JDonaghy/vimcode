@@ -49,7 +49,19 @@ pub(super) fn build_screen_for_tui(
         ACTIVITY_BAR_WIDTH
     };
     let content_cols = area.width.saturating_sub(ab_width + sidebar_cols);
-    let content_bounds = WindowRect::new(0.0, 0.0, content_cols as f64, content_rows as f64);
+    // #550: window rects are absolute terminal-screen coordinates, matching
+    // GTK's convention, rather than relative to the editor content area's own
+    // top-left. `editor_area`'s origin here must match the `Layout` split
+    // `draw_frame` performs on the same `area` (menu bar row, then activity
+    // bar + sidebar columns) — see the mirrored computation there.
+    let editor_origin_x = area.x as f64 + ab_width as f64 + sidebar_cols as f64;
+    let editor_origin_y = area.y as f64 + menu_height as f64;
+    let content_bounds = WindowRect::new(
+        editor_origin_x,
+        editor_origin_y,
+        content_cols as f64,
+        content_rows as f64,
+    );
     let tui_tab_bar_height = if engine.settings.breadcrumbs && !engine.terminal_maximized {
         2.0
     } else {
@@ -309,7 +321,6 @@ pub(super) fn draw_frame(
         screen,
         1.0,
         tui_tbh,
-        (editor_area.x as f64, editor_area.y as f64),
         (
             editor_area.x as f64,
             editor_area.y as f64,
@@ -339,7 +350,7 @@ pub(super) fn draw_frame(
         }
         // Render windows first so tab bars draw on top (prevents window content
         // from overwriting an adjacent group's tab bar in horizontal splits).
-        render_all_windows(backend, frame, editor_area, &screen.windows, theme);
+        render_all_windows(backend, frame, &screen.windows, theme);
         // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
         // the group's window content (bounds.y - tab_bar_height).
         for target in &tab_bar_targets {
@@ -357,12 +368,7 @@ pub(super) fn draw_frame(
         // conditions + rect math (including the zero-width fallback filter)
         // come from `render::breadcrumb_draw_targets`, shared with GTK, so
         // the two backends can't drift apart (#547).
-        for t in render::breadcrumb_draw_targets(
-            screen,
-            engine.terminal_maximized,
-            1.0,
-            (editor_area.x as f64, editor_area.y as f64),
-        ) {
+        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, 1.0) {
             let bc_rect = Rect {
                 x: t.rect.x as u16,
                 y: t.rect.y as u16,
@@ -373,12 +379,15 @@ pub(super) fn draw_frame(
             *t.draw_layout.borrow_mut() = Some(layout);
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
+        // `div.position`/`.cross_start` are already absolute terminal-screen
+        // coordinates (#550), matching `editor_area`'s own coordinate space —
+        // no offset addition needed.
         let sep_fg = rc(theme.separator);
         let sep_bg = rc(theme.background);
         for div in &split.dividers {
             if div.direction == SplitDirection::Vertical {
-                let div_x = editor_area.x + div.position as u16;
-                let y_start = editor_area.y + div.cross_start as u16;
+                let div_x = div.position as u16;
+                let y_start = div.cross_start as u16;
                 let y_end = y_start + div.cross_size as u16;
                 for y in y_start..y_end {
                     if div_x < editor_area.x + editor_area.width {
@@ -423,12 +432,7 @@ pub(super) fn draw_frame(
         // → `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
         // therefore the derived breadcrumb bounds) up by one row in that case,
         // so this no longer needs its own `is_tab_bar_hidden` special case (#547).
-        for t in render::breadcrumb_draw_targets(
-            screen,
-            engine.terminal_maximized,
-            1.0,
-            (editor_area.x as f64, editor_area.y as f64),
-        ) {
+        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, 1.0) {
             let bc_rect = Rect {
                 x: t.rect.x as u16,
                 y: t.rect.y as u16,
@@ -438,7 +442,7 @@ pub(super) fn draw_frame(
             let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
             *t.draw_layout.borrow_mut() = Some(layout);
         }
-        render_all_windows(backend, frame, editor_area, &screen.windows, theme);
+        render_all_windows(backend, frame, &screen.windows, theme);
     }
 
     // Register the editor viewport as a scroll surface so dispatch_scroll
@@ -496,8 +500,8 @@ pub(super) fn draw_frame(
         {
             if let Some((cursor_pos, _)) = &active_win.cursor {
                 let gutter_w = active_win.gutter_char_width as u16;
-                let win_x = editor_area.x + active_win.rect.x as u16;
-                let win_y = editor_area.y + active_win.rect.y as u16;
+                let win_x = active_win.rect.x as u16;
+                let win_y = active_win.rect.y as u16;
                 let raw = active_win
                     .lines
                     .get(cursor_pos.view_line)
@@ -546,8 +550,8 @@ pub(super) fn draw_frame(
             .find(|w| w.window_id == screen.active_window_id)
         {
             let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = editor_area.x + active_win.rect.x as u16;
-            let win_y = editor_area.y + active_win.rect.y as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
             let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
             let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
@@ -576,8 +580,8 @@ pub(super) fn draw_frame(
             .find(|w| w.window_id == screen.active_window_id)
         {
             let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = editor_area.x + active_win.rect.x as u16;
-            let win_y = editor_area.y + active_win.rect.y as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
             // Use frozen scroll offsets so the popup stays fixed on screen
             let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
             let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
@@ -599,8 +603,8 @@ pub(super) fn draw_frame(
             .find(|w| w.window_id == screen.active_window_id)
         {
             let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = editor_area.x + active_win.rect.x as u16;
-            let win_y = editor_area.y + active_win.rect.y as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
             let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
             let popup_x = win_x + gutter_w;
             // anchor at the cursor's own row; placement=Bottom (with
@@ -628,8 +632,8 @@ pub(super) fn draw_frame(
             .find(|w| w.window_id == screen.active_window_id)
         {
             let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = editor_area.x + active_win.rect.x as u16;
-            let win_y = editor_area.y + active_win.rect.y as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
             let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
             let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
@@ -921,14 +925,16 @@ pub(super) fn draw_frame(
 
     // ── Find/replace overlay (top-right of active group) ───────────────────
     if let Some(ref find_replace) = screen.find_replace {
-        let editor_left = h_chunks[0].width + h_chunks[1].width;
-        super::quadraui_tui::draw_find_replace(
-            frame.buffer_mut(),
-            area,
-            find_replace,
-            theme,
-            editor_left,
-        );
+        // #550: `find_replace.group_bounds` is derived from `window_rects`
+        // (render.rs's `active_group_bounds`) and is now absolute
+        // terminal-screen space, not content-relative. quadraui's shared
+        // `draw_find_replace(..., editor_left)` still expects to translate a
+        // content-relative `group_bounds` by `editor_left` internally (it's
+        // TUI-only — GTK never calls this path, so there's no established
+        // absolute-input convention to lean on there); passing `0` here
+        // keeps that internal translation a no-op instead of double-
+        // counting the origin now baked into `group_bounds` itself.
+        super::quadraui_tui::draw_find_replace(frame.buffer_mut(), area, find_replace, theme);
     }
 
     // ── Unified picker modal (above terminal/status so it's fully visible) ──
@@ -1219,13 +1225,18 @@ fn build_tui_tab_slots(
     let mut map = std::collections::HashMap::new();
     if let Some(ref split) = screen.editor_group_split {
         for gtb in &split.group_tab_bars {
-            let abs_x = editor_x + gtb.bounds.x as f32;
+            // #550: `gtb.bounds` is already absolute terminal-screen space
+            // (same convention as GTK), so no `editor_x` offset addition.
+            let abs_x = gtb.bounds.x as f32;
             map.insert(
                 gtb.group_id.0,
                 tab_drag_slots_from_hit_regions(&gtb.hit_regions, abs_x),
             );
         }
     } else {
+        // Single-group bar spans the editor area's own left edge; hit
+        // regions are bar-relative offsets, not window-rect-derived, so
+        // `editor_x` is still the correct base here.
         map.insert(
             engine.active_group.0,
             tab_drag_slots_from_hit_regions(&screen.tab_bar_hit_regions, editor_x),
@@ -1256,10 +1267,21 @@ pub(super) fn render_tab_drag_overlay(
     } else {
         1.0
     };
+    // #550/#515: in split mode `gtb.bounds` is already absolute (built from
+    // absolute window rects, matching GTK), so the origin here must be
+    // (0,0) — adding `editor_area`'s origin again would double-count it,
+    // the same bug GTK's #515 fix addressed for its own call site.
+    // Single-group mode returns the origin directly (no `gtb.bounds` to
+    // derive it from), so it still needs the real editor origin.
+    let drop_origin = if screen.editor_group_split.is_some() {
+        (0.0, 0.0)
+    } else {
+        (editor_area.x as f32, editor_area.y as f32)
+    };
     let bounds = render::screen_to_drop_group_bounds(
         screen,
         engine,
-        (editor_area.x as f32, editor_area.y as f32),
+        drop_origin,
         (editor_area.width as f32, editor_area.height as f32),
         tbh_f,
     );
@@ -1347,10 +1369,17 @@ pub(super) fn compute_tui_tab_drop_zone(
     } else {
         1.0
     };
+    // #550/#515: same double-count hazard as `render_tab_drag_overlay` above —
+    // split-mode `gtb.bounds` is already absolute, so the origin must be (0,0).
+    let drop_origin = if layout.editor_group_split.is_some() {
+        (0.0, 0.0)
+    } else {
+        (editor_left as f32, menu_rows as f32)
+    };
     let bounds = render::screen_to_drop_group_bounds(
         layout,
         engine,
-        (editor_left as f32, menu_rows as f32),
+        drop_origin,
         (editor_w as f32, editor_h as f32),
         tbh_f,
     );
@@ -1416,20 +1445,20 @@ pub(super) fn draw_breadcrumb_bar(
 pub(super) fn render_all_windows(
     backend: &mut super::backend::TuiBackend,
     frame: &mut ratatui::Frame,
-    editor_area: Rect,
     windows: &[RenderedWindow],
     theme: &Theme,
 ) {
     for window in windows {
+        // #550: `window.rect` is already absolute terminal-screen coordinates.
         let win_rect = Rect {
-            x: editor_area.x + window.rect.x as u16,
-            y: editor_area.y + window.rect.y as u16,
+            x: window.rect.x as u16,
+            y: window.rect.y as u16,
             width: window.rect.width as u16,
             height: window.rect.height as u16,
         };
         render_window(backend, frame, win_rect, window, theme);
     }
-    render_separators(frame.buffer_mut(), editor_area, windows, theme);
+    render_separators(frame.buffer_mut(), windows, theme);
 }
 
 /// Render the unified picker popup. Supports single-pane (no preview) and
@@ -1570,7 +1599,6 @@ pub(super) fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize
 
 pub(super) fn render_separators(
     buf: &mut ratatui::buffer::Buffer,
-    editor_area: Rect,
     windows: &[RenderedWindow],
     theme: &Theme,
 ) {
@@ -1592,10 +1620,11 @@ pub(super) fn render_separators(
             let v_overlap =
                 a.rect.y.max(b.rect.y) < (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height);
             if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 && v_overlap {
-                let sep_x = editor_area.x + (a.rect.x + a.rect.width) as u16;
-                let y_start = editor_area.y + a.rect.y.max(b.rect.y) as u16;
-                let y_end =
-                    editor_area.y + (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
+                // #550: `a.rect`/`b.rect` are already absolute terminal-screen
+                // coordinates, so no `editor_area` offset addition needed.
+                let sep_x = (a.rect.x + a.rect.width) as u16;
+                let y_start = a.rect.y.max(b.rect.y) as u16;
+                let y_end = (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
 
                 // #481 (iter4): `quadraui::tui::draw_editor` already paints
                 // window `a`'s own vertical scrollbar in this exact column
@@ -1644,10 +1673,9 @@ pub(super) fn render_separators(
                 false
             };
             if (a.rect.y + a.rect.height - b.rect.y).abs() < 1.0 && h_overlap && !upper_has_status {
-                let sep_y = editor_area.y + (a.rect.y + a.rect.height) as u16;
-                let x_start = editor_area.x + a.rect.x.max(b.rect.x) as u16;
-                let x_end =
-                    editor_area.x + (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width) as u16;
+                let sep_y = (a.rect.y + a.rect.height) as u16;
+                let x_start = a.rect.x.max(b.rect.x) as u16;
+                let x_end = (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width) as u16;
                 for x in x_start..x_end.max(x_start) {
                     set_cell(buf, x, sep_y.saturating_sub(1), '─', sep_fg, sep_bg);
                 }

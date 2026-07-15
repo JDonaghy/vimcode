@@ -738,11 +738,13 @@ pub struct BreadcrumbDrawTarget<'a> {
 /// Relm4-era draw path that *did* draw breadcrumbs stopped being called
 /// after the #540 ShellApp migration and nothing replaced it).
 ///
-/// `origin_offset` translates `bc.bounds` (computed relative to the
-/// coordinate space of the `window_rects` passed into `build_screen_layout`)
-/// into the caller's screen space: GTK's window rects are already absolute,
-/// so it passes `(0.0, 0.0)`; TUI's are content-area-relative, so it passes
-/// `(editor_area.x, editor_area.y)`.
+/// `bc.bounds` is already in the caller's screen space: both backends feed
+/// `build_screen_layout` window rects in absolute terminal/pixel coordinates
+/// (#550 — TUI used to compute content-area-relative rects and every draw
+/// call site had to re-add the editor area's origin via an `origin_offset`
+/// param here; that offset is always `(0.0, 0.0)` now that TUI's
+/// `content_bounds` origin matches GTK's convention, so the param was
+/// dropped).
 ///
 /// Targets with zero width (the `min_x == f64::MAX` fallback in
 /// `build_screen_layout` when a group has no matching window rects, e.g.
@@ -754,20 +756,18 @@ pub fn breadcrumb_draw_targets(
     screen: &ScreenLayout,
     terminal_maximized: bool,
     line_height: f64,
-    origin_offset: (f64, f64),
 ) -> Vec<BreadcrumbDrawTarget<'_>> {
     if terminal_maximized {
         return Vec::new();
     }
-    let (ox, oy) = origin_offset;
     screen
         .breadcrumbs
         .iter()
         .filter(|bc| !bc.segments.is_empty() && bc.bounds.width > 0.0)
         .map(|bc| BreadcrumbDrawTarget {
             rect: quadraui::Rect::new(
-                (bc.bounds.x + ox) as f32,
-                (bc.bounds.y + oy) as f32,
+                bc.bounds.x as f32,
+                bc.bounds.y as f32,
                 bc.bounds.width as f32,
                 line_height as f32,
             ),
@@ -816,11 +816,10 @@ pub struct TabBarDrawTarget<'a> {
 /// 2 rows) — used to recover the tab row's own top edge from
 /// `GroupTabBar::bounds.y`, which is the *window* content's top edge.
 ///
-/// `origin_offset` translates `bounds` (relative to the coordinate space of
-/// the `window_rects` passed into `build_screen_layout`) into the caller's
-/// screen space, same convention as `breadcrumb_draw_targets`: GTK's window
-/// rects are already absolute, so it passes `(0.0, 0.0)`; TUI's are
-/// content-area-relative, so it passes `(editor_area.x, editor_area.y)`.
+/// `bounds` is already in the caller's screen space, same convention as
+/// `breadcrumb_draw_targets` (#550 — the `origin_offset` param this function
+/// used to carry for TUI's content-area-relative rects was dropped once TUI
+/// started feeding absolute rects like GTK).
 ///
 /// `single_group_rect` is `(x, y, width)` for the single-group tab bar,
 /// already in the caller's output coordinate space (there is no per-group
@@ -839,10 +838,8 @@ pub fn tab_bar_draw_targets<'a>(
     screen: &'a ScreenLayout,
     tab_row_h: f64,
     reserved_h: f64,
-    origin_offset: (f64, f64),
     single_group_rect: (f64, f64, f64),
 ) -> Vec<TabBarDrawTarget<'a>> {
-    let (ox, oy) = origin_offset;
     if let Some(ref split) = screen.editor_group_split {
         split
             .group_tab_bars
@@ -850,8 +847,8 @@ pub fn tab_bar_draw_targets<'a>(
             .filter(|gtb| !engine.is_tab_bar_hidden(gtb.group_id) && gtb.bounds.width > 0.0)
             .map(|gtb| TabBarDrawTarget {
                 rect: quadraui::Rect::new(
-                    (gtb.bounds.x + ox) as f32,
-                    (gtb.bounds.y - reserved_h + oy) as f32,
+                    gtb.bounds.x as f32,
+                    (gtb.bounds.y - reserved_h) as f32,
                     gtb.bounds.width as f32,
                     tab_row_h as f32,
                 ),
@@ -16016,9 +16013,10 @@ mod tests {
     /// Direct unit test for `breadcrumb_draw_targets` itself (#547 review
     /// finding: the test above only pins the pre-existing `build_screen_layout`
     /// bounds computation, never the new shared helper). Covers the
-    /// `terminal_maximized` early return, the `origin_offset` translation
-    /// arithmetic, the `segments.is_empty()` filter, and the zero-width
-    /// fallback filter.
+    /// `terminal_maximized` early return, the pass-through of already-absolute
+    /// bounds (#550 — the `origin_offset` translation this used to carry was
+    /// dropped once both backends feed absolute window rects), the
+    /// `segments.is_empty()` filter, and the zero-width fallback filter.
     #[test]
     fn test_breadcrumb_draw_targets_offset_terminal_maximized_and_filters() {
         use crate::core::engine::Engine;
@@ -16039,7 +16037,9 @@ mod tests {
             engine.buffer_manager.get_mut(buf_id).unwrap().file_path =
                 Some(std::path::PathBuf::from("src/main.rs"));
             let tbh = 24.0;
-            let content_bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+            // Non-zero origin to prove `breadcrumb_draw_targets` passes
+            // through absolute bounds untouched rather than assuming (0,0).
+            let content_bounds = WindowRect::new(10.0, 20.0, 800.0, 600.0);
             let (rects, _) = engine.calculate_group_window_rects(content_bounds, tbh);
             build_screen_layout(&engine, &theme, &rects, line_height, char_width, true)
         };
@@ -16049,45 +16049,28 @@ mod tests {
         assert!(!screen.breadcrumbs[0].segments.is_empty());
         assert!(screen.breadcrumbs[0].bounds.width > 0.0);
 
-        // `terminal_maximized` short-circuits to empty regardless of offset.
-        let targets = breadcrumb_draw_targets(&screen, true, line_height, (10.0, 20.0));
+        // `terminal_maximized` short-circuits to empty.
+        let targets = breadcrumb_draw_targets(&screen, true, line_height);
         assert!(
             targets.is_empty(),
             "terminal_maximized must suppress all breadcrumb targets"
         );
 
-        // Not maximized: one target, translated by `origin_offset` (TUI's convention).
-        let targets = breadcrumb_draw_targets(&screen, false, line_height, (10.0, 20.0));
+        // Not maximized: one target, matching the already-absolute bounds.
+        let targets = breadcrumb_draw_targets(&screen, false, line_height);
         assert_eq!(targets.len(), 1);
-        assert_eq!(
-            targets[0].rect.x,
-            (screen.breadcrumbs[0].bounds.x + 10.0) as f32
-        );
-        assert_eq!(
-            targets[0].rect.y,
-            (screen.breadcrumbs[0].bounds.y + 20.0) as f32
-        );
+        assert_eq!(targets[0].rect.x, screen.breadcrumbs[0].bounds.x as f32);
+        assert_eq!(targets[0].rect.y, screen.breadcrumbs[0].bounds.y as f32);
         assert_eq!(
             targets[0].rect.width,
             screen.breadcrumbs[0].bounds.width as f32
         );
         assert_eq!(targets[0].rect.height, line_height as f32);
 
-        // Zero offset (GTK's convention): rect matches raw bounds untouched.
-        let targets_zero = breadcrumb_draw_targets(&screen, false, line_height, (0.0, 0.0));
-        assert_eq!(
-            targets_zero[0].rect.x,
-            screen.breadcrumbs[0].bounds.x as f32
-        );
-        assert_eq!(
-            targets_zero[0].rect.y,
-            screen.breadcrumbs[0].bounds.y as f32
-        );
-
         // Empty segments are filtered out even when not maximized.
         let mut screen_no_segments = build_screen();
         screen_no_segments.breadcrumbs[0].segments.clear();
-        let targets = breadcrumb_draw_targets(&screen_no_segments, false, line_height, (0.0, 0.0));
+        let targets = breadcrumb_draw_targets(&screen_no_segments, false, line_height);
         assert!(
             targets.is_empty(),
             "a breadcrumb bar with no segments must not be drawn"
@@ -16098,7 +16081,7 @@ mod tests {
         // its own `rect.width > 0.0` guard (unlike TUI's pre-existing one).
         let mut screen_zero_width = build_screen();
         screen_zero_width.breadcrumbs[0].bounds.width = 0.0;
-        let targets = breadcrumb_draw_targets(&screen_zero_width, false, line_height, (0.0, 0.0));
+        let targets = breadcrumb_draw_targets(&screen_zero_width, false, line_height);
         assert!(
             targets.is_empty(),
             "a zero-width breadcrumb bar must not be drawn"
@@ -16107,9 +16090,11 @@ mod tests {
 
     /// Direct unit test for `tab_bar_draw_targets` (#549, follow-up to
     /// #547's `breadcrumb_draw_targets`). Covers the single-group rect
-    /// pass-through, the split-group `reserved_h` subtraction +
-    /// `origin_offset` translation, the `is_tab_bar_hidden` filter in both
-    /// modes, and the zero-width fallback filter in split mode.
+    /// pass-through, the split-group `reserved_h` subtraction against
+    /// already-absolute bounds (#550 — the `origin_offset` translation this
+    /// used to carry was dropped once both backends feed absolute window
+    /// rects), the `is_tab_bar_hidden` filter in both modes, and the
+    /// zero-width fallback filter in split mode.
     #[test]
     fn test_tab_bar_draw_targets_single_and_split() {
         use crate::core::engine::Engine;
@@ -16128,14 +16113,8 @@ mod tests {
         let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
         assert!(screen.editor_group_split.is_none());
 
-        let targets = tab_bar_draw_targets(
-            &engine,
-            &screen,
-            tab_row_h,
-            reserved_h,
-            (0.0, 0.0),
-            (10.0, 20.0, 800.0),
-        );
+        let targets =
+            tab_bar_draw_targets(&engine, &screen, tab_row_h, reserved_h, (10.0, 20.0, 800.0));
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].rect.x, 10.0);
         assert_eq!(targets[0].rect.y, 20.0);
@@ -16152,7 +16131,6 @@ mod tests {
             &screen_hidden,
             tab_row_h,
             reserved_h,
-            (0.0, 0.0),
             (10.0, 20.0, 800.0),
         );
         assert!(
@@ -16161,9 +16139,12 @@ mod tests {
         );
 
         // ── Split-group mode ────────────────────────────────────────────
+        // Non-zero content_bounds origin to prove `tab_bar_draw_targets`
+        // passes through absolute bounds untouched rather than assuming (0,0).
         let mut engine = Engine::new();
         engine.execute_command("EditorGroupSplit");
         assert_eq!(engine.group_layout.leaf_count(), 2);
+        let content_bounds = WindowRect::new(5.0, 7.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, reserved_h);
         let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
         let split = screen
@@ -16172,13 +16153,12 @@ mod tests {
             .expect("2 groups must produce Some(editor_group_split)");
         assert_eq!(split.group_tab_bars.len(), 2);
 
-        // Zero offset (GTK's convention): rect derived from bounds.y - reserved_h.
+        // Rect derived from the already-absolute `bounds.y - reserved_h`.
         let targets = tab_bar_draw_targets(
             &engine,
             &screen,
             tab_row_h,
             reserved_h,
-            (0.0, 0.0),
             (0.0, 0.0, 0.0), // unused in split mode
         );
         assert_eq!(targets.len(), 2);
@@ -16189,24 +16169,6 @@ mod tests {
             assert_eq!(target.rect.width, gtb.bounds.width as f32);
             assert_eq!(target.rect.height, tab_row_h as f32);
         }
-
-        // Non-zero offset (TUI's convention): translated by origin_offset.
-        let targets = tab_bar_draw_targets(
-            &engine,
-            &screen,
-            tab_row_h,
-            reserved_h,
-            (5.0, 7.0),
-            (0.0, 0.0, 0.0),
-        );
-        assert_eq!(
-            targets[0].rect.x,
-            (split.group_tab_bars[0].bounds.x + 5.0) as f32
-        );
-        assert_eq!(
-            targets[0].rect.y,
-            (split.group_tab_bars[0].bounds.y - reserved_h + 7.0) as f32
-        );
 
         // Note: `is_tab_bar_hidden` only ever returns true in single-group
         // mode (`hide_single_tab` + `leaf_count() <= 1`, see
@@ -16231,7 +16193,6 @@ mod tests {
             &screen_zero_width,
             tab_row_h,
             reserved_h,
-            (0.0, 0.0),
             (0.0, 0.0, 0.0),
         );
         assert_eq!(
