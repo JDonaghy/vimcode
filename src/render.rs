@@ -8615,22 +8615,22 @@ pub fn picker_panel_to_palette(picker: &PickerPanel) -> quadraui::Palette {
 /// engine fields.
 ///
 /// Scope: covers the scrollable field list. Callers still handle the
-/// panel header / search input / scrollbar themselves, and fall back
-/// to a legacy inline renderer when `settings_editing.is_some()` or
-/// `ext_settings_editing.is_some()` because the `Form` primitive does
-/// not yet render an editable `TextInput` for inline-edit mode (the
-/// cursor-aware primitive support landed in A.3d but the adapter has
-/// not been upgraded to emit `TextInput` for active-edit fields —
-/// tracked as a future refinement).
+/// panel header / search input / scrollbar themselves.
 ///
 /// Field type mapping:
 /// - `CoreCategory` / `ExtCategory` → `FieldKind::Label` (collapsible header)
 /// - `CoreSetting` with `Bool` → `FieldKind::Toggle`
-/// - `CoreSetting` with any other type → `FieldKind::ReadOnly`
+/// - `CoreSetting` currently being inline-edited (`engine.settings_editing
+///   == Some(idx)`) → `FieldKind::TextInput` sourced from
+///   `engine.settings_edit_buf`, with `cursor` set to the buffer's byte
+///   length (edits are append/backspace-only — the cursor always sits at
+///   the end, see `Engine::handle_settings_key`).
+/// - `CoreSetting` with any other type, not being edited → `FieldKind::ReadOnly`
 ///   (enum cycling / numeric / string values still work — keys are
 ///   handled by `engine.handle_settings_key()`; the adapter just shows
 ///   the current value)
-/// - `ExtSetting` mapped analogously via the manifest's declared type.
+/// - `ExtSetting` mapped analogously via the manifest's declared type,
+///   using `engine.ext_settings_editing` for the inline-edit check.
 pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
     use crate::core::engine::SettingsRow;
     use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
@@ -8680,14 +8680,23 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
             }
             SettingsRow::CoreSetting(idx) => {
                 let def = &SETTING_DEFS[*idx];
-                let value_str = engine.settings.get_value_str(def.key);
-                let kind = match def.setting_type {
-                    SettingType::Bool => FieldKind::Toggle {
-                        value: value_str == "true",
-                    },
-                    _ => FieldKind::ReadOnly {
-                        value: StyledText::plain(value_str),
-                    },
+                let kind = if engine.settings_editing == Some(*idx) {
+                    FieldKind::TextInput {
+                        value: engine.settings_edit_buf.clone(),
+                        placeholder: String::new(),
+                        cursor: Some(engine.settings_edit_buf.len()),
+                        selection_anchor: None,
+                    }
+                } else {
+                    let value_str = engine.settings.get_value_str(def.key);
+                    match def.setting_type {
+                        SettingType::Bool => FieldKind::Toggle {
+                            value: value_str == "true",
+                        },
+                        _ => FieldKind::ReadOnly {
+                            value: StyledText::plain(value_str),
+                        },
+                    }
                 };
                 FormField {
                     id: WidgetId::new(format!("setting-{}", idx)),
@@ -8699,15 +8708,32 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                 }
             }
             SettingsRow::ExtSetting(ext_name, key) => {
+                let editing_this = engine
+                    .ext_settings_editing
+                    .as_ref()
+                    .is_some_and(|(en, ek)| en == ext_name && ek == key);
                 let def_opt = engine.find_ext_setting_def(ext_name, key);
-                let value_str = engine.get_ext_setting(ext_name, key);
-                let (label_str, kind) = if let Some(d) = def_opt {
-                    let label = if d.label.is_empty() {
-                        key.clone()
-                    } else {
-                        d.label.clone()
-                    };
-                    let kind = if d.r#type == "bool" {
+                let label_str = def_opt
+                    .as_ref()
+                    .map(|d| {
+                        if d.label.is_empty() {
+                            key.clone()
+                        } else {
+                            d.label.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| key.clone());
+                let kind = if editing_this {
+                    FieldKind::TextInput {
+                        value: engine.settings_edit_buf.clone(),
+                        placeholder: String::new(),
+                        cursor: Some(engine.settings_edit_buf.len()),
+                        selection_anchor: None,
+                    }
+                } else {
+                    let value_str = engine.get_ext_setting(ext_name, key);
+                    let is_bool = def_opt.as_ref().is_some_and(|d| d.r#type == "bool");
+                    if is_bool {
                         FieldKind::Toggle {
                             value: value_str == "true",
                         }
@@ -8715,15 +8741,7 @@ pub fn settings_to_form(engine: &Engine) -> quadraui::Form {
                         FieldKind::ReadOnly {
                             value: StyledText::plain(value_str),
                         }
-                    };
-                    (label, kind)
-                } else {
-                    (
-                        key.clone(),
-                        FieldKind::ReadOnly {
-                            value: StyledText::plain(value_str),
-                        },
-                    )
+                    }
                 };
                 FormField {
                     id: WidgetId::new(format!("ext-setting-{}-{}", ext_name, key)),
@@ -14507,6 +14525,90 @@ mod tests {
             e.buffer_mut().insert(0, text);
         }
         e
+    }
+
+    #[test]
+    fn test_settings_to_form_read_only_by_default() {
+        let e = test_engine("");
+        let idx = crate::core::settings::SETTING_DEFS
+            .iter()
+            .position(|d| d.key == "font_family")
+            .expect("font_family setting exists");
+        let form = settings_to_form(&e);
+        let field = form
+            .fields
+            .iter()
+            .find(|f| f.id == quadraui::WidgetId::new(format!("setting-{idx}")))
+            .expect("font_family field present");
+        assert!(
+            matches!(field.kind, quadraui::FieldKind::ReadOnly { .. }),
+            "non-edited StringVal setting should render ReadOnly, got {:?}",
+            field.kind
+        );
+    }
+
+    #[test]
+    fn test_settings_to_form_inline_edit_emits_text_input_with_cursor() {
+        let mut e = test_engine("");
+        let idx = crate::core::settings::SETTING_DEFS
+            .iter()
+            .position(|d| d.key == "font_family")
+            .expect("font_family setting exists");
+        e.settings_editing = Some(idx);
+        e.settings_edit_buf = "Fira Code".to_string();
+
+        let form = settings_to_form(&e);
+        let field = form
+            .fields
+            .iter()
+            .find(|f| f.id == quadraui::WidgetId::new(format!("setting-{idx}")))
+            .expect("font_family field present");
+        match &field.kind {
+            quadraui::FieldKind::TextInput { value, cursor, .. } => {
+                assert_eq!(value, "Fira Code");
+                assert_eq!(*cursor, Some("Fira Code".len()));
+            }
+            other => panic!("expected TextInput while editing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_settings_to_form_ext_setting_inline_edit_emits_text_input() {
+        use crate::core::extensions::{ExtSettingDef, ExtensionManifest};
+        use crate::core::session::InstalledExtension;
+
+        let mut e = test_engine("");
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: "myext".to_string(),
+            display_name: "My Ext".to_string(),
+            settings: vec![ExtSettingDef {
+                key: "greeting".to_string(),
+                label: "Greeting".to_string(),
+                r#type: "string".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }]);
+        e.extension_state.installed.push(InstalledExtension {
+            name: "myext".to_string(),
+            version: String::new(),
+        });
+        e.ext_settings_editing = Some(("myext".to_string(), "greeting".to_string()));
+        e.settings_edit_buf = "hi".to_string();
+
+        let form = settings_to_form(&e);
+        let field = form
+            .fields
+            .iter()
+            .find(|f| f.id == quadraui::WidgetId::new("ext-setting-myext-greeting"))
+            .expect("ext setting field present");
+        match &field.kind {
+            quadraui::FieldKind::TextInput { value, cursor, .. } => {
+                assert_eq!(value, "hi");
+                assert_eq!(*cursor, Some("hi".len()));
+            }
+            other => panic!("expected TextInput while editing ext setting, got {other:?}"),
+        }
     }
 
     #[test]
