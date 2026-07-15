@@ -124,18 +124,9 @@ pub(super) fn render_settings_panel(
     engine: &Engine,
 ) {
     let buf = frame.buffer_mut();
-    use crate::core::settings::{setting_categories, SettingType, SETTING_DEFS};
 
     let fg = rc(theme.foreground);
     let bg = rc(theme.tab_bar_bg);
-    let dim_fg = rc(theme.line_number_fg);
-    let key_fg = rc(theme.keyword);
-    let sel_bg = if engine.settings_has_focus {
-        rc(theme.sidebar_sel_bg)
-    } else {
-        rc(theme.sidebar_sel_bg_inactive)
-    };
-    let cat_fg = rc(theme.keyword);
 
     if area.height == 0 {
         return;
@@ -166,350 +157,31 @@ pub(super) fn render_settings_panel(
         &super::quadraui_tui::q_theme(theme),
     );
 
-    // Rows 2+: scrollable form content
+    // Rows 2+: scrollable form content, via the shared `quadraui::Form` +
+    // `FormController` primitive (#479). Inline-edit rows are driven
+    // through `FieldKind::TextInput` with a cursor (see
+    // `render::settings_to_form`) so there is no separate manual
+    // renderer for the edit-in-progress state.
     let content_start = area.y + 2;
     let content_height = area.height.saturating_sub(2) as usize;
     if content_height == 0 {
         return;
     }
 
-    // Phase A.3b migration: when no inline edit is active, render the
-    // field list via the shared `quadraui::Form` primitive. The legacy
-    // inline renderer below still handles inline-edit modes (integer /
-    // string cursor, enum cycling UI) until the `Form` primitive gains
-    // text-cursor support.
-    let has_inline_edit =
-        engine.settings_editing.is_some() || engine.ext_settings_editing.is_some();
-    if !has_inline_edit {
-        render::populate_settings_form_controller(engine);
-        let q_rect = quadraui::Rect::new(
-            area.x as f32,
-            content_start as f32,
-            area.width as f32,
-            content_height as f32,
-        );
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            engine
-                .settings_form_controller
-                .borrow_mut()
-                .render_and_cache(b, q_rect);
-        });
-        return;
-    }
-
-    let flat = engine.settings_flat_list();
-    let cats = setting_categories();
-    let total = flat.len();
-
-    // Scrollbar column is the rightmost
-    let sb_col = area.x + area.width - 1;
-    let content_width = area.width.saturating_sub(1); // leave room for scrollbar
-
-    let scroll = engine.settings_scroll_top;
-
-    for vi in 0..content_height {
-        let fi = scroll + vi;
-        let y = content_start + vi as u16;
-        if fi >= total {
-            break;
-        }
-
-        use crate::core::engine::SettingsRow;
-        let row = &flat[fi];
-        let is_selected = fi == engine.settings_selected && engine.settings_has_focus;
-        let row_bg = if is_selected { sel_bg } else { bg };
-
-        // Fill row background
-        for x in area.x..area.x + content_width {
-            set_cell(buf, x, y, ' ', fg, row_bg);
-        }
-
-        let right_edge = area.x + content_width;
-
-        match row {
-            SettingsRow::CoreCategory(cat_idx) => {
-                let collapsed = *cat_idx < engine.settings_collapsed.len()
-                    && engine.settings_collapsed[*cat_idx];
-                let arrow = if collapsed { '▶' } else { '▼' };
-                let cat_name = if *cat_idx < cats.len() {
-                    cats[*cat_idx]
-                } else {
-                    "?"
-                };
-                let mut x = area.x + 1;
-                set_cell(buf, x, y, arrow, cat_fg, row_bg);
-                x += 2;
-                for ch in cat_name.chars() {
-                    if x >= area.x + content_width {
-                        break;
-                    }
-                    set_cell(buf, x, y, ch, cat_fg, row_bg);
-                    x += 1;
-                }
-            }
-            SettingsRow::ExtCategory(name) => {
-                let collapsed = engine
-                    .ext_settings_collapsed
-                    .get(name)
-                    .copied()
-                    .unwrap_or(false);
-                let arrow = if collapsed { '▶' } else { '▼' };
-                // Use display_name if available, otherwise capitalize name
-                let display = engine
-                    .ext_available_manifests()
-                    .into_iter()
-                    .find(|m| &m.name == name)
-                    .map(|m| m.display_name.clone())
-                    .unwrap_or_else(|| name.clone());
-                let mut x = area.x + 1;
-                set_cell(buf, x, y, arrow, cat_fg, row_bg);
-                x += 2;
-                for ch in display.chars() {
-                    if x >= area.x + content_width {
-                        break;
-                    }
-                    set_cell(buf, x, y, ch, cat_fg, row_bg);
-                    x += 1;
-                }
-            }
-            SettingsRow::CoreSetting(idx) => {
-                let def = &SETTING_DEFS[*idx];
-                let mut x = area.x + 3;
-                for ch in def.label.chars() {
-                    if x >= area.x + content_width {
-                        break;
-                    }
-                    set_cell(buf, x, y, ch, fg, row_bg);
-                    x += 1;
-                }
-
-                let editing_this = engine.settings_editing == Some(*idx);
-
-                match &def.setting_type {
-                    SettingType::Bool => {
-                        let val = engine.settings.get_value_str(def.key);
-                        let display = if val == "true" { "[✓]" } else { "[ ]" };
-                        let val_len = 3u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx;
-                        for ch in display.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, key_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                    SettingType::Integer { .. } => {
-                        let display = if editing_this {
-                            format!("{}█", engine.settings_edit_buf)
-                        } else {
-                            engine.settings.get_value_str(def.key)
-                        };
-                        let val_len = display.chars().count() as u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx.max(x);
-                        for ch in display.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, key_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                    SettingType::Enum(_) | SettingType::DynamicEnum(_) => {
-                        let val = engine.settings.get_value_str(def.key);
-                        let display = format!("{val} ▸");
-                        let val_len = display.chars().count() as u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx.max(x);
-                        for ch in display.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, key_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                    SettingType::StringVal => {
-                        let display = if editing_this {
-                            format!("{}█", engine.settings_edit_buf)
-                        } else {
-                            let val = engine.settings.get_value_str(def.key);
-                            if val.is_empty() {
-                                "(empty)".to_string()
-                            } else {
-                                val
-                            }
-                        };
-                        let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
-                        let truncated: String = display.chars().take(max_val_width).collect();
-                        let val_len = truncated.chars().count() as u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx.max(x);
-                        let val_fg = if editing_this { fg } else { dim_fg };
-                        for ch in truncated.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, val_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                    SettingType::BufferEditor => {
-                        let display = match def.key {
-                            "keymaps" => {
-                                format!("{} defined ▸", engine.settings.keymaps.len())
-                            }
-                            "extension_registries" => {
-                                format!(
-                                    "{} configured ▸",
-                                    engine.settings.extension_registries.len()
-                                )
-                            }
-                            _ => "▸".to_string(),
-                        };
-                        let val_len = display.chars().count() as u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx.max(x);
-                        for ch in display.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, key_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                }
-            }
-            SettingsRow::ExtSetting(ext_name, ext_key) => {
-                // Extension setting — render like core settings
-                let def = engine.find_ext_setting_def(ext_name, ext_key);
-                let label = def.as_ref().map(|d| d.label.as_str()).unwrap_or(ext_key);
-                let mut x = area.x + 3;
-                for ch in label.chars() {
-                    if x >= area.x + content_width {
-                        break;
-                    }
-                    set_cell(buf, x, y, ch, fg, row_bg);
-                    x += 1;
-                }
-
-                let editing_this = engine
-                    .ext_settings_editing
-                    .as_ref()
-                    .is_some_and(|(en, ek)| en == ext_name && ek == ext_key);
-                let val = engine.get_ext_setting(ext_name, ext_key);
-                let typ = def.as_ref().map(|d| d.r#type.as_str()).unwrap_or("string");
-
-                match typ {
-                    "bool" => {
-                        let display = if val == "true" { "[✓]" } else { "[ ]" };
-                        let val_len = 3u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx;
-                        for ch in display.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, key_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                    "enum" => {
-                        let display = format!("{val} ▸");
-                        let val_len = display.chars().count() as u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx.max(x);
-                        for ch in display.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, key_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                    _ => {
-                        // string/integer
-                        let display = if editing_this {
-                            format!("{}█", engine.settings_edit_buf)
-                        } else if val.is_empty() {
-                            "(empty)".to_string()
-                        } else {
-                            val
-                        };
-                        let max_val_width = content_width.saturating_sub(x - area.x + 2) as usize;
-                        let truncated: String = display.chars().take(max_val_width).collect();
-                        let val_len = truncated.chars().count() as u16;
-                        let vx = right_edge.saturating_sub(val_len + 1);
-                        let mut cx = vx.max(x);
-                        let val_fg = if editing_this { fg } else { dim_fg };
-                        for ch in truncated.chars() {
-                            if cx >= right_edge {
-                                break;
-                            }
-                            set_cell(buf, cx, y, ch, val_fg, row_bg);
-                            cx += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Scrollbar
-    let settings_scrollbar = if total > content_height && content_height > 0 {
-        let sb_thumb = rc(theme.scrollbar_thumb);
-        let sb_track = rc(theme.scrollbar_track);
-        let sb_bg = rc(theme.background);
-        let track_len = content_height;
-        let thumb_len = (content_height * content_height / total).max(1);
-        let thumb_start = scroll * track_len / total;
-        for i in 0..track_len {
-            let y = content_start + i as u16;
-            let (ch, cfp) = if i >= thumb_start && i < thumb_start + thumb_len {
-                ('█', sb_thumb)
-            } else {
-                ('░', sb_track)
-            };
-            set_cell(buf, sb_col, y, ch, cfp, sb_bg);
-        }
-        Some(quadraui::SurfaceScrollbar {
-            axis: quadraui::ScrollAxis::Vertical,
-            track_bounds: quadraui::Rect::new(
-                sb_col as f32,
-                content_start as f32,
-                1.0,
-                track_len as f32,
-            ),
-            thumb_bounds: quadraui::Rect::new(
-                sb_col as f32,
-                content_start as f32 + thumb_start as f32,
-                1.0,
-                thumb_len as f32,
-            ),
-            total_items: total,
-            visible_items: content_height,
-            scroll_offset: scroll,
-            inverted: false,
-        })
-    } else {
-        None
-    };
-    engine
-        .scroll_surfaces
-        .borrow_mut()
-        .push(quadraui::ScrollSurface {
-            id: quadraui::WidgetId::new("tui:settings"),
-            bounds: quadraui::Rect::new(
-                area.x as f32,
-                content_start as f32,
-                area.width as f32,
-                content_height as f32,
-            ),
-            scrollbar: settings_scrollbar,
-        });
+    render::populate_settings_form_controller(engine);
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        content_start as f32,
+        area.width as f32,
+        content_height as f32,
+    );
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.enter_frame_scope(frame, |b| {
+        engine
+            .settings_form_controller
+            .borrow_mut()
+            .render_and_cache(b, q_rect);
+    });
 }
 
 /// Render the project search panel via SidebarSystem (Form + TreeView).
