@@ -16451,7 +16451,11 @@ mod tests {
         let (split, rect) = divider_to_split(&div, quadraui::WidgetId::new("wdiv:0:0"));
         // vimcode's `Vertical` (side-by-side) is quadraui's `Horizontal`.
         assert_eq!(split.direction, quadraui::SplitDirection::Horizontal);
-        assert!((split.ratio - 0.4).abs() < 0.0001, "ratio = {}", split.ratio);
+        assert!(
+            (split.ratio - 0.4).abs() < 0.0001,
+            "ratio = {}",
+            split.ratio
+        );
         // `rect` reconstructs the original node bounds exactly.
         assert_eq!(rect, quadraui::Rect::new(0.0, 5.0, 100.0, 20.0));
     }
@@ -16473,7 +16477,83 @@ mod tests {
         let (split, rect) = divider_to_split(&div, quadraui::WidgetId::new("wdiv:0:0"));
         // vimcode's `Horizontal` (stacked) is quadraui's `Vertical`.
         assert_eq!(split.direction, quadraui::SplitDirection::Vertical);
-        assert!((split.ratio - 0.6).abs() < 0.0001, "ratio = {}", split.ratio);
+        assert!(
+            (split.ratio - 0.6).abs() < 0.0001,
+            "ratio = {}",
+            split.ratio
+        );
         assert_eq!(rect, quadraui::Rect::new(10.0, 0.0, 20.0, 50.0));
+    }
+
+    /// #582 iteration-2 regression: GTK's `:vsplit` divider was unhittable
+    /// because the hit-test rebuilt its bounds at origin `(0, 0)` while
+    /// `render_content` painted from `main_content_bounds` — origin offset
+    /// right by the activity bar/sidebar. The press then missed and fell
+    /// through to text-selection.
+    ///
+    /// Pins the invariant the GTK fix relies on: a divider's hit band tracks
+    /// its `axis_start`, so an origin-shifted (`0.0`) recomputation of the
+    /// same split is NOT interchangeable with the painted one. If this ever
+    /// passes at both positions, the two frames have been conflated again.
+    #[test]
+    fn divider_hit_test_follows_axis_start_not_screen_origin() {
+        // A `:vsplit` inside a group whose content starts at x=300 (activity
+        // bar + sidebar) — painted at 300 + 600*0.5 = 600.
+        let div = WindowDivider {
+            group_id: GroupId(0),
+            split_index: 0,
+            direction: SplitDirection::Vertical,
+            position: 600.0,
+            axis_start: 300.0,
+            axis_size: 600.0,
+            cross_start: 40.0,
+            cross_size: 500.0,
+        };
+        let dividers = [div];
+
+        // A click on the painted line hits.
+        assert_eq!(
+            divider_hit_test(&dividers, 600.0, 300.0, (6.0, 6.0), (6.0, 6.0), false),
+            Some(0),
+        );
+        // The position an origin-at-zero recomputation would have painted
+        // (0 + 600*0.5 = 300) is NOT the divider — this is the exact
+        // displacement that made #582's `:vsplit` fall through.
+        assert_eq!(
+            divider_hit_test(&dividers, 300.0, 300.0, (6.0, 6.0), (6.0, 6.0), false),
+            None,
+        );
+
+        // The drag ratio is likewise anchored to `axis_start`: dragging to
+        // x=450 is 25% across the group, not 75% (which is what 450/600 would
+        // give if the origin were dropped).
+        let r = divider_ratio_from_pos(&dividers[0], 450.0, 300.0);
+        assert!((r - 0.25).abs() < 0.0001, "ratio = {r}");
+    }
+
+    /// Companion to the above for the paint side: `divider_to_split` must
+    /// reconstruct the divider's *absolute* node bounds, so `Backend::
+    /// draw_split` lands the line on the same pixels `divider_hit_test`
+    /// accepts. An origin-relative rect here would paint the line away from
+    /// its own hit band.
+    #[test]
+    fn divider_to_split_preserves_absolute_origin() {
+        let div = WindowDivider {
+            group_id: GroupId(0),
+            split_index: 0,
+            direction: SplitDirection::Vertical,
+            position: 600.0,
+            axis_start: 300.0,
+            axis_size: 600.0,
+            cross_start: 40.0,
+            cross_size: 500.0,
+        };
+        let (split, rect) = divider_to_split(&div, quadraui::WidgetId::new("wdiv:0:0"));
+        assert!(
+            (split.ratio - 0.5).abs() < 0.0001,
+            "ratio = {}",
+            split.ratio
+        );
+        assert_eq!(rect, quadraui::Rect::new(300.0, 40.0, 600.0, 500.0));
     }
 }

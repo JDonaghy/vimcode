@@ -647,6 +647,26 @@ struct App {
     tab_drag_drop_zone: core::window::DropZone,
     /// GTK window handle — set in `ShellApp::setup` once the runner creates the window.
     window: Option<gtk4::Window>,
+    /// Editor content bounds + tab-bar height as used by the LAST
+    /// `render_content` pass, in the same **absolute** DA coordinate frame
+    /// that mouse events arrive in (#550, #582).
+    ///
+    /// `render_content` derives `editor_bounds` from
+    /// `AppShellLayout::main_content_bounds`, whose origin is offset by the
+    /// activity bar / sidebar (x) and the title-bar band (y). The divider
+    /// hit-test and drag handlers used to re-derive their own bounds at
+    /// `(0.0, 0.0)` with a *different* height formula — so every divider they
+    /// computed sat roughly one activity-bar-width left (and one title-bar
+    /// height up) of the line actually painted. `:vsplit` dividers were
+    /// consequently unhittable and the press fell through to text-selection
+    /// (#582 iteration-2 smoke failure); `:split` only appeared to work
+    /// because its y-error was small enough that a click on the per-window
+    /// status bar landed inside the 6px band by luck.
+    ///
+    /// Caching what the renderer actually used — rather than recomputing —
+    /// makes hit-test-agrees-with-paint true *by construction* instead of by
+    /// two formulas being kept in sync by hand.
+    cached_editor_bounds: Cell<Option<(core::WindowRect, f64)>>,
     /// Menu bar row rect (full content width, `lh` tall) computed in
     /// `render_content` each frame. Reused by `handle()` so `MenuSystem`'s
     /// click/key routing tests against the exact rect the bar was drawn
@@ -1429,6 +1449,7 @@ impl App {
             tab_drag_source: None,
             tab_drag_drop_zone: core::window::DropZone::None,
             window: None,
+            cached_editor_bounds: Cell::new(None),
             menu_row_rect: Cell::new(quadraui::Rect::default()),
             title_bar_rect: Cell::new(quadraui::Rect::default()),
             title_bar_interaction: RefCell::new(quadraui::StatusBarInteraction::new()),
@@ -3412,6 +3433,22 @@ impl App {
         false
     }
 
+    /// Editor content bounds + tab-bar height **as last painted**, in the
+    /// absolute DA coordinate frame mouse events arrive in (#582).
+    ///
+    /// Divider hit-testing must run against the geometry the renderer used, not
+    /// a parallel re-derivation: `render_content` anchors `editor_bounds` at
+    /// `AppShellLayout::main_content_bounds` (offset right by the activity
+    /// bar/sidebar, down by the title-bar band), so any handler that rebuilt
+    /// bounds at `(0.0, 0.0)` hit-tested a phantom divider displaced by that
+    /// offset — the `:vsplit` failure in #582.
+    ///
+    /// `None` only before the first frame has been painted, when there is no
+    /// divider on screen to hit anyway.
+    fn painted_editor_bounds(&self) -> Option<(core::WindowRect, f64)> {
+        self.cached_editor_bounds.get()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
         self.reconcile_editor_hover_modal();
@@ -4324,20 +4361,9 @@ impl App {
                 }
 
                 // ── Editor group divider hit-test ─────────────────────────────
-                {
+                if let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() {
                     let engine = self.engine.borrow();
                     if !engine.group_layout.is_single_group() {
-                        let lh = self.cached_line_height;
-                        let tab_row_h = (lh * 1.6).ceil();
-                        let tab_bar_h = if engine.settings.breadcrumbs {
-                            tab_row_h + lh
-                        } else {
-                            tab_row_h
-                        };
-                        let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
-                        let content_bounds =
-                            core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
-
                         // Compute tab bar regions so we can exclude them from
                         // divider drag — tab bar clicks should go to tab handlers.
                         let group_rects = engine
@@ -4377,18 +4403,8 @@ impl App {
                 // `:split`/`:vsplit` panes within a single editor group —
                 // independent of the group-divider check above, which only
                 // fires when there are 2+ editor groups.
-                {
+                if let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() {
                     let engine = self.engine.borrow();
-                    let lh = self.cached_line_height;
-                    let tab_row_h = (lh * 1.6).ceil();
-                    let tab_bar_h = if engine.settings.breadcrumbs {
-                        tab_row_h + lh
-                    } else {
-                        tab_row_h
-                    };
-                    let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
-                    let content_bounds =
-                        core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
                     let (window_rects, _group_dividers) =
                         engine.calculate_group_window_rects(content_bounds, tab_bar_h);
                     let window_dividers = engine.calculate_window_dividers(&window_rects);
@@ -4759,11 +4775,9 @@ impl App {
         }
         // Editor group divider drag — adjust split ratio.
         if let Some(split_index) = self.group_divider_dragging {
-            let engine = self.engine.borrow();
-            let lh = self.cached_line_height;
-            let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
-            drop(engine);
-            let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
+            let Some((content_bounds, _tab_bar_h)) = self.painted_editor_bounds() else {
+                return;
+            };
             let dividers = self
                 .engine
                 .borrow()
@@ -4781,16 +4795,10 @@ impl App {
         }
         // Window-split divider drag — adjust ratio (#582).
         if let Some((group_id, split_index)) = self.window_divider_dragging {
-            let engine = self.engine.borrow();
-            let lh = self.cached_line_height;
-            let tab_row_h = (lh * 1.6).ceil();
-            let tab_bar_h = if engine.settings.breadcrumbs {
-                tab_row_h + lh
-            } else {
-                tab_row_h
+            let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
+                return;
             };
-            let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
-            let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
+            let engine = self.engine.borrow();
             let (window_rects, _group_dividers) =
                 engine.calculate_group_window_rects(content_bounds, tab_bar_h);
             let window_dividers = engine.calculate_window_dividers(&window_rects);
@@ -7747,6 +7755,11 @@ impl quadraui::ShellApp for App {
                 .max(0.0);
 
         let editor_bounds = WindowRect::new(x, y, w, editor_area_h);
+        // Hand the exact bounds/tab-bar-height this frame painted with to the
+        // click + drag handlers, so divider hit-tests land on the painted line
+        // instead of on a second, differently-originated guess (#582).
+        self.cached_editor_bounds
+            .set(Some((editor_bounds, tab_bar_h)));
         let (window_rects, _dividers) =
             engine.calculate_group_window_rects(editor_bounds, tab_bar_h);
 
@@ -7838,19 +7851,18 @@ impl quadraui::ShellApp for App {
         }
 
         // ── Window-split divider lines (#582 follow-up) ────────────────────────
-        // `:vsplit` boundaries had no visual at all in GTK (unlike TUI, where
-        // the neighbouring window's own scrollbar/separator column coincidentally
-        // marked the spot) — nothing told the user where to grab. Paint one via
-        // quadraui's `Split` primitive (already wired for both backends) rather
-        // than hand-rolling Cairo here. `:split` (horizontal) boundaries are left
-        // alone: the per-window status bar just above the boundary, drawn above,
-        // already marks them and is what the existing hit-test tolerance in
-        // `render::divider_hit_test` (mouse.rs) is aligned to.
-        for div in screen
-            .window_dividers
-            .iter()
-            .filter(|d| d.direction == core::window::SplitDirection::Vertical)
-        {
+        // `:split`/`:vsplit` boundaries had no visual of their own in GTK —
+        // nothing told the user where to grab. Paint one via quadraui's `Split`
+        // primitive (already wired for both backends via `Surface::Split` ->
+        // `Backend::draw_split`) rather than hand-rolling Cairo here.
+        //
+        // Both axes are painted. The iteration-2 smoke found `:split` only
+        // *seemed* draggable because the per-window status bar happens to sit
+        // one line above the boundary and reads as a divider; that is a
+        // coincidence of an unrelated feature, not a handle, and it leaves the
+        // real 6px hit band invisible. A true line on both axes makes what is
+        // grabbable match what is drawn.
+        for div in &screen.window_dividers {
             let (split, rect) = render::divider_to_split(
                 div,
                 quadraui::WidgetId::new(format!("wdiv:{}:{}", div.group_id.0, div.split_index)),
