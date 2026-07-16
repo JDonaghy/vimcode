@@ -444,6 +444,10 @@ struct App {
     /// Set to true in update() whenever a draw is needed; cleared by the #[watch] block.
     /// This prevents the 20/sec SearchPollTick timer from unconditionally calling queue_draw().
     draw_needed: Rc<Cell<bool>>,
+    /// A file dialog requested this frame, drained by the next `tick()`
+    /// call (which has the `backend` handle `PlatformServices` needs).
+    /// See [`PendingFileDialog`] (#572).
+    pending_file_dialog: Cell<Option<PendingFileDialog>>,
     /// DrawingArea for the file explorer sidebar (Phase A.2b-2: native
     /// `gtk4::TreeView` replaced by a single DrawingArea rendering via
     /// `draw_explorer_panel`).
@@ -897,6 +901,33 @@ fn setup_gtk_clipboard(engine: &mut Engine) {
 struct WindowScrollbars {
     vertical: gtk4::Scrollbar,
     cursor_indicator: gtk4::DrawingArea,
+}
+
+/// A native file dialog requested by `Msg::OpenFileDialog` /
+/// `Msg::SaveWorkspaceAsDialog`, deferred to the next `tick()` (#572).
+///
+/// `dispatch()` — where those `Msg` variants are handled — has no
+/// `backend: &mut dyn quadraui::Backend` in scope, but `PlatformServices`
+/// (and the re-entrancy-guarded nested-mainloop pump backing it, see
+/// `quadraui::gtk::services` #427) is only reachable through that
+/// runner-owned `backend` parameter. `tick()` receives it every frame, so
+/// the request is stashed here and drained there instead of threading
+/// `backend` through the whole `dispatch`/`dispatch_engine_action`/
+/// `handle_menu_msg` call graph.
+///
+/// Deliberately **not** routed through `self.backend` (`App`'s own
+/// `Rc<RefCell<GtkBackend>>`, used for modal-stack/drag-state handles) —
+/// that is a separate `GtkBackend` instance from the one
+/// `quadraui::gtk::run::run` constructs internally and passes as the
+/// trait-object `backend` param. Its `PlatformServices` has its own,
+/// unshared `pump_depth` counter, so pumping the nested main loop through
+/// it would not signal the runner's own event controllers to skip their
+/// `backend.borrow_mut()` calls — reintroducing the double-borrow panic
+/// #427's guard exists to prevent.
+#[derive(Debug, Clone, Copy)]
+enum PendingFileDialog {
+    OpenFile,
+    SaveWorkspaceAs,
 }
 
 #[derive(Debug)]
@@ -1378,6 +1409,7 @@ impl App {
         App {
             engine,
             draw_needed: Rc::new(Cell::new(false)),
+            pending_file_dialog: Cell::new(None),
             explorer_sidebar_da_ref: Rc::new(RefCell::new(None)),
             activity_bar_da_ref: Rc::new(RefCell::new(None)),
             explorer_row_height_cell: Rc::new(Cell::new(28.0)),
@@ -1474,6 +1506,44 @@ impl App {
 }
 
 impl App {
+    /// Run a file dialog requested via [`PendingFileDialog`] (#572), using
+    /// the runner-owned `backend`'s `PlatformServices` — `show_file_open_dialog`
+    /// / `show_file_save_dialog` block (via quadraui's nested-mainloop pump,
+    /// #427) until the user picks or cancels, then this returns synchronously.
+    fn run_pending_file_dialog(
+        &mut self,
+        req: PendingFileDialog,
+        backend: &mut dyn quadraui::Backend,
+    ) {
+        use quadraui::FileDialogOptions;
+        match req {
+            PendingFileDialog::OpenFile => {
+                let path = backend.services().show_file_open_dialog(FileDialogOptions {
+                    title: Some("Open File".to_string()),
+                    ..Default::default()
+                });
+                if let Some(path) = path {
+                    let _ = self
+                        .engine
+                        .borrow_mut()
+                        .open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent);
+                    self.dispatch(Msg::RefreshFileTree);
+                }
+            }
+            PendingFileDialog::SaveWorkspaceAs => {
+                let path = backend.services().show_file_save_dialog(FileDialogOptions {
+                    title: Some("Save Workspace As".to_string()),
+                    initial_filename: Some(".vimcode-workspace".to_string()),
+                    ..Default::default()
+                });
+                if let Some(path) = path {
+                    self.engine.borrow_mut().save_workspace_as(&path);
+                }
+            }
+        }
+        self.draw_needed.set(true);
+    }
+
     fn dispatch(&mut self, msg: Msg) {
         // Track if this is a scrollbar change to avoid syncing feedback loop
         let is_scrollbar_msg = matches!(
@@ -7442,25 +7512,17 @@ impl App {
                 }
             }
             Msg::OpenFileDialog => {
-                let engine = self.engine.clone();
-                let sender2 = self.sender.clone();
-                let dialog = gtk4::FileDialog::new();
-                dialog.set_title("Open File");
-                let win = self.window.clone();
-                dialog.open(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
-                    if let Ok(file) = result {
-                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
-                            let _ = engine.borrow_mut().open_file_with_mode(
-                                &path,
-                                crate::core::engine::OpenMode::Permanent,
-                            );
-                            sender2.send(Msg::RefreshFileTree).ok();
-                        }
-                    }
-                });
+                // Deferred to tick(), which has the runner-owned `backend`
+                // handle PlatformServices needs — see PendingFileDialog (#572).
+                self.pending_file_dialog
+                    .set(Some(PendingFileDialog::OpenFile));
                 self.draw_needed.set(true);
             }
             Msg::OpenFolderDialog => {
+                // #572: still direct gtk4::FileDialog — quadraui::PlatformServices
+                // has no folder-select mode yet (only show_file_open_dialog /
+                // show_file_save_dialog, both file pickers). Needs a new
+                // quadraui issue (folder-select support) before this can move.
                 let engine = self.engine.clone();
                 let sender2 = self.sender.clone();
                 let dialog = gtk4::FileDialog::new();
@@ -7485,18 +7547,9 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::SaveWorkspaceAsDialog => {
-                let engine = self.engine.clone();
-                let dialog = gtk4::FileDialog::new();
-                dialog.set_title("Save Workspace As");
-                dialog.set_initial_name(Some(".vimcode-workspace"));
-                let win = self.window.clone();
-                dialog.save(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
-                    if let Ok(file) = result {
-                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
-                            engine.borrow_mut().save_workspace_as(&path);
-                        }
-                    }
-                });
+                // Deferred to tick() — see PendingFileDialog (#572).
+                self.pending_file_dialog
+                    .set(Some(PendingFileDialog::SaveWorkspaceAs));
                 self.draw_needed.set(true);
             }
             Msg::OpenRecentDialog => {
@@ -8604,6 +8657,13 @@ impl quadraui::ShellApp for App {
         let msgs = self.sender.drain();
         for msg in msgs {
             self.dispatch(msg);
+        }
+
+        // Run a file dialog requested this frame — needs the runner-owned
+        // `backend` handle for `PlatformServices` (#572). See
+        // `PendingFileDialog` for why this can't happen in `dispatch()`.
+        if let Some(req) = self.pending_file_dialog.take() {
+            self.run_pending_file_dialog(req, backend);
         }
 
         // Periodic background work: LSP, DAP, git, search, etc.
