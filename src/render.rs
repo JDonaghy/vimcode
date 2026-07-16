@@ -12694,6 +12694,64 @@ pub fn divider_ratio_from_pos(div: &impl DividerGeometry, x: f64, y: f64) -> f64
     (mouse_pos - div.axis_start()) / div.axis_size()
 }
 
+/// Convert a [`DividerGeometry`] divider into the `(quadraui::Split,
+/// quadraui::Rect)` pair a backend needs to paint it via the shared
+/// `backend.draw_split()` primitive (#582 follow-up).
+///
+/// `WindowLayout`/`GroupLayout` dividers had no dedicated visual — TUI
+/// vertical splits only looked divided by coincidence (the neighbouring
+/// window's own scrollbar/separator column), and GTK painted nothing at
+/// all for `:vsplit`. Rather than hand-roll a second per-backend line
+/// renderer, reuse quadraui's existing `Split` primitive (`primitives/
+/// split.rs`, already wired for `backend.draw_split` in both backends) —
+/// it draws exactly one divider line from a ratio + bounds, which is all
+/// a single `DividerGeometry` node needs (the fact that `WindowLayout` as
+/// a whole is an N-way tree doesn't matter here: each *divider* is always
+/// a 2-pane boundary).
+///
+/// `ratio` is back-derived from `position`/`axis_start`/`axis_size`
+/// (rather than threading the tree's own stored ratio through) so this
+/// works uniformly for both `GroupDivider` and `WindowDivider`, neither of
+/// which carries a ratio field.
+pub fn divider_to_split(
+    div: &impl DividerGeometry,
+    id: quadraui::WidgetId,
+) -> (quadraui::Split, quadraui::Rect) {
+    let ratio = ((div.position() - div.axis_start()) / div.axis_size()) as f32;
+    let (direction, rect) = match div.direction() {
+        // vimcode's `Vertical` = side-by-side panes = quadraui's `Horizontal`
+        // (their `Split::direction` names the divider's own orientation
+        // relative to "panes side by side" vs "panes stacked", the inverse
+        // of vimcode's "divider direction" naming — see primitives/split.rs).
+        SplitDirection::Vertical => (
+            quadraui::SplitDirection::Horizontal,
+            quadraui::Rect::new(
+                div.axis_start() as f32,
+                div.cross_start() as f32,
+                div.axis_size() as f32,
+                div.cross_size() as f32,
+            ),
+        ),
+        SplitDirection::Horizontal => (
+            quadraui::SplitDirection::Vertical,
+            quadraui::Rect::new(
+                div.cross_start() as f32,
+                div.axis_start() as f32,
+                div.cross_size() as f32,
+                div.axis_size() as f32,
+            ),
+        ),
+    };
+    let split = quadraui::Split {
+        id,
+        direction,
+        ratio,
+        first_min: 0.0,
+        second_min: 0.0,
+    };
+    (split, rect)
+}
+
 /// Find which window contains a point and return its index.
 ///
 /// Coordinates are in the same frame as `screen_zone_hit_test` — editor
@@ -16372,5 +16430,50 @@ mod tests {
                 "glyph and fallback must differ so backend selection is observable"
             );
         }
+    }
+
+    // ── divider_to_split (#582 follow-up) ───────────────────────────────────
+
+    #[test]
+    fn divider_to_split_vertical_maps_direction_ratio_and_bounds() {
+        // A `:vsplit` (side-by-side panes) divider at x=40 within a 0..100
+        // wide, 5..25 tall node.
+        let div = WindowDivider {
+            group_id: GroupId(0),
+            split_index: 0,
+            direction: SplitDirection::Vertical,
+            position: 40.0,
+            axis_start: 0.0,
+            axis_size: 100.0,
+            cross_start: 5.0,
+            cross_size: 20.0,
+        };
+        let (split, rect) = divider_to_split(&div, quadraui::WidgetId::new("wdiv:0:0"));
+        // vimcode's `Vertical` (side-by-side) is quadraui's `Horizontal`.
+        assert_eq!(split.direction, quadraui::SplitDirection::Horizontal);
+        assert!((split.ratio - 0.4).abs() < 0.0001, "ratio = {}", split.ratio);
+        // `rect` reconstructs the original node bounds exactly.
+        assert_eq!(rect, quadraui::Rect::new(0.0, 5.0, 100.0, 20.0));
+    }
+
+    #[test]
+    fn divider_to_split_horizontal_maps_direction_ratio_and_bounds() {
+        // A `:split` (stacked panes) divider at y=30 within a 10..30 wide,
+        // 0..50 tall node.
+        let div = WindowDivider {
+            group_id: GroupId(0),
+            split_index: 0,
+            direction: SplitDirection::Horizontal,
+            position: 30.0,
+            axis_start: 0.0,
+            axis_size: 50.0,
+            cross_start: 10.0,
+            cross_size: 20.0,
+        };
+        let (split, rect) = divider_to_split(&div, quadraui::WidgetId::new("wdiv:0:0"));
+        // vimcode's `Horizontal` (stacked) is quadraui's `Vertical`.
+        assert_eq!(split.direction, quadraui::SplitDirection::Vertical);
+        assert!((split.ratio - 0.6).abs() < 0.0001, "ratio = {}", split.ratio);
+        assert_eq!(rect, quadraui::Rect::new(10.0, 0.0, 20.0, 50.0));
     }
 }
