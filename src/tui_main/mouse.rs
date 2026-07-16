@@ -162,6 +162,7 @@ pub(super) fn handle_mouse(
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
     dragging_group_divider: &mut Option<usize>,
+    dragging_window_divider: &mut Option<(crate::core::window::GroupId, usize)>,
     drag_state: &mut quadraui::DragState,
     modal_stack: &mut quadraui::ModalStack,
     last_layout: Option<&render::ScreenLayout>,
@@ -977,21 +978,36 @@ pub(super) fn handle_mouse(
                 return sidebar_width;
             }
             // Group divider drag — update ratio based on mouse position.
+            // #550: `div.axis_start`/`.axis_size` are already absolute
+            // terminal-screen coordinates, so `col`/`row` compare directly
+            // with no editor-origin subtraction.
             if let Some(split_index) = *dragging_group_divider {
                 if let Some(split) = last_layout.and_then(|l| l.editor_group_split.as_ref()) {
                     if let Some(div) = split.dividers.iter().find(|d| d.split_index == split_index)
                     {
-                        // #550: `div.axis_start`/`.axis_size` are already
-                        // absolute terminal-screen coordinates, so `col`/`row`
-                        // compare directly with no editor-origin subtraction.
-                        let mouse_pos = match div.direction {
-                            crate::core::window::SplitDirection::Vertical => col as f64,
-                            crate::core::window::SplitDirection::Horizontal => row as f64,
-                        };
-                        let new_ratio = (mouse_pos - div.axis_start) / div.axis_size;
+                        let new_ratio = render::divider_ratio_from_pos(div, col as f64, row as f64);
                         engine
                             .group_layout
                             .set_ratio_at_index(split_index, new_ratio);
+                    }
+                }
+                return sidebar_width;
+            }
+            // Window-split divider drag — update ratio based on mouse position (#582).
+            if let Some((group_id, split_index)) = *dragging_window_divider {
+                if let Some(layout) = last_layout {
+                    if let Some(div) = layout
+                        .window_dividers
+                        .iter()
+                        .find(|d| d.group_id == group_id && d.split_index == split_index)
+                    {
+                        let new_ratio = render::divider_ratio_from_pos(div, col as f64, row as f64);
+                        if let Some(group) = engine.editor_groups.get_mut(&group_id) {
+                            group
+                                .active_tab_mut()
+                                .layout
+                                .set_ratio_at_index(split_index, new_ratio);
+                        }
                     }
                 }
                 return sidebar_width;
@@ -1189,6 +1205,7 @@ pub(super) fn handle_mouse(
             // old separate `mouse_text_drag = false` reset.
             drag_state.end();
             *dragging_group_divider = None;
+            *dragging_window_divider = None;
             *cmd_dragging = false;
             *hover_selecting = false;
             if *dragging_terminal_resize {
@@ -2815,37 +2832,48 @@ pub(super) fn handle_mouse(
 
     // ── Group divider click — start drag ──────────────────────────────────────
     // #452: must use the same float-to-int conversion as the divider
-    // renderer (`render_impl.rs::draw_frame` truncates with `as u16`).
-    // Using `.round()` here meant clicks on a divider at e.g. col 40.5
-    // (rendered at 40) were hit-tested at 41 and missed.
+    // renderer (`render_impl.rs::draw_frame` truncates with `as u16`) —
+    // `render::divider_hit_test`'s `quantize: true` handles this. Using
+    // `.round()` here meant clicks on a divider at e.g. col 40.5 (rendered at
+    // 40) were hit-tested at 41 and missed.
     //
     // For horizontal splits the "visual divider" is the second group's
     // entire tab-bar block (per render_impl.rs:359). When breadcrumbs are
-    // on the block is 2 rows tall — accept a click on either row.
+    // on the block is 2 rows tall — accept a click on either row (the
+    // asymmetric `(0.0, tab_bar_rows)` horizontal tolerance below).
     if let Some(layout) = last_layout {
         if let Some(ref split) = layout.editor_group_split {
             let tab_bar_rows: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-            for div in &split.dividers {
-                let hit = match div.direction {
-                    crate::core::window::SplitDirection::Vertical => {
-                        let div_col = div.position as u16;
-                        col == div_col
-                            && (row as f64) >= div.cross_start
-                            && (row as f64) < div.cross_start + div.cross_size
-                    }
-                    crate::core::window::SplitDirection::Horizontal => {
-                        let div_row = div.position as u16;
-                        row >= div_row
-                            && row < div_row + tab_bar_rows
-                            && (col as f64) >= div.cross_start
-                            && (col as f64) < div.cross_start + div.cross_size
-                    }
-                };
-                if hit {
-                    *dragging_group_divider = Some(div.split_index);
-                    return sidebar_width;
-                }
+            if let Some(i) = render::divider_hit_test(
+                &split.dividers,
+                col as f64,
+                row as f64,
+                (0.0, 1.0),
+                (0.0, tab_bar_rows as f64),
+                true,
+            ) {
+                *dragging_group_divider = Some(split.dividers[i].split_index);
+                return sidebar_width;
             }
+        }
+    }
+
+    // ── Window-split divider click — start drag (#582) ─────────────────────────
+    // `:split`/`:vsplit` panes within a single editor group — a plain line,
+    // symmetric one-cell tolerance in both directions (no tab-bar-block
+    // asymmetry, unlike the group divider above).
+    if let Some(layout) = last_layout {
+        if let Some(i) = render::divider_hit_test(
+            &layout.window_dividers,
+            col as f64,
+            row as f64,
+            (0.0, 1.0),
+            (0.0, 1.0),
+            true,
+        ) {
+            let div = &layout.window_dividers[i];
+            *dragging_window_divider = Some((div.group_id, div.split_index));
+            return sidebar_width;
         }
     }
 
@@ -3267,6 +3295,7 @@ mod tests {
             &mut false,
             &mut false,
             &mut None,
+            &mut None,
             &mut drag_state,
             &mut modal_stack,
             None,
@@ -3466,6 +3495,7 @@ mod tests {
         row: u16,
         last_layout: Option<&render::ScreenLayout>,
         dragging_group_divider: &mut Option<usize>,
+        dragging_window_divider: &mut Option<(crate::core::window::GroupId, usize)>,
     ) {
         let ev = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3493,6 +3523,7 @@ mod tests {
             &mut false,
             &mut false,
             dragging_group_divider,
+            dragging_window_divider,
             &mut drag_state,
             &mut modal_stack,
             last_layout,
@@ -3571,7 +3602,15 @@ mod tests {
 
         let mut engine_hit = split_engine_with_sidebar_and_menu();
         let mut dragging = None;
-        dispatch_left_click(&mut engine_hit, col, row, Some(&screen), &mut dragging);
+        let mut dragging_window = None;
+        dispatch_left_click(
+            &mut engine_hit,
+            col,
+            row,
+            Some(&screen),
+            &mut dragging,
+            &mut dragging_window,
+        );
         assert_eq!(
             dragging,
             Some(div.split_index),
@@ -3581,16 +3620,194 @@ mod tests {
         // One column off must NOT hit the divider.
         let mut engine_miss = split_engine_with_sidebar_and_menu();
         let mut dragging_miss = None;
+        let mut dragging_window_miss = None;
         dispatch_left_click(
             &mut engine_miss,
             col - 1,
             row,
             Some(&screen),
             &mut dragging_miss,
+            &mut dragging_window_miss,
         );
         assert_eq!(
             dragging_miss, None,
             "click one column off the divider must not start a drag"
+        );
+    }
+
+    fn vsplit_engine_with_sidebar_and_menu() -> Engine {
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.mode = crate::core::Mode::Normal;
+        e.menu_bar_visible = true;
+        if !e.app_shell.sidebar_visible() {
+            e.toggle_sidebar();
+        }
+        // `:vsplit` — a vim window split *within* the single default editor
+        // group, distinct from `open_editor_group` above (#582).
+        e.split_window(crate::core::window::SplitDirection::Vertical, None);
+        e
+    }
+
+    /// #582: clicking a `:vsplit` window-divider at its painted position must
+    /// start the window-divider drag, and dragging must resize the panes —
+    /// this is the actual bug (window splits had no divider hit-test/drag at
+    /// all; only editor-group splits, a separate feature, worked). Mirrors
+    /// `group_divider_click_matches_painted_divider_position` above.
+    #[test]
+    fn window_divider_click_starts_drag_and_resizes() {
+        let engine = vsplit_engine_with_sidebar_and_menu();
+        let theme = crate::render::Theme::onedark();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let screen = super::render_impl::build_screen_for_tui(
+            &engine,
+            &theme,
+            area,
+            &sidebar,
+            SIDEBAR_WIDTH,
+        );
+        let div = screen
+            .window_dividers
+            .first()
+            .expect("a :vsplit must produce one window divider");
+        assert_eq!(div.direction, crate::core::window::SplitDirection::Vertical);
+
+        let editor_left = ACTIVITY_BAR_WIDTH + SIDEBAR_WIDTH + 1;
+        assert!(
+            (div.position as u16) > editor_left,
+            "divider column {} should sit inside the editor area (left edge {editor_left})",
+            div.position
+        );
+
+        let col = div.position as u16;
+        let row = (div.cross_start + 1.0) as u16;
+        let group_id = div.group_id;
+        let split_index = div.split_index;
+
+        // Click on the painted divider column starts the drag.
+        let mut engine_hit = vsplit_engine_with_sidebar_and_menu();
+        let mut dragging_group = None;
+        let mut dragging_window = None;
+        dispatch_left_click(
+            &mut engine_hit,
+            col,
+            row,
+            Some(&screen),
+            &mut dragging_group,
+            &mut dragging_window,
+        );
+        assert_eq!(
+            dragging_window,
+            Some((group_id, split_index)),
+            "click at the painted window-divider column ({col}, {row}) must start the drag"
+        );
+
+        // One column off must NOT hit the divider.
+        let mut engine_miss = vsplit_engine_with_sidebar_and_menu();
+        let mut dragging_group_miss = None;
+        let mut dragging_window_miss = None;
+        dispatch_left_click(
+            &mut engine_miss,
+            col - 1,
+            row,
+            Some(&screen),
+            &mut dragging_group_miss,
+            &mut dragging_window_miss,
+        );
+        assert_eq!(
+            dragging_window_miss, None,
+            "click one column off the window divider must not start a drag"
+        );
+
+        // Dragging right must move the divider and grow the first pane
+        // (`WindowLayout::set_ratio_at_index`, previously a dead no-op — #582).
+        let move_ev = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col + 10,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar_state = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut last_click_time = Instant::now();
+        let mut last_click_pos: (u16, u16) = (0, 0);
+        let mut should_quit = false;
+        handle_mouse(
+            move_ev,
+            &mut sidebar_state,
+            &mut engine_hit,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut dragging_group,
+            &mut dragging_window,
+            &mut drag_state,
+            &mut modal_stack,
+            Some(&screen),
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut crate::core::window::DropZone::None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+        );
+
+        // Recompute the group's own window rects the same way
+        // `Engine::calculate_window_dividers` does, then re-derive dividers
+        // from that bounding box to confirm the ratio actually moved.
+        let group = engine_hit
+            .editor_groups
+            .get(&group_id)
+            .expect("group still exists");
+        let ids = group.active_tab().layout.window_ids();
+        let mut min_x = f64::MAX;
+        let mut min_y = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut max_y = f64::MIN;
+        for w in &screen.windows {
+            if ids.contains(&w.window_id) {
+                min_x = min_x.min(w.rect.x);
+                min_y = min_y.min(w.rect.y);
+                max_x = max_x.max(w.rect.x + w.rect.width);
+                max_y = max_y.max(w.rect.y + w.rect.height);
+            }
+        }
+        let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+        let redivided = group.active_tab().layout.dividers(bounds, &mut 0);
+        assert!(
+            redivided[0].position > div.position,
+            "dragging right must move the window divider right (was {}, now {})",
+            div.position,
+            redivided[0].position
         );
     }
 
@@ -3655,6 +3872,7 @@ mod tests {
             &mut false,
             &mut false,
             &mut false,
+            &mut None,
             &mut None,
             &mut drag_state,
             &mut modal_stack,

@@ -28,7 +28,8 @@ use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, InstallContext};
 use super::view::{FoldRegion, View};
 use super::window::{
-    GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowId, WindowLayout, WindowRect,
+    GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowDivider, WindowId,
+    WindowLayout, WindowRect,
 };
 use quadraui::terminal_engine::TerminalSession;
 use std::borrow::Cow;

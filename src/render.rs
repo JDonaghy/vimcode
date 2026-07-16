@@ -19,7 +19,7 @@ pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::settings::LineNumberMode;
 use crate::core::view::View;
-use crate::core::window::{GroupDivider, GroupId, SplitDirection};
+use crate::core::window::{GroupDivider, GroupId, SplitDirection, WindowDivider};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
 use crate::icons;
 
@@ -3849,6 +3849,10 @@ pub struct ScreenLayout {
     /// (Setting name is historical — the UI labels it "Status Line Inside Window";
     /// `true` keeps the bar inside each editor window, `false` extracts it.)
     pub separated_status_line: Option<WindowStatusLine>,
+    /// Window-split (`:split`/`:vsplit`) dividers across all editor groups'
+    /// active tabs. Independent of `editor_group_split` — window splits exist
+    /// regardless of how many editor groups are open (#582).
+    pub window_dividers: Vec<WindowDivider>,
 }
 
 /// Context menu data for TUI rendering.
@@ -5943,6 +5947,10 @@ pub fn build_screen_layout(
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
 
+    // Window-split dividers (#582) — independent of the `n >= 2` editor-group
+    // check below, since `:split`/`:vsplit` panes exist within a single group.
+    let window_dividers = engine.calculate_window_dividers(window_rects);
+
     let windows = window_rects
         .iter()
         .map(|(window_id, rect)| {
@@ -6643,6 +6651,7 @@ pub fn build_screen_layout(
         }),
         tab_switcher,
         editor_group_split,
+        window_dividers,
         ext_sidebar,
         ai_panel,
         ext_panel: build_ext_panel_data(engine),
@@ -12563,6 +12572,126 @@ pub fn screen_zone_hit_test(
     }
 
     ScreenZone::None
+}
+
+// ─── Divider hit-test / drag (shared by GroupLayout and WindowLayout, #582) ──
+
+/// Common geometry accessor so [`divider_hit_test`] and
+/// [`divider_ratio_from_pos`] work identically over `GroupDivider`
+/// (editor-group splits) and `WindowDivider` (in-group `:split`/`:vsplit`
+/// window splits) without duplicating the hit-test/drag math per divider
+/// kind (or, previously, per backend — see below).
+pub trait DividerGeometry {
+    fn direction(&self) -> SplitDirection;
+    fn position(&self) -> f64;
+    fn axis_start(&self) -> f64;
+    fn axis_size(&self) -> f64;
+    fn cross_start(&self) -> f64;
+    fn cross_size(&self) -> f64;
+}
+
+impl DividerGeometry for GroupDivider {
+    fn direction(&self) -> SplitDirection {
+        self.direction
+    }
+    fn position(&self) -> f64 {
+        self.position
+    }
+    fn axis_start(&self) -> f64 {
+        self.axis_start
+    }
+    fn axis_size(&self) -> f64 {
+        self.axis_size
+    }
+    fn cross_start(&self) -> f64 {
+        self.cross_start
+    }
+    fn cross_size(&self) -> f64 {
+        self.cross_size
+    }
+}
+
+impl DividerGeometry for WindowDivider {
+    fn direction(&self) -> SplitDirection {
+        self.direction
+    }
+    fn position(&self) -> f64 {
+        self.position
+    }
+    fn axis_start(&self) -> f64 {
+        self.axis_start
+    }
+    fn axis_size(&self) -> f64 {
+        self.axis_size
+    }
+    fn cross_start(&self) -> f64 {
+        self.cross_start
+    }
+    fn cross_size(&self) -> f64 {
+        self.cross_size
+    }
+}
+
+/// Asymmetric hit-band tolerance around a divider's `position`, along the
+/// split axis: `(before, after)`.
+pub type DividerTolerance = (f64, f64);
+
+/// Hit-test a point against a list of dividers. Returns the index *into
+/// `dividers`* (not `split_index`) so callers can recover any extra fields
+/// (e.g. `WindowDivider::group_id`) from the matched element.
+///
+/// A single divider list can mix vertical and horizontal splits (nested
+/// splits alternate direction), so tolerance is supplied per-direction:
+/// `vertical_tol`/`horizontal_tol`. GTK wants a symmetric pixel tolerance
+/// around the thin divider line in both directions (`before == after`),
+/// while TUI's editor-group horizontal divider is grabbable across the
+/// *second* group's whole tab-bar block rather than a single row
+/// (`before == 0`, `after == tab_bar_rows` — see the call site for why).
+///
+/// `quantize`: TUI must hit-test against the *same truncated* position the
+/// renderer draws at (`div.position as u16`), matching the renderer exactly
+/// so a click on the rendered glyph always hits (see #452 — using a plain
+/// tolerance window centered on the untruncated float position could match
+/// the wrong adjacent cell). GTK renders at the continuous pixel position, so
+/// it passes `false`.
+pub fn divider_hit_test<D: DividerGeometry>(
+    dividers: &[D],
+    x: f64,
+    y: f64,
+    vertical_tol: DividerTolerance,
+    horizontal_tol: DividerTolerance,
+    quantize: bool,
+) -> Option<usize> {
+    for (i, div) in dividers.iter().enumerate() {
+        let pos = if quantize {
+            (div.position() as u16) as f64
+        } else {
+            div.position()
+        };
+        let (axis, cross, (tol_before, tol_after)) = match div.direction() {
+            SplitDirection::Vertical => (x, y, vertical_tol),
+            SplitDirection::Horizontal => (y, x, horizontal_tol),
+        };
+        let hit = axis >= pos - tol_before
+            && axis < pos + tol_after
+            && cross >= div.cross_start()
+            && cross < div.cross_start() + div.cross_size();
+        if hit {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Given a divider being dragged and the current pointer position, compute
+/// the new split ratio (unclamped — `set_ratio_at_index` on both
+/// `GroupLayout` and `WindowLayout` already clamps to `0.1..0.9`).
+pub fn divider_ratio_from_pos(div: &impl DividerGeometry, x: f64, y: f64) -> f64 {
+    let mouse_pos = match div.direction() {
+        SplitDirection::Vertical => x,
+        SplitDirection::Horizontal => y,
+    };
+    (mouse_pos - div.axis_start()) / div.axis_size()
 }
 
 /// Find which window contains a point and return its index.

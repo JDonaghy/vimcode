@@ -632,6 +632,11 @@ struct App {
     terminal_split_dragging: bool,
     /// Split index being dragged (None if not dragging a group divider).
     group_divider_dragging: Option<usize>,
+    /// (owning GroupId, tree-local split_index) being dragged, or `None`
+    /// (#582 — `:split`/`:vsplit` window-split divider, distinct from the
+    /// editor-group divider above; each group's `WindowLayout` numbers its
+    /// own splits independently, so the owning group must travel with it).
+    window_divider_dragging: Option<(core::window::GroupId, usize)>,
     /// True while the user is dragging a tab between groups.
     tab_dragging: bool,
     /// Start position of a potential tab drag (set on MouseClick in tab bar).
@@ -1418,6 +1423,7 @@ impl App {
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
             group_divider_dragging: None,
+            window_divider_dragging: None,
             tab_dragging: false,
             tab_drag_start: None,
             tab_drag_source: None,
@@ -4350,27 +4356,55 @@ impl App {
 
                         if !in_tab_bar {
                             let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                            for div in &dividers {
-                                let hit = match div.direction {
-                                    core::window::SplitDirection::Vertical => {
-                                        (x - div.position).abs() < 6.0
-                                            && y >= div.cross_start
-                                            && y < div.cross_start + div.cross_size
-                                    }
-                                    core::window::SplitDirection::Horizontal => {
-                                        (y - div.position).abs() < 6.0
-                                            && x >= div.cross_start
-                                            && x < div.cross_start + div.cross_size
-                                    }
-                                };
-                                if hit {
-                                    let si = div.split_index;
-                                    drop(engine);
-                                    self.group_divider_dragging = Some(si);
-                                    return;
-                                }
+                            if let Some(i) = render::divider_hit_test(
+                                &dividers,
+                                x,
+                                y,
+                                (6.0, 6.0),
+                                (6.0, 6.0),
+                                false,
+                            ) {
+                                let si = dividers[i].split_index;
+                                drop(engine);
+                                self.group_divider_dragging = Some(si);
+                                return;
                             }
                         }
+                    }
+                }
+
+                // ── Window-split divider hit-test (#582) ───────────────────────
+                // `:split`/`:vsplit` panes within a single editor group —
+                // independent of the group-divider check above, which only
+                // fires when there are 2+ editor groups.
+                {
+                    let engine = self.engine.borrow();
+                    let lh = self.cached_line_height;
+                    let tab_row_h = (lh * 1.6).ceil();
+                    let tab_bar_h = if engine.settings.breadcrumbs {
+                        tab_row_h + lh
+                    } else {
+                        tab_row_h
+                    };
+                    let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
+                    let content_bounds =
+                        core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
+                    let (window_rects, _group_dividers) =
+                        engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+                    let window_dividers = engine.calculate_window_dividers(&window_rects);
+                    if let Some(i) = render::divider_hit_test(
+                        &window_dividers,
+                        x,
+                        y,
+                        (6.0, 6.0),
+                        (6.0, 6.0),
+                        false,
+                    ) {
+                        let div = &window_dividers[i];
+                        let target = (div.group_id, div.split_index);
+                        drop(engine);
+                        self.window_divider_dragging = Some(target);
+                        return;
                     }
                 }
 
@@ -4736,15 +4770,42 @@ impl App {
                 .group_layout
                 .dividers(content_bounds, &mut 0);
             if let Some(div) = dividers.iter().find(|d| d.split_index == split_index) {
-                let mouse_pos = match div.direction {
-                    core::window::SplitDirection::Vertical => x,
-                    core::window::SplitDirection::Horizontal => y,
-                };
-                let new_ratio = (mouse_pos - div.axis_start) / div.axis_size;
+                let new_ratio = render::divider_ratio_from_pos(div, x, y);
                 self.engine
                     .borrow_mut()
                     .group_layout
                     .set_ratio_at_index(split_index, new_ratio);
+            }
+            self.draw_needed.set(true);
+            return;
+        }
+        // Window-split divider drag — adjust ratio (#582).
+        if let Some((group_id, split_index)) = self.window_divider_dragging {
+            let engine = self.engine.borrow();
+            let lh = self.cached_line_height;
+            let tab_row_h = (lh * 1.6).ceil();
+            let tab_bar_h = if engine.settings.breadcrumbs {
+                tab_row_h + lh
+            } else {
+                tab_row_h
+            };
+            let editor_bottom = gtk_editor_bottom(&engine, width, height, lh);
+            let content_bounds = core::window::WindowRect::new(0.0, 0.0, width, editor_bottom);
+            let (window_rects, _group_dividers) =
+                engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+            let window_dividers = engine.calculate_window_dividers(&window_rects);
+            drop(engine);
+            if let Some(div) = window_dividers
+                .iter()
+                .find(|d| d.group_id == group_id && d.split_index == split_index)
+            {
+                let new_ratio = render::divider_ratio_from_pos(div, x, y);
+                if let Some(group) = self.engine.borrow_mut().editor_groups.get_mut(&group_id) {
+                    group
+                        .active_tab_mut()
+                        .layout
+                        .set_ratio_at_index(split_index, new_ratio);
+                }
             }
             self.draw_needed.set(true);
             return;
@@ -4911,6 +4972,7 @@ impl App {
         }
         self.h_sb_drag_cell.set(None);
         self.group_divider_dragging = None;
+        self.window_divider_dragging = None;
         {
             let mut engine = self.engine.borrow_mut();
             engine.mouse_drag_active = false;
