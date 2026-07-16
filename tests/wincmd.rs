@@ -8,6 +8,18 @@ fn win_count(e: &vimcode_core::Engine) -> usize {
     e.active_tab().layout.window_ids().len()
 }
 
+/// Ratio of the active tab's root window split, or `None` if there's a
+/// single window (no split). Mirrors `vim_compat_batch.rs::get_split_ratio`,
+/// which reads `e.group_layout` instead — a *different* split tree (editor
+/// groups, not vim `:split`/`:vsplit` window panes) — see #582.
+fn window_split_ratio(e: &vimcode_core::Engine) -> Option<f64> {
+    use vimcode_core::core::window::WindowLayout;
+    match &e.active_tab().layout {
+        WindowLayout::Split { ratio, .. } => Some(*ratio),
+        WindowLayout::Leaf(_) => None,
+    }
+}
+
 // ── :wincmd ex command ───────────────────────────────────────────────────────
 
 #[test]
@@ -88,6 +100,27 @@ fn wincmd_equalize() {
     assert_eq!(win_count(&e), 2);
 }
 
+/// #582: `Ctrl-W =` (`:wincmd =`) previously only ever equalized editor-group
+/// splits (`self.group_layout`); it was a silent no-op for a plain `:vsplit`
+/// window pane like this one, since the active window is never a `GroupId`.
+#[test]
+fn wincmd_equalize_actually_resets_window_split_ratio() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "vsplit");
+    exec(&mut e, "wincmd > 5");
+    let widened = window_split_ratio(&e).expect("vsplit produces a window split");
+    assert_ne!(
+        widened, 0.5,
+        "sanity: wincmd > must have moved the ratio off 0.5"
+    );
+    exec(&mut e, "wincmd =");
+    assert_eq!(
+        window_split_ratio(&e),
+        Some(0.5),
+        "wincmd = must reset the vsplit's own window-split ratio, not just leave it untouched"
+    );
+}
+
 #[test]
 fn wincmd_resize_with_count() {
     let mut e = engine_with("hello\n");
@@ -99,6 +132,32 @@ fn wincmd_resize_with_count() {
     assert_eq!(win_count(&e), 2);
 }
 
+/// #582: `Ctrl-W >`/`<` previously never touched a plain `:vsplit` window
+/// pane's ratio at all (see `wincmd_resize_with_count` above, which predates
+/// this fix and only checked the windows didn't disappear/crash — it never
+/// asserted the resize actually happened). `+`/`-` target `Horizontal`
+/// splits so are exercised separately in `wincmd_vertical_resize_untouched`-
+/// adjacent coverage; this covers the `Vertical` (`</>`) direction that
+/// `:vsplit` itself produces.
+#[test]
+fn wincmd_resize_actually_changes_window_split_ratio() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "vsplit");
+    let initial = window_split_ratio(&e).expect("vsplit produces a window split");
+    exec(&mut e, "wincmd > 3");
+    let widened = window_split_ratio(&e).expect("split still exists");
+    assert!(
+        widened > initial,
+        "wincmd > must grow the left pane's window-split ratio (was {initial}, now {widened})"
+    );
+    exec(&mut e, "wincmd < 5");
+    let narrowed = window_split_ratio(&e).expect("split still exists");
+    assert!(
+        narrowed < widened,
+        "wincmd < must shrink the left pane's window-split ratio (was {widened}, now {narrowed})"
+    );
+}
+
 #[test]
 fn wincmd_maximize() {
     let mut e = engine_with("hello\n");
@@ -106,6 +165,20 @@ fn wincmd_maximize() {
     exec(&mut e, "wincmd _");
     exec(&mut e, "wincmd |");
     assert_eq!(win_count(&e), 2);
+}
+
+/// #582: `Ctrl-W |` (maximize width) previously only ever operated on
+/// `self.group_layout`, a no-op for a plain `:vsplit` window pane.
+#[test]
+fn wincmd_maximize_actually_widens_window_split() {
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "vsplit");
+    exec(&mut e, "wincmd |");
+    assert_eq!(
+        window_split_ratio(&e),
+        Some(0.9),
+        "wincmd | must maximize the active (first/left) window's split ratio to 0.9"
+    );
 }
 
 // ── Abbreviation ─────────────────────────────────────────────────────────────

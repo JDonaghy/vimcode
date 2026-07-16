@@ -2225,6 +2225,53 @@ impl Engine {
         (all_rects, dividers)
     }
 
+    /// Compute window-split dividers (`:split`/`:vsplit` boundaries) for every
+    /// editor group's active tab, one independent `WindowLayout` tree per
+    /// group.
+    ///
+    /// Derives each group's bounds from the bounding box of its own entries
+    /// in `window_rects` (rather than re-deriving them from
+    /// `group_layout.calculate_group_rects` with a fresh tab-bar-height
+    /// guess) so divider positions always agree exactly with whatever
+    /// `window_rects` the caller is already using/rendering — see #582.
+    pub fn calculate_window_dividers(
+        &self,
+        window_rects: &[(WindowId, WindowRect)],
+    ) -> Vec<WindowDivider> {
+        let mut out = Vec::new();
+        for gid in self.group_layout.group_ids() {
+            let Some(group) = self.editor_groups.get(&gid) else {
+                continue;
+            };
+            let tab = group.active_tab();
+            let ids = tab.layout.window_ids();
+            let mut min_x = f64::MAX;
+            let mut min_y = f64::MAX;
+            let mut max_x = f64::MIN;
+            let mut max_y = f64::MIN;
+            for (wid, rect) in window_rects {
+                if ids.contains(wid) {
+                    min_x = min_x.min(rect.x);
+                    min_y = min_y.min(rect.y);
+                    max_x = max_x.max(rect.x + rect.width);
+                    max_y = max_y.max(rect.y + rect.height);
+                }
+            }
+            if min_x == f64::MAX {
+                continue; // group has no rendered windows (shouldn't happen)
+            }
+            let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+            let mut counter = 0;
+            out.extend(
+                tab.layout
+                    .dividers(bounds, &mut counter)
+                    .into_iter()
+                    .map(|d| WindowDivider::from_group_divider(gid, d)),
+            );
+        }
+        out
+    }
+
     /// Open a file from the explorer: switch to an existing tab that shows it,
     /// or create a new tab when no tab currently displays it.
     ///
@@ -2841,9 +2888,21 @@ impl Engine {
     // Window resize (CTRL-W +/-/</>=/|/_)
     // =======================================================================
 
-    /// Resize the window's parent split by delta steps.
+    /// Resize the active window's parent split by delta steps.
     /// `direction`: which split direction to look for (Horizontal for +/-, Vertical for </>).
-    /// `increase`: true = make active group bigger, false = smaller.
+    /// `increase`: true = make active window/group bigger, false = smaller.
+    ///
+    /// #582: tries the active *window*'s split within its tab's
+    /// `WindowLayout` first (vim `:split`/`:vsplit` panes) — this was
+    /// entirely unwired before (Ctrl-W resize only ever touched
+    /// `self.group_layout`, so it was a no-op for vim window splits, whose
+    /// active window is never a `GroupId`). Falls back to the active
+    /// editor-group's parent split (`Ctrl-W e`/`E` layouts, a separate,
+    /// pre-existing, already-tested feature — see
+    /// `tests/vim_compat_batch.rs::test_ctrl_w_plus_resize`) when the active
+    /// tab has no window split in the requested direction, matching vim's
+    /// "operate on the current window, or whatever's locally splittable"
+    /// convention.
     pub(crate) fn resize_window_split(
         &mut self,
         direction: SplitDirection,
@@ -2851,28 +2910,61 @@ impl Engine {
         count: usize,
     ) {
         let delta_per_step = 0.05;
+        let delta = if increase {
+            delta_per_step * count as f64
+        } else {
+            -(delta_per_step * count as f64)
+        };
+        let active_window = self.active_window_id();
+        if let Some((split_idx, split_dir, is_first)) =
+            self.active_tab().layout.parent_split_of(active_window)
+        {
+            if split_dir == direction {
+                // Active window is in first child → increasing ratio makes it bigger
+                let delta = if is_first { delta } else { -delta };
+                self.active_tab_mut()
+                    .layout
+                    .adjust_ratio_at_index(split_idx, delta);
+                return;
+            }
+        }
         if let Some((split_idx, split_dir, is_first)) =
             self.group_layout.parent_split_of(self.active_group)
         {
             if split_dir == direction {
-                // Active group is in first child → increasing ratio makes it bigger
-                let delta = if (is_first && increase) || (!is_first && !increase) {
-                    delta_per_step * count as f64
-                } else {
-                    -(delta_per_step * count as f64)
-                };
+                let delta = if is_first { delta } else { -delta };
                 self.group_layout.adjust_ratio_at_index(split_idx, delta);
             }
         }
     }
 
-    /// Equalize all split ratios to 0.5.
+    /// Equalize split ratios to 0.5. Prefers the active tab's window splits
+    /// (vim `:split`/`:vsplit`) when any exist, falling back to editor-group
+    /// splits otherwise — see `resize_window_split`'s doc for why (#582).
     pub(crate) fn equalize_splits(&mut self) {
-        self.group_layout.set_all_ratios(0.5);
+        if self.active_tab().layout.is_single_window() {
+            self.group_layout.set_all_ratios(0.5);
+        } else {
+            self.active_tab_mut().layout.set_all_ratios(0.5);
+        }
     }
 
     /// Maximize window in a given direction (CTRL-W _ for height, CTRL-W | for width).
+    /// Same window-split-first, group-split-fallback preference as
+    /// `resize_window_split` (#582).
     pub(crate) fn maximize_window_split(&mut self, direction: SplitDirection) {
+        let active_window = self.active_window_id();
+        if let Some((split_idx, split_dir, is_first)) =
+            self.active_tab().layout.parent_split_of(active_window)
+        {
+            if split_dir == direction {
+                let ratio = if is_first { 0.9 } else { 0.1 };
+                self.active_tab_mut()
+                    .layout
+                    .set_ratio_at_index(split_idx, ratio);
+                return;
+            }
+        }
         if let Some((split_idx, split_dir, is_first)) =
             self.group_layout.parent_split_of(self.active_group)
         {

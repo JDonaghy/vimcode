@@ -834,6 +834,10 @@ fn event_loop(
     let mut dragging_terminal_split: bool = false;
     // Non-None while user is dragging a group divider (stores split_index).
     let mut dragging_group_divider: Option<usize> = None;
+    // Non-None while user is dragging a window-split divider (#582), stores
+    // (owning GroupId, tree-local split_index) since each group's
+    // `WindowLayout` numbers its own splits independently.
+    let mut dragging_window_divider: Option<(crate::core::window::GroupId, usize)> = None;
     // True while user is drag-selecting text inside the editor hover popup.
     let mut hover_selecting: bool = false;
     // True while user is drag-selecting text inside a find/replace input field.
@@ -2764,6 +2768,7 @@ fn event_loop(
                                 &mut dragging_terminal_resize,
                                 &mut dragging_terminal_split,
                                 &mut dragging_group_divider,
+                                &mut dragging_window_divider,
                                 drag_state_ref,
                                 modal_stack_ref,
                                 last_layout.as_ref(),
@@ -2814,6 +2819,7 @@ fn event_loop(
                     &mut dragging_terminal_resize,
                     &mut dragging_terminal_split,
                     &mut dragging_group_divider,
+                    &mut dragging_window_divider,
                     drag_state_ref,
                     modal_stack_ref,
                     last_layout.as_ref(),
