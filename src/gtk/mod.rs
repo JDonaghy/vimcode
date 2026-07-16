@@ -7837,6 +7837,32 @@ impl quadraui::ShellApp for App {
             }
         }
 
+        // ── Window-split divider lines (#582 follow-up) ────────────────────────
+        // `:vsplit` boundaries had no visual at all in GTK (unlike TUI, where
+        // the neighbouring window's own scrollbar/separator column coincidentally
+        // marked the spot) — nothing told the user where to grab. Paint one via
+        // quadraui's `Split` primitive (already wired for both backends) rather
+        // than hand-rolling Cairo here. `:split` (horizontal) boundaries are left
+        // alone: the per-window status bar just above the boundary, drawn above,
+        // already marks them and is what the existing hit-test tolerance in
+        // `render::divider_hit_test` (mouse.rs) is aligned to.
+        for div in screen
+            .window_dividers
+            .iter()
+            .filter(|d| d.direction == core::window::SplitDirection::Vertical)
+        {
+            let (split, rect) = render::divider_to_split(
+                div,
+                quadraui::WidgetId::new(format!("wdiv:{}:{}", div.group_id.0, div.split_index)),
+            );
+            let mut frame = QSL::new();
+            frame.push(Surface::Split {
+                rect,
+                split: &split,
+            });
+            frame.draw(backend);
+        }
+
         // ── Recover a FrameHitMap for Editor/TabBar zone detection (#449) ──────
         // Pure `.push()` accumulation into a *separate* `ScreenLayout`, built
         // from the same `Editor` objects just painted above (`window_editors`,

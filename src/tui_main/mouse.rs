@@ -2859,16 +2859,27 @@ pub(super) fn handle_mouse(
     }
 
     // ── Window-split divider click — start drag (#582) ─────────────────────────
-    // `:split`/`:vsplit` panes within a single editor group — a plain line,
-    // symmetric one-cell tolerance in both directions (no tab-bar-block
-    // asymmetry, unlike the group divider above).
+    // `:split`/`:vsplit` panes within a single editor group. `div.position` is
+    // the boundary column/row itself (first column/row of the *second* pane),
+    // but the only thing actually drawn there is one cell *before* it: for
+    // `:vsplit`, `render_separators` paints the neighbouring window's own
+    // separator/scrollbar column at `sep_x - 1`; for `:split`, the upper
+    // window's per-window status line (its own reserved bottom row) occupies
+    // `sep_y - 1` and there's no separate glyph at all. A `(0.0, 1.0)`
+    // tolerance only accepted `col`/`row == position`, one cell past
+    // whatever the user can actually see and click — 100% miss for
+    // `:split` (no glyph ever sat at `position`) and a coin-flip for
+    // `:vsplit` (only imprecise aim ever landed exactly on `position`
+    // instead of the visible glyph at `position - 1`). Extend `tol_before`
+    // to 1 so both the visible mark and the boundary cell register (#582
+    // smoke-test failure: TUI :split divider unclickable, :vsplit flaky).
     if let Some(layout) = last_layout {
         if let Some(i) = render::divider_hit_test(
             &layout.window_dividers,
             col as f64,
             row as f64,
-            (0.0, 1.0),
-            (0.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 1.0),
             true,
         ) {
             let div = &layout.window_dividers[i];
@@ -3708,13 +3719,37 @@ mod tests {
             "click at the painted window-divider column ({col}, {row}) must start the drag"
         );
 
-        // One column off must NOT hit the divider.
+        // `col - 1` is where `render_separators` actually paints the visible
+        // mark (the left window's own separator/scrollbar column, one cell
+        // before the boundary at `col`) — the hit-test tolerance deliberately
+        // covers it too (#582 smoke-test fix: clicking the glyph the user can
+        // actually see used to miss ~half the time). Two columns off must
+        // still miss.
+        let mut engine_hit_neighbor = vsplit_engine_with_sidebar_and_menu();
+        let mut dragging_group_neighbor = None;
+        let mut dragging_window_neighbor = None;
+        dispatch_left_click(
+            &mut engine_hit_neighbor,
+            col - 1,
+            row,
+            Some(&screen),
+            &mut dragging_group_neighbor,
+            &mut dragging_window_neighbor,
+        );
+        assert_eq!(
+            dragging_window_neighbor,
+            Some((group_id, split_index)),
+            "click on the visible glyph column ({}, {row}), one before the boundary, must also start the drag",
+            col - 1
+        );
+
+        // Two columns off must NOT hit the divider.
         let mut engine_miss = vsplit_engine_with_sidebar_and_menu();
         let mut dragging_group_miss = None;
         let mut dragging_window_miss = None;
         dispatch_left_click(
             &mut engine_miss,
-            col - 1,
+            col - 2,
             row,
             Some(&screen),
             &mut dragging_group_miss,
@@ -3722,7 +3757,7 @@ mod tests {
         );
         assert_eq!(
             dragging_window_miss, None,
-            "click one column off the window divider must not start a drag"
+            "click two columns off the window divider must not start a drag"
         );
 
         // Dragging right must move the divider and grow the first pane
@@ -3806,6 +3841,184 @@ mod tests {
         assert!(
             redivided[0].position > div.position,
             "dragging right must move the window divider right (was {}, now {})",
+            div.position,
+            redivided[0].position
+        );
+    }
+
+    fn hsplit_engine_with_sidebar_and_menu() -> Engine {
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.mode = crate::core::Mode::Normal;
+        e.menu_bar_visible = true;
+        if !e.app_shell.sidebar_visible() {
+            e.toggle_sidebar();
+        }
+        // `:split` — a vim window split *within* the single default editor
+        // group (#582). `window_status_line` defaults to `true`, so the
+        // upper window's own status line (its reserved bottom row) is the
+        // only thing marking the boundary — `render_separators` skips
+        // drawing a `─` glyph entirely in that case.
+        e.split_window(crate::core::window::SplitDirection::Horizontal, None);
+        e
+    }
+
+    /// #582 smoke-test fix: a `:split` (horizontal) window-divider was
+    /// completely unclickable — `render_separators` draws nothing at all for
+    /// the boundary when `window_status_line` is on (the default; the upper
+    /// window's own status line row visually marks it instead), but the old
+    /// `(0.0, 1.0)` tolerance only accepted a click exactly at `div.position`
+    /// (the *lower* window's first content row) — one row below the status
+    /// line the user actually sees and clicks. Mirrors
+    /// `window_divider_click_starts_drag_and_resizes` (the `:vsplit` case)
+    /// but for the row axis.
+    #[test]
+    fn window_divider_horizontal_click_starts_drag_and_resizes() {
+        let engine = hsplit_engine_with_sidebar_and_menu();
+        let theme = crate::render::Theme::onedark();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 40,
+        };
+        let screen = super::render_impl::build_screen_for_tui(
+            &engine,
+            &theme,
+            area,
+            &sidebar,
+            SIDEBAR_WIDTH,
+        );
+        let div = screen
+            .window_dividers
+            .first()
+            .expect("a :split must produce one window divider");
+        assert_eq!(
+            div.direction,
+            crate::core::window::SplitDirection::Horizontal
+        );
+
+        let col = (div.cross_start + 1.0) as u16;
+        let row = div.position as u16;
+        let group_id = div.group_id;
+        let split_index = div.split_index;
+
+        // Click on the upper window's status-line row — `row - 1`, the only
+        // row actually marked in this default (`window_status_line = true`)
+        // configuration — must start the drag.
+        let mut engine_hit = hsplit_engine_with_sidebar_and_menu();
+        let mut dragging_group = None;
+        let mut dragging_window = None;
+        dispatch_left_click(
+            &mut engine_hit,
+            col,
+            row - 1,
+            Some(&screen),
+            &mut dragging_group,
+            &mut dragging_window,
+        );
+        assert_eq!(
+            dragging_window,
+            Some((group_id, split_index)),
+            "click on the status-line row ({col}, {}), one row above the boundary, must start the drag",
+            row - 1
+        );
+
+        // Two rows off must NOT hit the divider.
+        let mut engine_miss = hsplit_engine_with_sidebar_and_menu();
+        let mut dragging_group_miss = None;
+        let mut dragging_window_miss = None;
+        dispatch_left_click(
+            &mut engine_miss,
+            col,
+            row - 2,
+            Some(&screen),
+            &mut dragging_group_miss,
+            &mut dragging_window_miss,
+        );
+        assert_eq!(
+            dragging_window_miss, None,
+            "click two rows off the window divider must not start a drag"
+        );
+
+        // Dragging down must move the divider down and grow the first pane.
+        let move_ev = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: col,
+            row: row + 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar_state = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut last_click_time = Instant::now();
+        let mut last_click_pos: (u16, u16) = (0, 0);
+        let mut should_quit = false;
+        handle_mouse(
+            move_ev,
+            &mut sidebar_state,
+            &mut engine_hit,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut dragging_group,
+            &mut dragging_window,
+            &mut drag_state,
+            &mut modal_stack,
+            Some(&screen),
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut crate::core::window::DropZone::None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+        );
+
+        let group = engine_hit
+            .editor_groups
+            .get(&group_id)
+            .expect("group still exists");
+        let ids = group.active_tab().layout.window_ids();
+        let mut min_x = f64::MAX;
+        let mut min_y = f64::MAX;
+        let mut max_x = f64::MIN;
+        let mut max_y = f64::MIN;
+        for w in &screen.windows {
+            if ids.contains(&w.window_id) {
+                min_x = min_x.min(w.rect.x);
+                min_y = min_y.min(w.rect.y);
+                max_x = max_x.max(w.rect.x + w.rect.width);
+                max_y = max_y.max(w.rect.y + w.rect.height);
+            }
+        }
+        let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+        let redivided = group.active_tab().layout.dividers(bounds, &mut 0);
+        assert!(
+            redivided[0].position > div.position,
+            "dragging down must move the window divider down (was {}, now {})",
             div.position,
             redivided[0].position
         );
