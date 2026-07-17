@@ -2095,7 +2095,20 @@ impl Engine {
                 EngineAction::None
             }
             "saveas" => {
-                self.message = "Usage: :saveas {file}".to_string();
+                // No-argument invocation — GTK/TUI menu "File: Save As…" and
+                // the command palette both route here via
+                // dispatch_menu_action/PickerAction::ExecuteCommand. Rather
+                // than a per-backend native dialog, pre-fill the command
+                // line with the current path for interactive editing, same
+                // platform-neutral pattern as `:Rename` with no argument
+                // above (#585).
+                let current = self
+                    .file_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                self.mode = Mode::Command;
+                self.command_buffer = format!("saveas {current}");
+                self.command_cursor = self.command_buffer.chars().count();
                 EngineAction::None
             }
             "keys" => {
