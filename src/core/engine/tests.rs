@@ -27644,3 +27644,73 @@ fn test_existing_markdown_link_behavior_unchanged() {
         assert!(is_safe_url(&link.3), "unsafe URL in links: {}", link.3);
     }
 }
+
+// ── #585: :saveas with no argument ──────────────────────────────────────
+// GTK/TUI "File: Save As…" menu item and command palette entry both
+// resolve to `execute_command("saveas")`. It used to just print a status
+// message and do nothing visible. It should now pre-fill Command mode
+// with the current path for interactive editing (same pattern as
+// `:Rename` with no argument), fully platform-neutral.
+
+#[test]
+fn test_saveas_no_arg_prefills_command_line_with_current_path() {
+    let mut engine = Engine::new();
+    engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/existing.rs"));
+
+    let action = engine.execute_command("saveas");
+
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "saveas /tmp/existing.rs");
+    assert_eq!(engine.command_cursor, engine.command_buffer.chars().count());
+}
+
+#[test]
+fn test_saveas_no_arg_on_unnamed_buffer_prefills_empty_path() {
+    let mut engine = Engine::new();
+    // Fresh buffer has no file_path.
+    assert!(engine.file_path().is_none());
+
+    let action = engine.execute_command("saveas");
+
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "saveas ");
+}
+
+#[test]
+fn test_saveas_no_arg_via_menu_dispatch() {
+    // Menu bar / command palette both route through dispatch_menu_action,
+    // which forces Mode::Normal before calling execute_command — verify
+    // execute_command's Mode::Command still wins so the command line
+    // actually opens.
+    let mut engine = Engine::new();
+    engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/existing.rs"));
+
+    let action = engine.dispatch_menu_action("saveas");
+
+    assert_eq!(action, EngineAction::None);
+    assert_eq!(engine.mode, Mode::Command);
+    assert_eq!(engine.command_buffer, "saveas /tmp/existing.rs");
+}
+
+#[test]
+fn test_saveas_with_explicit_arg_still_saves_directly() {
+    // Existing `:saveas {file}` behavior (with an explicit argument) must
+    // be unaffected by the no-arg prefill change.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello");
+    let dir = std::env::temp_dir();
+    let target = dir.join(format!("vimcode_saveas_test_{}.txt", std::process::id()));
+    let target_str = target.to_string_lossy().to_string();
+
+    let action = engine.execute_command(&format!("saveas {target_str}"));
+
+    assert_eq!(action, EngineAction::None);
+    // Mode is untouched by this path — no Command-mode prefill happens
+    // when an explicit path is given.
+    assert_eq!(engine.mode, Mode::Normal);
+    assert_eq!(engine.file_path(), Some(&target));
+    assert!(target.exists());
+    let _ = std::fs::remove_file(&target);
+}
