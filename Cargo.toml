@@ -96,6 +96,23 @@ insta = "1.39"
 [build-dependencies]
 cc = "1.0"
 
+# quadraui#452: quadraui's develop tip pulls in vt100 0.16, whose upstream
+# manifest exact-pins its own `unicode-width` floor to "^0.2.1" — mutually
+# exclusive with `ratatui = "0.29"` above, which upstream-pins
+# `unicode-width` to exactly "=0.2.0". quadraui vendored a copy of vt100
+# 0.16.2 with only that bound loosened (no source changes) and patches it
+# via `[patch.crates-io]` in its OWN Cargo.toml — but Cargo only honors a
+# `[patch]` section declared in the root manifest of the workspace actually
+# being built, so quadraui's patch has zero effect here; this repo's own
+# `[patch.crates-io]` entry (pointing at the same vendored copy, which
+# lives at the quadraui monorepo root, a sibling of the `quadraui` crate
+# path-dep above) is required too. See
+# ../quadraui/vendor/vt100-0.16.2-patched/README-PATCH.md and
+# ../quadraui/quadraui/docs/LESSONS.md for the full rationale — do not
+# remove this without reading both first.
+[patch.crates-io]
+vt100 = { path = "../quadraui/vendor/vt100-0.16.2-patched" }
+
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible
 # GUI sluggishness during development.  Our own code stays at opt-level 0 for
