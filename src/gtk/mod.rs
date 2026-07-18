@@ -865,7 +865,30 @@ fn setup_gtk_clipboard(engine: &mut Engine) {
             copypasta_ext::x11_bin::ClipboardContext::new()
                 .ok()
                 .map(|c| Box::new(c) as Box<dyn ClipboardProviderExt>)
-                .or_else(copypasta_ext::try_context)
+                .or_else(|| {
+                    // xclip/xsel aren't on PATH, so `x11_bin` failed. Do NOT
+                    // fall back to `copypasta_ext::try_context()` here — on
+                    // X11 that prefers `x11_fork::ClipboardContext` by
+                    // default (#587 Problem 2, discovered via manual GTK
+                    // smoke test): its `set_contents` calls `fork()` inside
+                    // this GTK4 process, and its `get_contents` opens its
+                    // own in-process X11 connection. Forking a process with
+                    // GTK's thread pool, glib workers, gdbus and Cairo/Mesa
+                    // threads risks the child inheriting a mutex locked by a
+                    // thread that doesn't exist in the child and hanging
+                    // forever; the extra connection also contends with
+                    // GTK's main-thread X11 event loop per the module doc
+                    // above. Any machine without xclip/xsel installed hit
+                    // this fallback and froze the whole app on clipboard
+                    // access. `X11ClipboardContext` (used here directly,
+                    // bypassing `x11_fork`) does the same I/O on a
+                    // background thread with a bounded (3s) read timeout
+                    // and never calls `fork()`.
+                    use copypasta_ext::copypasta::x11_clipboard::{Clipboard, X11ClipboardContext};
+                    X11ClipboardContext::<Clipboard>::new()
+                        .ok()
+                        .map(|c| Box::new(c) as Box<dyn ClipboardProviderExt>)
+                })
         } else {
             copypasta_ext::try_context()
         }
