@@ -278,13 +278,19 @@ pub(super) const ACC_NAV_FORWARD: &str = "gtk.panel.nav_forward";
 
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
-/// Dead in ShellApp mode until accelerator re-binding is re-wired (#448-C follow-on).
-#[allow(dead_code)]
+///
+/// Called from `ShellApp::setup` (#587) — mirrors `tui_main`'s call at
+/// startup. Takes the trait object (`&mut dyn quadraui::Backend`) rather
+/// than the concrete `backend::GtkBackend` because the ShellApp runner
+/// only ever hands `setup`/`handle` a `&mut dyn quadraui::Backend`; the
+/// separate `self.backend: GtkBackend` field is a distinct instance used
+/// only for click hit-testing (see the #560 comment in `render_content`)
+/// and never receives `UiEvent::Accelerator`, so registering against it
+/// would be silently ineffective.
 fn register_panel_accelerators(
-    backend: &mut backend::GtkBackend,
+    backend: &mut dyn quadraui::Backend,
     pk: &crate::core::settings::PanelKeys,
 ) {
-    use quadraui::Backend;
     let entries: [(&str, &str); 14] = [
         (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
         (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
@@ -7715,6 +7721,15 @@ impl quadraui::ShellApp for App {
         let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
         let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
         self.css_provider.load_from_data(&combined);
+
+        // Register the panel-keys accelerator set (toggle sidebar, fuzzy
+        // finder, live grep, command palette, ...) on the runner's backend.
+        // This was previously only wired for TUI (`tui_main::run` calls it
+        // right after `TuiBackend::new()`); the GTK side's registration
+        // function existed but was never called after the ShellApp
+        // migration, so none of these 14 global shortcuts — including
+        // Ctrl+Shift+P for the command palette — ever fired on GTK (#587).
+        register_panel_accelerators(backend, &self.engine.borrow().settings.panel_keys);
     }
 
     fn render_content(
