@@ -8291,6 +8291,37 @@ impl quadraui::ShellApp for App {
         // already reads (and was simply never being fed).
         let popup_vp = backend.viewport();
         let popup_viewport = quadraui::Rect::new(0.0, 0.0, popup_vp.width, popup_vp.height);
+
+        // ── Picker / command-palette overlay (#587) ───────────────────────────
+        // Same class of bug #546 fixed for dialog/context-menu: the palette was
+        // painted only by the dead legacy `draw_editor` Cairo path
+        // (`draw.rs::draw_picker_popup`), which has zero live callers under
+        // ShellApp. So `Ctrl+Shift+P` opened the picker in engine state
+        // (`picker_open = true`, items populated) but nothing ever painted — the
+        // "command palette fails to open silently" symptom. Geometry comes from
+        // the same generic helpers the legacy path used (`PickerGeometry` +
+        // `gtk_picker_sizing`), so no Pango/Cairo access is needed here.
+        //
+        // Drawn *before* dialog / context menu to match TUI's modal z-order
+        // (`tui_main/render_impl.rs`: picker at :940, context menu :983,
+        // dialog :1009) — the picker is the lowest of the modal overlays.
+        if let Some(ref picker) = screen.picker {
+            let has_preview = picker.preview.is_some();
+            let geo = render::PickerGeometry::compute(
+                popup_vp.width,
+                popup_vp.height,
+                has_preview,
+                &render::gtk_picker_sizing(lh as f32),
+            );
+            let palette = render::picker_panel_to_palette(picker);
+            let mut frame = QSL::new();
+            frame.push(Surface::Palette {
+                rect: quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h),
+                palette: &palette,
+            });
+            frame.draw(backend);
+        }
+
         if let Some(ref panel) = screen.dialog {
             let (dialog, dlayout) = render::dialog_generic_layout(panel, popup_viewport, cw, lh);
             let mut frame = QSL::new();
