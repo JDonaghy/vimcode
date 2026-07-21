@@ -298,10 +298,7 @@ pub(super) fn render_source_control(
             }
         }
     }
-    let item_fg = rc(theme.foreground);
     let dim_fg = rc(theme.line_number_fg);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
-    let row_bg = rc(theme.tab_bar_bg);
 
     // Build SC data from engine state via the render abstraction.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
@@ -330,14 +327,7 @@ pub(super) fn render_source_control(
     };
 
     // ── Row 0: header "SOURCE CONTROL" ──────────────────────────────────────
-    let branch_info = if sc.ahead > 0 || sc.behind > 0 {
-        format!(
-            "  \u{e702} SOURCE CONTROL  {}  \u{2191}{} \u{2193}{}",
-            sc.branch, sc.ahead, sc.behind
-        )
-    } else {
-        format!("  \u{e702} SOURCE CONTROL  {}", sc.branch)
-    };
+    let branch_info = render::sc_header_text(sc);
     for x in area.x..area.x + area.width {
         set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
     }
@@ -349,81 +339,30 @@ pub(super) fn render_source_control(
         return;
     }
 
-    // ── Row 1+: commit input row(s) ──────────────────────────────────────────
-    let commit_lines: Vec<&str> = sc.commit_message.split('\n').collect();
-    let commit_rows = commit_lines.len().max(1) as u16;
+    // ── Row 1+: commit input box (quadraui::TextInput, #480) ─────────────────
+    // Migrated from a hand-rolled `set_cell` multi-line editor to the shared
+    // `TextInput` primitive (quadraui#222). `commit_box_h` includes the
+    // primitive's 1-row border on top and bottom — see
+    // `render::sc_commit_input_box_height` doc for why this height is the
+    // single source of truth shared with `mouse.rs`'s click hit-test.
+    let ti = render::sc_commit_message_to_text_input(sc);
+    let commit_box_h = render::sc_commit_input_box_height(&sc.commit_message);
     {
-        let inp_bg = if sc.commit_input_active {
-            sel_bg
-        } else {
-            row_bg
-        };
-        let prompt_fg = if sc.commit_input_active {
-            item_fg
-        } else {
-            dim_fg
-        };
-
-        // Compute cursor line/col for active input.
-        let (cursor_line, cursor_col) = if sc.commit_input_active {
-            let before_cursor = &sc.commit_message[..sc.commit_cursor.min(sc.commit_message.len())];
-            let cl = before_cursor.matches('\n').count();
-            let line_start = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            (cl, before_cursor[line_start..].chars().count())
-        } else {
-            (0, 0)
-        };
-        let prefix = " \u{f044}  ";
-        let pad = "    "; // 4 spaces — same visual width as prefix
-
-        if sc.commit_message.is_empty() && !sc.commit_input_active {
-            let commit_y = area.y + 1;
-            let prompt = format!("{}Message (press c)", prefix);
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, commit_y, ' ', prompt_fg, inp_bg);
-            }
-            for (i, ch) in prompt.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, commit_y, ch, prompt_fg, inp_bg);
-            }
-        } else {
-            for (line_idx, line) in commit_lines.iter().enumerate() {
-                let commit_y = area.y + 1 + line_idx as u16;
-                if commit_y >= area.y + area.height {
-                    break;
-                }
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, commit_y, ' ', prompt_fg, inp_bg);
-                }
-                let pfx = if line_idx == 0 { prefix } else { pad };
-                let text = format!("{}{}", pfx, line);
-                let pfx_len = pfx.chars().count();
-                for (i, ch) in text.chars().enumerate().take(area.width as usize) {
-                    // Show cursor by inverting fg/bg at cursor position.
-                    let (fg, bg) = if sc.commit_input_active
-                        && line_idx == cursor_line
-                        && i == pfx_len + cursor_col
-                    {
-                        (inp_bg, prompt_fg)
-                    } else {
-                        (prompt_fg, inp_bg)
-                    };
-                    set_cell(buf, area.x + i as u16, commit_y, ch, fg, bg);
-                }
-                // If cursor is at end of line, show inverted space after text.
-                if sc.commit_input_active
-                    && line_idx == cursor_line
-                    && cursor_col >= line.chars().count()
-                {
-                    let cx = area.x + (pfx_len + cursor_col) as u16;
-                    if cx < area.x + area.width {
-                        set_cell(buf, cx, commit_y, ' ', inp_bg, prompt_fg);
-                    }
-                }
-            }
-        }
+        let paint_h = commit_box_h.min(area.height.saturating_sub(1));
+        let ti_rect = quadraui::Rect::new(
+            area.x as f32,
+            (area.y + 1) as f32,
+            area.width as f32,
+            paint_h as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_text_input(ti_rect, &ti);
+        });
     }
 
-    if area.height < 1 + commit_rows + 2 {
+    if area.height < 1 + commit_box_h {
         return;
     }
 
@@ -434,7 +373,7 @@ pub(super) fn render_source_control(
     // per-side padding rows — option (a) from the issue: tighter layout,
     // zero manual arithmetic.
     {
-        let slab_y = area.y + 1 + commit_rows;
+        let slab_y = area.y + 1 + commit_box_h;
         let slab_h = (area.y + area.height).saturating_sub(slab_y);
         let slab_rect = quadraui::Rect::new(
             area.x as f32,
@@ -453,7 +392,7 @@ pub(super) fn render_source_control(
         let l = engine.sc_panel_layout.borrow();
         l.as_ref()
             .map(|l| l.content_bounds.y as u16)
-            .unwrap_or(area.y + 2 + commit_rows) // fallback: btn row + 1
+            .unwrap_or(area.y + 1 + commit_box_h + 1) // fallback: btn row + 1
     };
     if section_start_y >= area.y + area.height {
         return;
@@ -478,226 +417,48 @@ pub(super) fn render_source_control(
     backend.enter_frame_scope(frame, |b| {
         engine.sc_sidebar_system.borrow().render(b, q_rect);
     });
-    let buf = frame.buffer_mut();
-
-    // ── Branch picker / create popup ─────────────────────────────────────────
+    // ── Branch picker / create popup (quadraui::Palette dual-mode, #480) ─────
+    // Migrated from a hand-rolled popup to the dual-mode `Palette` primitive
+    // shipped in quadraui#224 (list mode = switch branch, input mode =
+    // create branch). Scroll is authoritative in the TUI rasteriser (keeps
+    // `selected_idx` in view), so no manual scroll-offset math is needed
+    // here the way the hand-rolled version required.
     if let Some(ref bp) = sc.branch_picker {
-        let popup_bg = rc(theme.completion_bg);
-        let popup_fg = rc(theme.completion_fg);
-        let popup_border = rc(theme.completion_border);
-        let popup_sel = rc(theme.completion_selected_bg);
+        let palette = render::sc_branch_picker_to_palette(bp);
         let popup_w = area.width.saturating_sub(2).min(40);
         let popup_h = if bp.create_mode {
-            3u16
+            4u16
         } else {
             area.height.saturating_sub(4).min(15)
         };
         let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
         let popup_y = area.y + 2;
-        // Clear popup area
-        for y in popup_y..popup_y + popup_h {
-            for x in popup_x..popup_x + popup_w {
-                set_cell(buf, x, y, ' ', popup_fg, popup_bg);
-            }
-        }
-        // Top border
-        if popup_w >= 2 {
-            set_cell(buf, popup_x, popup_y, '┌', popup_border, popup_bg);
-            set_cell(
-                buf,
-                popup_x + popup_w - 1,
-                popup_y,
-                '┐',
-                popup_border,
-                popup_bg,
-            );
-            for x in popup_x + 1..popup_x + popup_w - 1 {
-                set_cell(buf, x, popup_y, '─', popup_border, popup_bg);
-            }
-            let title = if bp.create_mode {
-                " New Branch "
-            } else {
-                " Switch Branch "
-            };
-            let title_x = popup_x + 1;
-            for (i, ch) in title.chars().enumerate() {
-                let x = title_x + i as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, popup_y, ch, popup_border, popup_bg);
-                }
-            }
-        }
-        if bp.create_mode {
-            let iy = popup_y + 1;
-            let label = "Name: ";
-            for (i, ch) in label.chars().enumerate() {
-                let x = popup_x + 1 + i as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, iy, ch, dim_fg, popup_bg);
-                }
-            }
-            let input_x = popup_x + 1 + label.len() as u16;
-            for (i, ch) in bp.create_input.chars().enumerate() {
-                let x = input_x + i as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, iy, ch, popup_fg, popup_bg);
-                }
-            }
-            let cx = input_x + bp.create_input.len() as u16;
-            if cx < popup_x + popup_w - 1 {
-                set_cell(buf, cx, iy, '▏', popup_fg, popup_bg);
-            }
-            let by = popup_y + popup_h - 1;
-            set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
-            set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
-            for x in popup_x + 1..popup_x + popup_w - 1 {
-                set_cell(buf, x, by, '─', popup_border, popup_bg);
-            }
-        } else {
-            let iy = popup_y + 1;
-            let prefix = " \u{f002} ";
-            for (i, ch) in prefix.chars().enumerate() {
-                let x = popup_x + i as u16;
-                if x < popup_x + popup_w {
-                    set_cell(buf, x, iy, ch, dim_fg, popup_bg);
-                }
-            }
-            let qx = popup_x + prefix.chars().count() as u16;
-            for (i, ch) in bp.query.chars().enumerate() {
-                let x = qx + i as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, iy, ch, popup_fg, popup_bg);
-                }
-            }
-            let list_y = popup_y + 2;
-            let list_h = popup_h.saturating_sub(3) as usize;
-            let scroll_off = if bp.selected >= list_h {
-                bp.selected - list_h + 1
-            } else {
-                0
-            };
-            for (vi, (name, is_current)) in
-                bp.results.iter().skip(scroll_off).take(list_h).enumerate()
-            {
-                let y = list_y + vi as u16;
-                let is_sel = vi + scroll_off == bp.selected;
-                let bg = if is_sel { popup_sel } else { popup_bg };
-                for x in popup_x..popup_x + popup_w {
-                    set_cell(buf, x, y, ' ', popup_fg, bg);
-                }
-                let marker = if *is_current { "● " } else { "  " };
-                let display = format!("{marker}{name}");
-                for (i, ch) in display.chars().enumerate() {
-                    let x = popup_x + 1 + i as u16;
-                    if x < popup_x + popup_w - 1 {
-                        set_cell(buf, x, y, ch, popup_fg, bg);
-                    }
-                }
-            }
-            let by = popup_y + popup_h - 1;
-            if by >= list_y {
-                set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
-                set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
-                for x in popup_x + 1..popup_x + popup_w - 1 {
-                    set_cell(buf, x, by, '─', popup_border, popup_bg);
-                }
-            }
-        }
-        // Side borders
-        for y in popup_y + 1..popup_y + popup_h.saturating_sub(1) {
-            set_cell(buf, popup_x, y, '│', popup_border, popup_bg);
-            if popup_x + popup_w > 0 {
-                set_cell(buf, popup_x + popup_w - 1, y, '│', popup_border, popup_bg);
-            }
-        }
+        let q_rect = quadraui::Rect::new(
+            popup_x as f32,
+            popup_y as f32,
+            popup_w as f32,
+            popup_h as f32,
+        );
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.enter_frame_scope(frame, |b| {
+            use quadraui::Backend;
+            b.draw_palette(q_rect, &palette);
+        });
     }
 
-    // ── Help dialog ──────────────────────────────────────────────────────────
+    // ── Help dialog (quadraui::Dialog + DialogTable, #480) ───────────────────
+    // Migrated from a hand-rolled 2-column popup to `Dialog`'s table slot,
+    // shipped in quadraui#225. Bindings list lives once in
+    // `render::sc_help_dialog` instead of being duplicated per backend.
     if sc.help_open {
-        let popup_bg = rc(theme.completion_bg);
-        let popup_fg = rc(theme.completion_fg);
-        let popup_border = rc(theme.completion_border);
-        let bindings: &[(&str, &str)] = &[
-            ("j/k", "Navigate"),
-            ("s", "Stage / unstage"),
-            ("S", "Stage all"),
-            ("d", "Discard file"),
-            ("D", "Discard all unstaged"),
-            ("c", "Commit message"),
-            ("b", "Switch branch"),
-            ("B", "Create branch"),
-            ("p", "Push"),
-            ("P", "Pull"),
-            ("f", "Fetch"),
-            ("r", "Refresh"),
-            ("Tab", "Expand / collapse"),
-            ("Enter", "Open file"),
-            ("q/Esc", "Close panel"),
-        ];
-        let popup_w = area.width.saturating_sub(2).min(36);
-        let popup_h = (bindings.len() as u16 + 3).min(area.height.saturating_sub(2));
-        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-        let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-        for y in popup_y..popup_y + popup_h {
-            for x in popup_x..popup_x + popup_w {
-                set_cell(buf, x, y, ' ', popup_fg, popup_bg);
-            }
-        }
-        set_cell(buf, popup_x, popup_y, '┌', popup_border, popup_bg);
-        set_cell(
-            buf,
-            popup_x + popup_w - 1,
-            popup_y,
-            '┐',
-            popup_border,
-            popup_bg,
+        let viewport = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
         );
-        for x in popup_x + 1..popup_x + popup_w - 1 {
-            set_cell(buf, x, popup_y, '─', popup_border, popup_bg);
-        }
-        let title = " Keybindings ";
-        let tx = popup_x + (popup_w.saturating_sub(title.len() as u16)) / 2;
-        for (i, ch) in title.chars().enumerate() {
-            let x = tx + i as u16;
-            if x > popup_x && x < popup_x + popup_w - 1 {
-                set_cell(buf, x, popup_y, ch, popup_border, popup_bg);
-            }
-        }
-        // Close hint
-        let close_x = popup_x + popup_w - 2;
-        if close_x > popup_x {
-            set_cell(buf, close_x, popup_y, 'x', popup_border, popup_bg);
-        }
-        let key_fg = rc(theme.function);
-        for (i, (key, desc)) in bindings.iter().enumerate() {
-            let y = popup_y + 1 + i as u16;
-            if y >= popup_y + popup_h - 1 {
-                break;
-            }
-            for (j, ch) in key.chars().enumerate() {
-                let x = popup_x + 2 + j as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, y, ch, key_fg, popup_bg);
-                }
-            }
-            let desc_x = popup_x + 12;
-            for (j, ch) in desc.chars().enumerate() {
-                let x = desc_x + j as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, y, ch, popup_fg, popup_bg);
-                }
-            }
-        }
-        let by = popup_y + popup_h - 1;
-        set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
-        set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
-        for x in popup_x + 1..popup_x + popup_w - 1 {
-            set_cell(buf, x, by, '─', popup_border, popup_bg);
-        }
-        for y in popup_y + 1..popup_y + popup_h - 1 {
-            set_cell(buf, popup_x, y, '│', popup_border, popup_bg);
-            set_cell(buf, popup_x + popup_w - 1, y, '│', popup_border, popup_bg);
-        }
+        let (dialog, layout) = render::sc_help_dialog_layout(viewport, 1.0, 1.0);
+        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
     }
 }
 

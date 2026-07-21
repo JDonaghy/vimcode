@@ -8169,19 +8169,81 @@ impl quadraui::ShellApp for App {
                 }
                 PANEL_GIT => {
                     if let Some(ref sc) = screen.source_control {
-                        // Render the toolbar-slab + section list; the header row
-                        // (branch name) and commit-input chrome are deferred to a
-                        // follow-up migration once a Backend primitive for them lands.
-                        render::draw_sc_sidebar_panel(backend, &engine, sc, q_sb);
+                        // Header row + commit-input box (#480). Previously
+                        // entirely unpainted under ShellApp — the only place
+                        // that ever drew them was the dead
+                        // `draw.rs::draw_source_control_panel` Cairo painter,
+                        // which has zero live callers (superseded by this
+                        // `render_content` path back when the 14 legacy DAs
+                        // were collapsed into one, #493). Paint them for
+                        // real now that quadraui#222 (TextInput) has landed,
+                        // through the same `render::sc_*` adapters TUI uses
+                        // so the two renderers can't drift.
+                        let header_h = lh as f32;
+                        let header_rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, header_h);
+                        let header_bar = render::sc_header_status_bar(sc, &theme);
+                        let _ = backend.draw_status_bar(header_rect, &header_bar, None, None);
+
+                        let ti = render::sc_commit_message_to_text_input(sc);
+                        let commit_rows = render::sc_commit_input_row_count(&sc.commit_message);
+                        // +2px for the primitive's 1px border top+bottom — GTK's
+                        // native unit is pixels, unlike TUI's whole-cell border
+                        // (see `render::sc_commit_input_box_height` doc).
+                        let commit_h = commit_rows as f32 * lh as f32 + 2.0;
+                        let ti_rect =
+                            quadraui::Rect::new(q_sb.x, q_sb.y + header_h, q_sb.width, commit_h);
+                        backend.draw_text_input(ti_rect, &ti);
+
+                        // Render the toolbar-slab + section list below the
+                        // header + commit input.
+                        let slab_y = q_sb.y + header_h + commit_h;
+                        let slab_rect = quadraui::Rect::new(
+                            q_sb.x,
+                            slab_y,
+                            q_sb.width,
+                            (q_sb.height - header_h - commit_h).max(0.0),
+                        );
+                        render::draw_sc_sidebar_panel(backend, &engine, sc, slab_rect);
                         let body_rect = engine
                             .sc_panel_layout
                             .borrow()
                             .as_ref()
                             .map(|l| l.content_bounds)
-                            .unwrap_or(q_sb);
+                            .unwrap_or(slab_rect);
                         engine.sc_sidebar_body_rect.set(body_rect);
                         render::populate_sc_sidebar_system(&engine, &theme);
                         engine.sc_sidebar_system.borrow().render(backend, body_rect);
+
+                        // Branch picker / create popup (dual-mode Palette,
+                        // quadraui#224) and help dialog (Dialog + DialogTable,
+                        // quadraui#225) — both keyboard-reachable via
+                        // `dispatch_sc_sidebar_key_unified` even though the
+                        // git sidebar has no live mouse-click routing yet
+                        // (#449 tracks that separately). Render over the
+                        // whole sidebar content area, same popup-over-panel
+                        // z-order TUI uses.
+                        if let Some(ref bp) = sc.branch_picker {
+                            let palette = render::sc_branch_picker_to_palette(bp);
+                            let popup_w = q_sb.width.min(40.0 * cw as f32);
+                            let popup_h = if bp.create_mode {
+                                4.0 * lh as f32
+                            } else {
+                                (q_sb.height * 0.6).min(15.0 * lh as f32)
+                            };
+                            let popup_x = q_sb.x + (q_sb.width - popup_w) / 2.0;
+                            let popup_y = q_sb.y + 2.0 * lh as f32;
+                            backend.draw_palette(
+                                quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
+                                &palette,
+                            );
+                        }
+
+                        if sc.help_open {
+                            let viewport = q_sb;
+                            let (dialog, dlayout) =
+                                render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
+                            backend.draw_dialog(&dialog, &dlayout);
+                        }
                     }
                 }
                 PANEL_EXTENSIONS => {

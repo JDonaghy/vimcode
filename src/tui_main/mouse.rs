@@ -2478,11 +2478,12 @@ pub(super) fn handle_mouse(
 
             // sidebar_row layout after #509 (option a, no padding):
             //   0               = header
-            //   1 .. commit_end = commit input
+            //   1 .. commit_end = commit input (quadraui::TextInput box,
+            //                     including its 1-row border top+bottom — #480)
             //   commit_end      = toolbar slot (button row, SidebarPanel)
             //   commit_end+1 .. = sections (SidebarPanel content area)
-            let commit_rows = engine.sc_commit_message.split('\n').count().max(1) as u16;
-            let commit_end = 1 + commit_rows;
+            let commit_box_h = render::sc_commit_input_box_height(&engine.sc_commit_message);
+            let commit_end = 1 + commit_box_h;
 
             if sidebar_row == 0 {
                 engine.sc_commit_input_active = false;
