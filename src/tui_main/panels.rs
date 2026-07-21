@@ -1405,3 +1405,166 @@ pub(super) fn render_terminal_panel(
         });
     }
 }
+
+// ─── Source Control panel rendering tests (#480) ─────────────────────────────
+//
+// Drives `render_source_control` through the same headless
+// `ratatui::Terminal<TestBackend>` harness `render_impl.rs`'s test module
+// uses for full-frame rendering — vimcode's equivalent of quadraui's
+// `TuiDriver`. Exercises the migrated `TextInput` / dual-mode `Palette` /
+// `Dialog`+`DialogTable` paint paths end-to-end (build_screen_layout →
+// render_source_control → backend rasterisers) rather than only unit-testing
+// the `render::sc_*` adapters in isolation, so a regression in the wiring
+// (wrong rect, wrong field) would show up as a rendered-buffer mismatch.
+#[cfg(test)]
+mod sc_panel_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// Hermetic engine with the Source Control panel active and focused.
+    /// Resets git-derived fields so snapshots don't depend on the repo
+    /// state of whatever machine/branch the test happens to run on.
+    fn test_engine() -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.extension_state = crate::core::session::ExtensionState::default();
+        e.ext_registry = None;
+        e.git_branch = None;
+        e.sc_ahead = 0;
+        e.sc_behind = 0;
+        e.sc_has_focus = true;
+        e.app_shell.show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        e
+    }
+
+    /// Render just the SC panel and return the rasterised buffer as lines.
+    fn render_sc(engine: &Engine, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let theme = crate::render::Theme::onedark();
+        let mut tui_backend = super::super::backend::TuiBackend::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        terminal
+            .draw(|frame| {
+                render_source_control(&mut tui_backend, frame, area, engine, &theme);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let mut line = String::new();
+                for x in 0..width {
+                    line.push_str(buf[(x, y)].symbol());
+                }
+                line.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    fn contains(lines: &[String], substr: &str) -> bool {
+        lines.iter().any(|l| l.contains(substr))
+    }
+
+    #[test]
+    fn empty_commit_message_shows_placeholder() {
+        let e = test_engine();
+        let lines = render_sc(&e, 40, 20);
+        assert!(
+            contains(&lines, "Message (press c)"),
+            "expected commit-input placeholder, got: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn active_commit_input_renders_typed_message_not_placeholder() {
+        let mut e = test_engine();
+        e.sc_commit_message = "Fix the thing".to_string();
+        e.sc_commit_cursor = e.sc_commit_message.len();
+        e.sc_commit_input_active = true;
+        let lines = render_sc(&e, 40, 20);
+        assert!(
+            contains(&lines, "Fix the thing"),
+            "expected typed commit message, got: {lines:#?}"
+        );
+        assert!(
+            !contains(&lines, "Message (press c)"),
+            "placeholder should not show while actively editing, got: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn multiline_commit_message_renders_every_line() {
+        let mut e = test_engine();
+        e.sc_commit_message = "Summary line\n\nBody line one\nBody line two".to_string();
+        e.sc_commit_cursor = 0;
+        e.sc_commit_input_active = true;
+        // Tall enough for the multi-line TextInput box + toolbar + sections.
+        let lines = render_sc(&e, 40, 24);
+        assert!(contains(&lines, "Summary line"), "{lines:#?}");
+        assert!(contains(&lines, "Body line one"), "{lines:#?}");
+        assert!(contains(&lines, "Body line two"), "{lines:#?}");
+    }
+
+    #[test]
+    fn branch_picker_list_mode_renders_branches_and_marks_current() {
+        let mut e = test_engine();
+        e.sc_branch_picker_open = true;
+        e.sc_branch_picker_branches = vec![
+            crate::core::git::BranchEntry {
+                name: "main".to_string(),
+                is_current: true,
+                upstream: None,
+                ahead_behind: None,
+            },
+            crate::core::git::BranchEntry {
+                name: "feature/foo".to_string(),
+                is_current: false,
+                upstream: None,
+                ahead_behind: None,
+            },
+        ];
+        let lines = render_sc(&e, 50, 24);
+        assert!(contains(&lines, "Switch Branch"), "{lines:#?}");
+        assert!(contains(&lines, "main"), "{lines:#?}");
+        assert!(contains(&lines, "feature/foo"), "{lines:#?}");
+    }
+
+    #[test]
+    fn branch_picker_create_mode_renders_typed_name() {
+        let mut e = test_engine();
+        e.sc_branch_create_mode = true;
+        e.sc_branch_create_input = "wip-feature".to_string();
+        let lines = render_sc(&e, 50, 24);
+        assert!(contains(&lines, "New Branch"), "{lines:#?}");
+        assert!(contains(&lines, "wip-feature"), "{lines:#?}");
+    }
+
+    #[test]
+    fn help_dialog_renders_keybindings_table() {
+        let mut e = test_engine();
+        e.sc_help_open = true;
+        let lines = render_sc(&e, 60, 24);
+        assert!(contains(&lines, "Keybindings"), "{lines:#?}");
+        assert!(contains(&lines, "Navigate"), "{lines:#?}");
+        assert!(contains(&lines, "Close"), "{lines:#?}");
+    }
+
+    #[test]
+    fn renders_without_panicking_at_minimum_size() {
+        // Regression guard: the migrated TextInput/Palette/Dialog primitives
+        // must degrade gracefully instead of panicking when the panel is
+        // squeezed very small (e.g. a tiny terminal or heavily split window).
+        let mut e = test_engine();
+        e.sc_commit_message = "line one\nline two".to_string();
+        e.sc_commit_input_active = true;
+        let _ = render_sc(&e, 10, 3);
+        e.sc_help_open = true;
+        let _ = render_sc(&e, 10, 3);
+    }
+}
