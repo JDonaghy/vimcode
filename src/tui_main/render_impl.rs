@@ -2286,4 +2286,142 @@ mod tests {
         let lines = render_tui(&e, 60, 12);
         snap_settings().bind(|| insta::assert_snapshot!("line_numbers", lines.join("\n")));
     }
+
+    // ── :help render regression tests (#596) ─────────────────────────────────
+
+    /// Drive `:help` through the full event→handle→render path and assert that
+    /// (a) the engine does not panic, and (b) the help content appears in the
+    /// rendered output.
+    ///
+    /// Also exercises the case where the cursor is at a non-zero line before
+    /// the split (the new help window inherits the view, but the help buffer
+    /// is shorter — verifying that the render handles an out-of-range cursor).
+    #[test]
+    fn test_tui_help_no_panic_and_renders_content() {
+        // Use a 50-line buffer and move the cursor down so the view is at a
+        // non-zero position before :help is invoked.
+        let long_text: String = (0..50).map(|i| format!("line {}\n", i)).collect();
+        let mut e = test_engine(&long_text);
+        // Move cursor to line ~30 so view.scroll_top and cursor.line are non-zero.
+        for _ in 0..30 {
+            e.handle_key("j", Some('j'), false);
+        }
+        // Enter command mode and type 'help', then submit.
+        e.handle_key(":", Some(':'), false);
+        e.handle_key("h", Some('h'), false);
+        e.handle_key("e", Some('e'), false);
+        e.handle_key("l", Some('l'), false);
+        e.handle_key("p", Some('p'), false);
+        e.handle_key("Return", None, false);
+
+        // After :help, there should be a split (2 windows in the layout).
+        let win_count = e.active_tab().layout.window_ids().len();
+        assert_eq!(win_count, 2, ":help should open a vsplit (2 windows)");
+
+        // Rendering must not panic.
+        let lines = render_tui(&e, 80, 24);
+
+        // The help content should appear somewhere in the rendered output.
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("VimCode Help") || rendered.contains("topics"),
+            "rendered output should contain help content, got:\n{rendered}"
+        );
+    }
+
+    /// `:help topics` — named topic must open a split and render content.
+    #[test]
+    fn test_tui_help_topics_no_panic() {
+        let mut e = test_engine("");
+        e.handle_key(":", Some(':'), false);
+        for ch in "help topics".chars() {
+            e.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        e.handle_key("Return", None, false);
+        let lines = render_tui(&e, 80, 24);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("VimCode Help") || rendered.contains("topics"),
+            "help topics should render, got:\n{rendered}"
+        );
+    }
+
+    /// `:help keys` — must not panic, and must render key reference content.
+    #[test]
+    fn test_tui_help_keys_no_panic() {
+        let mut e = test_engine("");
+        e.handle_key(":", Some(':'), false);
+        for ch in "help keys".chars() {
+            e.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        e.handle_key("Return", None, false);
+        let lines = render_tui(&e, 80, 24);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Normal Mode") || rendered.contains("Motion"),
+            "help keys should render key reference, got:\n{rendered}"
+        );
+    }
+
+    /// `:help commands` — must not panic, and must render command reference.
+    #[test]
+    fn test_tui_help_commands_no_panic() {
+        let mut e = test_engine("");
+        e.handle_key(":", Some(':'), false);
+        for ch in "help commands".chars() {
+            e.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        e.handle_key("Return", None, false);
+        let lines = render_tui(&e, 80, 24);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Command Mode") || rendered.contains(":w"),
+            "help commands should render command reference, got:\n{rendered}"
+        );
+    }
+
+    /// `:help explorer` — must not panic, and must render explorer keys.
+    #[test]
+    fn test_tui_help_explorer_no_panic() {
+        let mut e = test_engine("");
+        e.handle_key(":", Some(':'), false);
+        for ch in "help explorer".chars() {
+            e.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        e.handle_key("Return", None, false);
+        let lines = render_tui(&e, 80, 24);
+        let rendered = lines.join("\n");
+        assert!(
+            rendered.contains("Explorer") || rendered.contains("sidebar"),
+            "help explorer should render explorer reference, got:\n{rendered}"
+        );
+    }
+
+    /// `:help bogus` (unknown topic) — must NOT open a split and must show
+    /// the "No help for..." message without crashing.
+    #[test]
+    fn test_tui_help_unknown_topic_no_panic() {
+        let mut e = test_engine("");
+        let win_count_before = e.active_tab().layout.window_ids().len();
+        e.handle_key(":", Some(':'), false);
+        for ch in "help bogus".chars() {
+            e.handle_key(&ch.to_string(), Some(ch), false);
+        }
+        e.handle_key("Return", None, false);
+
+        // Unknown topic must NOT create a new split.
+        let win_count_after = e.active_tab().layout.window_ids().len();
+        assert_eq!(
+            win_count_after, win_count_before,
+            "unknown :help topic must not open a split"
+        );
+        assert!(
+            e.message.contains("No help for"),
+            "engine.message should say 'No help for', got: {:?}",
+            e.message
+        );
+
+        // Render must not panic either.
+        let _lines = render_tui(&e, 80, 24);
+    }
 }

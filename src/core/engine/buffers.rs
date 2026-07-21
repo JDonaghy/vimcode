@@ -463,8 +463,16 @@ impl Engine {
         }
 
         // Open in vsplit, then redirect new window to the preview buffer.
+        // Reset cursor/scroll so the inherited view doesn't carry an
+        // out-of-bounds cursor from the (potentially longer) source buffer.
         self.split_window(crate::core::window::SplitDirection::Vertical, None);
-        self.active_window_mut().buffer_id = buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
         self.message = format!("[Preview] {title}");
         buf_id
     }
@@ -489,7 +497,14 @@ impl Engine {
 
         self.split_window(crate::core::window::SplitDirection::Vertical, None);
         let preview_win = self.active_window_id();
-        self.active_window_mut().buffer_id = buf_id;
+        // Reset cursor/scroll for the preview window (inherits original view).
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
         self.md_preview_links.insert(buf_id, source_id);
         self.scroll_bind_pairs.push((source_win, preview_win));
         self.message = format!("[Preview] {title}");
@@ -760,8 +775,17 @@ impl Engine {
                 }
                 // Split vertically; the new window (now active) shares the original buffer.
                 // Redirect it to the diff buffer without touching the original.
+                // Reset cursor/scroll: the diff output is not the same length
+                // as the original source file, so the inherited cursor may be
+                // out of bounds.
                 self.split_window(SplitDirection::Vertical, None);
-                self.active_window_mut().buffer_id = buf_id;
+                {
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                    win.view.scroll_left = 0;
+                }
                 self.message = format!("Git diff: {}", path.display());
                 EngineAction::None
             }
@@ -884,9 +908,17 @@ impl Engine {
         }
 
         // Split: new window (left) gets HEAD buffer.
+        // Reset cursor/scroll on left_win: it inherits the view from right_win,
+        // but HEAD content may differ in length (lines added/removed since HEAD).
         self.split_window(SplitDirection::Vertical, None);
         let left_win = self.active_window_id();
-        self.active_window_mut().buffer_id = head_buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = head_buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
@@ -1028,9 +1060,16 @@ impl Engine {
         }
 
         // Split: new window (left) gets HEAD buffer.
+        // Reset cursor/scroll for the same reason as cmd_diffsplit above.
         self.split_window(SplitDirection::Vertical, None);
         let left_win = self.active_window_id();
-        self.active_window_mut().buffer_id = head_buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = head_buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
@@ -1111,10 +1150,17 @@ impl Engine {
             }
         }
 
-        // Split vertically — new window (left) gets the "before" buffer
+        // Split vertically — new window (left) gets the "before" buffer.
+        // Reset cursor/scroll so the inherited view is valid for left_buf_id.
         self.split_window(SplitDirection::Vertical, None);
         let left_win = self.active_window_id();
-        self.active_window_mut().buffer_id = left_buf_id;
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = left_buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
 
         // Focus the right (after) window
         self.active_tab_mut().active_window = right_win;
@@ -1567,7 +1613,15 @@ impl Engine {
                     state.buffer.content = ropey::Rope::from_str(&text);
                 }
                 self.split_window(SplitDirection::Vertical, None);
-                self.active_window_mut().buffer_id = buf_id;
+                // Reset view so a stale cursor from the original buffer does
+                // not go out-of-bounds in the (typically shorter) status text.
+                {
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                    win.view.scroll_left = 0;
+                }
                 self.message = "Git status".to_string();
                 EngineAction::None
             }
@@ -1715,7 +1769,18 @@ impl Engine {
             state.buffer.content = ropey::Rope::from_str(&text);
         }
         self.split_window(SplitDirection::Vertical, None);
-        self.active_window_mut().buffer_id = buf_id;
+        // Reset cursor/scroll: the new window inherited the previous window's
+        // view (which may have cursor.line > help-buffer line count), but the
+        // help buffer is short.  Without this reset, update_bracket_match and
+        // render code call ropey line_to_char with an out-of-bounds index and
+        // panic.  Fix for #596.
+        {
+            let win = self.active_window_mut();
+            win.buffer_id = buf_id;
+            win.view.cursor = crate::core::cursor::Cursor::default();
+            win.view.scroll_top = 0;
+            win.view.scroll_left = 0;
+        }
         self.message = if topic.is_empty() {
             "Help".to_string()
         } else {
@@ -1814,7 +1879,16 @@ impl Engine {
                 let source_win = self.active_window_id();
                 self.split_window(SplitDirection::Vertical, None);
                 let blame_win = self.active_window_id();
-                self.active_window_mut().buffer_id = buf_id;
+                // Reset cursor/scroll: blame output line count matches the
+                // source file, but cursor may still be beyond the visible
+                // portion after the view copy.  Start at the top.
+                {
+                    let win = self.active_window_mut();
+                    win.buffer_id = buf_id;
+                    win.view.cursor = crate::core::cursor::Cursor::default();
+                    win.view.scroll_top = 0;
+                    win.view.scroll_left = 0;
+                }
                 self.scroll_bind_pairs.push((source_win, blame_win));
                 self.message = format!("Git blame: {}", path.display());
                 EngineAction::None
