@@ -6,7 +6,7 @@
 > line. The `Platform-Neutrality Rule` at the top of `CLAUDE.md` is the *operational
 > rule*; **this file is the source of truth for *intent* and *sequencing*.**
 >
-> _Last updated: 2026-06-26_
+> _Last updated: 2026-07-21_
 
 ## 🎯 North star
 
@@ -76,14 +76,37 @@ deletions waiting to be picked up:
 |---|---|---|
 | **#515** | editor-group drag-and-drop → `TabGroupController` | quadraui#349 LANDED, but **quadraui#375** (TUI drag-start panics) must be fixed before adoption is safe |
 
-**Blocked on quadraui** — genuinely waiting on unbuilt infra (the *only* one left):
+**Blocked on quadraui** — genuinely waiting on unbuilt infra: none currently. **#480
+(the last entry here) shipped 2026-07-21** — quadraui#223/#224/#225 all closed, TUI
+*and* GTK migrated to `TextInput`/dual-mode `Palette`/`Dialog`+`DialogTable` (GTK's
+git-sidebar chrome had been silently unpainted under `ShellApp` since #493 — fixed
+in the same pass). PR open, pending merge. When a new #7 issue is discovered to be
+supply-blocked, add its row back here.
 
-| Issue | Migration | Blocked on (quadraui milestone #9) |
+## Architecture milestones — beyond primitive-by-primitive adoption
+
+Two larger, multi-session items surfaced 2026-07-21 while scoping #480's follow-on
+work. Both are sequencing/architecture questions, not single-primitive swaps, so
+they're tracked here rather than in the per-issue tables above:
+
+| Issue | What | Status |
 |---|---|---|
-| **#480** | TUI Source Control panel → shared primitives | **#223** ButtonBar · **#224** dual-mode Palette · **#225** Dialog rich content (TextInput #222 already landed) |
+| **vimcode#595** | TUI → `quadraui::ShellApp` + `run_with_shell`, mirroring GTK's landed #493 migration. Closes the largest remaining GTK/TUI architectural divergence (TUI's ~2,100-line hand-rolled `event_loop()` vs. GTK's quadraui-owned runner). Large refactor — not a quick pick, do not claim without reading the issue body's suggested incremental-landing approach. | 📋 Filed, unscoped-for-dispatch |
+| **quadraui#465** | macOS backend: add `ShellApp` + `run_with_shell` composition support (mirrors the TUI/GTK `shell_runner.rs` pattern). All macOS chrome *primitives* already exist (`activity_bar`, `sidebar_panel`, `tab_bar`, …) — this is purely the composition/runner wiring, analogous to what #595 does for TUI. **This, not #595, is the actual gate on "macOS port is a thin wrapper"** — TUI already runs on macOS via crossterm and doesn't need porting for reach. | 📋 Filed on quadraui, supply-side (#5) |
 
-## Status (2026-06-26)
+Neither blocks the other. #595 is pure vimcode-side convergence value (kills a bug
+class); quadraui#465 is pure quadraui-side supply work that unblocks a *future*
+native macOS backend adopting vimcode's `App: ShellApp` impl with zero new vimcode
+code, once it exists.
 
+## Status (2026-07-21)
+
+- ✅ **#480 shipped — the "Blocked on quadraui" table is now empty.** All #223/#224/
+  #225-blocked TUI work is done; GTK got a bonus fix in the same pass (git-sidebar
+  header/commit-input had been unpainted since #493, see above). Filed vimcode#595
+  (TUI `ShellApp` migration) and quadraui#465 (macOS `ShellApp` support) as the next
+  two architecture-level items — see "Architecture milestones" above. Neither is a
+  quick #7-table pick; **#512 is still the best next quick pick** (below).
 - ✅ **Milestone #7 "Platform-Neutral" created** and seeded with 15 adoption issues
   (11 pulled out of #5, #133 out of Crate Extraction, + #146/#512/#515 from
   no-milestone). #5 is now scoped to pure quadraui-build. All 15 sent to the coord

@@ -10,6 +10,36 @@
 
 ---
 
+## 🧭 Current wave (2026-07-21) — TUI → `ShellApp`/`run_with_shell` (vimcode#595)
+
+**Status:** filed, not yet started. See `GOALS.md`'s "Architecture milestones"
+section for the full why/scope. This note exists so a future session can resume
+without re-deriving the plan.
+
+**What's already true (don't re-derive):**
+- GTK did the equivalent migration already — #493, landed. `App` in `src/gtk/mod.rs`
+  implements `quadraui::ShellApp`; `main.rs` calls
+  `quadraui::gtk::shell_runner::run_with_shell(...)`. That's the pattern to mirror.
+- TUI's render layer is *already* `&Engine`-shaped (immutable) via `Cell`/`RefCell`
+  render-time caches (`sc_panel_layout`, `explorer_tree_rect`, …) — the part of the
+  migration that sounds hardest (paint needing an immutable receiver) is already done.
+- The actual work is restructuring `src/tui_main/mod.rs::event_loop()`
+  (~2,100 lines, starts at `mod.rs:787`) into `ShellApp`'s `setup`/`render_content`/
+  `handle`/`tick` shape, then swapping `tui_main::run()`'s hand-rolled raw-mode/
+  terminal/frame-timing bootstrap for `quadraui::tui::shell_runner::run_with_shell`.
+
+**Resume steps:**
+1. Read vimcode#595 in full (has the detailed scoping, non-goals, and suggested
+   incremental-landing approach).
+2. Do **not** attempt this as one PR — get a wrapper compiling against `ShellApp`'s
+   shape first, without cutting over the live entry point, verify parity via the
+   `sc_panel_tests`-style `TestBackend` regression pattern (`src/tui_main/panels.rs`)
+   plus manual smoke testing, *then* cut `main.rs`/`tui_bin.rs` over.
+3. Not blocked on quadraui#465 (macOS `ShellApp` support) — that's an independent,
+   parallel supply-side item; TUI already runs on macOS via crossterm regardless.
+
+---
+
 ## 🧭 Course correction (Session 346) — harness-first quadraui
 
 **The premise.** Quadraui's core promise is "primitives that work without
