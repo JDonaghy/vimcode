@@ -1708,6 +1708,13 @@ impl Engine {
         }
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
+        // Guard against stale cursors that are out of range for the current
+        // buffer (e.g. after :help / :split reassigns a shorter buffer to the
+        // active window while the view still holds the previous cursor position).
+        if line >= self.buffer().len_lines() {
+            self.bracket_match = None;
+            return;
+        }
         let line_start = self.buffer().line_to_char(line);
         let char_pos = line_start + col;
         if char_pos >= self.buffer().len_chars() {
