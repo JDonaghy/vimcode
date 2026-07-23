@@ -132,6 +132,16 @@ pub(super) fn draw_frame(
 ) {
     let area = frame.area();
 
+    // #600 Stage 1: `backend` is already inside `with_frame_scope`'s single
+    // frame-scope entry for the whole call (`mod.rs::event_loop`'s two
+    // `terminal.draw` closures each open exactly one), so every
+    // `Backend::draw_*` call below can be made directly — no per-call
+    // `enter_frame_scope`/`set_current_theme` needed. `q_theme` is computed
+    // once here and reused everywhere a quadraui primitive needs it.
+    use quadraui::Backend as _;
+    let q_theme = super::quadraui_tui::q_theme(theme);
+    backend.set_current_theme(q_theme);
+
     engine.scroll_surfaces.borrow_mut().clear();
 
     // ── Top-level: [menu] / [content_area] ──
@@ -216,7 +226,6 @@ pub(super) fn draw_frame(
 
     // ── Render menu bar strip (if visible) ───────────────────────────────────
     if screen.menu_bar_visible {
-        let q_theme = super::quadraui_tui::q_theme(theme);
         let bar = engine.menu_system.borrow().menu_bar();
         let bar_rect = quadraui::Rect::new(
             menu_bar_area.x as f32,
@@ -224,10 +233,7 @@ pub(super) fn draw_frame(
             menu_bar_area.width as f32,
             menu_bar_area.height as f32,
         );
-        let mb_layout = backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_menu_bar(bar_rect, &bar)
-        });
+        let mb_layout = backend.draw_menu_bar(bar_rect, &bar);
 
         let menu_end: u16 = mb_layout
             .visible_items
@@ -254,8 +260,13 @@ pub(super) fn draw_frame(
                 .saturating_sub(menu_end - menu_bar_area.x),
             height: menu_bar_area.height,
         };
-        let cc_layout =
-            quadraui::tui::draw_command_center(frame.buffer_mut(), cc_area, &cc, &q_theme);
+        let cc_q_rect = quadraui::Rect::new(
+            cc_area.x as f32,
+            cc_area.y as f32,
+            cc_area.width as f32,
+            cc_area.height as f32,
+        );
+        let cc_layout = backend.draw_command_center(cc_q_rect, &cc);
         engine.command_center_layout.replace(Some(cc_layout));
         // Note: dropdown is rendered LAST (after all content) so it draws on top.
     } else {
@@ -360,7 +371,7 @@ pub(super) fn draw_frame(
                 width: target.rect.width as u16,
                 height: 1,
             };
-            let vis = render_tab_bar(backend, frame, g_tab, target.bar, theme);
+            let vis = render_tab_bar(backend, g_tab, target.bar, theme);
             tab_visible_counts_out.push((target.group_id, vis));
         }
         // Draw breadcrumb bars (below each group's tab bar). Hidden while the
@@ -375,7 +386,7 @@ pub(super) fn draw_frame(
                 width: t.rect.width as u16,
                 height: 1,
             };
-            let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
+            let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
             *t.draw_layout.borrow_mut() = Some(layout);
         }
         // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
@@ -423,7 +434,7 @@ pub(super) fn draw_frame(
                 width: target.rect.width as u16,
                 height: 1,
             };
-            let vis = render_tab_bar(backend, frame, tab_rect, target.bar, theme);
+            let vis = render_tab_bar(backend, tab_rect, target.bar, theme);
             tab_visible_counts_out.push((target.group_id, vis));
         }
         // Draw breadcrumb bar for the single group. Hidden while the terminal
@@ -439,7 +450,7 @@ pub(super) fn draw_frame(
                 width: t.rect.width as u16,
                 height: 1,
             };
-            let layout = draw_breadcrumb_bar(backend, frame, bc_rect, t.bar, theme);
+            let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
             *t.draw_layout.borrow_mut() = Some(layout);
         }
         render_all_windows(backend, frame, &screen.windows, theme);
@@ -465,6 +476,7 @@ pub(super) fn draw_frame(
     if tab_drag_source.is_some() {
         render_tab_drag_overlay(
             frame,
+            backend,
             engine,
             editor_area,
             screen,
@@ -531,12 +543,7 @@ pub(super) fn draw_frame(
                     max_popup_height,
                     |_| quadraui::CompletionItemMeasure::new(1.0),
                 );
-                super::quadraui_tui::draw_completions(
-                    frame.buffer_mut(),
-                    &completions,
-                    &layout,
-                    theme,
-                );
+                backend.draw_completions(&completions, &layout);
                 *completion_layout_out = Some(layout);
             }
         }
@@ -566,7 +573,7 @@ pub(super) fn draw_frame(
             );
             let (tooltip, layout) =
                 render::hover_popup_to_quadraui_tooltip(hover, popup_x, popup_y, viewport);
-            super::quadraui_tui::draw_tooltip(frame.buffer_mut(), &tooltip, &layout, theme);
+            backend.draw_tooltip(&tooltip, &layout);
         }
     }
 
@@ -588,7 +595,7 @@ pub(super) fn draw_frame(
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
             let (eh_links, eh_rect, eh_sb) =
-                render_editor_hover_popup(frame, eh, popup_x, popup_y, frame.area(), theme);
+                render_editor_hover_popup(backend, eh, popup_x, popup_y, area, theme);
             *editor_hover_link_rects_out = eh_links;
             *editor_hover_popup_rect_out = eh_rect;
             *editor_hover_scrollbar_out = eh_sb;
@@ -620,7 +627,7 @@ pub(super) fn draw_frame(
             );
             let (tooltip, layout) =
                 render::diff_peek_to_quadraui_tooltip(peek, popup_x, popup_y, viewport, theme);
-            super::quadraui_tui::draw_tooltip(frame.buffer_mut(), &tooltip, &layout, theme);
+            backend.draw_tooltip(&tooltip, &layout);
         }
     }
 
@@ -648,27 +655,19 @@ pub(super) fn draw_frame(
             );
             let (tooltip, layout) =
                 render::signature_help_to_quadraui_tooltip(sig, popup_x, popup_y, viewport, theme);
-            super::quadraui_tui::draw_tooltip(frame.buffer_mut(), &tooltip, &layout, theme);
+            backend.draw_tooltip(&tooltip, &layout);
         }
     }
 
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
-        render_quickfix_panel(
-            frame,
-            quickfix_area,
-            qf,
-            quickfix_scroll_top,
-            theme,
-            backend,
-        );
+        render_quickfix_panel(quickfix_area, qf, quickfix_scroll_top, theme, backend);
     }
 
     // ── Separated status line (above terminal, when status_line_above_terminal is active) ──
     if let Some(ref status) = screen.separated_status_line {
         render_window_status_line(
             backend,
-            frame,
             separated_status_area.x,
             separated_status_area.y,
             separated_status_area.width,
@@ -703,7 +702,6 @@ pub(super) fn draw_frame(
         };
         let hits = render_bottom_panel_tabs(
             backend,
-            frame,
             tab_bar_area,
             &engine.bottom_panel_kind,
             engine.terminal_open,
@@ -720,7 +718,7 @@ pub(super) fn draw_frame(
                         width: content_area.width,
                         height: 1,
                     };
-                    let hits = render_terminal_toolbar(backend, frame, toolbar_area, term, theme);
+                    let hits = render_terminal_toolbar(backend, toolbar_area, term, theme);
                     engine.terminal_toolbar_hits.replace(Some(hits));
                     let term_content = Rect {
                         x: content_area.x,
@@ -757,15 +755,8 @@ pub(super) fn draw_frame(
                     content_area.width as f32,
                     content_area.height as f32,
                 );
-                backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-                let td_layout = {
-                    use quadraui::Backend;
-                    backend.text_display_layout(q_rect, &td)
-                };
-                backend.enter_frame_scope(frame, |b| {
-                    use quadraui::Backend;
-                    b.draw_text_display(q_rect, &td);
-                });
+                let td_layout = backend.text_display_layout(q_rect, &td);
+                backend.draw_text_display(q_rect, &td);
                 let scrollbar =
                     td_layout
                         .scrollbar_bounds
@@ -817,10 +808,7 @@ pub(super) fn draw_frame(
             debug_toolbar_area.height as f32,
         );
         *debug_toolbar_rect_out = q_rect;
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            render::draw_debug_toolbar(b, engine, q_rect);
-        });
+        render::draw_debug_toolbar(backend, engine, q_rect);
     }
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
@@ -832,11 +820,7 @@ pub(super) fn draw_frame(
             wildmenu_area.width as f32,
             wildmenu_area.height as f32,
         );
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_status_bar(q_rect, &bar, None, None);
-        });
+        backend.draw_status_bar(q_rect, &bar, None, None);
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
@@ -847,11 +831,7 @@ pub(super) fn draw_frame(
             status_area.width as f32,
             status_area.height as f32,
         );
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_status_bar(q_rect, bar, None, None);
-        });
+        backend.draw_status_bar(q_rect, bar, None, None);
     }
 
     render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
@@ -878,7 +858,7 @@ pub(super) fn draw_frame(
         let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
         if sidebar.ext_panel_name.is_some() || engine.active_panel_is(PANEL_GIT) {
             let (rects, popup_rect) = render_panel_hover_popup(
-                frame,
+                backend,
                 screen,
                 theme,
                 sep_x + 1,
@@ -916,11 +896,7 @@ pub(super) fn draw_frame(
             popup_area.width as f32,
             popup_area.height as f32,
         );
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_palette(q_rect, &palette);
-        });
+        backend.draw_palette(q_rect, &palette);
     }
 
     // ── Find/replace overlay (top-right of active group) ───────────────────
@@ -934,12 +910,18 @@ pub(super) fn draw_frame(
         // absolute-input convention to lean on there); passing `0` here
         // keeps that internal translation a no-op instead of double-
         // counting the origin now baked into `group_bounds` itself.
-        super::quadraui_tui::draw_find_replace(frame.buffer_mut(), area, find_replace, theme);
+        let q_area = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
+        );
+        backend.draw_find_replace(q_area, find_replace);
     }
 
     // ── Unified picker modal (above terminal/status so it's fully visible) ──
     if let Some(ref picker) = screen.picker {
-        render_picker_popup(frame, picker, area, theme, backend);
+        render_picker_popup(picker, area, theme, backend);
     }
 
     // ── Tab switcher popup ───────────────────────────────────────────────────
@@ -972,11 +954,7 @@ pub(super) fn draw_frame(
                 popup_area.width as f32,
                 popup_area.height as f32,
             );
-            backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-            backend.enter_frame_scope(frame, |b| {
-                use quadraui::Backend;
-                b.draw_list(q_rect, &list);
-            });
+            backend.draw_list(q_rect, &list);
         }
     }
 
@@ -1002,7 +980,7 @@ pub(super) fn draw_frame(
         };
         let (menu, layout) =
             render::context_menu_generic_layout(&inset_panel, inner_viewport, 1.0, 1.0, 1.0);
-        super::quadraui_tui::draw_context_menu(frame.buffer_mut(), &menu, &layout, theme);
+        let _ = backend.draw_context_menu(&menu, &layout);
         *context_menu_layout_out = Some(layout);
     }
 
@@ -1015,7 +993,7 @@ pub(super) fn draw_frame(
             area.height as f32,
         );
         let (q_dialog, layout) = render::dialog_generic_layout(dialog, viewport, 1.0, 1.0);
-        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &q_dialog, &layout, theme);
+        let _ = backend.draw_dialog(&q_dialog, &layout);
         *dialog_layout_out = Some(layout);
     } else {
         *dialog_layout_out = None;
@@ -1029,9 +1007,7 @@ pub(super) fn draw_frame(
             menu_bar_area.width as f32,
             menu_bar_area.height as f32,
         );
-        backend.enter_frame_scope(frame, |b| {
-            engine.menu_system.borrow().render(b, bar_rect);
-        });
+        engine.menu_system.borrow().render(backend, bar_rect);
     }
 
     // Toast overlay (#450) — drawn LAST so it sits on top of every other
@@ -1040,10 +1016,14 @@ pub(super) fn draw_frame(
     // returned layout is cached on the engine so click handlers can run
     // hit_test → handle_toast_hit (× close, action buttons).
     if let Some(stack) = render::build_toast_stack(engine) {
-        let q_theme = super::quadraui_tui::q_theme(theme);
         let toast_area = frame.area();
-        let layout =
-            quadraui::tui::draw_toast_stack(frame.buffer_mut(), toast_area, &stack, &q_theme);
+        let q_toast_area = quadraui::Rect::new(
+            toast_area.x as f32,
+            toast_area.y as f32,
+            toast_area.width as f32,
+            toast_area.height as f32,
+        );
+        let layout = backend.draw_toast_stack(q_toast_area, &stack);
         engine.toast_layout.replace(Some(layout));
     } else {
         engine.toast_layout.replace(None);
@@ -1253,6 +1233,7 @@ fn build_tui_tab_slots(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_tab_drag_overlay(
     frame: &mut ratatui::Frame,
+    backend: &mut super::backend::TuiBackend,
     engine: &Engine,
     editor_area: Rect,
     screen: &render::ScreenLayout,
@@ -1296,13 +1277,14 @@ pub(super) fn render_tab_drag_overlay(
         };
 
     {
-        let q_theme = super::quadraui_tui::q_theme(theme);
+        use quadraui::Backend;
         let q_overlay = quadraui::DropOverlay {
             highlight: overlay.highlight,
             insertion_bar: overlay.insertion_bar,
             ghost_position: Some(overlay.ghost_position),
         };
-        quadraui::tui::draw_drop_overlay(frame.buffer_mut(), &q_overlay, &q_theme);
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.draw_drop_overlay(&q_overlay);
     }
 
     // Look up the tab label from engine using the captured drag source.
@@ -1396,11 +1378,11 @@ pub(super) fn compute_tui_tab_drop_zone(
 /// (built by `render::build_screen_layout`).
 pub(super) fn render_tab_bar(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     area: Rect,
     bar: &quadraui::TabBar,
     theme: &Theme,
 ) -> usize {
+    use quadraui::Backend;
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
@@ -1408,10 +1390,7 @@ pub(super) fn render_tab_bar(
         area.height as f32,
     );
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    let hits = backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_tab_bar(q_rect, bar, None)
-    });
+    let hits = backend.draw_tab_bar(q_rect, bar, None);
     hits.available_cols
 }
 
@@ -1422,11 +1401,11 @@ pub(super) fn render_tab_bar(
 /// Returns the `StatusBarLayout` for click-time hit testing.
 pub(super) fn draw_breadcrumb_bar(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     area: Rect,
     bar: &quadraui::StatusBar,
     theme: &Theme,
 ) -> quadraui::StatusBarLayout {
+    use quadraui::Backend;
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
@@ -1434,10 +1413,7 @@ pub(super) fn draw_breadcrumb_bar(
         area.height as f32,
     );
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_status_bar(q_rect, bar, None, None)
-    })
+    backend.draw_status_bar(q_rect, bar, None, None)
 }
 
 // ─── Editor windows ───────────────────────────────────────────────────────────
@@ -1464,12 +1440,12 @@ pub(super) fn render_all_windows(
 /// Render the unified picker popup. Supports single-pane (no preview) and
 /// two-pane (with preview) layouts, fuzzy match highlighting, and scrollbar.
 pub(super) fn render_picker_popup(
-    frame: &mut ratatui::Frame,
     picker: &render::PickerPanel,
     term_area: Rect,
     theme: &Theme,
     backend: &mut super::backend::TuiBackend,
 ) {
+    use quadraui::Backend;
     let has_preview = picker.preview.is_some();
     let geo = render::PickerGeometry::compute(
         term_area.width as f32,
@@ -1480,10 +1456,7 @@ pub(super) fn render_picker_popup(
     let palette = render::picker_panel_to_palette(picker);
     let q_rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_palette(q_rect, &palette);
-    });
+    backend.draw_palette(q_rect, &palette);
 }
 
 /// Render one editor window (pane) into `frame`.
@@ -1521,23 +1494,24 @@ pub(super) fn render_window(
     };
 
     let editor = render::to_q_editor(window);
-    let q_theme = super::quadraui_tui::q_theme(theme);
-    let result = quadraui::tui::draw_editor(frame.buffer_mut(), editor_area, &editor, &q_theme);
+    let editor_q_rect = quadraui::Rect::new(
+        editor_area.x as f32,
+        editor_area.y as f32,
+        editor_area.width as f32,
+        editor_area.height as f32,
+    );
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    let result = {
+        use quadraui::Backend;
+        backend.draw_editor(editor_q_rect, &editor)
+    };
 
     if let Some(pos) = result.cursor_position {
         frame.set_cursor_position(pos);
     }
 
     if let (Some(status), Some(sy)) = (&window.status_line, status_bar_row) {
-        render_window_status_line(
-            backend,
-            frame,
-            editor_area.x,
-            sy,
-            editor_area.width,
-            status,
-            theme,
-        );
+        render_window_status_line(backend, editor_area.x, sy, editor_area.width, status, theme);
     }
 }
 
@@ -1555,23 +1529,20 @@ pub(super) fn render_window(
 /// click handler runs the layout on demand against current bar width.
 fn render_window_status_line(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     x: u16,
     y: u16,
     width: u16,
     status: &crate::render::WindowStatusLine,
     theme: &crate::render::Theme,
 ) {
+    use quadraui::Backend;
     let bar = crate::render::window_status_line_to_status_bar(
         status,
         quadraui::WidgetId::new("status:window"),
     );
     let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, 1.0);
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        let _ = b.draw_status_bar(q_rect, &bar, None, None);
-    });
+    let _ = backend.draw_status_bar(q_rect, &bar, None, None);
 }
 
 /// Convert a character-index column to a visual column, expanding tabs.
@@ -1755,32 +1726,38 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                draw_frame(
-                    frame,
-                    &screen,
-                    &theme,
-                    &mut sidebar,
-                    engine,
-                    sidebar_width,
-                    0,    // quickfix_scroll_top
-                    None, // folder_picker
-                    None, // cmd_sel
-                    None, // explorer_drop_target
-                    &mut hover_link_rects,
-                    &mut hover_popup_rect,
-                    &mut editor_hover_popup_rect,
-                    &mut editor_hover_link_rects,
-                    &mut editor_hover_scrollbar,
-                    &mut tab_visible_counts,
-                    &mut dbg_toolbar_rect,
-                    &mut completion_layout,
-                    &mut context_menu_layout,
-                    &mut dialog_layout,
-                    &mut backend,
-                    None,                                 // tab_drag_source
-                    None,                                 // tab_drag_cursor
-                    &crate::core::window::DropZone::None, // tab_drop_zone
-                );
+                // #600: `draw_frame` calls `Backend::draw_*` trait methods
+                // directly (no per-call `enter_frame_scope`), so this
+                // harness opens the one frame-scope entry itself — mirrors
+                // `event_loop`'s two `terminal.draw` closures in `mod.rs`.
+                super::with_frame_scope(&mut backend, frame, |backend, frame| {
+                    draw_frame(
+                        frame,
+                        &screen,
+                        &theme,
+                        &mut sidebar,
+                        engine,
+                        sidebar_width,
+                        0,    // quickfix_scroll_top
+                        None, // folder_picker
+                        None, // cmd_sel
+                        None, // explorer_drop_target
+                        &mut hover_link_rects,
+                        &mut hover_popup_rect,
+                        &mut editor_hover_popup_rect,
+                        &mut editor_hover_link_rects,
+                        &mut editor_hover_scrollbar,
+                        &mut tab_visible_counts,
+                        &mut dbg_toolbar_rect,
+                        &mut completion_layout,
+                        &mut context_menu_layout,
+                        &mut dialog_layout,
+                        backend,
+                        None,                                 // tab_drag_source
+                        None,                                 // tab_drag_cursor
+                        &crate::core::window::DropZone::None, // tab_drop_zone
+                    );
+                });
             })
             .unwrap();
 
@@ -1962,32 +1939,34 @@ mod tests {
         let mut backend2 = super::backend::TuiBackend::new();
         terminal
             .draw(|frame| {
-                draw_frame(
-                    frame,
-                    &screen,
-                    &theme,
-                    &mut sidebar,
-                    engine,
-                    0,
-                    0,
-                    None,
-                    None,
-                    None,
-                    &mut hlr,
-                    &mut hpr,
-                    &mut ehpr,
-                    &mut ehlr,
-                    &mut ehs,
-                    &mut tvc,
-                    &mut dtr,
-                    &mut cl,
-                    &mut cml,
-                    &mut dl,
-                    &mut backend2,
-                    None,
-                    None,
-                    &crate::core::window::DropZone::None,
-                );
+                super::with_frame_scope(&mut backend2, frame, |backend2, frame| {
+                    draw_frame(
+                        frame,
+                        &screen,
+                        &theme,
+                        &mut sidebar,
+                        engine,
+                        0,
+                        0,
+                        None,
+                        None,
+                        None,
+                        &mut hlr,
+                        &mut hpr,
+                        &mut ehpr,
+                        &mut ehlr,
+                        &mut ehs,
+                        &mut tvc,
+                        &mut dtr,
+                        &mut cl,
+                        &mut cml,
+                        &mut dl,
+                        backend2,
+                        None,
+                        None,
+                        &crate::core::window::DropZone::None,
+                    );
+                });
             })
             .unwrap();
         terminal.backend().buffer().clone()

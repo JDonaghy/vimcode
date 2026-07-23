@@ -784,6 +784,46 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, keyboard_
 
 // ─── Event loop ───────────────────────────────────────────────────────────────
 
+/// Enter `backend`'s frame scope exactly once for the whole `draw_frame`
+/// call, while still handing `draw_frame` (and everything it calls) a
+/// genuine `&mut ratatui::Frame` for the handful of raw buffer writes
+/// (separators, cursor placement, ...) that have no `Backend::draw_*`
+/// trait equivalent and are interleaved with trait calls in a
+/// z-order-sensitive sequence (#600 Stage 1 — collapsing the ~30
+/// `enter_frame_scope` sites `draw_frame`/`panels.rs` used to open
+/// individually down to the one this function makes).
+///
+/// Rust's borrow checker won't let a single closure passed to
+/// `TuiBackend::enter_frame_scope(frame, |b| ...)` also capture the
+/// outer `frame` binding — `frame` is already consumed as
+/// `enter_frame_scope`'s own argument, so referencing it again inside
+/// the closure is E0382 (use of moved value). Relaying it through a raw
+/// pointer sidesteps that: it's the same type-erasure technique
+/// `TuiBackend::enter_frame_scope` already uses internally to smuggle
+/// `&mut Frame<'_>` past its own `Cell<*mut ()>` field, just applied one
+/// layer higher so `f` can reach both `backend` and `frame` at once.
+fn with_frame_scope<R>(
+    backend: &mut backend::TuiBackend,
+    frame: &mut ratatui::Frame<'_>,
+    f: impl FnOnce(&mut backend::TuiBackend, &mut ratatui::Frame<'_>) -> R,
+) -> R {
+    // Reborrow (not move) so `frame` is still available to pass into
+    // `enter_frame_scope` below; the raw pointer itself carries no
+    // borrow-checker-tracked lifetime.
+    let frame_ptr: *mut ratatui::Frame<'_> = &mut *frame as *mut ratatui::Frame<'_>;
+    backend.enter_frame_scope(frame, |b| {
+        // SAFETY: `frame_ptr` aliases the exact `Frame` `frame` refers
+        // to. The outer `frame` binding above is not read again until
+        // this closure returns (it was moved into the `enter_frame_scope`
+        // call and `enter_frame_scope` itself only touches it through
+        // its own type-erased pointer, never dereferencing it while `f`
+        // runs — see that function's doc comment), so this is the only
+        // live `&mut Frame` in play for the duration of `f`.
+        let frame: &mut ratatui::Frame<'_> = unsafe { &mut *frame_ptr };
+        f(b, frame)
+    })
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     engine: &mut Engine,
@@ -1038,32 +1078,34 @@ fn event_loop(
                 .draw(|frame| {
                     if let Some(s) = &screen {
                         let drop_target = explorer_drag_active.as_ref().and_then(|&(_, t)| t);
-                        draw_frame(
-                            frame,
-                            s,
-                            &theme,
-                            &mut sidebar,
-                            engine,
-                            sidebar_width,
-                            quickfix_scroll_top,
-                            folder_picker.as_ref(),
-                            cmd_sel,
-                            drop_target,
-                            &mut hover_link_rects,
-                            &mut hover_popup_rect,
-                            &mut editor_hover_popup_rect,
-                            &mut editor_hover_link_rects,
-                            &mut editor_hover_scrollbar,
-                            &mut tab_visible_counts,
-                            &mut debug_toolbar_rect,
-                            &mut completion_layout,
-                            &mut context_menu_layout,
-                            &mut dialog_layout,
-                            &mut backend,
-                            tui_drag_source,
-                            tui_drag_cursor,
-                            &tui_tab_drop_zone,
-                        );
+                        with_frame_scope(&mut backend, frame, |backend, frame| {
+                            draw_frame(
+                                frame,
+                                s,
+                                &theme,
+                                &mut sidebar,
+                                engine,
+                                sidebar_width,
+                                quickfix_scroll_top,
+                                folder_picker.as_ref(),
+                                cmd_sel,
+                                drop_target,
+                                &mut hover_link_rects,
+                                &mut hover_popup_rect,
+                                &mut editor_hover_popup_rect,
+                                &mut editor_hover_link_rects,
+                                &mut editor_hover_scrollbar,
+                                &mut tab_visible_counts,
+                                &mut debug_toolbar_rect,
+                                &mut completion_layout,
+                                &mut context_menu_layout,
+                                &mut dialog_layout,
+                                backend,
+                                tui_drag_source,
+                                tui_drag_cursor,
+                                &tui_tab_drop_zone,
+                            );
+                        });
                     }
                 })
                 .expect("draw frame");
@@ -1093,32 +1135,34 @@ fn event_loop(
                             if let Some(s) = last_layout.as_ref() {
                                 let drop_target =
                                     explorer_drag_active.as_ref().and_then(|&(_, t)| t);
-                                draw_frame(
-                                    frame,
-                                    s,
-                                    &theme,
-                                    &mut sidebar,
-                                    engine,
-                                    sidebar_width,
-                                    quickfix_scroll_top,
-                                    folder_picker.as_ref(),
-                                    cmd_sel,
-                                    drop_target,
-                                    &mut hover_link_rects,
-                                    &mut hover_popup_rect,
-                                    &mut editor_hover_popup_rect,
-                                    &mut editor_hover_link_rects,
-                                    &mut editor_hover_scrollbar,
-                                    &mut tab_visible_counts2,
-                                    &mut debug_toolbar_rect,
-                                    &mut completion_layout,
-                                    &mut context_menu_layout,
-                                    &mut dialog_layout,
-                                    &mut backend,
-                                    tui_drag_source,
-                                    tui_drag_cursor,
-                                    &tui_tab_drop_zone,
-                                );
+                                with_frame_scope(&mut backend, frame, |backend, frame| {
+                                    draw_frame(
+                                        frame,
+                                        s,
+                                        &theme,
+                                        &mut sidebar,
+                                        engine,
+                                        sidebar_width,
+                                        quickfix_scroll_top,
+                                        folder_picker.as_ref(),
+                                        cmd_sel,
+                                        drop_target,
+                                        &mut hover_link_rects,
+                                        &mut hover_popup_rect,
+                                        &mut editor_hover_popup_rect,
+                                        &mut editor_hover_link_rects,
+                                        &mut editor_hover_scrollbar,
+                                        &mut tab_visible_counts2,
+                                        &mut debug_toolbar_rect,
+                                        &mut completion_layout,
+                                        &mut context_menu_layout,
+                                        &mut dialog_layout,
+                                        backend,
+                                        tui_drag_source,
+                                        tui_drag_cursor,
+                                        &tui_tab_drop_zone,
+                                    );
+                                });
                             }
                         })
                         .expect("draw frame");

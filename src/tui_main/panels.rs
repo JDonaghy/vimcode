@@ -47,11 +47,11 @@ pub(super) fn render_sidebar(
             return;
         }
         Some(PANEL_SEARCH) => {
-            render_search_panel(backend, frame, area, engine, theme);
+            render_search_panel(backend, area, engine, theme);
             return;
         }
         Some(PANEL_DEBUG) => {
-            render_debug_sidebar(backend, frame, area, engine, theme);
+            render_debug_sidebar(backend, area, engine, theme);
             return;
         }
         Some(PANEL_GIT) => {
@@ -176,18 +176,15 @@ pub(super) fn render_settings_panel(
         content_height as f32,
     );
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        engine
-            .settings_form_controller
-            .borrow_mut()
-            .render_and_cache(b, q_rect);
-    });
+    engine
+        .settings_form_controller
+        .borrow_mut()
+        .render_and_cache(backend, q_rect);
 }
 
 /// Render the project search panel via SidebarSystem (Form + TreeView).
 pub(super) fn render_search_panel(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -215,9 +212,10 @@ pub(super) fn render_search_panel(
     engine.search_sidebar_body_rect.set(q_rect);
 
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        engine.search_sidebar_system.borrow().render(b, q_rect);
-    });
+    engine
+        .search_sidebar_system
+        .borrow()
+        .render(backend, q_rect);
 }
 
 // ─── Status / command line ────────────────────────────────────────────────────
@@ -355,11 +353,9 @@ pub(super) fn render_source_control(
             area.width as f32,
             paint_h as f32,
         );
+        use quadraui::Backend;
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_text_input(ti_rect, &ti);
-        });
+        backend.draw_text_input(ti_rect, &ti);
     }
 
     if area.height < 1 + commit_box_h {
@@ -382,9 +378,7 @@ pub(super) fn render_source_control(
             slab_h as f32,
         );
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            render::draw_sc_sidebar_panel(b, engine, sc, slab_rect);
-        });
+        render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
     }
 
     // Read section-area origin from the cached layout.
@@ -414,9 +408,7 @@ pub(super) fn render_source_control(
     engine.sc_sidebar_body_rect.set(q_rect);
     render::populate_sc_sidebar_system(engine, theme);
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        engine.sc_sidebar_system.borrow().render(b, q_rect);
-    });
+    engine.sc_sidebar_system.borrow().render(backend, q_rect);
     // ── Branch picker / create popup (quadraui::Palette dual-mode, #480) ─────
     // Migrated from a hand-rolled popup to the dual-mode `Palette` primitive
     // shipped in quadraui#224 (list mode = switch branch, input mode =
@@ -439,11 +431,9 @@ pub(super) fn render_source_control(
             popup_w as f32,
             popup_h as f32,
         );
+        use quadraui::Backend;
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_palette(q_rect, &palette);
-        });
+        backend.draw_palette(q_rect, &palette);
     }
 
     // ── Help dialog (quadraui::Dialog + DialogTable, #480) ───────────────────
@@ -451,6 +441,7 @@ pub(super) fn render_source_control(
     // shipped in quadraui#225. Bindings list lives once in
     // `render::sc_help_dialog` instead of being duplicated per backend.
     if sc.help_open {
+        use quadraui::Backend;
         let viewport = quadraui::Rect::new(
             area.x as f32,
             area.y as f32,
@@ -458,7 +449,8 @@ pub(super) fn render_source_control(
             area.height as f32,
         );
         let (dialog, layout) = render::sc_help_dialog_layout(viewport, 1.0, 1.0);
-        super::quadraui_tui::draw_dialog(frame.buffer_mut(), &dialog, &layout, theme);
+        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        let _ = backend.draw_dialog(&dialog, &layout);
     }
 }
 
@@ -518,11 +510,9 @@ pub(super) fn render_ext_panel(
             body_w as f32,
             body_h as f32,
         );
+        use quadraui::Backend;
         backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_tree(body_q_rect, &tree);
-        });
+        backend.draw_tree(body_q_rect, &tree);
 
         // Manual scrollbar: `draw_tree` doesn't render scrollbars yet.
         // Total visible rows = tree.rows.len() (sections + their expanded
@@ -662,9 +652,9 @@ pub(super) fn render_ext_panel(
 /// The popup displays rendered markdown content and appears to the right of
 /// the sidebar at the vertical position of the hovered item.
 /// Returns (link_rects, popup_rect) where popup_rect is (x, y, w, h).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn render_panel_hover_popup(
-    frame: &mut ratatui::Frame,
+    backend: &mut super::backend::TuiBackend,
     screen: &render::ScreenLayout,
     theme: &Theme,
     sidebar_right_x: u16,
@@ -753,7 +743,9 @@ pub(super) fn render_panel_hover_popup(
         },
     );
 
-    super::quadraui_tui::draw_rich_text_popup(frame.buffer_mut(), &popup, &layout, theme);
+    use quadraui::Backend;
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.draw_rich_text_popup(&popup, &layout);
 
     let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
         .link_hit_regions
@@ -789,9 +781,9 @@ pub(super) fn render_panel_hover_popup(
 /// Render an editor hover popup via the `quadraui::RichTextPopup`
 /// primitive. Returns `(link_rects, popup_bounds, scrollbar_hit)` for
 /// mouse hit-testing — derived from the primitive's resolved layout.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn render_editor_hover_popup(
-    frame: &mut ratatui::Frame,
+    backend: &mut super::backend::TuiBackend,
     eh: &render::EditorHoverPopupData,
     popup_x: u16,
     popup_y: u16,
@@ -837,7 +829,9 @@ pub(super) fn render_editor_hover_popup(
         },
     );
 
-    super::quadraui_tui::draw_rich_text_popup(frame.buffer_mut(), &popup, &layout, theme);
+    use quadraui::Backend;
+    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.draw_rich_text_popup(&popup, &layout);
 
     let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
         .link_hit_regions
@@ -965,9 +959,7 @@ pub(super) fn render_ext_sidebar(
     render::populate_ext_sidebar_system(engine);
     let q_theme = super::quadraui_tui::q_theme(theme);
     backend.set_current_theme(q_theme);
-    backend.enter_frame_scope(frame, |b| {
-        engine.ext_sidebar_system.borrow().render(b, msv_rect);
-    });
+    engine.ext_sidebar_system.borrow().render(backend, msv_rect);
 }
 
 // ─── AI assistant sidebar panel ───────────────────────────────────────────────
@@ -1190,11 +1182,12 @@ pub(super) fn render_ai_sidebar(
 /// chrome; item rendering goes through `Backend::draw_tree`.
 pub(super) fn render_debug_sidebar(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
 ) {
+    use quadraui::Backend;
+
     if area.height == 0 {
         return;
     }
@@ -1209,10 +1202,7 @@ pub(super) fn render_debug_sidebar(
 
     let title_rect = quadraui::Rect::new(area.x as f32, area.y as f32, area.width as f32, 1.0);
     backend.set_current_theme(q_theme);
-    backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        let _ = b.draw_status_bar(title_rect, &title_bar, None, None);
-    });
+    let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
 
     if area.height < 2 {
         return;
@@ -1221,10 +1211,7 @@ pub(super) fn render_debug_sidebar(
     let action_rect =
         quadraui::Rect::new(area.x as f32, (area.y + 1) as f32, area.width as f32, 1.0);
     backend.set_current_theme(q_theme);
-    let hits = backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_status_bar(action_rect, &action_bar, None, None)
-    });
+    let hits = backend.draw_status_bar(action_rect, &action_bar, None, None);
     engine.dap_sidebar_action_hits.replace(Some(hits));
 
     // ── SidebarSystem body (the four sections). ──
@@ -1240,9 +1227,7 @@ pub(super) fn render_debug_sidebar(
     engine.dap_sidebar_body_rect.set(msv_rect);
     render::populate_dap_sidebar_system(engine);
     backend.set_current_theme(q_theme);
-    backend.enter_frame_scope(frame, |b| {
-        engine.dap_sidebar_system.borrow().render(b, msv_rect);
-    });
+    engine.dap_sidebar_system.borrow().render(backend, msv_rect);
 }
 
 /// Render the bottom panel tab bar (Terminal | Debug Output) via
@@ -1250,13 +1235,13 @@ pub(super) fn render_debug_sidebar(
 /// click handler (caller caches on `engine.bottom_tab_bar_hits`).
 pub(super) fn render_bottom_panel_tabs(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     area: Rect,
     active: &render::BottomPanelKind,
     has_terminal: bool,
     has_debug_output: bool,
     theme: &Theme,
 ) -> quadraui::TabBarHits {
+    use quadraui::Backend;
     let bar = render::build_bottom_panel_tab_bar(active, has_terminal, has_debug_output);
     let q_rect = quadraui::Rect::new(
         area.x as f32,
@@ -1265,22 +1250,19 @@ pub(super) fn render_bottom_panel_tabs(
         area.height as f32,
     );
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_tab_bar(q_rect, &bar, None)
-    })
+    backend.draw_tab_bar(q_rect, &bar, None)
 }
 
 // ─── Quickfix panel ───────────────────────────────────────────────────────────
 
 pub(super) fn render_quickfix_panel(
-    frame: &mut ratatui::Frame,
     area: Rect,
     qf: &render::QuickfixPanel,
     scroll_top: usize,
     theme: &Theme,
     backend: &mut super::backend::TuiBackend,
 ) {
+    use quadraui::Backend;
     if area.height == 0 {
         return;
     }
@@ -1298,10 +1280,7 @@ pub(super) fn render_quickfix_panel(
         area.height as f32,
     );
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        use quadraui::Backend;
-        b.draw_list(q_rect, &list);
-    });
+    backend.draw_list(q_rect, &list);
 }
 
 // ─── Terminal panel ───────────────────────────────────────────────────────────
@@ -1310,12 +1289,12 @@ pub(super) fn render_quickfix_panel(
 /// quadraui primitives. Returns cached hit data for click dispatch.
 pub(super) fn render_terminal_toolbar(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     area: Rect,
     panel: &render::TerminalPanel,
     theme: &Theme,
 ) -> crate::core::engine::TerminalToolbarHits {
     use crate::core::engine::TerminalToolbarHits;
+    use quadraui::Backend;
 
     let toolbar = render::build_terminal_toolbar(panel, theme);
     let q_rect = quadraui::Rect::new(
@@ -1327,12 +1306,9 @@ pub(super) fn render_terminal_toolbar(
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
     match toolbar {
         render::TerminalToolbar::FindBar(bar) => {
-            let layout = backend.enter_frame_scope(frame, |b| {
-                use quadraui::Backend;
-                let _regions = b.draw_status_bar(q_rect, &bar, None, None);
-                bar.layout(area.width as f32, 1.0, 2.0, |seg| {
-                    quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
-                })
+            let _regions = backend.draw_status_bar(q_rect, &bar, None, None);
+            let layout = bar.layout(area.width as f32, 1.0, 2.0, |seg| {
+                quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
             });
             TerminalToolbarHits::FindBar {
                 layout,
@@ -1340,10 +1316,7 @@ pub(super) fn render_terminal_toolbar(
             }
         }
         render::TerminalToolbar::TabStrip(bar) => {
-            let hits = backend.enter_frame_scope(frame, |b| {
-                use quadraui::Backend;
-                b.draw_tab_bar(q_rect, &bar, None)
-            });
+            let hits = backend.draw_tab_bar(q_rect, &bar, None);
             TerminalToolbarHits::TabStrip(hits)
         }
     }
@@ -1382,27 +1355,23 @@ pub(super) fn render_terminal_panel(
     let td = render::build_terminal_draw_data(panel, q_area, 1.0, 1.0, content_rows, None);
     engine.terminal_split_layout.replace(td.split);
     backend.set_current_theme(q_theme);
-    if let Some(split) = &td.split {
-        let left = td.left.as_ref().unwrap();
-        let right = td.right.as_ref().unwrap();
-        let sl = *split;
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_terminal(sl.left, left);
-            b.draw_terminal(sl.right, right);
-        });
-        quadraui::tui::draw_terminal_divider(
-            frame.buffer_mut(),
-            split.divider_x as u16,
-            area.y,
-            area.height,
-            &q_theme,
-        );
-    } else if let Some(ref term) = td.single {
-        backend.enter_frame_scope(frame, |b| {
-            use quadraui::Backend;
-            b.draw_terminal(q_area, term);
-        });
+    {
+        use quadraui::Backend;
+        if let Some(split) = &td.split {
+            let left = td.left.as_ref().unwrap();
+            let right = td.right.as_ref().unwrap();
+            backend.draw_terminal(split.left, left);
+            backend.draw_terminal(split.right, right);
+            quadraui::tui::draw_terminal_divider(
+                frame.buffer_mut(),
+                split.divider_x as u16,
+                area.y,
+                area.height,
+                &q_theme,
+            );
+        } else if let Some(ref term) = td.single {
+            backend.draw_terminal(q_area, term);
+        }
     }
 }
 
@@ -1452,7 +1421,13 @@ mod sc_panel_tests {
         };
         terminal
             .draw(|frame| {
-                render_source_control(&mut tui_backend, frame, area, engine, &theme);
+                // #600: `render_source_control` calls `Backend::draw_*` trait
+                // methods directly now (no per-call `enter_frame_scope`), so
+                // this harness needs to open the scope itself — mirrors what
+                // `event_loop`'s two `terminal.draw` closures do in `mod.rs`.
+                super::with_frame_scope(&mut tui_backend, frame, |backend, frame| {
+                    render_source_control(backend, frame, area, engine, &theme);
+                });
             })
             .unwrap();
         let buf = terminal.backend().buffer();
