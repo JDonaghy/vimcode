@@ -88,10 +88,13 @@ pub(super) fn render_sidebar(
     engine.explorer_tree_rect.set(q_rect);
     engine.explorer_viewport_rows.set(area.height as usize);
     render::populate_explorer_tree_controller(engine, theme);
+    // Do NOT open a nested `enter_frame_scope` here — `render_sidebar` is
+    // called from `draw_frame`, which already runs inside the caller's
+    // single `with_frame_scope` (see mod.rs's `terminal.draw` closures).
+    // Re-entering would just be a no-op round trip on `current_frame_ptr`,
+    // but it contradicts the "entered once per draw closure" invariant.
     backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    backend.enter_frame_scope(frame, |b| {
-        engine.explorer_tree.borrow().render(b, q_rect);
-    });
+    engine.explorer_tree.borrow().render(backend, q_rect);
 
     // TreeController.render() draws the scrollbar internally.
     // Register a ScrollSurface for scroll-wheel dispatch only.
@@ -147,6 +150,9 @@ pub(super) fn render_settings_panel(
         width: area.width,
         height: chrome_h,
     };
+    // Stage 1 scope note: `draw_settings_chrome` is a free rasteriser with no
+    // `Backend::draw_*` trait equivalent (checked against quadraui's Backend
+    // trait), so calling it directly on `buf` is correct and out of scope here.
     quadraui::tui::draw_settings_chrome(
         buf,
         chrome_area,
@@ -489,6 +495,9 @@ pub(super) fn render_ext_panel(
         width: area.width,
         height: chrome_h,
     };
+    // Stage 1 scope note: `draw_settings_chrome` is a free rasteriser with no
+    // `Backend::draw_*` trait equivalent (checked against quadraui's Backend
+    // trait), so calling it directly on the buffer is correct and out of scope here.
     quadraui::tui::draw_settings_chrome(
         frame.buffer_mut(),
         chrome_area,
@@ -1362,6 +1371,10 @@ pub(super) fn render_terminal_panel(
             let right = td.right.as_ref().unwrap();
             backend.draw_terminal(split.left, left);
             backend.draw_terminal(split.right, right);
+            // Stage 1 scope note: `draw_terminal_divider` is a free rasteriser
+            // with no `Backend::draw_*` trait equivalent (checked against
+            // quadraui's Backend trait), so calling it directly is correct
+            // and out of scope here.
             quadraui::tui::draw_terminal_divider(
                 frame.buffer_mut(),
                 split.divider_x as u16,
