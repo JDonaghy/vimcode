@@ -21,26 +21,39 @@
 //!
 //! # What's intentionally NOT yet ported, and why
 //!
-//! Three structural gaps were found while scoping this stage (recorded as
-//! pinned `coord context` notes on vimcode#595 for the next session):
+//! Three structural gaps were found while scoping Stage 0 (recorded as
+//! pinned `coord context` notes on vimcode#595):
 //!
 //! 1. **Painting.** `render_content(&self, backend: &mut dyn Backend, ...)`
-//!    never gets a raw `ratatui::Frame` — but `render_impl.rs` + `panels.rs`
-//!    (~4,000 lines combined) call `backend.enter_frame_scope(frame, ...)`
-//!    at ~30 sites, and several sites (editor, toast stack, drop overlay,
-//!    tooltip, dialog, context menu, find/replace) call quadraui's *free*
-//!    rasteriser functions directly on `frame.buffer_mut()` instead of the
-//!    equivalent `Backend::draw_*` trait method that already exists and
-//!    would work through `&mut dyn Backend`. Fixing this is a real but
-//!    bounded sweep (same underlying function either way — swap the call
-//!    site, not the logic) and is the next stage's main body of work.
+//!    never gets a raw `ratatui::Frame` — confirmed structural, not just
+//!    unwired: quadraui's `TuiBackend` stashes its frame pointer in a
+//!    *private* field (`current_frame_ptr`) with no public accessor, and
+//!    `render_content` runs inside quadraui's own `enter_frame_scope` (see
+//!    `shell_adapter.rs::ShellAdapter::render` /
+//!    `tui/run.rs::render_frame`) — so `Backend::draw_*` trait calls work
+//!    fine (they use the smuggled pointer internally), but nothing needing
+//!    raw `Frame`/`Buffer` access can ever work from this signature, full
+//!    stop. #600 (Stage 1) converted the ~13 sites that were free-function
+//!    calls with a trait equivalent; #601 (Stage 2) wires the
+//!    now-trait-only subset — editor windows, tab bars, breadcrumb bars,
+//!    per-window status lines, and the completion/hover/editor-hover/
+//!    diff-peek/signature-help popups — into `render_content`, via
+//!    `render_impl.rs::build_screen_for_shell_content` +
+//!    `paint_editor_popups`. What #601 still cannot paint (true raw-buffer
+//!    holdouts, each filed as its own follow-on, all blocking #605
+//!    cutover): sidebar panel content (#607), quickfix panel + bottom
+//!    panel/terminal PTY content (#608), window/group divider lines +
+//!    tab-drag overlay + tab-hover tooltip (#609), and cursor placement
+//!    (#604 / quadraui#466). The menu bar row is reserved in the layout
+//!    math but not painted either (out of scope for #601; folds into key
+//!    dispatch, #603).
 //! 2. **Mouse handling.** `mouse::handle_mouse` (~3,066 lines) takes
 //!    `&mut quadraui::DragState` + `&mut quadraui::ModalStack` directly via
 //!    `TuiBackend::drag_and_modal_mut()` — a concrete-only method the
 //!    `Backend` trait deliberately doesn't expose. It cannot be called from
 //!    `handle(&mut self, event, backend: &mut dyn Backend, ...)` as-is.
-//!    Needs either a trait-level accessor or a rewrite onto
-//!    `quadraui::dispatch_mouse_down/drag/up`.
+//!    Needs either a trait-level accessor (quadraui#467) or a rewrite onto
+//!    `quadraui::dispatch_mouse_down/drag/up`. Tracked as #602.
 //! 3. **Editor cursor placement.** `Backend::draw_editor`'s
 //!    `EditorPaintResult::cursor_position` is documented "host applies via
 //!    `Frame::set_cursor_position`", but no consumer of it exists anywhere
@@ -48,15 +61,14 @@
 //!    Frame to call it on. Filed as quadraui#466: cache the position on
 //!    `TuiBackend`, apply it in `tui/run.rs::render_frame` the same way
 //!    `apply_selection_highlight` already runs post-`render_content`.
+//!    Tracked as #604.
 //!
 //! Given (1) and (2), `handle()` below only implements the two dispatch
 //! layers that genuinely don't need raw Frame/DragState access — panel-key
 //! accelerators and the `MenuSystem` intercept — plus routes plain
 //! `KeyPressed` events (no mouse) to `Engine::handle_key`, which is already
 //! backend-agnostic. Everything else returns `Reaction::Continue` with a
-//! `// TODO(#595)` marker rather than a half-correct guess. `render_content`
-//! computes the screen layout (pure, no Frame needed) but does not yet
-//! paint, pending gap (1).
+//! `// TODO(#595)` marker rather than a half-correct guess.
 //!
 //! Also NOT yet ported: the "#318" Alt+menu-letter "reveal menu bar" shim
 //! sitting between those two dispatch layers in `event_loop()`
@@ -253,13 +265,89 @@ impl ShellApp for TuiShellApp {
 
     fn render_content(
         &self,
-        _backend: &mut dyn quadraui::Backend,
-        _layout: &quadraui::AppShellLayout,
+        backend: &mut dyn quadraui::Backend,
+        layout: &quadraui::AppShellLayout,
     ) {
-        // Screen-layout computation is pure (no Frame needed) and safe to
-        // run today; left here so the next stage's paint sweep has a
-        // concrete anchor. Painting itself is gap (1) in the module doc.
-        let _theme = self.theme();
+        // #601: paints the trait-portable subset of `draw_frame` — editor
+        // windows, tab bars, breadcrumb bars, per-window status lines, and
+        // the editor-anchored popups — into `layout.main_content_bounds`.
+        // See the module doc's gap (1) for exactly what's still deferred
+        // (sidebar content #607, quickfix/bottom panel #608, dividers/
+        // drag-overlay/tab-tooltip #609, cursor placement #604) and why.
+        let theme = self.theme();
+        let main = layout.main_content_bounds;
+        if main.width < 1.0 || main.height < 1.0 {
+            return;
+        }
+        let area = Rect {
+            x: main.x.round() as u16,
+            y: main.y.round() as u16,
+            width: main.width.round() as u16,
+            height: main.height.round() as u16,
+        };
+
+        backend.set_theme(super::quadraui_tui::q_theme(&theme));
+
+        let screen = build_screen_for_shell_content(&self.engine, &theme, area);
+
+        // ── Tab bar(s) + breadcrumb bar(s) + editor windows ─────────────
+        // Windows are painted first (matches `draw_frame`'s split-group
+        // order — see its own comment) so window content can't overwrite
+        // an adjacent group's tab bar; divider lines between windows are
+        // skipped here (#609), same as passing `frame: None` skips them in
+        // `render_all_windows`.
+        render_all_windows(backend, None, &screen.windows, &theme);
+
+        let tui_tbh: f64 = if self.engine.settings.breadcrumbs && !self.engine.terminal_maximized {
+            2.0
+        } else {
+            1.0
+        };
+        let tab_bar_targets = render::tab_bar_draw_targets(
+            &self.engine,
+            &screen,
+            1.0,
+            tui_tbh,
+            (area.x as f64, area.y as f64, area.width as f64),
+        );
+        for target in &tab_bar_targets {
+            let g_tab = Rect {
+                x: target.rect.x as u16,
+                y: target.rect.y as u16,
+                width: target.rect.width as u16,
+                height: 1,
+            };
+            render_tab_bar(backend, g_tab, target.bar, &theme);
+        }
+        for t in render::breadcrumb_draw_targets(&screen, self.engine.terminal_maximized, 1.0) {
+            let bc_rect = Rect {
+                x: t.rect.x as u16,
+                y: t.rect.y as u16,
+                width: t.rect.width as u16,
+                height: 1,
+            };
+            let bc_layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, &theme);
+            *t.draw_layout.borrow_mut() = Some(bc_layout);
+        }
+
+        // ── Editor-anchored popups (completion/hover/editor-hover/
+        // diff-peek/signature-help) — same code `draw_frame` calls, all
+        // already trait-only (#601's `paint_editor_popups` extraction).
+        let mut completion_layout = self.completion_layout.borrow_mut();
+        let mut editor_hover_link_rects = self.editor_hover_link_rects.borrow_mut();
+        let mut editor_hover_popup_rect = self.editor_hover_popup_rect.get();
+        let mut editor_hover_scrollbar = self.editor_hover_scrollbar.borrow_mut();
+        paint_editor_popups(
+            backend,
+            &screen,
+            area,
+            &theme,
+            &mut completion_layout,
+            &mut editor_hover_link_rects,
+            &mut editor_hover_popup_rect,
+            &mut editor_hover_scrollbar,
+        );
+        self.editor_hover_popup_rect.set(editor_hover_popup_rect);
     }
 
     fn handle(
@@ -679,15 +767,56 @@ mod tests {
 
     /// End-to-end smoke: the `ShellConfig`/`PanelDefinition` wiring this
     /// stage introduced constructs through the real `driver_with_shell`
-    /// harness and paints a first frame without panicking. `render_content`
-    /// is still a stub (gap 1 in the module doc), so this only proves the
-    /// plumbing, not painted content.
+    /// harness and paints a first frame without panicking.
     #[test]
     fn shell_app_constructs_via_driver_with_shell() {
         let driver = driver_with_shell(TuiShellApp::new(None), config(), 80, 24);
-        // AppShell chrome (activity bar) paints even though render_content
-        // doesn't yet — proves the shell/adapter wiring is sound.
         let _ = driver.screen();
+    }
+
+    /// #601: `render_content` must actually paint the active editor
+    /// window's text through the `ShellApp` path — this is the core claim
+    /// of the stage, so assert on it directly rather than just "didn't
+    /// panic". `driver_with_shell` (via `TuiDriver::new`) runs `setup` +
+    /// one `render()` pass immediately, so inserting the marker text into
+    /// the engine *before* constructing the driver is enough for it to
+    /// show up in the first painted frame.
+    #[test]
+    fn render_content_paints_editor_text_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .buffer_mut()
+            .insert(0, "ZQXW_STAGE2_EDITOR_MARKER");
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_STAGE2_EDITOR_MARKER"),
+            "editor content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #601: `render_content` must also paint per-editor-group tab bars —
+    /// exercise the multi-window code path (`render_all_windows` +
+    /// `render::tab_bar_draw_targets` for `screen.editor_group_split`) by
+    /// opening a vertical split before painting. Vim/vimcode splits show
+    /// the *same* buffer in both panes, so the marker text (on line 0,
+    /// visible from the top in a freshly split window) should appear once
+    /// per pane — proving both windows actually painted, not just the
+    /// first.
+    #[test]
+    fn render_content_paints_multiple_windows_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .buffer_mut()
+            .insert(0, "ZQXW_STAGE2_SPLIT_MARKER");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let driver = driver_with_shell(app, config(), 120, 24);
+        let screen = driver.screen();
+        let occurrences = screen.matches("ZQXW_STAGE2_SPLIT_MARKER").count();
+        assert_eq!(
+            occurrences, 2,
+            "expected the marker text to paint once per split pane; screen:\n{screen}"
+        );
     }
 
     /// `dispatch_panel_accelerator_sizeless`'s `ACC_TERMINAL_TOGGLE_MAX` arm
