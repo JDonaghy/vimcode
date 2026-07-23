@@ -45,9 +45,9 @@
 //!    `EditorPaintResult::cursor_position` is documented "host applies via
 //!    `Frame::set_cursor_position`", but no consumer of it exists anywhere
 //!    in quadraui's `shell_adapter`/TUI runner — `render_content` has no
-//!    Frame to call it on. Needs a quadraui-side fix (cache the position on
+//!    Frame to call it on. Filed as quadraui#466: cache the position on
 //!    `TuiBackend`, apply it in `tui/run.rs::render_frame` the same way
-//!    `apply_selection_highlight` already runs post-`render_content`).
+//!    `apply_selection_highlight` already runs post-`render_content`.
 //!
 //! Given (1) and (2), `handle()` below only implements the two dispatch
 //! layers that genuinely don't need raw Frame/DragState access — panel-key
