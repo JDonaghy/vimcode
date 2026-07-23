@@ -57,6 +57,15 @@
 //! `// TODO(#595)` marker rather than a half-correct guess. `render_content`
 //! computes the screen layout (pure, no Frame needed) but does not yet
 //! paint, pending gap (1).
+//!
+//! Also NOT yet ported: the "#318" Alt+menu-letter "reveal menu bar" shim
+//! sitting between those two dispatch layers in `event_loop()`
+//! (`mod.rs:1275`-`:1294`), which sets `engine.menu_bar_visible = true` on
+//! an Alt+<letter> keypress so the same keystroke both reveals and
+//! activates the menu. It's not a fourth structural gap — the blocker is
+//! simply that `KeyPressed` routing is itself still a `// TODO(#595)` stub
+//! below — but it's called out here explicitly so a future session doesn't
+//! assume key dispatch is complete once that stub is filled in.
 
 use std::cell::{Cell, RefCell};
 
@@ -266,7 +275,20 @@ impl ShellApp for TuiShellApp {
         // first; the current set (`dispatch_panel_accelerator`) only
         // touches `engine`/`sidebar`, so it's fully portable as-is except
         // for its `terminal: &Terminal<...>` parameter, which every arm
-        // uses only for `.size()` — satisfied here by `backend.viewport()`.
+        // uses only for `.size()` — satisfied here by `backend.viewport()`,
+        // threading both `width` and `height` through (the
+        // `ACC_TERMINAL_TOGGLE_MAX` arm needs both — see
+        // `dispatch_panel_accelerator_sizeless`'s doc comment).
+        //
+        // NOT yet ported here: the "#318" Alt+menu-letter reveal shim
+        // (`mod.rs:1275`-`:1294`) that sets `engine.menu_bar_visible = true`
+        // on an Alt+<letter> keypress so the same keystroke both reveals
+        // and activates the menu bar. It belongs between this block and the
+        // MenuSystem intercept below, but depends on the `KeyPressed`
+        // routing that's still a `// TODO(#595)` stub further down — so it
+        // has no home yet either. Flagging it explicitly here (rather than
+        // only in the module doc) so it isn't missed when that TODO is
+        // finally implemented.
         if let UiEvent::Accelerator(ref acc_id, acc_mods) = event {
             if self.engine.dialog.is_none() {
                 let viewport = backend.viewport();
@@ -277,6 +299,7 @@ impl ShellApp for TuiShellApp {
                     &mut self.engine,
                     &mut self.sidebar,
                     viewport.width as u16,
+                    viewport.height as u16,
                     self.sidebar_width,
                     &mut needs_redraw,
                 ) {
@@ -460,11 +483,15 @@ impl ShellApp for TuiShellApp {
 }
 
 /// [`dispatch_panel_accelerator`] minus the `terminal: &Terminal<...>`
-/// parameter, replaced with a plain `screen_w: u16` — every call site in
-/// the original only used `terminal` for `.size()`. Kept as a separate
-/// wrapper (rather than changing the original's signature) so the still-live
-/// `event_loop()` call site is untouched; the next stage that actually
-/// deletes `event_loop()` should collapse these back into one function.
+/// parameter, replaced with plain `screen_w: u16` / `screen_h: u16` —
+/// every call site in the original only used `terminal` for `.size()`,
+/// which returns both dimensions (`ACC_TERMINAL_TOGGLE_MAX` needs both:
+/// `screen_w` for `terminal_cols`, `screen_h` for
+/// `terminal_target_maximize_rows_tui`'s `screen_h` parameter — see
+/// `mod.rs:225`-`:239`). Kept as a separate wrapper (rather than changing
+/// the original's signature) so the still-live `event_loop()` call site is
+/// untouched; the next stage that actually deletes `event_loop()` should
+/// collapse these back into one function.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_panel_accelerator_sizeless(
     id: &str,
@@ -472,6 +499,7 @@ fn dispatch_panel_accelerator_sizeless(
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
     screen_w: u16,
+    screen_h: u16,
     sidebar_width: u16,
     needs_redraw: &mut bool,
 ) -> bool {
@@ -540,7 +568,7 @@ fn dispatch_panel_accelerator_sizeless(
         ACC_TERMINAL_TOGGLE_MAX => {
             let ctx = crate::core::engine::UiEventContext {
                 terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
-                terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_w),
+                terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_h),
             };
             engine.handle_ui_event(
                 crate::core::engine::UiEvent::Accelerator(
@@ -660,5 +688,68 @@ mod tests {
         // AppShell chrome (activity bar) paints even though render_content
         // doesn't yet — proves the shell/adapter wiring is sound.
         let _ = driver.screen();
+    }
+
+    /// `dispatch_panel_accelerator_sizeless`'s `ACC_TERMINAL_TOGGLE_MAX` arm
+    /// must derive `terminal_max_rows` from `screen_h` (the terminal's row
+    /// count), not `screen_w` — the bug review iteration 1 of vimcode#595
+    /// caught: the wrapper silently fed `screen_w` into
+    /// `terminal_target_maximize_rows_tui`, whose parameter is documented
+    /// `screen_h`. Uses a screen far wider than it is tall so swapping the
+    /// two arguments would produce a visibly different (larger) row count,
+    /// making the regression this guards against actually detectable.
+    #[test]
+    fn terminal_toggle_max_uses_screen_height_not_width() {
+        let mut engine = Engine::new();
+        let mut sidebar = TuiSidebar::new();
+        let mut needs_redraw = false;
+
+        let screen_w: u16 = 200;
+        let screen_h: u16 = 24;
+
+        // `terminal_target_maximize_rows_tui` only returns a nonzero target
+        // once the terminal panel is considered open (`bp_open` in
+        // `compute_editor_layout`). In `dispatch_panel_accelerator_sizeless`,
+        // the `ACC_TERMINAL_TOGGLE_MAX` arm builds `ctx` (which is where the
+        // screen_w/screen_h bug lives) *before* calling
+        // `Engine::handle_ui_event` — and it's that call that flips
+        // `terminal_open` via `toggle_terminal_maximize`. So the bug is only
+        // observable when the terminal panel is *already* open and just not
+        // yet maximized (e.g. the user has a terminal open and presses
+        // "maximize") — pre-seed that precondition so `bp_open` is already
+        // true when `ctx` is built, matching the live-usage scenario this
+        // regression test guards.
+        engine.terminal_open = true;
+        let expected_target = terminal_target_maximize_rows_tui(&engine, screen_h);
+        // Sanity check: if width and height produced the same target, this
+        // test couldn't distinguish the bug (screen_w used) from the fix
+        // (screen_h used).
+        assert_ne!(
+            expected_target,
+            terminal_target_maximize_rows_tui(&engine, screen_w),
+            "fixture must pick w/h whose targets diverge, or this test proves nothing"
+        );
+
+        let dispatched = dispatch_panel_accelerator_sizeless(
+            ACC_TERMINAL_TOGGLE_MAX,
+            quadraui::Modifiers::default(),
+            &mut engine,
+            &mut sidebar,
+            screen_w,
+            screen_h,
+            SIDEBAR_WIDTH,
+            &mut needs_redraw,
+        );
+
+        assert!(dispatched);
+        assert!(needs_redraw);
+        assert!(engine.terminal_maximized);
+        assert_eq!(engine.terminal_panes.len(), 1);
+        let expected_rows = engine.effective_terminal_panel_rows(expected_target);
+        assert_eq!(
+            engine.terminal_panes[0].session.rows(),
+            expected_rows,
+            "spawned terminal's row count must derive from screen_h, not screen_w"
+        );
     }
 }
