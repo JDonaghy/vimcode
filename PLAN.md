@@ -10,33 +10,144 @@
 
 ---
 
-## 🧭 Current wave (2026-07-21) — TUI → `ShellApp`/`run_with_shell` (vimcode#595)
+## 🧭 Current wave (2026-07-23) — TUI → `ShellApp`/`run_with_shell` (vimcode#595)
 
-**Status:** filed, not yet started. See `GOALS.md`'s "Architecture milestones"
-section for the full why/scope. This note exists so a future session can resume
-without re-deriving the plan.
+**Status:** Stage 0 landed this session — `TuiShellApp` scaffold
+(`src/tui_main/shell_app.rs`) with `setup`/`tick` fully ported, dormant (not
+wired to `main.rs`/`tui_bin.rs`). **This is genuinely multi-session** — the
+2026-07-21 note below undersold the coupling depth by roughly an order of
+magnitude (see "What this session found" below). Do not re-attempt the
+discovery work below; it's done. Pick up at "Staged plan," Stage 1.
 
-**What's already true (don't re-derive):**
-- GTK did the equivalent migration already — #493, landed. `App` in `src/gtk/mod.rs`
-  implements `quadraui::ShellApp`; `main.rs` calls
-  `quadraui::gtk::shell_runner::run_with_shell(...)`. That's the pattern to mirror.
-- TUI's render layer is *already* `&Engine`-shaped (immutable) via `Cell`/`RefCell`
-  render-time caches (`sc_panel_layout`, `explorer_tree_rect`, …) — the part of the
-  migration that sounds hardest (paint needing an immutable receiver) is already done.
-- The actual work is restructuring `src/tui_main/mod.rs::event_loop()`
-  (~2,100 lines, starts at `mod.rs:787`) into `ShellApp`'s `setup`/`render_content`/
-  `handle`/`tick` shape, then swapping `tui_main::run()`'s hand-rolled raw-mode/
-  terminal/frame-timing bootstrap for `quadraui::tui::shell_runner::run_with_shell`.
+**All findings below are also recorded as pinned `coord context` notes on
+vimcode#595** (ids 260-262) — this section is the human-readable expansion.
 
-**Resume steps:**
-1. Read vimcode#595 in full (has the detailed scoping, non-goals, and suggested
-   incremental-landing approach).
-2. Do **not** attempt this as one PR — get a wrapper compiling against `ShellApp`'s
-   shape first, without cutting over the live entry point, verify parity via the
-   `sc_panel_tests`-style `TestBackend` regression pattern (`src/tui_main/panels.rs`)
-   plus manual smoke testing, *then* cut `main.rs`/`tui_bin.rs` over.
-3. Not blocked on quadraui#465 (macOS `ShellApp` support) — that's an independent,
-   parallel supply-side item; TUI already runs on macOS via crossterm regardless.
+### What this session found (bigger than the original scoping assumed)
+
+The GTK precedent (#493) took **9 stages** (B.5) **+ 13 more stages** (B.5b) to
+go from "trait compiles" to "runtime actually uses it" — see this file's
+"Phase B.5"/"Phase B.5b" sections below for the full history. TUI's equivalent
+is at least that size, for the same reason GTK's was: `ShellApp::render_content(&self,
+backend: &mut dyn Backend, ...)` and `handle(&mut self, event, backend: &mut dyn
+Backend, ...)` **only ever get a trait object** — never a raw `ratatui::Frame`,
+never the concrete `TuiBackend`. Three concrete places TUI's current code
+depends on one of those two things:
+
+1. **Paint layer.** `src/tui_main/render_impl.rs` (2,427 lines) +
+   `src/tui_main/panels.rs` (1,570 lines) call
+   `backend.enter_frame_scope(frame, |b| {...})` at **~30 separate call
+   sites** (each re-threading the raw `Frame` and re-calling
+   `backend.set_current_theme(...)` per panel) instead of entering scope
+   once at the top the way quadraui's own runner does
+   (`quadraui/src/tui/run.rs::render_frame`). Several sites also call
+   quadraui's *free* rasteriser functions directly on `frame.buffer_mut()`
+   (`quadraui::tui::draw_editor`, `draw_toast_stack`, `draw_drop_overlay`;
+   `super::quadraui_tui::draw_tooltip`, `draw_find_replace`,
+   `draw_context_menu`, `draw_dialog`) instead of the equivalent
+   `Backend::draw_*` trait method that **already exists** and would work
+   through `&mut dyn Backend` — likely a historical artifact of the trait
+   methods being added after these call sites were written. Fixing this is
+   mechanical (same underlying function either way — swap the call site,
+   not the logic) but touches ~30 sites across two large, currently-live
+   files. A handful of raw `set_cell(frame.buffer_mut(), ...)` writes for
+   decorative separators have no primitive/trait equivalent at all yet.
+2. **Mouse handling.** `src/tui_main/mouse.rs::handle_mouse` (~3,066 lines,
+   the bulk of the file's 4,124) takes `&mut quadraui::DragState` +
+   `&mut quadraui::ModalStack` directly via `TuiBackend::drag_and_modal_mut()`
+   — a concrete-only method the `Backend` trait deliberately does not
+   expose (by design — see the method's own doc comment). It cannot be
+   called from `ShellApp::handle` as written. Needs either a new
+   trait-level accessor in quadraui, or `handle_mouse` rewritten onto the
+   newer `quadraui::dispatch_mouse_down/drag/up()` free-function pattern
+   GTK increasingly uses (see "Hit-test glue" rows in the cross-backend
+   coverage table in `PROJECT_STATE.md`).
+3. **Editor cursor placement (quadraui-side gap, not vimcode's to fix).**
+   `Backend::draw_editor`'s `EditorPaintResult::cursor_position` is
+   documented "host applies via `Frame::set_cursor_position`" — but
+   **no consumer of it exists anywhere in quadraui's `shell_adapter.rs` or
+   `tui/run.rs`** (verified by grep). `render_content` has no Frame to call
+   `set_cursor_position` on. The fix belongs in quadraui: cache the last
+   `cursor_position` on `TuiBackend`, apply it in
+   `tui/run.rs::render_frame` after `terminal.draw(...)` returns — the
+   exact same shape `apply_selection_highlight(frame.buffer_mut())` already
+   uses for the same class of problem (buffer-only paint can't carry a
+   Frame-level side effect). **File this as a quadraui issue before
+   attempting the live cutover** — per `CLAUDE.md`'s Platform-Neutrality
+   Rule, do not work around it inside vimcode.
+
+### What landed this session (Stage 0)
+
+`src/tui_main/shell_app.rs` (new, `mod shell_app;` added to `mod.rs`):
+- `TuiShellApp` struct — every local `mut` variable `event_loop()` declares
+  (`mod.rs:793`-`:911`), moved onto the struct. Render-time-mutated fields
+  (`last_layout`, hover/completion/context-menu/dialog layout caches, etc.)
+  wrapped in `Cell`/`RefCell`, mirroring GTK's `App` (`menu_row_rect:
+  Cell<Rect>`) and `Engine`'s own render-time caches.
+- `ShellApp::setup` — fully ported (nerd-font sync, panel-key accelerator
+  registration, menu defs). Required widening TUI's
+  `register_panel_accelerators` from `&mut backend::TuiBackend` (concrete)
+  to `&mut dyn quadraui::Backend` (mirrors GTK's own copy of this function,
+  which already took the trait object) — safe, since it only calls
+  `Backend::register_accelerator`/`unregister_accelerator`, both trait
+  methods.
+- `ShellApp::tick` — fully ported: the per-frame viewport sync
+  (`mod.rs:916`-`:967`, using `backend.viewport()` in place of
+  `terminal.size()`) + all the idle-loop background work (`mod.rs:1157`-
+  `:1247`: `poll_idle`, format-on-save deferred quit, sidebar/SC
+  auto-refresh, settings reload, pending terminal command, startup
+  message, ext-panel focus request, yank-highlight expiry, tab-switcher
+  auto-confirm).
+- `ShellApp::handle` — only the two dispatch layers that don't touch
+  Frame/DragState/ModalStack: panel-key accelerators (via a
+  `dispatch_panel_accelerator_sizeless` wrapper — same logic, `terminal:
+  &Terminal<...>` replaced with `screen_w: u16` from `backend.viewport()`)
+  and the `MenuSystem` intercept. Key/mouse dispatch bodies are explicit
+  `// TODO(#595)` stubs, not guesses.
+- `ShellApp::render_content` — stub (computes nothing yet; gap 1 above
+  blocks real painting).
+- Tests: `TuiShellApp::setup`/`tick` are exercised directly against a real
+  `TuiBackend` (quadraui's `driver_with_shell`/`TuiDriver` wraps the app in
+  a `pub(crate)`-fielded `ShellAdapter` with no accessor back to the
+  concrete app and no exposed `tick()` passthrough, so it can't be used for
+  field-level assertions) + one `driver_with_shell` end-to-end smoke
+  (constructs + paints a first frame without panicking, proving the
+  `ShellConfig`/`PanelDefinition` wiring).
+
+### Staged plan for follow-up sessions
+
+Mirrors how GTK's B.5/B.5b actually shipped — many small, independently
+buildable/testable stages, not one PR:
+
+- **Stage 1 — paint centralization.** Sweep `render_impl.rs` + `panels.rs`:
+  (a) convert the handful of free-function-on-`frame.buffer_mut()` calls to
+  their existing `Backend::draw_*` trait equivalents; (b) collapse the ~30
+  `enter_frame_scope`/`set_current_theme` call sites to one entry, made by
+  each of `event_loop()`'s two `terminal.draw(|frame| ...)` closures (keeps
+  the live path working throughout — Path A style). This alone is valuable
+  independent of #595 and should be tested via the existing
+  `cargo test --no-default-features` suite (no behavior change, pure
+  threading).
+- **Stage 2 — `render_content` for real.** Once Stage 1 lands, `draw_frame`
+  and friends work through `&mut dyn Backend` — wire `render_content` to
+  call the now-portable paint path against `layout.main_content_bounds`.
+  Add `driver_with_shell` paint assertions (`screen_contains`).
+- **Stage 3 — mouse handling.** Resolve gap 2 (new quadraui trait accessor,
+  or `handle_mouse` rewritten onto `dispatch_mouse_down/drag/up`), then wire
+  `TuiShellApp::handle`'s mouse arms.
+- **Stage 4 — key handling.** Wire the remaining `KeyPressed` dispatch
+  (dialog/palette/completion/context-menu intercepts, `Engine::handle_key`)
+  into `handle()`.
+- **Stage 5 — quadraui cursor-placement fix.** File the quadraui issue for
+  gap 3 (editor cursor); wait for it to land before cutover, since without
+  it the live TUI would lose its blinking cursor.
+- **Stage 6 — parity + cutover.** Once Stages 1-5 land and `driver_with_shell`
+  coverage is solid, swap `main.rs`/`tui_bin.rs` to
+  `quadraui::tui::shell_runner::run_with_shell`, delete `event_loop()`, do
+  the full manual smoke pass, then land.
+
+Not blocked on quadraui#465 (macOS `ShellApp` support) — independent,
+parallel supply-side item; TUI already runs on macOS via crossterm
+regardless.
 
 ---
 

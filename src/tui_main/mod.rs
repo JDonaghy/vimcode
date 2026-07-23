@@ -25,6 +25,7 @@ mod panels;
 mod quadraui_tui;
 mod render_impl;
 mod services;
+mod shell_app;
 
 #[allow(unused_imports)]
 use mouse::*;
@@ -280,10 +281,9 @@ fn dispatch_panel_accelerator(
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
 fn register_panel_accelerators(
-    backend: &mut backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     pk: &crate::core::settings::PanelKeys,
 ) {
-    use quadraui::Backend;
     let entries: [(&str, &str); 14] = [
         (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
         (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
