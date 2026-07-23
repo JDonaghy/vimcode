@@ -71,9 +71,10 @@ depends on one of those two things:
    `tui/run.rs::render_frame` after `terminal.draw(...)` returns — the
    exact same shape `apply_selection_highlight(frame.buffer_mut())` already
    uses for the same class of problem (buffer-only paint can't carry a
-   Frame-level side effect). **File this as a quadraui issue before
-   attempting the live cutover** — per `CLAUDE.md`'s Platform-Neutrality
-   Rule, do not work around it inside vimcode.
+   Frame-level side effect). **Filed as
+   [quadraui#466](https://github.com/JDonaghy/quadraui/issues/466)** — per
+   `CLAUDE.md`'s Platform-Neutrality Rule, wait for it to land rather than
+   working around it inside vimcode.
 
 ### What landed this session (Stage 0)
 
@@ -137,9 +138,10 @@ buildable/testable stages, not one PR:
 - **Stage 4 — key handling.** Wire the remaining `KeyPressed` dispatch
   (dialog/palette/completion/context-menu intercepts, `Engine::handle_key`)
   into `handle()`.
-- **Stage 5 — quadraui cursor-placement fix.** File the quadraui issue for
-  gap 3 (editor cursor); wait for it to land before cutover, since without
-  it the live TUI would lose its blinking cursor.
+- **Stage 5 — quadraui cursor-placement fix.** Filed as
+  [quadraui#466](https://github.com/JDonaghy/quadraui/issues/466); wait for
+  it to land before cutover, since without it the live TUI would lose its
+  blinking cursor.
 - **Stage 6 — parity + cutover.** Once Stages 1-5 land and `driver_with_shell`
   coverage is solid, swap `main.rs`/`tui_bin.rs` to
   `quadraui::tui::shell_runner::run_with_shell`, delete `event_loop()`, do
