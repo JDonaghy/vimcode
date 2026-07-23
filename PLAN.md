@@ -12,12 +12,38 @@
 
 ## 🧭 Current wave (2026-07-23) — TUI → `ShellApp`/`run_with_shell` (vimcode#595)
 
-**Status:** Stage 0 landed this session — `TuiShellApp` scaffold
-(`src/tui_main/shell_app.rs`) with `setup`/`tick` fully ported, dormant (not
-wired to `main.rs`/`tui_bin.rs`). **This is genuinely multi-session** — the
-2026-07-21 note below undersold the coupling depth by roughly an order of
-magnitude (see "What this session found" below). Do not re-attempt the
-discovery work below; it's done. Pick up at "Staged plan," Stage 1.
+**Status:** Stage 0 (`TuiShellApp` scaffold), Stage 1 (#600, paint
+centralization), and Stage 2 (#601, `render_content` paints for real) are
+landed. Still dormant — not wired to `main.rs`/`tui_bin.rs`. **This is
+genuinely multi-session** — the 2026-07-21 note below undersold the coupling
+depth by roughly an order of magnitude (see "What this session found"
+below). Do not re-attempt the discovery work below; it's done. Pick up at
+"Staged plan," Stage 3 (#602).
+
+**Stage 2 scoping note (2026-07-23):** confirmed structural, not just
+unwired — `render_content(&self, backend: &mut dyn Backend, ...)` can
+*never* get a raw `ratatui::Frame`/`Buffer`, in any future stage:
+`TuiBackend`'s frame pointer (`current_frame_ptr`) is a **private** field
+with no public accessor, and `render_content` runs inside quadraui's own
+`enter_frame_scope` (`shell_adapter.rs::ShellAdapter::render` →
+`tui/run.rs::render_frame`) — so `Backend::draw_*` trait calls work (they
+reach the smuggled pointer internally), but nothing needing raw buffer
+access ever can, from this signature, period. #601 wires everything that
+*is* reachable that way (editor windows, tab/breadcrumb bars, per-window
+status lines, the 4 editor-anchored popup kinds) and splits out the true
+raw-buffer holdouts as three follow-on issues, all filed and added to the
+epic's Work order (`after: 601`) and to #605's dependencies (cutover can't
+drop `event_loop()` while these stay unpainted):
+[#607](https://github.com/JDonaghy/vimcode/issues/607) sidebar panel
+content, [#608](https://github.com/JDonaghy/vimcode/issues/608)
+quickfix/bottom panel, [#609](https://github.com/JDonaghy/vimcode/issues/609)
+window/group dividers + tab-drag overlay + tab-hover tooltip. Note for
+whoever picks up #608: `render_quickfix_panel`, `render_bottom_panel_tabs`,
+and `render_terminal_toolbar` (unlike `render_terminal_panel`'s actual PTY
+grid content and the debug-output `TextDisplay`'s surrounding chrome) turned
+out to already be trait-only, no raw buffer needed — worth checking before
+assuming the whole panel needs new plumbing; #601 did not paint them (kept
+to its originally-approved scope) but they may be a quick win.
 
 **All findings below are also recorded as pinned `coord context` notes on
 vimcode#595** (ids 260-262) — this section is the human-readable expansion.
@@ -119,33 +145,46 @@ depends on one of those two things:
 Mirrors how GTK's B.5/B.5b actually shipped — many small, independently
 buildable/testable stages, not one PR:
 
-- **Stage 1 — paint centralization.** Sweep `render_impl.rs` + `panels.rs`:
-  (a) convert the handful of free-function-on-`frame.buffer_mut()` calls to
-  their existing `Backend::draw_*` trait equivalents; (b) collapse the ~30
-  `enter_frame_scope`/`set_current_theme` call sites to one entry, made by
-  each of `event_loop()`'s two `terminal.draw(|frame| ...)` closures (keeps
-  the live path working throughout — Path A style). This alone is valuable
-  independent of #595 and should be tested via the existing
-  `cargo test --no-default-features` suite (no behavior change, pure
-  threading).
-- **Stage 2 — `render_content` for real.** Once Stage 1 lands, `draw_frame`
-  and friends work through `&mut dyn Backend` — wire `render_content` to
-  call the now-portable paint path against `layout.main_content_bounds`.
-  Add `driver_with_shell` paint assertions (`screen_contains`).
-- **Stage 3 — mouse handling.** Resolve gap 2 (new quadraui trait accessor,
+- ✅ **Stage 1 — paint centralization** (#600, landed). Swept
+  `render_impl.rs` + `panels.rs`: (a) converted the free-function-on-
+  `frame.buffer_mut()` calls with a `Backend::draw_*` trait equivalent;
+  (b) collapsed the ~30 `enter_frame_scope`/`set_current_theme` call sites
+  to one entry per `terminal.draw(|frame| ...)` closure via a new
+  `with_frame_scope` helper. No behavior change, pure threading.
+- ✅ **Stage 2 — `render_content` for real** (#601, landed). Wired
+  `render_content` to paint the trait-portable subset — editor windows
+  (`render_all_windows`, `Frame` param now `Option`), tab bars, breadcrumb
+  bars, per-window status lines, and the completion/hover/editor-hover/
+  diff-peek/signature-help popups (extracted into a shared
+  `paint_editor_popups` so `draw_frame` and `render_content` can't drift) —
+  via a new `build_screen_for_shell_content` (mirrors `build_screen_for_tui`'s
+  row-accounting tail without re-subtracting activity-bar/sidebar width,
+  since `AppShellLayout::main_content_bounds` already excludes that chrome).
+  `render_tab_bar`/`draw_breadcrumb_bar`/`render_window_status_line`/
+  `render_editor_hover_popup` widened from concrete `&mut TuiBackend` to
+  `&mut dyn quadraui::Backend`, same technique Stage 0 used for
+  `register_panel_accelerators`. 2 new `driver_with_shell` `screen_contains`
+  assertions (single-window text, and a vertical-split proving multi-window
+  painting). What's *not* painted this stage — and structurally can't be,
+  from `render_content`'s `&mut dyn Backend`-only signature, without raw
+  `Frame`/`Buffer` access `TuiBackend` doesn't expose — split into three
+  follow-on issues, see the "Stage 2 scoping note" above: #607 (sidebar
+  content), #608 (quickfix/bottom panel), #609 (dividers/drag-overlay/
+  tab-tooltip). All three now block #605 (cutover) in the epic's Work order.
+- **Stage 3 — mouse handling** (#602). Resolve gap 2 (new quadraui trait accessor,
   or `handle_mouse` rewritten onto `dispatch_mouse_down/drag/up`), then wire
   `TuiShellApp::handle`'s mouse arms.
-- **Stage 4 — key handling.** Wire the remaining `KeyPressed` dispatch
+- **Stage 4 — key handling** (#603). Wire the remaining `KeyPressed` dispatch
   (dialog/palette/completion/context-menu intercepts, `Engine::handle_key`)
   into `handle()`.
-- **Stage 5 — quadraui cursor-placement fix.** Filed as
+- **Stage 5 — quadraui cursor-placement fix** (#604). Filed as
   [quadraui#466](https://github.com/JDonaghy/quadraui/issues/466); wait for
   it to land before cutover, since without it the live TUI would lose its
   blinking cursor.
-- **Stage 6 — parity + cutover.** Once Stages 1-5 land and `driver_with_shell`
-  coverage is solid, swap `main.rs`/`tui_bin.rs` to
-  `quadraui::tui::shell_runner::run_with_shell`, delete `event_loop()`, do
-  the full manual smoke pass, then land.
+- **Stage 6 — parity + cutover** (#605). Once Stages 1-5 *and* 2a/2b/2c
+  (#607/#608/#609) land and `driver_with_shell` coverage is solid, swap
+  `main.rs`/`tui_bin.rs` to `quadraui::tui::shell_runner::run_with_shell`,
+  delete `event_loop()`, do the full manual smoke pass, then land.
 
 Not blocked on quadraui#465 (macOS `ShellApp` support) — independent,
 parallel supply-side item; TUI already runs on macOS via crossterm

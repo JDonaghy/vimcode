@@ -98,6 +98,78 @@ pub(super) fn build_screen_for_tui(
     result
 }
 
+/// `TuiShellApp::render_content`-side counterpart to [`build_screen_for_tui`]
+/// (#601). `render_content` receives `layout.main_content_bounds` from
+/// quadraui's `AppShell::render`, which has *already* painted the activity
+/// bar + sidebar chrome and carved their width out of `area` — unlike
+/// `build_screen_for_tui`, called from the live `event_loop()` path with the
+/// *full* terminal rect, this must not subtract activity-bar/sidebar width a
+/// second time (that would double-count it and shrink the editor area).
+///
+/// Still applies vimcode's own row accounting — quickfix/terminal/
+/// debug-toolbar/wildmenu/status rows — since `AppShellLayout` has no
+/// concept of any of those; this mirrors `build_screen_for_tui`'s tail (from
+/// its `content_bounds` computation onward) so the two paths share the same
+/// formula and can't silently drift. `area` is treated directly as the
+/// editor column.
+///
+/// The menu-bar row is still reserved (so window rects land where the live
+/// path would put them) but not painted — `render_content` doesn't paint a
+/// menu bar this stage (out of scope; TUI's menu bar defaults hidden except
+/// in vscode-mode or via Alt-reveal, tracked with the rest of key dispatch
+/// in #603).
+pub(super) fn build_screen_for_shell_content(
+    engine: &Engine,
+    theme: &Theme,
+    area: Rect,
+) -> render::ScreenLayout {
+    let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let term_height: u16 = if bottom_panel_open {
+        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
+        engine.effective_terminal_panel_rows(target) + 2
+    } else {
+        0
+    };
+    let menu_height: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+    let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
+    let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
+        1
+    } else {
+        0
+    };
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_rows: u16 = if per_window_status { 0 } else { 1 };
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
+    let separated_status_rows: u16 = if separate_status { 1 } else { 0 };
+    let content_rows = area.height.saturating_sub(
+        1 + global_status_rows
+            + qf_height
+            + term_height
+            + menu_height
+            + dbg_height
+            + wildmenu_height
+            + separated_status_rows,
+    );
+    let editor_origin_x = area.x as f64;
+    let editor_origin_y = area.y as f64 + menu_height as f64;
+    let content_bounds = WindowRect::new(
+        editor_origin_x,
+        editor_origin_y,
+        area.width as f64,
+        content_rows as f64,
+    );
+    let tui_tab_bar_height = if engine.settings.breadcrumbs && !engine.terminal_maximized {
+        2.0
+    } else {
+        1.0
+    };
+    let (window_rects, _dividers) =
+        engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
+    build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true)
+}
+
 // ─── Frame rendering ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -361,7 +433,7 @@ pub(super) fn draw_frame(
         }
         // Render windows first so tab bars draw on top (prevents window content
         // from overwriting an adjacent group's tab bar in horizontal splits).
-        render_all_windows(backend, frame, &screen.windows, theme);
+        render_all_windows(backend, Some(frame), &screen.windows, theme);
         // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
         // the group's window content (bounds.y - tab_bar_height).
         for target in &tab_bar_targets {
@@ -453,7 +525,7 @@ pub(super) fn draw_frame(
             let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
             *t.draw_layout.borrow_mut() = Some(layout);
         }
-        render_all_windows(backend, frame, &screen.windows, theme);
+        render_all_windows(backend, Some(frame), &screen.windows, theme);
     }
 
     // Register the editor viewport as a scroll surface so dispatch_scroll
@@ -503,161 +575,21 @@ pub(super) fn draw_frame(
         }
     }
 
-    // ── Completion popup (rendered on top of editor) ───────────────────────
-    if let Some(ref menu) = screen.completion {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            if let Some((cursor_pos, _)) = &active_win.cursor {
-                let gutter_w = active_win.gutter_char_width as u16;
-                let win_x = active_win.rect.x as u16;
-                let win_y = active_win.rect.y as u16;
-                let raw = active_win
-                    .lines
-                    .get(cursor_pos.view_line)
-                    .map(|l| l.raw_text.as_str())
-                    .unwrap_or("");
-                let vis_col = char_col_to_visual(raw, cursor_pos.col, active_win.tabstop)
-                    .saturating_sub(active_win.scroll_left) as u16;
-                let popup_x = win_x + gutter_w + vis_col;
-                let popup_y = win_y + cursor_pos.view_line as u16 + 1;
-                // Per D6: build quadraui::Completions + layout + rasterise.
-                let completions = render::completion_menu_to_quadraui_completions(menu);
-                let area = frame.area();
-                let viewport = quadraui::Rect::new(
-                    area.x as f32,
-                    area.y as f32,
-                    area.width as f32,
-                    area.height as f32,
-                );
-                let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
-                let max_popup_height = 10.0;
-                let layout = completions.layout(
-                    popup_x as f32,
-                    popup_y as f32 - 1.0, // cursor y; layout adds line_height below
-                    1.0,
-                    viewport,
-                    popup_width,
-                    max_popup_height,
-                    |_| quadraui::CompletionItemMeasure::new(1.0),
-                );
-                backend.draw_completions(&completions, &layout);
-                *completion_layout_out = Some(layout);
-            }
-        }
-    }
-
-    // ── Hover popup (rendered on top of editor) ──────────────────────────────
-    if let Some(ref hover) = screen.hover {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise.
-            let area = frame.area();
-            let viewport = quadraui::Rect::new(
-                area.x as f32,
-                area.y as f32,
-                area.width as f32,
-                area.height as f32,
-            );
-            let (tooltip, layout) =
-                render::hover_popup_to_quadraui_tooltip(hover, popup_x, popup_y, viewport);
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
-
-    // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
-    *editor_hover_popup_rect_out = None; // Clear stale rect before rendering
-    *editor_hover_scrollbar_out = None;
-    if let Some(ref eh) = screen.editor_hover {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            // Use frozen scroll offsets so the popup stays fixed on screen
-            let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
-            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            let (eh_links, eh_rect, eh_sb) =
-                render_editor_hover_popup(backend, eh, popup_x, popup_y, area, theme);
-            *editor_hover_link_rects_out = eh_links;
-            *editor_hover_popup_rect_out = eh_rect;
-            *editor_hover_scrollbar_out = eh_sb;
-        }
-    }
-
-    // ── Diff peek popup (inline git hunk preview) ──────────────────────────
-    if let Some(ref peek) = screen.diff_peek {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let popup_x = win_x + gutter_w;
-            // anchor at the cursor's own row; placement=Bottom (with
-            // primitive fallback to Top) puts the popup just below it.
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise.
-            let area = frame.area();
-            let viewport = quadraui::Rect::new(
-                area.x as f32,
-                area.y as f32,
-                area.width as f32,
-                area.height as f32,
-            );
-            let (tooltip, layout) =
-                render::diff_peek_to_quadraui_tooltip(peek, popup_x, popup_y, viewport, theme);
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
-
-    // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
-    if let Some(ref sig) = screen.signature_help {
-        if let Some(active_win) = screen
-            .windows
-            .iter()
-            .find(|w| w.window_id == screen.active_window_id)
-        {
-            let gutter_w = active_win.gutter_char_width as u16;
-            let win_x = active_win.rect.x as u16;
-            let win_y = active_win.rect.y as u16;
-            let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
-            let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
-            let popup_x = win_x + gutter_w + vis_col;
-            let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise.
-            let area = frame.area();
-            let viewport = quadraui::Rect::new(
-                area.x as f32,
-                area.y as f32,
-                area.width as f32,
-                area.height as f32,
-            );
-            let (tooltip, layout) =
-                render::signature_help_to_quadraui_tooltip(sig, popup_x, popup_y, viewport, theme);
-            backend.draw_tooltip(&tooltip, &layout);
-        }
-    }
+    // ── Editor popups: completion / hover / editor-hover / diff-peek /
+    // signature-help — extracted to `paint_editor_popups` (#601) so
+    // `TuiShellApp::render_content` can call the exact same code (these are
+    // all already trait-only, no raw `Frame`/`Buffer` access, so nothing
+    // here needed to change to become reachable from `&mut dyn Backend`).
+    paint_editor_popups(
+        backend,
+        screen,
+        area,
+        theme,
+        completion_layout_out,
+        editor_hover_link_rects_out,
+        editor_hover_popup_rect_out,
+        editor_hover_scrollbar_out,
+    );
 
     // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
     if let Some(ref qf) = screen.quickfix {
@@ -1030,6 +962,165 @@ pub(super) fn draw_frame(
     }
 }
 
+/// Paint the editor-anchored popups: completion menu, LSP hover, the rich
+/// "editor hover" markdown popup, diff-peek, and signature-help.
+///
+/// Extracted out of `draw_frame` (#601) because every one of these is
+/// already trait-only — `backend.draw_completions`/`draw_tooltip` plus
+/// `render_editor_hover_popup` (also widened to `&mut dyn Backend` in
+/// #601) — so the exact same code is callable from
+/// `TuiShellApp::render_content`, which never has a raw `ratatui::Frame`
+/// to pass. `draw_frame` now calls this too, so the two paint paths can't
+/// drift on this logic. `area` stands in for each block's original
+/// `frame.area()` call (all four computed the identical value from the
+/// same frame, just redundantly per-block).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_editor_popups(
+    backend: &mut dyn quadraui::Backend,
+    screen: &render::ScreenLayout,
+    area: Rect,
+    theme: &Theme,
+    completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
+    editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
+    editor_hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
+    editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
+) {
+    let viewport = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+
+    // ── Completion popup (rendered on top of editor) ───────────────────────
+    if let Some(ref menu) = screen.completion {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            if let Some((cursor_pos, _)) = &active_win.cursor {
+                let gutter_w = active_win.gutter_char_width as u16;
+                let win_x = active_win.rect.x as u16;
+                let win_y = active_win.rect.y as u16;
+                let raw = active_win
+                    .lines
+                    .get(cursor_pos.view_line)
+                    .map(|l| l.raw_text.as_str())
+                    .unwrap_or("");
+                let vis_col = char_col_to_visual(raw, cursor_pos.col, active_win.tabstop)
+                    .saturating_sub(active_win.scroll_left) as u16;
+                let popup_x = win_x + gutter_w + vis_col;
+                let popup_y = win_y + cursor_pos.view_line as u16 + 1;
+                // Per D6: build quadraui::Completions + layout + rasterise.
+                let completions = render::completion_menu_to_quadraui_completions(menu);
+                let popup_width = (menu.max_width as f32 + 4.0).max(12.0);
+                let max_popup_height = 10.0;
+                let layout = completions.layout(
+                    popup_x as f32,
+                    popup_y as f32 - 1.0, // cursor y; layout adds line_height below
+                    1.0,
+                    viewport,
+                    popup_width,
+                    max_popup_height,
+                    |_| quadraui::CompletionItemMeasure::new(1.0),
+                );
+                backend.draw_completions(&completions, &layout);
+                *completion_layout_out = Some(layout);
+            }
+        }
+    }
+
+    // ── Hover popup (rendered on top of editor) ──────────────────────────────
+    if let Some(ref hover) = screen.hover {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
+            let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+            let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
+            let popup_x = win_x + gutter_w + vis_col;
+            let popup_y = win_y + anchor_view;
+            // Per D6: build quadraui::Tooltip + layout + rasterise.
+            let (tooltip, layout) =
+                render::hover_popup_to_quadraui_tooltip(hover, popup_x, popup_y, viewport);
+            backend.draw_tooltip(&tooltip, &layout);
+        }
+    }
+
+    // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
+    *editor_hover_popup_rect_out = None; // Clear stale rect before rendering
+    *editor_hover_scrollbar_out = None;
+    if let Some(ref eh) = screen.editor_hover {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
+            // Use frozen scroll offsets so the popup stays fixed on screen
+            let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as u16;
+            let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as u16;
+            let popup_x = win_x + gutter_w + vis_col;
+            let popup_y = win_y + anchor_view;
+            let (eh_links, eh_rect, eh_sb) =
+                render_editor_hover_popup(backend, eh, popup_x, popup_y, area, theme);
+            *editor_hover_link_rects_out = eh_links;
+            *editor_hover_popup_rect_out = eh_rect;
+            *editor_hover_scrollbar_out = eh_sb;
+        }
+    }
+
+    // ── Diff peek popup (inline git hunk preview) ──────────────────────────
+    if let Some(ref peek) = screen.diff_peek {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
+            let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+            let popup_x = win_x + gutter_w;
+            // anchor at the cursor's own row; placement=Bottom (with
+            // primitive fallback to Top) puts the popup just below it.
+            let popup_y = win_y + anchor_view;
+            // Per D6: build quadraui::Tooltip + layout + rasterise.
+            let (tooltip, layout) =
+                render::diff_peek_to_quadraui_tooltip(peek, popup_x, popup_y, viewport, theme);
+            backend.draw_tooltip(&tooltip, &layout);
+        }
+    }
+
+    // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
+    if let Some(ref sig) = screen.signature_help {
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as u16;
+            let win_x = active_win.rect.x as u16;
+            let win_y = active_win.rect.y as u16;
+            let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as u16;
+            let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
+            let popup_x = win_x + gutter_w + vis_col;
+            let popup_y = win_y + anchor_view;
+            // Per D6: build quadraui::Tooltip + layout + rasterise.
+            let (tooltip, layout) =
+                render::signature_help_to_quadraui_tooltip(sig, popup_x, popup_y, viewport, theme);
+            backend.draw_tooltip(&tooltip, &layout);
+        }
+    }
+}
+
 /// Convert a TUI-local `FolderPickerState` into a `quadraui::Palette`.
 ///
 /// FolderPickerState lives in the TUI module (it's not portable across
@@ -1376,20 +1467,24 @@ pub(super) fn compute_tui_tab_drop_zone(
 ///
 /// The pre-built `quadraui::TabBar` primitive comes from `ScreenLayout`
 /// (built by `render::build_screen_layout`).
+/// `backend` is `&mut dyn quadraui::Backend` (not the concrete `TuiBackend`)
+/// so this is callable from `TuiShellApp::render_content` (#601), which only
+/// ever gets a trait object — never a raw `ratatui::Frame`. Existing callers
+/// passing a concrete `&mut TuiBackend` still work unchanged via Rust's
+/// implicit unsized coercion at the call site.
 pub(super) fn render_tab_bar(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     bar: &quadraui::TabBar,
     theme: &Theme,
 ) -> usize {
-    use quadraui::Backend;
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
         area.width as f32,
         area.height as f32,
     );
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     let hits = backend.draw_tab_bar(q_rect, bar, None);
     hits.available_cols
 }
@@ -1399,28 +1494,34 @@ pub(super) fn render_tab_bar(
 /// The pre-built `quadraui::StatusBar` primitive comes from
 /// `ScreenLayout` (built by `render::build_screen_layout`).
 /// Returns the `StatusBarLayout` for click-time hit testing.
+/// See `render_tab_bar`'s doc comment for why `backend` is the trait object
+/// rather than the concrete `TuiBackend` (#601).
 pub(super) fn draw_breadcrumb_bar(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     bar: &quadraui::StatusBar,
     theme: &Theme,
 ) -> quadraui::StatusBarLayout {
-    use quadraui::Backend;
     let q_rect = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
         area.width as f32,
         area.height as f32,
     );
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_status_bar(q_rect, bar, None, None)
 }
 
 // ─── Editor windows ───────────────────────────────────────────────────────────
 
+/// `frame: None` (from `TuiShellApp::render_content`, #601) skips cursor
+/// placement (see `render_window`'s doc comment) *and* skips
+/// `render_separators`' window-divider lines — raw `Buffer` writes with no
+/// `Backend::draw_*` trait equivalent yet, tracked as vimcode#609. The live
+/// `draw_frame` path keeps passing `Some(frame)`, unchanged behavior.
 pub(super) fn render_all_windows(
-    backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
+    backend: &mut dyn quadraui::Backend,
+    mut frame: Option<&mut ratatui::Frame>,
     windows: &[RenderedWindow],
     theme: &Theme,
 ) {
@@ -1432,9 +1533,11 @@ pub(super) fn render_all_windows(
             width: window.rect.width as u16,
             height: window.rect.height as u16,
         };
-        render_window(backend, frame, win_rect, window, theme);
+        render_window(backend, frame.as_deref_mut(), win_rect, window, theme);
     }
-    render_separators(frame.buffer_mut(), windows, theme);
+    if let Some(frame) = frame {
+        render_separators(frame.buffer_mut(), windows, theme);
+    }
 }
 
 /// Render the unified picker popup. Supports single-pane (no preview) and
@@ -1471,9 +1574,16 @@ pub(super) fn render_picker_popup(
 /// applying the rasteriser's returned cursor position when the shape
 /// is `Bar` / `Underline` (which sets `Frame`-level cursor state and
 /// can't live inside a `Buffer`-only rasteriser).
+///
+/// `frame` is `Option` (#601): `TuiShellApp::render_content` only ever gets
+/// `&mut dyn quadraui::Backend`, never a raw `ratatui::Frame` (confirmed —
+/// `TuiBackend`'s frame pointer is private with no public accessor), so it
+/// calls this with `None` and simply doesn't get cursor placement — the
+/// same already-tracked gap as quadraui#466 (vimcode#604). The live
+/// `draw_frame` path keeps passing `Some(frame)`, unchanged behavior.
 pub(super) fn render_window(
-    backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
+    backend: &mut dyn quadraui::Backend,
+    frame: Option<&mut ratatui::Frame>,
     area: Rect,
     window: &RenderedWindow,
     theme: &Theme,
@@ -1500,13 +1610,10 @@ pub(super) fn render_window(
         editor_area.width as f32,
         editor_area.height as f32,
     );
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
-    let result = {
-        use quadraui::Backend;
-        backend.draw_editor(editor_q_rect, &editor)
-    };
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    let result = backend.draw_editor(editor_q_rect, &editor);
 
-    if let Some(pos) = result.cursor_position {
+    if let (Some(frame), Some(pos)) = (frame, result.cursor_position) {
         frame.set_cursor_position(pos);
     }
 
@@ -1527,21 +1634,22 @@ pub(super) fn render_window(
 /// after the layout's hit_test() resolves a click — TUI doesn't
 /// consume the hit regions returned by `draw_status_bar` because the
 /// click handler runs the layout on demand against current bar width.
+/// See `render_tab_bar`'s doc comment for why `backend` is the trait object
+/// rather than the concrete `TuiBackend` (#601).
 fn render_window_status_line(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     x: u16,
     y: u16,
     width: u16,
     status: &crate::render::WindowStatusLine,
     theme: &crate::render::Theme,
 ) {
-    use quadraui::Backend;
     let bar = crate::render::window_status_line_to_status_bar(
         status,
         quadraui::WidgetId::new("status:window"),
     );
     let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, 1.0);
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     let _ = backend.draw_status_bar(q_rect, &bar, None, None);
 }
 

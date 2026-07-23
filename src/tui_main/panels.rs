@@ -790,9 +790,12 @@ pub(super) fn render_panel_hover_popup(
 /// Render an editor hover popup via the `quadraui::RichTextPopup`
 /// primitive. Returns `(link_rects, popup_bounds, scrollbar_hit)` for
 /// mouse hit-testing — derived from the primitive's resolved layout.
+/// `backend` is `&mut dyn quadraui::Backend` (not the concrete `TuiBackend`)
+/// so this is callable from `TuiShellApp::render_content` (#601) — see
+/// `render_impl.rs::render_tab_bar`'s doc comment for the general rationale.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn render_editor_hover_popup(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     eh: &render::EditorHoverPopupData,
     popup_x: u16,
     popup_y: u16,
@@ -838,8 +841,7 @@ pub(super) fn render_editor_hover_popup(
         },
     );
 
-    use quadraui::Backend;
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_rich_text_popup(&popup, &layout);
 
     let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
