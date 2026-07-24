@@ -22,7 +22,9 @@
 //! # What's intentionally NOT yet ported, and why
 //!
 //! Three structural gaps were found while scoping Stage 0 (recorded as
-//! pinned `coord context` notes on vimcode#595):
+//! pinned `coord context` notes on vimcode#595). Gap 2 (mouse handling) has
+//! since been resolved by #602 — see the note after gap 3 below; gaps 1 and
+//! 3 (painting, cursor placement) remain open:
 //!
 //! 1. **Painting.** `render_content(&self, backend: &mut dyn Backend, ...)`
 //!    never gets a raw `ratatui::Frame` — confirmed structural, not just
@@ -47,13 +49,21 @@
 //!    (#604 / quadraui#466). The menu bar row is reserved in the layout
 //!    math but not painted either (out of scope for #601; folds into key
 //!    dispatch, #603).
-//! 2. **Mouse handling.** `mouse::handle_mouse` (~3,066 lines) takes
-//!    `&mut quadraui::DragState` + `&mut quadraui::ModalStack` directly via
-//!    `TuiBackend::drag_and_modal_mut()` — a concrete-only method the
-//!    `Backend` trait deliberately doesn't expose. It cannot be called from
-//!    `handle(&mut self, event, backend: &mut dyn Backend, ...)` as-is.
-//!    Needs either a trait-level accessor (quadraui#467) or a rewrite onto
-//!    `quadraui::dispatch_mouse_down/drag/up`. Tracked as #602.
+//! 2. **Mouse handling (#602, resolved).** `mouse::handle_mouse`
+//!    (~4,100 lines) takes `&mut quadraui::DragState` + `&mut
+//!    quadraui::ModalStack` directly via `TuiBackend::drag_and_modal_mut()`
+//!    — a concrete-only method the `Backend` trait deliberately doesn't
+//!    expose, so it couldn't be called from `handle(&mut self, event,
+//!    backend: &mut dyn Backend, ...)` as-is. `Backend::drag_and_modal_mut`
+//!    (quadraui#467) landed a trait-level accessor, unblocking the fix:
+//!    [`TuiShellApp::handle_mouse_event`] bridges a mouse-shaped [`UiEvent`]
+//!    back to a crossterm `MouseEvent` and dispatches through
+//!    `mouse::handle_mouse`, but *before* that it also ports the four panel
+//!    intercepts `event_loop` runs ahead of `handle_mouse` (debug sidebar,
+//!    extensions sidebar, debug toolbar hit-test, explorer
+//!    `TreeController`; `mod.rs` ~1416-1605) — see that method's own doc
+//!    comment for the details, including why the debug toolbar intercept is
+//!    a documented no-op until gap 1 paints that toolbar's rect.
 //! 3. **Editor cursor placement.** `Backend::draw_editor`'s
 //!    `EditorPaintResult::cursor_position` is documented "host applies via
 //!    `Frame::set_cursor_position`", but no consumer of it exists anywhere
@@ -63,12 +73,12 @@
 //!    `apply_selection_highlight` already runs post-`render_content`.
 //!    Tracked as #604.
 //!
-//! Given (1) and (2), `handle()` below only implements the two dispatch
-//! layers that genuinely don't need raw Frame/DragState access — panel-key
-//! accelerators and the `MenuSystem` intercept — plus routes plain
-//! `KeyPressed` events (no mouse) to `Engine::handle_key`, which is already
-//! backend-agnostic. Everything else returns `Reaction::Continue` with a
-//! `// TODO(#595)` marker rather than a half-correct guess.
+//! Given (1), `handle()` below implements panel-key accelerators, the
+//! `MenuSystem` intercept, and (per gap 2 above) full mouse dispatch through
+//! `handle_mouse_event`, plus routes plain `KeyPressed` events (no mouse) to
+//! `Engine::handle_key`, which is already backend-agnostic. Everything else
+//! returns `Reaction::Continue` with a `// TODO(#595)` marker rather than a
+//! half-correct guess.
 //!
 //! Also NOT yet ported: the "#318" Alt+menu-letter "reveal menu bar" shim
 //! sitting between those two dispatch layers in `event_loop()`
@@ -269,11 +279,211 @@ impl TuiShellApp {
     /// this stage. `Cell`/`RefCell`-wrapped fields are copied/borrowed out
     /// into locals and written back after the call, since `handle_mouse`
     /// wants plain `&mut`/`&`, not interior-mutability handles.
+    ///
+    /// Review fix (#602 iteration 1): `event_loop` doesn't send every mouse
+    /// event straight to `handle_mouse` — it runs four panel intercepts
+    /// first (debug sidebar, extensions sidebar, debug toolbar, explorer
+    /// `TreeController`; `mod.rs` ~1416-1605), each gated by the `#459`
+    /// modal-stack priority check, and short-circuits `handle_mouse`
+    /// entirely when one of them consumes the event. `handle_mouse`'s own
+    /// `PANEL_EXTENSIONS` arm explicitly relies on the sidebar intercept for
+    /// rows 2+ ("handled by SidebarSystem mouse intercept in main loop",
+    /// `mouse.rs` ~2557), so skipping this block silently drops those
+    /// clicks. All four are ported below, in the same order, before the
+    /// `DoubleClick` fold / `handle_mouse` dispatch.
     fn handle_mouse_event(
         &mut self,
         event: UiEvent,
         backend: &mut dyn quadraui::Backend,
     ) -> Reaction {
+        // #459: hit-test the modal stack first. The reconcile happens in
+        // `mouse.rs` at the top of `handle_mouse`; here it must run before
+        // the panel intercepts below, which have to yield when the event
+        // lands inside a floating modal (e.g. an open context menu) — the
+        // same priority rule `event_loop` applies (`mod.rs` ~1416-1434).
+        let ctx_blocks_event = {
+            let event_pos: Option<quadraui::Point> = match &event {
+                UiEvent::Scroll { position, .. }
+                | UiEvent::MouseDown { position, .. }
+                | UiEvent::MouseUp { position, .. }
+                | UiEvent::MouseMoved { position, .. }
+                | UiEvent::DoubleClick { position, .. } => Some(*position),
+                _ => None,
+            };
+            let (_, modal_stack) = backend.drag_and_modal_mut();
+            event_pos.is_some_and(|p| modal_stack.hit_test(p).is_some())
+        };
+
+        // ── SidebarSystem intercept: debug sidebar (mirrors `mod.rs`
+        // ~1436-1471) ──
+        if !ctx_blocks_event
+            && self.engine.app_shell.sidebar_visible()
+            && self.engine.active_panel_is(PANEL_DEBUG)
+        {
+            let rect = self.engine.dap_sidebar_body_rect.get();
+            let is_sidebar_mouse = rect.width > 0.0
+                && match &event {
+                    UiEvent::Scroll { position, .. }
+                    | UiEvent::MouseDown { position, .. }
+                    | UiEvent::MouseUp { position, .. }
+                    | UiEvent::MouseMoved { position, .. } => rect.contains(*position),
+                    _ => false,
+                };
+            if is_sidebar_mouse {
+                if matches!(event, UiEvent::MouseDown { .. }) {
+                    self.sidebar.has_focus = true;
+                    self.engine.dap_sidebar_has_focus = true;
+                }
+                render::populate_dap_sidebar_system(&self.engine);
+                let sidebar_event = self
+                    .engine
+                    .dap_sidebar_system
+                    .borrow_mut()
+                    .handle(&event, backend, rect);
+                if self.engine.dispatch_dap_sidebar_event(sidebar_event) {
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── SidebarSystem intercept: extensions sidebar (mirrors `mod.rs`
+        // ~1473-1498). Not redundant with `handle_mouse`'s own
+        // `PANEL_EXTENSIONS` arm — that arm explicitly declines rows 2+
+        // ("handled by SidebarSystem mouse intercept in main loop",
+        // `mouse.rs` ~2557), so skipping this would silently drop those
+        // clicks. ──
+        if !ctx_blocks_event
+            && self.engine.app_shell.sidebar_visible()
+            && self.engine.active_panel_is(PANEL_EXTENSIONS)
+        {
+            let rect = self.engine.ext_sidebar_body_rect.get();
+            let is_sidebar_mouse = rect.width > 0.0
+                && match &event {
+                    UiEvent::Scroll { position, .. }
+                    | UiEvent::MouseDown { position, .. }
+                    | UiEvent::MouseUp { position, .. }
+                    | UiEvent::MouseMoved { position, .. } => rect.contains(*position),
+                    _ => false,
+                };
+            if is_sidebar_mouse {
+                if matches!(event, UiEvent::MouseDown { .. }) {
+                    self.sidebar.has_focus = true;
+                    self.engine.ext_sidebar_has_focus = true;
+                }
+                if self.engine.handle_ext_sidebar_ui_event(event.clone()) {
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── Debug toolbar hover/press via `ToolbarLayout` hit-test (mirrors
+        // `mod.rs` ~1500-1543, #510).
+        //
+        // `self.debug_toolbar_rect` is populated by the raw-`Frame` toolbar
+        // paint (`render_impl.rs::draw_frame`'s `debug_toolbar_rect_out`
+        // out-param), which `render_content` cannot call into yet (module
+        // doc gap 1 — the debug toolbar isn't painted through
+        // `ShellApp::render_content` today). Until that lands, the rect
+        // stays zero-sized and this block is a documented no-op rather than
+        // a silent gap — ported now so dispatch is already correct once
+        // painting catches up. ──
+        if !ctx_blocks_event
+            && self.engine.debug_toolbar_visible
+            && self.debug_toolbar_rect.get().width > 0.0
+        {
+            let rect = self.debug_toolbar_rect.get();
+            match &event {
+                UiEvent::MouseDown { position, .. } => {
+                    let p = *position;
+                    if p.y >= rect.y && p.y < rect.y + rect.height {
+                        let idx = self.engine.debug_button_hit(p.x, p.y);
+                        self.engine.debug_button_pressed = idx;
+                        if let Some(i) = idx {
+                            if let Some(btn) = render::DEBUG_BUTTONS.get(i) {
+                                let _ = self.engine.execute_command(btn.action);
+                            }
+                        }
+                        return Reaction::Redraw;
+                    }
+                }
+                UiEvent::MouseMoved { position, .. } => {
+                    let p = *position;
+                    let new_hover = if p.y >= rect.y && p.y < rect.y + rect.height {
+                        self.engine.debug_button_hit(p.x, p.y)
+                    } else {
+                        None
+                    };
+                    if self.engine.debug_button_hovered != new_hover {
+                        self.engine.debug_button_hovered = new_hover;
+                        return Reaction::Redraw;
+                    }
+                }
+                UiEvent::MouseUp { .. } => {
+                    if self.engine.debug_button_pressed.is_some() {
+                        self.engine.debug_button_pressed = None;
+                        return Reaction::Redraw;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // ── Explorer mouse events → `TreeController` (mirrors `mod.rs`
+        // ~1545-1605). Routes mouse events through `TreeController::handle`
+        // so the built-in scrollbar (click, thumb drag, track page) works;
+        // `MouseDown`/`DoubleClick` for row selection, `MouseMoved` (left
+        // held) and `MouseUp` for scrollbar drag lifecycle. The `MouseMoved`/
+        // `MouseUp` arm intentionally ignores `ctx_blocks_event` (matches
+        // `event_loop`) so an in-flight scrollbar drag isn't interrupted by
+        // the pointer momentarily crossing a modal's hit region. ──
+        {
+            let is_explorer_event = match &event {
+                UiEvent::MouseDown { position, .. } | UiEvent::DoubleClick { position, .. } => {
+                    let rect = self.engine.explorer_tree_rect.get();
+                    !ctx_blocks_event
+                        && self.engine.app_shell.sidebar_visible()
+                        && self.engine.active_panel_is(PANEL_EXPLORER)
+                        && rect.width > 0.0
+                        && rect.contains(*position)
+                }
+                UiEvent::MouseMoved { .. } | UiEvent::MouseUp { .. } => self.explorer_sb_dragging,
+                _ => false,
+            };
+            if is_explorer_event {
+                let rect = self.engine.explorer_tree_rect.get();
+                let theme = self.theme();
+                render::populate_explorer_tree_controller(&self.engine, &theme);
+                let tree_event = self
+                    .engine
+                    .explorer_tree
+                    .borrow_mut()
+                    .handle(&event, backend, rect);
+                let is_scrollbar =
+                    matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
+                match &event {
+                    UiEvent::DoubleClick { .. } => {
+                        self.engine.explorer_has_focus = true;
+                        self.sidebar.has_focus = true;
+                        self.engine.dispatch_explorer_tree_event(tree_event);
+                    }
+                    UiEvent::MouseDown { .. } => {
+                        if is_scrollbar {
+                            self.explorer_sb_dragging = true;
+                        } else {
+                            self.engine.explorer_has_focus = true;
+                            self.sidebar.has_focus = true;
+                        }
+                        self.engine.handle_explorer_mouse_event(tree_event);
+                    }
+                    UiEvent::MouseUp { .. } => {
+                        self.explorer_sb_dragging = false;
+                    }
+                    _ => {} // MouseMoved — TreeController drag_to() handles internally
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         let event = match event {
             UiEvent::DoubleClick { position, .. } => UiEvent::MouseDown {
                 button: quadraui::MouseButton::Left,
@@ -364,6 +574,14 @@ impl TuiShellApp {
         if should_quit {
             return Reaction::Exit;
         }
+
+        // Poll editor hover dwell / inline blame after every dispatched
+        // mouse event so the timer can fire even when continuous mouse
+        // events prevent idle polling — mirrors `event_loop`'s own
+        // post-`handle_mouse` calls (`mod.rs`, right after both
+        // `handle_mouse` call sites).
+        self.engine.poll_editor_hover();
+        self.engine.poll_blame();
 
         // Mouse events (clicks, drags) almost always change visual state —
         // mirrors `event_loop`'s own unconditional post-mouse redraw.
@@ -1122,5 +1340,185 @@ mod tests {
         let mut driver = driver_with_shell(TuiShellApp::new(None), config(), 80, 24);
         let reaction = driver.drag(40.0, 10.0, 45.0, 12.0);
         assert_eq!(reaction, Reaction::Redraw);
+    }
+
+    // ── Review fix (#602 iteration 1): the four panel intercepts ported
+    // into `handle_mouse_event` ─────────────────────────────────────────
+    //
+    // `mouse::handle_mouse` carries its own, independent, column/row-derived
+    // sidebar-click handling for every one of these panels (`mouse.rs`
+    // ~2341 on: gated on `sidebar_visible() && col < ab_width +
+    // sidebar_width`, i.e. `col < 33` given `ACTIVITY_BAR_WIDTH` (3) +
+    // `SIDEBAR_WIDTH` (30)) — it sets the *same* `sidebar.has_focus` /
+    // `*_has_focus` fields these new intercepts do, as a leftover
+    // compatibility path. A click inside that column range can't tell you
+    // which code path actually ran: an earlier version of these tests
+    // placed the intercept rects at x=0..20 and asserted on those flags,
+    // and they kept passing even with all four new intercepts stubbed out
+    // (verified by temporarily forcing each `if` condition to `false` and
+    // re-running — legacy `handle_mouse` alone satisfied every assertion).
+    // Every rect below is instead placed at x=50, past legacy's `col < 33`
+    // gate, so `mouse::handle_mouse` cannot reach its own sidebar-click
+    // arms for these positions at all — leaving the new `SidebarSystem`/
+    // `TreeController` intercepts as the *only* code that can produce the
+    // observed focus-flag side effects.
+
+    /// Puts `panel_id` in front and visible without accidentally toggling it
+    /// *off* — `Engine::toggle_sidebar_panel` hides the sidebar if the
+    /// requested panel is already the active + visible one, which would
+    /// silently defeat these tests if called unconditionally.
+    fn ensure_panel_active(engine: &mut Engine, panel_id: &str) {
+        if !(engine.active_panel_is(panel_id) && engine.app_shell.sidebar_visible()) {
+            engine.toggle_sidebar_panel(panel_id);
+        }
+        assert!(engine.active_panel_is(panel_id));
+        assert!(engine.app_shell.sidebar_visible());
+    }
+
+    /// Review fix: `handle_mouse_event` must run the debug-sidebar
+    /// `SidebarSystem` intercept (mirrors `event_loop`'s `mod.rs` ~1436-1471)
+    /// before falling through to `mouse::handle_mouse` — the reviewer's
+    /// blocking finding on #602 iteration 1 noted no test exercised this.
+    /// A `MouseDown` inside `dap_sidebar_body_rect` while the debug panel is
+    /// active must claim sidebar focus, proving the intercept branch itself
+    /// ran (see the module-comment above for why the rect sits at x=50,
+    /// outside `mouse::handle_mouse`'s own sidebar column range).
+    #[test]
+    fn debug_sidebar_intercept_claims_focus_on_mouse_down() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_DEBUG);
+        app.engine
+            .dap_sidebar_body_rect
+            .set(quadraui::Rect::new(50.0, 1.0, 20.0, 10.0));
+
+        let mut backend = backend_at(80.0, 24.0);
+        let reaction = app.handle_mouse_event(
+            UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(55.0, 3.0),
+                modifiers: quadraui::Modifiers::default(),
+            },
+            &mut backend,
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(
+            app.sidebar.has_focus && app.engine.dap_sidebar_has_focus,
+            "a click inside dap_sidebar_body_rect (outside handle_mouse's own \
+             sidebar column range) must be claimed by the debug SidebarSystem \
+             intercept, not silently dropped"
+        );
+    }
+
+    /// Review fix: same as above for the extensions-sidebar intercept
+    /// (mirrors `mod.rs` ~1473-1498) — `mouse::handle_mouse`'s own
+    /// `PANEL_EXTENSIONS` arm explicitly declines rows 2+ ("handled by
+    /// SidebarSystem mouse intercept in main loop", `mouse.rs` ~2557), so a
+    /// missing intercept here would silently drop those clicks.
+    #[test]
+    fn ext_sidebar_intercept_claims_focus_on_mouse_down() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_EXTENSIONS);
+        app.engine
+            .ext_sidebar_body_rect
+            .set(quadraui::Rect::new(50.0, 1.0, 20.0, 10.0));
+
+        let mut backend = backend_at(80.0, 24.0);
+        let reaction = app.handle_mouse_event(
+            UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(55.0, 3.0),
+                modifiers: quadraui::Modifiers::default(),
+            },
+            &mut backend,
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(
+            app.sidebar.has_focus && app.engine.ext_sidebar_has_focus,
+            "a click inside ext_sidebar_body_rect (outside handle_mouse's own \
+             sidebar column range) must be claimed by the extensions \
+             SidebarSystem intercept, not silently dropped"
+        );
+    }
+
+    /// Review fix: the explorer → `TreeController` intercept (mirrors
+    /// `mod.rs` ~1545-1605) must claim a `MouseDown` inside
+    /// `explorer_tree_rect` when the explorer panel is active — the
+    /// reviewer flagged that `TuiShellApp` already carried the matching
+    /// `explorer_sb_dragging` field (Stage 0) but nothing read/wrote it,
+    /// "a strong signal this block was meant to be ported but wasn't".
+    #[test]
+    fn explorer_tree_intercept_claims_focus_on_mouse_down() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_EXPLORER);
+        app.engine
+            .explorer_tree_rect
+            .set(quadraui::Rect::new(50.0, 1.0, 20.0, 10.0));
+
+        let mut backend = backend_at(80.0, 24.0);
+        let reaction = app.handle_mouse_event(
+            UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(55.0, 3.0),
+                modifiers: quadraui::Modifiers::default(),
+            },
+            &mut backend,
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(
+            app.engine.explorer_has_focus && app.sidebar.has_focus,
+            "a click inside explorer_tree_rect (outside handle_mouse's own \
+             sidebar column range) must be claimed by the explorer \
+             TreeController intercept, not silently dropped"
+        );
+    }
+
+    /// Review fix / #459: a modal that hit-tests positive at the click
+    /// position must make every panel intercept above yield — mirrors
+    /// `event_loop`'s `ctx_blocks_event` check (`mod.rs` ~1416-1434). Without
+    /// it, a context menu drawn over the explorer tree couldn't be clicked;
+    /// the click would be swallowed by the tree intercept underneath instead.
+    /// Reuses the x=50 rect placement from the tests above so
+    /// `mouse::handle_mouse`'s own sidebar-click handling — which has no
+    /// notion of the quadraui `ModalStack` at all — cannot itself explain
+    /// `sidebar.has_focus` staying `false`; only correct `ctx_blocks_event`
+    /// gating can.
+    #[test]
+    fn ctx_blocks_event_skips_explorer_intercept_when_modal_covers_click() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_EXPLORER);
+        app.engine
+            .explorer_tree_rect
+            .set(quadraui::Rect::new(50.0, 1.0, 20.0, 10.0));
+
+        let mut backend = backend_at(80.0, 24.0);
+        {
+            let (_, modal_stack) = backend.drag_and_modal_mut();
+            modal_stack.push(
+                quadraui::WidgetId::new("test:modal"),
+                quadraui::Rect::new(50.0, 1.0, 20.0, 10.0),
+            );
+        }
+
+        app.handle_mouse_event(
+            UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(55.0, 3.0),
+                modifiers: quadraui::Modifiers::default(),
+            },
+            &mut backend,
+        );
+
+        assert!(
+            !app.sidebar.has_focus,
+            "a modal covering the click position must block the explorer \
+             TreeController intercept from claiming the event (#459)"
+        );
     }
 }
