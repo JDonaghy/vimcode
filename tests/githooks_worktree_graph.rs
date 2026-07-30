@@ -23,6 +23,11 @@
 //! via `GIT_TRACE`, that the hook was actually invoked — otherwise a broken
 //! hook wiring would make these tests pass for the wrong reason (see the
 //! `assert_hook_ran` helper below).
+//!
+//! These tests drive real `sh`-executed hooks, real symlinks, and POSIX file
+//! modes, so the whole module is unix-only — it skips cleanly (no tests
+//! collected) rather than failing to compile on a Windows CI leg.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -117,6 +122,14 @@ fn assert_hook_ran(trace: &str, hook_name: &str) {
 /// `_lib.sh`) to mode 0o755, commit a `graphify-out/.gitignore` stub (mirroring
 /// the real repo, where the graph itself is gitignored but its `.gitignore`
 /// is tracked), and turn on `core.hooksPath`.
+///
+/// The chmod exists purely so the *behavioral* tests below (symlink
+/// creation, no-clobber, shim reachability) don't depend on this checkout's
+/// on-disk executable bits — they only care that the hooks *run*. It is
+/// deliberately NOT used as evidence for the mode-regression test: that test
+/// (`hooks_are_committed_as_executable`) reads `CARGO_MANIFEST_DIR`'s own git
+/// index instead, since asserting against a mode this function just forced
+/// on would be circular and could never catch a real regression.
 fn init_base_repo(dest: &Path) {
     run_ok(dest, &["init", "-q", "-b", "main"]);
     run_ok(dest, &["config", "user.email", "test@example.com"]);
@@ -130,12 +143,9 @@ fn init_base_repo(dest: &Path) {
         let src = entry.path();
         let dst = hooks_dir.join(&name);
         fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {:?} -> {:?}: {}", src, dst, e));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = if name == "_lib.sh" { 0o644 } else { 0o755 };
-            fs::set_permissions(&dst, fs::Permissions::from_mode(mode)).unwrap();
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if name == "_lib.sh" { 0o644 } else { 0o755 };
+        fs::set_permissions(&dst, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     let graphify_out = dest.join("graphify-out");
@@ -282,15 +292,23 @@ fn real_graph_in_worktree_is_never_clobbered() {
 }
 
 // ── 4. checked-in hooks are mode 100755 (except _lib.sh) ───────────────────
+//
+// This asserts against the *real* repo's own git index (CARGO_MANIFEST_DIR),
+// not a scratch copy: `init_base_repo` deliberately force-chmods its copied
+// hooks to 0o755/0o644 (via `fs::set_permissions`) so the *behavioral* tests
+// above don't depend on this checkout's on-disk mode bits (which may be
+// mangled by tarball extraction, an editor, etc.) — but that same chmod would
+// make a mode check against the scratch repo vacuous, since it always
+// re-derives the mode it's about to assert on rather than reading what's
+// actually committed. Querying `CARGO_MANIFEST_DIR` directly is the only way
+// this test can catch a hook silently losing its executable bit in a real
+// commit.
 
 #[test]
 fn hooks_are_committed_as_executable() {
-    let root = ScratchDir::new("mode_check");
-    let base = root.join("base");
-    fs::create_dir_all(&base).unwrap();
-    init_base_repo(&base);
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let out = run_ok(&base, &["ls-files", "-s", ".githooks"]);
+    let out = run_ok(&repo_root, &["ls-files", "-s", ".githooks"]);
     let listing = String::from_utf8_lossy(&out.stdout);
 
     let mut seen = Vec::new();
@@ -324,14 +342,44 @@ fn hooks_are_committed_as_executable() {
     );
 }
 
-// ── 5. post-commit / post-merge shims are reachable and don't error ────────
+// ── 5. post-commit / post-merge shims: skip in a linked worktree, chain in the main one ──
+
+/// Install a fake "machine-local" hook — the kind graphify itself installs
+/// into `$GIT_COMMON_DIR/hooks/`, and which `.githooks/post-commit` and
+/// `.githooks/post-merge` hand off to via `gfy_chain` — that appends a line
+/// to `marker` each time it runs.
+fn write_fake_local_hook(common_dir: &Path, name: &str, marker: &Path) {
+    let hooks_dir = common_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let dst = hooks_dir.join(name);
+    fs::write(
+        &dst,
+        format!("#!/bin/sh\necho ran >> \"{}\"\n", marker.to_str().unwrap()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&dst, fs::Permissions::from_mode(0o755)).unwrap();
+}
 
 #[test]
-fn post_commit_and_post_merge_shims_run_in_linked_worktree() {
+fn post_commit_and_post_merge_shims_skip_in_linked_worktree_and_chain_in_main() {
     let root = ScratchDir::new("commit_merge_shims");
     let base = root.join("base");
     fs::create_dir_all(&base).unwrap();
     init_base_repo(&base);
+
+    // Install fake machine-local hooks in the *base* repo's common git dir.
+    // Without these, "committing in the worktree didn't touch anything"
+    // can't distinguish "skipped because this is a linked worktree" from
+    // "chained to a machine-local hook that was never installed" — both
+    // look identical if $GIT_COMMON_DIR/hooks/ is empty. Installing a real
+    // one, and separately proving it *does* fire from the main worktree,
+    // pins down the actual skip-vs-chain branch.
+    let common_dir = base.join(".git");
+    let commit_marker = root.join("local-post-commit-marker");
+    let merge_marker = root.join("local-post-merge-marker");
+    write_fake_local_hook(&common_dir, "post-commit", &commit_marker);
+    write_fake_local_hook(&common_dir, "post-merge", &merge_marker);
 
     let wt = root.join("wt");
     run_ok(
@@ -339,16 +387,29 @@ fn post_commit_and_post_merge_shims_run_in_linked_worktree() {
         &["worktree", "add", wt.to_str().unwrap(), "-b", "feature-5"],
     );
 
-    // post-commit: committing inside the linked worktree must not error, and
-    // the hook must actually be invoked (core.hooksPath resolves against the
-    // worktree here, not the base repo).
+    // ── post-commit, linked worktree: shim runs but must NOT chain ──
     fs::write(wt.join("f.txt"), "hello\n").unwrap();
     run_ok(&wt, &["add", "f.txt"]);
     let (out, trace) = run_traced(&wt, &["commit", "-q", "-m", "wt commit"]);
     assert!(out.status.success(), "commit in worktree failed: {}", trace);
     assert_hook_ran(&trace, "post-commit");
+    assert!(
+        !commit_marker.exists(),
+        "post-commit shim must skip (not chain to the machine-local hook) inside a linked worktree"
+    );
 
-    // post-merge: merging inside the linked worktree must not error either.
+    // ── post-commit, main worktree: shim must chain to the local hook ──
+    fs::write(base.join("g.txt"), "hello\n").unwrap();
+    run_ok(&base, &["add", "g.txt"]);
+    let (out, trace) = run_traced(&base, &["commit", "-q", "-m", "base commit"]);
+    assert!(out.status.success(), "commit in base repo failed: {}", trace);
+    assert_hook_ran(&trace, "post-commit");
+    assert!(
+        commit_marker.exists(),
+        "post-commit shim must chain to the machine-local hook outside a linked worktree"
+    );
+
+    // ── post-merge, linked worktree: shim runs but must NOT chain ──
     // Give `other-line` a real extra commit so the merge is non-trivial.
     run_ok(&base, &["checkout", "-q", "-b", "other-line"]);
     fs::write(base.join("o.txt"), "other\n").unwrap();
@@ -360,4 +421,17 @@ fn post_commit_and_post_merge_shims_run_in_linked_worktree() {
     let (out, trace) = run_traced(&wt, &["merge", "-q", "FETCH_HEAD"]);
     assert!(out.status.success(), "merge in worktree failed: {}", trace);
     assert_hook_ran(&trace, "post-merge");
+    assert!(
+        !merge_marker.exists(),
+        "post-merge shim must skip (not chain to the machine-local hook) inside a linked worktree"
+    );
+
+    // ── post-merge, main worktree: shim must chain to the local hook ──
+    let (out, trace) = run_traced(&base, &["merge", "-q", "other-line"]);
+    assert!(out.status.success(), "merge in base repo failed: {}", trace);
+    assert_hook_ran(&trace, "post-merge");
+    assert!(
+        merge_marker.exists(),
+        "post-merge shim must chain to the machine-local hook outside a linked worktree"
+    );
 }
