@@ -12,5 +12,5 @@ expression: snapshot_text(&lines)
 
 
 
- INSERT [No Name] 󰘖 utf-8 LF Spaces: 4 Ln 1, Col 1
+     INSERT  [No Name] 󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
  

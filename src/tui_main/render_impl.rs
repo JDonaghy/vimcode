@@ -2335,32 +2335,47 @@ mod tests {
     /// between the two based on `unicode-width`'s classification of the
     /// specific codepoint (see quadraui's `cell_width` doc comment) — a
     /// classification that is not guaranteed identical across otherwise
-    /// dependency-compatible builds. That one-column difference reflows
-    /// every cell to the right of the glyph on the same row.
+    /// dependency-compatible builds. A miscounted glyph shifts the
+    /// whitespace run touching it by exactly one column (statusline/tab-bar
+    /// segments elsewhere on the row are drawn at their own fixed
+    /// coordinates and are unaffected — see the CI-vs-local diff in #615,
+    /// where only the padding immediately around the glyph moved).
     ///
-    /// A snapshot asserting the exact padding around one of these glyphs is
-    /// therefore asserting on something the rendering code cannot itself
-    /// guarantee — see #615 for the full investigation (toolchain version
-    /// and `unicode-width` patch/version were both tried locally and ruled
-    /// out; the ambiguity is inherent to the codepoints, not a resolvable
-    /// dependency bug). Collapse whitespace runs on any row containing a
-    /// PUA glyph so the assertion covers content and ordering, not the
-    /// exact column count separating them.
+    /// A snapshot asserting the exact padding directly touching one of
+    /// these glyphs is therefore asserting on something the rendering code
+    /// cannot itself guarantee — see #615 for the full investigation
+    /// (toolchain version and `unicode-width` patch/version were both tried
+    /// locally and ruled out; the ambiguity is inherent to the codepoints,
+    /// not a resolvable dependency bug). Collapse only the whitespace run
+    /// immediately before and/or after each PUA glyph to a single space;
+    /// every other whitespace run on the row — including gutter padding,
+    /// indentation, and column alignment not touching a glyph — is left
+    /// untouched and still asserted byte-for-byte.
     fn desensitize_glyph_width(line: &str) -> String {
         if !line.chars().any(is_pua) {
             return line.to_string();
         }
+        let chars: Vec<char> = line.chars().collect();
         let mut out = String::with_capacity(line.len());
-        let mut in_space = false;
-        for c in line.chars() {
-            if c == ' ' {
-                if !in_space {
-                    out.push(' ');
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == ' ' {
+                let start = i;
+                let mut end = i;
+                while end < chars.len() && chars[end] == ' ' {
+                    end += 1;
                 }
-                in_space = true;
+                let touches_pua = (start > 0 && is_pua(chars[start - 1]))
+                    || (end < chars.len() && is_pua(chars[end]));
+                if touches_pua {
+                    out.push(' ');
+                } else {
+                    out.extend(&chars[start..end]);
+                }
+                i = end;
             } else {
-                out.push(c);
-                in_space = false;
+                out.push(chars[i]);
+                i += 1;
             }
         }
         out

@@ -5,12 +5,12 @@ expression: snapshot_text(&lines)
  󰍜 1: [No Name] × 󰤲  ⋯
 ▎
   -fn main() {
-  │ println!("hello");
+  │   println!("hello");
   }
  
  
 
 
 
- NORMAL [No Name] 󰘖 utf-8 LF Spaces: 4 Ln 1, Col 1
+     NORMAL  [No Name] 󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
  
