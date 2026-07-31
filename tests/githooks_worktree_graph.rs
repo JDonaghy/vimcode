@@ -5,8 +5,21 @@
 //! tracked), so `git worktree add` normally materialises an empty
 //! `graphify-out/` in the new worktree, and `graphify query` — which resolves
 //! `graphify-out/graph.json` strictly relative to cwd — fails there. The
-//! `post-checkout` hook in `.githooks/` fixes this by symlinking the new
-//! worktree's `graphify-out` at the base checkout's graph.
+//! `post-checkout` hook in `.githooks/` fixes this by symlinking each *entry*
+//! of the base checkout's graph into the new worktree's `graphify-out/`.
+//!
+//! It deliberately does NOT replace `graphify-out/` itself with a symlink.
+//! That was the shape of the original port, and it was a live incident
+//! (claude-coordinator#1617): `git worktree add` checks out the tracked
+//! `graphify-out/.gitignore`, so `rm -rf graphify-out && ln -sfn ...` deleted
+//! a tracked file out from under git, leaving every fresh worktree with a
+//! deleted `.gitignore` plus an untracked, machine-local, absolute-path
+//! symlink — both of which the worktree-rescue sweep then committed onto
+//! unrelated worker branches. `graphify-out/.gitignore` is `*` / `!.gitignore`,
+//! so entries placed *inside* the directory are invisible to git for free,
+//! provided that tracked file survives. `worktree_add_leaves_git_status_empty`
+//! below is the assertion whose absence let that ship; treat it as the
+//! acceptance bar for any future change to this hook.
 //!
 //! These tests drive *real* `git` via `std::process::Command`: build a temp
 //! "base" repo, copy in the actual `.githooks/` directory from this repo,
@@ -157,51 +170,188 @@ fn init_base_repo(dest: &Path) {
     run_ok(dest, &["config", "core.hooksPath", ".githooks"]);
 }
 
-// ── 1. `worktree add` produces the symlink ──────────────────────────────────
+/// Seed a "real" graph in a base checkout, as if graphify had built it:
+/// `graph.json` plus a sibling file and a subdirectory, so the per-entry
+/// linking loop is exercised on more than one entry kind.
+fn seed_base_graph(base: &Path) {
+    let out = base.join("graphify-out");
+    fs::write(out.join("graph.json"), r#"{"fake":"basegraph"}"#).unwrap();
+    fs::write(out.join("manifest.json"), r#"{"fake":"manifest"}"#).unwrap();
+    fs::create_dir_all(out.join("cache")).unwrap();
+    fs::write(out.join("cache/entry"), "cached\n").unwrap();
+}
+
+fn porcelain_status(dir: &Path) -> String {
+    let out = run_ok(dir, &["status", "--porcelain"]);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+// ── 1. `worktree add` links the graph *contents*, keeping the directory ─────
 
 #[test]
-fn worktree_add_creates_symlink_to_base_graph() {
+fn worktree_add_links_base_graph_contents_into_worktree() {
     let root = ScratchDir::new("wt_add_ok");
     let base = root.join("base");
     fs::create_dir_all(&base).unwrap();
     init_base_repo(&base);
-
-    // Seed a "real" graph in the base checkout, as if graphify had built it.
-    fs::write(
-        base.join("graphify-out/graph.json"),
-        r#"{"fake":"basegraph"}"#,
-    )
-    .unwrap();
+    seed_base_graph(&base);
 
     let wt = root.join("wt");
     let (out, trace) = run_traced(
         &base,
-        &[
-            "worktree",
-            "add",
-            wt.to_str().unwrap(),
-            "-b",
-            "feature-1",
-        ],
+        &["worktree", "add", wt.to_str().unwrap(), "-b", "feature-1"],
     );
     assert!(out.status.success(), "worktree add failed: {}", trace);
     assert_hook_ran(&trace, "post-checkout");
 
-    let linked = wt.join("graphify-out");
-    let meta = fs::symlink_metadata(&linked).expect("graphify-out should exist in worktree");
+    // The progress message the hook prints — kept in sync with the hook so a
+    // silent behaviour change can't slip past this test. Checked across both
+    // streams: git routes hook output to stderr for some subcommands.
+    let printed = format!("{}{}", String::from_utf8_lossy(&out.stdout), trace);
     assert!(
-        meta.file_type().is_symlink(),
-        "expected graphify-out to be a symlink, got {:?}",
+        printed.contains("[graphify] linked graphify-out"),
+        "expected the hook's progress message in its output, got:\n{}",
+        printed
+    );
+
+    // claude-coordinator#1617: `graphify-out/` itself must stay a real
+    // directory. Replacing it with a symlink deletes the tracked
+    // `graphify-out/.gitignore` and pollutes the worker's branch.
+    let dir = wt.join("graphify-out");
+    let meta = fs::symlink_metadata(&dir).expect("graphify-out should exist in worktree");
+    assert!(
+        !meta.file_type().is_symlink() && meta.is_dir(),
+        "graphify-out/ must stay a real directory, not become a symlink (got {:?})",
         meta.file_type()
     );
 
-    // It must resolve to the base checkout's graph, with matching content.
-    let resolved = fs::canonicalize(&linked).unwrap();
-    let base_graphify_out = fs::canonicalize(base.join("graphify-out")).unwrap();
-    assert_eq!(resolved, base_graphify_out);
+    // Each entry of the base graph is linked *into* that directory, and
+    // resolves back to the base checkout's copy with matching content.
+    for name in ["graph.json", "manifest.json", "cache"] {
+        let entry = dir.join(name);
+        assert!(
+            fs::symlink_metadata(&entry)
+                .unwrap_or_else(|e| panic!("graphify-out/{} missing: {}", name, e))
+                .file_type()
+                .is_symlink(),
+            "graphify-out/{} should be a symlink into the base graph",
+            name
+        );
+        assert_eq!(
+            fs::canonicalize(&entry).unwrap(),
+            fs::canonicalize(base.join("graphify-out").join(name)).unwrap(),
+            "graphify-out/{} should resolve to the base checkout's copy",
+            name
+        );
+    }
 
-    let content = fs::read_to_string(linked.join("graph.json")).unwrap();
+    // And it is actually usable — the graph reads through the link.
+    let content = fs::read_to_string(dir.join("graph.json")).unwrap();
     assert_eq!(content, r#"{"fake":"basegraph"}"#);
+    assert_eq!(
+        fs::read_to_string(dir.join("cache/entry")).unwrap(),
+        "cached\n"
+    );
+}
+
+// ── 1b. the acceptance bar: a fresh linked worktree is `git status` clean ───
+//
+// This is the assertion whose absence let claude-coordinator#1617 ship. The
+// original bug showed up here as a *deleted* tracked `graphify-out/.gitignore`
+// plus a *new untracked* absolute-path symlink — both invisible to any check
+// that only looks at what the link points to.
+
+#[test]
+fn worktree_add_leaves_git_status_empty() {
+    let root = ScratchDir::new("wt_status_clean");
+    let base = root.join("base");
+    fs::create_dir_all(&base).unwrap();
+    init_base_repo(&base);
+    seed_base_graph(&base);
+
+    let wt = root.join("wt");
+    let (out, trace) = run_traced(
+        &base,
+        &["worktree", "add", wt.to_str().unwrap(), "-b", "feature-1b"],
+    );
+    assert!(out.status.success(), "worktree add failed: {}", trace);
+    assert_hook_ran(&trace, "post-checkout");
+
+    let status = porcelain_status(&wt);
+    assert!(
+        status.is_empty(),
+        "a fresh linked worktree must be git-clean after the hook runs, got:\n{}",
+        status
+    );
+
+    // Same after the hook re-fires on an in-worktree checkout (the idempotent
+    // re-link path, which `ln -sfn`s over links it already created).
+    let (out, trace) = run_traced(&wt, &["checkout", "-q", "-b", "feature-1b-2"]);
+    assert!(out.status.success(), "checkout in worktree failed: {}", trace);
+    assert_hook_ran(&trace, "post-checkout");
+    let status = porcelain_status(&wt);
+    assert!(
+        status.is_empty(),
+        "re-firing the hook must not dirty the worktree, got:\n{}",
+        status
+    );
+}
+
+// ── 1c. the tracked `.gitignore` survives, unshadowed ──────────────────────
+
+#[test]
+fn worktree_add_preserves_the_tracked_gitignore() {
+    let root = ScratchDir::new("wt_keeps_gitignore");
+    let base = root.join("base");
+    fs::create_dir_all(&base).unwrap();
+    init_base_repo(&base);
+    seed_base_graph(&base);
+
+    let wt = root.join("wt");
+    run_ok(
+        &base,
+        &["worktree", "add", wt.to_str().unwrap(), "-b", "feature-1c"],
+    );
+
+    // Anti-vacuity: check the *parent* first. Under the old hook this test
+    // passed for the wrong reason — `wt/graphify-out/.gitignore` resolved
+    // through the directory symlink to the base checkout's real file, and
+    // `ls-files` reads the (untouched) index either way. Both assertions
+    // below are only meaningful once we know we're looking at the worktree's
+    // own checked-out copy.
+    let dir = wt.join("graphify-out");
+    assert!(
+        !fs::symlink_metadata(&dir).unwrap().file_type().is_symlink(),
+        "graphify-out/ is a symlink — the .gitignore assertions below would \
+         be inspecting the base checkout's file, not the worktree's"
+    );
+
+    // The tracked file must still be a real file — not deleted, and not
+    // shadowed by a symlink to the base checkout's copy. It is the whole
+    // reason the linked entries are invisible to git.
+    let gitignore = wt.join("graphify-out/.gitignore");
+    let meta = fs::symlink_metadata(&gitignore).expect("graphify-out/.gitignore should exist");
+    assert!(
+        !meta.file_type().is_symlink() && meta.is_file(),
+        "graphify-out/.gitignore must stay a real tracked file, got {:?}",
+        meta.file_type()
+    );
+    assert!(fs::read_to_string(&gitignore).unwrap().contains("!.gitignore"));
+
+    let tracked = run_ok(&wt, &["ls-files", "graphify-out/.gitignore"]);
+    assert_eq!(
+        String::from_utf8_lossy(&tracked.stdout).trim(),
+        "graphify-out/.gitignore",
+        "graphify-out/.gitignore must still be tracked in the worktree"
+    );
+    // ...and git agrees it is present, not deleted from the work tree.
+    let status = run_ok(&wt, &["status", "--porcelain", "--", "graphify-out/.gitignore"]);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).is_empty(),
+        "graphify-out/.gitignore must be unmodified, got:\n{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert!(wt.join("graphify-out/graph.json").is_file());
 }
 
 // ── 2. no symlink when the base checkout has no graph.json ─────────────────
@@ -223,16 +373,26 @@ fn no_symlink_when_base_has_no_graph() {
     // Anti-vacuity: prove the hook actually ran before asserting it did nothing.
     assert_hook_ran(&trace, "post-checkout");
 
-    let linked = wt.join("graphify-out");
-    let meta = fs::symlink_metadata(&linked).expect("graphify-out should exist in worktree");
+    let dir = wt.join("graphify-out");
+    let meta = fs::symlink_metadata(&dir).expect("graphify-out should exist in worktree");
     assert!(
         !meta.file_type().is_symlink(),
-        "must not create a dangling symlink when the base has no graph.json"
+        "must not replace graphify-out with a symlink"
     );
     assert!(meta.is_dir(), "graphify-out should still be a plain dir");
     // The stub materialised by `worktree add` itself (its tracked .gitignore).
-    assert!(linked.join(".gitignore").is_file());
-    assert!(!linked.join("graph.json").exists());
+    assert!(dir.join(".gitignore").is_file());
+    // No dangling link left behind for a graph that does not exist.
+    assert!(!dir.join("graph.json").exists());
+    assert!(fs::symlink_metadata(dir.join("graph.json")).is_err());
+
+    // And nothing half-linked dirtied the worktree.
+    let status = porcelain_status(&wt);
+    assert!(
+        status.is_empty(),
+        "worktree must stay git-clean when there is no base graph, got:\n{}",
+        status
+    );
 }
 
 // ── 3. a real graph already in the worktree is never clobbered ─────────────
@@ -243,27 +403,22 @@ fn real_graph_in_worktree_is_never_clobbered() {
     let base = root.join("base");
     fs::create_dir_all(&base).unwrap();
     init_base_repo(&base);
-    fs::write(
-        base.join("graphify-out/graph.json"),
-        r#"{"fake":"basegraph"}"#,
-    )
-    .unwrap();
+    seed_base_graph(&base);
 
     let wt = root.join("wt");
     run_ok(
         &base,
         &["worktree", "add", wt.to_str().unwrap(), "-b", "feature-3"],
     );
-    // Sanity: the symlink was created by test 1's mechanism.
-    assert!(fs::symlink_metadata(wt.join("graphify-out"))
+    // Sanity: the link was created by test 1's mechanism.
+    assert!(fs::symlink_metadata(wt.join("graphify-out/graph.json"))
         .unwrap()
         .file_type()
         .is_symlink());
 
     // Simulate a real, worktree-local graph having been built here by hand,
-    // replacing the symlink with an actual directory + graph.json.
-    fs::remove_file(wt.join("graphify-out")).unwrap();
-    fs::create_dir_all(wt.join("graphify-out")).unwrap();
+    // replacing the linked graph.json with an actual file.
+    fs::remove_file(wt.join("graphify-out/graph.json")).unwrap();
     fs::write(
         wt.join("graphify-out/graph.json"),
         r#"{"fake":"worktree-local-graph"}"#,
@@ -278,16 +433,65 @@ fn real_graph_in_worktree_is_never_clobbered() {
     assert!(out.status.success(), "checkout in worktree failed: {}", trace);
     assert_hook_ran(&trace, "post-checkout");
 
-    let linked = wt.join("graphify-out");
-    let meta = fs::symlink_metadata(&linked).unwrap();
+    let dir = wt.join("graphify-out");
     assert!(
-        !meta.file_type().is_symlink(),
+        !fs::symlink_metadata(&dir).unwrap().file_type().is_symlink(),
+        "graphify-out/ must stay a real directory"
+    );
+    assert!(
+        !fs::symlink_metadata(dir.join("graph.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "a real worktree-local graph must never be replaced by a symlink"
     );
-    let content = fs::read_to_string(linked.join("graph.json")).unwrap();
+    let content = fs::read_to_string(dir.join("graph.json")).unwrap();
     assert_eq!(
         content, r#"{"fake":"worktree-local-graph"}"#,
         "worktree-local graph content must be untouched"
+    );
+}
+
+// ── 3b. removing the worktree must never reach into the base checkout ──────
+//
+// The per-entry links include a *directory* symlink (`cache/`). Both
+// `git worktree remove` and the coordinator's rmtree cleanup sweep unlink
+// directory symlinks rather than recursing into them — but only if we never
+// hand them a symlink they'd follow. This pins that invariant.
+
+#[test]
+fn worktree_remove_leaves_the_base_graph_intact() {
+    let root = ScratchDir::new("wt_remove_safe");
+    let base = root.join("base");
+    fs::create_dir_all(&base).unwrap();
+    init_base_repo(&base);
+    seed_base_graph(&base);
+
+    let wt = root.join("wt");
+    run_ok(
+        &base,
+        &["worktree", "add", wt.to_str().unwrap(), "-b", "feature-3b"],
+    );
+    assert!(wt.join("graphify-out/cache/entry").is_file());
+
+    run_ok(&base, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+
+    let out = base.join("graphify-out");
+    assert!(
+        !fs::symlink_metadata(&out).unwrap().file_type().is_symlink(),
+        "the base checkout's graphify-out/ must still be a real directory"
+    );
+    assert!(out.join("graph.json").is_file(), "base graph.json was destroyed");
+    assert!(
+        out.join("cache/entry").is_file(),
+        "base graph cache/ was destroyed through the directory symlink"
+    );
+    assert!(out.join(".gitignore").is_file());
+    let status = porcelain_status(&base);
+    assert!(
+        status.is_empty(),
+        "the base checkout must stay git-clean after worktree removal, got:\n{}",
+        status
     );
 }
 
