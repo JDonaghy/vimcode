@@ -12,5 +12,5 @@ expression: snapshot_text(&lines)
 
 
 
- COMMAND [No Name] 󰘖 utf-8 LF Spaces: 4 Ln 1, Col 1
+     COMMAND  [No Name] 󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
   :set

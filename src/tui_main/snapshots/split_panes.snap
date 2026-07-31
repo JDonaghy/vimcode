@@ -2,9 +2,9 @@
 source: src/tui_main/render_impl.rs
 expression: snapshot_text(&lines)
 ---
- 󰍜 1: [No Name] × ⋯ 1: [No Name] × 󰤲  ⋯
+ 󰍜 1: [No Name] ×                     ⋯  1: [No Name] × 󰤲  ⋯
 ▎ │
-  left pane content │ left pane content
+  left pane content                   │ left pane content
   │
   │
   │
