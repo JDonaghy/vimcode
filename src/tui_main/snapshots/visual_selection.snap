@@ -1,16 +1,16 @@
 ---
 source: src/tui_main/render_impl.rs
-expression: snapshot_text(&lines)
+expression: "lines.join(\"\\n\")"
 ---
- 󰍜 1: [No Name] × 󰤲  ⋯
+ 󰍜   1: [No Name] ×                                 󰤲    ⋯
 ▎
-  select this text
-  and this too
+    select this text
+    and this too
  
  
  
 
 
 
-     VISUAL  [No Name] 󰘖 utf-8 LF Spaces: 4  Ln 1, Col 11
+     VISUAL  [No Name]   󰘖 utf-8 LF Spaces: 4  Ln 1, Col 11
  
