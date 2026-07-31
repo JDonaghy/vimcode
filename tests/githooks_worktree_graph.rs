@@ -287,7 +287,11 @@ fn worktree_add_leaves_git_status_empty() {
     // Same after the hook re-fires on an in-worktree checkout (the idempotent
     // re-link path, which `ln -sfn`s over links it already created).
     let (out, trace) = run_traced(&wt, &["checkout", "-q", "-b", "feature-1b-2"]);
-    assert!(out.status.success(), "checkout in worktree failed: {}", trace);
+    assert!(
+        out.status.success(),
+        "checkout in worktree failed: {}",
+        trace
+    );
     assert_hook_ran(&trace, "post-checkout");
     let status = porcelain_status(&wt);
     assert!(
@@ -336,7 +340,9 @@ fn worktree_add_preserves_the_tracked_gitignore() {
         "graphify-out/.gitignore must stay a real tracked file, got {:?}",
         meta.file_type()
     );
-    assert!(fs::read_to_string(&gitignore).unwrap().contains("!.gitignore"));
+    assert!(fs::read_to_string(&gitignore)
+        .unwrap()
+        .contains("!.gitignore"));
 
     let tracked = run_ok(&wt, &["ls-files", "graphify-out/.gitignore"]);
     assert_eq!(
@@ -345,7 +351,10 @@ fn worktree_add_preserves_the_tracked_gitignore() {
         "graphify-out/.gitignore must still be tracked in the worktree"
     );
     // ...and git agrees it is present, not deleted from the work tree.
-    let status = run_ok(&wt, &["status", "--porcelain", "--", "graphify-out/.gitignore"]);
+    let status = run_ok(
+        &wt,
+        &["status", "--porcelain", "--", "graphify-out/.gitignore"],
+    );
     assert!(
         String::from_utf8_lossy(&status.stdout).is_empty(),
         "graphify-out/.gitignore must be unmodified, got:\n{}",
@@ -430,7 +439,11 @@ fn real_graph_in_worktree_is_never_clobbered() {
     // is also what proves the hook is reachable from in-worktree checkouts,
     // where the relative core.hooksPath resolves against the worktree itself).
     let (out, trace) = run_traced(&wt, &["checkout", "-b", "other-branch"]);
-    assert!(out.status.success(), "checkout in worktree failed: {}", trace);
+    assert!(
+        out.status.success(),
+        "checkout in worktree failed: {}",
+        trace
+    );
     assert_hook_ran(&trace, "post-checkout");
 
     let dir = wt.join("graphify-out");
@@ -474,14 +487,20 @@ fn worktree_remove_leaves_the_base_graph_intact() {
     );
     assert!(wt.join("graphify-out/cache/entry").is_file());
 
-    run_ok(&base, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+    run_ok(
+        &base,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
 
     let out = base.join("graphify-out");
     assert!(
         !fs::symlink_metadata(&out).unwrap().file_type().is_symlink(),
         "the base checkout's graphify-out/ must still be a real directory"
     );
-    assert!(out.join("graph.json").is_file(), "base graph.json was destroyed");
+    assert!(
+        out.join("graph.json").is_file(),
+        "base graph.json was destroyed"
+    );
     assert!(
         out.join("cache/entry").is_file(),
         "base graph cache/ was destroyed through the directory symlink"
@@ -526,7 +545,10 @@ fn hooks_are_committed_as_executable() {
             .unwrap_or("");
         seen.push(name.to_string());
         if name == "_lib.sh" {
-            assert_eq!(mode, "100644", "_lib.sh is sourced, not run — should not be executable");
+            assert_eq!(
+                mode, "100644",
+                "_lib.sh is sourced, not run — should not be executable"
+            );
         } else if !name.is_empty() {
             assert_eq!(
                 mode, "100755",
@@ -606,7 +628,11 @@ fn post_commit_and_post_merge_shims_skip_in_linked_worktree_and_chain_in_main() 
     fs::write(base.join("g.txt"), "hello\n").unwrap();
     run_ok(&base, &["add", "g.txt"]);
     let (out, trace) = run_traced(&base, &["commit", "-q", "-m", "base commit"]);
-    assert!(out.status.success(), "commit in base repo failed: {}", trace);
+    assert!(
+        out.status.success(),
+        "commit in base repo failed: {}",
+        trace
+    );
     assert_hook_ran(&trace, "post-commit");
     assert!(
         commit_marker.exists(),
