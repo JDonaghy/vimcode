@@ -1799,6 +1799,23 @@ mod tests {
         e.git_branch = None;
         e.sc_ahead = 0;
         e.sc_behind = 0;
+        // #615: Engine::new() also calls SessionState::load(), which reads
+        // ~/.config/vimcode/session.json from the *test runner's* home
+        // directory. A machine that has run vimcode interactively has
+        // explorer_visible: true there, so the sidebar (and its U+258E
+        // active-accent cell) always renders locally; a fresh CI $HOME has
+        // no such file, defaults to explorer_visible: false, and
+        // Engine::new() calls `app_shell.hide_sidebar()` before we ever get
+        // a chance to sanitize anything. Reset the session state so it no
+        // longer depends on the runner's home, and re-show the sidebar
+        // through the app_shell's own public API (hide_sidebar() already
+        // ran inside Engine::new(), so assigning `e.session` alone would
+        // not undo it) so it matches what the committed snapshots assume.
+        e.session = crate::core::session::SessionState::default();
+        e.session.explorer_visible = true;
+        if !e.app_shell.sidebar_visible() {
+            e.app_shell.toggle_sidebar();
+        }
         if !text.is_empty() {
             e.buffer_mut().insert(0, text);
         }
