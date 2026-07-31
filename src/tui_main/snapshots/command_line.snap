@@ -1,10 +1,10 @@
 ---
 source: src/tui_main/render_impl.rs
-expression: snapshot_text(&lines)
+expression: "lines.join(\"\\n\")"
 ---
- 󰍜 1: [No Name] × 󰤲  ⋯
+ 󰍜   1: [No Name] ×                                 󰤲    ⋯
 ▎
-  buffer content
+    buffer content
  
  
  
@@ -12,5 +12,5 @@ expression: snapshot_text(&lines)
 
 
 
-     COMMAND  [No Name] 󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
-  :set
+     COMMAND  [No Name]   󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
+   :set
