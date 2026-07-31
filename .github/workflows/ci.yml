@@ -17,6 +17,17 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # Cargo.toml has two path-deps on a *sibling* quadraui checkout:
+    #   quadraui = { path = "../quadraui/quadraui" }
+    #   vt100    = { path = "../quadraui/vendor/vt100-0.16.2-patched" }
+    # actions/checkout cannot write outside the workspace, so clone it by hand.
+    # quadraui is public and vendors the patched vt100, so no token is needed.
+    - name: Check out quadraui (sibling path dependency)
+      run: |
+        git clone --depth 1 --branch develop \
+          https://github.com/JDonaghy/quadraui.git \
+          "$(dirname "$GITHUB_WORKSPACE")/quadraui"
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
