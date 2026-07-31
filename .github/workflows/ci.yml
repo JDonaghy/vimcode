@@ -31,6 +31,33 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    # TEMPORARY (#615 diagnosis — remove before merge). The six render snapshots
+    # pass on every dev box and fail here. Nothing has ever measured *why* from
+    # inside the failing environment. Three questions, one run:
+    #   1. which rustc/unicode-width does CI actually resolve?
+    #   2. does the build re-resolve Cargo.lock (path-dep to a freshly cloned
+    #      quadraui develop can invalidate it — `cargo test` has no --locked)?
+    #   3. do the snapshots still fail once we know 1 and 2?
+    - name: Diagnose resolution skew (#615)
+      run: |
+        echo "::group::toolchain"
+        rustc --version && cargo --version
+        echo "::endgroup::"
+        echo "::group::unicode-width in the committed lock"
+        grep -A2 'name = "unicode-width"' Cargo.lock || echo "ABSENT from lock"
+        echo "::endgroup::"
+        echo "::group::what cargo resolves for unicode-width"
+        cargo tree -i unicode-width --no-default-features 2>&1 | head -40 || true
+        echo "::endgroup::"
+        echo "::group::did resolution rewrite Cargo.lock?"
+        if git diff --exit-code --stat Cargo.lock; then
+          echo "LOCK UNCHANGED — cargo honored the committed lock"
+        else
+          echo "LOCK REWRITTEN — cargo re-resolved; this is the skew"
+          git diff Cargo.lock | head -60
+        fi
+        echo "::endgroup::"
+
     - name: Cache cargo registry
       uses: actions/cache@v4
       with:
