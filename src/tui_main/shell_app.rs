@@ -86,21 +86,19 @@
 //!    `apply_selection_highlight` already runs post-`render_content`.
 //!    Tracked as #604.
 //!
-//! Given (1), `handle()` below implements panel-key accelerators, the
-//! `MenuSystem` intercept, and (per gap 2 above) full mouse dispatch through
-//! `handle_mouse_event`, plus routes plain `KeyPressed` events (no mouse) to
-//! `Engine::handle_key`, which is already backend-agnostic. Everything else
-//! returns `Reaction::Continue` with a `// TODO(#595)` marker rather than a
-//! half-correct guess.
-//!
-//! Also NOT yet ported: the "#318" Alt+menu-letter "reveal menu bar" shim
-//! sitting between those two dispatch layers in `event_loop()`
-//! (`mod.rs:1275`-`:1294`), which sets `engine.menu_bar_visible = true` on
-//! an Alt+<letter> keypress so the same keystroke both reveals and
-//! activates the menu. It's not a fourth structural gap — the blocker is
-//! simply that `KeyPressed` routing is itself still a `// TODO(#595)` stub
-//! below — but it's called out here explicitly so a future session doesn't
-//! assume key dispatch is complete once that stub is filled in.
+//! Given (2) is now closed by #602 and (1)/(3) remain the only open
+//! structural gaps, `handle()` below implements every dispatch layer that
+//! doesn't need raw Frame access: panel-key accelerators, the "#318"
+//! Alt+menu-letter "reveal menu bar" shim (mirrors `mod.rs:1319`-`:1338` —
+//! sets `engine.menu_bar_visible = true` on an Alt+<letter> keypress so the
+//! same keystroke both reveals and activates the menu), the `MenuSystem`
+//! intercept, full mouse dispatch through `handle_mouse_event` (#602), and
+//! — #603 (Stage 4) — the full `KeyPressed` dispatch chain (modal dialog /
+//! context-menu intercepts, then the general `Engine::handle_key` fallback
+//! that also resolves command-palette and completion-popup state
+//! internally). See `handle_key_pressed`'s own doc comment for the exact
+//! precedence chain and why it's a free function rather than a
+//! `TuiShellApp` method.
 
 use std::cell::{Cell, RefCell};
 
@@ -174,6 +172,20 @@ pub(super) struct TuiShellApp {
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
+    /// Mirrors `event_loop`'s once-computed `keyboard_enhanced` flag
+    /// (`mod.rs:696`, from `supports_keyboard_enhancement()` before the
+    /// loop starts) — threaded into `translate_key` to disambiguate a
+    /// handful of Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
+    /// Ctrl+Shift+[/]) that arrive ambiguously without the kitty keyboard
+    /// protocol. This dormant scaffold has no live terminal session to
+    /// query yet — only `driver_with_shell`'s `TestBackend`, where
+    /// querying would be meaningless and `supports_keyboard_enhancement()`'s
+    /// real terminal round-trip could misbehave without a TTY — so this
+    /// defaults to `false`, the same value `unwrap_or(false)` falls back to
+    /// on any terminal that doesn't support the protocol. Stage 6 cutover
+    /// (#605) should thread the real value in from wherever
+    /// `run_with_shell` ends up being called.
+    keyboard_enhanced: bool,
 }
 
 #[allow(dead_code)] // see the struct-level #[allow(dead_code)] doc above
@@ -264,6 +276,7 @@ impl TuiShellApp {
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
+            keyboard_enhanced: false,
         }
     }
 
@@ -764,16 +777,6 @@ impl ShellApp for TuiShellApp {
         // threading both `width` and `height` through (the
         // `ACC_TERMINAL_TOGGLE_MAX` arm needs both — see
         // `dispatch_panel_accelerator_sizeless`'s doc comment).
-        //
-        // NOT yet ported here: the "#318" Alt+menu-letter reveal shim
-        // (`mod.rs:1275`-`:1294`) that sets `engine.menu_bar_visible = true`
-        // on an Alt+<letter> keypress so the same keystroke both reveals
-        // and activates the menu bar. It belongs between this block and the
-        // MenuSystem intercept below, but depends on the `KeyPressed`
-        // routing that's still a `// TODO(#595)` stub further down — so it
-        // has no home yet either. Flagging it explicitly here (rather than
-        // only in the module doc) so it isn't missed when that TODO is
-        // finally implemented.
         if let UiEvent::Accelerator(ref acc_id, acc_mods) = event {
             if self.engine.dialog.is_none() {
                 let viewport = backend.viewport();
@@ -793,6 +796,29 @@ impl ShellApp for TuiShellApp {
                     } else {
                         Reaction::Continue
                     };
+                }
+            }
+        }
+
+        // ── #318: Alt+menu-letter "reveal menu bar" shim (mirrors
+        // `mod.rs:1319`-`:1338`) ─────────────────────────────────────────
+        // When the menu bar is hidden, Alt+<letter> must still activate the
+        // corresponding menu — otherwise the bare letter falls through to
+        // `Engine::handle_key` (which ignores Alt) and triggers a Vim
+        // motion (e.g. Alt+T → t-motion). Setting `menu_bar_visible` here
+        // makes the *same* keystroke both reveal and activate the menu via
+        // the `MenuSystem` intercept immediately below. Queries the live
+        // menu system rather than hardcoding letters so the truth stays in
+        // `MENU_STRUCTURE` (render.rs) → `MenuDef`.
+        if !self.engine.menu_bar_visible {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                if modifiers.alt {
+                    if let quadraui::Key::Char(c) = key {
+                        let bar = self.engine.menu_system.borrow().menu_bar();
+                        if bar.find_alt_target(*c).is_some() {
+                            self.engine.menu_bar_visible = true;
+                        }
+                    }
                 }
             }
         }
@@ -822,12 +848,28 @@ impl ShellApp for TuiShellApp {
         }
 
         match event {
-            // TODO(#595): route through `Engine::handle_key` once the
-            // mode/register plumbing that `event_loop`'s key arm wraps it
-            // in (dialog/palette/completion/context-menu intercepts, all
-            // of which currently live in `mouse.rs`-adjacent code) has a
-            // Frame-free home. Left unimplemented rather than guessed.
-            UiEvent::KeyPressed { .. } => Reaction::Continue,
+            // #603 (Stage 4): dialog / context-menu / general
+            // `Engine::handle_key` fallback — see `handle_key_pressed`'s
+            // doc comment for the precedence chain.
+            UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+            } => {
+                let viewport = backend.viewport();
+                handle_key_pressed(
+                    key,
+                    modifiers,
+                    repeat,
+                    &mut self.engine,
+                    &mut self.sidebar,
+                    self.sidebar_width,
+                    &mut self.folder_picker,
+                    self.keyboard_enhanced,
+                    viewport.width as u16,
+                    viewport.height as u16,
+                )
+            }
             // #602 (gap 2): dispatch through the legacy `mouse::handle_mouse`
             // now that `Backend::drag_and_modal_mut` (quadraui#467) makes its
             // `&mut DragState`/`&mut ModalStack` params reachable through
@@ -1106,6 +1148,169 @@ fn dispatch_panel_accelerator_sizeless(
     }
 }
 
+/// Route a `KeyPressed` event through `Engine::handle_key`, replicating
+/// `event_loop()`'s three-tier precedence for it (`mod.rs:1629`-`:2737`):
+///
+/// 1. **Modal dialog** (`mod.rs:1629`-`:1651`) intercepts *all* keys —
+///    checked first and returns unconditionally, exactly like the legacy
+///    loop's own early `continue`.
+/// 2. **Context menu** (`mod.rs:2608`-`:2635`) — checked ahead of
+///    `Engine::handle_key`, even though `Engine::handle_key` has its own
+///    context-menu branch (`keys.rs:66`-`:71`), because the engine's copy
+///    only consumes the key and discards the resulting action. This
+///    function's copy dispatches that action to
+///    [`handle_explorer_context_action`] (new_file/rename/delete/
+///    open_terminal/find_in_folder/…), which needs TUI-local state
+///    (`sidebar`, terminal size) `Engine::handle_key` has no access to.
+/// 3. **General fallback** (`mod.rs:2637`-`:2737`) — this is also where
+///    command-palette (`picker_open`) and completion-popup
+///    (`completion_idx`) keys land: `Engine::handle_key` already resolves
+///    both internally (see `keys.rs`'s own precedence chain), so this
+///    function's job for those two is purely getting the key there,
+///    then unpacking the `EngineAction` side effects `Engine::handle_key`
+///    can't perform itself because they need backend-supplied terminal
+///    size or TUI-local state (`folder_picker`, `sidebar`): open terminal,
+///    toggle-maximize, run-in-terminal, folder/workspace/recent dialogs,
+///    quit confirmation.
+///
+/// Translates the backend-neutral `Key`/`Modifiers` into the
+/// `(key_name, unicode, ctrl)` shape `Engine::handle_key` expects by
+/// reusing the legacy `translate_key` — synthesizing a crossterm
+/// `KeyEvent` via quadraui's own `synth_keyevent` first, the same
+/// `UiEvent -> crossterm::Event` round trip `event_loop()`'s live loop
+/// already performs (`events::uievent_to_crossterm`) — rather than
+/// re-deriving `translate_key`'s crossterm quirk table (Ctrl+\, Ctrl+/,
+/// kitty shift-symbol resolution, …) a second time for `quadraui::Key`.
+///
+/// A free function (mirrors [`dispatch_panel_accelerator_sizeless`])
+/// rather than a `TuiShellApp` method: `ShellContext` has no public
+/// constructor (`pub(crate) fn new`, quadraui-internal), so
+/// `TuiShellApp::handle()` itself can only be driven through
+/// `driver_with_shell`, which has no accessor back to the concrete app's
+/// fields. Structuring the real logic as a free function over borrowed
+/// pieces keeps it directly unit-testable against a bare `Engine`.
+#[allow(clippy::too_many_arguments)]
+fn handle_key_pressed(
+    key: quadraui::Key,
+    modifiers: quadraui::Modifiers,
+    repeat: bool,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    sidebar_width: u16,
+    folder_picker: &mut Option<FolderPickerState>,
+    keyboard_enhanced: bool,
+    screen_w: u16,
+    screen_h: u16,
+) -> Reaction {
+    let Some(key_event) = quadraui::tui::events::synth_keyevent(&key, modifiers, repeat) else {
+        return Reaction::Continue;
+    };
+
+    // ── Modal dialog intercepts ALL keys (mirrors mod.rs:1629-:1651) ────
+    if engine.dialog.is_some() {
+        if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) {
+            let action = engine.handle_key(&key_name, unicode, ctrl);
+            if handle_action(engine, action) {
+                return Reaction::Exit;
+            }
+        } else if key_event.kind != KeyEventKind::Release {
+            match key_event.code {
+                KeyCode::Tab => {
+                    engine.handle_key("Tab", None, false);
+                }
+                KeyCode::BackTab => {
+                    engine.handle_key("Shift_Tab", None, false);
+                }
+                _ => {}
+            }
+        }
+        return Reaction::Redraw;
+    }
+
+    if key_event.kind == KeyEventKind::Release {
+        return Reaction::Continue;
+    }
+    let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) else {
+        return Reaction::Continue;
+    };
+
+    // ── Context menu keyboard intercept (mirrors mod.rs:2608-:2635) ─────
+    if engine.context_menu.is_some() {
+        let effective_key = if key_name.is_empty() {
+            unicode.map(|c| c.to_string()).unwrap_or_default()
+        } else {
+            key_name.clone()
+        };
+        let ctx = engine.context_menu_target_path();
+        let (consumed, action) = engine.handle_context_menu_key(&effective_key);
+        if consumed {
+            if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
+                handle_explorer_context_action(
+                    &act,
+                    engine,
+                    sidebar,
+                    Some(Size::new(screen_w, screen_h)),
+                    ctx_path,
+                    ctx_is_dir,
+                );
+            }
+            return Reaction::Redraw;
+        }
+    }
+
+    // ── General fallback: `Engine::handle_key` (mirrors
+    // mod.rs:2637-:2737) ─────────────────────────────────────────────────
+    let action = engine.handle_key(&key_name, unicode, ctrl);
+    if engine.mode == crate::core::Mode::Insert && engine.settings.ai_completions {
+        engine.ai_completion_reset_timer();
+    }
+
+    if action == EngineAction::OpenTerminal {
+        let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_new_tab(cols, rows);
+    } else if action == EngineAction::ToggleTerminalMaximize {
+        let ctx = crate::core::engine::UiEventContext {
+            terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
+            terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_h),
+        };
+        engine.handle_ui_event(
+            crate::core::engine::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(ACC_TERMINAL_TOGGLE_MAX),
+                quadraui::Modifiers::default(),
+            ),
+            ctx,
+        );
+    } else if let EngineAction::RunInTerminal(cmd) = &action {
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_run_command(cmd, screen_w, rows);
+    } else if action == EngineAction::OpenFolderDialog {
+        *folder_picker = Some(FolderPickerState::new(
+            &engine.cwd.clone(),
+            FolderPickerMode::OpenFolder,
+            engine.settings.show_hidden_files,
+        ));
+    } else if action == EngineAction::OpenRecentDialog {
+        if engine.session.recent_workspaces.is_empty() {
+            engine.message = "No recent workspaces".to_string();
+        } else {
+            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
+        }
+    } else if action == EngineAction::OpenWorkspaceDialog {
+        *sidebar = TuiSidebar::new();
+        engine.explorer_rebuild_rows();
+    } else if action == EngineAction::SaveWorkspaceAsDialog {
+        let ws_path = engine.cwd.join(".vimcode-workspace");
+        engine.save_workspace_as(&ws_path);
+    } else if action == EngineAction::QuitWithUnsaved {
+        engine.show_quit_confirm();
+    } else if handle_action(engine, action) {
+        return Reaction::Exit;
+    }
+
+    Reaction::Redraw
+}
+
 #[cfg(test)]
 mod tests {
     //! `TuiDriver`/`driver_with_shell` (quadraui's headless `ShellApp`
@@ -1113,9 +1318,17 @@ mod tests {
     //! no accessor back to the concrete `TuiShellApp` and no exposed
     //! `tick()` passthrough — so `setup`/`tick` are exercised directly here
     //! against a real `TuiBackend`, which is exactly what the live runner
-    //! does under the hood. `driver_with_shell` is still used for the one
-    //! true end-to-end smoke: does the whole `ShellConfig` wiring construct
-    //! and paint a first frame without panicking.
+    //! does under the hood. `driver_with_shell` is used for the end-to-end
+    //! smokes (does the whole `ShellConfig` wiring construct and paint a
+    //! first frame without panicking) and — #603 (Stage 4) — for
+    //! `handle()`'s `KeyPressed` dispatch: `ShellContext::new` is
+    //! quadraui-`pub(crate)`, so `handle()` itself can only be driven
+    //! through the driver's key-injection helpers (`press`/`type_char`/
+    //! `dispatch`), asserting on the painted screen rather than on internal
+    //! `TuiShellApp` fields. `handle_key_pressed`'s dialog/context-menu
+    //! branches are additionally exercised directly (bypassing `handle()`
+    //! and the driver entirely) since that logic lives in a free function
+    //! over a bare `&mut Engine`.
     use super::*;
     use quadraui::tui::testing::driver_with_shell;
     use quadraui::Backend as _;
@@ -1646,6 +1859,199 @@ mod tests {
             "an open explorer context menu must block the TreeController \
              intercept so the click reaches mouse.rs's ctx-menu confirm \
              instead of being consumed as a tree row activation (#456)"
+        );
+    }
+
+    /// #603 baseline: a plain `KeyPressed` sequence (no modal state open)
+    /// must reach `Engine::handle_key` and actually mutate the buffer —
+    /// establishes that the general fallback in `handle_key_pressed` is
+    /// wired at all, so `command_palette_open_intercepts_keys_via_shell_app`
+    /// below has something meaningful to contrast against.
+    #[test]
+    fn key_press_inserts_text_via_shell_app_general_fallback() {
+        let app = TuiShellApp::new(None);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        driver.type_char('i'); // Normal -> Insert
+        for c in "ZQXW_TYPED".chars() {
+            driver.type_char(c);
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_TYPED"),
+            "typed text should reach the buffer via Engine::handle_key; screen:\n{screen}"
+        );
+    }
+
+    /// #603 acceptance: once the command palette is open
+    /// (`engine.picker_open`), `Engine::handle_key` resolves it internally
+    /// (`keys.rs:152`) — the same "i" + marker keystrokes that insert text
+    /// in `key_press_inserts_text_via_shell_app_general_fallback` above
+    /// must instead feed the picker's query and never reach the buffer.
+    /// Opens the palette via the already-wired (Stage 0) `ACC_COMMAND_PALETTE`
+    /// accelerator, exactly how a real keybinding would.
+    #[test]
+    fn command_palette_open_intercepts_keys_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        let opened = driver.dispatch(quadraui::UiEvent::Accelerator(
+            quadraui::AcceleratorId::new(ACC_COMMAND_PALETTE),
+            quadraui::Modifiers::default(),
+        ));
+        assert_eq!(
+            opened,
+            Reaction::Redraw,
+            "opening the command palette should request a redraw"
+        );
+
+        driver.type_char('i');
+        for c in "ZQXW_TYPED".chars() {
+            driver.type_char(c);
+        }
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW_TYPED"),
+            "keys typed while the command palette is open must not reach the \
+             editor buffer (they should feed the picker query instead); \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #603 acceptance / #318: Alt+<menu-letter> must reveal the (hidden by
+    /// default) menu bar and hand the very same keystroke to the
+    /// `MenuSystem` intercept, which activates the matching top-level menu.
+    /// `handle()` never paints the menu bar itself (out of `render_content`'s
+    /// scope this stage — see the module doc), so the only screen-visible
+    /// effect of `engine.menu_bar_visible` flipping is that
+    /// `build_screen_for_shell_content` reserves one extra row above the
+    /// editor content (`menu_height`) — shifting the marker text down by
+    /// exactly one line is this test's proof the #318 shim actually ran.
+    #[test]
+    fn alt_letter_reveals_menu_bar_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "ZQXW_ALT_MARKER");
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        let before = driver.screen();
+        let before_row = before
+            .lines()
+            .position(|l| l.contains("ZQXW_ALT_MARKER"))
+            .expect("marker should paint before the Alt-reveal keypress");
+
+        // 'f' is `MENU_STRUCTURE`'s alt-letter for the "File" menu
+        // (`render.rs`: `("File", 'f', ...)`). The bar starts hidden —
+        // `Engine::new()` defaults `menu_bar_visible = false` outside
+        // vscode mode (`mod.rs:3685`/`:3963`) — so this exercises the #318
+        // shim specifically, not an already-visible bar.
+        let reaction = driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        assert_eq!(
+            reaction,
+            Reaction::Redraw,
+            "Alt+F should reveal + activate the File menu, both of which redraw"
+        );
+
+        let after = driver.screen();
+        let after_row = after
+            .lines()
+            .position(|l| l.contains("ZQXW_ALT_MARKER"))
+            .expect("marker should still paint after the Alt-reveal keypress");
+        assert_eq!(
+            after_row,
+            before_row + 1,
+            "revealing the menu bar should reserve one more row above the \
+             editor content, shifting the marker down by exactly one line; \
+             before:\n{before}\nafter:\n{after}"
+        );
+    }
+
+    /// `handle_key_pressed`'s dialog branch must route every key straight
+    /// to `Engine::handle_key` while a dialog is open, bypassing the
+    /// context-menu/general-fallback branches entirely (mirrors
+    /// `mod.rs:1629`-`:1651`). Exercised directly against a bare `Engine`
+    /// (see the test-module doc) rather than through `driver_with_shell`,
+    /// since `ShellContext` has no public constructor.
+    #[test]
+    fn handle_key_pressed_dialog_intercepts_all_keys() {
+        let mut engine = Engine::new();
+        engine.show_quit_confirm();
+        assert!(engine.dialog.is_some());
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+
+        // "Down" cycles the selected dialog button (`panels.rs`'s
+        // `handle_dialog_key`) — proving the key actually reached
+        // `Engine::handle_key`'s dialog handling, not re-testing dialog
+        // button navigation itself.
+        let reaction = handle_key_pressed(
+            quadraui::Key::Named(quadraui::NamedKey::Down),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(
+            engine.dialog.is_some(),
+            "dialog should remain open after a navigation key"
+        );
+        assert_eq!(engine.dialog.as_ref().unwrap().selected, 1);
+    }
+
+    /// `handle_key_pressed`'s context-menu branch must dispatch the
+    /// confirmed item's action to [`handle_explorer_context_action`]
+    /// (mirrors `mod.rs:2608`-`:2635`) — unlike `Engine::handle_key`'s own
+    /// context-menu branch (`keys.rs:66`-`:71`), which consumes the key but
+    /// silently discards the resulting action. Confirms the first item
+    /// ("New File...", action `"new_file"`) of a folder context menu and
+    /// asserts on `explorer_new_entry_pending`, the observable side effect
+    /// `dispatch_explorer_crud(ExplorerAction::NewFile)` produces.
+    #[test]
+    fn handle_key_pressed_context_menu_dispatches_explorer_action() {
+        let mut engine = Engine::new();
+        let dir = engine.cwd.clone();
+        engine.open_explorer_context_menu(dir, true, 5, 5);
+        assert!(engine.context_menu.is_some());
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+
+        let reaction = handle_key_pressed(
+            quadraui::Key::Named(quadraui::NamedKey::Enter),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(
+            engine.context_menu.is_none(),
+            "confirming an item should close the context menu"
+        );
+        assert!(
+            engine.explorer_new_entry_pending.is_some(),
+            "the 'New File...' action should reach `handle_explorer_context_action` \
+             and dispatch `ExplorerAction::NewFile`"
         );
     }
 }
