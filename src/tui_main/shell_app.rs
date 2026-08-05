@@ -22,9 +22,10 @@
 //! # What's intentionally NOT yet ported, and why
 //!
 //! Three structural gaps were found while scoping Stage 0 (recorded as
-//! pinned `coord context` notes on vimcode#595). Gap 2 (mouse handling) has
-//! since been resolved by #602 — see the note after gap 3 below; gaps 1 and
-//! 3 (painting, cursor placement) remain open:
+//! pinned `coord context` notes on vimcode#595). Gap 2 (mouse handling) is
+//! largely closed by #602 — dispatch is wired and the panel intercepts are
+//! ported — with one residual seam noted inline below; gaps 1 and 3
+//! (painting, cursor placement) remain open:
 //!
 //! 1. **Painting.** `render_content(&self, backend: &mut dyn Backend, ...)`
 //!    never gets a raw `ratatui::Frame` — confirmed structural, not just
@@ -49,7 +50,7 @@
 //!    (#604 / quadraui#466). The menu bar row is reserved in the layout
 //!    math but not painted either (out of scope for #601; folds into key
 //!    dispatch, #603).
-//! 2. **Mouse handling (#602, resolved).** `mouse::handle_mouse`
+//! 2. **Mouse handling (#602, largely resolved).** `mouse::handle_mouse`
 //!    (~4,100 lines) takes `&mut quadraui::DragState` + `&mut
 //!    quadraui::ModalStack` directly via `TuiBackend::drag_and_modal_mut()`
 //!    — a concrete-only method the `Backend` trait deliberately doesn't
@@ -64,6 +65,18 @@
 //!    `TreeController`; `mod.rs` ~1416-1605) — see that method's own doc
 //!    comment for the details, including why the debug toolbar intercept is
 //!    a documented no-op until gap 1 paints that toolbar's rect.
+//!
+//!    Residual seam (blocked on gap 1, not on #602): the context menu is
+//!    still painted only on the raw-`Frame` path, so
+//!    `self.context_menu_layout` stays `None` and `mouse.rs`'s `#459`
+//!    modal-stack reconcile never registers an open menu. Dispatch stays
+//!    *correct* — the intercepts gate on `engine.context_menu` directly
+//!    (see `handle_mouse_event`) so menu clicks aren't stolen by the panel
+//!    underneath — but `handle_mouse` receives `context_menu_layout: None`
+//!    and therefore closes the menu instead of resolving the clicked item.
+//!    Clears once the explorer menu paints through `render_content`, which
+//!    lands with the sidebar-content holdout (#607) since the menu anchors
+//!    over the sidebar, outside `main_content_bounds`.
 //! 3. **Editor cursor placement.** `Backend::draw_editor`'s
 //!    `EditorPaintResult::cursor_position` is documented "host applies via
 //!    `Frame::set_cursor_position`", but no consumer of it exists anywhere
@@ -283,25 +296,34 @@ impl TuiShellApp {
     /// Review fix (#602 iteration 1): `event_loop` doesn't send every mouse
     /// event straight to `handle_mouse` — it runs four panel intercepts
     /// first (debug sidebar, extensions sidebar, debug toolbar, explorer
-    /// `TreeController`; `mod.rs` ~1416-1605), each gated by the `#459`
-    /// modal-stack priority check, and short-circuits `handle_mouse`
-    /// entirely when one of them consumes the event. `handle_mouse`'s own
+    /// `TreeController`; `mod.rs` ~1436-1604), each gated by the `#459`
+    /// modal-stack priority check that `mod.rs` computes into its own
+    /// `ctx_blocks_event` local (`mod.rs` ~1416-1433 — the `// #459: Hit-test
+    /// the modal stack` block), and short-circuits `handle_mouse` entirely
+    /// when one of them consumes the event. `handle_mouse`'s own
     /// `PANEL_EXTENSIONS` arm explicitly relies on the sidebar intercept for
     /// rows 2+ ("handled by SidebarSystem mouse intercept in main loop",
     /// `mouse.rs` ~2557), so skipping this block silently drops those
     /// clicks. All four are ported below, in the same order, before the
     /// `DoubleClick` fold / `handle_mouse` dispatch.
+    ///
+    /// Review fix (#602 iteration 2): those intercepts are additionally
+    /// gated on `engine.context_menu.is_none()`, which `event_loop` does
+    /// *not* need. See the long comment on `ctx_menu_blocks_event` in the
+    /// body for why the modal-stack gate alone is load-bearing there but
+    /// inert here.
     fn handle_mouse_event(
         &mut self,
         event: UiEvent,
         backend: &mut dyn quadraui::Backend,
     ) -> Reaction {
         // #459: hit-test the modal stack first. The reconcile happens in
-        // `mouse.rs` at the top of `handle_mouse`; here it must run before
-        // the panel intercepts below, which have to yield when the event
-        // lands inside a floating modal (e.g. an open context menu) — the
-        // same priority rule `event_loop` applies (`mod.rs` ~1416-1434).
-        let ctx_blocks_event = {
+        // `mouse.rs` at the top of `handle_mouse` (`mouse.rs` ~255-267);
+        // here it must run before the panel intercepts below, which have to
+        // yield when the event lands inside a floating modal (e.g. an open
+        // editor-hover popup or picker) — the same priority rule
+        // `event_loop` applies (`mod.rs` ~1423-1433).
+        let modal_blocks_event = {
             let event_pos: Option<quadraui::Point> = match &event {
                 UiEvent::Scroll { position, .. }
                 | UiEvent::MouseDown { position, .. }
@@ -314,9 +336,44 @@ impl TuiShellApp {
             event_pos.is_some_and(|p| modal_stack.hit_test(p).is_some())
         };
 
+        // Review fix (#602 iteration 2): `modal_blocks_event` alone is NOT
+        // sufficient here, even though it is the only gate `event_loop`
+        // needs. `mouse.rs`'s `#459` reconcile is what registers an open
+        // context menu on the `ModalStack`, and it does so from the
+        // `context_menu_layout` argument:
+        //
+        //     match context_menu_layout {
+        //         Some(layout) => modal_stack.push(ctx_menu_id, layout.bounds),
+        //         None => { modal_stack.pop(&ctx_menu_id); }
+        //     }
+        //
+        // `event_loop` feeds that argument a layout its raw-`Frame` paint
+        // produced (`draw_frame`'s `context_menu_layout_out` out-param,
+        // `render_impl.rs` ~916, threaded via `mod.rs` ~1101/~1158), so its
+        // modal stack really does learn about the menu. `TuiShellApp`'s
+        // `self.context_menu_layout` is *never written* — the context-menu
+        // paint still lives on the raw-`Frame` path `render_content` cannot
+        // reach (module-doc gap 1; the explorer menu anchors over the
+        // sidebar, i.e. outside `main_content_bounds`, so it lands with the
+        // sidebar-content holdout #607). It is therefore permanently `None`
+        // here, the reconcile always takes the `pop` branch, and
+        // `modal_blocks_event` can never become `true` for a context menu.
+        //
+        // Without the extra engine-level gate below, right-clicking an
+        // explorer file and then left-clicking a menu item would have the
+        // click land inside `explorer_tree_rect` (the menu floats over the
+        // tree), get claimed by the ported `TreeController` intercept as a
+        // row activation, and never reach `mouse.rs`'s own context-menu
+        // confirm (`mouse.rs` ~1651+) — exactly the bug class `#456`
+        // guarded against. Gate on `engine.context_menu` directly: it is
+        // the authoritative state, it costs nothing, and it stays correct
+        // if/when #607 makes the modal-stack path work too.
+        let ctx_menu_blocks_event = self.engine.context_menu.is_some();
+        let intercepts_blocked = modal_blocks_event || ctx_menu_blocks_event;
+
         // ── SidebarSystem intercept: debug sidebar (mirrors `mod.rs`
         // ~1436-1471) ──
-        if !ctx_blocks_event
+        if !intercepts_blocked
             && self.engine.app_shell.sidebar_visible()
             && self.engine.active_panel_is(PANEL_DEBUG)
         {
@@ -352,7 +409,7 @@ impl TuiShellApp {
         // ("handled by SidebarSystem mouse intercept in main loop",
         // `mouse.rs` ~2557), so skipping this would silently drop those
         // clicks. ──
-        if !ctx_blocks_event
+        if !intercepts_blocked
             && self.engine.app_shell.sidebar_visible()
             && self.engine.active_panel_is(PANEL_EXTENSIONS)
         {
@@ -387,7 +444,7 @@ impl TuiShellApp {
         // stays zero-sized and this block is a documented no-op rather than
         // a silent gap — ported now so dispatch is already correct once
         // painting catches up. ──
-        if !ctx_blocks_event
+        if !intercepts_blocked
             && self.engine.debug_toolbar_visible
             && self.debug_toolbar_rect.get().width > 0.0
         {
@@ -433,14 +490,14 @@ impl TuiShellApp {
         // so the built-in scrollbar (click, thumb drag, track page) works;
         // `MouseDown`/`DoubleClick` for row selection, `MouseMoved` (left
         // held) and `MouseUp` for scrollbar drag lifecycle. The `MouseMoved`/
-        // `MouseUp` arm intentionally ignores `ctx_blocks_event` (matches
+        // `MouseUp` arm intentionally ignores `intercepts_blocked` (matches
         // `event_loop`) so an in-flight scrollbar drag isn't interrupted by
         // the pointer momentarily crossing a modal's hit region. ──
         {
             let is_explorer_event = match &event {
                 UiEvent::MouseDown { position, .. } | UiEvent::DoubleClick { position, .. } => {
                     let rect = self.engine.explorer_tree_rect.get();
-                    !ctx_blocks_event
+                    !intercepts_blocked
                         && self.engine.app_shell.sidebar_visible()
                         && self.engine.active_panel_is(PANEL_EXPLORER)
                         && rect.width > 0.0
@@ -1480,16 +1537,17 @@ mod tests {
 
     /// Review fix / #459: a modal that hit-tests positive at the click
     /// position must make every panel intercept above yield — mirrors
-    /// `event_loop`'s `ctx_blocks_event` check (`mod.rs` ~1416-1434). Without
-    /// it, a context menu drawn over the explorer tree couldn't be clicked;
-    /// the click would be swallowed by the tree intercept underneath instead.
-    /// Reuses the x=50 rect placement from the tests above so
-    /// `mouse::handle_mouse`'s own sidebar-click handling — which has no
-    /// notion of the quadraui `ModalStack` at all — cannot itself explain
-    /// `sidebar.has_focus` staying `false`; only correct `ctx_blocks_event`
-    /// gating can.
+    /// `event_loop`'s `ctx_blocks_event` check (`mod.rs` ~1416-1433, the
+    /// `// #459: Hit-test the modal stack` block). Without it, an
+    /// editor-hover popup or picker drawn over the explorer tree couldn't be
+    /// clicked; the click would be swallowed by the tree intercept
+    /// underneath instead. Reuses the x=50 rect placement from the tests
+    /// above so `mouse::handle_mouse`'s own sidebar-click handling — which
+    /// has no notion of the quadraui `ModalStack` at all — cannot itself
+    /// explain `sidebar.has_focus` staying `false`; only correct
+    /// `modal_blocks_event` gating can.
     #[test]
-    fn ctx_blocks_event_skips_explorer_intercept_when_modal_covers_click() {
+    fn modal_blocks_event_skips_explorer_intercept_when_modal_covers_click() {
         let mut app = TuiShellApp::new(None);
         ensure_panel_active(&mut app.engine, PANEL_EXPLORER);
         app.engine
@@ -1519,6 +1577,75 @@ mod tests {
             !app.sidebar.has_focus,
             "a modal covering the click position must block the explorer \
              TreeController intercept from claiming the event (#459)"
+        );
+    }
+
+    /// Review fix (#602 iteration 2) / #456: the companion to the test
+    /// above, for the gate that actually fires in practice.
+    ///
+    /// An *open explorer context menu* must block the `TreeController`
+    /// intercept even though nothing is on the `ModalStack`. In
+    /// `event_loop` the modal stack would carry the menu, because
+    /// `mouse.rs`'s `#459` reconcile pushes `context_menu_layout.bounds`
+    /// and `event_loop` feeds it a real layout from its raw-`Frame` paint.
+    /// `TuiShellApp` has no such paint yet (module-doc gap 1 / #607), so
+    /// `self.context_menu_layout` is always `None`, the reconcile always
+    /// *pops*, and `modal_blocks_event` is permanently `false` for a
+    /// context menu — hence the separate `engine.context_menu` gate.
+    ///
+    /// This test deliberately pushes **nothing** onto the modal stack, so
+    /// it fails against a build gated on `modal_blocks_event` alone. As
+    /// with the tests above, the tree rect sits at x=50 — outside
+    /// `mouse::handle_mouse`'s own `col < 33` legacy sidebar range — so a
+    /// passing assertion can only be explained by the new gate.
+    #[test]
+    fn open_context_menu_skips_explorer_intercept_without_modal_stack_entry() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_EXPLORER);
+        app.engine
+            .explorer_tree_rect
+            .set(quadraui::Rect::new(50.0, 1.0, 20.0, 10.0));
+
+        // Right-click outcome: an explorer context menu is open, floating
+        // over the tree. Nothing is registered on the ModalStack.
+        app.engine.open_explorer_context_menu(
+            std::path::PathBuf::from("/tmp/zqxw.txt"),
+            false,
+            55,
+            3,
+        );
+        assert!(
+            app.engine.context_menu.is_some(),
+            "test precondition: context menu must be open"
+        );
+
+        let mut backend = backend_at(80.0, 24.0);
+        {
+            let (_, modal_stack) = backend.drag_and_modal_mut();
+            assert!(
+                modal_stack
+                    .hit_test(quadraui::Point::new(55.0, 3.0))
+                    .is_none(),
+                "test precondition: nothing may be on the modal stack, \
+                 otherwise this would re-test modal_blocks_event"
+            );
+        }
+
+        app.handle_mouse_event(
+            UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(55.0, 3.0),
+                modifiers: quadraui::Modifiers::default(),
+            },
+            &mut backend,
+        );
+
+        assert!(
+            !app.engine.explorer_has_focus && !app.sidebar.has_focus,
+            "an open explorer context menu must block the TreeController \
+             intercept so the click reaches mouse.rs's ctx-menu confirm \
+             instead of being consumed as a tree row activation (#456)"
         );
     }
 }
