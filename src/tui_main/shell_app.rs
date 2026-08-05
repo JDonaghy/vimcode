@@ -93,12 +93,16 @@
 //! sets `engine.menu_bar_visible = true` on an Alt+<letter> keypress so the
 //! same keystroke both reveals and activates the menu), the `MenuSystem`
 //! intercept, full mouse dispatch through `handle_mouse_event` (#602), and
-//! — #603 (Stage 4) — the full `KeyPressed` dispatch chain (modal dialog /
-//! context-menu intercepts, then the general `Engine::handle_key` fallback
-//! that also resolves command-palette and completion-popup state
-//! internally). See `handle_key_pressed`'s own doc comment for the exact
-//! precedence chain and why it's a free function rather than a
-//! `TuiShellApp` method.
+//! — #603 (Stage 4) — the `KeyPressed` dispatch chain (modal dialog /
+//! folder-picker-modal / context-menu intercepts, then the general
+//! `Engine::handle_key` fallback that also resolves command-palette and
+//! completion-popup state internally). This is *not* the full
+//! `mod.rs:1629`-`:2737` precedence chain: activity-bar-focused,
+//! sidebar-focused, and command-output-selection (`cmd_sel`) keyboard tiers
+//! are still unported, since their gating focus state is set almost
+//! entirely by `mouse::handle_mouse`. See `handle_key_pressed`'s own doc
+//! comment for the exact precedence chain and this gap's full detail, and
+//! for why it's a free function rather than a `TuiShellApp` method.
 
 use std::cell::{Cell, RefCell};
 
@@ -848,9 +852,10 @@ impl ShellApp for TuiShellApp {
         }
 
         match event {
-            // #603 (Stage 4): dialog / context-menu / general
-            // `Engine::handle_key` fallback — see `handle_key_pressed`'s
-            // doc comment for the precedence chain.
+            // #603 (Stage 4): dialog / folder-picker / context-menu /
+            // general `Engine::handle_key` fallback — see
+            // `handle_key_pressed`'s doc comment for the precedence chain
+            // and its unported-tiers gap note.
             UiEvent::KeyPressed {
                 key,
                 modifiers,
@@ -1148,13 +1153,23 @@ fn dispatch_panel_accelerator_sizeless(
     }
 }
 
-/// Route a `KeyPressed` event through `Engine::handle_key`, replicating
-/// `event_loop()`'s three-tier precedence for it (`mod.rs:1629`-`:2737`):
+/// Route a `KeyPressed` event through `Engine::handle_key`, replicating four
+/// of `event_loop()`'s precedence tiers for it (`mod.rs:1629`-`:2737`) —
+/// see the "Not ported" note below for the tiers this function deliberately
+/// skips:
 ///
 /// 1. **Modal dialog** (`mod.rs:1629`-`:1651`) intercepts *all* keys —
 ///    checked first and returns unconditionally, exactly like the legacy
 ///    loop's own early `continue`.
-/// 2. **Context menu** (`mod.rs:2608`-`:2635`) — checked ahead of
+/// 2. **Folder picker modal** (`mod.rs:1653`-`:1708`) — checked next,
+///    ahead of context-menu/general-fallback, because it operates purely
+///    on `folder_picker: &mut Option<FolderPickerState>` (mirroring how
+///    `sidebar`/`context_menu` state is already threaded through) and,
+///    like the modal dialog above, must intercept every key once open —
+///    type-to-filter, Up/Down/j/k, Enter, Esc, `-`, Backspace — so they
+///    never fall through to `Engine::handle_key` and get misinterpreted as
+///    Normal/Insert-mode editor input.
+/// 3. **Context menu** (`mod.rs:2608`-`:2635`) — checked ahead of
 ///    `Engine::handle_key`, even though `Engine::handle_key` has its own
 ///    context-menu branch (`keys.rs:66`-`:71`), because the engine's copy
 ///    only consumes the key and discards the resulting action. This
@@ -1162,7 +1177,7 @@ fn dispatch_panel_accelerator_sizeless(
 ///    [`handle_explorer_context_action`] (new_file/rename/delete/
 ///    open_terminal/find_in_folder/…), which needs TUI-local state
 ///    (`sidebar`, terminal size) `Engine::handle_key` has no access to.
-/// 3. **General fallback** (`mod.rs:2637`-`:2737`) — this is also where
+/// 4. **General fallback** (`mod.rs:2637`-`:2737`) — this is also where
 ///    command-palette (`picker_open`) and completion-popup
 ///    (`completion_idx`) keys land: `Engine::handle_key` already resolves
 ///    both internally (see `keys.rs`'s own precedence chain), so this
@@ -1172,6 +1187,18 @@ fn dispatch_panel_accelerator_sizeless(
 ///    size or TUI-local state (`folder_picker`, `sidebar`): open terminal,
 ///    toggle-maximize, run-in-terminal, folder/workspace/recent dialogs,
 ///    quit confirmation.
+///
+/// **Not ported (gap, tracked alongside #602):** `mod.rs:1629`-`:2737` also
+/// contains an activity-bar-focused tier (`mod.rs:1711`), a sidebar-focused
+/// tier with its own nested context-menu/explorer-key intercept
+/// (`mod.rs:1760`+), and command-output-selection (`cmd_sel`) handling —
+/// none of which this function replicates. Deferred alongside the
+/// already-acknowledged mouse gap (#602) since all three tiers gate on
+/// focus/selection state (`activity_bar_focused`, `sidebar.has_focus`,
+/// `cmd_sel`) that today is set almost entirely by `mouse::handle_mouse`,
+/// which this dormant `handle()` doesn't call yet; a future session should
+/// re-check whether keyboard-only focus transitions exist before assuming
+/// this is purely a mouse-side gap.
 ///
 /// Translates the backend-neutral `Key`/`Modifiers` into the
 /// `(key_name, unicode, ctrl)` shape `Engine::handle_key` expects by
@@ -1223,6 +1250,66 @@ fn handle_key_pressed(
                 }
                 _ => {}
             }
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Folder picker modal (mirrors mod.rs:1653-:1708) ─────────────────
+    // Checked ahead of the context-menu/general-fallback tiers, exactly
+    // like the legacy loop, so that once `EngineAction::OpenFolderDialog`
+    // (below) populates `folder_picker`, every subsequent key — type-to-
+    // filter, Up/Down/j/k, Enter, Esc, `-`, Backspace — goes to the picker
+    // instead of falling through to `Engine::handle_key` and being
+    // misinterpreted as Normal/Insert-mode editor input.
+    if folder_picker.is_some() && key_event.kind != KeyEventKind::Release {
+        let picker_ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+        let picker = folder_picker.as_mut().unwrap();
+        match key_event.code {
+            KeyCode::Esc => {
+                *folder_picker = None;
+            }
+            KeyCode::Enter => {
+                // Check if ".." was selected — navigate up instead of opening.
+                let is_dotdot = picker
+                    .filtered
+                    .get(picker.selected)
+                    .map(|p| p.as_os_str() == "..")
+                    .unwrap_or(false);
+                if is_dotdot {
+                    picker.navigate_up();
+                } else if let Some(path) = picker.selected_path() {
+                    *folder_picker = None;
+                    engine.open_folder(&path);
+                    *sidebar = TuiSidebar::new();
+                    engine.explorer_rebuild_rows();
+                    if let Some(path) = engine.file_path().cloned() {
+                        engine.explorer_reveal_path(&path);
+                    }
+                }
+            }
+            // '-' navigates up to the parent directory (like vim netrw).
+            KeyCode::Char('-') if !picker_ctrl => {
+                picker.navigate_up();
+            }
+            KeyCode::Up | KeyCode::Char('k') if !picker_ctrl => {
+                picker.move_up();
+            }
+            KeyCode::Down | KeyCode::Char('j') if !picker_ctrl => {
+                picker.move_down();
+            }
+            KeyCode::Backspace => {
+                picker.pop_char();
+            }
+            KeyCode::Char(c) if !picker_ctrl => {
+                picker.push_char(c);
+            }
+            _ => {}
+        }
+        // Keep scroll in sync with selection.
+        if let Some(ref mut picker) = folder_picker {
+            let popup_h = ((screen_h as usize) * 55 / 100).max(15);
+            let visible_rows = popup_h.saturating_sub(4);
+            picker.sync_scroll(visible_rows);
         }
         return Reaction::Redraw;
     }
@@ -2011,6 +2098,60 @@ mod tests {
             "dialog should remain open after a navigation key"
         );
         assert_eq!(engine.dialog.as_ref().unwrap().selected, 1);
+    }
+
+    /// `handle_key_pressed`'s folder-picker branch must intercept keys once
+    /// `folder_picker` is populated (mirrors `mod.rs:1653`-`:1708`), ahead
+    /// of the context-menu/general-fallback branches — this is the
+    /// regression the tier guards against: without it, a keystroke like
+    /// `'x'` (a bare-letter Normal-mode delete-char motion) would fall
+    /// through to `Engine::handle_key` instead of updating the picker's
+    /// type-to-filter `query`. Also confirms `Esc` dismisses the picker.
+    #[test]
+    fn handle_key_pressed_folder_picker_intercepts_keys() {
+        let mut engine = Engine::new();
+        let cwd = engine.cwd.clone();
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = Some(FolderPickerState::new(
+            &cwd,
+            FolderPickerMode::OpenFolder,
+            engine.settings.show_hidden_files,
+        ));
+
+        let reaction = handle_key_pressed(
+            quadraui::Key::Char('x'),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+        );
+        assert_eq!(reaction, Reaction::Redraw);
+        assert_eq!(
+            folder_picker.as_ref().map(|p| p.query.as_str()),
+            Some("x"),
+            "'x' should filter the picker's entry list, not reach Engine::handle_key \
+             as a delete-char motion"
+        );
+
+        let reaction = handle_key_pressed(
+            quadraui::Key::Named(quadraui::NamedKey::Escape),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+        );
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(folder_picker.is_none(), "Esc should dismiss the picker");
     }
 
     /// `handle_key_pressed`'s context-menu branch must dispatch the
