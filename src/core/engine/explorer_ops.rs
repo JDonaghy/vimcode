@@ -522,6 +522,33 @@ pub fn build_explorer_rows(
     out
 }
 
+/// Ordering used to sort explorer entries: directories before files, then by
+/// name (respecting `case_insensitive`). Takes the directory-ness and name
+/// already resolved rather than a filesystem handle, so it never touches the
+/// filesystem and is a total order by construction -- see `collect_explorer_rows`
+/// for why that matters (#631).
+fn explorer_entry_cmp(
+    a_is_dir: bool,
+    a_name: &std::ffi::OsStr,
+    b_is_dir: bool,
+    b_name: &std::ffi::OsStr,
+    case_insensitive: bool,
+) -> std::cmp::Ordering {
+    match (a_is_dir, b_is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => {
+            if case_insensitive {
+                let an = a_name.to_string_lossy().to_lowercase();
+                let bn = b_name.to_string_lossy().to_lowercase();
+                an.cmp(&bn)
+            } else {
+                a_name.cmp(b_name)
+            }
+        }
+    }
+}
+
 fn collect_explorer_rows(
     dir: &Path,
     depth: usize,
@@ -534,31 +561,32 @@ fn collect_explorer_rows(
         Ok(e) => e,
         Err(_) => return,
     };
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    entries.sort_by(|a, b| {
-        let ad = a.path().is_dir();
-        let bd = b.path().is_dir();
-        match (ad, bd) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => {
-                if case_insensitive {
-                    let an = a.file_name().to_string_lossy().to_lowercase();
-                    let bn = b.file_name().to_string_lossy().to_lowercase();
-                    an.cmp(&bn)
-                } else {
-                    a.file_name().cmp(&b.file_name())
-                }
-            }
-        }
+    // Decorate-sort-undecorate: resolve each entry's directory-ness exactly once,
+    // before sorting, rather than inside the comparator. `DirEntry::path().is_dir()`
+    // issues a fresh `stat()` (following symlinks) on every call, so calling it from
+    // the comparator re-stats the same entries repeatedly over the life of the sort.
+    // If the directory mutates concurrently -- or an entry disappears, which
+    // `is_dir()` silently reports as `false` -- the same entry can answer `true`
+    // early in the sort and `false` later, breaking the total order `sort_by`
+    // requires and panicking (#631). Precomputing the key makes the comparator pure
+    // and total by construction, and this also reuses the same value for the row's
+    // `is_dir` below instead of stat-ing again.
+    let mut entries: Vec<(bool, std::fs::DirEntry)> = entries
+        .filter_map(|e| e.ok())
+        .map(|entry| {
+            let is_dir = entry.path().is_dir();
+            (is_dir, entry)
+        })
+        .collect();
+    entries.sort_by(|(ad, a), (bd, b)| {
+        explorer_entry_cmp(*ad, &a.file_name(), *bd, &b.file_name(), case_insensitive)
     });
-    for entry in entries {
+    for (is_dir, entry) in entries {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') && !show_hidden {
             continue;
         }
-        let is_dir = path.is_dir();
         let is_expanded = is_dir && expanded.contains(&path);
         out.push(ExplorerRow {
             depth,
@@ -577,5 +605,174 @@ fn collect_explorer_rows(
                 out,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod explorer_sort_tests {
+    use super::explorer_entry_cmp;
+    use std::cmp::Ordering;
+    use std::ffi::OsStr;
+
+    // Regression coverage for #631: `explorer_entry_cmp` is the pure key
+    // comparator extracted from `collect_explorer_rows`'s sort. Because it takes
+    // an already-resolved `is_dir` bool instead of re-stat-ing the filesystem,
+    // it is total and transitive by construction -- unlike the old comparator,
+    // which could observe a directory mutate mid-sort and answer inconsistently,
+    // violating the total order `sort_by` requires and panicking.
+    //
+    // "Factoring the comparator out to take a precomputed `is_dir` and unit-
+    // testing its totality directly" is exactly the cheaper regression strategy
+    // the issue calls out as preferable to racing a second thread against the
+    // real sort.
+
+    #[derive(Clone, Copy)]
+    struct Entry<'a> {
+        is_dir: bool,
+        name: &'a str,
+    }
+
+    fn cmp(a: Entry, b: Entry, case_insensitive: bool) -> Ordering {
+        explorer_entry_cmp(
+            a.is_dir,
+            OsStr::new(a.name),
+            b.is_dir,
+            OsStr::new(b.name),
+            case_insensitive,
+        )
+    }
+
+    #[test]
+    fn dirs_sort_before_files_regardless_of_name() {
+        let dir = Entry {
+            is_dir: true,
+            name: "zzz",
+        };
+        let file = Entry {
+            is_dir: false,
+            name: "aaa",
+        };
+        assert_eq!(cmp(dir, file, false), Ordering::Less);
+        assert_eq!(cmp(file, dir, false), Ordering::Greater);
+    }
+
+    #[test]
+    fn same_kind_sorts_by_name() {
+        let a = Entry {
+            is_dir: false,
+            name: "alpha.txt",
+        };
+        let b = Entry {
+            is_dir: false,
+            name: "beta.rs",
+        };
+        assert_eq!(cmp(a, b, false), Ordering::Less);
+        assert_eq!(cmp(b, a, false), Ordering::Greater);
+    }
+
+    #[test]
+    fn case_insensitive_flag_is_respected() {
+        let upper = Entry {
+            is_dir: false,
+            name: "Beta.rs",
+        };
+        let lower = Entry {
+            is_dir: false,
+            name: "alpha.txt",
+        };
+        // Case-sensitive: uppercase 'B' (0x42) sorts before lowercase 'a' (0x61).
+        assert_eq!(cmp(upper, lower, false), Ordering::Less);
+        // Case-insensitive: "alpha" < "beta" alphabetically.
+        assert_eq!(cmp(upper, lower, true), Ordering::Greater);
+    }
+
+    #[test]
+    fn comparator_is_reflexive_and_total_over_a_fixture_set() {
+        // The same entry, asked twice, must always answer consistently -- the
+        // exact property the old fs-querying comparator violated when a
+        // directory disappeared or changed kind mid-sort.
+        let entries = [
+            Entry {
+                is_dir: true,
+                name: "subdir",
+            },
+            Entry {
+                is_dir: true,
+                name: "another",
+            },
+            Entry {
+                is_dir: false,
+                name: "alpha.txt",
+            },
+            Entry {
+                is_dir: false,
+                name: "beta.rs",
+            },
+            Entry {
+                is_dir: false,
+                name: ".hidden",
+            },
+        ];
+
+        for &a in &entries {
+            // Reflexivity: an entry compares equal to itself.
+            assert_eq!(cmp(a, a, false), Ordering::Equal);
+            for &b in &entries {
+                // Antisymmetry: swapping arguments reverses the ordering.
+                assert_eq!(cmp(a, b, false), cmp(b, a, false).reverse());
+                for &c in &entries {
+                    // Transitivity: a<=b and b<=c implies a<=c.
+                    if cmp(a, b, false) != Ordering::Greater
+                        && cmp(b, c, false) != Ordering::Greater
+                    {
+                        assert_ne!(
+                            cmp(a, c, false),
+                            Ordering::Greater,
+                            "transitivity violated for {:?}/{:?}/{:?}",
+                            a.name,
+                            b.name,
+                            c.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorting_a_fixture_set_never_panics_and_is_stable_on_repeat() {
+        // A direct stand-in for the original panic: run the real `sort_by`
+        // (which detects and panics on non-total comparators) over a fixture
+        // set repeatedly and assert the resulting order never changes, i.e.
+        // the comparator behaves as a pure, total order across repeated calls
+        // rather than drifting the way a live fs-stat comparator could.
+        let mut entries = vec![
+            Entry {
+                is_dir: true,
+                name: "subdir",
+            },
+            Entry {
+                is_dir: true,
+                name: "another",
+            },
+            Entry {
+                is_dir: false,
+                name: "alpha.txt",
+            },
+            Entry {
+                is_dir: false,
+                name: "beta.rs",
+            },
+        ];
+        entries.sort_by(|a, b| cmp(*a, *b, false));
+        let first_pass: Vec<&str> = entries.iter().map(|e| e.name).collect();
+
+        for _ in 0..50 {
+            entries.sort_by(|a, b| cmp(*a, *b, false));
+            let this_pass: Vec<&str> = entries.iter().map(|e| e.name).collect();
+            assert_eq!(this_pass, first_pass);
+        }
+
+        assert_eq!(first_pass, vec!["another", "subdir", "alpha.txt", "beta.rs"]);
     }
 }
