@@ -1319,15 +1319,19 @@ pub(super) fn render_debug_sidebar(
 /// Render the bottom panel tab bar (Terminal | Debug Output) via
 /// `quadraui::Backend::draw_tab_bar`. Returns `TabBarHits` for the
 /// click handler (caller caches on `engine.bottom_tab_bar_hits`).
+///
+/// #608: `backend` widened to `&mut dyn quadraui::Backend` — this renderer
+/// was already trait-pure, same rationale as `render_search_panel` (#607).
+/// `draw_frame`'s own call site keeps compiling unchanged: `&mut TuiBackend`
+/// coerces to `&mut dyn Backend` at the call.
 pub(super) fn render_bottom_panel_tabs(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     active: &render::BottomPanelKind,
     has_terminal: bool,
     has_debug_output: bool,
     theme: &Theme,
 ) -> quadraui::TabBarHits {
-    use quadraui::Backend;
     let bar = render::build_bottom_panel_tab_bar(active, has_terminal, has_debug_output);
     let q_rect = quadraui::Rect::new(
         area.x as f32,
@@ -1335,20 +1339,24 @@ pub(super) fn render_bottom_panel_tabs(
         area.width as f32,
         area.height as f32,
     );
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_tab_bar(q_rect, &bar, None)
 }
 
 // ─── Quickfix panel ───────────────────────────────────────────────────────────
 
+/// #608: `backend` widened to `&mut dyn quadraui::Backend` — this renderer
+/// was already trait-pure (a single `Backend::draw_list` call), same
+/// rationale as `render_search_panel` (#607). `draw_frame`'s own call site
+/// keeps compiling unchanged: `&mut TuiBackend` coerces to `&mut dyn
+/// Backend` at the call.
 pub(super) fn render_quickfix_panel(
     area: Rect,
     qf: &render::QuickfixPanel,
     scroll_top: usize,
     theme: &Theme,
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
 ) {
-    use quadraui::Backend;
     if area.height == 0 {
         return;
     }
@@ -1365,7 +1373,7 @@ pub(super) fn render_quickfix_panel(
         area.width as f32,
         area.height as f32,
     );
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_list(q_rect, &list);
 }
 
@@ -1373,14 +1381,18 @@ pub(super) fn render_quickfix_panel(
 
 /// Render the terminal toolbar row (find bar or tab strip) through
 /// quadraui primitives. Returns cached hit data for click dispatch.
+///
+/// #608: `backend` widened to `&mut dyn quadraui::Backend` — this renderer
+/// was already trait-pure, same rationale as `render_search_panel` (#607).
+/// `draw_frame`'s own call site keeps compiling unchanged: `&mut TuiBackend`
+/// coerces to `&mut dyn Backend` at the call.
 pub(super) fn render_terminal_toolbar(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     panel: &render::TerminalPanel,
     theme: &Theme,
 ) -> crate::core::engine::TerminalToolbarHits {
     use crate::core::engine::TerminalToolbarHits;
-    use quadraui::Backend;
 
     let toolbar = render::build_terminal_toolbar(panel, theme);
     let q_rect = quadraui::Rect::new(
@@ -1389,7 +1401,7 @@ pub(super) fn render_terminal_toolbar(
         area.width as f32,
         area.height as f32,
     );
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     match toolbar {
         render::TerminalToolbar::FindBar(bar) => {
             let _regions = backend.draw_status_bar(q_rect, &bar, None, None);
@@ -1462,6 +1474,80 @@ pub(super) fn render_terminal_panel(
         } else if let Some(ref term) = td.single {
             backend.draw_terminal(q_area, term);
         }
+    }
+}
+
+/// Trait-pure counterpart to [`render_terminal_panel`] for
+/// [`super::shell_app::TuiShellApp::render_content`] (#608).
+///
+/// `render_terminal_panel`'s two raw-`Frame` uses are handled differently
+/// here: the background-clear `set_cell` loop is replaced with the same
+/// `Backend::draw_status_bar`-blank-segment trick #607 used for the
+/// explorer sidebar's background (`render_explorer_sidebar_content` above)
+/// — `draw_status_bar`'s TUI rasteriser always fills the *entire* row with
+/// the first segment's `bg` before painting text, so an empty-text segment
+/// reproduces the old solid-fill behavior exactly. `Backend::draw_terminal`
+/// itself is already a trait method (works via `TuiBackend`'s smuggled
+/// frame pointer — see `shell_app.rs`'s module doc gap 1), so the actual
+/// cell-grid paint needs no change at all.
+///
+/// Known gap: split terminal panes (`Ctrl+\`, i.e. `panel.split_left_rows`
+/// is `Some`) are NOT painted here. `render_terminal_panel`'s split arm
+/// draws the divider line via `quadraui::tui::draw_terminal_divider`, a
+/// free rasteriser with no `Backend::draw_*` trait equivalent (checked
+/// against quadraui's `Backend` trait — the same class of gap as
+/// `draw_settings_chrome`), so there is no way to paint a correctly
+/// divided split from this signature; the area is left untouched (still
+/// background-cleared) rather than drawing an undivided pane that would
+/// misrepresent the split state. Filed as part of this stage's documented
+/// gap list (`shell_app.rs`'s module doc).
+pub(super) fn render_terminal_panel_content(
+    backend: &mut dyn quadraui::Backend,
+    area: Rect,
+    panel: &render::TerminalPanel,
+    theme: &Theme,
+    engine: &Engine,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let q_theme = super::quadraui_tui::q_theme(theme);
+    backend.set_theme(q_theme);
+
+    let bg_bar = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("terminal:bg"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: String::new(),
+            fg: render::to_quadraui_color(theme.status_fg),
+            bg: render::to_quadraui_color(theme.terminal_bg),
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![],
+    };
+    for y in area.y..area.y + area.height {
+        let row_rect = quadraui::Rect::new(area.x as f32, y as f32, area.width as f32, 1.0);
+        let _ = backend.draw_status_bar(row_rect, &bg_bar, None, None);
+    }
+
+    if panel.split_left_rows.is_some() {
+        // Known gap — see doc comment above. Background is cleared but the
+        // split content and divider are not drawn.
+        engine.terminal_split_layout.replace(None);
+        return;
+    }
+
+    let q_area = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        area.height as f32,
+    );
+    let td = render::build_terminal_draw_data(panel, q_area, 1.0, 1.0, area.height as usize, None);
+    engine.terminal_split_layout.replace(td.split);
+    backend.set_theme(q_theme);
+    if let Some(ref term) = td.single {
+        backend.draw_terminal(q_area, term);
     }
 }
 

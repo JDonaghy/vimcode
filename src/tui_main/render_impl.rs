@@ -170,6 +170,86 @@ pub(super) fn build_screen_for_shell_content(
     build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true)
 }
 
+/// Quickfix panel + bottom panel (terminal/debug output) rects for
+/// [`super::shell_app::TuiShellApp::render_content`] (#608).
+///
+/// quadraui's `AppShellLayout` has no concept of quickfix/terminal/
+/// debug-toolbar/wildmenu rows — vimcode-specific chrome that `draw_frame`'s
+/// own vertical `Layout::split` (its `v_chunks` block) computes today from
+/// the *live* editor column. This mirrors that split over `area` (==
+/// `layout.main_content_bounds` from `render_content`, already carved of
+/// activity-bar/sidebar width by quadraui's `AppShell::render`, exactly the
+/// same "editor column" `draw_frame`'s `right_col` is) so the shell-content
+/// path's quickfix/bottom-panel rects land at the same coordinates the live
+/// path would use, and the space `build_screen_for_shell_content` reserved
+/// above (subtracted from `content_rows`) lines up with what's actually
+/// carved out here — same reserved-but-unpainted treatment `render_content`
+/// already gives the menu-bar row applies to debug-toolbar/wildmenu/status
+/// here too (their heights are still subtracted so the chunks below them
+/// don't shift, but only quickfix + bottom panel are returned/painted this
+/// stage — the rest is #603/#609 territory).
+///
+/// Investigated per this issue's scope note: quadraui's own generic
+/// `ShellConfig::with_bottom_panel` / `BottomPanelController`
+/// (`shell_adapter.rs`, `compose/app_shell.rs`) model a single resizable
+/// drawer, not vimcode's stack of independently-toggleable
+/// quickfix/terminal/debug-toolbar/wildmenu rows, and `TuiShellApp`'s own
+/// `ShellConfig` (this module's `#[cfg(test)] config()`) doesn't call
+/// `with_bottom_panel` — so `layout.bottom_panel_bounds` is always `None`
+/// today. Carving a private sub-region out of `main_content_bounds`, matching
+/// `draw_frame`, is therefore the only option that doesn't require a much
+/// larger `ShellConfig`/layout-model change.
+pub(super) struct BottomChromeRects {
+    pub(super) quickfix: Rect,
+    pub(super) bottom_panel: Rect,
+}
+
+pub(super) fn bottom_chrome_rects_for_shell_content(
+    engine: &Engine,
+    screen: &render::ScreenLayout,
+    area: Rect,
+) -> BottomChromeRects {
+    let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let bottom_panel_height: u16 = if bottom_panel_open {
+        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
+        engine.effective_terminal_panel_rows(target) + 2
+    } else {
+        0
+    };
+    let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
+    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
+    let per_window_status = engine.settings.window_status_line;
+    let global_status_height: u16 = if per_window_status { 0 } else { 1 };
+    let separated_status_height: u16 = if screen.separated_status_line.is_some() {
+        1
+    } else {
+        0
+    };
+
+    // Mirrors `draw_frame`'s `v_chunks` layout exactly (see its own comment)
+    // so `content_rows`'s reservation in `build_screen_for_shell_content`
+    // and the rects carved here can't drift apart.
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),                          // 0: editor
+            Constraint::Length(qf_height),               // 1: quickfix
+            Constraint::Length(bottom_panel_height),     // 2: terminal/debug bottom panel
+            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar (unpainted, #603)
+            Constraint::Length(separated_status_height), // 4: separated status (unpainted)
+            Constraint::Length(wildmenu_height),         // 5: wildmenu (unpainted, #603)
+            Constraint::Length(global_status_height),    // 6: global status (unpainted)
+            Constraint::Length(1),                       // 7: cmd (unpainted)
+        ])
+        .split(area);
+
+    BottomChromeRects {
+        quickfix: v_chunks[1],
+        bottom_panel: v_chunks[2],
+    }
+}
+
 // ─── Frame rendering ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]

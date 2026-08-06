@@ -71,9 +71,39 @@
 //!      (`render_ai_sidebar` takes `buf: &mut ratatui::buffer::Buffer`
 //!      directly — no backend parameter at all, the most raw of the
 //!      lot).
-//!    - Quickfix panel + bottom panel/terminal PTY content (#608).
 //!    - Window/group divider lines + tab-drag overlay + tab-hover tooltip
 //!      (#609).
+//!
+//!    #608 (Stage 2b, closed) additionally wires the quickfix panel and the
+//!    bottom panel (terminal/debug output) into `render_content`, via
+//!    `render_impl.rs::bottom_chrome_rects_for_shell_content` (carves their
+//!    rects out of `layout.main_content_bounds` by hand, mirroring
+//!    `draw_frame`'s own `v_chunks` split — `AppShellLayout` has no concept
+//!    of either row, and quadraui's own generic `ShellConfig
+//!    ::with_bottom_panel` / `BottomPanelController`
+//!    (`shell_adapter.rs`/`compose/app_shell.rs`) model a single resizable
+//!    drawer, not vimcode's stack of independently-toggleable
+//!    quickfix/terminal/debug-toolbar/wildmenu rows, and isn't wired for
+//!    `TuiShellApp` regardless — see `bottom_chrome_rects_for_shell_content`'s
+//!    doc comment for the full investigation) + `panels::render_quickfix_panel`
+//!    / `panels::render_bottom_panel_tabs` / `panels::render_terminal_toolbar`
+//!    (all three widened to `&mut dyn quadraui::Backend`, same treatment
+//!    #607 gave `render_search_panel`/`render_debug_sidebar` — they were
+//!    already trait-pure) + a new `panels::render_terminal_panel_content`
+//!    (trait-pure counterpart to `render_terminal_panel`'s raw-`Frame`
+//!    background-clear loop, using the same `draw_status_bar`-blank-segment
+//!    trick #607 introduced) for the Terminal tab, or
+//!    `Backend::draw_text_display` (already trait-pure) for the Debug
+//!    Output tab. Known gap: **split terminal panes** (`Ctrl+\`,
+//!    `panel.split_left_rows.is_some()`) are NOT painted —
+//!    `render_terminal_panel`'s split arm draws the divider via
+//!    `quadraui::tui::draw_terminal_divider`, a free rasteriser with no
+//!    `Backend::draw_*` trait equivalent (same class of gap as
+//!    `draw_settings_chrome`), so a correctly-divided split can't be
+//!    painted from this signature; `render_terminal_panel_content` clears
+//!    the background and leaves it otherwise blank rather than drawing an
+//!    undivided pane that would misrepresent the split state. See
+//!    `panels::render_terminal_panel_content`'s own doc comment.
 //!
 //!    The menu bar row is reserved in the layout math but not painted
 //!    either (out of scope for #601; folds into key dispatch, #603).
@@ -830,6 +860,149 @@ impl ShellApp for TuiShellApp {
             &mut editor_hover_scrollbar,
         );
         self.editor_hover_popup_rect.set(editor_hover_popup_rect);
+
+        // ── Quickfix panel + bottom panel (terminal/debug output) (#608) ──
+        // `AppShellLayout` has no concept of either — see
+        // `bottom_chrome_rects_for_shell_content`'s doc comment for why
+        // their rects are carved out of `area` (== `main_content_bounds`)
+        // by hand, matching `draw_frame`'s own `v_chunks` layout, rather
+        // than sourced from `layout.bottom_panel_bounds` (quadraui's
+        // generic single-drawer `BottomPanelController`, a different shape
+        // than vimcode's stacked chrome, and unwired for `TuiShellApp`
+        // regardless — always `None` here).
+        let chrome = bottom_chrome_rects_for_shell_content(&self.engine, &screen, area);
+
+        if let Some(ref qf) = screen.quickfix {
+            render_quickfix_panel(
+                chrome.quickfix,
+                qf,
+                self.quickfix_scroll_top,
+                &theme,
+                backend,
+            );
+        }
+
+        if chrome.bottom_panel.height > 0 {
+            self.engine.bottom_panel_geometry.replace(Some(
+                crate::core::engine::BottomPanelGeometry {
+                    top_y: chrome.bottom_panel.y as f64,
+                    height: chrome.bottom_panel.height as f64,
+                    toolbar_y: 1.0,
+                    content_y: 2.0,
+                    content_row_h: 1.0,
+                },
+            ));
+            let tab_bar_area = Rect {
+                x: chrome.bottom_panel.x,
+                y: chrome.bottom_panel.y,
+                width: chrome.bottom_panel.width,
+                height: 1,
+            };
+            let content_area = Rect {
+                x: chrome.bottom_panel.x,
+                y: chrome.bottom_panel.y + 1,
+                width: chrome.bottom_panel.width,
+                height: chrome.bottom_panel.height.saturating_sub(1),
+            };
+            let hits = render_bottom_panel_tabs(
+                backend,
+                tab_bar_area,
+                &self.engine.bottom_panel_kind,
+                self.engine.terminal_open,
+                !screen.bottom_tabs.output_lines.is_empty(),
+                &theme,
+            );
+            self.engine.bottom_tab_bar_hits.replace(Some(hits));
+            match self.engine.bottom_panel_kind {
+                render::BottomPanelKind::Terminal => {
+                    if let Some(ref term) = screen.bottom_tabs.terminal {
+                        let toolbar_area = Rect {
+                            x: content_area.x,
+                            y: content_area.y,
+                            width: content_area.width,
+                            height: 1,
+                        };
+                        let hits = render_terminal_toolbar(backend, toolbar_area, term, &theme);
+                        self.engine.terminal_toolbar_hits.replace(Some(hits));
+                        let term_content = Rect {
+                            x: content_area.x,
+                            y: content_area.y + 1,
+                            width: content_area.width,
+                            height: content_area.height.saturating_sub(1),
+                        };
+                        render_terminal_panel_content(
+                            backend,
+                            term_content,
+                            term,
+                            &theme,
+                            &self.engine,
+                        );
+                        self.engine
+                            .scroll_surfaces
+                            .borrow_mut()
+                            .push(quadraui::ScrollSurface {
+                                id: quadraui::WidgetId::new("terminal_scrollback"),
+                                bounds: quadraui::Rect::new(
+                                    term_content.x as f32,
+                                    term_content.y as f32,
+                                    term_content.width as f32,
+                                    term_content.height as f32,
+                                ),
+                                scrollbar: None,
+                            });
+                    }
+                }
+                render::BottomPanelKind::DebugOutput => {
+                    let td = render::debug_output_to_text_display(
+                        &screen.bottom_tabs.output_lines,
+                        self.engine.debug_output_scroll,
+                        self.engine.debug_output_auto_scroll,
+                    );
+                    let q_rect = quadraui::Rect::new(
+                        content_area.x as f32,
+                        content_area.y as f32,
+                        content_area.width as f32,
+                        content_area.height as f32,
+                    );
+                    let td_layout = backend.text_display_layout(q_rect, &td);
+                    backend.draw_text_display(q_rect, &td);
+                    let scrollbar = td_layout.scrollbar_bounds.zip(td_layout.thumb_bounds).map(
+                        |(track, thumb)| {
+                            let offset_y = q_rect.y;
+                            quadraui::SurfaceScrollbar {
+                                axis: quadraui::ScrollAxis::Vertical,
+                                track_bounds: quadraui::Rect::new(
+                                    q_rect.x + track.x,
+                                    offset_y + track.y,
+                                    track.width,
+                                    track.height,
+                                ),
+                                thumb_bounds: quadraui::Rect::new(
+                                    q_rect.x + thumb.x,
+                                    offset_y + thumb.y,
+                                    thumb.width,
+                                    thumb.height,
+                                ),
+                                total_items: td.lines.len(),
+                                visible_items: td_layout.visible_lines.len(),
+                                scroll_offset: td_layout.resolved_scroll_offset,
+                                inverted: false,
+                            }
+                        },
+                    );
+                    self.engine
+                        .scroll_surfaces
+                        .borrow_mut()
+                        .push(quadraui::ScrollSurface {
+                            id: quadraui::WidgetId::new("debug_output"),
+                            bounds: q_rect,
+                            scrollbar,
+                        });
+                }
+            }
+        } else {
+            self.engine.bottom_panel_geometry.replace(None);
+        }
     }
 
     fn handle(
@@ -1628,6 +1801,86 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #608: `render_content` must also paint the *quickfix panel* — a
+    /// persistent bottom strip vimcode's own row math carves out of
+    /// `layout.main_content_bounds` (quadraui's `AppShellLayout` has no
+    /// concept of it) — via `bottom_chrome_rects_for_shell_content` +
+    /// `panels::render_quickfix_panel`. Seeds a single match with a
+    /// distinctive `line_text` (short enough to survive the
+    /// `file:line: snippet` formatting `render.rs`'s quickfix adapter
+    /// applies) and opens the panel directly on `engine` state, mirroring
+    /// how the live find-references flow sets `quickfix_items` +
+    /// `quickfix_open` (`core/engine/panels.rs`).
+    #[test]
+    fn render_content_paints_quickfix_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .quickfix_items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("zqxw608.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_608_QUICKFIX_MARKER".to_string(),
+            });
+        app.engine.quickfix_open = true;
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_608_QUICKFIX_MARKER"),
+            "quickfix panel content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #608: `render_content` must also paint the *bottom panel* (terminal
+    /// tab bar + Debug Output content) via
+    /// `bottom_chrome_rects_for_shell_content` + `render_bottom_panel_tabs`
+    /// + the `Backend::draw_text_display` branch (already trait-pure, no
+    /// raw `Frame`/`Buffer` access — see `shell_app.rs`'s module doc). Sets
+    /// `bottom_panel_open` + `bottom_panel_kind` directly (mirroring how a
+    /// real DAP session flips them, `core/engine/dap_ops.rs`) rather than
+    /// running an actual debug session, and seeds `dap_output_lines` with a
+    /// marker line.
+    #[test]
+    fn render_content_paints_bottom_panel_debug_output_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.bottom_panel_open = true;
+        app.engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
+        app.engine
+            .dap_output_lines
+            .push("ZQXW_608_DEBUG_OUTPUT_MARKER".to_string());
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_608_DEBUG_OUTPUT_MARKER"),
+            "bottom panel debug-output content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #608: the *terminal* branch of the bottom panel (tab bar label +
+    /// `panels::render_terminal_panel_content`, the trait-pure counterpart
+    /// to `render_terminal_panel`'s raw-`Frame` background-clear loop) must
+    /// also paint without panicking. Spawns a real PTY via
+    /// `terminal_new_tab` (same pattern `render.rs`'s own terminal tests
+    /// use) rather than asserting on the shell's prompt text, which is
+    /// environment-dependent — the tab bar's "Terminal" label
+    /// (`render::build_bottom_panel_tab_bar`) is the one deterministic
+    /// signal available that the terminal branch (not the Debug Output
+    /// branch above) painted.
+    #[test]
+    fn render_content_paints_bottom_panel_terminal_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.terminal_new_tab(80, 10);
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Terminal"),
+            "bottom panel terminal tab bar should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
     }
 
     /// `dispatch_panel_accelerator_sizeless`'s `ACC_TERMINAL_TOGGLE_MAX` arm
