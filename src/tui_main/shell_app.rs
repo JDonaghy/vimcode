@@ -24,8 +24,8 @@
 //! Three structural gaps were found while scoping Stage 0 (recorded as
 //! pinned `coord context` notes on vimcode#595). Gap 2 (mouse handling) is
 //! largely closed by #602 — dispatch is wired and the panel intercepts are
-//! ported — with one residual seam noted inline below; gaps 1 and 3
-//! (painting, cursor placement) remain open:
+//! ported — with one residual seam noted inline below. Gap 3 (cursor
+//! placement) closed by #604. Gap 1 (painting) remains open:
 //!
 //! 1. **Painting.** `render_content(&self, backend: &mut dyn Backend, ...)`
 //!    never gets a raw `ratatui::Frame` — confirmed structural, not just
@@ -45,11 +45,13 @@
 //!    `paint_editor_popups`. What #601 still cannot paint (true raw-buffer
 //!    holdouts, each filed as its own follow-on, all blocking #605
 //!    cutover): sidebar panel content (#607), quickfix panel + bottom
-//!    panel/terminal PTY content (#608), window/group divider lines +
-//!    tab-drag overlay + tab-hover tooltip (#609), and cursor placement
-//!    (#604 / quadraui#466). The menu bar row is reserved in the layout
-//!    math but not painted either (out of scope for #601; folds into key
-//!    dispatch, #603).
+//!    panel/terminal PTY content (#608), and window/group divider lines +
+//!    tab-drag overlay + tab-hover tooltip (#609). The menu bar row is
+//!    reserved in the layout math but not painted either (out of scope for
+//!    #601; folds into key dispatch, #603). Cursor placement used to be a
+//!    fourth raw-buffer holdout in this list (it needs `Frame::
+//!    set_cursor_position`, and `render_content` has no `Frame`) but #604
+//!    closed it a different way — see gap 3 below, now resolved.
 //! 2. **Mouse handling (#602, largely resolved).** `mouse::handle_mouse`
 //!    (~4,100 lines) takes `&mut quadraui::DragState` + `&mut
 //!    quadraui::ModalStack` directly via `TuiBackend::drag_and_modal_mut()`
@@ -77,18 +79,31 @@
 //!    Clears once the explorer menu paints through `render_content`, which
 //!    lands with the sidebar-content holdout (#607) since the menu anchors
 //!    over the sidebar, outside `main_content_bounds`.
-//! 3. **Editor cursor placement.** `Backend::draw_editor`'s
+//! 3. **Editor cursor placement (#604, closed).** `Backend::draw_editor`'s
 //!    `EditorPaintResult::cursor_position` is documented "host applies via
-//!    `Frame::set_cursor_position`", but no consumer of it exists anywhere
+//!    `Frame::set_cursor_position`", but no consumer of it existed anywhere
 //!    in quadraui's `shell_adapter`/TUI runner — `render_content` has no
-//!    Frame to call it on. Filed as quadraui#466: cache the position on
-//!    `TuiBackend`, apply it in `tui/run.rs::render_frame` the same way
-//!    `apply_selection_highlight` already runs post-`render_content`.
-//!    Tracked as #604.
+//!    `Frame` to call it on, and that's still true. quadraui#466 closed the
+//!    gap without needing one: `TuiBackend::draw_editor` now caches
+//!    `cursor_position` on itself unconditionally (regardless of whether
+//!    the caller had a `Frame`), and `tui/run.rs::render_frame` — the fn
+//!    `ShellAdapter::render` runs inside, shared by the live runner,
+//!    `run_with_shell`, and `TuiDriver` — takes the cached value and calls
+//!    `Frame::set_cursor_position` on the *real* `Frame` after
+//!    `render_content` returns, the same way `apply_selection_highlight`
+//!    already runs post-`render_content`. So `render_window`'s local
+//!    `frame: None` (still passed everywhere on this path, per gap 1) no
+//!    longer means "no cursor" — it only ever meant "can't paint dividers
+//!    and can't call `set_cursor_position` *from inside `render_content`*",
+//!    and the latter is now moot since `render_frame` does it one layer up.
+//!    Verified end-to-end (typed insert-mode `Bar` cursor reaching
+//!    `TestBackend`'s terminal cursor) by
+//!    `insert_mode_bar_cursor_reaches_terminal_frame_via_shell_app` below.
 //!
-//! Given (2) is now closed by #602 and (1)/(3) remain the only open
-//! structural gaps, `handle()` below implements every dispatch layer that
-//! doesn't need raw Frame access: panel-key accelerators, the "#318"
+//! Given (2) is now closed by #602, (3) is now closed by #604, and (1)
+//! remains the only open structural gap, `handle()` below implements every
+//! dispatch layer that doesn't need raw Frame access: panel-key
+//! accelerators, the "#318"
 //! Alt+menu-letter "reveal menu bar" shim (mirrors `mod.rs:1319`-`:1338` —
 //! sets `engine.menu_bar_visible = true` on an Alt+<letter> keypress so the
 //! same keystroke both reveals and activates the menu), the `MenuSystem`
@@ -1968,6 +1983,67 @@ mod tests {
         assert!(
             screen.contains("ZQXW_TYPED"),
             "typed text should reach the buffer via Engine::handle_key; screen:\n{screen}"
+        );
+    }
+
+    /// #604: closes gap 3. `render_content` never gets a raw `Frame` (see
+    /// the module doc), so `render_window`/`render_all_windows` always call
+    /// `Backend::draw_editor` with `frame: None` on the `ShellApp` path —
+    /// but quadraui#466 moved the `Frame::set_cursor_position` handoff out
+    /// of that call site entirely: `TuiBackend::draw_editor` now caches
+    /// `EditorPaintResult::cursor_position` on itself unconditionally, and
+    /// `quadraui::tui::run::render_frame` (the fn `ShellAdapter::render`
+    /// runs inside, shared by the live runner/`run_with_shell`/`TuiDriver`)
+    /// applies it to the real `Frame` *after* `render_content` returns — so
+    /// the missing raw-`Frame` access in `render_content` no longer matters
+    /// for cursor placement. Insert mode paints a `Bar` cursor (see
+    /// `render.rs`'s cursor-shape match), which is one of the two shapes
+    /// `draw_editor` reports a `cursor_position` for (the other is
+    /// `Underline`; `Block` inverts a buffer cell instead and reports
+    /// `None` — out of scope here). Derives the expected screen position
+    /// from where the typed marker actually painted (`TuiDriver::find`)
+    /// rather than hard-coding gutter/chrome offsets, so the assertion
+    /// stays correct regardless of line-number gutter width or how many
+    /// chrome rows (tab bar, breadcrumb bar) sit above the editor.
+    #[test]
+    fn insert_mode_bar_cursor_reaches_terminal_frame_via_shell_app() {
+        const MARKER: &str = "ZQXW_CURSOR_MARKER";
+
+        let app = TuiShellApp::new(None);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        driver.type_char('i'); // Normal -> Insert, Bar cursor shape.
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+
+        let (marker_x, marker_y) = driver
+            .find(MARKER)
+            .expect("typed marker should be visible on screen");
+        // `find` returns cell-*centre* coordinates (`col + 0.5`); the cursor
+        // sits one cell past the marker's last character, in the same row.
+        let marker_col = (marker_x - 0.5).round() as u16;
+        let expected = (
+            marker_col + MARKER.chars().count() as u16,
+            (marker_y - 0.5).round() as u16,
+        );
+
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some(expected),
+            "draw_editor's Bar cursor_position should reach Frame::set_cursor_position \
+             via render_frame, even though render_content passes frame: None"
+        );
+
+        // Confirm the handoff tracks a later frame too (not a first-paint
+        // fluke) — typing another char must shift the applied position by
+        // exactly one cell, mirroring quadraui's own
+        // `editor_bar_cursor_position_updates_across_frames`.
+        driver.type_char('!');
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some((expected.0 + 1, expected.1)),
+            "a later frame's draw_editor call must overwrite the previous cursor position"
         );
     }
 
