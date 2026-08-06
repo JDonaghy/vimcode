@@ -89,7 +89,7 @@ use ratatui::style::{Color as RColor, Modifier};
 use ratatui::Terminal;
 
 use crate::core::engine::EngineAction;
-use crate::core::window::{GroupId, SplitDirection};
+use crate::core::window::{GroupDivider, GroupId, SplitDirection};
 use crate::core::{Engine, Mode, OpenMode, WindowRect};
 use crate::icons;
 use crate::render::{self, build_screen_layout, Color, RenderedWindow, Theme};

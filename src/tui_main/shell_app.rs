@@ -71,8 +71,38 @@
 //!      (`render_ai_sidebar` takes `buf: &mut ratatui::buffer::Buffer`
 //!      directly — no backend parameter at all, the most raw of the
 //!      lot).
-//!    - Window/group divider lines + tab-drag overlay + tab-hover tooltip
-//!      (#609).
+//!
+//!    #609 (Stage 2c, closed) additionally wires the window/editor-group
+//!    divider lines, the tab-drag ghost overlay, and the tab-hover tooltip
+//!    into `render_content`. All three were raw `Buffer`/`Frame` writes in
+//!    `draw_frame` with no `Backend::draw_*` trait equivalent at the time
+//!    #601 scoped them out — #609 found none was actually needed: a
+//!    1-cell-wide (or 1-row) `StatusBar` with a single solid/text segment,
+//!    painted through `Backend::draw_status_bar`, reproduces a raw
+//!    `set_cell` write exactly (`render_impl.rs::draw_rule_cell`/
+//!    `draw_rule_row`) — the same trick quadraui's own
+//!    `compose::app_shell::AppShell::render` already uses for its generic
+//!    sidebar-resize divider, confirming the issue's hunch that no new
+//!    primitive was required. `render_separators` (within-group
+//!    `:split`/`:vsplit` dividers) and the group-level divider loop
+//!    (`split.dividers`, between `Ctrl+W v`/`Ctrl+W s` groups) both moved
+//!    to this trick and now run unconditionally in `render_all_windows`/
+//!    `draw_frame` — including on the *live* `draw_frame` path, which used
+//!    to read back `frame.buffer_mut()[(div_x - 1, y)]`'s painted symbol
+//!    to avoid a phantom double-divider beside an overflowing window's own
+//!    scrollbar (#481); that read-back is now `group_divider_cells`, a
+//!    pure data computation over `RenderedWindow` geometry shared by both
+//!    callers — see its doc comment. The tab-drag overlay reads
+//!    `TuiShellApp`'s `tui_drag_source`/`tui_drag_cursor`/
+//!    `tui_tab_drop_zone` fields, which #602 already wires
+//!    `handle_mouse_event` to populate, so no further sequencing with #602
+//!    was needed, just the paint call. The tab-hover tooltip sources
+//!    straight from `engine.tab_hover_tooltip`, a plain field with no
+//!    per-frame state of its own. Covered by
+//!    `render_content_paints_group_divider_via_shell_app` (`driver_with_shell`,
+//!    the required headless case per #609's acceptance bar),
+//!    `render_content_paints_tab_drag_ghost_via_shell_app`, and
+//!    `render_content_paints_tab_hover_tooltip_via_shell_app` below.
 //!
 //!    #608 (Stage 2b, closed) additionally wires the quickfix panel and the
 //!    bottom panel (terminal/debug output) into `render_content`, via
@@ -805,9 +835,12 @@ impl ShellApp for TuiShellApp {
         // ── Tab bar(s) + breadcrumb bar(s) + editor windows ─────────────
         // Windows are painted first (matches `draw_frame`'s split-group
         // order — see its own comment) so window content can't overwrite
-        // an adjacent group's tab bar; divider lines between windows are
-        // skipped here (#609), same as passing `frame: None` skips them in
-        // `render_all_windows`.
+        // an adjacent group's tab bar. `render_all_windows` also paints the
+        // within-group (`:split`/`:vsplit`) divider lines unconditionally
+        // now (#609 routed `render_separators` through
+        // `Backend::draw_status_bar` — see its doc comment — so it no
+        // longer needs the raw `Frame` that `frame: None` used to skip it
+        // for).
         render_all_windows(backend, None, &screen.windows, &theme);
 
         let tui_tbh: f64 = if self.engine.settings.breadcrumbs && !self.engine.terminal_maximized {
@@ -840,6 +873,59 @@ impl ShellApp for TuiShellApp {
             };
             let bc_layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, &theme);
             *t.draw_layout.borrow_mut() = Some(bc_layout);
+        }
+
+        // ── Group divider lines (#609) ───────────────────────────────────
+        // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed to
+        // `render_all_windows`'s within-group `render_separators` above) —
+        // only present when the editor is split into multiple groups.
+        // Mirrors `draw_frame`'s own divider block, ported to
+        // `Backend::draw_status_bar` via `render_group_dividers` (see its
+        // doc comment, and `group_divider_cells`'s for how the #481
+        // phantom-divider-beside-scrollbar guard became a pure data
+        // computation instead of a `Buffer` read-back).
+        if let Some(ref split) = screen.editor_group_split {
+            render_group_dividers(backend, &split.dividers, &screen.windows, area, &theme);
+        }
+
+        // ── Tab-drag ghost overlay (#609) ────────────────────────────────
+        // Drag state (`tui_drag_source`/`tui_drag_cursor`/
+        // `tui_tab_drop_zone`) is already live here — #602 wired
+        // `handle_mouse_event` to mutate these three fields via
+        // `mouse::handle_mouse` (see `handle()` below) — so painting from
+        // it needs no further sequencing with #602, just the paint call
+        // itself, which is this issue's scope.
+        if self.tui_drag_source.is_some() {
+            render_tab_drag_overlay(
+                backend,
+                &self.engine,
+                area,
+                &screen,
+                &theme,
+                self.tui_drag_source,
+                self.tui_drag_cursor,
+                &self.tui_tab_drop_zone,
+            );
+        }
+
+        // ── Tab-hover tooltip (#609) ─────────────────────────────────────
+        // Mirrors `draw_frame`'s own tooltip block, ported to
+        // `Backend::draw_status_bar` via `render_tab_hover_tooltip`. Unlike
+        // `draw_frame`'s `editor_area` (whose `y` is implicitly 0-based —
+        // it's the live terminal frame's own top-level split), `area` here
+        // is `layout.main_content_bounds`, already offset below whatever
+        // `AppShell::render` painted above it — see that function's doc
+        // comment for why the row math differs between the two callers.
+        if let Some(ref tooltip_text) = screen.tab_tooltip {
+            let menu_height: u16 = if self.engine.menu_bar_visible { 1 } else { 0 };
+            render_tab_hover_tooltip(
+                backend,
+                area.x,
+                area.y + menu_height + 1,
+                area.width,
+                tooltip_text,
+                &theme,
+            );
         }
 
         // ── Editor-anchored popups (completion/hover/editor-hover/
@@ -1761,6 +1847,131 @@ mod tests {
         assert_eq!(
             occurrences, 2,
             "expected the marker text to paint once per split pane; screen:\n{screen}"
+        );
+    }
+
+    /// #609: `render_content` must also paint the *group-level* divider
+    /// line between split editor groups — `render_group_dividers`, ported
+    /// from `draw_frame`'s raw-`Buffer`-read loop to
+    /// `Backend::draw_status_bar` (see that function's and
+    /// `group_divider_cells`'s doc comments). Content is short (well under
+    /// the viewport height) so neither pane overflows and shows a
+    /// scrollbar — the #481 guard that lets a pane's own scrollbar double
+    /// as the separator would otherwise mask the divider glyph itself from
+    /// this assertion.
+    ///
+    /// Rather than hard-code an expected column (fragile against
+    /// `AppShell`'s own activity-bar/sidebar layout constants), the
+    /// expected column is derived from the actual painted screen: both
+    /// panes' tab bars share row 0 (`"[No Name]"` once per pane), so the
+    /// divider must land strictly between the two tab labels' start
+    /// columns on every row of the editor body.
+    #[test]
+    fn render_content_paints_group_divider_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "short\n");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+
+        let tab_row = lines[0];
+        let starts: Vec<usize> = tab_row
+            .match_indices("[No Name]")
+            .map(|(i, _)| tab_row[..i].chars().count())
+            .collect();
+        assert_eq!(
+            starts.len(),
+            2,
+            "expected two tab bars, one per pane; row:\n{tab_row}"
+        );
+        let (left_tab_start, right_tab_start) = (starts[0], starts[1]);
+
+        // Only scan columns to the right of the left pane's own tab label —
+        // the sidebar (a separate screen region, to the left of both panes)
+        // can paint its own unrelated '│' glyphs (e.g. explorer tree
+        // indent guides), which aren't the group divider under test.
+        let mut found_divider = false;
+        for (y, line) in lines.iter().enumerate().skip(1).take(15) {
+            let chars: Vec<char> = line.chars().collect();
+            let Some(col) = chars
+                .iter()
+                .enumerate()
+                .skip(left_tab_start)
+                .find(|(_, &c)| c == '│')
+                .map(|(i, _)| i)
+            else {
+                continue;
+            };
+            found_divider = true;
+            assert!(
+                col > left_tab_start && col < right_tab_start,
+                "row {y}: divider at col {col} should land strictly between the \
+                 two panes' tab labels (cols {left_tab_start}..{right_tab_start}); \
+                 line:\n{line}"
+            );
+        }
+        assert!(
+            found_divider,
+            "expected the group divider glyph '│' to paint via \
+             TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #609: `render_content` must also paint the tab-drag ghost overlay —
+    /// `render_tab_drag_overlay`, ported from a raw-`Frame`-write tail
+    /// (the ghost label) to `Backend::draw_status_bar` (see its doc
+    /// comment). Drives a real drag through `TuiDriver`'s mouse harness
+    /// (`mouse_down` + `mouse_move`, no `mouse_up`) so `tui_drag_source`
+    /// is genuinely live when `render_content` runs — #602 already wires
+    /// `handle_mouse_event` to populate it, so this is exercising the
+    /// paint side, not the input side. `mouse.rs`'s drag-start detection
+    /// requires the cursor to move `dx + dy >= 2` cells from the
+    /// mouse-down position before activating (distinguishing a drag from
+    /// a click), hence the `+4, +3` move. `driver_with_shell` wraps
+    /// `TuiShellApp` in an opaque `ShellAdapter` with no accessor back to
+    /// it (see this `mod tests`'s own doc comment), so this asserts on the
+    /// painted screen — a third `"[No Name]"` occurrence, the ghost label,
+    /// alongside the two static tab labels — rather than on
+    /// `tui_drag_source` directly.
+    #[test]
+    fn render_content_paints_tab_drag_ghost_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.new_tab(None);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let (tx, ty) = driver
+            .find("[No Name]")
+            .expect("tab label should be painted on screen");
+        driver.mouse_down(tx, ty);
+        driver.mouse_move(tx + 4.0, ty + 3.0);
+
+        let screen = driver.screen();
+        let occurrences = screen.matches("[No Name]").count();
+        assert!(
+            occurrences >= 3,
+            "expected the two static tab labels plus a drag-ghost label \
+             (>= 3 occurrences of \"[No Name]\"), got {occurrences}; screen:\n{screen}"
+        );
+    }
+
+    /// #609: `render_content` must also paint the tab-hover tooltip —
+    /// `render_tab_hover_tooltip`, ported from `draw_frame`'s raw-`Buffer`
+    /// write to `Backend::draw_status_bar` (see that function's doc
+    /// comment). `screen.tab_tooltip` sources straight from
+    /// `engine.tab_hover_tooltip` (`render.rs`'s `ScreenLayout` builder),
+    /// a plain `Option<String>` with no real-time hover-dwell timer behind
+    /// it — unlike the tab-drag overlay (real SGR mouse-drag sequencing,
+    /// left to `SMOKE_TESTS`), so this is fully reachable headlessly by
+    /// just setting the field directly before painting.
+    #[test]
+    fn render_content_paints_tab_hover_tooltip_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.tab_hover_tooltip = Some("ZQXW_609_TOOLTIP_MARKER".to_string());
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_609_TOOLTIP_MARKER"),
+            "tab-hover tooltip should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
     }
 
