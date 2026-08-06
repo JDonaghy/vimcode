@@ -26,16 +26,8 @@ pub(super) fn render_sidebar(
     theme: &Theme,
     _explorer_drop_target: Option<usize>,
 ) {
-    let buf = frame.buffer_mut();
-    let default_fg = rc(theme.explorer_file_fg);
-    let row_bg = rc(theme.tab_bar_bg);
-
     // Extension panel (plugin-provided)
     if sidebar.ext_panel_name.is_some() {
-        // Drop the buffer borrow before passing frame to render_ext_panel
-        // — the new TreeView-based renderer takes the backend + frame so it
-        // can route draw calls through quadraui primitives.
-        let _ = buf;
         render_ext_panel(backend, frame, area, engine, theme);
         return;
     }
@@ -63,20 +55,64 @@ pub(super) fn render_sidebar(
             return;
         }
         Some(PANEL_AI) => {
-            render_ai_sidebar(buf, area, engine, theme);
+            render_ai_sidebar(frame.buffer_mut(), area, engine, theme);
             return;
         }
         _ => {}
     }
 
-    // ── Background fill — covers empty space below tree rows ────────────
+    // Do NOT open a nested `enter_frame_scope` here — `render_sidebar` is
+    // called from `draw_frame`, which already runs inside the caller's
+    // single `with_frame_scope` (see mod.rs's `terminal.draw` closures).
+    // Re-entering would just be a no-op round trip on `current_frame_ptr`,
+    // but it contradicts the "entered once per draw closure" invariant.
+    render_explorer_sidebar_content(backend, area, engine, theme);
+}
+
+/// Render the explorer tree panel's body: background fill + the
+/// `TreeController` itself + its scroll-surface registration.
+///
+/// Extracted from `render_sidebar`'s default (explorer) branch (#607) so
+/// both the live `draw_frame` path (via `render_sidebar` above) and
+/// `TuiShellApp::render_content` (`shell_app.rs`, which never has a raw
+/// `Frame`/`Buffer` — see that module's doc comment) share one
+/// implementation instead of two copies that could drift. The background
+/// fill that used to be a raw `set_cell` loop over `frame.buffer_mut()` is
+/// now painted via `Backend::draw_status_bar` with a single blank segment
+/// per row — `draw_status_bar`'s TUI rasteriser always fills the *entire*
+/// row with the first segment's `bg` before painting segment text
+/// (`quadraui/src/tui/status_bar.rs`'s `fill_bg` loop), so an empty-text
+/// segment is enough to reproduce the old solid-fill behavior exactly. This
+/// is the same "solid `StatusBar` as background fill" trick quadraui's own
+/// `AppShell::render` uses for its resize divider (`compose/app_shell.rs`'s
+/// `divider_bounds` block) — the issue's suggested stand-in for raw
+/// background fills that have no direct `Backend::draw_*` equivalent.
+pub(super) fn render_explorer_sidebar_content(
+    backend: &mut dyn quadraui::Backend,
+    area: Rect,
+    engine: &Engine,
+    theme: &Theme,
+) {
     if area.height == 0 {
         return;
     }
+
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+
+    let bg_bar = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("explorer:bg"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: String::new(),
+            fg: render::to_quadraui_color(theme.explorer_file_fg),
+            bg: render::to_quadraui_color(theme.tab_bar_bg),
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![],
+    };
     for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', default_fg, row_bg);
-        }
+        let row_rect = quadraui::Rect::new(area.x as f32, y as f32, area.width as f32, 1.0);
+        let _ = backend.draw_status_bar(row_rect, &bg_bar, None, None);
     }
 
     let q_rect = quadraui::Rect::new(
@@ -88,12 +124,7 @@ pub(super) fn render_sidebar(
     engine.explorer_tree_rect.set(q_rect);
     engine.explorer_viewport_rows.set(area.height as usize);
     render::populate_explorer_tree_controller(engine, theme);
-    // Do NOT open a nested `enter_frame_scope` here — `render_sidebar` is
-    // called from `draw_frame`, which already runs inside the caller's
-    // single `with_frame_scope` (see mod.rs's `terminal.draw` closures).
-    // Re-entering would just be a no-op round trip on `current_frame_ptr`,
-    // but it contradicts the "entered once per draw closure" invariant.
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine.explorer_tree.borrow().render(backend, q_rect);
 
     // TreeController.render() draws the scrollbar internally.
@@ -103,14 +134,50 @@ pub(super) fn render_sidebar(
         .borrow_mut()
         .push(quadraui::ScrollSurface {
             id: quadraui::WidgetId::new("explorer:sb"),
-            bounds: quadraui::Rect::new(
-                area.x as f32,
-                area.y as f32,
-                area.width as f32,
-                area.height as f32,
-            ),
+            bounds: q_rect,
             scrollbar: None,
         });
+}
+
+/// Sidebar panel content for [`super::shell_app::TuiShellApp::render_content`]
+/// (#607). `render_sidebar` above stays the live `draw_frame` entry point
+/// (unchanged behavior, still frame-having); this is a parallel, narrower
+/// dispatcher over the subset of panels whose renderers need nothing but
+/// `Backend::draw_*` trait calls — no raw `Frame`/`Buffer` access — mirroring
+/// how `render_content` itself already has its own parallel entry points for
+/// editor content (`build_screen_for_shell_content` + `paint_editor_popups`
+/// in `render_impl.rs`, #601) and key dispatch
+/// (`dispatch_panel_accelerator_sizeless`, `handle_key_pressed`, above in
+/// `shell_app.rs`).
+///
+/// Ported: explorer (default panel, via [`render_explorer_sidebar_content`]),
+/// search (`render_search_panel`, already trait-pure — no raw buffer use at
+/// all), debug (`render_debug_sidebar`, likewise already trait-pure). Every
+/// other panel is a documented, deferred gap for this stage — see
+/// `shell_app.rs`'s module doc for the specific raw-buffer blocker each one
+/// hits (settings chrome, source-control header/clear/hint rows, the
+/// extensions-sidebar header/search rows, the plugin extension panel's
+/// chrome + popups, and the AI panel's fully-`Buffer`-typed signature).
+pub(super) fn render_sidebar_content(
+    backend: &mut dyn quadraui::Backend,
+    area: Rect,
+    sidebar: &TuiSidebar,
+    engine: &Engine,
+    theme: &Theme,
+) {
+    if sidebar.ext_panel_name.is_some() {
+        // Deferred — see this fn's doc comment and shell_app.rs's module doc.
+        return;
+    }
+
+    match engine.app_shell.active_panel_id().map(|w| w.as_str()) {
+        Some(PANEL_SEARCH) => render_search_panel(backend, area, engine, theme),
+        Some(PANEL_DEBUG) => render_debug_sidebar(backend, area, engine, theme),
+        // Settings, source control, extensions, and AI: deferred — see this
+        // fn's doc comment and shell_app.rs's module doc.
+        Some(PANEL_SETTINGS | PANEL_GIT | PANEL_EXTENSIONS | PANEL_AI) => {}
+        _ => render_explorer_sidebar_content(backend, area, engine, theme),
+    }
 }
 
 /// Render the settings panel — shows current key settings and the file path.
@@ -189,8 +256,16 @@ pub(super) fn render_settings_panel(
 }
 
 /// Render the project search panel via SidebarSystem (Form + TreeView).
+///
+/// `backend` is `&mut dyn quadraui::Backend` (not the concrete `TuiBackend`)
+/// — this renderer was already trait-pure (no raw `Frame`/`Buffer` access),
+/// so #607 widened the parameter the same way #601 did for
+/// `render_tab_bar`/`draw_breadcrumb_bar`, letting
+/// `TuiShellApp::render_content` call it via [`render_sidebar_content`]
+/// without a concrete backend. `render_sidebar`'s own call site keeps compiling
+/// unchanged: `&mut TuiBackend` coerces to `&mut dyn Backend` at the call.
 pub(super) fn render_search_panel(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -217,7 +292,7 @@ pub(super) fn render_search_panel(
     );
     engine.search_sidebar_body_rect.set(q_rect);
 
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine
         .search_sidebar_system
         .borrow()
@@ -1191,14 +1266,14 @@ pub(super) fn render_ai_sidebar(
 /// section. Panel header (row 0) + Run/Stop button (row 1) + per-section
 /// title rows + per-section scrollbar overlays remain panel-specific
 /// chrome; item rendering goes through `Backend::draw_tree`.
+/// #607: `backend` widened to `&mut dyn quadraui::Backend` — this renderer
+/// was already trait-pure, same rationale as `render_search_panel` above.
 pub(super) fn render_debug_sidebar(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
 ) {
-    use quadraui::Backend;
-
     if area.height == 0 {
         return;
     }
@@ -1212,7 +1287,7 @@ pub(super) fn render_debug_sidebar(
     let q_theme = super::quadraui_tui::q_theme(theme);
 
     let title_rect = quadraui::Rect::new(area.x as f32, area.y as f32, area.width as f32, 1.0);
-    backend.set_current_theme(q_theme);
+    backend.set_theme(q_theme);
     let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
 
     if area.height < 2 {
@@ -1221,7 +1296,7 @@ pub(super) fn render_debug_sidebar(
 
     let action_rect =
         quadraui::Rect::new(area.x as f32, (area.y + 1) as f32, area.width as f32, 1.0);
-    backend.set_current_theme(q_theme);
+    backend.set_theme(q_theme);
     let hits = backend.draw_status_bar(action_rect, &action_bar, None, None);
     engine.dap_sidebar_action_hits.replace(Some(hits));
 
@@ -1237,7 +1312,7 @@ pub(super) fn render_debug_sidebar(
     );
     engine.dap_sidebar_body_rect.set(msv_rect);
     render::populate_dap_sidebar_system(engine);
-    backend.set_current_theme(q_theme);
+    backend.set_theme(q_theme);
     engine.dap_sidebar_system.borrow().render(backend, msv_rect);
 }
 

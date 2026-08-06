@@ -42,16 +42,45 @@
 //!    per-window status lines, and the completion/hover/editor-hover/
 //!    diff-peek/signature-help popups — into `render_content`, via
 //!    `render_impl.rs::build_screen_for_shell_content` +
-//!    `paint_editor_popups`. What #601 still cannot paint (true raw-buffer
+//!    `paint_editor_popups`. #607 (Stage 2a) additionally wires the
+//!    trait-pure subset of sidebar panel content — explorer (the default
+//!    panel), search, debug — into `layout.sidebar_content_bounds`, via
+//!    `panels::render_sidebar_content`; see that function's doc comment for
+//!    the per-panel audit. What's still unpainted (true raw-buffer
 //!    holdouts, each filed as its own follow-on, all blocking #605
-//!    cutover): sidebar panel content (#607), quickfix panel + bottom
-//!    panel/terminal PTY content (#608), and window/group divider lines +
-//!    tab-drag overlay + tab-hover tooltip (#609). The menu bar row is
-//!    reserved in the layout math but not painted either (out of scope for
-//!    #601; folds into key dispatch, #603). Cursor placement used to be a
-//!    fourth raw-buffer holdout in this list (it needs `Frame::
-//!    set_cursor_position`, and `render_content` has no `Frame`) but #604
-//!    closed it a different way — see gap 3 below, now resolved.
+//!    cutover):
+//!
+//!    - The rest of the sidebar (#607's own known-gap list, no separate
+//!      issue): **settings** (`render_settings_panel`'s header + search-box
+//!      chrome is a free `quadraui::tui::draw_settings_chrome` rasteriser
+//!      with no `Backend::draw_*` trait equivalent — its own "Stage 1 scope
+//!      note" doc comment already flags this; the form body below the
+//!      chrome *is* trait-pure via `FormController::render_and_cache`, but
+//!      painting only the body and leaving the chrome blank was judged not
+//!      worth the coordinate-mismatch risk for this stage), **source
+//!      control** (header row, focused-hint row, and full-area background
+//!      clear are raw `set_cell` loops over `frame.buffer_mut()` — the
+//!      `draw_status_bar`-blank-segment trick #607 used for the explorer's
+//!      background would work here too, just not attempted this stage),
+//!      **extensions** (`render_ext_sidebar`'s two chrome rows are the same
+//!      raw-`set_cell` pattern; likewise a `draw_status_bar` candidate),
+//!      the **plugin extension panel** (`render_ext_panel`'s chrome is the
+//!      same non-trait `draw_settings_chrome` as settings, *and* its help
+//!      popup overlay and manual scrollbar are raw `set_cell` box-drawing
+//!      with no primitive stand-in checked yet), and the **AI panel**
+//!      (`render_ai_sidebar` takes `buf: &mut ratatui::buffer::Buffer`
+//!      directly — no backend parameter at all, the most raw of the
+//!      lot).
+//!    - Quickfix panel + bottom panel/terminal PTY content (#608).
+//!    - Window/group divider lines + tab-drag overlay + tab-hover tooltip
+//!      (#609).
+//!
+//!    The menu bar row is reserved in the layout math but not painted
+//!    either (out of scope for #601; folds into key dispatch, #603).
+//!    Cursor placement used to be a raw-buffer holdout in this list (it
+//!    needs `Frame::set_cursor_position`, and `render_content` has no
+//!    `Frame`) but #604 closed it a different way — see gap 3 below, now
+//!    resolved.
 //! 2. **Mouse handling (#602, largely resolved).** `mouse::handle_mouse`
 //!    (~4,100 lines) takes `&mut quadraui::DragState` + `&mut
 //!    quadraui::ModalStack` directly via `TuiBackend::drag_and_modal_mut()`
@@ -701,9 +730,33 @@ impl ShellApp for TuiShellApp {
         // windows, tab bars, breadcrumb bars, per-window status lines, and
         // the editor-anchored popups — into `layout.main_content_bounds`.
         // See the module doc's gap (1) for exactly what's still deferred
-        // (sidebar content #607, quickfix/bottom panel #608, dividers/
-        // drag-overlay/tab-tooltip #609, cursor placement #604) and why.
+        // (quickfix/bottom panel #608, dividers/drag-overlay/tab-tooltip
+        // #609, cursor placement #604) and why.
         let theme = self.theme();
+
+        // ── Sidebar panel content (#607) ─────────────────────────────────
+        // `AppShell::render` (quadraui, called by the runner before
+        // `render_content`) already painted the generic sidebar chrome
+        // (activity bar + header) — this paints the *active panel's* body
+        // into `layout.sidebar_content_bounds`. Independent of
+        // `main_content_bounds` below (distinct screen regions), so it
+        // isn't gated on that guard. See `panels::render_sidebar_content`'s
+        // doc comment for exactly which panels are ported (explorer —
+        // the default panel, search, debug) vs. still a documented,
+        // deferred gap for this stage (settings, source control,
+        // extensions, AI, the plugin extension panel).
+        if let Some(sb) = layout.sidebar_content_bounds {
+            if sb.width >= 1.0 && sb.height >= 1.0 {
+                let sb_area = Rect {
+                    x: sb.x.round() as u16,
+                    y: sb.y.round() as u16,
+                    width: sb.width.round() as u16,
+                    height: sb.height.round() as u16,
+                };
+                render_sidebar_content(backend, sb_area, &self.sidebar, &self.engine, &theme);
+            }
+        }
+
         let main = layout.main_content_bounds;
         if main.width < 1.0 || main.height < 1.0 {
             return;
@@ -1536,6 +1589,45 @@ mod tests {
             occurrences, 2,
             "expected the marker text to paint once per split pane; screen:\n{screen}"
         );
+    }
+
+    /// #607: `render_content` must also paint the *sidebar's* content —
+    /// the explorer tree, since explorer is the default active panel — into
+    /// `layout.sidebar_content_bounds`, via
+    /// `panels::render_sidebar_content`. Mirrors the temp-dir-plus-
+    /// `explorer_rebuild_rows` pattern `core::engine::tests`'s explorer
+    /// tests already use (`test_goto_tab_reveals_file_in_explorer` et al.):
+    /// write a file with a distinctive name under a fresh temp dir, point
+    /// `engine.cwd` at it, and reveal the file via `explorer_reveal_path`
+    /// (which expands the root row *and* rebuilds the rows — the root
+    /// starts collapsed, so `explorer_rebuild_rows` alone would only show
+    /// the root folder's own row, not its children) before asserting the
+    /// file name shows up in the painted sidebar column. The marker is kept
+    /// short (well under `SIDEBAR_WIDTH`) so it survives the tree row's
+    /// icon/indent prefix without truncation.
+    #[test]
+    fn render_content_paints_explorer_sidebar_content_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_607_shell_app_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("zqxw607.txt");
+        std::fs::write(&marker_file, "marker").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&marker_file);
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("zqxw607.txt"),
+            "explorer sidebar content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `dispatch_panel_accelerator_sizeless`'s `ACC_TERMINAL_TOGGLE_MAX` arm
