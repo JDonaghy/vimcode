@@ -89,6 +89,50 @@ fn explore_defaults_to_file_dir() {
     cleanup(&dir);
 }
 
+// ── :Explore survives a directory mutating mid-listing (#631) ───────────
+
+// Regression test for #631: `collect_explorer_rows` used to sort with a
+// comparator that re-`stat`'d the filesystem on every comparison
+// (`DirEntry::path().is_dir()`), which is not a cached property. If the
+// directory being listed mutated concurrently -- exactly what the other
+// netrw tests do to `/tmp` in parallel -- the same entry could answer
+// `true` early in the sort and `false` later, breaking the total order
+// `sort_by` requires and panicking the whole app. The fix precomputes each
+// entry's directory-ness once before sorting so the comparator never
+// touches the filesystem. This test drives `:Explore` against a directory
+// while a second thread concurrently creates and removes entries in it,
+// asserting the run completes without panicking.
+#[test]
+fn explore_survives_concurrent_directory_churn() {
+    let dir = make_test_dir();
+    let churn_dir = dir.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_churner = stop.clone();
+
+    let churner = std::thread::spawn(move || {
+        let mut i: u64 = 0;
+        while !stop_churner.load(Ordering::SeqCst) {
+            let p = churn_dir.join(format!("churn_{i}"));
+            let _ = fs::create_dir(&p);
+            let _ = fs::write(churn_dir.join(format!("churn_file_{i}.tmp")), b"x");
+            let _ = fs::remove_dir(&p);
+            let _ = fs::remove_file(churn_dir.join(format!("churn_file_{i}.tmp")));
+            i += 1;
+        }
+    });
+
+    let mut e = engine_with("");
+    e.cwd = dir.clone();
+    for _ in 0..500 {
+        exec(&mut e, &format!("Explore {}", dir.display()));
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    churner.join().expect("churn thread should not panic");
+
+    cleanup(&dir);
+}
+
 // ── :Explore defaults to cwd when no file ───────────────────────────────
 
 #[test]
