@@ -541,42 +541,18 @@ pub(super) fn draw_frame(
             let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
             *t.draw_layout.borrow_mut() = Some(layout);
         }
-        // Draw divider lines (vertical only — horizontal splits use the tab bar as divider).
-        // `div.position`/`.cross_start` are already absolute terminal-screen
-        // coordinates (#550), matching `editor_area`'s own coordinate space —
-        // no offset addition needed.
-        let sep_fg = rc(theme.separator);
-        let sep_bg = rc(theme.background);
-        for div in &split.dividers {
-            if div.direction == SplitDirection::Vertical {
-                let div_x = div.position as u16;
-                let y_start = div.cross_start as u16;
-                let y_end = y_start + div.cross_size as u16;
-                for y in y_start..y_end {
-                    if div_x < editor_area.x + editor_area.width {
-                        // #481: the window immediately to the left already
-                        // renders its own separator in the column right before
-                        // the divider (`div_x - 1`) — either its vertical
-                        // scrollbar (via `quadraui::tui::draw_editor`, glyphs
-                        // `█`/`░`) when it overflows, or a plain divider line
-                        // (`│`, painted by `render_separators`) when it does
-                        // not. Either way that column already visually
-                        // separates the two groups, so painting a second
-                        // divider glyph beside it produces a phantom
-                        // "duplicate scrollbar"/double-line bar in multi-tab-
-                        // group layouts. Skip the divider on rows where such a
-                        // separator already occupies `div_x - 1`.
-                        if div_x > editor_area.x {
-                            let left = frame.buffer_mut()[(div_x - 1, y)].symbol();
-                            if left == "█" || left == "░" || left == "│" {
-                                continue;
-                            }
-                        }
-                        set_cell(frame.buffer_mut(), div_x, y, '│', sep_fg, sep_bg);
-                    }
-                }
-            }
-        }
+        // Draw divider lines between editor groups. `div.position`/
+        // `.cross_start` are already absolute terminal-screen coordinates
+        // (#550), matching `editor_area`'s own coordinate space — no offset
+        // addition needed. #609: routed through `Backend::draw_status_bar`
+        // (via `render_group_dividers`/`group_divider_cells`) instead of a
+        // raw `Buffer` write, so `TuiShellApp::render_content` — which has
+        // no `Buffer`/`Frame` to write into — can paint the exact same
+        // dividers; see `group_divider_cells`'s doc comment for how the old
+        // `frame.buffer_mut()[(div_x - 1, y)]` read-back (the #481
+        // phantom-divider-beside-scrollbar guard) became a pure data
+        // computation both call sites now share.
+        render_group_dividers(backend, &split.dividers, &screen.windows, editor_area, theme);
     } else {
         // Single group: tab bar at row 0 of editor_area, windows at row 1+.
         for target in &tab_bar_targets {
@@ -627,7 +603,6 @@ pub(super) fn draw_frame(
     // ── Tab drag overlay ────────────────────────────────────────────────────
     if tab_drag_source.is_some() {
         render_tab_drag_overlay(
-            frame,
             backend,
             engine,
             editor_area,
@@ -642,17 +617,14 @@ pub(super) fn draw_frame(
     // ── Tab hover tooltip (rendered on top of editor, below tab bar) ──────
     if let Some(ref tooltip_text) = screen.tab_tooltip {
         let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        let tooltip_row = menu_rows + 1; // just below the tab bar row
-        let len = tooltip_text.chars().count() as u16;
-        // Position at the right edge of the editor area, or where the tooltip fits.
-        let tooltip_x = editor_area.x;
-        let tooltip_w = len.min(editor_area.width);
-        let fg = rc(theme.hover_fg);
-        let bg = rc(theme.hover_bg);
-        for dx in 0..tooltip_w {
-            let ch = tooltip_text.chars().nth(dx as usize).unwrap_or(' ');
-            set_cell(frame.buffer_mut(), tooltip_x + dx, tooltip_row, ch, fg, bg);
-        }
+        render_tab_hover_tooltip(
+            backend,
+            editor_area.x,
+            menu_rows + 1, // just below the tab bar row
+            editor_area.width,
+            tooltip_text,
+            theme,
+        );
     }
 
     // ── Editor popups: completion / hover / editor-hover / diff-peek /
@@ -1403,8 +1375,7 @@ fn build_tui_tab_slots(
 /// `tab_drop_zone` is the most recently computed drop zone.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_tab_drag_overlay(
-    frame: &mut ratatui::Frame,
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     engine: &Engine,
     editor_area: Rect,
     screen: &render::ScreenLayout,
@@ -1448,13 +1419,12 @@ pub(super) fn render_tab_drag_overlay(
         };
 
     {
-        use quadraui::Backend;
         let q_overlay = quadraui::DropOverlay {
             highlight: overlay.highlight,
             insertion_bar: overlay.insertion_bar,
             ghost_position: Some(overlay.ghost_position),
         };
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
         backend.draw_drop_overlay(&q_overlay);
     }
 
@@ -1476,21 +1446,51 @@ pub(super) fn render_tab_drag_overlay(
 
     if tab_drag_cursor.is_some() && !drag_label.is_empty() {
         let label = &drag_label;
-        if !label.is_empty() {
-            let gx = overlay.ghost_position.0 as u16;
-            let gy = overlay.ghost_position.1 as u16;
-            let ghost_fg = RColor::White;
-            let ghost_bg = RColor::Indexed(238);
-            let buf = frame.buffer_mut();
-            for (i, ch) in label.chars().enumerate() {
-                let cx = gx + i as u16;
-                let area = buf.area;
-                if cx < area.x + area.width && gy < area.y + area.height {
-                    buf[(cx, gy)].set_char(ch).set_fg(ghost_fg).set_bg(ghost_bg);
-                }
-            }
-        }
+        let gx = overlay.ghost_position.0 as u16;
+        let gy = overlay.ghost_position.1 as u16;
+        // #609: was a raw `Buffer` write (`frame.buffer_mut()`); routed
+        // through `draw_rule_row` (the `Backend::draw_status_bar` trick —
+        // see `draw_rule_cell`'s doc comment) so this reaches the screen
+        // from `&mut dyn Backend`, which `TuiShellApp::render_content` has
+        // but no `Frame`/`Buffer` for. `RColor::White` /
+        // `RColor::Indexed(238)` (an xterm-256 palette index with no
+        // meaningful `quadraui::Color` RGB equivalent) become plain
+        // truecolor RGB — `Color::from_rgb(255, 255, 255)` and the
+        // `Indexed(238)` grayscale-ramp equivalent `Color::from_rgb(68, 68,
+        // 68)` (xterm 256-color formula: `8 + (238 - 232) * 10`) — losing
+        // exact palette parity but matching every other `draw_status_bar`
+        // call site here, which are all already truecolor.
+        let ghost_fg = Color::from_rgb(255, 255, 255);
+        let ghost_bg = Color::from_rgb(68, 68, 68);
+        draw_rule_row(backend, gx, gy, label, ghost_fg, ghost_bg, theme);
     }
+}
+
+/// Paint the tab-hover tooltip — the small popup shown when the mouse
+/// hovers a tab and lingers, naming the buffer under the cursor. `screen
+/// .tab_tooltip` (pre-computed by `render::build_screen_layout`) is the
+/// only input; painting is a single-row `Backend::draw_status_bar` call
+/// (the `draw_rule_row`/[`draw_rule_cell`] trick, #609) instead of the raw
+/// `Buffer` write this replaces, so both `draw_frame` and
+/// `TuiShellApp::render_content` can call it — the two callers differ only
+/// in `(x, y)`, since `render_content`'s `area` doesn't start at the
+/// terminal's row 0 the way `draw_frame`'s `editor_area` implicitly did
+/// (see call sites for the position math each uses).
+pub(super) fn render_tab_hover_tooltip(
+    backend: &mut dyn quadraui::Backend,
+    x: u16,
+    y: u16,
+    max_width: u16,
+    tooltip_text: &str,
+    theme: &Theme,
+) {
+    let len = tooltip_text.chars().count() as u16;
+    let w = len.min(max_width);
+    if w == 0 {
+        return;
+    }
+    let text: String = tooltip_text.chars().take(w as usize).collect();
+    draw_rule_row(backend, x, y, &text, theme.hover_fg, theme.hover_bg, theme);
 }
 
 /// Compute the drop zone for a tab drag in TUI based on cursor cell position.
@@ -1595,10 +1595,15 @@ pub(super) fn draw_breadcrumb_bar(
 // ─── Editor windows ───────────────────────────────────────────────────────────
 
 /// `frame: None` (from `TuiShellApp::render_content`, #601) skips cursor
-/// placement (see `render_window`'s doc comment) *and* skips
-/// `render_separators`' window-divider lines — raw `Buffer` writes with no
-/// `Backend::draw_*` trait equivalent yet, tracked as vimcode#609. The live
-/// `draw_frame` path keeps passing `Some(frame)`, unchanged behavior.
+/// placement only (see `render_window`'s doc comment) — cursor placement
+/// needs `Frame::set_cursor_position`, which `render_content` still can't
+/// reach directly, but #604 closed that gap a layer up (`tui/run.rs
+/// ::render_frame` applies `TuiBackend`'s cached `cursor_position` after
+/// `render_content` returns). `render_separators`'s window-divider lines
+/// used to be a second, unrelated casualty of `frame: None` (raw `Buffer`
+/// writes with no `Backend::draw_*` trait equivalent) — #609 ported it to
+/// `Backend::draw_status_bar` (see that function's doc comment), so it now
+/// runs unconditionally here regardless of `frame`.
 pub(super) fn render_all_windows(
     backend: &mut dyn quadraui::Backend,
     mut frame: Option<&mut ratatui::Frame>,
@@ -1615,9 +1620,7 @@ pub(super) fn render_all_windows(
         };
         render_window(backend, frame.as_deref_mut(), win_rect, window, theme);
     }
-    if let Some(frame) = frame {
-        render_separators(frame.buffer_mut(), windows, theme);
-    }
+    render_separators(backend, windows, theme);
 }
 
 /// Render the unified picker popup. Supports single-pane (no preview) and
@@ -1756,26 +1759,39 @@ pub(super) fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize
     vis
 }
 
-pub(super) fn render_separators(
-    buf: &mut ratatui::buffer::Buffer,
-    windows: &[RenderedWindow],
-    theme: &Theme,
-) {
-    if windows.len() <= 1 {
-        return;
-    }
-    let sep_fg = rc(theme.separator);
-    let sep_bg = rc(theme.background);
+/// True when `w`'s own `Backend::draw_editor` scrollbar occupies its last
+/// column (i.e. its buffer content overflows the visible text rows).
+/// Extracted from `render_separators`' vertical-separator branch (#481
+/// iter4's fix) so both `render_separators` and [`group_divider_cells`]
+/// (#609) can apply the exact same "the scrollbar already doubles as the
+/// separator" rule without duplicating the row-accounting math.
+fn window_overflows_vertically(w: &RenderedWindow) -> bool {
+    let text_rows = (w.rect.height as usize)
+        .saturating_sub(if w.status_line.is_some() && w.rect.height > 1.0 {
+            1
+        } else {
+            0
+        });
+    w.total_lines > text_rows
+}
 
+/// Absolute `(x, y)` terminal cells where [`render_separators`] paints a
+/// vertical `'│'` window-divider glyph — the same geometry its own
+/// painting loop below walks, factored out as a pure data computation (no
+/// `Buffer`/`Backend` access) so [`group_divider_cells`] (#609) can ask
+/// "would `render_separators` already put a divider-like glyph in this
+/// cell?" without needing to read back whatever was actually painted.
+fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::HashSet<(u16, u16)> {
+    let mut cells = std::collections::HashSet::new();
     for i in 0..windows.len() {
         for j in (i + 1)..windows.len() {
             let a = &windows[i];
             let b = &windows[j];
 
-            // Vertical separator: window a is the left pane, b is the right pane.
-            // The boundary sits in the last column of a (`sep_x - 1`).
-            // Also require vertical overlap — windows from different groups may
-            // share an x edge but not overlap in y (e.g. 2×2 grid).
+            // Window a is the left pane, b is the right pane. The boundary
+            // sits in the last column of a (`sep_x - 1`). Also require
+            // vertical overlap — windows from different groups may share an
+            // x edge but not overlap in y (e.g. 2×2 grid).
             let v_overlap =
                 a.rect.y.max(b.rect.y) < (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height);
             if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 && v_overlap {
@@ -1799,26 +1815,99 @@ pub(super) fn render_separators(
                 // boundaries. Let `draw_editor`'s scrollbar own the column; it
                 // doubles as the visual separator. Only when the left window
                 // has NO scrollbar do we draw a plain divider line.
-                //
-                // Match `draw_editor`'s overflow test exactly (it reserves the
-                // status-line row from the viewport) so we draw the '│' in
-                // precisely the cases where it drew no scrollbar.
-                let text_rows = (a.rect.height as usize).saturating_sub(
-                    if a.status_line.is_some() && a.rect.height > 1.0 {
-                        1
-                    } else {
-                        0
-                    },
-                );
-                let has_scroll = a.total_lines > text_rows && y_end > y_start;
+                let has_scroll = window_overflows_vertically(a) && y_end > y_start;
 
                 if !has_scroll {
-                    for dy in 0..y_end.saturating_sub(y_start) {
-                        let y = y_start + dy;
-                        set_cell(buf, sep_x.saturating_sub(1), y, '│', sep_fg, sep_bg);
+                    for y in y_start..y_end {
+                        cells.insert((sep_x.saturating_sub(1), y));
                     }
                 }
             }
+        }
+    }
+    cells
+}
+
+/// Paint a single divider/rule glyph at `(x, y)` through
+/// `Backend::draw_status_bar` — the same "a solid-colour `StatusBar`
+/// segment stands in for a plain rule line" trick `AppShell::render`'s own
+/// generic divider (quadraui `compose/app_shell.rs::render`'s
+/// `divider_bounds` block) uses for the sidebar-resize divider, so no new
+/// quadraui primitive is needed (#609). `tui/status_bar.rs::draw_status_bar`
+/// paints segment text verbatim, one character per cell, in the segment's
+/// `fg`/`bg` — a 1-cell-wide, 1-row `StatusBar` therefore renders exactly
+/// like a raw `set_cell` write would, but reaches the screen through
+/// `&mut dyn Backend`, which `set_cell`/`Buffer` writes cannot.
+fn draw_rule_cell(
+    backend: &mut dyn quadraui::Backend,
+    x: u16,
+    y: u16,
+    ch: char,
+    fg: Color,
+    bg: Color,
+    theme: &Theme,
+) {
+    draw_rule_row(backend, x, y, &ch.to_string(), fg, bg, theme);
+}
+
+/// Same trick as [`draw_rule_cell`], for a horizontal run of `text` in one
+/// row — used both for horizontal window separators (`'─'` repeated) and
+/// the tab-drag ghost label / tab-hover tooltip (#609), which paint
+/// multi-character text rather than a single rule glyph.
+fn draw_rule_row(
+    backend: &mut dyn quadraui::Backend,
+    x: u16,
+    y: u16,
+    text: &str,
+    fg: Color,
+    bg: Color,
+    theme: &Theme,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let bar = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("tui:rule"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: text.to_string(),
+            fg: render::to_quadraui_color(fg),
+            bg: render::to_quadraui_color(bg),
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![],
+    };
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    let width = text.chars().count() as f32;
+    let q_rect = quadraui::Rect::new(x as f32, y as f32, width, 1.0);
+    let _ = backend.draw_status_bar(q_rect, &bar, None, None);
+}
+
+/// Window/editor-group divider lines through `Backend::draw_status_bar`
+/// (#609) — see [`draw_rule_cell`]'s doc comment for the underlying trick.
+/// Draws both the vertical dividers *between windows within a split group*
+/// (e.g. `:vsplit`) and the horizontal ones (`:split`); the group-level
+/// dividers *between* editor groups (`split.dividers`, drawn only when
+/// `screen.editor_group_split.is_some()`) are a separate pass —
+/// [`group_divider_cells`], called by both `draw_frame` and
+/// `TuiShellApp::render_content`.
+pub(super) fn render_separators(
+    backend: &mut dyn quadraui::Backend,
+    windows: &[RenderedWindow],
+    theme: &Theme,
+) {
+    if windows.len() <= 1 {
+        return;
+    }
+
+    for (x, y) in vertical_separator_cells(windows) {
+        draw_rule_cell(backend, x, y, '│', theme.separator, theme.background, theme);
+    }
+
+    for i in 0..windows.len() {
+        for j in (i + 1)..windows.len() {
+            let a = &windows[i];
+            let b = &windows[j];
 
             // Horizontal separator — also require horizontal overlap.
             // Skip when the upper window has a per-window status bar (it replaces the separator).
@@ -1835,11 +1924,93 @@ pub(super) fn render_separators(
                 let sep_y = (a.rect.y + a.rect.height) as u16;
                 let x_start = a.rect.x.max(b.rect.x) as u16;
                 let x_end = (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width) as u16;
-                for x in x_start..x_end.max(x_start) {
-                    set_cell(buf, x, sep_y.saturating_sub(1), '─', sep_fg, sep_bg);
+                if x_end > x_start {
+                    let row: String = "─".repeat((x_end - x_start) as usize);
+                    draw_rule_row(
+                        backend,
+                        x_start,
+                        sep_y.saturating_sub(1),
+                        &row,
+                        theme.separator,
+                        theme.background,
+                        theme,
+                    );
                 }
             }
         }
+    }
+}
+
+/// Absolute `(x, y)` cells where the *group-level* divider (`split
+/// .dividers` — the boundary between editor groups, e.g. `Ctrl+W v`, as
+/// opposed to `render_separators`' within-group `:vsplit`/`:split`
+/// dividers) should paint a vertical `'│'` glyph (#609). Filters out cells
+/// where the window immediately to the left already shows a visual
+/// separator of its own in that exact column — its own overflow scrollbar,
+/// or a `render_separators` divider landing on the same cell (#481: two
+/// adjacent divider-like columns read as a phantom "duplicate scrollbar").
+///
+/// Pure data computation over `windows`, no `Buffer` read: the pre-#609
+/// `draw_frame` loop this replaces read back
+/// `frame.buffer_mut()[(div_x - 1, y)]`'s already-painted symbol to detect
+/// the same condition, which only worked because it ran after
+/// `render_all_windows`/`render_separators` had already painted into that
+/// `Buffer`. `TuiShellApp::render_content` has no `Buffer` to read at all
+/// (see this module's own doc comment), so this recomputes "does the left
+/// window already separate the two groups here" directly from window
+/// geometry (`window_overflows_vertically` for the scrollbar case,
+/// `vertical_separator_cells` for the `render_separators` case) instead —
+/// both `draw_frame` and `render_content` can now share one answer.
+pub(super) fn group_divider_cells(
+    dividers: &[GroupDivider],
+    windows: &[RenderedWindow],
+    editor_area: Rect,
+) -> Vec<(u16, u16)> {
+    let already_separated = vertical_separator_cells(windows);
+    let mut out = Vec::new();
+    for div in dividers {
+        if div.direction != SplitDirection::Vertical {
+            continue; // horizontal splits use the tab bar as divider.
+        }
+        let div_x = div.position as u16;
+        if div_x >= editor_area.x + editor_area.width {
+            continue;
+        }
+        let y_start = div.cross_start as u16;
+        let y_end = y_start + div.cross_size as u16;
+        for y in y_start..y_end {
+            if div_x > editor_area.x {
+                let left_col = div_x - 1;
+                let left_has_scrollbar = windows.iter().any(|w| {
+                    let last_col = (w.rect.x + w.rect.width) as u16;
+                    last_col.saturating_sub(1) == left_col
+                        && (w.rect.y as u16..(w.rect.y + w.rect.height) as u16).contains(&y)
+                        && window_overflows_vertically(w)
+                });
+                if left_has_scrollbar || already_separated.contains(&(left_col, y)) {
+                    continue;
+                }
+            }
+            out.push((div_x, y));
+        }
+    }
+    out
+}
+
+/// Paint the group-level divider lines computed by [`group_divider_cells`]
+/// through `Backend::draw_status_bar` (see [`draw_rule_cell`]'s doc
+/// comment for the underlying trick). Shared by `draw_frame` (the live
+/// path) and `TuiShellApp::render_content` (#609) — see the latter's call
+/// site for why it's the same call for both.
+pub(super) fn render_group_dividers(
+    backend: &mut dyn quadraui::Backend,
+    dividers: &[GroupDivider],
+    windows: &[RenderedWindow],
+    editor_area: Rect,
+    theme: &Theme,
+) {
+    for (x, y) in group_divider_cells(dividers, windows, editor_area) {
+        draw_rule_cell(backend, x, y, '│', theme.separator, theme.background, theme);
     }
 }
 
