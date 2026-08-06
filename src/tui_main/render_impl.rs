@@ -1450,7 +1450,7 @@ pub(super) fn render_tab_drag_overlay(
         let gy = overlay.ghost_position.1 as u16;
         // #609: was a raw `Buffer` write (`frame.buffer_mut()`); routed
         // through `draw_rule_row` (the `Backend::draw_status_bar` trick —
-        // see `draw_rule_cell`'s doc comment) so this reaches the screen
+        // see `draw_rule_cell_themed`'s doc comment) so this reaches the screen
         // from `&mut dyn Backend`, which `TuiShellApp::render_content` has
         // but no `Frame`/`Buffer` for. `RColor::White` /
         // `RColor::Indexed(238)` (an xterm-256 palette index with no
@@ -1470,7 +1470,7 @@ pub(super) fn render_tab_drag_overlay(
 /// hovers a tab and lingers, naming the buffer under the cursor. `screen
 /// .tab_tooltip` (pre-computed by `render::build_screen_layout`) is the
 /// only input; painting is a single-row `Backend::draw_status_bar` call
-/// (the `draw_rule_row`/[`draw_rule_cell`] trick, #609) instead of the raw
+/// (the `draw_rule_row`/[`draw_rule_cell_themed`] trick, #609) instead of the raw
 /// `Buffer` write this replaces, so both `draw_frame` and
 /// `TuiShellApp::render_content` can call it — the two callers differ only
 /// in `(x, y)`, since `render_content`'s `area` doesn't start at the
@@ -1828,6 +1828,31 @@ fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::Has
     cells
 }
 
+/// Same trick as [`draw_rule_row`], for a horizontal run of `text` in one
+/// row — used both for horizontal window separators (`'─'` repeated) and
+/// the tab-drag ghost label / tab-hover tooltip (#609), which paint
+/// multi-character text rather than a single rule glyph.
+///
+/// Sets the backend theme on every call, which is correct (if slightly
+/// redundant with the caller's own up-front `set_theme`) for the
+/// single-shot call sites (drag ghost, hover tooltip) but wasteful for
+/// per-cell loops — see [`draw_rule_cell_themed`]/[`draw_rule_row_themed`],
+/// which [`render_separators`] and [`render_group_dividers`] use instead so
+/// the ~50-field `quadraui::Theme` is rebuilt once per frame, not once per
+/// divider cell.
+fn draw_rule_row(
+    backend: &mut dyn quadraui::Backend,
+    x: u16,
+    y: u16,
+    text: &str,
+    fg: Color,
+    bg: Color,
+    theme: &Theme,
+) {
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    draw_rule_row_themed(backend, x, y, text, fg, bg);
+}
+
 /// Paint a single divider/rule glyph at `(x, y)` through
 /// `Backend::draw_status_bar` — the same "a solid-colour `StatusBar`
 /// segment stands in for a plain rule line" trick `AppShell::render`'s own
@@ -1838,35 +1863,45 @@ fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::Has
 /// `fg`/`bg` — a 1-cell-wide, 1-row `StatusBar` therefore renders exactly
 /// like a raw `set_cell` write would, but reaches the screen through
 /// `&mut dyn Backend`, which `set_cell`/`Buffer` writes cannot.
-fn draw_rule_cell(
+///
+/// Assumes the caller has already applied `backend.set_theme(...)` — see
+/// [`draw_rule_row_themed`]'s doc comment for why callers that loop over
+/// many cells use this instead of setting the theme per call.
+fn draw_rule_cell_themed(
     backend: &mut dyn quadraui::Backend,
     x: u16,
     y: u16,
     ch: char,
     fg: Color,
     bg: Color,
-    theme: &Theme,
 ) {
-    draw_rule_row(backend, x, y, &ch.to_string(), fg, bg, theme);
+    draw_rule_row_themed(backend, x, y, &ch.to_string(), fg, bg);
 }
 
-/// Same trick as [`draw_rule_cell`], for a horizontal run of `text` in one
-/// row — used both for horizontal window separators (`'─'` repeated) and
-/// the tab-drag ghost label / tab-hover tooltip (#609), which paint
-/// multi-character text rather than a single rule glyph.
-fn draw_rule_row(
+/// Theme-less core of [`draw_rule_row`] — paints without touching the
+/// backend's current theme. Callers that loop over many cells/rows in one
+/// frame (`render_separators`, `render_group_dividers`) call
+/// `backend.set_theme(...)` once up front and then use this (via
+/// [`draw_rule_cell_themed`]) for every cell, instead of reconstructing the
+/// theme on each of the dozens of divider cells a tall terminal can have.
+fn draw_rule_row_themed(
     backend: &mut dyn quadraui::Backend,
     x: u16,
     y: u16,
     text: &str,
     fg: Color,
     bg: Color,
-    theme: &Theme,
 ) {
     if text.is_empty() {
         return;
     }
     let bar = quadraui::StatusBar {
+        // Every divider/rule/ghost/tooltip draw shares this literal ID.
+        // That's intentionally inert today — `draw_status_bar`'s returned
+        // hit-region layout is discarded (`let _ = ...`) by every caller
+        // here, and TUI's `draw_status_bar` impl does no ID-keyed caching —
+        // but if a future caller wires hover/press state or click handling
+        // through this helper, every rule line sharing one ID will collide.
         id: quadraui::WidgetId::new("tui:rule"),
         left_segments: vec![quadraui::StatusBarSegment {
             text: text.to_string(),
@@ -1877,14 +1912,13 @@ fn draw_rule_row(
         }],
         right_segments: vec![],
     };
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
     let width = text.chars().count() as f32;
     let q_rect = quadraui::Rect::new(x as f32, y as f32, width, 1.0);
     let _ = backend.draw_status_bar(q_rect, &bar, None, None);
 }
 
 /// Window/editor-group divider lines through `Backend::draw_status_bar`
-/// (#609) — see [`draw_rule_cell`]'s doc comment for the underlying trick.
+/// (#609) — see [`draw_rule_cell_themed`]'s doc comment for the underlying trick.
 /// Draws both the vertical dividers *between windows within a split group*
 /// (e.g. `:vsplit`) and the horizontal ones (`:split`); the group-level
 /// dividers *between* editor groups (`split.dividers`, drawn only when
@@ -1900,8 +1934,14 @@ pub(super) fn render_separators(
         return;
     }
 
+    // Set the backend theme once up front rather than per divider cell/row
+    // (see `draw_rule_row_themed`'s doc comment) — a tall terminal with
+    // several vertical dividers would otherwise rebuild the ~50-field
+    // `quadraui::Theme` dozens of times per frame.
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+
     for (x, y) in vertical_separator_cells(windows) {
-        draw_rule_cell(backend, x, y, '│', theme.separator, theme.background, theme);
+        draw_rule_cell_themed(backend, x, y, '│', theme.separator, theme.background);
     }
 
     for i in 0..windows.len() {
@@ -1926,14 +1966,13 @@ pub(super) fn render_separators(
                 let x_end = (a.rect.x + a.rect.width).min(b.rect.x + b.rect.width) as u16;
                 if x_end > x_start {
                     let row: String = "─".repeat((x_end - x_start) as usize);
-                    draw_rule_row(
+                    draw_rule_row_themed(
                         backend,
                         x_start,
                         sep_y.saturating_sub(1),
                         &row,
                         theme.separator,
                         theme.background,
-                        theme,
                     );
                 }
             }
@@ -1983,8 +2022,21 @@ pub(super) fn group_divider_cells(
                 let left_col = div_x - 1;
                 let left_has_scrollbar = windows.iter().any(|w| {
                     let last_col = (w.rect.x + w.rect.width) as u16;
+                    // Bound the row range the same way `window_overflows_vertically`
+                    // bounds `text_rows`: `draw_editor` only paints the scrollbar
+                    // into the window's *text* rows, never the last row when that
+                    // row is reserved for the per-window status line (see
+                    // `render_window`). Without this the status-line row was
+                    // wrongly treated as scrollbar-covered, leaving a 1-row gap in
+                    // the group divider right at the neighbor's status bar.
+                    let text_row_end = (w.rect.y + w.rect.height) as u16
+                        - if w.status_line.is_some() && w.rect.height > 1.0 {
+                            1
+                        } else {
+                            0
+                        };
                     last_col.saturating_sub(1) == left_col
-                        && (w.rect.y as u16..(w.rect.y + w.rect.height) as u16).contains(&y)
+                        && (w.rect.y as u16..text_row_end).contains(&y)
                         && window_overflows_vertically(w)
                 });
                 if left_has_scrollbar || already_separated.contains(&(left_col, y)) {
@@ -1998,7 +2050,7 @@ pub(super) fn group_divider_cells(
 }
 
 /// Paint the group-level divider lines computed by [`group_divider_cells`]
-/// through `Backend::draw_status_bar` (see [`draw_rule_cell`]'s doc
+/// through `Backend::draw_status_bar` (see [`draw_rule_cell_themed`]'s doc
 /// comment for the underlying trick). Shared by `draw_frame` (the live
 /// path) and `TuiShellApp::render_content` (#609) — see the latter's call
 /// site for why it's the same call for both.
@@ -2009,8 +2061,17 @@ pub(super) fn render_group_dividers(
     editor_area: Rect,
     theme: &Theme,
 ) {
-    for (x, y) in group_divider_cells(dividers, windows, editor_area) {
-        draw_rule_cell(backend, x, y, '│', theme.separator, theme.background, theme);
+    let cells = group_divider_cells(dividers, windows, editor_area);
+    if cells.is_empty() {
+        return;
+    }
+    // Set the theme once for the whole batch — see `draw_rule_row_themed`'s
+    // doc comment for why the per-cell `draw_rule_cell_themed` (which
+    // assumes the theme is already set) is used here instead of
+    // `draw_rule_row` (which sets the theme on every call).
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    for (x, y) in cells {
+        draw_rule_cell_themed(backend, x, y, '│', theme.separator, theme.background);
     }
 }
 
@@ -2030,7 +2091,8 @@ pub(super) fn render_group_dividers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::window::GroupId;
+    use crate::core::window::{GroupId, WindowId};
+    use crate::render::WindowStatusLine;
     use ratatui::backend::TestBackend;
 
     /// Create a hermetic engine for rendering tests.
@@ -2778,5 +2840,106 @@ mod tests {
 
         // Render must not panic either.
         let _lines = render_tui(&e, 80, 24);
+    }
+
+    /// Minimal `RenderedWindow` fixture with every field defaulted except
+    /// what the caller overrides — mirrors `render.rs::build_rendered_window`'s
+    /// own `empty` closure, since `RenderedWindow` has no `Default` impl.
+    fn fixture_window(
+        window_id: WindowId,
+        rect: WindowRect,
+        total_lines: usize,
+        status_line: Option<WindowStatusLine>,
+    ) -> RenderedWindow {
+        RenderedWindow {
+            window_id,
+            rect,
+            lines: vec![],
+            cursor: None,
+            extra_cursors: vec![],
+            selection: None,
+            extra_selections: vec![],
+            yank_highlight: None,
+            scroll_top: 0,
+            scroll_left: 0,
+            total_lines,
+            gutter_char_width: 0,
+            text_viewport_cols: 0,
+            is_active: true,
+            show_active_bg: false,
+            has_git_diff: false,
+            has_breakpoints: false,
+            max_col: 0,
+            diagnostic_gutter: std::collections::HashMap::new(),
+            code_action_lines: std::collections::HashSet::new(),
+            bracket_match_positions: Vec::new(),
+            active_indent_col: None,
+            tabstop: 4,
+            cursorline: false,
+            status_line,
+        }
+    }
+
+    /// #609 review fix: [`group_divider_cells`]'s `left_has_scrollbar` check
+    /// must exclude the neighbor window's per-window status-line row, the
+    /// same way `window_overflows_vertically` excludes it from `text_rows`.
+    /// Before the fix, the check spanned the window's *full* rect height,
+    /// so an overflowing left window with a status line wrongly looked
+    /// scrollbar-covered on its status-line row too — leaving a 1-row gap
+    /// in the group divider exactly at that row. Regresses the scenario the
+    /// higher-level `render_content_paints_group_divider_via_shell_app`
+    /// test deliberately sidesteps (per its own doc comment: short,
+    /// non-overflowing content).
+    #[test]
+    fn group_divider_cells_covers_neighbor_status_line_row() {
+        // Left window: overflows vertically (total_lines=20 >> the 9 text
+        // rows available after reserving 1 row for the status line out of
+        // height=10), and has a per-window status line on its last row (y=9).
+        let left = fixture_window(
+            WindowId(0),
+            WindowRect::new(0.0, 0.0, 10.0, 10.0),
+            20,
+            Some(WindowStatusLine {
+                left_segments: vec![],
+                right_segments: vec![],
+            }),
+        );
+        let divider = GroupDivider {
+            split_index: 0,
+            direction: SplitDirection::Vertical,
+            position: 10.0,
+            axis_start: 0.0,
+            axis_size: 20.0,
+            cross_start: 0.0,
+            cross_size: 10.0,
+        };
+        let editor_area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 10,
+        };
+
+        let cells = group_divider_cells(&[divider], &[left], editor_area);
+
+        // The status-line row (y=9) is NOT one of the window's text rows —
+        // `draw_editor` never paints a scrollbar glyph there — so the group
+        // divider must still cover it.
+        assert!(
+            cells.contains(&(10, 9)),
+            "group divider should cover the neighbor's status-line row (y=9), \
+             leaving no gap; got cells: {cells:?}"
+        );
+        // Sanity check the other half of the rule: every actual text row
+        // (y=0..9) IS covered by the left window's own overflow scrollbar,
+        // so the group divider correctly stays out of those rows (letting
+        // the scrollbar double as the divider, per #481).
+        for y in 0..9u16 {
+            assert!(
+                !cells.contains(&(10, y)),
+                "row {y} is a text row with an overflow scrollbar; the group \
+                 divider should not double up there. got cells: {cells:?}"
+            );
+        }
     }
 }
