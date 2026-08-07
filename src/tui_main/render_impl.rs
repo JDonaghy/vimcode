@@ -1902,6 +1902,32 @@ pub(super) fn draw_rule_row_themed(
     fg: Color,
     bg: Color,
 ) {
+    draw_rule_row_q(
+        backend,
+        x,
+        y,
+        text,
+        render::to_quadraui_color(fg),
+        render::to_quadraui_color(bg),
+    );
+}
+
+/// [`draw_rule_row_themed`] over already-converted `quadraui::Color`s.
+///
+/// Panels that reproduce a quadraui rasteriser's own chrome (#605's
+/// `panels::draw_settings_chrome_via_backend`, the trait-only stand-in for
+/// `quadraui::tui::draw_settings_chrome`) source their colours straight from
+/// `q_theme(theme)` so they can't drift from the rasteriser they're standing
+/// in for — round-tripping those back through vimcode's `Color` would be
+/// lossy busywork.
+pub(super) fn draw_rule_row_q(
+    backend: &mut dyn quadraui::Backend,
+    x: u16,
+    y: u16,
+    text: &str,
+    fg: quadraui::Color,
+    bg: quadraui::Color,
+) {
     if text.is_empty() {
         return;
     }
@@ -1915,8 +1941,8 @@ pub(super) fn draw_rule_row_themed(
         id: quadraui::WidgetId::new("tui:rule"),
         left_segments: vec![quadraui::StatusBarSegment {
             text: text.to_string(),
-            fg: render::to_quadraui_color(fg),
-            bg: render::to_quadraui_color(bg),
+            fg,
+            bg,
             bold: false,
             action_id: None,
         }],

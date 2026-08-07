@@ -35,7 +35,7 @@ pub(super) fn render_sidebar(
     let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
     match active_id {
         Some(PANEL_SETTINGS) => {
-            render_settings_panel(backend, frame, area, theme, engine);
+            render_settings_panel(backend, area, theme, engine);
             return;
         }
         Some(PANEL_SEARCH) => {
@@ -47,7 +47,7 @@ pub(super) fn render_sidebar(
             return;
         }
         Some(PANEL_GIT) => {
-            render_source_control(backend, frame, area, engine, theme);
+            render_source_control(backend, area, engine, theme);
             return;
         }
         Some(PANEL_EXTENSIONS) => {
@@ -152,12 +152,20 @@ pub(super) fn render_explorer_sidebar_content(
 ///
 /// Ported: explorer (default panel, via [`render_explorer_sidebar_content`]),
 /// search (`render_search_panel`, already trait-pure — no raw buffer use at
-/// all), debug (`render_debug_sidebar`, likewise already trait-pure). Every
-/// other panel is a documented, deferred gap for this stage — see
-/// `shell_app.rs`'s module doc for the specific raw-buffer blocker each one
-/// hits (settings chrome, source-control header/clear/hint rows, the
-/// extensions-sidebar header/search rows, the plugin extension panel's
-/// chrome + popups, and the AI panel's fully-`Buffer`-typed signature).
+/// all), debug (`render_debug_sidebar`, likewise already trait-pure), and —
+/// #605 — **settings** and **source control**, whose raw `set_cell` chrome
+/// (background wipe, header row, focused-hint row, and the settings
+/// header/search box) was converted to [`fill_rect`] / [`fill_row`] /
+/// [`draw_settings_chrome_via_backend`]. Both renderers dropped their
+/// `&mut Frame` parameter entirely as a result, so `draw_frame` and
+/// `render_content` now share one implementation of each rather than the
+/// live path keeping a frame-having variant.
+///
+/// Still deferred, each still blocked on raw-`Buffer` access — see
+/// `shell_app.rs`'s module doc: the **extensions** sidebar's two chrome rows,
+/// the **plugin extension panel**'s chrome + help popup + manual scrollbar,
+/// and the **AI panel**, whose signature takes `buf: &mut Buffer` outright
+/// with no backend parameter at all.
 pub(super) fn render_sidebar_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -173,10 +181,157 @@ pub(super) fn render_sidebar_content(
     match engine.app_shell.active_panel_id().map(|w| w.as_str()) {
         Some(PANEL_SEARCH) => render_search_panel(backend, area, engine, theme),
         Some(PANEL_DEBUG) => render_debug_sidebar(backend, area, engine, theme),
-        // Settings, source control, extensions, and AI: deferred — see this
-        // fn's doc comment and shell_app.rs's module doc.
-        Some(PANEL_SETTINGS | PANEL_GIT | PANEL_EXTENSIONS | PANEL_AI) => {}
+        // #605: settings + source control are no longer deferred — both had
+        // their raw `set_cell` chrome converted to the rule-row trick.
+        Some(PANEL_SETTINGS) => render_settings_panel(backend, area, theme, engine),
+        Some(PANEL_GIT) => render_source_control(backend, area, engine, theme),
+        // Extensions and AI: still deferred — see this fn's doc comment and
+        // shell_app.rs's module doc.
+        Some(PANEL_EXTENSIONS | PANEL_AI) => {}
         _ => render_explorer_sidebar_content(backend, area, engine, theme),
+    }
+}
+
+// ─── Trait-only stand-ins for raw-`Buffer` chrome (#605) ─────────────────────
+
+/// Fill `width` cells at `(x, y)` with `text`, space-padded (or truncated) to
+/// exactly `width` characters, in one [`render_impl::draw_rule_row_q`] call.
+///
+/// This is the trait-only equivalent of the "blank the row with `set_cell`,
+/// then write the text over it with `set_cell`" two-pass pattern the sidebar
+/// panels used before #605. Padding produces the identical result — cells past
+/// the end of `text` stay blank in the same `fg`/`bg` — but reaches the screen
+/// through `&mut dyn Backend`, which `Buffer` writes cannot.
+fn fill_row_q(
+    backend: &mut dyn quadraui::Backend,
+    x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    fg: quadraui::Color,
+    bg: quadraui::Color,
+) {
+    if width == 0 {
+        return;
+    }
+    let mut row: String = text.chars().take(width as usize).collect();
+    let painted = row.chars().count();
+    for _ in painted..width as usize {
+        row.push(' ');
+    }
+    super::render_impl::draw_rule_row_q(backend, x, y, &row, fg, bg);
+}
+
+/// [`fill_row_q`] over vimcode's own `Color`.
+fn fill_row(
+    backend: &mut dyn quadraui::Backend,
+    x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    fg: Color,
+    bg: Color,
+) {
+    fill_row_q(
+        backend,
+        x,
+        y,
+        width,
+        text,
+        render::to_quadraui_color(fg),
+        render::to_quadraui_color(bg),
+    );
+}
+
+/// Clear `area` to `bg` — the trait-only equivalent of the nested
+/// `for y { for x { set_cell(..) } }` background wipe the panels open with.
+fn fill_rect(backend: &mut dyn quadraui::Backend, area: Rect, fg: Color, bg: Color) {
+    for y in area.y..area.y + area.height {
+        fill_row(backend, area.x, y, area.width, "", fg, bg);
+    }
+}
+
+/// Trait-only stand-in for `quadraui::tui::draw_settings_chrome`, which takes
+/// a `&mut Buffer` and so can't be called from `render_content`.
+///
+/// Reproduces that rasteriser's two rows exactly — header row, then the
+/// `" / "`-prefixed search input row with its optional block caret — and
+/// sources every colour from `q_theme(theme)`, the same `quadraui::Theme` the
+/// rasteriser itself reads, so the two can't drift on palette changes. Filed
+/// as a quadraui gap in `shell_app.rs`'s module doc: the clean fix is a
+/// `Backend::draw_settings_chrome` trait method, at which point this helper
+/// and its call sites collapse to one line.
+fn draw_settings_chrome_via_backend(
+    backend: &mut dyn quadraui::Backend,
+    area: Rect,
+    header_text: &str,
+    query: &str,
+    placeholder: &str,
+    active: bool,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let q = super::quadraui_tui::q_theme(theme);
+
+    // Row 0: header.
+    fill_row_q(
+        backend,
+        area.x,
+        area.y,
+        area.width,
+        header_text,
+        q.header_fg,
+        q.header_bg,
+    );
+
+    if area.height < 2 {
+        return;
+    }
+
+    // Row 1: search input — `" / "` prompt, then the query (or the
+    // placeholder when idle and empty), then a block caret when active.
+    let search_y = area.y + 1;
+    let row_bg = if active { q.selected_bg } else { q.tab_bar_bg };
+    let show_placeholder = query.is_empty() && !placeholder.is_empty() && !active;
+    let (text, text_fg) = if show_placeholder {
+        (placeholder, q.muted_fg)
+    } else {
+        (query, q.foreground)
+    };
+
+    // Blank the whole row first so the segments below only need to cover the
+    // cells they actually paint.
+    fill_row_q(
+        backend,
+        area.x,
+        search_y,
+        area.width,
+        "",
+        q.foreground,
+        row_bg,
+    );
+
+    let prompt = " / ";
+    let prompt_w = (prompt.chars().count() as u16).min(area.width);
+    fill_row_q(
+        backend, area.x, search_y, prompt_w, prompt, q.muted_fg, row_bg,
+    );
+
+    let mut x = area.x + prompt_w;
+    let end = area.x + area.width;
+    if x < end {
+        let avail = end - x;
+        let shown: String = text.chars().take(avail as usize).collect();
+        let shown_w = shown.chars().count() as u16;
+        if shown_w > 0 {
+            fill_row_q(backend, x, search_y, shown_w, &shown, text_fg, row_bg);
+        }
+        x += shown_w;
+    }
+    if active && x < end {
+        fill_row_q(backend, x, search_y, 1, "\u{2588}", q.accent_fg, row_bg);
     }
 }
 
@@ -184,30 +339,25 @@ pub(super) fn render_sidebar_content(
 ///
 /// B5c.4: routes the form rendering through `Backend::draw_form` so
 /// the form rasteriser and call site share the same code path GTK
-/// uses. The buffer-only chrome (background fill, focus border)
-/// stays inline.
+/// uses.
+///
+/// #605: `backend` widened from `&mut TuiBackend` + `&mut Frame` to
+/// `&mut dyn Backend`. The background wipe and the header/search-box chrome
+/// were the last two raw-`Buffer` pieces; they now go through [`fill_rect`]
+/// and [`draw_settings_chrome_via_backend`], so `TuiShellApp::render_content`
+/// can paint this panel.
 pub(super) fn render_settings_panel(
-    backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     theme: &Theme,
     engine: &Engine,
 ) {
-    let buf = frame.buffer_mut();
-
-    let fg = rc(theme.foreground);
-    let bg = rc(theme.tab_bar_bg);
-
     if area.height == 0 {
         return;
     }
 
     // Fill background
-    for y in area.y..area.y + area.height {
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, ' ', fg, bg);
-        }
-    }
+    fill_rect(backend, area, theme.foreground, theme.tab_bar_bg);
 
     // Rows 0–1: header + search input chrome.
     let chrome_h = area.height.min(2);
@@ -217,17 +367,14 @@ pub(super) fn render_settings_panel(
         width: area.width,
         height: chrome_h,
     };
-    // Stage 1 scope note: `draw_settings_chrome` is a free rasteriser with no
-    // `Backend::draw_*` trait equivalent (checked against quadraui's Backend
-    // trait), so calling it directly on `buf` is correct and out of scope here.
-    quadraui::tui::draw_settings_chrome(
-        buf,
+    draw_settings_chrome_via_backend(
+        backend,
         chrome_area,
         " SETTINGS",
         &engine.settings_query,
         "",
         engine.settings_input_active,
-        &super::quadraui_tui::q_theme(theme),
+        theme,
     );
 
     // Rows 2+: scrollable form content, via the shared `quadraui::Form` +
@@ -248,7 +395,7 @@ pub(super) fn render_settings_panel(
         area.width as f32,
         content_height as f32,
     );
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine
         .settings_form_controller
         .borrow_mut()
@@ -396,30 +543,26 @@ pub(super) fn render_command_line(
 
 // ─── Input translation ────────────────────────────────────────────────────────
 
+/// #605: widened from `&mut TuiBackend` + `&mut Frame` to `&mut dyn Backend`.
+/// The three raw-`Buffer` pieces — the full-area background wipe, the
+/// focused-hint row, and the "SOURCE CONTROL" header row — all became
+/// [`fill_rect`]/[`fill_row`] calls, so `TuiShellApp::render_content` can
+/// paint this panel. Everything else here was already a `Backend::draw_*`
+/// trait call.
 pub(super) fn render_source_control(
-    backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
 ) {
-    let buf = frame.buffer_mut();
     if area.height == 0 {
         return;
     }
-    let hdr_fg = rc(theme.status_fg);
-    let hdr_bg = rc(theme.status_bg);
+    let hdr_fg = theme.status_fg;
+    let hdr_bg = theme.status_bg;
     // Clear the entire area first to prevent stale content from previous renders.
-    {
-        let clear_fg = rc(theme.foreground);
-        let clear_bg = rc(theme.tab_bar_bg);
-        for cy in area.y..area.y + area.height {
-            for cx in area.x..area.x + area.width {
-                set_cell(buf, cx, cy, ' ', clear_fg, clear_bg);
-            }
-        }
-    }
-    let dim_fg = rc(theme.line_number_fg);
+    fill_rect(backend, area, theme.foreground, theme.tab_bar_bg);
+    let dim_fg = theme.line_number_fg;
 
     // Build SC data from engine state via the render abstraction.
     let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
@@ -430,13 +573,15 @@ pub(super) fn render_source_control(
     // Reserve bottom row for hint bar when focused.
     let area = if sc.has_focus && area.height > 2 {
         let hint_y = area.y + area.height - 1;
-        let hint_text = " Press '?' for help";
-        for cx in area.x..area.x + area.width {
-            set_cell(buf, cx, hint_y, ' ', dim_fg, hdr_bg);
-        }
-        for (i, ch) in hint_text.chars().enumerate().take(area.width as usize) {
-            set_cell(buf, area.x + i as u16, hint_y, ch, dim_fg, hdr_bg);
-        }
+        fill_row(
+            backend,
+            area.x,
+            hint_y,
+            area.width,
+            " Press '?' for help",
+            dim_fg,
+            hdr_bg,
+        );
         Rect {
             x: area.x,
             y: area.y,
@@ -449,12 +594,15 @@ pub(super) fn render_source_control(
 
     // ── Row 0: header "SOURCE CONTROL" ──────────────────────────────────────
     let branch_info = render::sc_header_text(sc);
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', hdr_fg, hdr_bg);
-    }
-    for (i, ch) in branch_info.chars().enumerate().take(area.width as usize) {
-        set_cell(buf, area.x + i as u16, area.y, ch, hdr_fg, hdr_bg);
-    }
+    fill_row(
+        backend,
+        area.x,
+        area.y,
+        area.width,
+        &branch_info,
+        hdr_fg,
+        hdr_bg,
+    );
 
     if area.height < 2 {
         return;
@@ -476,8 +624,7 @@ pub(super) fn render_source_control(
             area.width as f32,
             paint_h as f32,
         );
-        use quadraui::Backend;
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
         backend.draw_text_input(ti_rect, &ti);
     }
 
@@ -500,7 +647,7 @@ pub(super) fn render_source_control(
             area.width as f32,
             slab_h as f32,
         );
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
         render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
     }
 
@@ -530,7 +677,7 @@ pub(super) fn render_source_control(
     );
     engine.sc_sidebar_body_rect.set(q_rect);
     render::populate_sc_sidebar_system(engine, theme);
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     engine.sc_sidebar_system.borrow().render(backend, q_rect);
     // ── Branch picker / create popup (quadraui::Palette dual-mode, #480) ─────
     // Migrated from a hand-rolled popup to the dual-mode `Palette` primitive
@@ -554,8 +701,7 @@ pub(super) fn render_source_control(
             popup_w as f32,
             popup_h as f32,
         );
-        use quadraui::Backend;
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
         backend.draw_palette(q_rect, &palette);
     }
 
@@ -564,7 +710,6 @@ pub(super) fn render_source_control(
     // shipped in quadraui#225. Bindings list lives once in
     // `render::sc_help_dialog` instead of being duplicated per backend.
     if sc.help_open {
-        use quadraui::Backend;
         let viewport = quadraui::Rect::new(
             area.x as f32,
             area.y as f32,
@@ -572,7 +717,7 @@ pub(super) fn render_source_control(
             area.height as f32,
         );
         let (dialog, layout) = render::sc_help_dialog_layout(viewport, 1.0, 1.0);
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
         let _ = backend.draw_dialog(&dialog, &layout);
     }
 }
@@ -636,8 +781,7 @@ pub(super) fn render_ext_panel(
             body_w as f32,
             body_h as f32,
         );
-        use quadraui::Backend;
-        backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
         backend.draw_tree(body_q_rect, &tree);
 
         // Manual scrollbar: `draw_tree` doesn't render scrollbars yet.
@@ -1085,7 +1229,7 @@ pub(super) fn render_ext_sidebar(
     engine.ext_sidebar_body_rect.set(msv_rect);
     render::populate_ext_sidebar_system(engine);
     let q_theme = super::quadraui_tui::q_theme(theme);
-    backend.set_current_theme(q_theme);
+    backend.set_theme(q_theme);
     engine.ext_sidebar_system.borrow().render(backend, msv_rect);
 }
 
@@ -1493,9 +1637,8 @@ pub(super) fn render_terminal_panel(
     );
     let td = render::build_terminal_draw_data(panel, q_area, 1.0, 1.0, content_rows, None);
     engine.terminal_split_layout.replace(td.split);
-    backend.set_current_theme(q_theme);
+    backend.set_theme(q_theme);
     {
-        use quadraui::Backend;
         if let Some(split) = &td.split {
             let left = td.left.as_ref().unwrap();
             let right = td.right.as_ref().unwrap();
@@ -1642,8 +1785,11 @@ mod sc_panel_tests {
                 // methods directly now (no per-call `enter_frame_scope`), so
                 // this harness needs to open the scope itself — mirrors what
                 // `event_loop`'s two `terminal.draw` closures do in `mod.rs`.
-                super::with_frame_scope(&mut tui_backend, frame, |backend, frame| {
-                    render_source_control(backend, frame, area, engine, &theme);
+                // #605: the renderer no longer needs the `Frame` at all, but
+                // the scope entry is still what gives its `draw_*` calls a
+                // buffer to land in.
+                super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
+                    render_source_control(backend, area, engine, &theme);
                 });
             })
             .unwrap();
