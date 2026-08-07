@@ -301,54 +301,96 @@ pub(super) fn render_search_panel(
 
 // ─── Status / command line ────────────────────────────────────────────────────
 
+/// Paint the `:`-command line row (background fill, text, inverted block
+/// cursor, and the mouse drag-selection inversion).
+///
+/// #605 (Stage 6 parity sweep): this used to write straight into
+/// `frame.buffer_mut()` via `set_cell`, which made it unreachable from
+/// `TuiShellApp::render_content`'s `&mut dyn Backend`-only signature. It now
+/// composes the row into a `(char, fg, bg)` cell vector and paints it through
+/// [`render_impl::draw_rule_row_themed`] — the same
+/// `Backend::draw_status_bar`-stands-in-for-a-raw-`set_cell` trick #609
+/// introduced for the window dividers (see that helper's doc comment).
+///
+/// The two inversions (cursor, then `selection`) are applied to the composed
+/// cells *before* painting rather than as buffer read-back passes afterwards.
+/// That's behaviour-identical to the old two-pass version — including the
+/// double-invert-cancels case where the cursor cell also falls inside the
+/// selection — but needs no `Buffer` access. `selection` is `event_loop`'s
+/// `cmd_sel` local (`(start, end)` character indices, either order).
 pub(super) fn render_command_line(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     command: &render::CommandLineData,
     theme: &Theme,
+    selection: Option<(usize, usize)>,
 ) {
-    let fg = rc(theme.command_fg);
-    let bg = rc(theme.command_bg);
-
-    for x in area.x..area.x + area.width {
-        set_cell(buf, x, area.y, ' ', fg, bg);
+    if area.width == 0 || area.height == 0 {
+        return;
     }
+    let fg = theme.command_fg;
+    let bg = theme.command_bg;
+    let width = area.width as usize;
 
+    // Row composition: background fill first, then the text on top.
+    let mut cells: Vec<(char, Color, Color)> = vec![(' ', fg, bg); width];
+    let chars: Vec<char> = command.text.chars().collect();
     if command.right_align {
-        let chars: Vec<char> = command.text.chars().collect();
-        let len = chars.len() as u16;
-        if len <= area.width {
-            let mut x = area.x + area.width - len;
-            for &ch in &chars {
-                if x >= area.x + area.width {
-                    break;
-                }
-                set_cell(buf, x, area.y, ch, fg, bg);
-                x += 1;
+        // Right-aligned text that doesn't fit is dropped entirely — matches
+        // the old `if len <= area.width` guard.
+        if chars.len() <= width {
+            let start = width - chars.len();
+            for (i, &ch) in chars.iter().enumerate() {
+                cells[start + i].0 = ch;
             }
         }
     } else {
-        let mut x = area.x;
-        for ch in command.text.chars() {
-            if x >= area.x + area.width {
+        for (i, &ch) in chars.iter().enumerate() {
+            if i >= width {
                 break;
             }
-            set_cell(buf, x, area.y, ch, fg, bg);
-            x += 1;
+            cells[i].0 = ch;
         }
     }
 
-    // Command-line cursor (inverted block at insertion point)
+    // Command-line cursor (inverted block at insertion point).
     if command.show_cursor {
-        let cursor_col = command.cursor_anchor_text.chars().count() as u16;
-        let cx = area.x + cursor_col.min(area.width.saturating_sub(1));
-        let buf_area = buf.area;
-        if cx < buf_area.x + buf_area.width {
-            let cell = &mut buf[(cx, area.y)];
-            let old_fg = cell.fg;
-            let old_bg = cell.bg;
-            cell.set_fg(old_bg).set_bg(old_fg);
+        let cursor_col = command.cursor_anchor_text.chars().count();
+        let idx = cursor_col.min(width - 1);
+        let cell = &mut cells[idx];
+        std::mem::swap(&mut cell.1, &mut cell.2);
+    }
+
+    // Mouse drag-selection: invert fg/bg for the selected span.
+    if let Some((start, end)) = selection {
+        let lo = start.min(end);
+        let hi = start.max(end);
+        for cell in cells.iter_mut().take(hi + 1).skip(lo) {
+            std::mem::swap(&mut cell.1, &mut cell.2);
         }
+    }
+
+    // Paint, batching runs of identically-coloured cells into one
+    // `draw_status_bar` call so a plain uncoloured command line costs one
+    // draw rather than `width` of them.
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    let mut run_start = 0usize;
+    while run_start < width {
+        let (_, run_fg, run_bg) = cells[run_start];
+        let mut run_end = run_start + 1;
+        while run_end < width && cells[run_end].1 == run_fg && cells[run_end].2 == run_bg {
+            run_end += 1;
+        }
+        let text: String = cells[run_start..run_end].iter().map(|c| c.0).collect();
+        super::render_impl::draw_rule_row_themed(
+            backend,
+            area.x + run_start as u16,
+            area.y,
+            &text,
+            run_fg,
+            run_bg,
+        );
+        run_start = run_end;
     }
 }
 
@@ -738,7 +780,7 @@ pub(super) fn render_ext_panel(
 /// Returns (link_rects, popup_rect) where popup_rect is (x, y, w, h).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn render_panel_hover_popup(
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
     screen: &render::ScreenLayout,
     theme: &Theme,
     sidebar_right_x: u16,
@@ -827,8 +869,7 @@ pub(super) fn render_panel_hover_popup(
         },
     );
 
-    use quadraui::Backend;
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_rich_text_popup(&popup, &layout);
 
     let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
