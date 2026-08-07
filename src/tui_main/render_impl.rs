@@ -118,6 +118,13 @@ pub(super) fn build_screen_for_tui(
 /// menu bar this stage (out of scope; TUI's menu bar defaults hidden except
 /// in vscode-mode or via Alt-reveal, tracked with the rest of key dispatch
 /// in #603).
+///
+/// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
+/// (`shell_app.rs`), which nothing outside that module's own
+/// `#[cfg(test)]` tests constructs yet — same dormant-scaffold reasoning as
+/// the `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the
+/// Stage 6 (#605) entry-point cutover.
+#[allow(dead_code)]
 pub(super) fn build_screen_for_shell_content(
     engine: &Engine,
     theme: &Theme,
@@ -202,6 +209,14 @@ pub(super) fn build_screen_for_shell_content(
 /// today. Carving a private sub-region out of `main_content_bounds`, matching
 /// `draw_frame`, is therefore the only option that doesn't require a much
 /// larger `ShellConfig`/layout-model change.
+///
+/// `#[allow(dead_code)]` (both this struct and
+/// [`bottom_chrome_rects_for_shell_content`] below): only constructed from
+/// `TuiShellApp::render_content` (`shell_app.rs`), which nothing outside
+/// that module's own `#[cfg(test)]` tests constructs yet — same
+/// dormant-scaffold reasoning as the `#[allow(dead_code)]` on `TuiShellApp`
+/// itself. Goes live at the Stage 6 (#605) entry-point cutover.
+#[allow(dead_code)]
 pub(super) struct BottomChromeRects {
     pub(super) quickfix: Rect,
     pub(super) bottom_panel: Rect,
@@ -212,6 +227,7 @@ pub(super) struct BottomChromeRects {
     pub(super) cmd: Rect,
 }
 
+#[allow(dead_code)]
 pub(super) fn bottom_chrome_rects_for_shell_content(
     engine: &Engine,
     screen: &render::ScreenLayout,

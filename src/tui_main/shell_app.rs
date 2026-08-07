@@ -54,10 +54,13 @@
 //!      issue). #605 closed two of the five: **settings**
 //!      (`render_settings_panel`'s header + search-box chrome was a free
 //!      `quadraui::tui::draw_settings_chrome` rasteriser with no
-//!      `Backend::draw_*` trait equivalent — `panels::
-//!      draw_settings_chrome_via_backend` now reproduces it exactly through
-//!      the rule-row trick, sourcing every colour from the same
-//!      `q_theme(theme)` the rasteriser reads so the two can't drift) and
+//!      `Backend::draw_*` trait equivalent — filed as
+//!      [JDonaghy/quadraui#531](https://github.com/JDonaghy/quadraui/issues/531);
+//!      `panels::draw_settings_chrome_via_backend` reproduces it exactly
+//!      through the rule-row trick, sourcing every colour from the same
+//!      `q_theme(theme)` the rasteriser reads so the two can't drift, as a
+//!      temporary stand-in until #531 lands and this collapses to one line)
+//!      and
 //!      **source control** (header row, focused-hint row, and full-area
 //!      background clear were raw `set_cell` loops; now `fill_row`/
 //!      `fill_rect`). Both renderers dropped their `&mut Frame` parameter,
@@ -80,7 +83,8 @@
 //!
 //!      The clean long-term fix for the settings chrome specifically is a
 //!      `Backend::draw_settings_chrome` trait method in quadraui (the
-//!      rasteriser already exists there; only the trait entry is missing),
+//!      rasteriser already exists there; only the trait entry is missing) —
+//!      filed as [JDonaghy/quadraui#531](https://github.com/JDonaghy/quadraui/issues/531) —
 //!      at which point `draw_settings_chrome_via_backend` deletes.
 //!
 //!    #609 (Stage 2c, closed) additionally wires the window/editor-group
@@ -143,8 +147,9 @@
 //!    `draw_settings_chrome`), so a correctly-divided split can't be
 //!    painted from this signature; `render_terminal_panel_content` clears
 //!    the background and leaves it otherwise blank rather than drawing an
-//!    undivided pane that would misrepresent the split state. See
-//!    `panels::render_terminal_panel_content`'s own doc comment.
+//!    undivided pane that would misrepresent the split state. Filed as
+//!    [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533).
+//!    See `panels::render_terminal_panel_content`'s own doc comment.
 //!
 //!    The menu bar row is reserved in the layout math but not painted
 //!    either (out of scope for #601; folds into key dispatch, #603).
@@ -242,7 +247,8 @@
 //! would overwrite the activity bar's first row, while always reserving a
 //! title-bar row would cost an editor row whenever the menu is hidden. Needs
 //! `AppShell::set_title_bar_visible` (or equivalent) upstream — a
-//! Platform-Neutrality-Rule gap, not something to work around here.
+//! Platform-Neutrality-Rule gap, not something to work around here. Filed as
+//! [JDonaghy/quadraui#532](https://github.com/JDonaghy/quadraui/issues/532).
 //! Everything else about these three is ready: `draw_menu_bar`,
 //! `draw_command_center` and `MenuSystem::render` are all already trait
 //! calls.
@@ -250,8 +256,9 @@
 //! **B. Split terminal panes — blocked on quadraui.** Same class as the
 //! (now-closed) settings chrome: `render_terminal_panel`'s split arm draws
 //! its divider with `quadraui::tui::draw_terminal_divider`, a free
-//! rasteriser with no `Backend::draw_*` entry. See
-//! `panels::render_terminal_panel_content`'s doc comment.
+//! rasteriser with no `Backend::draw_*` entry. Filed as
+//! [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533).
+//! See `panels::render_terminal_panel_content`'s doc comment.
 //!
 //! **C. Plugin extension panel + AI sidebar panel — vimcode-side.**
 //! `render_ext_panel`'s help-popup overlay and manual scrollbar are raw
@@ -1653,7 +1660,14 @@ impl ShellApp for TuiShellApp {
 /// the original's signature) so the still-live `event_loop()` call site is
 /// untouched; the next stage that actually deletes `event_loop()` should
 /// collapse these back into one function.
+///
+/// `#[allow(dead_code)]`: only called from `TuiShellApp::handle` in this
+/// module, which nothing outside this module's own `#[cfg(test)]` tests
+/// constructs yet — same dormant-scaffold reasoning as the
+/// `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the Stage 6
+/// (#605) entry-point cutover.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn dispatch_panel_accelerator_sizeless(
     id: &str,
     mods: quadraui::Modifiers,
@@ -1838,7 +1852,14 @@ fn dispatch_panel_accelerator_sizeless(
 /// `driver_with_shell`, which has no accessor back to the concrete app's
 /// fields. Structuring the real logic as a free function over borrowed
 /// pieces keeps it directly unit-testable against a bare `Engine`.
+///
+/// `#[allow(dead_code)]`: only called from `TuiShellApp::handle` in this
+/// module, which nothing outside this module's own `#[cfg(test)]` tests
+/// constructs yet — same dormant-scaffold reasoning as the
+/// `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the Stage 6
+/// (#605) entry-point cutover.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn handle_key_pressed(
     key: quadraui::Key,
     modifiers: quadraui::Modifiers,
