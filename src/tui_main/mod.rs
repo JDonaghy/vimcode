@@ -768,6 +768,101 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     }
 }
 
+/// #635 (Stage 6b item F): dormant sibling to [`run`], wired the same way
+/// `TuiShellApp` itself has been since Stage 0 (see that struct's module
+/// doc) — not called from `main.rs`/`tui_bin.rs` yet, only compiled.
+/// Flipping the live entry point over to this is #634's job; this issue
+/// only has to make that flip a pure function swap, with nothing left to
+/// figure out about sequencing at that point.
+///
+/// Establishes `run()`'s non-loop responsibilities — the panic hook,
+/// emergency-engine registration, the emergency swap flush, and the custom
+/// crash message — around `quadraui::tui::shell_runner::run_with_shell`
+/// instead of [`event_loop`].
+///
+/// Unlike `run()`, this does **not** do its own raw-mode / alternate-screen
+/// / mouse-capture / keyboard-enhancement terminal setup or teardown:
+/// `run_with_shell` → `quadraui::tui::run::run` (`quadraui/src/tui/run.rs`)
+/// already does all of that internally (`enable_raw_mode`,
+/// `EnterAlternateScreen`, `EnableMouseCapture`, `EnableBracketedPaste`, the
+/// kitty keyboard-enhancement push/pop), and always restores the terminal
+/// — even on panic, via its own inner `catch_unwind` — before propagating
+/// via `resume_unwind`. That's exactly what makes wrapping it in a second,
+/// outer `catch_unwind` here safe and sufficient: this closure's
+/// `catch_unwind` still observes the same panic payload, with the terminal
+/// already back to normal, the same guarantee `run()`'s own outer
+/// `catch_unwind` relies on around `event_loop`.
+///
+/// `keyboard_enhanced` (threaded into `translate_key` for Ctrl-combo
+/// disambiguation) and the emergency-engine pointer registration both move
+/// into `TuiShellApp::setup` instead of living here — see
+/// [`shell_app::TuiShellApp::prepare_for_live_run`] and that `setup`
+/// override's doc comments for why: `run_with_shell` takes `app` *by
+/// value* and moves it through several stack frames
+/// (`build_shell_adapter` → `ShellAdapter`'s own field →
+/// `tui::run::run`'s `mut app: A` local) before it settles, so a raw
+/// pointer captured here, before that call, would already be stale by the
+/// time anything could read it — `setup()` runs only after all of those
+/// moves are done.
+#[allow(dead_code)]
+pub(super) fn run_via_shell(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
+    if let Some(ref path) = debug_log_path {
+        init_debug_log(path);
+        debug_log!("=== VimCode TUI debug log started ===");
+    }
+
+    let mut app = shell_app::TuiShellApp::new(file_path);
+    app.prepare_for_live_run();
+
+    // Always install a panic hook that writes crash info to
+    // /tmp/vimcode-crash.log AND to the debug log (if --debug is active) —
+    // verbatim copy of `run()`'s own hook above.
+    {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Emergency: flush swap files for all dirty buffers before
+            // anything else, via the pointer `TuiShellApp::setup` registers
+            // once `app` reaches its stable live-run address.
+            crate::core::swap::run_emergency_flush();
+
+            if let Some(path) = crate::core::swap::write_crash_log(info) {
+                debug_log!("Crash log written to {}", path.display());
+            }
+            prev_hook(info);
+        }));
+    }
+
+    let config = shell_app::TuiShellApp::shell_config(app.engine.menu_bar_visible);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        quadraui::tui::shell_runner::run_with_shell(app, config);
+    }));
+
+    if let Err(e) = result {
+        // Unlike `run()`, there is no locally-owned `engine` left to call
+        // `emergency_swap_flush()` on directly here — `app` (and its
+        // `engine`) moved into `run_with_shell` above and is gone by the
+        // time a panic unwinds back to this frame. The panic hook already
+        // ran `run_emergency_flush()` via the registered emergency-engine
+        // pointer *before* unwinding started (while `engine` was still
+        // fully valid), so the flush already happened; this block only
+        // reproduces `run()`'s user-facing crash message.
+        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+            format!("VimCode internal error: {s}")
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            format!("VimCode internal error: {s}")
+        } else {
+            "VimCode internal error (unknown panic payload)".to_string()
+        };
+        let crash_path = crate::core::swap::crash_log_path();
+        eprintln!("{msg}");
+        eprintln!("Unsaved buffers written to swap files for recovery.");
+        eprintln!("Crash details written to {}", crash_path.display());
+        eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
+        std::process::exit(1);
+    }
+}
+
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>, keyboard_enhanced: bool) {
     if keyboard_enhanced {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);

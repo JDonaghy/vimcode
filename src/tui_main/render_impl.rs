@@ -476,7 +476,6 @@ pub(super) fn draw_frame(
 
         render_sidebar(
             backend,
-            frame,
             sidebar_area,
             sidebar,
             engine,
