@@ -51,7 +51,7 @@ pub(super) fn render_sidebar(
             return;
         }
         Some(PANEL_EXTENSIONS) => {
-            render_ext_sidebar(backend, frame, area, engine, theme);
+            render_ext_sidebar(backend, area, engine, theme);
             return;
         }
         Some(PANEL_AI) => {
@@ -153,19 +153,18 @@ pub(super) fn render_explorer_sidebar_content(
 /// Ported: explorer (default panel, via [`render_explorer_sidebar_content`]),
 /// search (`render_search_panel`, already trait-pure — no raw buffer use at
 /// all), debug (`render_debug_sidebar`, likewise already trait-pure), and —
-/// #605 — **settings** and **source control**, whose raw `set_cell` chrome
-/// (background wipe, header row, focused-hint row, and the settings
-/// header/search box) was converted to [`fill_rect`] / [`fill_row`] /
-/// [`draw_settings_chrome_via_backend`]. Both renderers dropped their
+/// #605 — **settings**, **source control** and **extensions**, whose raw
+/// `set_cell` chrome (background wipe, header rows, focused-hint row, search
+/// boxes) was converted to [`fill_rect`] / [`fill_row`] /
+/// [`draw_settings_chrome_via_backend`]. All three renderers dropped their
 /// `&mut Frame` parameter entirely as a result, so `draw_frame` and
 /// `render_content` now share one implementation of each rather than the
 /// live path keeping a frame-having variant.
 ///
 /// Still deferred, each still blocked on raw-`Buffer` access — see
-/// `shell_app.rs`'s module doc: the **extensions** sidebar's two chrome rows,
-/// the **plugin extension panel**'s chrome + help popup + manual scrollbar,
-/// and the **AI panel**, whose signature takes `buf: &mut Buffer` outright
-/// with no backend parameter at all.
+/// `shell_app.rs`'s module doc: the **plugin extension panel**'s help popup +
+/// manual scrollbar, and the **AI panel**, whose signature takes
+/// `buf: &mut Buffer` outright with no backend parameter at all.
 pub(super) fn render_sidebar_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -181,13 +180,15 @@ pub(super) fn render_sidebar_content(
     match engine.app_shell.active_panel_id().map(|w| w.as_str()) {
         Some(PANEL_SEARCH) => render_search_panel(backend, area, engine, theme),
         Some(PANEL_DEBUG) => render_debug_sidebar(backend, area, engine, theme),
-        // #605: settings + source control are no longer deferred — both had
-        // their raw `set_cell` chrome converted to the rule-row trick.
+        // #605: settings, source control and extensions are no longer
+        // deferred — each had its raw `set_cell` chrome converted to the
+        // rule-row trick.
         Some(PANEL_SETTINGS) => render_settings_panel(backend, area, theme, engine),
         Some(PANEL_GIT) => render_source_control(backend, area, engine, theme),
-        // Extensions and AI: still deferred — see this fn's doc comment and
-        // shell_app.rs's module doc.
-        Some(PANEL_EXTENSIONS | PANEL_AI) => {}
+        Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, area, engine, theme),
+        // AI: still deferred — see this fn's doc comment and shell_app.rs's
+        // module doc.
+        Some(PANEL_AI) => {}
         _ => render_explorer_sidebar_content(backend, area, engine, theme),
     }
 }
@@ -1152,9 +1153,12 @@ pub(super) fn render_editor_hover_popup(
 /// primitive — there is no per-backend section-walk code that paint
 /// and click could disagree on (the structural fix for the #281 bug
 /// classes).
+/// #605: widened from `&mut TuiBackend` + `&mut Frame` to `&mut dyn Backend`.
+/// The two chrome rows were the only raw-`Buffer` writes left; the local
+/// `write_row` closure they used is exactly what [`fill_row`] does, so it
+/// collapsed into that.
 pub(super) fn render_ext_sidebar(
-    backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -1168,52 +1172,48 @@ pub(super) fn render_ext_sidebar(
         return;
     };
 
-    let header_fg = rc(theme.status_fg);
-    let header_bg = rc(theme.status_bg);
-    let default_fg = rc(theme.foreground);
-    let dim_fg = rc(theme.line_number_fg);
-    let sel_bg = rc(theme.fuzzy_selected_bg);
-    let panel_bg = rc(theme.completion_bg);
+    let header_fg = theme.status_fg;
+    let header_bg = theme.status_bg;
+    let default_fg = theme.foreground;
+    let dim_fg = theme.line_number_fg;
+    let sel_bg = theme.fuzzy_selected_bg;
+    let panel_bg = theme.completion_bg;
 
     // ── Chrome rows: panel header (row 0) + search box (row 1) ───────────────
-    {
-        let buf = frame.buffer_mut();
+    if area.height >= 1 {
+        let hdr = if ext.fetching {
+            " \u{eb85} EXTENSIONS  (fetching…)".to_string()
+        } else {
+            " \u{eb85} EXTENSIONS".to_string()
+        };
+        fill_row(
+            backend, area.x, area.y, area.width, &hdr, header_fg, header_bg,
+        );
+    }
 
-        let write_row =
-            |buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, fg: RColor, bg: RColor| {
-                for x in area.x..area.x + area.width {
-                    set_cell(buf, x, y, ' ', fg, bg);
-                }
-                for (i, ch) in text.chars().enumerate().take(area.width as usize) {
-                    set_cell(buf, area.x + i as u16, y, ch, fg, bg);
-                }
-            };
-
-        if area.height >= 1 {
-            let hdr = if ext.fetching {
-                " \u{eb85} EXTENSIONS  (fetching…)".to_string()
-            } else {
-                " \u{eb85} EXTENSIONS".to_string()
-            };
-            write_row(buf, area.y, &hdr, header_fg, header_bg);
-        }
-
-        if area.height >= 2 {
-            let search_bg = if ext.input_active { sel_bg } else { panel_bg };
-            let search_fg = if ext.input_active || !ext.query.is_empty() {
-                default_fg
-            } else {
-                dim_fg
-            };
-            let search_text = if ext.input_active {
-                format!(" \u{f002} {}|", ext.query)
-            } else if ext.query.is_empty() {
-                " \u{f002} Search extensions (press /)".to_string()
-            } else {
-                format!(" \u{f002} {}", ext.query)
-            };
-            write_row(buf, area.y + 1, &search_text, search_fg, search_bg);
-        }
+    if area.height >= 2 {
+        let search_bg = if ext.input_active { sel_bg } else { panel_bg };
+        let search_fg = if ext.input_active || !ext.query.is_empty() {
+            default_fg
+        } else {
+            dim_fg
+        };
+        let search_text = if ext.input_active {
+            format!(" \u{f002} {}|", ext.query)
+        } else if ext.query.is_empty() {
+            " \u{f002} Search extensions (press /)".to_string()
+        } else {
+            format!(" \u{f002} {}", ext.query)
+        };
+        fill_row(
+            backend,
+            area.x,
+            area.y + 1,
+            area.width,
+            &search_text,
+            search_fg,
+            search_bg,
+        );
     }
 
     // ── SidebarSystem body: rest of the panel ──────────────────────────────
