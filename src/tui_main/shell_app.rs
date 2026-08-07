@@ -51,41 +51,39 @@
 //!    cutover):
 //!
 //!    - The rest of the sidebar (#607's own known-gap list, no separate
-//!      issue). #605 closed two of the five: **settings**
-//!      (`render_settings_panel`'s header + search-box chrome was a free
-//!      `quadraui::tui::draw_settings_chrome` rasteriser with no
-//!      `Backend::draw_*` trait equivalent — filed as
-//!      [JDonaghy/quadraui#531](https://github.com/JDonaghy/quadraui/issues/531);
-//!      `panels::draw_settings_chrome_via_backend` reproduces it exactly
-//!      through the rule-row trick, sourcing every colour from the same
-//!      `q_theme(theme)` the rasteriser reads so the two can't drift, as a
-//!      temporary stand-in until #531 lands and this collapses to one line)
-//!      and
-//!      **source control** (header row, focused-hint row, and full-area
-//!      background clear were raw `set_cell` loops; now `fill_row`/
-//!      `fill_rect`). Both renderers dropped their `&mut Frame` parameter,
-//!      so there is one implementation shared by `draw_frame` and
+//!      issue) is now fully painted. #605 closed the first two of five:
+//!      **settings** and **source control** (header rows, focused-hint row,
+//!      and full-area background clears were raw `set_cell` loops; now
+//!      `fill_row`/`fill_rect`). Both renderers dropped their `&mut Frame`
+//!      parameter, so there is one implementation shared by `draw_frame` and
 //!      `render_content`, and `panels.rs`'s own source-control buffer
 //!      snapshot test still passes unchanged — i.e. the conversion is
-//!      byte-identical on the live path.
+//!      byte-identical on the live path. **extensions** followed the same
+//!      way (`render_ext_sidebar`'s two chrome rows were a local
+//!      raw-`set_cell` `write_row` closure that is exactly what `fill_row`
+//!      does).
 //!
-//!      **extensions** followed the same way (`render_ext_sidebar`'s two
-//!      chrome rows were a local raw-`set_cell` `write_row` closure that is
-//!      exactly what `fill_row` does).
-//!
-//!      Still open: the **plugin extension panel**
-//!      (`render_ext_panel` uses the same `draw_settings_chrome`, which
-//!      `draw_settings_chrome_via_backend` now covers, *but* its help popup
-//!      overlay and manual scrollbar are raw `set_cell` box-drawing with no
-//!      primitive stand-in checked yet), and the **AI panel**
-//!      (`render_ai_sidebar` takes `buf: &mut ratatui::buffer::Buffer`
-//!      directly — no backend parameter at all, the most raw of the lot).
-//!
-//!      The clean long-term fix for the settings chrome specifically is a
-//!      `Backend::draw_settings_chrome` trait method in quadraui (the
-//!      rasteriser already exists there; only the trait entry is missing) —
-//!      filed as [JDonaghy/quadraui#531](https://github.com/JDonaghy/quadraui/issues/531) —
-//!      at which point `draw_settings_chrome_via_backend` deletes.
+//!      #635 (Stage 6b, item C) closed the last two. The **settings chrome**
+//!      specifically also got its clean long-term fix in the same stage:
+//!      [JDonaghy/quadraui#531](https://github.com/JDonaghy/quadraui/issues/531)
+//!      landed `Backend::draw_settings_chrome` as a real trait method, so
+//!      the temporary `panels::draw_settings_chrome_via_backend` rule-row
+//!      stand-in this doc used to describe is gone — `render_settings_panel`
+//!      and `render_ext_panel` both call the trait method directly now. The
+//!      **plugin extension panel**'s help-popup overlay now paints through
+//!      `Backend::draw_tooltip` (manually-constructed `TooltipLayout`, since
+//!      its content is a centered box rather than an anchor-relative
+//!      tooltip) and its manual scrollbar through `fill_row`; the **AI
+//!      panel** (`render_ai_sidebar`, previously the most raw of the lot —
+//!      `buf: &mut ratatui::buffer::Buffer` with no backend parameter at
+//!      all) now takes `&mut dyn Backend`, using the already-trait-pure
+//!      `Backend::draw_message_list` for the chat history and `fill_row` for
+//!      its plain chrome rows. See `render_ext_panel`'s and
+//!      `render_ai_sidebar`'s own doc comments for the couple of minor,
+//!      intentional cosmetic differences (no border-embedded popup title, no
+//!      close glyph, message-list background sourced from
+//!      `TuiBackend::current_theme.background` instead of an explicit
+//!      parameter).
 //!
 //!    #609 (Stage 2c, closed) additionally wires the window/editor-group
 //!    divider lines, the tab-drag ghost overlay, and the tab-hover tooltip
@@ -139,24 +137,24 @@
 //!    background-clear loop, using the same `draw_status_bar`-blank-segment
 //!    trick #607 introduced) for the Terminal tab, or
 //!    `Backend::draw_text_display` (already trait-pure) for the Debug
-//!    Output tab. Known gap: **split terminal panes** (`Ctrl+\`,
-//!    `panel.split_left_rows.is_some()`) are NOT painted —
-//!    `render_terminal_panel`'s split arm draws the divider via
-//!    `quadraui::tui::draw_terminal_divider`, a free rasteriser with no
+//!    Output tab. **Split terminal panes** (`Ctrl+\`,
+//!    `panel.split_left_rows.is_some()`) used to be a known gap here —
+//!    `render_terminal_panel`'s split arm drew its divider via the free
+//!    `quadraui::tui::draw_terminal_divider` rasteriser, with no
 //!    `Backend::draw_*` trait equivalent (same class of gap as
-//!    `draw_settings_chrome`), so a correctly-divided split can't be
-//!    painted from this signature; `render_terminal_panel_content` clears
-//!    the background and leaves it otherwise blank rather than drawing an
-//!    undivided pane that would misrepresent the split state. Filed as
-//!    [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533).
-//!    See `panels::render_terminal_panel_content`'s own doc comment.
+//!    `draw_settings_chrome`) — but #635 (Stage 6b, item B) closed it now
+//!    that [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533)
+//!    landed `Backend::draw_terminal_divider`: both panes and the divider
+//!    now paint through the trait, mirroring `render_terminal_panel`'s live
+//!    `draw_frame` path exactly. See `panels::render_terminal_panel_content`'s
+//!    own doc comment.
 //!
-//!    The menu bar row is reserved in the layout math but not painted
-//!    either (out of scope for #601; folds into key dispatch, #603).
-//!    Cursor placement used to be a raw-buffer holdout in this list (it
-//!    needs `Frame::set_cursor_position`, and `render_content` has no
-//!    `Frame`) but #604 closed it a different way — see gap 3 below, now
-//!    resolved.
+//!    The menu bar row used to be reserved in the layout math but not
+//!    painted (out of scope for #601; folded into key dispatch, #603, then
+//!    painting, #635 item A — see the Stage 6b section below). Cursor
+//!    placement used to be a raw-buffer holdout in this list (it needs
+//!    `Frame::set_cursor_position`, and `render_content` has no `Frame`)
+//!    but #604 closed it a different way — see gap 3 below, now resolved.
 //! 2. **Mouse handling (#602, largely resolved).** `mouse::handle_mouse`
 //!    (~4,100 lines) takes `&mut quadraui::DragState` + `&mut
 //!    quadraui::ModalStack` directly via `TuiBackend::drag_and_modal_mut()`
@@ -205,90 +203,106 @@
 //!    `TestBackend`'s terminal cursor) by
 //!    `insert_mode_bar_cursor_reaches_terminal_frame_via_shell_app` below.
 //!
-//! Given (2) is now closed by #602, (3) is now closed by #604, and (1)
-//! remains the only open structural gap, `handle()` below implements every
-//! dispatch layer that doesn't need raw Frame access: panel-key
-//! accelerators, the "#318"
-//! Alt+menu-letter "reveal menu bar" shim (mirrors `mod.rs:1319`-`:1338` —
-//! sets `engine.menu_bar_visible = true` on an Alt+<letter> keypress so the
-//! same keystroke both reveals and activates the menu), the `MenuSystem`
+//! Given (2) is now closed by #602, (3) is now closed by #604, and (1) is
+//! now fully closed by #605 + #635 (Stage 6b), `handle()` below implements
+//! every keyboard/mouse dispatch layer except the sidebar-focused tier (see
+//! item D below): panel-key accelerators, the "#318" Alt+menu-letter
+//! "reveal menu bar" shim (mirrors `mod.rs:1319`-`:1338` — sets
+//! `engine.menu_bar_visible = true` on an Alt+<letter> keypress so the same
+//! keystroke both reveals and activates the menu), the `MenuSystem`
 //! intercept, full mouse dispatch through `handle_mouse_event` (#602), and
 //! — #603 (Stage 4) — the `KeyPressed` dispatch chain (modal dialog /
 //! folder-picker-modal / context-menu intercepts, then the general
 //! `Engine::handle_key` fallback that also resolves command-palette and
-//! completion-popup state internally). This is *not* the full
-//! `mod.rs:1629`-`:2737` precedence chain: activity-bar-focused,
-//! sidebar-focused, and command-output-selection (`cmd_sel`) keyboard tiers
-//! are still unported, since their gating focus state is set almost
-//! entirely by `mouse::handle_mouse`. See `handle_key_pressed`'s own doc
-//! comment for the exact precedence chain and this gap's full detail, and
-//! for why it's a free function rather than a `TuiShellApp` method.
+//! completion-popup state internally), plus — #635 (Stage 6b, item D) —
+//! activity-bar-focused and command-output-selection (`cmd_sel`) tiers. See
+//! `handle_key_pressed`'s own doc comment for the exact precedence chain,
+//! the sidebar-focused gap's full detail, and for why it's a free function
+//! rather than a `TuiShellApp` method.
 //!
-//! # Stage 6 (#605) cutover: what is still missing
+//! # Stage 6b (#635) cutover prerequisites: results
 //!
-//! #605 swept `draw_frame`'s tail into `render_content` (separated status,
-//! debug toolbar, wildmenu, global status bar, command line + `cmd_sel`,
+//! #605 (Stage 6) swept `draw_frame`'s tail into `render_content` (separated
+//! status, debug toolbar, wildmenu, global status bar, command line,
 //! panel hover popup, folder picker, find/replace, unified picker, tab
-//! switcher, context menu, dialog, toast stack) and closed three of the five
-//! sidebar-panel gaps (settings, source control, extensions). It did **not**
-//! flip `tui_main::run()` over to
-//! `quadraui::tui::shell_runner::run_with_shell`, because the list below is
-//! what a cutover today would silently regress. Each item is recorded with
-//! what it would actually take, so the next session starts from a scoped
-//! list rather than a re-survey.
+//! switcher, context menu, dialog, toast stack), closed three of the five
+//! sidebar-panel gaps (settings, source control, extensions), and recorded
+//! six items (A–F) a cutover to `quadraui::tui::shell_runner::run_with_shell`
+//! would otherwise silently regress. #635 (Stage 6b) is that follow-through:
 //!
-//! **A. Menu bar + command centre + menu dropdown — blocked on quadraui.**
-//! `draw_frame` carves a full-width row 0 for these *above* the activity bar,
-//! and vimcode's menu bar is runtime-toggleable (`engine.menu_bar_visible`,
-//! `menu_bar_toggleable = true` in `setup`). `AppShell` reserves its
-//! title-bar row at construction (`ShellConfig`/`AppShell::with_title_bar`)
-//! and exposes no runtime toggle, and with no title bar it starts the
-//! activity bar at `y = 0` — so painting the menu into `window_bounds` row 0
-//! would overwrite the activity bar's first row, while always reserving a
-//! title-bar row would cost an editor row whenever the menu is hidden. Needs
-//! `AppShell::set_title_bar_visible` (or equivalent) upstream — a
-//! Platform-Neutrality-Rule gap, not something to work around here. Filed as
-//! [JDonaghy/quadraui#532](https://github.com/JDonaghy/quadraui/issues/532).
-//! Everything else about these three is ready: `draw_menu_bar`,
-//! `draw_command_center` and `MenuSystem::render` are all already trait
-//! calls.
+//! **A. Menu bar + command centre + menu dropdown — done.**
+//! [JDonaghy/quadraui#532](https://github.com/JDonaghy/quadraui/issues/532)
+//! landed `AppShell::set_title_bar_visible`, the runtime toggle this needed
+//! (unlike `AppShell::with_title_bar`, a construction-time-only commitment —
+//! see that method's own doc comment). [`TuiShellApp::shell_config`] seeds
+//! the title-bar reservation from `engine.menu_bar_visible` at construction
+//! (so the very first frame, painted before any `handle()` dispatch, is
+//! already correct), and `handle()`'s first block keeps it synced via
+//! `ShellContext::shell_mut().set_title_bar_visible(...)` on every
+//! subsequent dispatch. `render_content` paints the menu bar + command
+//! centre into `layout.title_bar_bounds` when reserved, and the menu
+//! dropdown last (after the dialog, before the toast stack — mirrors
+//! `draw_frame`'s own "rendered last so it draws on top of everything"
+//! ordering). `draw_menu_bar`, `draw_command_center` and
+//! `MenuSystem::render` were already trait calls, as this doc predicted —
+//! the gap was purely the missing reservation toggle.
 //!
-//! **B. Split terminal panes — blocked on quadraui.** Same class as the
-//! (now-closed) settings chrome: `render_terminal_panel`'s split arm draws
-//! its divider with `quadraui::tui::draw_terminal_divider`, a free
-//! rasteriser with no `Backend::draw_*` entry. Filed as
-//! [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533).
-//! See `panels::render_terminal_panel_content`'s doc comment.
+//! **B. Split terminal panes — done.**
+//! [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533)
+//! landed `Backend::draw_terminal_divider`. Both `render_terminal_panel`
+//! (the live `draw_frame` path) and `render_terminal_panel_content` (the
+//! `render_content` path) now paint both panes and the divider through it;
+//! see the terminal-divider migration note in the painting section above.
 //!
-//! **C. Plugin extension panel + AI sidebar panel — vimcode-side.**
-//! `render_ext_panel`'s help-popup overlay and manual scrollbar are raw
-//! `set_cell` box drawing (no primitive stand-in checked yet);
-//! `render_ai_sidebar` takes `buf: &mut ratatui::buffer::Buffer` outright.
+//! **C. Plugin extension panel + AI sidebar panel — done.**
+//! `render_ext_panel`'s help-popup overlay now paints through
+//! `Backend::draw_tooltip`, its manual scrollbar through `fill_row`;
+//! `render_ai_sidebar` dropped its `buf: &mut Buffer` parameter for
+//! `&mut dyn Backend`, using `Backend::draw_message_list` (already a trait
+//! method — it just wasn't being called through it) for the chat history.
+//! See the painting section above and each function's own doc comment for
+//! the couple of minor, intentional cosmetic differences.
 //!
-//! **D. The three unported keyboard tiers — vimcode-side.** Activity-bar-
-//! focused, sidebar-focused, and `cmd_sel` — see the paragraph above.
+//! **D. The three unported keyboard tiers — two of three done.**
+//! Activity-bar-focused (mirrors `mod.rs:1805`-`:1854`) and `cmd_sel`
+//! (mirrors `mod.rs:2651`-`:2701`) are ported in `handle_key_pressed`. The
+//! **sidebar-focused tier remains open** — at ~500 lines across five nested
+//! per-panel dispatchers (search/debug/extension-panel/source-control/
+//! explorer, plus its own context-menu intercept and Ctrl-W navigation,
+//! `mod.rs:1856`-`:2385`) it's an order of magnitude larger than the other
+//! two and wasn't safely portable in the same pass. Not a regression: a key
+//! press while `sidebar.has_focus` is true falls through to the general
+//! `Engine::handle_key` fallback, exactly as it did before this stage.
 //!
-//! **E. `ShellConfig` build-out — vimcode-side, mechanical.** The
-//! `#[cfg(test)] config()` below declares a single `panel:explorer`
-//! `PanelDefinition`, so `AppShell`'s own activity bar would render one icon.
-//! A live config needs every panel vimcode's `render::build_activity_bar`
-//! emits, split across `ShellConfig.panels` / `with_bottom_items`, plus an
-//! `on_shell_event` arm that treats the hamburger item as "open the menu"
-//! rather than "switch panel". (`AppShell::build_activity_bar` leaves
-//! `active_accent`/`selection_bg` `None` where vimcode's sets them from the
-//! theme; the TUI rasteriser falls back to `theme.cursor`, so that one is a
-//! cosmetic difference, not a blocker.)
+//! **E. `ShellConfig` build-out — done.** [`TuiShellApp::shell_config`]
+//! derives its panel list from the same `PANEL_*` ids
+//! `render::build_activity_bar`'s `fixed` array switches on (explorer,
+//! search, debug, source control, extensions, AI), plus the menu hamburger
+//! (top) and settings (bottom) — the two items outside that array. Dynamic
+//! per-session extension panels (`engine.ext_panels`) are NOT included;
+//! wiring those through `AppShell::add_panel`/`remove_panel` needs a live
+//! `AppShell` instance, which nothing constructs until #634.
+//! [`ShellApp::on_shell_event`] intercepts the hamburger's
+//! `AppShellEvent::PanelChanged` and reveals the menu bar instead of
+//! switching the sidebar to a nonexistent "Menu" panel. (`AppShell::
+//! build_activity_bar` still leaves `active_accent`/`selection_bg` `None`
+//! where vimcode's sets them from the theme; the TUI rasteriser falls back
+//! to `theme.cursor`, so that's still a cosmetic difference, not a
+//! blocker.)
 //!
-//! **F. `run()`'s own non-loop responsibilities — vimcode-side.** The panic
-//! hook, `core::swap::register_emergency_engine`, the emergency swap flush
-//! and the custom crash message all live in `run()` around `event_loop`.
-//! `run_with_shell` → `tui::run::run` does its own `catch_unwind` and
-//! `resume_unwind`s after restoring the terminal, so an outer `catch_unwind`
-//! in `run()` still sees the payload; the ordering just has to be
-//! re-established deliberately. `keyboard_enhanced` is *not* a blocker
-//! despite the field comment below: `setup()` can call
-//! `crossterm::terminal::supports_keyboard_enhancement()` itself and get the
-//! same answer the runner's own push used.
+//! **F. `run()`'s own non-loop responsibilities — done, as a dormant
+//! sibling.** [`super::run_via_shell`] (`mod.rs`) reproduces `run()`'s panic
+//! hook, emergency-engine registration, emergency swap flush, and custom
+//! crash message around `run_with_shell` instead of `event_loop` — see its
+//! own doc comment for the exact sequencing, and [`Self::prepare_for_live_run`]
+//! / `ShellApp::setup`'s `self.live` gate for why `keyboard_enhanced` and
+//! the (`unsafe`) emergency-engine pointer registration had to move into
+//! `setup()` rather than staying in the wrapper: `run_with_shell` takes
+//! `app` *by value* and moves it through several stack frames before it
+//! settles, so a pointer captured before that call would already be stale.
+//! `run_via_shell` is not called from `main.rs`/`tui_bin.rs` yet — same
+//! dormant-scaffold status `TuiShellApp` itself has had since Stage 0 —
+//! wiring it in is #634's job.
 //!
 //! Note that none of the above is reachable by `driver_with_shell` in the
 //! sense of proving the *live* TUI works — see the pinned note on #605:
@@ -307,6 +321,13 @@ use super::*;
 /// verbatim. Named alias so the `TuiShellApp` fields below don't trip
 /// clippy's `type_complexity` lint.
 type HoverLinkRects = Vec<(u16, u16, u16, u16, String)>;
+
+/// Activity-bar item id for the menu hamburger — must match the literal
+/// `render::build_activity_bar` uses for its own hamburger `ActivityItem`
+/// (`"activity:menu"`, `render.rs:8147`) so [`TuiShellApp::shell_config`]'s
+/// `PanelDefinition` and [`ShellApp::on_shell_event`]'s hamburger check stay
+/// in lockstep with the live `draw_frame` path.
+const HAMBURGER_PANEL_ID: &str = "activity:menu";
 
 /// TUI counterpart to GTK's `App` struct. Owns everything that is a local
 /// `mut` variable in `event_loop()` today. Fields the (`&self`)
@@ -373,15 +394,35 @@ pub(super) struct TuiShellApp {
     /// loop starts) — threaded into `translate_key` to disambiguate a
     /// handful of Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
     /// Ctrl+Shift+[/]) that arrive ambiguously without the kitty keyboard
-    /// protocol. This dormant scaffold has no live terminal session to
-    /// query yet — only `driver_with_shell`'s `TestBackend`, where
-    /// querying would be meaningless and `supports_keyboard_enhancement()`'s
-    /// real terminal round-trip could misbehave without a TTY — so this
-    /// defaults to `false`, the same value `unwrap_or(false)` falls back to
-    /// on any terminal that doesn't support the protocol. Stage 6 cutover
-    /// (#605) should thread the real value in from wherever
-    /// `run_with_shell` ends up being called.
+    /// protocol. Defaults to `false`, the same value `unwrap_or(false)`
+    /// falls back to on any terminal that doesn't support the protocol —
+    /// exactly what every `driver_with_shell` test gets, since
+    /// `ShellApp::setup` only queries the real terminal when [`Self::live`]
+    /// is set (see that field and `setup`'s own doc comments for why).
     keyboard_enhanced: bool,
+    /// Set by [`Self::prepare_for_live_run`], never by anything else — in
+    /// particular never by a `driver_with_shell` test. Gates the two
+    /// `ShellApp::setup` steps that are unsound or unsafe to run under a
+    /// short-lived headless test instance (#635, Stage 6b item F):
+    ///
+    /// - `supports_keyboard_enhancement()` does a blocking round-trip
+    ///   against the real terminal (enables raw mode if not already on,
+    ///   writes a query escape sequence, and reads/polls for the
+    ///   response — see crossterm's `query_keyboard_enhancement_flags_*`).
+    ///   Under `driver_with_shell`'s `TestBackend` there is no real
+    ///   terminal to answer, so every test using the driver would pay that
+    ///   round-trip's latency (or worse, hang) for no benefit.
+    /// - `core::swap::register_emergency_engine` stores a raw
+    ///   `*const Engine` in a process-global `static`, on the explicit
+    ///   contract that "the caller must ensure `engine` lives for the rest
+    ///   of the process" (see that function's doc comment). A
+    ///   `driver_with_shell` test's `TuiShellApp` is dropped at the end of
+    ///   the test function — registering it would leave the global pointer
+    ///   dangling for the rest of the *test binary's* process lifetime,
+    ///   ready to be dereferenced by an unrelated later test's panic hook.
+    ///   That's a genuine soundness bug, not just a slowdown, so this must
+    ///   never run under test.
+    live: bool,
 }
 
 #[allow(dead_code)] // see the struct-level #[allow(dead_code)] doc above
@@ -473,11 +514,128 @@ impl TuiShellApp {
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
             keyboard_enhanced: false,
+            live: false,
         }
     }
 
     fn theme(&self) -> Theme {
         Theme::from_name(&self.engine.settings.colorscheme)
+    }
+
+    /// Arm [`Self::live`] (#635, Stage 6b item F). Call exactly once,
+    /// after [`Self::new`] and before handing `self` to
+    /// `quadraui::tui::shell_runner::run_with_shell` (which takes
+    /// ownership of `self` — never call this on an instance that's about
+    /// to be dropped or moved into a `driver_with_shell` test instead).
+    ///
+    /// `run_with_shell(app, config)` moves `app` through several stack
+    /// frames before it settles (`build_shell_adapter` → `ShellAdapter`'s
+    /// own field → `tui::run::run`'s `mut app: A` local) — so a raw
+    /// pointer to `self.engine` taken *before* that call would already be
+    /// stale by the time anything could dereference it. `ShellApp::setup`
+    /// runs from inside `tui::run::run`, after all of those moves are
+    /// done and `self` has reached its final, stable address for the rest
+    /// of the process — that's why the two operations this flag gates
+    /// live in `setup()` rather than here or in the wrapper that calls
+    /// this. This method only records the caller's intent; it doesn't do
+    /// either operation itself.
+    pub(super) fn prepare_for_live_run(&mut self) {
+        self.live = true;
+    }
+
+    /// The live `ShellConfig` for `TuiShellApp` (#635, Stage 6b item E).
+    ///
+    /// `render::build_activity_bar` (`render.rs:8147`) is the source of
+    /// truth for which icons the live `draw_frame` path's activity bar
+    /// shows — this mirrors its `fixed` array (explorer, search, debug,
+    /// source control, extensions, AI) by id, icon and tooltip exactly, so
+    /// `AppShell`'s own activity bar (painted by the shell runner ahead of
+    /// `render_content`, once #634 wires this config in) can't drift from
+    /// it. Also registers the menu hamburger (top, matching its position in
+    /// `build_activity_bar`'s `top` list) and settings (bottom, matching
+    /// `build_activity_bar`'s `bottom` list) — the two items outside the
+    /// `fixed` array. Per-session extension panels (`engine.ext_panels`)
+    /// are appended dynamically by `build_activity_bar` itself and aren't
+    /// representable in a static `ShellConfig`; wiring those through
+    /// `AppShell::add_panel`/`remove_panel` needs a live `AppShell`
+    /// instance to call them on, which nothing constructs until #634.
+    ///
+    /// The hamburger is a top-row `PanelDefinition`, not a bottom item, so
+    /// clicking it produces `AppShellEvent::PanelChanged` the same way a
+    /// real panel click does — [`ShellApp::on_shell_event`] below
+    /// intercepts that and treats it as "open the menu" rather than
+    /// switching the sidebar to a nonexistent "Menu" panel.
+    ///
+    /// `menu_bar_visible` seeds `AppShell`'s title-bar row reservation
+    /// (#635, Stage 6b item A) with the engine's *construction-time* menu
+    /// state (`engine.menu_bar_visible` — `true` when `is_vscode_mode()`,
+    /// `false` otherwise) so the very first frame, painted before any
+    /// `ShellApp::handle` dispatch gets a chance to call
+    /// `ShellContext::shell_mut().set_title_bar_visible`, already reserves
+    /// (or doesn't reserve) the row correctly. Every dispatch after that
+    /// keeps it in sync — see `handle()`'s first block below. Always sets
+    /// `title_bar_height_lh` to exactly 1 row (`draw_frame`'s own
+    /// `menu_bar_height` constraint — `render_impl.rs`'s `top_chunks`) —
+    /// not `AppShell::with_title_bar`'s 1.5-line-height default — so a
+    /// later `set_title_bar_visible(true)` toggle (which preserves
+    /// whatever height was last configured, never recomputing it) can't
+    /// silently reserve the wrong row count. `ShellConfig::has_title_bar`/
+    /// `title_bar_height_lh` are the plain DTO fields `build_shell_adapter`
+    /// (`quadraui::tui::shell_runner`) reads to decide whether to call
+    /// `AppShell::with_title_bar` at construction — setting them directly
+    /// here is simpler than routing through that builder twice.
+    pub(super) fn shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
+        fn panel(id: &str, icon: &str, title: &str, tooltip: &str) -> quadraui::PanelDefinition {
+            quadraui::PanelDefinition {
+                id: quadraui::WidgetId::new(id),
+                icon: icon.to_string(),
+                title: title.to_string(),
+                tooltip: tooltip.to_string(),
+            }
+        }
+
+        let mut cfg = quadraui::ShellConfig::new(
+            "VimCode",
+            vec![
+                panel(HAMBURGER_PANEL_ID, icons::HAMBURGER.s(), "Menu", "Menu"),
+                panel(
+                    PANEL_EXPLORER,
+                    icons::EXPLORER.s(),
+                    "Explorer",
+                    "Explorer (Ctrl+Shift+E)",
+                ),
+                panel(
+                    PANEL_SEARCH,
+                    icons::SEARCH.s(),
+                    "Search",
+                    "Search (Ctrl+Shift+F)",
+                ),
+                panel(PANEL_DEBUG, icons::DEBUG.s(), "Debug", "Debug"),
+                panel(
+                    PANEL_GIT,
+                    icons::GIT_BRANCH.s(),
+                    "Source Control",
+                    "Source Control",
+                ),
+                panel(
+                    PANEL_EXTENSIONS,
+                    icons::EXTENSIONS.s(),
+                    "Extensions",
+                    "Extensions",
+                ),
+                panel(PANEL_AI, icons::AI_CHAT.s(), "AI Assistant", "AI Assistant"),
+            ],
+        )
+        .with_bottom_items(vec![panel(
+            PANEL_SETTINGS,
+            icons::SETTINGS.s(),
+            "Settings",
+            "Settings",
+        )]);
+
+        cfg.has_title_bar = menu_bar_visible;
+        cfg.title_bar_height_lh = 1.0;
+        cfg
     }
 
     /// #602 (gap 2): translate a mouse-shaped [`UiEvent`] back into the
@@ -899,6 +1057,36 @@ impl ShellApp for TuiShellApp {
             .menu_system
             .borrow_mut()
             .set_menus(render::build_menu_defs(self.engine.is_vscode_mode()));
+
+        // ── #635 (Stage 6b item F): live-only setup ──────────────────────
+        // Gated on `self.live` (set only by `Self::prepare_for_live_run`,
+        // called only by the not-yet-wired `run_via_shell` wrapper) — see
+        // that field's doc comment for why running either of these under
+        // `driver_with_shell` would be a real bug (a blocking terminal
+        // round-trip, and an unsound dangling-pointer registration),
+        // not just redundant work.
+        if self.live {
+            // Mirrors `event_loop`'s once-computed `keyboard_enhanced`
+            // query (`mod.rs:696`) — same call, same fallback, just moved
+            // to run once here instead of in the wrapper, since by this
+            // point `self` has reached the stable address the SAFETY note
+            // below also depends on.
+            self.keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+
+            // SAFETY: `run_with_shell` → `build_shell_adapter` →
+            // `tui::run::run`'s own `mut app: A` local is what finally
+            // owns `self` for the rest of the process — `run_inner` (which
+            // calls this `setup`) only ever touches it through `&mut app`
+            // from here on, so `self`, and therefore `&self.engine`, is at
+            // its final address. `self.live` is `true` only when
+            // `run_via_shell` called `Self::prepare_for_live_run`
+            // immediately before moving `self` into `run_with_shell` — see
+            // that method's doc comment — so `self.engine` living for the
+            // rest of the process (this fn's safety contract) holds.
+            unsafe {
+                crate::core::swap::register_emergency_engine(&self.engine as *const _);
+            }
+        }
     }
 
     fn render_content(
@@ -913,6 +1101,78 @@ impl ShellApp for TuiShellApp {
         // (quickfix/bottom panel #608, dividers/drag-overlay/tab-tooltip
         // #609, cursor placement #604) and why.
         let theme = self.theme();
+
+        // ── Menu bar + command centre (#635, Stage 6b item A) ────────────
+        // Mirrors `draw_frame`'s own `menu_bar_area` block
+        // (`render_impl.rs`, the `screen.menu_bar_visible` block right
+        // after `top_chunks`). `AppShell::set_title_bar_visible`
+        // (quadraui#532, synced from `engine.menu_bar_visible` by
+        // `handle()`/seeded by `Self::shell_config` — see their doc
+        // comments) is what makes `layout.title_bar_bounds` `Some` in the
+        // first place; when the menu is hidden the shell never reserved
+        // the row, so there's nothing to paint. `draw_menu_bar` and
+        // `draw_command_center` were already trait calls — the gap this
+        // stage closes was purely the missing runtime-toggleable reserved
+        // row, not these calls themselves. The menu *dropdown* (the open
+        // popup, as opposed to this horizontal bar) paints separately,
+        // last, near the end of this function — see that block's comment
+        // for why.
+        if self.engine.menu_bar_visible {
+            if let Some(tb) = layout.title_bar_bounds {
+                let tb_area = Rect {
+                    x: tb.x.round() as u16,
+                    y: tb.y.round() as u16,
+                    width: tb.width.round() as u16,
+                    height: tb.height.round() as u16,
+                };
+                if tb_area.width >= 1 && tb_area.height >= 1 {
+                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                    let bar = self.engine.menu_system.borrow().menu_bar();
+                    let bar_rect = quadraui::Rect::new(
+                        tb_area.x as f32,
+                        tb_area.y as f32,
+                        tb_area.width as f32,
+                        tb_area.height as f32,
+                    );
+                    let mb_layout = backend.draw_menu_bar(bar_rect, &bar);
+
+                    let menu_end: u16 = mb_layout
+                        .visible_items
+                        .last()
+                        .map(|vi| tb_area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
+                        .unwrap_or(tb_area.x);
+
+                    let title = self
+                        .engine
+                        .cwd
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "VimCode".to_string());
+                    let cc = render::build_command_center_view(
+                        self.engine.tab_nav_can_go_back(),
+                        self.engine.tab_nav_can_go_forward(),
+                        &title,
+                    );
+                    let cc_area = Rect {
+                        x: menu_end,
+                        y: tb_area.y,
+                        width: tb_area.width.saturating_sub(menu_end - tb_area.x),
+                        height: tb_area.height,
+                    };
+                    let cc_q_rect = quadraui::Rect::new(
+                        cc_area.x as f32,
+                        cc_area.y as f32,
+                        cc_area.width as f32,
+                        cc_area.height as f32,
+                    );
+                    let cc_layout = backend.draw_command_center(cc_q_rect, &cc);
+                    self.engine.command_center_layout.replace(Some(cc_layout));
+                }
+            }
+        } else {
+            self.engine.command_center_layout.replace(None);
+        }
 
         // ── Sidebar panel content (#607) ─────────────────────────────────
         // `AppShell::render` (quadraui, called by the runner before
@@ -1410,6 +1670,28 @@ impl ShellApp for TuiShellApp {
             *self.dialog_layout.borrow_mut() = None;
         }
 
+        // ── Menu dropdown (#635, Stage 6b item A) — rendered after the
+        // dialog so it draws on top of everything below it, mirroring
+        // `draw_frame`'s own "rendered last so it draws on top of
+        // everything" comment on this exact block (`render_impl.rs`, right
+        // before the toast overlay). `MenuSystem::render` was already a
+        // trait call; the only reason this couldn't paint before was the
+        // same missing `layout.title_bar_bounds` reservation the menu bar
+        // block above now provides — reuse the same rect here rather than
+        // recomputing it, since `MenuSystem::render` anchors the dropdown
+        // relative to the bar it was opened from.
+        if self.engine.menu_bar_visible {
+            if let Some(tb) = layout.title_bar_bounds {
+                let bar_rect = quadraui::Rect::new(
+                    tb.x.round(),
+                    tb.y.round(),
+                    tb.width.round(),
+                    tb.height.round(),
+                );
+                self.engine.menu_system.borrow().render(backend, bar_rect);
+            }
+        }
+
         // ── Toast overlay (#450) — last, so it sits on top of everything ─
         if let Some(stack) = render::build_toast_stack(&self.engine) {
             let q_toast_area = quadraui::Rect::new(
@@ -1431,7 +1713,24 @@ impl ShellApp for TuiShellApp {
         backend: &mut dyn quadraui::Backend,
         ctx: &ShellContext<'_>,
     ) -> Reaction {
-        let _ = ctx;
+        // ── #635 (Stage 6b item A): keep `AppShell`'s title-bar row
+        // reservation in sync with `engine.menu_bar_visible` ────────────────
+        // `layout.title_bar_bounds` (read by `render_content` below) is
+        // computed by the shell runner from the *real*, `ShellAdapter`-owned
+        // `AppShell` — not from anything on `self` — so toggling
+        // `engine.menu_bar_visible` (the Alt+menu-letter shim below,
+        // `dispatch_panel_accelerator_sizeless`, `:set menu`, ...) has no
+        // effect on the painted layout unless it's also pushed through
+        // `ShellContext::shell_mut()`. Doing this unconditionally at the top
+        // of every dispatch — rather than only in the specific arms that
+        // change the flag — is what `AppShell::set_title_bar_visible`'s own
+        // doc comment recommends (quadraui#532): "toggling this and calling
+        // [layout/render] next is sufficient". `Self::shell_config` seeds the
+        // *first* frame (painted before any `handle` call) from the same
+        // flag at construction time, so this and that stay in lockstep from
+        // frame zero.
+        ctx.shell_mut()
+            .set_title_bar_visible(self.engine.menu_bar_visible);
 
         // ── Panel-key accelerators (mirrors `mod.rs:1259`-`:1273`) ──────────
         // Mouse-affecting accelerators (none today) would need gap (2)
@@ -1534,6 +1833,8 @@ impl ShellApp for TuiShellApp {
                     self.keyboard_enhanced,
                     viewport.width as u16,
                     viewport.height as u16,
+                    backend,
+                    &self.cmd_sel,
                 )
             }
             // #602 (gap 2): dispatch through the legacy `mouse::handle_mouse`
@@ -1546,6 +1847,30 @@ impl ShellApp for TuiShellApp {
             | UiEvent::Scroll { .. }
             | UiEvent::DoubleClick { .. } => self.handle_mouse_event(event, backend),
             _ => Reaction::Continue,
+        }
+    }
+
+    /// #635 (Stage 6b item E): the menu hamburger is registered as a
+    /// top-row `PanelDefinition` in [`Self::shell_config`] so it keeps its
+    /// place before Explorer in the activity bar — but it isn't a real
+    /// content panel, so a click on it (which `AppShell` reports as an
+    /// ordinary `AppShellEvent::PanelChanged`, same as clicking Explorer or
+    /// Search) shouldn't be treated as a sidebar-panel switch. Reveal the
+    /// menu bar instead, mirroring the Alt+menu-letter shim and
+    /// `MenuSystem` intercept in `handle()` above. `engine.app_shell` (the
+    /// shadow copy `render_sidebar_content` actually reads to decide what
+    /// to paint — see that field's use sites) never observes this event at
+    /// all, so no sidebar content ever switches to "Menu": the only
+    /// consequence of leaving `AppShell`'s own active-panel index pointed
+    /// at the hamburger is a one-frame-cosmetic "Menu" label in its
+    /// generic sidebar-header row, in the same tolerance band as the
+    /// `active_accent`/`selection_bg` gap `shell_config`'s doc comment
+    /// notes.
+    fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
+        if let quadraui::AppShellEvent::PanelChanged { panel_id } = event {
+            if panel_id.as_str() == HAMBURGER_PANEL_ID {
+                self.engine.menu_bar_visible = true;
+            }
         }
     }
 
@@ -1856,17 +2181,28 @@ fn dispatch_panel_accelerator_sizeless(
 ///    toggle-maximize, run-in-terminal, folder/workspace/recent dialogs,
 ///    quit confirmation.
 ///
-/// **Not ported (gap, tracked alongside #602):** `mod.rs:1629`-`:2737` also
-/// contains an activity-bar-focused tier (`mod.rs:1711`), a sidebar-focused
-/// tier with its own nested context-menu/explorer-key intercept
-/// (`mod.rs:1760`+), and command-output-selection (`cmd_sel`) handling —
-/// none of which this function replicates. Deferred alongside the
-/// already-acknowledged mouse gap (#602) since all three tiers gate on
-/// focus/selection state (`activity_bar_focused`, `sidebar.has_focus`,
-/// `cmd_sel`) that today is set almost entirely by `mouse::handle_mouse`,
-/// which this dormant `handle()` doesn't call yet; a future session should
-/// re-check whether keyboard-only focus transitions exist before assuming
-/// this is purely a mouse-side gap.
+/// **#635 (Stage 6b item D) ported two of the three tiers `mod.rs:1629`-
+/// `:2737` used to leave out:** the activity-bar-focused tier (mirrors
+/// `mod.rs:1805`-`:1854` — `j`/`k`/`l`/`h`/`Enter`/`Esc`/`q` while
+/// `engine.activity_bar_focused`, reachable now that gap 2/mouse is closed
+/// by #602 and sets that flag for real) and command-output-selection
+/// (`cmd_sel` — mirrors `mod.rs:2651`-`:2701`: Ctrl+C copies the selected
+/// message/command-line substring via `tui_copy_to_clipboard`, any other
+/// key clears it; `cmd_sel` itself was already populated by mouse drag and
+/// painted by `panels::render_command_line`, so this closes the keyboard
+/// side only).
+///
+/// **Still not ported:** the sidebar-focused tier (`mod.rs:1856`-`:2385` —
+/// per-panel keyboard dispatch for search/debug/extension-panel/source-
+/// control/explorer while `sidebar.has_focus`, plus its own nested
+/// context-menu intercept and Ctrl-W toolbar/panel/editor navigation). At
+/// ~500 lines across five nested per-panel dispatchers it's an order of
+/// magnitude larger than the other two tiers and wasn't safely portable in
+/// the same pass; left as the one open item from Stage 6b's item D. Until
+/// it lands, a key press while `sidebar.has_focus` is true falls through
+/// to the general `Engine::handle_key` fallback below, same as before this
+/// stage — no regression, just the pre-existing gap narrowed rather than
+/// closed.
 ///
 /// Translates the backend-neutral `Key`/`Modifiers` into the
 /// `(key_name, unicode, ctrl)` shape `Engine::handle_key` expects by
@@ -1903,6 +2239,8 @@ fn handle_key_pressed(
     keyboard_enhanced: bool,
     screen_w: u16,
     screen_h: u16,
+    backend: &mut dyn quadraui::Backend,
+    cmd_sel: &Cell<Option<(usize, usize)>>,
 ) -> Reaction {
     let Some(key_event) = quadraui::tui::events::synth_keyevent(&key, modifiers, repeat) else {
         return Reaction::Continue;
@@ -1989,12 +2327,127 @@ fn handle_key_pressed(
         return Reaction::Redraw;
     }
 
+    // ── Activity bar (toolbar) focused (mirrors mod.rs:1805-:1854) ──────
+    // #635 (Stage 6b item D): ported now that gap 2 (mouse) is closed by
+    // #602 — `engine.activity_bar_focused` is set by `mouse::handle_mouse`
+    // via `TuiShellApp::handle_mouse_event`, so this tier is reachable from
+    // a real click sequence, not just synthetic test state.
+    if engine.activity_bar_focused && !engine.picker_open && key_event.kind != KeyEventKind::Release
+    {
+        match key_event.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                engine.activity_bar_move_down();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                engine.activity_bar_move_up();
+            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+                use crate::core::engine::sidebar::ActivityBarActivation;
+                let activation = engine.activity_bar_activate();
+                match activation {
+                    ActivityBarActivation::MenuToggled => {
+                        if !engine.menu_bar_visible {
+                            engine.menu_system.borrow_mut().close(backend);
+                        }
+                    }
+                    ActivityBarActivation::PanelFocused => {
+                        sidebar.ext_panel_name = None;
+                        sidebar.has_focus = true;
+                    }
+                    ActivityBarActivation::ExtPanelFocused(name) => {
+                        sidebar.ext_panel_name = Some(name);
+                        sidebar.has_focus = true;
+                    }
+                    ActivityBarActivation::NoOp => {}
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
+                // Leave toolbar, return focus to editor.
+                engine.activity_bar_focus_out();
+            }
+            KeyCode::Char('q') => {
+                // Collapse sidebar from toolbar.
+                engine.activity_bar_focus_out();
+                engine.app_shell.hide_sidebar();
+                engine.clear_sidebar_focus();
+                sidebar.has_focus = false;
+                engine.session.explorer_visible = false;
+                let _ = engine.session.save();
+            }
+            _ => {}
+        }
+        return Reaction::Redraw;
+    }
+
+    // NOTE: the sidebar-focused keyboard tier (mod.rs:1856-:2385 — search
+    // panel, debug panel, extension panel, source control, and explorer
+    // key handling while `sidebar.has_focus` is set) is NOT yet ported.
+    // It's an order of magnitude larger than the activity-bar tier above
+    // (~500 lines, five nested per-panel dispatchers) and, unlike the
+    // activity-bar tier, isn't self-contained enough to port safely without
+    // a dedicated session budgeted for it. Left as the one open item from
+    // #635's item D — see the module doc's Stage 6 section. Until it lands,
+    // a key press while `sidebar.has_focus` is true falls through to the
+    // general `Engine::handle_key` fallback below, same as before this
+    // stage.
+
     if key_event.kind == KeyEventKind::Release {
         return Reaction::Continue;
     }
     let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) else {
         return Reaction::Continue;
     };
+
+    // ── Command-line selection: Ctrl-C copies, any other key clears
+    // (mirrors mod.rs:2651-:2701) ─────────────────────────────────────────
+    // #635 (Stage 6b item D): `cmd_sel` itself is already populated by
+    // mouse drag (`TuiShellApp::handle_mouse_event`, #602) and painted by
+    // `panels::render_command_line` (#605) — this closes the keyboard
+    // side, the last of item D's three named tiers.
+    {
+        use crate::core::Mode;
+        let sel = cmd_sel.get();
+        if ctrl && matches!(unicode, Some('c') | Some('C')) && sel.is_some() {
+            if let Some((start, end)) = sel {
+                let lo = start.min(end);
+                let hi = start.max(end);
+                // Determine the source text for the selection.
+                let source = if matches!(engine.mode, Mode::Command | Mode::Search) {
+                    // col 0 = ':' prefix, col 1+ = buffer chars
+                    let buf_lo = lo.saturating_sub(1);
+                    let buf_hi = hi.saturating_sub(1);
+                    engine
+                        .command_buffer
+                        .chars()
+                        .enumerate()
+                        .filter(|(i, _)| *i >= buf_lo && *i <= buf_hi)
+                        .map(|(_, c)| c)
+                        .collect::<String>()
+                } else {
+                    // Normal mode message line — no prefix offset.
+                    engine
+                        .message
+                        .chars()
+                        .enumerate()
+                        .filter(|(i, _)| *i >= lo && *i <= hi)
+                        .map(|(_, c)| c)
+                        .collect::<String>()
+                };
+                if !source.is_empty() {
+                    tui_copy_to_clipboard(&source, engine);
+                }
+            }
+            cmd_sel.set(None);
+            return Reaction::Redraw;
+        }
+        if matches!(engine.mode, Mode::Command | Mode::Search) {
+            // Any other key clears the selection.
+            cmd_sel.set(None);
+        } else if sel.is_some() {
+            // In normal mode, any non-Ctrl-C key clears message selection.
+            cmd_sel.set(None);
+        }
+    }
 
     // ── Context menu keyboard intercept (mirrors mod.rs:2608-:2635) ─────
     if engine.context_menu.is_some() {
@@ -2122,6 +2575,21 @@ mod tests {
         assert!(!app.engine.settings.colorscheme.is_empty());
     }
 
+    /// #635 (Stage 6b item F): `live` must default to `false` (so every
+    /// `driver_with_shell` test skips the blocking terminal query and the
+    /// unsafe emergency-engine registration in `setup()` — see that
+    /// field's doc comment), and `prepare_for_live_run` must only set the
+    /// flag, not perform either of the operations it gates — so it's safe
+    /// to call on an instance that's never actually handed to
+    /// `run_with_shell`, like this one.
+    #[test]
+    fn prepare_for_live_run_only_sets_the_flag() {
+        let mut app = TuiShellApp::new(None);
+        assert!(!app.live);
+        app.prepare_for_live_run();
+        assert!(app.live);
+    }
+
     /// `setup()` must register the panel-key accelerators and populate the
     /// menu system — the two pieces of state `handle()` depends on.
     #[test]
@@ -2151,6 +2619,80 @@ mod tests {
     fn shell_app_constructs_via_driver_with_shell() {
         let driver = driver_with_shell(TuiShellApp::new(None), config(), 80, 24);
         let _ = driver.screen();
+    }
+
+    /// #635 (Stage 6b item E): [`TuiShellApp::shell_config`] must register
+    /// exactly the panels `render::build_activity_bar`'s `fixed` array
+    /// plus the hamburger (top) and settings (bottom) — the two items
+    /// outside that array — in the same order, so the eventual live
+    /// `AppShell` activity bar (#634) can't drift from what `draw_frame`
+    /// paints today. Static assertion over ids only (icons/tooltips aren't
+    /// load-bearing for dispatch), derived from the same `PANEL_*`
+    /// constants `build_activity_bar` itself switches on rather than
+    /// hand-transcribed string literals.
+    #[test]
+    fn shell_config_registers_every_build_activity_bar_panel() {
+        let cfg = TuiShellApp::shell_config(false);
+        let ids: Vec<&str> = cfg.panels.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                HAMBURGER_PANEL_ID,
+                PANEL_EXPLORER,
+                PANEL_SEARCH,
+                PANEL_DEBUG,
+                PANEL_GIT,
+                PANEL_EXTENSIONS,
+                PANEL_AI,
+            ]
+        );
+        assert_eq!(cfg.bottom_items.len(), 1);
+        assert_eq!(cfg.bottom_items[0].id.as_str(), PANEL_SETTINGS);
+    }
+
+    /// The live config (unlike the single-panel `config()` test helper
+    /// above) must also construct and paint a first frame without
+    /// panicking through the real `driver_with_shell` harness — the same
+    /// end-to-end smoke `shell_app_constructs_via_driver_with_shell` runs
+    /// for the test-only config.
+    #[test]
+    fn shell_app_constructs_via_driver_with_shell_using_live_config() {
+        let driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        let _ = driver.screen();
+    }
+
+    /// #635 (Stage 6b item E): a hamburger click reports as an ordinary
+    /// `AppShellEvent::PanelChanged` (`AppShell` doesn't know the
+    /// hamburger is special) — `on_shell_event` must recognize it by id
+    /// and reveal the menu bar instead of leaving it to be silently
+    /// mistaken for a sidebar-panel switch. Drives `on_shell_event`
+    /// directly (mirrors `handle_key_pressed_dialog_intercepts_all_keys`'s
+    /// approach below) since `ShellAdapter`'s fields are `pub(crate)` and
+    /// there is no accessor from `driver_with_shell` back to this event.
+    #[test]
+    fn on_shell_event_hamburger_click_reveals_menu_bar() {
+        let mut app = TuiShellApp::new(None);
+        assert!(!app.engine.menu_bar_visible);
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(HAMBURGER_PANEL_ID),
+        });
+        assert!(app.engine.menu_bar_visible);
+    }
+
+    /// A `PanelChanged` for a real panel must NOT trip the hamburger
+    /// special-case.
+    #[test]
+    fn on_shell_event_real_panel_click_does_not_reveal_menu_bar() {
+        let mut app = TuiShellApp::new(None);
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
+        });
+        assert!(!app.engine.menu_bar_visible);
     }
 
     /// #601: `render_content` must actually paint the active editor
@@ -2537,6 +3079,44 @@ mod tests {
         );
     }
 
+    /// #635 (Stage 6b item A): with the menu bar visible at construction,
+    /// `shell_config(true)` must reserve `layout.title_bar_bounds` (via
+    /// `AppShell::with_title_bar`, quadraui#532) and `render_content` must
+    /// actually paint into it — the menu bar's first label ("File",
+    /// `MENU_STRUCTURE`'s first entry) should reach the screen, the same
+    /// way `render_content_paints_editor_text_via_shell_app` proves the
+    /// editor content path above.
+    #[test]
+    fn render_content_paints_menu_bar_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.menu_bar_visible = true;
+
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "menu bar should paint via TuiShellApp::render_content when menu_bar_visible; screen:\n{screen}"
+        );
+    }
+
+    /// The title-bar row must NOT be reserved (and nothing painted into
+    /// row 0) when the menu is hidden — `shell_config(false)` is the
+    /// default `TuiShellApp::new` state, so this is the same driver setup
+    /// `shell_app_constructs_via_driver_with_shell_using_live_config`
+    /// above uses, just asserting the negative.
+    #[test]
+    fn render_content_does_not_paint_menu_bar_when_hidden_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        assert!(!app.engine.menu_bar_visible);
+
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("File"),
+            "menu bar should not paint when menu_bar_visible is false; screen:\n{screen}"
+        );
+    }
+
     /// The *source control* sidebar panel, likewise — its header/clear/hint
     /// rows were raw `set_cell` loops until #605 routed them through
     /// `fill_rect`/`fill_row`. `sc_header_text` always contains the literal
@@ -2572,6 +3152,56 @@ mod tests {
         assert!(
             screen.contains("EXTENSIONS"),
             "extensions panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #635 (Stage 6b item C): the plugin extension panel — the last raw-
+    /// `Frame` sidebar holdout (`render_ext_panel`'s help popup + manual
+    /// scrollbar) — must paint via `TuiShellApp::render_content` now that
+    /// it takes `&mut dyn Backend` instead of a concrete `TuiBackend` and a
+    /// `&mut Frame`. `sidebar.ext_panel_name` (not
+    /// `engine.app_shell.active_panel_id()`) is what selects this path —
+    /// see `render_sidebar_content`'s dispatch.
+    #[test]
+    fn render_content_paints_ext_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.ext_panels.insert(
+            "zqxw_plugin".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "zqxw_plugin".to_string(),
+                title: "ZQXW Plugin".to_string(),
+                icon: '?',
+                fallback_icon: None,
+                sections: vec![],
+            },
+        );
+        app.engine.ext_panel_active = Some("zqxw_plugin".to_string());
+        app.sidebar.ext_panel_name = Some("zqxw_plugin".to_string());
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW Plugin"),
+            "ext panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #635 (Stage 6b item C): the AI sidebar panel — the most raw-`Buffer`
+    /// of the lot (`render_ai_sidebar` used to take `buf: &mut Buffer`
+    /// outright, no backend parameter at all) — must paint via
+    /// `TuiShellApp::render_content` now that it takes `&mut dyn Backend`.
+    #[test]
+    fn render_content_paints_ai_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AI ASSISTANT"),
+            "AI panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
     }
 
@@ -3322,6 +3952,8 @@ mod tests {
         assert!(engine.dialog.is_some());
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let cmd_sel = Cell::new(None);
 
         // "Down" cycles the selected dialog button (`panels.rs`'s
         // `handle_dialog_key`) — proving the key actually reached
@@ -3338,6 +3970,8 @@ mod tests {
             false,
             80,
             24,
+            &mut backend,
+            &cmd_sel,
         );
 
         assert_eq!(reaction, Reaction::Redraw);
@@ -3365,6 +3999,8 @@ mod tests {
             FolderPickerMode::OpenFolder,
             engine.settings.show_hidden_files,
         ));
+        let mut backend = backend_at(80.0, 24.0);
+        let cmd_sel = Cell::new(None);
 
         let reaction = handle_key_pressed(
             quadraui::Key::Char('x'),
@@ -3377,6 +4013,8 @@ mod tests {
             false,
             80,
             24,
+            &mut backend,
+            &cmd_sel,
         );
         assert_eq!(reaction, Reaction::Redraw);
         assert_eq!(
@@ -3397,6 +4035,8 @@ mod tests {
             false,
             80,
             24,
+            &mut backend,
+            &cmd_sel,
         );
         assert_eq!(reaction, Reaction::Redraw);
         assert!(folder_picker.is_none(), "Esc should dismiss the picker");
@@ -3418,6 +4058,8 @@ mod tests {
         assert!(engine.context_menu.is_some());
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let cmd_sel = Cell::new(None);
 
         let reaction = handle_key_pressed(
             quadraui::Key::Named(quadraui::NamedKey::Enter),
@@ -3430,6 +4072,8 @@ mod tests {
             false,
             80,
             24,
+            &mut backend,
+            &cmd_sel,
         );
 
         assert_eq!(reaction, Reaction::Redraw);
@@ -3441,6 +4085,147 @@ mod tests {
             engine.explorer_new_entry_pending.is_some(),
             "the 'New File...' action should reach `handle_explorer_context_action` \
              and dispatch `ExplorerAction::NewFile`"
+        );
+    }
+
+    /// #635 (Stage 6b item D): the activity-bar-focused keyboard tier
+    /// (mirrors `mod.rs:1805`-`:1854`) — `j`/`Down` must move the keyboard
+    /// cursor, and `l`/Enter on the Explorer slot (toolbar index 1) must
+    /// activate it, clearing `activity_bar_focused` and requesting sidebar
+    /// focus (`ActivityBarActivation::PanelFocused`).
+    #[test]
+    fn handle_key_pressed_activity_bar_focused_moves_and_activates() {
+        let mut engine = Engine::new();
+        engine.activity_bar_focus_in_at(0); // hamburger slot
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let cmd_sel = Cell::new(None);
+
+        // 'j' moves the cursor from the hamburger (0) to Explorer (1).
+        let reaction = handle_key_pressed(
+            quadraui::Key::Char('j'),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &cmd_sel,
+        );
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(engine.activity_bar_focused, "still toolbar-focused after j");
+        assert_eq!(engine.activity_bar_selected, 1);
+
+        // 'l' activates the selected (Explorer) slot.
+        let reaction = handle_key_pressed(
+            quadraui::Key::Char('l'),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &cmd_sel,
+        );
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(
+            !engine.activity_bar_focused,
+            "activating a panel should clear toolbar focus"
+        );
+        assert!(
+            sidebar.has_focus,
+            "activating a real panel should request sidebar focus"
+        );
+    }
+
+    /// #635 (Stage 6b item D): the `cmd_sel` keyboard tier (mirrors
+    /// `mod.rs:2651`-`:2701`) — Ctrl+C copies the selected message-line
+    /// text and clears the selection. `Engine::new()` (no
+    /// `setup_tui_clipboard`) has no `clipboard_write` hook, so
+    /// `tui_copy_to_clipboard` takes its "clipboard unavailable" branch —
+    /// still enough to prove the selected substring reached the copy
+    /// helper, deterministically, with no real clipboard I/O.
+    #[test]
+    fn handle_key_pressed_cmd_sel_ctrl_c_copies_and_clears() {
+        let mut engine = Engine::new();
+        engine.message = "hello world".to_string();
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let cmd_sel = Cell::new(Some((0usize, 4usize))); // "hello"
+
+        let reaction = handle_key_pressed(
+            quadraui::Key::Char('c'),
+            quadraui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &cmd_sel,
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(cmd_sel.get().is_none(), "Ctrl+C should clear the selection");
+        assert!(
+            engine.message.contains("hello"),
+            "Ctrl+C should copy the selected substring; message: {}",
+            engine.message
+        );
+    }
+
+    /// A non-Ctrl+C key while a selection is active must clear it without
+    /// copying anything (mirrors the "any other key clears" half of
+    /// `mod.rs:2694`-`:2700`) — falls through to the general
+    /// `Engine::handle_key` fallback afterward, same as before this stage.
+    #[test]
+    fn handle_key_pressed_cmd_sel_other_key_clears_without_copying() {
+        let mut engine = Engine::new();
+        engine.message = "hello world".to_string();
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let cmd_sel = Cell::new(Some((0usize, 4usize)));
+
+        let _ = handle_key_pressed(
+            quadraui::Key::Char('x'),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            SIDEBAR_WIDTH,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &cmd_sel,
+        );
+
+        assert!(
+            cmd_sel.get().is_none(),
+            "any other key should clear the selection"
+        );
+        assert!(
+            !engine.message.contains("Copied") && !engine.message.contains("clipboard"),
+            "no copy should happen on a non-Ctrl+C key; message: {}",
+            engine.message
         );
     }
 }

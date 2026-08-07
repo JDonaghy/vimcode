@@ -19,7 +19,6 @@ pub(super) fn render_activity_bar(
 
 pub(super) fn render_sidebar(
     backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
     area: Rect,
     sidebar: &mut TuiSidebar,
     engine: &Engine,
@@ -28,7 +27,7 @@ pub(super) fn render_sidebar(
 ) {
     // Extension panel (plugin-provided)
     if sidebar.ext_panel_name.is_some() {
-        render_ext_panel(backend, frame, area, engine, theme);
+        render_ext_panel(backend, area, engine, theme);
         return;
     }
 
@@ -55,7 +54,7 @@ pub(super) fn render_sidebar(
             return;
         }
         Some(PANEL_AI) => {
-            render_ai_sidebar(frame.buffer_mut(), area, engine, theme);
+            render_ai_sidebar(backend, area, engine, theme);
             return;
         }
         _ => {}
@@ -156,15 +155,18 @@ pub(super) fn render_explorer_sidebar_content(
 /// #605 — **settings**, **source control** and **extensions**, whose raw
 /// `set_cell` chrome (background wipe, header rows, focused-hint row, search
 /// boxes) was converted to [`fill_rect`] / [`fill_row`] /
-/// [`draw_settings_chrome_via_backend`]. All three renderers dropped their
+/// `Backend::draw_settings_chrome`. All three renderers dropped their
 /// `&mut Frame` parameter entirely as a result, so `draw_frame` and
 /// `render_content` now share one implementation of each rather than the
 /// live path keeping a frame-having variant.
 ///
-/// Still deferred, each still blocked on raw-`Buffer` access — see
-/// `shell_app.rs`'s module doc: the **plugin extension panel**'s help popup +
-/// manual scrollbar, and the **AI panel**, whose signature takes
-/// `buf: &mut Buffer` outright with no backend parameter at all.
+/// #635 (Stage 6b item C) closed the last two: the **plugin extension
+/// panel** (`render_ext_panel`'s help-popup overlay now paints through
+/// `Backend::draw_tooltip`, its manual scrollbar through [`fill_row`]) and
+/// the **AI panel** (`render_ai_sidebar` dropped its `buf: &mut Buffer`
+/// parameter for `&mut dyn Backend`, using `Backend::draw_message_list` for
+/// the chat history and [`fill_row`] for its plain chrome rows). See each
+/// function's own doc comment for the specific tradeoffs.
 ///
 /// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
 /// (`shell_app.rs`), which nothing outside that module's own
@@ -180,7 +182,11 @@ pub(super) fn render_sidebar_content(
     theme: &Theme,
 ) {
     if sidebar.ext_panel_name.is_some() {
-        // Deferred — see this fn's doc comment and shell_app.rs's module doc.
+        // #635 (Stage 6b item C): no longer deferred — `render_ext_panel`
+        // dropped its `&mut Frame` parameter (help popup + scrollbar now
+        // paint through `Backend::draw_tooltip`/`fill_row`; see that
+        // function's doc comment).
+        render_ext_panel(backend, area, engine, theme);
         return;
     }
 
@@ -193,9 +199,9 @@ pub(super) fn render_sidebar_content(
         Some(PANEL_SETTINGS) => render_settings_panel(backend, area, theme, engine),
         Some(PANEL_GIT) => render_source_control(backend, area, engine, theme),
         Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, area, engine, theme),
-        // AI: still deferred — see this fn's doc comment and shell_app.rs's
-        // module doc.
-        Some(PANEL_AI) => {}
+        // #635 (Stage 6b item C): AI is no longer deferred — `render_ai_sidebar`
+        // dropped its `buf: &mut Buffer` parameter for `&mut dyn Backend`.
+        Some(PANEL_AI) => render_ai_sidebar(backend, area, engine, theme),
         _ => render_explorer_sidebar_content(backend, area, engine, theme),
     }
 }
@@ -266,95 +272,6 @@ fn fill_rect(backend: &mut dyn quadraui::Backend, area: Rect, fg: Color, bg: Col
     }
 }
 
-/// Trait-only stand-in for `quadraui::tui::draw_settings_chrome`, which takes
-/// a `&mut Buffer` and so can't be called from `render_content`.
-///
-/// Reproduces that rasteriser's two rows exactly — header row, then the
-/// `" / "`-prefixed search input row with its optional block caret — and
-/// sources every colour from `q_theme(theme)`, the same `quadraui::Theme` the
-/// rasteriser itself reads, so the two can't drift on palette changes.
-///
-/// Filed as JDonaghy/quadraui#531: the clean fix is a
-/// `Backend::draw_settings_chrome` trait method, at which point this helper
-/// and its call sites collapse to one line. Until #531 lands, this is a
-/// permanent-looking but intended-temporary local copy — **keep in sync with
-/// `quadraui::tui::form::draw_settings_chrome`** (`quadraui/src/tui/form.rs`):
-/// row layout, the `" / "` prompt construction, and placeholder logic must
-/// match, not just the colours.
-fn draw_settings_chrome_via_backend(
-    backend: &mut dyn quadraui::Backend,
-    area: Rect,
-    header_text: &str,
-    query: &str,
-    placeholder: &str,
-    active: bool,
-    theme: &Theme,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let q = super::quadraui_tui::q_theme(theme);
-
-    // Row 0: header.
-    fill_row_q(
-        backend,
-        area.x,
-        area.y,
-        area.width,
-        header_text,
-        q.header_fg,
-        q.header_bg,
-    );
-
-    if area.height < 2 {
-        return;
-    }
-
-    // Row 1: search input — `" / "` prompt, then the query (or the
-    // placeholder when idle and empty), then a block caret when active.
-    let search_y = area.y + 1;
-    let row_bg = if active { q.selected_bg } else { q.tab_bar_bg };
-    let show_placeholder = query.is_empty() && !placeholder.is_empty() && !active;
-    let (text, text_fg) = if show_placeholder {
-        (placeholder, q.muted_fg)
-    } else {
-        (query, q.foreground)
-    };
-
-    // Blank the whole row first so the segments below only need to cover the
-    // cells they actually paint.
-    fill_row_q(
-        backend,
-        area.x,
-        search_y,
-        area.width,
-        "",
-        q.foreground,
-        row_bg,
-    );
-
-    let prompt = " / ";
-    let prompt_w = (prompt.chars().count() as u16).min(area.width);
-    fill_row_q(
-        backend, area.x, search_y, prompt_w, prompt, q.muted_fg, row_bg,
-    );
-
-    let mut x = area.x + prompt_w;
-    let end = area.x + area.width;
-    if x < end {
-        let avail = end - x;
-        let shown: String = text.chars().take(avail as usize).collect();
-        let shown_w = shown.chars().count() as u16;
-        if shown_w > 0 {
-            fill_row_q(backend, x, search_y, shown_w, &shown, text_fg, row_bg);
-        }
-        x += shown_w;
-    }
-    if active && x < end {
-        fill_row_q(backend, x, search_y, 1, "\u{2588}", q.accent_fg, row_bg);
-    }
-}
-
 /// Render the settings panel — shows current key settings and the file path.
 ///
 /// B5c.4: routes the form rendering through `Backend::draw_form` so
@@ -362,10 +279,13 @@ fn draw_settings_chrome_via_backend(
 /// uses.
 ///
 /// #605: `backend` widened from `&mut TuiBackend` + `&mut Frame` to
-/// `&mut dyn Backend`. The background wipe and the header/search-box chrome
-/// were the last two raw-`Buffer` pieces; they now go through [`fill_rect`]
-/// and [`draw_settings_chrome_via_backend`], so `TuiShellApp::render_content`
-/// can paint this panel.
+/// `&mut dyn Backend`. The background wipe went through [`fill_rect`]; the
+/// header/search-box chrome was a local stand-in
+/// (`draw_settings_chrome_via_backend`) for the missing
+/// `Backend::draw_settings_chrome` trait method
+/// ([JDonaghy/quadraui#531](https://github.com/JDonaghy/quadraui/issues/531)).
+/// #635 (Stage 6b) retires that stand-in now that #531 has landed: the
+/// chrome paints through the real trait call below.
 pub(super) fn render_settings_panel(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -381,20 +301,19 @@ pub(super) fn render_settings_panel(
 
     // Rows 0–1: header + search input chrome.
     let chrome_h = area.height.min(2);
-    let chrome_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: chrome_h,
-    };
-    draw_settings_chrome_via_backend(
-        backend,
+    let chrome_area = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        chrome_h as f32,
+    );
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    backend.draw_settings_chrome(
         chrome_area,
         " SETTINGS",
         &engine.settings_query,
         "",
         engine.settings_input_active,
-        theme,
     );
 
     // Rows 2+: scrollable form content, via the shared `quadraui::Form` +
@@ -747,14 +666,17 @@ pub(super) fn render_source_control(
 /// Render an extension-provided sidebar panel.
 ///
 /// Migrated to `quadraui::TreeView` (#476). Header + search-input chrome
-/// route through `quadraui::tui::draw_settings_chrome`; the body rows
-/// (sections + expandable tree items + badges + action labels) flow
-/// through `render::ext_panel_to_tree_view()` + `Backend::draw_tree`.
-/// The help-popup overlay and the scrollbar/scroll-surface registration
-/// are panel-specific chrome that don't fit TreeView and stay inline.
+/// route through `Backend::draw_settings_chrome`; the body rows (sections +
+/// expandable tree items + badges + action labels) flow through
+/// `render::ext_panel_to_tree_view()` + `Backend::draw_tree`. The
+/// help-popup overlay and the scrollbar are panel-specific chrome that
+/// don't fit `TreeView` and stay inline — as of #635 (Stage 6b item C)
+/// through `Backend::draw_tooltip`/[`fill_row`] rather than raw `set_cell`,
+/// so `backend` widens to `&mut dyn Backend` and `frame` drops out of the
+/// signature entirely (this was the panel's own doc-flagged "no primitive
+/// stand-in checked yet" gap — see `shell_app.rs`'s module doc).
 pub(super) fn render_ext_panel(
-    backend: &mut super::backend::TuiBackend,
-    frame: &mut ratatui::Frame,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -771,23 +693,19 @@ pub(super) fn render_ext_panel(
     let input_visible = panel.input_active || !panel.input_text.is_empty();
     let chrome_h: u16 = (if input_visible { 2 } else { 1 }).min(area.height);
     let header_title = format!(" {}", panel.title);
-    let chrome_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: chrome_h,
-    };
-    // Stage 1 scope note: `draw_settings_chrome` is a free rasteriser with no
-    // `Backend::draw_*` trait equivalent (checked against quadraui's Backend
-    // trait), so calling it directly on the buffer is correct and out of scope here.
-    quadraui::tui::draw_settings_chrome(
-        frame.buffer_mut(),
+    let chrome_area = quadraui::Rect::new(
+        area.x as f32,
+        area.y as f32,
+        area.width as f32,
+        chrome_h as f32,
+    );
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    backend.draw_settings_chrome(
         chrome_area,
         &header_title,
         &panel.input_text,
         "",
         panel.input_active,
-        &super::quadraui_tui::q_theme(theme),
     );
 
     // ── Body: TreeView rasterised via the shared primitive. ────────────────
@@ -804,11 +722,13 @@ pub(super) fn render_ext_panel(
         backend.set_theme(super::quadraui_tui::q_theme(theme));
         backend.draw_tree(body_q_rect, &tree);
 
-        // Manual scrollbar: `draw_tree` doesn't render scrollbars yet.
-        // Total visible rows = tree.rows.len() (sections + their expanded
-        // items, separators included — same flat count the legacy renderer
-        // produced).
-        let buf = frame.buffer_mut();
+        // Scrollbar: `draw_tree` doesn't render scrollbars yet. Total
+        // visible rows = tree.rows.len() (sections + their expanded items,
+        // separators included — same flat count the legacy renderer
+        // produced). #635: the manual `set_cell` thumb/track loop is now
+        // one [`fill_row`] call per row (the rule-row trick #605 used for
+        // the settings/source-control/extensions sidebar chrome) instead
+        // of a raw `Buffer` write.
         let total = tree.rows.len();
         let track_h = body_h as usize;
         let ext_panel_scrollbar = if total > track_h && track_h > 0 {
@@ -816,17 +736,14 @@ pub(super) fn render_ext_panel(
             let sb_x = area.x + area.width - 1;
             let thumb_h = (track_h * track_h / total).max(1);
             let thumb_top = scroll * track_h / total;
-            let sb_thumb = rc(theme.scrollbar_thumb);
-            let sb_track = rc(theme.scrollbar_track);
-            let sb_bg = rc(theme.background);
             for i in 0..track_h {
                 let y = area.y + chrome_h + i as u16;
-                let (ch, cfp) = if i >= thumb_top && i < thumb_top + thumb_h {
-                    ('\u{2588}', sb_thumb)
+                let (ch, fg) = if i >= thumb_top && i < thumb_top + thumb_h {
+                    ('\u{2588}', theme.scrollbar_thumb)
                 } else {
-                    ('\u{2591}', sb_track)
+                    ('\u{2591}', theme.scrollbar_track)
                 };
-                set_cell(buf, sb_x, y, ch, cfp, sb_bg);
+                fill_row(backend, sb_x, y, 1, &ch.to_string(), fg, theme.background);
             }
             let track_start_y = (area.y + chrome_h) as f32;
             Some(quadraui::SurfaceScrollbar {
@@ -861,77 +778,58 @@ pub(super) fn render_ext_panel(
             });
     }
 
-    let buf = frame.buffer_mut();
-
     // ── Help popup overlay ──────────────────────────────────────────────────
+    // #635 (Stage 6b item C): was raw `set_cell` box-drawing (full border +
+    // centered title in the border + close 'x' glyph). `Backend::draw_tooltip`
+    // exists in quadraui's `Backend` trait, but its TUI rasteriser only
+    // draws side-bar borders (`│` on the first/last column, no top/bottom
+    // border or border-embedded title — see `quadraui::tui::draw_tooltip`'s
+    // doc comment), so the title moves into the content as its own styled
+    // row instead of being centered in a top border. `TooltipLayout` is
+    // built by hand rather than via `Tooltip::layout` (an anchor-relative
+    // placement API that doesn't fit this popup's "centered over `area`"
+    // positioning) — its fields are public for exactly this kind of direct
+    // construction. The close glyph had no click handler anywhere
+    // (`ext_panel_help_open` only ever closes via a key press — see
+    // `core/engine/ext_panel.rs`), so dropping it changes no behavior.
     if panel.help_open && !panel.help_bindings.is_empty() {
-        let popup_bg = rc(theme.completion_bg);
-        let popup_fg = rc(theme.completion_fg);
-        let popup_border = rc(theme.completion_border);
         let bindings = &panel.help_bindings;
         let popup_w = area.width.saturating_sub(2).min(36);
         let popup_h = (bindings.len() as u16 + 3).min(area.height.saturating_sub(2));
         let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
         let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-        for y in popup_y..popup_y + popup_h {
-            for x in popup_x..popup_x + popup_w {
-                set_cell(buf, x, y, ' ', popup_fg, popup_bg);
-            }
+
+        let q_popup_fg = render::to_quadraui_color(theme.completion_fg);
+        let q_key_fg = render::to_quadraui_color(theme.function);
+        let mut lines: Vec<quadraui::StyledText> = vec![quadraui::StyledText::plain("Keybindings")];
+        for (key, desc) in bindings.iter() {
+            lines.push(quadraui::StyledText {
+                spans: vec![
+                    quadraui::StyledSpan::with_fg(format!("{key:<9} "), q_key_fg),
+                    quadraui::StyledSpan::with_fg(desc.clone(), q_popup_fg),
+                ],
+            });
         }
-        set_cell(buf, popup_x, popup_y, '┌', popup_border, popup_bg);
-        set_cell(
-            buf,
-            popup_x + popup_w - 1,
-            popup_y,
-            '┐',
-            popup_border,
-            popup_bg,
-        );
-        for x in popup_x + 1..popup_x + popup_w - 1 {
-            set_cell(buf, x, popup_y, '─', popup_border, popup_bg);
-        }
-        let title = " Keybindings ";
-        let tx = popup_x + (popup_w.saturating_sub(title.len() as u16)) / 2;
-        for (i, ch) in title.chars().enumerate() {
-            let x = tx + i as u16;
-            if x > popup_x && x < popup_x + popup_w - 1 {
-                set_cell(buf, x, popup_y, ch, popup_border, popup_bg);
-            }
-        }
-        let close_x = popup_x + popup_w - 2;
-        if close_x > popup_x {
-            set_cell(buf, close_x, popup_y, 'x', popup_border, popup_bg);
-        }
-        let key_fg = rc(theme.function);
-        for (i, (key, desc)) in bindings.iter().enumerate() {
-            let y = popup_y + 1 + i as u16;
-            if y >= popup_y + popup_h - 1 {
-                break;
-            }
-            for (j, ch) in key.chars().enumerate() {
-                let x = popup_x + 2 + j as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, y, ch, key_fg, popup_bg);
-                }
-            }
-            let desc_x = popup_x + 12;
-            for (j, ch) in desc.chars().enumerate() {
-                let x = desc_x + j as u16;
-                if x < popup_x + popup_w - 1 {
-                    set_cell(buf, x, y, ch, popup_fg, popup_bg);
-                }
-            }
-        }
-        let by = popup_y + popup_h - 1;
-        set_cell(buf, popup_x, by, '└', popup_border, popup_bg);
-        set_cell(buf, popup_x + popup_w - 1, by, '┘', popup_border, popup_bg);
-        for x in popup_x + 1..popup_x + popup_w - 1 {
-            set_cell(buf, x, by, '─', popup_border, popup_bg);
-        }
-        for y in popup_y + 1..popup_y + popup_h - 1 {
-            set_cell(buf, popup_x, y, '│', popup_border, popup_bg);
-            set_cell(buf, popup_x + popup_w - 1, y, '│', popup_border, popup_bg);
-        }
+
+        let tooltip = quadraui::Tooltip {
+            id: quadraui::WidgetId::new("ext_panel:help"),
+            text: String::new(),
+            styled_lines: Some(lines),
+            placement: quadraui::TooltipPlacement::default(),
+            bg: Some(render::to_quadraui_color(theme.completion_bg)),
+            fg: Some(q_popup_fg),
+        };
+        let layout = quadraui::TooltipLayout {
+            bounds: quadraui::Rect::new(
+                popup_x as f32,
+                popup_y as f32,
+                popup_w as f32,
+                popup_h as f32,
+            ),
+            resolved_placement: quadraui::ResolvedPlacement::Bottom,
+        };
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
+        backend.draw_tooltip(&tooltip, &layout);
     }
 }
 
@@ -1255,8 +1153,27 @@ pub(super) fn render_ext_sidebar(
 // ─── AI assistant sidebar panel ───────────────────────────────────────────────
 
 /// Render the AI assistant sidebar panel.
+///
+/// #635 (Stage 6b item C): widened from `buf: &mut ratatui::buffer::Buffer`
+/// (the most raw-`Buffer` of the sidebar panels — no backend parameter at
+/// all) to `&mut dyn quadraui::Backend`, one implementation shared by
+/// `draw_frame` and `render_content` — the same shape the settings /
+/// source-control / extensions sidebar renderers already converted to
+/// (#605). Every plain-box row (`write_row`'s old two-pass `set_cell`
+/// blank-then-overwrite) went through the same [`fill_row`] rule-row trick
+/// those stages used; there was no chrome here `fill_row`/`fill_rect`
+/// couldn't reproduce exactly. `quadraui::tui::draw_message_list` (the
+/// message-history rasteriser) already had a `Backend::draw_message_list`
+/// trait equivalent — it just wasn't being called through it — so that
+/// swap needed no upstream change. One intentional, minor cosmetic
+/// difference: the trait method sources the message list's background from
+/// `TuiBackend::current_theme.background` internally rather than accepting
+/// it as a parameter, so the message area's background is now
+/// `theme.background` instead of the `theme.completion_bg` this used to
+/// pass explicitly — same tolerance band as the `active_accent`/
+/// `selection_bg` gap noted elsewhere in this stage.
 pub(super) fn render_ai_sidebar(
-    buf: &mut ratatui::buffer::Buffer,
+    backend: &mut dyn quadraui::Backend,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
@@ -1270,22 +1187,14 @@ pub(super) fn render_ai_sidebar(
         return;
     };
 
-    let header_fg = rc(theme.status_fg);
-    let header_bg = rc(theme.status_bg);
-    let default_fg = rc(theme.foreground);
-    let dim_fg = rc(theme.line_number_fg);
-    let panel_bg = rc(theme.completion_bg);
-    let input_bg = rc(theme.fuzzy_selected_bg);
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
 
-    let write_row =
-        |buf: &mut ratatui::buffer::Buffer, y: u16, text: &str, fg: RColor, bg: RColor| {
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, y, ' ', fg, bg);
-            }
-            for (i, ch) in text.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, y, ch, fg, bg);
-            }
-        };
+    let header_fg = theme.status_fg;
+    let header_bg = theme.status_bg;
+    let default_fg = theme.foreground;
+    let dim_fg = theme.line_number_fg;
+    let panel_bg = theme.completion_bg;
+    let input_bg = theme.fuzzy_selected_bg;
 
     let mut y = area.y;
 
@@ -1296,7 +1205,7 @@ pub(super) fn render_ai_sidebar(
         } else {
             " \u{f0e5} AI ASSISTANT"
         };
-        write_row(buf, y, hdr, header_fg, header_bg);
+        fill_row(backend, area.x, y, area.width, hdr, header_fg, header_bg);
         y += 1;
     }
 
@@ -1354,17 +1263,16 @@ pub(super) fn render_ai_sidebar(
         rows,
         scroll_top: start,
     };
-    quadraui::tui::draw_message_list(
-        buf,
-        Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: msg_area_height,
-        },
-        &msg_list,
-        q_panel_bg,
+    // #635 (Stage 6b item C): `Backend::draw_message_list` was already a
+    // trait method (see this fn's doc comment for the one cosmetic
+    // difference in how it sources its background colour).
+    let q_rect = quadraui::Rect::new(
+        area.x as f32,
+        y as f32,
+        area.width as f32,
+        msg_area_height as f32,
     );
+    backend.draw_message_list(q_rect, &msg_list);
     y += msg_area_height;
 
     // Fill any rows the message list didn't cover (when there are
@@ -1376,17 +1284,14 @@ pub(super) fn render_ai_sidebar(
         .min(msg_area_height as usize) as u16;
     let mut fill_y = area.y + 1 + painted;
     while fill_y < area.y + 1 + msg_area_height {
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, fill_y, ' ', dim_fg, panel_bg);
-        }
+        fill_row(backend, area.x, fill_y, area.width, "", dim_fg, panel_bg);
         fill_y += 1;
     }
 
     // ── Separator ─────────────────────────────────────────────────────────────
     if y < area.y + area.height {
-        for x in area.x..area.x + area.width {
-            set_cell(buf, x, y, '─', dim_fg, header_bg);
-        }
+        let sep: String = std::iter::repeat_n('─', area.width as usize).collect();
+        fill_row(backend, area.x, y, area.width, &sep, dim_fg, header_bg);
         y += 1;
     }
 
@@ -1415,32 +1320,22 @@ pub(super) fn render_ai_sidebar(
             if y >= area.y + area.height {
                 break;
             }
-            // Fill background
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, y, ' ', inp_fg, inp_bg);
-            }
-            // Prefix: " > " on first line, "   " on continuations
+            // Prefix (" > " on first line, "   " on continuations) + content,
+            // in one `fill_row` call — the row-blank, prefix-write, and
+            // content-write were always the same `inp_fg`/`inp_bg` pair, so
+            // painting the concatenated text over the whole-row fill in a
+            // single call is behaviour-identical to the old three-pass
+            // `set_cell` version.
             let pfx = if line_idx == 0 { " > " } else { "   " };
-            for (i, ch) in pfx.chars().enumerate() {
-                set_cell(buf, area.x + i as u16, y, ch, inp_fg, inp_bg);
-            }
-            // Content
-            for (i, &ch) in chunk.iter().enumerate() {
-                set_cell(
-                    buf,
-                    area.x + pfx_len as u16 + i as u16,
-                    y,
-                    ch,
-                    inp_fg,
-                    inp_bg,
-                );
-            }
+            let content: String = chunk.iter().collect();
+            let text = format!("{pfx}{content}");
+            fill_row(backend, area.x, y, area.width, &text, inp_fg, inp_bg);
             // Cursor (inverted cell on the cursor line)
             if ai.input_active && line_idx == cursor_line {
                 let cx = area.x + pfx_len as u16 + cursor_col as u16;
                 if cx < area.x + area.width {
                     let cursor_ch = input_chars.get(cursor).copied().unwrap_or(' ');
-                    set_cell(buf, cx, y, cursor_ch, inp_bg, inp_fg);
+                    fill_row(backend, cx, y, 1, &cursor_ch.to_string(), inp_bg, inp_fg);
                 }
             }
             y += 1;
@@ -1448,17 +1343,12 @@ pub(super) fn render_ai_sidebar(
     } else {
         // Placeholder when input is empty and not active
         if y < area.y + area.height {
-            for x in area.x..area.x + area.width {
-                set_cell(buf, x, y, ' ', inp_fg, inp_bg);
-            }
             let placeholder = if ai.streaming {
                 " (waiting for response…)"
             } else {
                 " Press i to type…"
             };
-            for (i, ch) in placeholder.chars().enumerate().take(area.width as usize) {
-                set_cell(buf, area.x + i as u16, y, ch, inp_fg, inp_bg);
-            }
+            fill_row(backend, area.x, y, area.width, placeholder, inp_fg, inp_bg);
         }
     }
 }
@@ -1663,17 +1553,19 @@ pub(super) fn render_terminal_panel(
             let right = td.right.as_ref().unwrap();
             backend.draw_terminal(split.left, left);
             backend.draw_terminal(split.right, right);
-            // Stage 1 scope note: `draw_terminal_divider` is a free rasteriser
-            // with no `Backend::draw_*` trait equivalent (checked against
-            // quadraui's Backend trait), so calling it directly is correct
-            // and out of scope here.
-            quadraui::tui::draw_terminal_divider(
-                frame.buffer_mut(),
-                split.divider_x as u16,
-                area.y,
-                area.height,
-                &q_theme,
-            );
+            // #635 (Stage 6b): `Backend::draw_terminal_divider` landed as
+            // JDonaghy/quadraui#533, replacing the free
+            // `quadraui::tui::draw_terminal_divider` rasteriser this used to
+            // call directly on `frame.buffer_mut()`. The trait method is
+            // geometry-neutral (`rect: Rect`, not raw `x`/`y`/`height`) — see
+            // its doc comment: `rect.x` is the divider column, `rect.y` its
+            // top row, `rect.height` its length, `rect.width` ignored.
+            backend.draw_terminal_divider(quadraui::Rect::new(
+                split.divider_x,
+                area.y as f32,
+                1.0,
+                area.height as f32,
+            ));
         } else if let Some(ref term) = td.single {
             backend.draw_terminal(q_area, term);
         }
@@ -1694,16 +1586,15 @@ pub(super) fn render_terminal_panel(
 /// frame pointer — see `shell_app.rs`'s module doc gap 1), so the actual
 /// cell-grid paint needs no change at all.
 ///
-/// Known gap: split terminal panes (`Ctrl+\`, i.e. `panel.split_left_rows`
-/// is `Some`) are NOT painted here. `render_terminal_panel`'s split arm
-/// draws the divider line via `quadraui::tui::draw_terminal_divider`, a
-/// free rasteriser with no `Backend::draw_*` trait equivalent (checked
-/// against quadraui's `Backend` trait — the same class of gap as
-/// `draw_settings_chrome`), so there is no way to paint a correctly
-/// divided split from this signature; the area is left untouched (still
-/// background-cleared) rather than drawing an undivided pane that would
-/// misrepresent the split state. Filed as part of this stage's documented
-/// gap list (`shell_app.rs`'s module doc).
+/// Split terminal panes (`Ctrl+\`, i.e. `panel.split_left_rows` is `Some`)
+/// used to be a known gap here: `render_terminal_panel`'s split arm drew its
+/// divider via the free `quadraui::tui::draw_terminal_divider` rasteriser,
+/// which has no `Backend::draw_*` trait equivalent, so a correctly-divided
+/// split couldn't be painted from this signature. #635 (Stage 6b) closes it
+/// now that `Backend::draw_terminal_divider`
+/// ([JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533))
+/// has landed: both panes and the divider paint through the trait,
+/// mirroring `render_terminal_panel`'s live path exactly.
 ///
 /// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
 /// (`shell_app.rs`), which nothing outside that module's own
@@ -1740,13 +1631,6 @@ pub(super) fn render_terminal_panel_content(
         let _ = backend.draw_status_bar(row_rect, &bg_bar, None, None);
     }
 
-    if panel.split_left_rows.is_some() {
-        // Known gap — see doc comment above. Background is cleared but the
-        // split content and divider are not drawn.
-        engine.terminal_split_layout.replace(None);
-        return;
-    }
-
     let q_area = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
@@ -1756,7 +1640,23 @@ pub(super) fn render_terminal_panel_content(
     let td = render::build_terminal_draw_data(panel, q_area, 1.0, 1.0, area.height as usize, None);
     engine.terminal_split_layout.replace(td.split);
     backend.set_theme(q_theme);
-    if let Some(ref term) = td.single {
+    if let Some(split) = &td.split {
+        // #635 (Stage 6b): `Backend::draw_terminal_divider`
+        // (JDonaghy/quadraui#533) closed the gap this used to leave open —
+        // split terminal panes now paint both halves and their divider from
+        // this trait-only signature, matching `render_terminal_panel`'s live
+        // `draw_frame` path exactly.
+        let left = td.left.as_ref().unwrap();
+        let right = td.right.as_ref().unwrap();
+        backend.draw_terminal(split.left, left);
+        backend.draw_terminal(split.right, right);
+        backend.draw_terminal_divider(quadraui::Rect::new(
+            split.divider_x,
+            area.y as f32,
+            1.0,
+            area.height as f32,
+        ));
+    } else if let Some(ref term) = td.single {
         backend.draw_terminal(q_area, term);
     }
 }
