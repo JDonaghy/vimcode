@@ -66,9 +66,11 @@
 //!      snapshot test still passes unchanged — i.e. the conversion is
 //!      byte-identical on the live path.
 //!
-//!      Still open: **extensions** (`render_ext_sidebar`'s two chrome rows
-//!      are the same raw-`set_cell` pattern — a straightforward `fill_row`
-//!      candidate, just not converted yet), the **plugin extension panel**
+//!      **extensions** followed the same way (`render_ext_sidebar`'s two
+//!      chrome rows were a local raw-`set_cell` `write_row` closure that is
+//!      exactly what `fill_row` does).
+//!
+//!      Still open: the **plugin extension panel**
 //!      (`render_ext_panel` uses the same `draw_settings_chrome`, which
 //!      `draw_settings_chrome_via_backend` now covers, *but* its help popup
 //!      overlay and manual scrollbar are raw `set_cell` box-drawing with no
@@ -2429,6 +2431,24 @@ mod tests {
         assert!(
             screen.contains("SOURCE CONTROL"),
             "source control panel should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// The *extensions* sidebar panel, likewise — its two chrome rows (the
+    /// header and the search box) were a local raw-`set_cell` `write_row`
+    /// closure that #605 collapsed into `panels::fill_row`.
+    #[test]
+    fn render_content_paints_extensions_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXTENSIONS));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("EXTENSIONS"),
+            "extensions panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
     }
 
