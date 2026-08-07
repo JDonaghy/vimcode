@@ -773,6 +773,9 @@ mod explorer_sort_tests {
             assert_eq!(this_pass, first_pass);
         }
 
-        assert_eq!(first_pass, vec!["another", "subdir", "alpha.txt", "beta.rs"]);
+        assert_eq!(
+            first_pass,
+            vec!["another", "subdir", "alpha.txt", "beta.rs"]
+        );
     }
 }

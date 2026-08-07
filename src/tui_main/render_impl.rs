@@ -552,7 +552,13 @@ pub(super) fn draw_frame(
         // `frame.buffer_mut()[(div_x - 1, y)]` read-back (the #481
         // phantom-divider-beside-scrollbar guard) became a pure data
         // computation both call sites now share.
-        render_group_dividers(backend, &split.dividers, &screen.windows, editor_area, theme);
+        render_group_dividers(
+            backend,
+            &split.dividers,
+            &screen.windows,
+            editor_area,
+            theme,
+        );
     } else {
         // Single group: tab bar at row 0 of editor_area, windows at row 1+.
         for target in &tab_bar_targets {
@@ -1766,12 +1772,13 @@ pub(super) fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize
 /// (#609) can apply the exact same "the scrollbar already doubles as the
 /// separator" rule without duplicating the row-accounting math.
 fn window_overflows_vertically(w: &RenderedWindow) -> bool {
-    let text_rows = (w.rect.height as usize)
-        .saturating_sub(if w.status_line.is_some() && w.rect.height > 1.0 {
+    let text_rows = (w.rect.height as usize).saturating_sub(
+        if w.status_line.is_some() && w.rect.height > 1.0 {
             1
         } else {
             0
-        });
+        },
+    );
     w.total_lines > text_rows
 }
 
