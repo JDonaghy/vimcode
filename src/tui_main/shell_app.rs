@@ -218,6 +218,76 @@
 //! entirely by `mouse::handle_mouse`. See `handle_key_pressed`'s own doc
 //! comment for the exact precedence chain and this gap's full detail, and
 //! for why it's a free function rather than a `TuiShellApp` method.
+//!
+//! # Stage 6 (#605) cutover: what is still missing
+//!
+//! #605 swept `draw_frame`'s tail into `render_content` (separated status,
+//! debug toolbar, wildmenu, global status bar, command line + `cmd_sel`,
+//! panel hover popup, folder picker, find/replace, unified picker, tab
+//! switcher, context menu, dialog, toast stack) and closed three of the five
+//! sidebar-panel gaps (settings, source control, extensions). It did **not**
+//! flip `tui_main::run()` over to
+//! `quadraui::tui::shell_runner::run_with_shell`, because the list below is
+//! what a cutover today would silently regress. Each item is recorded with
+//! what it would actually take, so the next session starts from a scoped
+//! list rather than a re-survey.
+//!
+//! **A. Menu bar + command centre + menu dropdown — blocked on quadraui.**
+//! `draw_frame` carves a full-width row 0 for these *above* the activity bar,
+//! and vimcode's menu bar is runtime-toggleable (`engine.menu_bar_visible`,
+//! `menu_bar_toggleable = true` in `setup`). `AppShell` reserves its
+//! title-bar row at construction (`ShellConfig`/`AppShell::with_title_bar`)
+//! and exposes no runtime toggle, and with no title bar it starts the
+//! activity bar at `y = 0` — so painting the menu into `window_bounds` row 0
+//! would overwrite the activity bar's first row, while always reserving a
+//! title-bar row would cost an editor row whenever the menu is hidden. Needs
+//! `AppShell::set_title_bar_visible` (or equivalent) upstream — a
+//! Platform-Neutrality-Rule gap, not something to work around here.
+//! Everything else about these three is ready: `draw_menu_bar`,
+//! `draw_command_center` and `MenuSystem::render` are all already trait
+//! calls.
+//!
+//! **B. Split terminal panes — blocked on quadraui.** Same class as the
+//! (now-closed) settings chrome: `render_terminal_panel`'s split arm draws
+//! its divider with `quadraui::tui::draw_terminal_divider`, a free
+//! rasteriser with no `Backend::draw_*` entry. See
+//! `panels::render_terminal_panel_content`'s doc comment.
+//!
+//! **C. Plugin extension panel + AI sidebar panel — vimcode-side.**
+//! `render_ext_panel`'s help-popup overlay and manual scrollbar are raw
+//! `set_cell` box drawing (no primitive stand-in checked yet);
+//! `render_ai_sidebar` takes `buf: &mut ratatui::buffer::Buffer` outright.
+//!
+//! **D. The three unported keyboard tiers — vimcode-side.** Activity-bar-
+//! focused, sidebar-focused, and `cmd_sel` — see the paragraph above.
+//!
+//! **E. `ShellConfig` build-out — vimcode-side, mechanical.** The
+//! `#[cfg(test)] config()` below declares a single `panel:explorer`
+//! `PanelDefinition`, so `AppShell`'s own activity bar would render one icon.
+//! A live config needs every panel vimcode's `render::build_activity_bar`
+//! emits, split across `ShellConfig.panels` / `with_bottom_items`, plus an
+//! `on_shell_event` arm that treats the hamburger item as "open the menu"
+//! rather than "switch panel". (`AppShell::build_activity_bar` leaves
+//! `active_accent`/`selection_bg` `None` where vimcode's sets them from the
+//! theme; the TUI rasteriser falls back to `theme.cursor`, so that one is a
+//! cosmetic difference, not a blocker.)
+//!
+//! **F. `run()`'s own non-loop responsibilities — vimcode-side.** The panic
+//! hook, `core::swap::register_emergency_engine`, the emergency swap flush
+//! and the custom crash message all live in `run()` around `event_loop`.
+//! `run_with_shell` → `tui::run::run` does its own `catch_unwind` and
+//! `resume_unwind`s after restoring the terminal, so an outer `catch_unwind`
+//! in `run()` still sees the payload; the ordering just has to be
+//! re-established deliberately. `keyboard_enhanced` is *not* a blocker
+//! despite the field comment below: `setup()` can call
+//! `crossterm::terminal::supports_keyboard_enhancement()` itself and get the
+//! same answer the runner's own push used.
+//!
+//! Note that none of the above is reachable by `driver_with_shell` in the
+//! sense of proving the *live* TUI works — see the pinned note on #605:
+//! `TuiDriver` renders to `TestBackend` and never parses real ANSI, so
+//! raw-mode, SGR mouse, and the embedded PTY pane stay outside its reach and
+//! the cutover needs a human smoke pass regardless.
 
 use std::cell::{Cell, RefCell};
 
