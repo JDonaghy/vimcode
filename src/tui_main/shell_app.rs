@@ -51,26 +51,35 @@
 //!    cutover):
 //!
 //!    - The rest of the sidebar (#607's own known-gap list, no separate
-//!      issue): **settings** (`render_settings_panel`'s header + search-box
-//!      chrome is a free `quadraui::tui::draw_settings_chrome` rasteriser
-//!      with no `Backend::draw_*` trait equivalent — its own "Stage 1 scope
-//!      note" doc comment already flags this; the form body below the
-//!      chrome *is* trait-pure via `FormController::render_and_cache`, but
-//!      painting only the body and leaving the chrome blank was judged not
-//!      worth the coordinate-mismatch risk for this stage), **source
-//!      control** (header row, focused-hint row, and full-area background
-//!      clear are raw `set_cell` loops over `frame.buffer_mut()` — the
-//!      `draw_status_bar`-blank-segment trick #607 used for the explorer's
-//!      background would work here too, just not attempted this stage),
-//!      **extensions** (`render_ext_sidebar`'s two chrome rows are the same
-//!      raw-`set_cell` pattern; likewise a `draw_status_bar` candidate),
-//!      the **plugin extension panel** (`render_ext_panel`'s chrome is the
-//!      same non-trait `draw_settings_chrome` as settings, *and* its help
-//!      popup overlay and manual scrollbar are raw `set_cell` box-drawing
-//!      with no primitive stand-in checked yet), and the **AI panel**
+//!      issue). #605 closed two of the five: **settings**
+//!      (`render_settings_panel`'s header + search-box chrome was a free
+//!      `quadraui::tui::draw_settings_chrome` rasteriser with no
+//!      `Backend::draw_*` trait equivalent — `panels::
+//!      draw_settings_chrome_via_backend` now reproduces it exactly through
+//!      the rule-row trick, sourcing every colour from the same
+//!      `q_theme(theme)` the rasteriser reads so the two can't drift) and
+//!      **source control** (header row, focused-hint row, and full-area
+//!      background clear were raw `set_cell` loops; now `fill_row`/
+//!      `fill_rect`). Both renderers dropped their `&mut Frame` parameter,
+//!      so there is one implementation shared by `draw_frame` and
+//!      `render_content`, and `panels.rs`'s own source-control buffer
+//!      snapshot test still passes unchanged — i.e. the conversion is
+//!      byte-identical on the live path.
+//!
+//!      Still open: **extensions** (`render_ext_sidebar`'s two chrome rows
+//!      are the same raw-`set_cell` pattern — a straightforward `fill_row`
+//!      candidate, just not converted yet), the **plugin extension panel**
+//!      (`render_ext_panel` uses the same `draw_settings_chrome`, which
+//!      `draw_settings_chrome_via_backend` now covers, *but* its help popup
+//!      overlay and manual scrollbar are raw `set_cell` box-drawing with no
+//!      primitive stand-in checked yet), and the **AI panel**
 //!      (`render_ai_sidebar` takes `buf: &mut ratatui::buffer::Buffer`
-//!      directly — no backend parameter at all, the most raw of the
-//!      lot).
+//!      directly — no backend parameter at all, the most raw of the lot).
+//!
+//!      The clean long-term fix for the settings chrome specifically is a
+//!      `Backend::draw_settings_chrome` trait method in quadraui (the
+//!      rasteriser already exists there; only the trait entry is missing),
+//!      at which point `draw_settings_chrome_via_backend` deletes.
 //!
 //!    #609 (Stage 2c, closed) additionally wires the window/editor-group
 //!    divider lines, the tab-drag ghost overlay, and the tab-hover tooltip
@@ -2379,6 +2388,47 @@ mod tests {
         assert!(
             screen.contains("ZQXW605DIALOG"),
             "modal dialog should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// The *settings* sidebar panel must now paint through `render_content`
+    /// too — it was one of #607's documented gaps, blocked on
+    /// `quadraui::tui::draw_settings_chrome` being a free `&mut Buffer`
+    /// rasteriser. #605 stands in for it with
+    /// `panels::draw_settings_chrome_via_backend`, so the `" SETTINGS"`
+    /// header row (a literal, hence deterministic) should reach the screen.
+    #[test]
+    fn render_content_paints_settings_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("SETTINGS"),
+            "settings panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// The *source control* sidebar panel, likewise — its header/clear/hint
+    /// rows were raw `set_cell` loops until #605 routed them through
+    /// `fill_rect`/`fill_row`. `sc_header_text` always contains the literal
+    /// "SOURCE CONTROL" regardless of repo state, so the assertion holds
+    /// whether or not the test process happens to sit in a git checkout.
+    #[test]
+    fn render_content_paints_source_control_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("SOURCE CONTROL"),
+            "source control panel should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
     }
 
