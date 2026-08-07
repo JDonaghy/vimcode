@@ -184,10 +184,13 @@ pub(super) fn build_screen_for_shell_content(
 /// path would use, and the space `build_screen_for_shell_content` reserved
 /// above (subtracted from `content_rows`) lines up with what's actually
 /// carved out here — same reserved-but-unpainted treatment `render_content`
-/// already gives the menu-bar row applies to debug-toolbar/wildmenu/status
-/// here too (their heights are still subtracted so the chunks below them
-/// don't shift, but only quickfix + bottom panel are returned/painted this
-/// stage — the rest is #603/#609 territory).
+/// already gives the menu-bar row applies to the remaining rows here too.
+///
+/// #605 (Stage 6 parity sweep): every one of `draw_frame`'s eight vertical
+/// chunks is now returned, not just quickfix + bottom panel — the
+/// separated-status / debug-toolbar / wildmenu / global-status / command-line
+/// rows are all painted by `TuiShellApp::render_content` through
+/// `Backend::draw_*` calls, so their rects have real consumers.
 ///
 /// Investigated per this issue's scope note: quadraui's own generic
 /// `ShellConfig::with_bottom_panel` / `BottomPanelController`
@@ -202,6 +205,11 @@ pub(super) fn build_screen_for_shell_content(
 pub(super) struct BottomChromeRects {
     pub(super) quickfix: Rect,
     pub(super) bottom_panel: Rect,
+    pub(super) debug_toolbar: Rect,
+    pub(super) separated_status: Rect,
+    pub(super) wildmenu: Rect,
+    pub(super) status: Rect,
+    pub(super) cmd: Rect,
 }
 
 pub(super) fn bottom_chrome_rects_for_shell_content(
@@ -236,17 +244,22 @@ pub(super) fn bottom_chrome_rects_for_shell_content(
             Constraint::Min(0),                          // 0: editor
             Constraint::Length(qf_height),               // 1: quickfix
             Constraint::Length(bottom_panel_height),     // 2: terminal/debug bottom panel
-            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar (unpainted, #603)
-            Constraint::Length(separated_status_height), // 4: separated status (unpainted)
-            Constraint::Length(wildmenu_height),         // 5: wildmenu (unpainted, #603)
-            Constraint::Length(global_status_height),    // 6: global status (unpainted)
-            Constraint::Length(1),                       // 7: cmd (unpainted)
+            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar
+            Constraint::Length(separated_status_height), // 4: separated status
+            Constraint::Length(wildmenu_height),         // 5: wildmenu
+            Constraint::Length(global_status_height),    // 6: global status
+            Constraint::Length(1),                       // 7: cmd
         ])
         .split(area);
 
     BottomChromeRects {
         quickfix: v_chunks[1],
         bottom_panel: v_chunks[2],
+        debug_toolbar: v_chunks[3],
+        separated_status: v_chunks[4],
+        wildmenu: v_chunks[5],
+        status: v_chunks[6],
+        cmd: v_chunks[7],
     }
 }
 
@@ -824,22 +837,10 @@ pub(super) fn draw_frame(
         backend.draw_status_bar(q_rect, bar, None, None);
     }
 
-    render_command_line(frame.buffer_mut(), cmd_area, &screen.command, theme);
-    // Highlight command-line mouse selection (invert fg/bg for selected cells)
-    if let Some((start, end)) = cmd_sel {
-        let lo = start.min(end);
-        let hi = start.max(end);
-        let buf = frame.buffer_mut();
-        for i in lo..=hi {
-            let cx = cmd_area.x + i as u16;
-            if cx < cmd_area.x + cmd_area.width {
-                let cell = &mut buf[(cx, cmd_area.y)];
-                let old_fg = cell.fg;
-                let old_bg = cell.bg;
-                cell.set_fg(old_bg).set_bg(old_fg);
-            }
-        }
-    }
+    // `render_command_line` also applies the `cmd_sel` mouse-selection
+    // inversion (#605 folded the separate buffer read-back pass into the
+    // renderer so `TuiShellApp::render_content` gets it for free).
+    render_command_line(backend, cmd_area, &screen.command, theme, cmd_sel);
 
     // ── Panel hover popup (drawn after editor so it's not overwritten) ─────
     hover_link_rects_out.clear();
@@ -1193,7 +1194,10 @@ pub(super) fn paint_editor_popups(
 /// `query_cursor` is set to the end of the query (no internal-edit
 /// cursor model in the TUI picker yet). `total_count` enables the
 /// `N/M` chip in the title via `draw_palette`.
-fn folder_picker_to_palette(picker: &FolderPickerState, popup_width: usize) -> quadraui::Palette {
+pub(super) fn folder_picker_to_palette(
+    picker: &FolderPickerState,
+    popup_width: usize,
+) -> quadraui::Palette {
     use quadraui::{Icon, Palette, PaletteItem, StyledText, WidgetId};
 
     // Build title — matches the legacy folder-picker title format.
@@ -1635,9 +1639,8 @@ pub(super) fn render_picker_popup(
     picker: &render::PickerPanel,
     term_area: Rect,
     theme: &Theme,
-    backend: &mut super::backend::TuiBackend,
+    backend: &mut dyn quadraui::Backend,
 ) {
-    use quadraui::Backend;
     let has_preview = picker.preview.is_some();
     let geo = render::PickerGeometry::compute(
         term_area.width as f32,
@@ -1647,7 +1650,7 @@ pub(super) fn render_picker_popup(
     );
     let palette = render::picker_panel_to_palette(picker);
     let q_rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
-    backend.set_current_theme(super::quadraui_tui::q_theme(theme));
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_palette(q_rect, &palette);
 }
 
@@ -1725,7 +1728,7 @@ pub(super) fn render_window(
 /// click handler runs the layout on demand against current bar width.
 /// See `render_tab_bar`'s doc comment for why `backend` is the trait object
 /// rather than the concrete `TuiBackend` (#601).
-fn render_window_status_line(
+pub(super) fn render_window_status_line(
     backend: &mut dyn quadraui::Backend,
     x: u16,
     y: u16,
@@ -1891,7 +1894,7 @@ fn draw_rule_cell_themed(
 /// `backend.set_theme(...)` once up front and then use this (via
 /// [`draw_rule_cell_themed`]) for every cell, instead of reconstructing the
 /// theme on each of the dozens of divider cells a tall terminal can have.
-fn draw_rule_row_themed(
+pub(super) fn draw_rule_row_themed(
     backend: &mut dyn quadraui::Backend,
     x: u16,
     y: u16,

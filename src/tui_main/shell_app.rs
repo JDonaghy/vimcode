@@ -968,6 +968,22 @@ impl ShellApp for TuiShellApp {
             );
         }
 
+        // ── Separated status line (#605) ─────────────────────────────────
+        // Shown above the terminal panel when `window_status_line` is on but
+        // `status_line_above_terminal` is off — `render_window_status_line`
+        // was already trait-pure (#601 widened it), so this is a straight
+        // port of `draw_frame`'s own block.
+        if let Some(ref status) = screen.separated_status_line {
+            render_window_status_line(
+                backend,
+                chrome.separated_status.x,
+                chrome.separated_status.y,
+                chrome.separated_status.width,
+                status,
+                &theme,
+            );
+        }
+
         if chrome.bottom_panel.height > 0 {
             self.engine.bottom_panel_geometry.replace(Some(
                 crate::core::engine::BottomPanelGeometry {
@@ -1088,6 +1104,204 @@ impl ShellApp for TuiShellApp {
             }
         } else {
             self.engine.bottom_panel_geometry.replace(None);
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // #605 (Stage 6 parity sweep): the rest of `draw_frame`'s tail, in
+        // its exact paint order. Everything below was already a
+        // `Backend::draw_*` trait call on the live path (the one exception,
+        // the command line, is now trait-pure too — see
+        // `panels::render_command_line`), so these are straight ports, not
+        // reimplementations.
+        //
+        // Screen-anchored overlays (modals, toasts, the panel hover popup)
+        // deliberately use `layout.window_bounds` — the *whole* terminal —
+        // rather than `area` (`main_content_bounds`, the editor column).
+        // `draw_frame` centres them on `frame.area()`, so anchoring them to
+        // the editor column instead would shift every modal right by the
+        // activity-bar + sidebar width.
+        let win = layout.window_bounds;
+        let win_area = Rect {
+            x: win.x.round() as u16,
+            y: win.y.round() as u16,
+            width: win.width.round() as u16,
+            height: win.height.round() as u16,
+        };
+
+        // ── Debug toolbar strip ──────────────────────────────────────────
+        if screen.debug_toolbar.is_some() {
+            let q_rect = quadraui::Rect::new(
+                chrome.debug_toolbar.x as f32,
+                chrome.debug_toolbar.y as f32,
+                chrome.debug_toolbar.width as f32,
+                chrome.debug_toolbar.height as f32,
+            );
+            self.debug_toolbar_rect.set(q_rect);
+            render::draw_debug_toolbar(backend, &self.engine, q_rect);
+        }
+
+        // ── Wildmenu bar (command Tab completion) ────────────────────────
+        if let Some(ref wm) = screen.wildmenu {
+            let bar = render::wildmenu_to_status_bar(wm, &theme);
+            let q_rect = quadraui::Rect::new(
+                chrome.wildmenu.x as f32,
+                chrome.wildmenu.y as f32,
+                chrome.wildmenu.width as f32,
+                chrome.wildmenu.height as f32,
+            );
+            backend.draw_status_bar(q_rect, &bar, None, None);
+        }
+
+        // ── Global status bar ────────────────────────────────────────────
+        if let Some(ref bar) = screen.global_status_bar {
+            let q_rect = quadraui::Rect::new(
+                chrome.status.x as f32,
+                chrome.status.y as f32,
+                chrome.status.width as f32,
+                chrome.status.height as f32,
+            );
+            backend.draw_status_bar(q_rect, bar, None, None);
+        }
+
+        // ── Command line (+ mouse drag-selection inversion) ──────────────
+        render_command_line(
+            backend,
+            chrome.cmd,
+            &screen.command,
+            &theme,
+            self.cmd_sel.get(),
+        );
+
+        // ── Panel hover popup ────────────────────────────────────────────
+        // Anchored just right of the sidebar's own right edge, which in the
+        // shell layout is exactly `main_content_bounds.x` (`AppShell` puts
+        // the resize divider between them and `area.x` is the first column
+        // past it) — the same column `draw_frame` computes as `sep_x + 1`.
+        {
+            let mut rects = self.hover_link_rects.borrow_mut();
+            rects.clear();
+            self.hover_popup_rect.set(None);
+            if let Some(sb) = layout.sidebar_content_bounds {
+                if self.engine.app_shell.sidebar_visible()
+                    && (self.sidebar.ext_panel_name.is_some()
+                        || self.engine.active_panel_is(PANEL_GIT))
+                {
+                    let (new_rects, popup_rect) = render_panel_hover_popup(
+                        backend,
+                        &screen,
+                        &theme,
+                        area.x,
+                        sb.y.round() as u16,
+                        sb.height.round() as u16,
+                        win_area,
+                    );
+                    *rects = new_rects;
+                    self.hover_popup_rect.set(popup_rect);
+                }
+            }
+        }
+
+        // ── Folder / workspace picker modal ──────────────────────────────
+        if let Some(ref picker) = self.folder_picker {
+            // Sizing identical to `draw_frame`'s: 60% of viewport width
+            // clamped to >= 50; 55% of viewport height clamped to >= 15.
+            let width = (win_area.width * 3 / 5).max(50);
+            let height = (win_area.height * 55 / 100).max(15);
+            let popup_x = win_area.x + (win_area.width.saturating_sub(width)) / 2;
+            let popup_y = win_area.y + (win_area.height.saturating_sub(height)) / 2;
+            let palette = folder_picker_to_palette(picker, width as usize);
+            let q_rect =
+                quadraui::Rect::new(popup_x as f32, popup_y as f32, width as f32, height as f32);
+            backend.draw_palette(q_rect, &palette);
+        }
+
+        // ── Find/replace overlay ─────────────────────────────────────────
+        // `find_replace.group_bounds` is already absolute terminal-screen
+        // space (#550), so the rect passed here only supplies the clip
+        // viewport — see `draw_frame`'s longer comment on the `editor_left`
+        // no-op translation.
+        if let Some(ref find_replace) = screen.find_replace {
+            let q_area = quadraui::Rect::new(
+                win_area.x as f32,
+                win_area.y as f32,
+                win_area.width as f32,
+                win_area.height as f32,
+            );
+            backend.draw_find_replace(q_area, find_replace);
+        }
+
+        // ── Unified picker modal ─────────────────────────────────────────
+        if let Some(ref picker) = screen.picker {
+            render_picker_popup(picker, win_area, &theme, backend);
+        }
+
+        // ── Tab switcher popup ───────────────────────────────────────────
+        if let Some(ref ts) = screen.tab_switcher {
+            if !ts.items.is_empty() {
+                let width = (win_area.width * 45 / 100).clamp(40, 80);
+                let max_visible = (win_area.height as usize).saturating_sub(4).min(20);
+                let visible = ts.items.len().min(max_visible);
+                let height = visible as u16 + 2;
+                let x = win_area.x + (win_area.width.saturating_sub(width)) / 2;
+                let y = win_area.y + (win_area.height.saturating_sub(height)) / 2;
+                let list = render::tab_switcher_to_quadraui_list_view(ts, max_visible);
+                let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, height as f32);
+                backend.draw_list(q_rect, &list);
+            }
+        }
+
+        // ── Context menu popup ───────────────────────────────────────────
+        // Painting this also closes the residual #602 seam noted in the
+        // module doc: `handle_mouse` receives `context_menu_layout` from the
+        // cell written here, so a click on a menu item now resolves to that
+        // item instead of falling through to "close the menu".
+        if let Some(ref ctx_menu) = screen.context_menu {
+            let inner_viewport = quadraui::Rect::new(
+                (win_area.x + 1) as f32,
+                (win_area.y + 1) as f32,
+                win_area.width.saturating_sub(2) as f32,
+                win_area.height.saturating_sub(2) as f32,
+            );
+            let inset_panel = render::ContextMenuPanel {
+                screen_col: ctx_menu.screen_col + 1,
+                screen_row: ctx_menu.screen_row + 1,
+                ..ctx_menu.clone()
+            };
+            let (menu, menu_layout) =
+                render::context_menu_generic_layout(&inset_panel, inner_viewport, 1.0, 1.0, 1.0);
+            let _ = backend.draw_context_menu(&menu, &menu_layout);
+            *self.context_menu_layout.borrow_mut() = Some(menu_layout);
+        } else {
+            *self.context_menu_layout.borrow_mut() = None;
+        }
+
+        // ── Modal dialog ─────────────────────────────────────────────────
+        if let Some(ref dialog) = screen.dialog {
+            let viewport = quadraui::Rect::new(
+                win_area.x as f32,
+                win_area.y as f32,
+                win_area.width as f32,
+                win_area.height as f32,
+            );
+            let (q_dialog, dlg_layout) = render::dialog_generic_layout(dialog, viewport, 1.0, 1.0);
+            let _ = backend.draw_dialog(&q_dialog, &dlg_layout);
+            *self.dialog_layout.borrow_mut() = Some(dlg_layout);
+        } else {
+            *self.dialog_layout.borrow_mut() = None;
+        }
+
+        // ── Toast overlay (#450) — last, so it sits on top of everything ─
+        if let Some(stack) = render::build_toast_stack(&self.engine) {
+            let q_toast_area = quadraui::Rect::new(
+                win_area.x as f32,
+                win_area.y as f32,
+                win_area.width as f32,
+                win_area.height as f32,
+            );
+            let toast_layout = backend.draw_toast_stack(q_toast_area, &stack);
+            self.engine.toast_layout.replace(Some(toast_layout));
+        } else {
+            self.engine.toast_layout.replace(None);
         }
     }
 
@@ -2094,6 +2308,95 @@ mod tests {
         );
     }
 
+    // ── #605 (Stage 6 parity sweep) ────────────────────────────────────────
+    //
+    // The rest of `draw_frame`'s tail, each asserted through
+    // `driver_with_shell` so the claim is "it reaches the painted screen",
+    // not "the call compiles".
+
+    /// The `:`-command row must paint. In Normal mode `build_command_line`
+    /// renders `engine.message` verbatim, which is the cheapest deterministic
+    /// way to get known text onto that row — and it specifically exercises
+    /// the trait-pure rewrite of `panels::render_command_line` (#605 replaced
+    /// its `frame.buffer_mut()` `set_cell` loop with the
+    /// `Backend::draw_status_bar` rule-row trick).
+    #[test]
+    fn render_content_paints_command_line_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.message = "ZQXW_605_CMDLINE_MARKER".to_string();
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_605_CMDLINE_MARKER"),
+            "command line should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// Command mode paints the typed `:command` *and* its inverted block
+    /// cursor. The cursor is a colour inversion, invisible to `screen()`'s
+    /// text dump, so this asserts on the text and relies on the run-batching
+    /// in `render_command_line` not swallowing cells: a cursor mid-string
+    /// splits the row into three colour runs, so a bug there would drop or
+    /// duplicate characters rather than merely mis-colour them.
+    #[test]
+    fn render_content_paints_command_mode_text_with_cursor_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.mode = crate::core::Mode::Command;
+        app.engine.command_buffer = "ZQXW605CMD".to_string();
+        app.engine.command_cursor = 4;
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains(":ZQXW605CMD"),
+            "command-mode text should paint intact around the inverted cursor cell; screen:\n{screen}"
+        );
+    }
+
+    /// A modal dialog must paint *and* cache its `DialogLayout` — the layout
+    /// is what `handle_key_pressed`'s dialog tier and `handle_mouse_event`
+    /// hit-test against, so a paint that doesn't publish it is only half
+    /// wired.
+    #[test]
+    fn render_content_paints_dialog_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.dialog = Some(crate::core::engine::Dialog {
+            title: "ZQXW605DIALOG".to_string(),
+            body: vec!["body line".to_string()],
+            buttons: vec![crate::core::engine::DialogButton {
+                label: "OK".to_string(),
+                hotkey: 'o',
+                action: "ok".to_string(),
+            }],
+            selected: 0,
+            tag: String::new(),
+            input: None,
+        });
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW605DIALOG"),
+            "modal dialog should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// Toasts are the last thing painted, on top of every other surface.
+    #[test]
+    fn render_content_paints_toast_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .push_toast("ZQXW605TOAST", "body", quadraui::ToastSeverity::Info);
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW605TOAST"),
+            "toast stack should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
     /// `dispatch_panel_accelerator_sizeless`'s `ACC_TERMINAL_TOGGLE_MAX` arm
     /// must derive `terminal_max_rows` from `screen_h` (the terminal's row
     /// count), not `screen_w` — the bug review iteration 1 of vimcode#595
@@ -2630,6 +2933,21 @@ mod tests {
             driver.type_char(c);
         }
 
+        // #605: the picker modal now actually paints (it was an unpainted gap
+        // when this test was written), so the typed text is legitimately on
+        // screen — in the palette's *query* row. Assert on that positively…
+        let open_screen = driver.screen();
+        assert!(
+            open_screen.contains("iZQXW_TYPED"),
+            "keys typed while the command palette is open should feed the \
+             picker query; screen:\n{open_screen}"
+        );
+
+        // …then dismiss the palette and re-check: with the overlay gone, any
+        // keystroke that had leaked through to the editor buffer would now be
+        // visible in the editor area. This is the original assertion, just
+        // moved past the point where the modal can mask it.
+        driver.press_named(quadraui::NamedKey::Escape);
         let screen = driver.screen();
         assert!(
             !screen.contains("ZQXW_TYPED"),
