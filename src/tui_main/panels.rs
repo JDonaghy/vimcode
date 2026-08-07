@@ -165,6 +165,13 @@ pub(super) fn render_explorer_sidebar_content(
 /// `shell_app.rs`'s module doc: the **plugin extension panel**'s help popup +
 /// manual scrollbar, and the **AI panel**, whose signature takes
 /// `buf: &mut Buffer` outright with no backend parameter at all.
+///
+/// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
+/// (`shell_app.rs`), which nothing outside that module's own
+/// `#[cfg(test)]` tests constructs yet — same dormant-scaffold reasoning as
+/// the `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the
+/// Stage 6 (#605) entry-point cutover.
+#[allow(dead_code)]
 pub(super) fn render_sidebar_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -194,6 +201,13 @@ pub(super) fn render_sidebar_content(
 }
 
 // ─── Trait-only stand-ins for raw-`Buffer` chrome (#605) ─────────────────────
+//
+// Perf note: every call below goes through `render_impl::draw_rule_row_q`,
+// which constructs one `StatusBar` + segment `Vec` per row (see that fn's
+// doc comment) rather than writing cells directly — a real per-row
+// allocation increase over the old two-pass `set_cell` loops. Unlikely to
+// matter for a handful of sidebar rows at TUI frame rates; worth a look if a
+// future profiling pass finds TUI paint time regressed.
 
 /// Fill `width` cells at `(x, y)` with `text`, space-padded (or truncated) to
 /// exactly `width` characters, in one [`render_impl::draw_rule_row_q`] call.
@@ -258,10 +272,15 @@ fn fill_rect(backend: &mut dyn quadraui::Backend, area: Rect, fg: Color, bg: Col
 /// Reproduces that rasteriser's two rows exactly — header row, then the
 /// `" / "`-prefixed search input row with its optional block caret — and
 /// sources every colour from `q_theme(theme)`, the same `quadraui::Theme` the
-/// rasteriser itself reads, so the two can't drift on palette changes. Filed
-/// as a quadraui gap in `shell_app.rs`'s module doc: the clean fix is a
+/// rasteriser itself reads, so the two can't drift on palette changes.
+///
+/// Filed as JDonaghy/quadraui#531: the clean fix is a
 /// `Backend::draw_settings_chrome` trait method, at which point this helper
-/// and its call sites collapse to one line.
+/// and its call sites collapse to one line. Until #531 lands, this is a
+/// permanent-looking but intended-temporary local copy — **keep in sync with
+/// `quadraui::tui::form::draw_settings_chrome`** (`quadraui/src/tui/form.rs`):
+/// row layout, the `" / "` prompt construction, and placeholder logic must
+/// match, not just the colours.
 fn draw_settings_chrome_via_backend(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -1685,6 +1704,13 @@ pub(super) fn render_terminal_panel(
 /// background-cleared) rather than drawing an undivided pane that would
 /// misrepresent the split state. Filed as part of this stage's documented
 /// gap list (`shell_app.rs`'s module doc).
+///
+/// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
+/// (`shell_app.rs`), which nothing outside that module's own
+/// `#[cfg(test)]` tests constructs yet — same dormant-scaffold reasoning as
+/// the `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the
+/// Stage 6 (#605) entry-point cutover.
+#[allow(dead_code)]
 pub(super) fn render_terminal_panel_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
