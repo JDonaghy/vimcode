@@ -1463,18 +1463,46 @@ fn event_loop(
                         .dap_sidebar_system
                         .borrow_mut()
                         .handle(&ui_event, &mut backend, rect);
-                if engine.dispatch_dap_sidebar_event(sidebar_event) {
-                    needs_redraw = true;
-                    continue;
-                }
+                // #637: claim unconditionally once the event is inside this
+                // panel's own body rect, even when the inner `SidebarEvent`
+                // comes back `Ignored` (e.g. a click on empty space below
+                // the last row). Only `continue`-ing on a "successful"
+                // dispatch let an `Ignored` result fall through past the
+                // `uievent_to_crossterm` re-synthesis below into the legacy
+                // `handle_mouse` dispatcher, which interprets the *same*
+                // coordinates under a totally different column-range model
+                // and can silently reset focus this intercept just claimed
+                // — see `debug_sidebar_intercept_claims_focus_on_mouse_down`
+                // / `ext_sidebar_intercept_claims_focus_on_mouse_down` in
+                // `shell_app.rs`, which pin the identical mechanism.
+                engine.dispatch_dap_sidebar_event(sidebar_event);
+                needs_redraw = true;
+                continue;
             }
         }
 
         // ── SidebarSystem intercept for mouse/scroll in extensions sidebar ──
         // #459: same priority rule as the debug sidebar above.
+        //
+        // Also requires `sidebar.ext_panel_name.is_none()` (#637): a
+        // plugin-provided extension panel (`render_ext_panel`,
+        // `sidebar.ext_panel_name`) takes over the sidebar body without
+        // touching `app_shell`'s active-panel id, so `active_panel_is(
+        // PANEL_EXTENSIONS)` can still read true from a *previous* visit to
+        // the Extensions marketplace panel while a plugin panel is what's
+        // actually on screen. Without this guard, `ext_sidebar_body_rect` —
+        // last populated when the marketplace panel was painted, and never
+        // cleared once it stops being painted (`panels.rs::render_sidebar`
+        // returns early for `ext_panel_name.is_some()` before touching it)
+        // — goes stale but keeps matching the same on-screen sidebar area,
+        // so clicks/scrolls meant for the plugin panel get silently
+        // swallowed by the marketplace intercept instead. Mirrors the
+        // `ext_panel_showing` guard `mouse.rs`'s raw scroll-wheel handler
+        // already uses for the same reason (`mouse.rs` ~1244).
         if !ctx_blocks_event
             && engine.app_shell.sidebar_visible()
             && engine.active_panel_is(PANEL_EXTENSIONS)
+            && sidebar.ext_panel_name.is_none()
         {
             let rect = engine.ext_sidebar_body_rect.get();
             let is_sidebar_mouse = rect.width > 0.0
@@ -1490,10 +1518,12 @@ fn event_loop(
                     sidebar.has_focus = true;
                     engine.ext_sidebar_has_focus = true;
                 }
-                if engine.handle_ext_sidebar_ui_event(ui_event.clone()) {
-                    needs_redraw = true;
-                    continue;
-                }
+                // #637: see the matching comment on the debug-sidebar
+                // intercept above — claim unconditionally regardless of
+                // dispatch result.
+                engine.handle_ext_sidebar_ui_event(ui_event.clone());
+                needs_redraw = true;
+                continue;
             }
         }
 
