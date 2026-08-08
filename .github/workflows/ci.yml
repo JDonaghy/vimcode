@@ -58,33 +58,6 @@ jobs:
     - name: Build
       run: cargo build --no-default-features
 
-    # These 6 snapshot tests fail intermittently on this CI job's headless
-    # runner but pass reliably in local development (verified across 26+
-    # local runs, including clean `rm -rf target` rebuilds, during #602's
-    # merge-prep; toolchain and quadraui-checkout parity with CI were
-    # confirmed, and a forced cold-cache CI run still failed identically,
-    # ruling out stale build-cache artifacts as the cause). They are NOT
-    # `#[ignore]`d in source, so they still run -- and must pass -- under
-    # every developer's local `cargo test --no-default-features` per the
-    # mandatory pre-commit check; this skip only relaxes the CI gate. See
-    # #625 for the tracking issue and full diagnostic trail.
-    #
-    # `ext_sidebar_intercept_claims_focus_on_mouse_down` was the 7th entry
-    # here (added by #602) but was a real, deterministic defect, not CI
-    # flakiness: the SidebarSystem intercept in `shell_app.rs`/`mod.rs` only
-    # claimed a click when the inner dispatch succeeded, so any click that
-    # landed inside the panel's own body rect without hitting a specific row
-    # (e.g. an empty extensions list on this runner's clean `$HOME`) fell
-    # through to the unrelated legacy `mouse::handle_mouse` dispatcher,
-    # which reset the focus the intercept had just claimed. Fixed by #637 —
-    # the intercept now claims unconditionally once the event is inside its
-    # rect, so this test is back in the standing suite.
     - name: Run tests
       run: |
-        cargo test --no-default-features -- \
-          --skip snapshot_command_line \
-          --skip snapshot_insert_mode \
-          --skip snapshot_line_numbers \
-          --skip snapshot_normal_mode \
-          --skip snapshot_split_panes \
-          --skip snapshot_visual_selection
+        cargo test --no-default-features
