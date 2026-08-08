@@ -2304,6 +2304,19 @@ pub(super) fn handle_mouse(
                     engine.ext_panel_has_focus = false;
                     engine.ext_panel_active = None;
                 } else {
+                    // #637: a plugin panel taking over the sidebar body
+                    // must drop whatever panel's focus flag (and, for
+                    // Extensions, `active_panel_id`-derived state like
+                    // `ext_sidebar_has_focus`) was left set from before —
+                    // `app_shell`'s active-panel id is deliberately left
+                    // untouched here (this isn't a `toggle_sidebar_panel`
+                    // switch), so nothing else clears it. A stale
+                    // `ext_sidebar_has_focus = true` left over from a
+                    // previous visit to the Extensions marketplace panel
+                    // otherwise keeps `active_panel_is(PANEL_EXTENSIONS)`'s
+                    // SidebarSystem intercept looking "focused" even though
+                    // this plugin panel is what's actually on screen.
+                    engine.clear_sidebar_focus();
                     sidebar.ext_panel_name = Some(name.clone());
                     if !engine.app_shell.sidebar_visible() {
                         engine.toggle_sidebar();

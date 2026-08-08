@@ -606,9 +606,21 @@ impl TuiShellApp {
                     .dap_sidebar_system
                     .borrow_mut()
                     .handle(&event, backend, rect);
-                if self.engine.dispatch_dap_sidebar_event(sidebar_event) {
-                    return Reaction::Redraw;
-                }
+                // #637: the event landed inside this panel's own body rect —
+                // it must be claimed here unconditionally, even when the
+                // inner `SidebarEvent` comes back `Ignored` (e.g. a click on
+                // empty space below the last row, or between two headers
+                // when the list is empty). Only returning `Redraw` on a
+                // "successful" dispatch let an `Ignored` result fall through
+                // to `mouse::handle_mouse`'s unrelated legacy dispatcher,
+                // which interprets the *same* coordinates under a totally
+                // different column-range model and can silently reset focus
+                // this intercept just claimed (reproduced by
+                // `debug_sidebar_intercept_claims_focus_on_mouse_down` /
+                // `ext_sidebar_intercept_claims_focus_on_mouse_down`, which
+                // hit exactly this path whenever the panel's list is empty).
+                self.engine.dispatch_dap_sidebar_event(sidebar_event);
+                return Reaction::Redraw;
             }
         }
 
@@ -617,10 +629,28 @@ impl TuiShellApp {
         // `PANEL_EXTENSIONS` arm — that arm explicitly declines rows 2+
         // ("handled by SidebarSystem mouse intercept in main loop",
         // `mouse.rs` ~2557), so skipping this would silently drop those
-        // clicks. ──
+        // clicks.
+        //
+        // Also requires `self.sidebar.ext_panel_name.is_none()` (#637): a
+        // plugin-provided extension panel (`render_ext_panel`,
+        // `sidebar.ext_panel_name`) takes over the sidebar body without
+        // touching `app_shell`'s active-panel id, so `active_panel_is(
+        // PANEL_EXTENSIONS)` can still read true from a *previous* visit to
+        // the Extensions marketplace panel while a plugin panel is what's
+        // actually on screen. Without this guard, `ext_sidebar_body_rect` —
+        // last populated when the marketplace panel was painted, and never
+        // cleared when it stops being painted (`panels.rs::render_sidebar`
+        // returns early for `ext_panel_name.is_some()` before ever touching
+        // it) — goes stale but keeps `rect.contains(position)` matching the
+        // same on-screen sidebar area, so every click/scroll meant for the
+        // plugin panel gets silently swallowed by the marketplace intercept
+        // instead. Mirrors the existing `ext_panel_showing` guard
+        // `mouse.rs`'s raw scroll-wheel handler already uses for the same
+        // reason (`mouse.rs` ~1244). ──
         if !intercepts_blocked
             && self.engine.app_shell.sidebar_visible()
             && self.engine.active_panel_is(PANEL_EXTENSIONS)
+            && self.sidebar.ext_panel_name.is_none()
         {
             let rect = self.engine.ext_sidebar_body_rect.get();
             let is_sidebar_mouse = rect.width > 0.0
@@ -636,9 +666,11 @@ impl TuiShellApp {
                     self.sidebar.has_focus = true;
                     self.engine.ext_sidebar_has_focus = true;
                 }
-                if self.engine.handle_ext_sidebar_ui_event(event.clone()) {
-                    return Reaction::Redraw;
-                }
+                // #637: see the matching comment on the debug-sidebar
+                // intercept above — claim unconditionally once the event is
+                // inside this panel's rect, regardless of dispatch result.
+                self.engine.handle_ext_sidebar_ui_event(event.clone());
+                return Reaction::Redraw;
             }
         }
 
@@ -2833,6 +2865,111 @@ mod tests {
             "a click inside ext_sidebar_body_rect (outside handle_mouse's own \
              sidebar column range) must be claimed by the extensions \
              SidebarSystem intercept, not silently dropped"
+        );
+    }
+
+    /// #637: pins the mechanism behind the "extension panel intermittently
+    /// stops responding" report, independent of any extensions actually
+    /// installed on the machine running the test (unlike the CI-observed
+    /// failure of `ext_sidebar_intercept_claims_focus_on_mouse_down`, which
+    /// depended on a clean `$HOME` — see that test's neighbouring history).
+    ///
+    /// A plugin-provided extension panel (`sidebar.ext_panel_name`, e.g.
+    /// "git-insights" — `render_ext_panel` / `mouse.rs`'s
+    /// `ActivityBarTarget::ExtensionPanel` path) takes over the sidebar
+    /// body without ever touching `app_shell`'s active-panel id
+    /// (`mouse.rs` ~2298-2320). So if the user visited the Extensions
+    /// *marketplace* panel (`PANEL_EXTENSIONS`) earlier this session and
+    /// then opened a plugin panel from the activity bar:
+    ///
+    /// 1. `active_panel_is(PANEL_EXTENSIONS)` still reads `true` while the
+    ///    plugin panel is what's actually on screen, and the marketplace's
+    ///    `ext_sidebar_body_rect` (last populated whenever the marketplace
+    ///    panel was painted, and never cleared since
+    ///    `panels.rs::render_sidebar` returns early for
+    ///    `ext_panel_name.is_some()` before ever touching it) still matches
+    ///    the same on-screen sidebar area. Every click meant for the
+    ///    plugin panel would then get silently claimed by the stale
+    ///    marketplace SidebarSystem intercept instead of reaching the
+    ///    plugin panel's own handling in `mouse::handle_mouse`.
+    /// 2. Opening the plugin panel via its activity-bar icon
+    ///    (`ActivityBarTarget::ExtensionPanel`) never cleared the
+    ///    marketplace's `ext_sidebar_has_focus` flag either, so it stays
+    ///    stuck `true` — a second, independent way for the marketplace
+    ///    panel to keep "winning" focus decisions after it's no longer
+    ///    even painted.
+    ///
+    /// Both are exactly the "stops responding" symptom, and both
+    /// reproduce on any machine regardless of installed extensions.
+    #[test]
+    fn plugin_ext_panel_wins_focus_and_clicks_after_marketplace_visit() {
+        let mut app = TuiShellApp::new(None);
+        // Register a fake plugin-provided extension panel (mirrors what a
+        // real plugin like "git-insights" registers).
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: ' ',
+                fallback_icon: None,
+                sections: Vec::new(),
+            },
+        );
+
+        // Visit the Extensions marketplace panel first, as a user would
+        // before ever opening a plugin panel this session.
+        ensure_panel_active(&mut app.engine, PANEL_EXTENSIONS);
+        app.engine
+            .ext_sidebar_body_rect
+            .set(quadraui::Rect::new(3.0, 2.0, 30.0, 20.0));
+        assert!(app.engine.ext_sidebar_has_focus);
+
+        let mut backend = backend_at(80.0, 24.0);
+
+        // Click the plugin panel's activity-bar icon — row 7, after
+        // menu(0)/explorer(1)/search(2)/debug(3)/git(4)/extensions(5)/ai(6)
+        // (`resolve_activity_bar_click`).
+        app.handle_mouse_event(
+            UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(1.0, 7.0),
+                modifiers: quadraui::Modifiers::default(),
+            },
+            &mut backend,
+        );
+        assert_eq!(app.sidebar.ext_panel_name.as_deref(), Some("git-insights"));
+        assert!(
+            app.engine.ext_panel_has_focus && !app.engine.ext_sidebar_has_focus,
+            "opening a plugin panel from the activity bar must clear focus \
+             flags left over from a previously-visited panel — the \
+             Extensions marketplace panel isn't painted anymore, so its \
+             ext_sidebar_has_focus must not linger true"
+        );
+
+        // A click inside the sidebar body — where the (now invisible)
+        // marketplace panel's stale `ext_sidebar_body_rect` still overlaps
+        // the same on-screen area — must be routed to the visible plugin
+        // panel, not silently reclaimed by the marketplace SidebarSystem
+        // intercept.
+        let reaction = app.handle_mouse_event(
+            UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(10.0, 5.0),
+                modifiers: quadraui::Modifiers::default(),
+            },
+            &mut backend,
+        );
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(
+            app.engine.ext_panel_has_focus && !app.engine.ext_sidebar_has_focus,
+            "a click inside the stale marketplace `ext_sidebar_body_rect` \
+             must be routed to the visible plugin extension panel \
+             (ext_panel_has_focus), not silently claimed by the \
+             marketplace SidebarSystem intercept for a panel that isn't \
+             even painted anymore (ext_sidebar_has_focus)"
         );
     }
 
