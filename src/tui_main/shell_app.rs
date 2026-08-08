@@ -247,6 +247,25 @@
 //! `MenuSystem::render` were already trait calls, as this doc predicted —
 //! the gap was purely the missing reservation toggle.
 //!
+//! A review of the first pass caught a second, more subtle gap in the same
+//! area: `Self::shell_config` always sets `title_bar_height_lh = 1.0`
+//! regardless of `has_title_bar` — deliberately, so a later
+//! `set_title_bar_visible(true)` toggle reserves the same 1 row
+//! `draw_frame`'s live path uses, not `AppShell`'s 1.5-line-height struct
+//! default — but `quadraui::tui::shell_runner::build_shell_adapter` only
+//! called `AppShell::with_title_bar` (which actually sets that height) when
+//! `has_title_bar` was already `true` at construction, silently discarding
+//! `title_bar_height_lh` on the (default) start-hidden path. That's a
+//! `quadraui` gap, not a vimcode one — no local stand-in was written per the
+//! Platform-Neutrality Rule; it was fixed upstream as
+//! [JDonaghy/quadraui#547](https://github.com/JDonaghy/quadraui/issues/547)
+//! ("honour `ShellConfig::title_bar_height_lh` regardless of
+//! `has_title_bar`"), landed as `f702422`, and this repo's quadraui path-dep
+//! checkout must carry it or later. Covered end-to-end (hidden at
+//! construction → revealed at runtime → exactly one row reserved) by
+//! `shell_config_hidden_then_revealed_reserves_exactly_one_title_bar_row`
+//! below — confirmed to fail against pre-#547 quadraui and pass at #547+.
+//!
 //! **B. Split terminal panes — done.**
 //! [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533)
 //! landed `Backend::draw_terminal_divider`. Both `render_terminal_panel`
@@ -545,13 +564,19 @@ impl TuiShellApp {
 
     /// The live `ShellConfig` for `TuiShellApp` (#635, Stage 6b item E).
     ///
-    /// `render::build_activity_bar` (`render.rs:8147`) is the source of
-    /// truth for which icons the live `draw_frame` path's activity bar
-    /// shows — this mirrors its `fixed` array (explorer, search, debug,
-    /// source control, extensions, AI) by id, icon and tooltip exactly, so
-    /// `AppShell`'s own activity bar (painted by the shell runner ahead of
-    /// `render_content`, once #634 wires this config in) can't drift from
-    /// it. Also registers the menu hamburger (top, matching its position in
+    /// The middle six panels (explorer, search, debug, source control,
+    /// extensions, AI) are built by zipping
+    /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the shared order constant
+    /// `render::build_activity_bar`'s (`render.rs:8147`) own `fixed` array is
+    /// debug-asserted against — with this function's local icon/title/tooltip
+    /// metadata array, so the *order* can't drift from `build_activity_bar`
+    /// without both a compile error here (index/length mismatch) and a
+    /// debug-assertion failure there. (Icon/title/tooltip strings are still a
+    /// second hand-maintained copy — `PanelDefinition` and `ActivityItem` are
+    /// different shapes with no shared metadata table to draw from — so a
+    /// wording-only change to `build_activity_bar`'s tooltips still needs a
+    /// matching edit here; only the *ordering* is now structurally shared.)
+    /// Also registers the menu hamburger (top, matching its position in
     /// `build_activity_bar`'s `top` list) and settings (bottom, matching
     /// `build_activity_bar`'s `bottom` list) — the two items outside the
     /// `fixed` array. Per-session extension panels (`engine.ext_panels`)
@@ -594,39 +619,38 @@ impl TuiShellApp {
             }
         }
 
-        let mut cfg = quadraui::ShellConfig::new(
-            "VimCode",
-            vec![
-                panel(HAMBURGER_PANEL_ID, icons::HAMBURGER.s(), "Menu", "Menu"),
-                panel(
-                    PANEL_EXPLORER,
-                    icons::EXPLORER.s(),
-                    "Explorer",
-                    "Explorer (Ctrl+Shift+E)",
-                ),
-                panel(
-                    PANEL_SEARCH,
-                    icons::SEARCH.s(),
-                    "Search",
-                    "Search (Ctrl+Shift+F)",
-                ),
-                panel(PANEL_DEBUG, icons::DEBUG.s(), "Debug", "Debug"),
-                panel(
-                    PANEL_GIT,
-                    icons::GIT_BRANCH.s(),
-                    "Source Control",
-                    "Source Control",
-                ),
-                panel(
-                    PANEL_EXTENSIONS,
-                    icons::EXTENSIONS.s(),
-                    "Extensions",
-                    "Extensions",
-                ),
-                panel(PANEL_AI, icons::AI_CHAT.s(), "AI Assistant", "AI Assistant"),
-            ],
-        )
-        .with_bottom_items(vec![panel(
+        // Icon/title/tooltip metadata for the fixed middle panels, in the
+        // same order as `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the shared
+        // constant `render::build_activity_bar`'s own `fixed` array is
+        // debug-asserted against, so both call sites are pinned to the same
+        // order (index-zipped below, not hand-matched by id). The array
+        // length is sized *from* `FIXED_ACTIVITY_PANEL_IDS::len()` itself
+        // (not a hand-copied literal `6`), so adding/removing a panel there
+        // is a compile error here until this array is resized to match —
+        // `zip` alone would otherwise silently truncate to the shorter side.
+        let mid_meta: [(&str, &str, &str);
+            crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS.len()] = [
+            (icons::EXPLORER.s(), "Explorer", "Explorer (Ctrl+Shift+E)"),
+            (icons::SEARCH.s(), "Search", "Search (Ctrl+Shift+F)"),
+            (icons::DEBUG.s(), "Debug", "Debug"),
+            (icons::GIT_BRANCH.s(), "Source Control", "Source Control"),
+            (icons::EXTENSIONS.s(), "Extensions", "Extensions"),
+            (icons::AI_CHAT.s(), "AI Assistant", "AI Assistant"),
+        ];
+        let mut panels = vec![panel(
+            HAMBURGER_PANEL_ID,
+            icons::HAMBURGER.s(),
+            "Menu",
+            "Menu",
+        )];
+        panels.extend(
+            crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS
+                .into_iter()
+                .zip(mid_meta)
+                .map(|(id, (icon, title, tooltip))| panel(id, icon, title, tooltip)),
+        );
+
+        let mut cfg = quadraui::ShellConfig::new("VimCode", panels).with_bottom_items(vec![panel(
             PANEL_SETTINGS,
             icons::SETTINGS.s(),
             "Settings",
@@ -1862,10 +1886,12 @@ impl ShellApp for TuiShellApp {
     /// to paint — see that field's use sites) never observes this event at
     /// all, so no sidebar content ever switches to "Menu": the only
     /// consequence of leaving `AppShell`'s own active-panel index pointed
-    /// at the hamburger is a one-frame-cosmetic "Menu" label in its
-    /// generic sidebar-header row, in the same tolerance band as the
-    /// `active_accent`/`selection_bg` gap `shell_config`'s doc comment
-    /// notes.
+    /// at the hamburger is a cosmetic "Menu" label in its generic
+    /// sidebar-header row. Nothing resets that index on later frames, so —
+    /// unlike a one-frame flash — it persists across every subsequent
+    /// repaint until the user clicks a real panel, in the same tolerance
+    /// band as the `active_accent`/`selection_bg` gap `shell_config`'s doc
+    /// comment notes.
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
         if let quadraui::AppShellEvent::PanelChanged { panel_id } = event {
             if panel_id.as_str() == HAMBURGER_PANEL_ID {
@@ -2162,7 +2188,7 @@ fn dispatch_panel_accelerator_sizeless(
 ///    type-to-filter, Up/Down/j/k, Enter, Esc, `-`, Backspace — so they
 ///    never fall through to `Engine::handle_key` and get misinterpreted as
 ///    Normal/Insert-mode editor input.
-/// 3. **Context menu** (`mod.rs:2608`-`:2635`) — checked ahead of
+/// 3. **Context menu** (`mod.rs:2703`-`:2706`) — checked ahead of
 ///    `Engine::handle_key`, even though `Engine::handle_key` has its own
 ///    context-menu branch (`keys.rs:66`-`:71`), because the engine's copy
 ///    only consumes the key and discards the resulting action. This
@@ -2449,7 +2475,7 @@ fn handle_key_pressed(
         }
     }
 
-    // ── Context menu keyboard intercept (mirrors mod.rs:2608-:2635) ─────
+    // ── Context menu keyboard intercept (mirrors mod.rs:2703-:2706) ─────
     if engine.context_menu.is_some() {
         let effective_key = if key_name.is_empty() {
             unicode.map(|c| c.to_string()).unwrap_or_default()
@@ -2626,26 +2652,20 @@ mod tests {
     /// plus the hamburger (top) and settings (bottom) — the two items
     /// outside that array — in the same order, so the eventual live
     /// `AppShell` activity bar (#634) can't drift from what `draw_frame`
-    /// paints today. Static assertion over ids only (icons/tooltips aren't
-    /// load-bearing for dispatch), derived from the same `PANEL_*`
-    /// constants `build_activity_bar` itself switches on rather than
-    /// hand-transcribed string literals.
+    /// paints today. The middle six ids are asserted against
+    /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` directly — the same array
+    /// `shell_config` zips its metadata against and `build_activity_bar`
+    /// debug-asserts its own `fixed` order against — rather than a
+    /// hand-transcribed literal, so a reordering of the shared constant
+    /// changes what this test expects automatically instead of needing a
+    /// matching hand-edit here.
     #[test]
     fn shell_config_registers_every_build_activity_bar_panel() {
         let cfg = TuiShellApp::shell_config(false);
         let ids: Vec<&str> = cfg.panels.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![
-                HAMBURGER_PANEL_ID,
-                PANEL_EXPLORER,
-                PANEL_SEARCH,
-                PANEL_DEBUG,
-                PANEL_GIT,
-                PANEL_EXTENSIONS,
-                PANEL_AI,
-            ]
-        );
+        let mut expected = vec![HAMBURGER_PANEL_ID];
+        expected.extend(crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS);
+        assert_eq!(ids, expected);
         assert_eq!(cfg.bottom_items.len(), 1);
         assert_eq!(cfg.bottom_items[0].id.as_str(), PANEL_SETTINGS);
     }
@@ -3061,9 +3081,10 @@ mod tests {
     /// The *settings* sidebar panel must now paint through `render_content`
     /// too — it was one of #607's documented gaps, blocked on
     /// `quadraui::tui::draw_settings_chrome` being a free `&mut Buffer`
-    /// rasteriser. #605 stands in for it with
-    /// `panels::draw_settings_chrome_via_backend`, so the `" SETTINGS"`
-    /// header row (a literal, hence deterministic) should reach the screen.
+    /// rasteriser. #635 (Stage 6b item B) switches this to the real
+    /// `Backend::draw_settings_chrome` trait method (`quadraui#531`), so the
+    /// `" SETTINGS"` header row (a literal, hence deterministic) should
+    /// reach the screen.
     #[test]
     fn render_content_paints_settings_panel_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -3114,6 +3135,97 @@ mod tests {
         assert!(
             !screen.contains("File"),
             "menu bar should not paint when menu_bar_visible is false; screen:\n{screen}"
+        );
+    }
+
+    /// #635 (Stage 6b item A) / quadraui#547 regression: the previous two
+    /// tests each construct in a single, fixed `menu_bar_visible` state —
+    /// neither exercises the hidden→shown *transition* at runtime, which is
+    /// exactly the shape the review that reopened this item flagged as
+    /// uncovered. `TuiShellApp::new` + `shell_config(false)` is the default
+    /// start state (`engine.menu_bar_visible` is `false` outside VSCode
+    /// mode), so `AppShell` is constructed with `has_title_bar: false`. Prior
+    /// to [JDonaghy/quadraui#547](https://github.com/JDonaghy/quadraui/issues/547),
+    /// `build_shell_adapter` only called `AppShell::with_title_bar` (which
+    /// sets the height) when `has_title_bar` was already `true`, so
+    /// `shell_config`'s `title_bar_height_lh = 1.0` was silently discarded in
+    /// favour of `AppShell`'s own struct default of 1.5 line-heights
+    /// (`compose/app_shell.rs`) — `ctx.shell_mut().set_title_bar_visible(true)`
+    /// (run from `handle()`'s first block on every dispatch once
+    /// `engine.menu_bar_visible` flips) would then reserve 2 rows, not the 1
+    /// row `render_impl.rs`'s live `draw_frame` path always uses. #547 fixed
+    /// `build_shell_adapter` to honour `title_bar_height_lh` unconditionally,
+    /// so this must now reserve exactly 1 row.
+    ///
+    /// Drives the reveal through the real #318 Alt+letter shim
+    /// (`alt_letter_reveals_menu_bar_via_shell_app` above) rather than poking
+    /// `engine.menu_bar_visible` directly — `driver_with_shell`'s
+    /// `ShellAdapter` wrapper is `pub(crate)`-fielded with no accessor back
+    /// to the concrete `TuiShellApp` (see this `mod tests`'s own doc
+    /// comment), so `handle()`'s dispatch is the only way in. Two dispatches
+    /// are required: Alt+F flips `engine.menu_bar_visible` partway through
+    /// its own `handle()` call, *after* that call's top-of-function
+    /// `set_title_bar_visible` sync already ran with the old (hidden) value
+    /// — so `AppShell`'s reservation only picks up the change on the
+    /// *following* dispatch. That one-frame lag is a separate, already-
+    /// accepted quirk (see `on_shell_event`'s doc comment for its sibling);
+    /// isolating it is why this test measures the marker's row delta
+    /// *between* the two post-dispatch frames, not from before any dispatch:
+    /// `build_screen_for_shell_content`'s own vimcode-local `menu_height`
+    /// row (independent of `AppShell`, see this test's sibling's doc
+    /// comment) already lands on the first dispatch, so diffing against
+    /// "before" would conflate the two reservations. Calls `driver.render()`
+    /// explicitly after the second dispatch rather than relying on its
+    /// `Reaction` — the sync already happened unconditionally at the top of
+    /// that `handle()` call regardless of what the rest of it (Escape may
+    /// land on an open menu dropdown) does with the event.
+    #[test]
+    fn shell_config_hidden_then_revealed_reserves_exactly_one_title_bar_row() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "ZQXW547MARKER");
+        assert!(!app.engine.menu_bar_visible);
+
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+
+        // 'f' is `MENU_STRUCTURE`'s alt-letter for "File" — same shim
+        // `alt_letter_reveals_menu_bar_via_shell_app` above exercises. This
+        // first dispatch flips `engine.menu_bar_visible` but — per this
+        // test's own doc comment — does NOT yet sync `AppShell`'s
+        // reservation; only `build_screen_for_shell_content`'s own
+        // vimcode-local row lands this frame.
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let frame1 = driver.screen();
+        let frame1_row = frame1
+            .lines()
+            .position(|l| l.contains("ZQXW547MARKER"))
+            .expect("marker should paint after the Alt-reveal keypress");
+
+        // Any second dispatch runs `handle()`'s top-of-function sync again,
+        // this time with `engine.menu_bar_visible` already `true`, so it
+        // actually pushes the reveal through to `AppShell`.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        let frame2 = driver.screen();
+        let frame2_row = frame2
+            .lines()
+            .position(|l| l.contains("ZQXW547MARKER"))
+            .expect("marker should still paint after the second dispatch");
+
+        assert_eq!(
+            frame2_row,
+            frame1_row + 1,
+            "AppShell's title-bar reservation, once synced, must be exactly \
+             ONE row — if this is `frame1_row + 2`, `title_bar_height_lh` \
+             was discarded and `AppShell`'s 1.5-line-height struct default \
+             (rounds to 2 rows) was used instead (quadraui#547 regression); \
+             frame1:\n{frame1}\nframe2:\n{frame2}"
         );
     }
 
@@ -4044,7 +4156,7 @@ mod tests {
 
     /// `handle_key_pressed`'s context-menu branch must dispatch the
     /// confirmed item's action to [`handle_explorer_context_action`]
-    /// (mirrors `mod.rs:2608`-`:2635`) — unlike `Engine::handle_key`'s own
+    /// (mirrors `mod.rs:2703`-`:2706`) — unlike `Engine::handle_key`'s own
     /// context-menu branch (`keys.rs:66`-`:71`), which consumes the key but
     /// silently discards the resulting action. Confirms the first item
     /// ("New File...", action `"new_file"`) of a folder context menu and

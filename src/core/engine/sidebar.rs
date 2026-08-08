@@ -17,6 +17,21 @@ pub const PANEL_EXTENSIONS: &str = "panel:extensions";
 pub const PANEL_AI: &str = "panel:ai";
 pub const PANEL_SETTINGS: &str = "bottom:settings";
 
+/// The single source of truth for the fixed (non-hamburger, non-settings,
+/// non-dynamic-extension) activity-bar panel order. `render::build_activity_bar`'s
+/// `fixed` array and `tui_main::shell_app::TuiShellApp::shell_config`'s
+/// `PanelDefinition` list both iterate this rather than hand-transcribing the
+/// order twice — a reordering here is now a one-line change both call sites
+/// pick up, instead of a silent drift only a snapshot test would catch.
+pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 6] = [
+    PANEL_EXPLORER,
+    PANEL_SEARCH,
+    PANEL_DEBUG,
+    PANEL_GIT,
+    PANEL_EXTENSIONS,
+    PANEL_AI,
+];
+
 impl Engine {
     /// Toggle a sidebar panel. If `panel_id` matches the active panel and the
     /// sidebar is already visible, hide it. Otherwise switch to the panel and
