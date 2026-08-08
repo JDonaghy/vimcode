@@ -1,0 +1,79 @@
+# quadraui pin — the single source of truth for "which quadraui is vimcode built against?"
+#
+# Why this file exists (#638)
+# ---------------------------
+# vimcode depends on quadraui through *relative sibling path dependencies*:
+#
+#     quadraui = { path = "../quadraui/quadraui", ... }
+#     vt100    = { path = "../quadraui/vendor/vt100-0.16.2-patched" }
+#
+# Cargo does not pin path deps — `Cargo.lock` has no entry for them — so every
+# build (local, agent, CI) silently compiles against whatever happens to be
+# checked out in the neighbouring directory. That means an upstream quadraui
+# merge can restate vimcode's behaviour with **zero vimcode commits**, and
+# nothing in vimcode's history records that anything moved.
+#
+# That is not hypothetical. quadraui#472 hardcoded `char_cell_width == 2` for
+# U+F0000..=U+F9999; the moment it landed on quadraui `develop` it staled six
+# `tui_main::render_impl::tests::snapshot_*` tests on every machine at once.
+# The failure was misdiagnosed for weeks as CI flakiness (#625, #615, #602),
+# earned a seven-entry `--skip` list in CI, and that skip list then hid a real
+# input-routing defect (#637) for its entire life.
+#
+# How the pin is enforced
+# -----------------------
+# `build.rs` resolves the sibling quadraui checkout, reads its `HEAD`, and
+# compares it to the rev below. A mismatch is a **hard build failure** naming
+# quadraui as the variable, not a silent behaviour change. The resolved rev is
+# also baked into the binary and printed by `vimcode --version` / `vcd
+# --version`, so "which quadraui?" is the first question the output answers
+# rather than the last one anyone thinks to ask.
+#
+# `.github/workflows/ci.yml` checks out this exact rev too, so CI and local
+# machines cannot silently disagree.
+#
+# Co-development escape hatch
+# ---------------------------
+# quadraui and vimcode are frequently co-developed and a hard pin must not make
+# that impossible. Two escapes, in order of preference:
+#
+#   1. Uncommitted edits in the quadraui checkout are always allowed. As long
+#      as quadraui's `HEAD` is the pinned rev, a dirty working tree only emits
+#      a warning — edit the sibling and rebuild, exactly as before.
+#
+#   2. To build against a *different* quadraui commit (a feature branch, a
+#      bisect, a local `develop`), set:
+#
+#          VIMCODE_QUADRAUI_UNPINNED=1 cargo build
+#
+#      The build then only warns, naming both revs. Never set this in CI, and
+#      never leave it exported in a shell you also run `cargo test` in — a
+#      stale-quadraui snapshot diff looks identical to a real regression.
+#
+# Bumping the pin
+# ---------------
+# Bumping is a deliberate, reviewable commit — that IS the point of this file:
+#
+#     cd ../quadraui && git checkout develop && git pull && git rev-parse HEAD
+#     # paste the sha below, then:
+#     cargo test          # snapshots re-run against the new quadraui
+#     git commit quadraui-pin.txt -m "chore: bump quadraui pin to <sha short>"
+#
+# If `cargo test` goes red on that commit, the redness is *attributable*: the
+# diff is one line and the cause is named in it.
+#
+# See also: docs/QUADRAUI_GUIDE.md, #638, #625, quadraui#472, quadraui#529.
+#
+# `coord-tui` has the identical exposure on the same path dep and should carry
+# a mirror of this file; see docs/QUADRAUI_GUIDE.md.
+#
+# ---------------------------------------------------------------------------
+# Format: the first non-comment, non-blank line is a full 40-char quadraui SHA.
+# ---------------------------------------------------------------------------
+#
+# f702422 — "fix(quadraui): honour ShellConfig::title_bar_height_lh regardless
+# of has_title_bar (#547)". First rev carrying every trait/API addition the
+# open vimcode work depends on: quadraui#531 draw_settings_chrome, #532
+# AppShell::set_title_bar_visible, #533 draw_terminal_divider, #537 WinBackend
+# parity, #545 char_cell_width, #547 title_bar_height_lh.
+f702422e0d6f5b4c34dbfc449494bce2d222cf1d

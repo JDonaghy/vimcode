@@ -4,13 +4,24 @@ Load this file when the work touches quadraui — migrations, new primitives, cr
 
 ## Working with the quadraui dep
 
-vimcode's `quadraui` dep is a **path dep** to `../quadraui/quadraui` — a sibling checkout of [JDonaghy/quadraui](https://github.com/JDonaghy/quadraui). Local builds always use whatever branch the sibling is currently on; no publish step.
+vimcode's `quadraui` dep is a **path dep** to `../quadraui/quadraui` — a sibling checkout of [JDonaghy/quadraui](https://github.com/JDonaghy/quadraui). There is no publish step.
 
-- **Update to latest:** `cd ~/src/quadraui && git checkout develop && git pull`. Then `cargo build` in vimcode picks it up.
-- **Test a quadraui PR:** `cd ~/src/quadraui && git fetch origin && git checkout <pr-branch>`. Switch back to `develop` when done.
+**The dep is pinned out-of-band (#638).** Cargo does not pin path deps — `Cargo.lock` has no entry for them — so a build compiles against whatever the sibling directory happens to contain. `quadraui-pin.txt` records the intended commit and `build.rs` enforces it; `.github/workflows/ci.yml` checks out the same rev, so CI and dev machines cannot silently disagree. Read `quadraui-pin.txt` first; it is the authoritative doc for this workflow.
+
+- **Build against the pin (default):** `git -C ~/src/quadraui fetch origin && git -C ~/src/quadraui checkout <sha from quadraui-pin.txt>`.
+- **Bump the pin:** put the new sha in `quadraui-pin.txt`, run `cargo test`, commit *that file alone* with a message naming the quadraui change. Bumping is meant to be a small, reviewable, attributable diff — that is the entire point of the mechanism.
+- **Co-develop / test a quadraui PR:** uncommitted edits at the pinned rev need nothing (they only warn). To build against a *different* quadraui commit, use `VIMCODE_QUADRAUI_UNPINNED=1 cargo build`. Never export it in a shell you also run `cargo test` in — an off-pin snapshot diff is indistinguishable from a real regression, which is precisely how #625 cost weeks.
+- **Which quadraui is this binary?** `vcd --version` / `vimcode --version` print the resolved rev; `cargo test` prints it too and fails `quadraui_pin::tests::test_run_is_against_the_pinned_quadraui` if the run is off-pin.
 - **Branching model:** same as vimcode (`develop` = integration, `main` = release-only).
-- **If a quadraui change breaks vimcode's build,** fix vimcode side on a normal vimcode branch. The path dep doesn't enforce a version contract.
-- **Vimcode CI is currently disabled** (`.github/workflows/*.yml.disabled`) because it can't resolve a sibling-clone path dep in a fresh `actions/checkout`.
+- **If a quadraui change breaks vimcode's build,** fix vimcode on a normal vimcode branch *in the same commit range as the pin bump*, so the breakage and its cause land together.
+
+### Why: quadraui#472 / #625
+
+quadraui#472 hardcoded `char_cell_width == 2` for U+F0000..=U+F9999. vimcode inherited it through the unpinned path dep with **no vimcode commit**, staling six `tui_main::render_impl::tests::snapshot_*` tests on every machine at once. It was misdiagnosed as CI flakiness for weeks (#625, #615, #602), earned a seven-entry `--skip` list in CI, and that skip list then hid a real input-routing defect (#637) for its whole life. The pin turns that class of event into a one-line diff.
+
+### `coord-tui` has the identical exposure
+
+`coord-tui` depends on the same sibling path and its CI also clones `develop`, so one breaking quadraui merge reddens open PRs in both repos at once (quadraui#476; upstream framing in quadraui#529). The mechanism here is deliberately repo-local and dependency-free — a text file, a `build.rs` check, and a CI checkout step — so it can be mirrored into `coord-tui` verbatim. Keep the two consistent, and keep both consistent with whatever quadraui#529 settles on.
 
 ## Migration prerequisites (vimcode → quadraui adoption)
 
