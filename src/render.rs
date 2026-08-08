@@ -8214,6 +8214,20 @@ pub fn build_activity_bar(
         ),
     ];
 
+    // #635 (Stage 6b): `tui_main::shell_app::TuiShellApp::shell_config` derives
+    // its own middle-panel `PanelDefinition` order from
+    // `sidebar::FIXED_ACTIVITY_PANEL_IDS` rather than re-reading this array (it
+    // can't — `fixed` is a local, and the two arrays carry different metadata
+    // shapes), so this assertion is what actually keeps them from drifting
+    // apart: a reordering here without updating the shared constant now trips
+    // in any test that exercises `build_activity_bar` (every one does).
+    debug_assert_eq!(
+        fixed.map(|(_, panel_id, _, _, _)| panel_id),
+        crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS,
+        "build_activity_bar's `fixed` panel-id order must match \
+         sidebar::FIXED_ACTIVITY_PANEL_IDS"
+    );
+
     for (toolbar_idx, panel_id, icon, tooltip, activity_id) in fixed {
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(activity_id),

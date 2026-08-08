@@ -1929,12 +1929,14 @@ pub(super) fn draw_rule_row_themed(
 
 /// [`draw_rule_row_themed`] over already-converted `quadraui::Color`s.
 ///
-/// Panels that reproduce a quadraui rasteriser's own chrome (#605's
-/// `panels::draw_settings_chrome_via_backend`, the trait-only stand-in for
-/// `quadraui::tui::draw_settings_chrome`) source their colours straight from
-/// `q_theme(theme)` so they can't drift from the rasteriser they're standing
-/// in for — round-tripping those back through vimcode's `Color` would be
-/// lossy busywork.
+/// Panels that reproduce a quadraui rasteriser's own chrome (formerly #605's
+/// `panels::draw_settings_chrome_via_backend`, a trait-only stand-in for
+/// `quadraui::tui::draw_settings_chrome` that #635, Stage 6b, retired in
+/// favour of the real `Backend::draw_settings_chrome` trait method once
+/// `quadraui#531` landed) source their colours straight from `q_theme(theme)`
+/// so they can't drift from the rasteriser they're standing in for —
+/// round-tripping those back through vimcode's `Color` would be lossy
+/// busywork.
 pub(super) fn draw_rule_row_q(
     backend: &mut dyn quadraui::Backend,
     x: u16,
