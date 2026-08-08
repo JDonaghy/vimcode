@@ -237,9 +237,15 @@
 //! see that method's own doc comment). [`TuiShellApp::shell_config`] seeds
 //! the title-bar reservation from `engine.menu_bar_visible` at construction
 //! (so the very first frame, painted before any `handle()` dispatch, is
-//! already correct), and `handle()`'s first block keeps it synced via
-//! `ShellContext::shell_mut().set_title_bar_visible(...)` on every
-//! subsequent dispatch. `render_content` paints the menu bar + command
+//! already correct), and `handle()` keeps it synced via
+//! `ShellContext::shell_mut().set_title_bar_visible(...)` on the way *out*
+//! of every subsequent dispatch — after the dispatch, so a reveal performed
+//! by the dispatch itself (Alt+F, `:set menu`) lands on the frame the runner
+//! paints for that same event rather than a frame later. That reservation is
+//! the *only* menu-bar row: `build_screen_for_shell_content` deliberately
+//! carries no `menu_height` term of its own, since `main_content_bounds`
+//! already has AppShell's title-bar row carved off it (see that function's
+//! doc comment). `render_content` paints the menu bar + command
 //! centre into `layout.title_bar_bounds` when reserved, and the menu
 //! dropdown last (after the dialog, before the toast stack — mirrors
 //! `draw_frame`'s own "rendered last so it draws on top of everything"
@@ -262,9 +268,20 @@
 //! ("honour `ShellConfig::title_bar_height_lh` regardless of
 //! `has_title_bar`"), landed as `f702422`, and this repo's quadraui path-dep
 //! checkout must carry it or later. Covered end-to-end (hidden at
-//! construction → revealed at runtime → exactly one row reserved) by
+//! construction → revealed at runtime → exactly one row of *total* menu-bar
+//! footprint, measured against the pre-reveal baseline) by
 //! `shell_config_hidden_then_revealed_reserves_exactly_one_title_bar_row`
 //! below — confirmed to fail against pre-#547 quadraui and pass at #547+.
+//!
+//! A review of the *second* pass caught the vimcode half of the same
+//! accounting: `build_screen_for_shell_content` still subtracted its own
+//! `menu_height` row from `main_content_bounds`, which `AppShell` had
+//! already carved the title-bar row out of — 2 rows consumed for a 1-row
+//! bar, one of them blank, with the editor content pushed one row too far
+//! down. That local term (and the matching one in `render_content`'s
+//! tab-hover-tooltip offset) is gone; the test above now measures the total
+//! footprint from the pre-reveal baseline instead of a delta between two
+//! already-shifted frames, which is what let the double count hide.
 //!
 //! **B. Split terminal panes — done.**
 //! [JDonaghy/quadraui#533](https://github.com/JDonaghy/quadraui/issues/533)
@@ -598,13 +615,18 @@ impl TuiShellApp {
     /// `ShellApp::handle` dispatch gets a chance to call
     /// `ShellContext::shell_mut().set_title_bar_visible`, already reserves
     /// (or doesn't reserve) the row correctly. Every dispatch after that
-    /// keeps it in sync — see `handle()`'s first block below. Always sets
+    /// keeps it in sync — see the block at the *end* of `handle()` below.
+    /// Always sets
     /// `title_bar_height_lh` to exactly 1 row (`draw_frame`'s own
     /// `menu_bar_height` constraint — `render_impl.rs`'s `top_chunks`) —
     /// not `AppShell::with_title_bar`'s 1.5-line-height default — so a
     /// later `set_title_bar_visible(true)` toggle (which preserves
     /// whatever height was last configured, never recomputing it) can't
-    /// silently reserve the wrong row count. `ShellConfig::has_title_bar`/
+    /// silently reserve the wrong row count. This reservation is the *only*
+    /// row the menu bar consumes on the `render_content` path —
+    /// `build_screen_for_shell_content` has no `menu_height` term of its own
+    /// (see its doc comment), so 1 row here means 1 row on screen.
+    /// `ShellConfig::has_title_bar`/
     /// `title_bar_height_lh` are the plain DTO fields `build_shell_adapter`
     /// (`quadraui::tui::shell_runner`) reads to decide whether to call
     /// `AppShell::with_title_bar` at construction — setting them directly
@@ -1320,12 +1342,16 @@ impl ShellApp for TuiShellApp {
         // is `layout.main_content_bounds`, already offset below whatever
         // `AppShell::render` painted above it — see that function's doc
         // comment for why the row math differs between the two callers.
+        // That offset already includes `AppShell`'s title-bar row whenever
+        // the menu bar is visible (`compute_layout`'s `band_y += h`), so —
+        // unlike `draw_frame`'s `menu_rows + 1` — there is no menu term to
+        // add here; adding one would double-count the row (#635 item A, and
+        // see `build_screen_for_shell_content`'s doc comment).
         if let Some(ref tooltip_text) = screen.tab_tooltip {
-            let menu_height: u16 = if self.engine.menu_bar_visible { 1 } else { 0 };
             render_tab_hover_tooltip(
                 backend,
                 area.x,
-                area.y + menu_height + 1,
+                area.y + 1,
                 area.width,
                 tooltip_text,
                 &theme,
@@ -1737,141 +1763,165 @@ impl ShellApp for TuiShellApp {
         backend: &mut dyn quadraui::Backend,
         ctx: &ShellContext<'_>,
     ) -> Reaction {
-        // ── #635 (Stage 6b item A): keep `AppShell`'s title-bar row
-        // reservation in sync with `engine.menu_bar_visible` ────────────────
-        // `layout.title_bar_bounds` (read by `render_content` below) is
-        // computed by the shell runner from the *real*, `ShellAdapter`-owned
-        // `AppShell` — not from anything on `self` — so toggling
-        // `engine.menu_bar_visible` (the Alt+menu-letter shim below,
-        // `dispatch_panel_accelerator_sizeless`, `:set menu`, ...) has no
-        // effect on the painted layout unless it's also pushed through
-        // `ShellContext::shell_mut()`. Doing this unconditionally at the top
-        // of every dispatch — rather than only in the specific arms that
-        // change the flag — is what `AppShell::set_title_bar_visible`'s own
-        // doc comment recommends (quadraui#532): "toggling this and calling
-        // [layout/render] next is sufficient". `Self::shell_config` seeds the
-        // *first* frame (painted before any `handle` call) from the same
-        // flag at construction time, so this and that stay in lockstep from
-        // frame zero.
-        ctx.shell_mut()
-            .set_title_bar_visible(self.engine.menu_bar_visible);
-
-        // ── Panel-key accelerators (mirrors `mod.rs:1259`-`:1273`) ──────────
-        // Mouse-affecting accelerators (none today) would need gap (2)
-        // first; the current set (`dispatch_panel_accelerator`) only
-        // touches `engine`/`sidebar`, so it's fully portable as-is except
-        // for its `terminal: &Terminal<...>` parameter, which every arm
-        // uses only for `.size()` — satisfied here by `backend.viewport()`,
-        // threading both `width` and `height` through (the
-        // `ACC_TERMINAL_TOGGLE_MAX` arm needs both — see
-        // `dispatch_panel_accelerator_sizeless`'s doc comment).
-        if let UiEvent::Accelerator(ref acc_id, acc_mods) = event {
-            if self.engine.dialog.is_none() {
-                let viewport = backend.viewport();
-                let mut needs_redraw = false;
-                if dispatch_panel_accelerator_sizeless(
-                    acc_id.as_str(),
-                    acc_mods,
-                    &mut self.engine,
-                    &mut self.sidebar,
-                    viewport.width as u16,
-                    viewport.height as u16,
-                    self.sidebar_width,
-                    &mut needs_redraw,
-                ) {
-                    return if needs_redraw {
-                        Reaction::Redraw
-                    } else {
-                        Reaction::Continue
-                    };
+        // The dispatch below has several early exits; a labelled block (not
+        // bare `return`s) is what keeps the title-bar sync that follows
+        // reachable on *every* one of them, including any arm added later.
+        let reaction = 'dispatch: {
+            // ── Panel-key accelerators (mirrors `mod.rs:1259`-`:1273`) ──────────
+            // Mouse-affecting accelerators (none today) would need gap (2)
+            // first; the current set (`dispatch_panel_accelerator`) only
+            // touches `engine`/`sidebar`, so it's fully portable as-is except
+            // for its `terminal: &Terminal<...>` parameter, which every arm
+            // uses only for `.size()` — satisfied here by `backend.viewport()`,
+            // threading both `width` and `height` through (the
+            // `ACC_TERMINAL_TOGGLE_MAX` arm needs both — see
+            // `dispatch_panel_accelerator_sizeless`'s doc comment).
+            if let UiEvent::Accelerator(ref acc_id, acc_mods) = event {
+                if self.engine.dialog.is_none() {
+                    let viewport = backend.viewport();
+                    let mut needs_redraw = false;
+                    if dispatch_panel_accelerator_sizeless(
+                        acc_id.as_str(),
+                        acc_mods,
+                        &mut self.engine,
+                        &mut self.sidebar,
+                        viewport.width as u16,
+                        viewport.height as u16,
+                        self.sidebar_width,
+                        &mut needs_redraw,
+                    ) {
+                        break 'dispatch if needs_redraw {
+                            Reaction::Redraw
+                        } else {
+                            Reaction::Continue
+                        };
+                    }
                 }
             }
-        }
 
-        // ── #318: Alt+menu-letter "reveal menu bar" shim (mirrors
-        // `mod.rs:1319`-`:1338`) ─────────────────────────────────────────
-        // When the menu bar is hidden, Alt+<letter> must still activate the
-        // corresponding menu — otherwise the bare letter falls through to
-        // `Engine::handle_key` (which ignores Alt) and triggers a Vim
-        // motion (e.g. Alt+T → t-motion). Setting `menu_bar_visible` here
-        // makes the *same* keystroke both reveal and activate the menu via
-        // the `MenuSystem` intercept immediately below. Queries the live
-        // menu system rather than hardcoding letters so the truth stays in
-        // `MENU_STRUCTURE` (render.rs) → `MenuDef`.
-        if !self.engine.menu_bar_visible {
-            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
-                if modifiers.alt {
-                    if let quadraui::Key::Char(c) = key {
-                        let bar = self.engine.menu_system.borrow().menu_bar();
-                        if bar.find_alt_target(*c).is_some() {
-                            self.engine.menu_bar_visible = true;
+            // ── #318: Alt+menu-letter "reveal menu bar" shim (mirrors
+            // `mod.rs:1319`-`:1338`) ─────────────────────────────────────────
+            // When the menu bar is hidden, Alt+<letter> must still activate the
+            // corresponding menu — otherwise the bare letter falls through to
+            // `Engine::handle_key` (which ignores Alt) and triggers a Vim
+            // motion (e.g. Alt+T → t-motion). Setting `menu_bar_visible` here
+            // makes the *same* keystroke both reveal and activate the menu via
+            // the `MenuSystem` intercept immediately below. Queries the live
+            // menu system rather than hardcoding letters so the truth stays in
+            // `MENU_STRUCTURE` (render.rs) → `MenuDef`.
+            if !self.engine.menu_bar_visible {
+                if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                    if modifiers.alt {
+                        if let quadraui::Key::Char(c) = key {
+                            let bar = self.engine.menu_system.borrow().menu_bar();
+                            if bar.find_alt_target(*c).is_some() {
+                                self.engine.menu_bar_visible = true;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        // ── MenuSystem intercept (mirrors `mod.rs:1296`-`:1304`) ────────────
-        if self.engine.menu_bar_visible {
-            let viewport = backend.viewport();
-            let bar_rect = quadraui::Rect::new(0.0, 0.0, viewport.width, 1.0);
-            let menu_system = self.engine.menu_system.clone();
-            let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
-            match menu_event {
-                quadraui::MenuEvent::Activated(id) => {
-                    let action = id.as_str().to_string();
-                    if action == "open_file_dialog" {
-                        self.engine
-                            .open_picker(crate::core::engine::PickerSource::Files);
-                    } else {
-                        let _ = self.engine.dispatch_menu_action(&action);
-                    }
-                    return Reaction::Redraw;
-                }
-                quadraui::MenuEvent::StateChanged | quadraui::MenuEvent::Consumed => {
-                    return Reaction::Redraw;
-                }
-                quadraui::MenuEvent::Ignored => {}
-            }
-        }
-
-        match event {
-            // #603 (Stage 4): dialog / folder-picker / context-menu /
-            // general `Engine::handle_key` fallback — see
-            // `handle_key_pressed`'s doc comment for the precedence chain
-            // and its unported-tiers gap note.
-            UiEvent::KeyPressed {
-                key,
-                modifiers,
-                repeat,
-            } => {
+            // ── MenuSystem intercept (mirrors `mod.rs:1296`-`:1304`) ────────────
+            if self.engine.menu_bar_visible {
                 let viewport = backend.viewport();
-                handle_key_pressed(
+                let bar_rect = quadraui::Rect::new(0.0, 0.0, viewport.width, 1.0);
+                let menu_system = self.engine.menu_system.clone();
+                let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
+                match menu_event {
+                    quadraui::MenuEvent::Activated(id) => {
+                        let action = id.as_str().to_string();
+                        if action == "open_file_dialog" {
+                            self.engine
+                                .open_picker(crate::core::engine::PickerSource::Files);
+                        } else {
+                            let _ = self.engine.dispatch_menu_action(&action);
+                        }
+                        break 'dispatch Reaction::Redraw;
+                    }
+                    quadraui::MenuEvent::StateChanged | quadraui::MenuEvent::Consumed => {
+                        break 'dispatch Reaction::Redraw;
+                    }
+                    quadraui::MenuEvent::Ignored => {}
+                }
+            }
+
+            match event {
+                // #603 (Stage 4): dialog / folder-picker / context-menu /
+                // general `Engine::handle_key` fallback — see
+                // `handle_key_pressed`'s doc comment for the precedence chain
+                // and its unported-tiers gap note.
+                UiEvent::KeyPressed {
                     key,
                     modifiers,
                     repeat,
-                    &mut self.engine,
-                    &mut self.sidebar,
-                    self.sidebar_width,
-                    &mut self.folder_picker,
-                    self.keyboard_enhanced,
-                    viewport.width as u16,
-                    viewport.height as u16,
-                    backend,
-                    &self.cmd_sel,
-                )
+                } => {
+                    let viewport = backend.viewport();
+                    handle_key_pressed(
+                        key,
+                        modifiers,
+                        repeat,
+                        &mut self.engine,
+                        &mut self.sidebar,
+                        self.sidebar_width,
+                        &mut self.folder_picker,
+                        self.keyboard_enhanced,
+                        viewport.width as u16,
+                        viewport.height as u16,
+                        backend,
+                        &self.cmd_sel,
+                    )
+                }
+                // #602 (gap 2): dispatch through the legacy `mouse::handle_mouse`
+                // now that `Backend::drag_and_modal_mut` (quadraui#467) makes its
+                // `&mut DragState`/`&mut ModalStack` params reachable through
+                // `&mut dyn Backend`. See `Self::handle_mouse_event`.
+                UiEvent::MouseDown { .. }
+                | UiEvent::MouseUp { .. }
+                | UiEvent::MouseMoved { .. }
+                | UiEvent::Scroll { .. }
+                | UiEvent::DoubleClick { .. } => self.handle_mouse_event(event, backend),
+                _ => Reaction::Continue,
             }
-            // #602 (gap 2): dispatch through the legacy `mouse::handle_mouse`
-            // now that `Backend::drag_and_modal_mut` (quadraui#467) makes its
-            // `&mut DragState`/`&mut ModalStack` params reachable through
-            // `&mut dyn Backend`. See `Self::handle_mouse_event`.
-            UiEvent::MouseDown { .. }
-            | UiEvent::MouseUp { .. }
-            | UiEvent::MouseMoved { .. }
-            | UiEvent::Scroll { .. }
-            | UiEvent::DoubleClick { .. } => self.handle_mouse_event(event, backend),
-            _ => Reaction::Continue,
-        }
+        };
+
+        // ── #635 (Stage 6b item A): keep `AppShell`'s title-bar row
+        // reservation in sync with `engine.menu_bar_visible` ────────────────
+        // `layout.title_bar_bounds` (read by `render_content` above) is
+        // computed by the shell runner from the *real*, `ShellAdapter`-owned
+        // `AppShell` — not from anything on `self` — so toggling
+        // `engine.menu_bar_visible` (the Alt+menu-letter shim above,
+        // `dispatch_panel_accelerator_sizeless`, `:set menu`, ...) has no
+        // effect on the painted layout unless it's also pushed through
+        // `ShellContext::shell_mut()`. Doing this unconditionally — rather
+        // than only in the specific arms that change the flag — is what
+        // `AppShell::set_title_bar_visible`'s own doc comment recommends
+        // (quadraui#532): "toggling this and calling [layout/render] next is
+        // sufficient". `Self::shell_config` seeds the *first* frame (painted
+        // before any `handle` call) from the same flag at construction time,
+        // so this and that stay in lockstep from frame zero.
+        //
+        // Runs *after* the dispatch, not before it (where #635's first cut
+        // put it): the runner renders as soon as `handle` returns, so syncing
+        // on the way out lets a reveal performed *by this very event* —
+        // Alt+F, `:set menu` — reserve and paint its row on the resulting
+        // frame instead of lagging behind until some later, unrelated
+        // keypress happens to run the sync. Since the reservation is now the
+        // *only* menu-bar row (`build_screen_for_shell_content` deliberately
+        // has no `menu_height` term of its own — see its doc comment), a
+        // pre-dispatch sync would have meant Alt+F painting no menu bar at
+        // all until the next keystroke.
+        //
+        // The one path that still lags a frame is `on_shell_event`'s
+        // hamburger reveal: `ShellAdapter::handle` consumes
+        // `AppShellEvent::PanelChanged` itself and returns without ever
+        // calling this method, and `on_shell_event` receives no
+        // `ShellContext` to sync through. The next dispatch's sync (this one)
+        // picks it up.
+        ctx.shell_mut()
+            .set_title_bar_visible(self.engine.menu_bar_visible);
+
+        reaction
     }
 
     /// #635 (Stage 6b item E): the menu hamburger is registered as a
@@ -2575,7 +2625,7 @@ mod tests {
     use quadraui::Backend as _;
 
     fn config() -> quadraui::ShellConfig {
-        quadraui::ShellConfig::new(
+        let mut cfg = quadraui::ShellConfig::new(
             "VimCode",
             vec![quadraui::PanelDefinition {
                 id: quadraui::WidgetId::new("panel:explorer"),
@@ -2583,7 +2633,13 @@ mod tests {
                 icon: String::new(),
                 tooltip: String::new(),
             }],
-        )
+        );
+        // Match `TuiShellApp::shell_config`'s 1-row title bar rather than
+        // `ShellConfig`'s own 1.5-line-height default, so tests that reveal
+        // the menu bar at runtime through this minimal config measure the
+        // same reservation the live config produces (quadraui#547).
+        cfg.title_bar_height_lh = 1.0;
+        cfg
     }
 
     fn backend_at(width: f32, height: f32) -> super::super::backend::TuiBackend {
@@ -3157,28 +3213,27 @@ mod tests {
     /// `build_shell_adapter` to honour `title_bar_height_lh` unconditionally,
     /// so this must now reserve exactly 1 row.
     ///
+    /// Measures the *total* menu-bar footprint — the marker's row before any
+    /// dispatch (menu hidden, nothing reserved anywhere) against its row once
+    /// the bar is revealed and painted — rather than a delta between two
+    /// already-shifted frames. That is the assertion that actually pins the
+    /// thing down: `build_screen_for_shell_content` used to subtract a
+    /// second, vimcode-local `menu_height` row on top of the one
+    /// `AppShell::compute_layout` had already carved out of
+    /// `main_content_bounds`, so the total was 2 rows for a 1-row bar even
+    /// with #547 in place — and a relative "frame N+1 is one below frame N"
+    /// check passed either way. It no longer does (see that function's doc
+    /// comment); this test fails at `+2` against either defect.
+    ///
     /// Drives the reveal through the real #318 Alt+letter shim
-    /// (`alt_letter_reveals_menu_bar_via_shell_app` above) rather than poking
+    /// (`alt_letter_reveals_menu_bar_via_shell_app` below) rather than poking
     /// `engine.menu_bar_visible` directly — `driver_with_shell`'s
     /// `ShellAdapter` wrapper is `pub(crate)`-fielded with no accessor back
     /// to the concrete `TuiShellApp` (see this `mod tests`'s own doc
-    /// comment), so `handle()`'s dispatch is the only way in. Two dispatches
-    /// are required: Alt+F flips `engine.menu_bar_visible` partway through
-    /// its own `handle()` call, *after* that call's top-of-function
-    /// `set_title_bar_visible` sync already ran with the old (hidden) value
-    /// — so `AppShell`'s reservation only picks up the change on the
-    /// *following* dispatch. That one-frame lag is a separate, already-
-    /// accepted quirk (see `on_shell_event`'s doc comment for its sibling);
-    /// isolating it is why this test measures the marker's row delta
-    /// *between* the two post-dispatch frames, not from before any dispatch:
-    /// `build_screen_for_shell_content`'s own vimcode-local `menu_height`
-    /// row (independent of `AppShell`, see this test's sibling's doc
-    /// comment) already lands on the first dispatch, so diffing against
-    /// "before" would conflate the two reservations. Calls `driver.render()`
-    /// explicitly after the second dispatch rather than relying on its
-    /// `Reaction` — the sync already happened unconditionally at the top of
-    /// that `handle()` call regardless of what the rest of it (Escape may
-    /// land on an open menu dropdown) does with the event.
+    /// comment), so `handle()`'s dispatch is the only way in. One dispatch is
+    /// enough: `handle()` syncs `set_title_bar_visible` on its way *out*, so
+    /// the reveal this very keypress performs is already reflected in the
+    /// frame the runner paints for it.
     #[test]
     fn shell_config_hidden_then_revealed_reserves_exactly_one_title_bar_row() {
         let mut app = TuiShellApp::new(None);
@@ -3187,12 +3242,18 @@ mod tests {
 
         let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
 
+        let before = driver.screen();
+        let before_row = before
+            .lines()
+            .position(|l| l.contains("ZQXW547MARKER"))
+            .expect("marker should paint before the Alt-reveal keypress");
+        assert!(
+            !before.contains("File"),
+            "no menu bar should be painted while it is hidden; screen:\n{before}"
+        );
+
         // 'f' is `MENU_STRUCTURE`'s alt-letter for "File" — same shim
-        // `alt_letter_reveals_menu_bar_via_shell_app` above exercises. This
-        // first dispatch flips `engine.menu_bar_visible` but — per this
-        // test's own doc comment — does NOT yet sync `AppShell`'s
-        // reservation; only `build_screen_for_shell_content`'s own
-        // vimcode-local row lands this frame.
+        // `alt_letter_reveals_menu_bar_via_shell_app` below exercises.
         driver.dispatch(quadraui::UiEvent::KeyPressed {
             key: quadraui::Key::Char('f'),
             modifiers: quadraui::Modifiers {
@@ -3201,31 +3262,27 @@ mod tests {
             },
             repeat: false,
         });
-        let frame1 = driver.screen();
-        let frame1_row = frame1
+        let after = driver.screen();
+        let after_row = after
             .lines()
             .position(|l| l.contains("ZQXW547MARKER"))
-            .expect("marker should paint after the Alt-reveal keypress");
+            .expect("marker should still paint after the Alt-reveal keypress");
 
-        // Any second dispatch runs `handle()`'s top-of-function sync again,
-        // this time with `engine.menu_bar_visible` already `true`, so it
-        // actually pushes the reveal through to `AppShell`.
-        driver.press_named(quadraui::NamedKey::Escape);
-        driver.render();
-        let frame2 = driver.screen();
-        let frame2_row = frame2
-            .lines()
-            .position(|l| l.contains("ZQXW547MARKER"))
-            .expect("marker should still paint after the second dispatch");
-
+        assert!(
+            after.contains("File"),
+            "the revealed menu bar must actually paint into the row it \
+             reserved, on the same frame the reveal happened; screen:\n{after}"
+        );
         assert_eq!(
-            frame2_row,
-            frame1_row + 1,
-            "AppShell's title-bar reservation, once synced, must be exactly \
-             ONE row — if this is `frame1_row + 2`, `title_bar_height_lh` \
-             was discarded and `AppShell`'s 1.5-line-height struct default \
-             (rounds to 2 rows) was used instead (quadraui#547 regression); \
-             frame1:\n{frame1}\nframe2:\n{frame2}"
+            after_row,
+            before_row + 1,
+            "the menu bar's TOTAL footprint must be exactly ONE row. `+2` \
+             means either `title_bar_height_lh` was discarded and \
+             `AppShell`'s 1.5-line-height struct default (rounds to 2 rows) \
+             was used (quadraui#547 regression), or \
+             `build_screen_for_shell_content` grew back a vimcode-local \
+             `menu_height` term on top of AppShell's own reservation \
+             (#635 item A); before:\n{before}\nafter:\n{after}"
         );
     }
 
@@ -4000,12 +4057,16 @@ mod tests {
     /// #603 acceptance / #318: Alt+<menu-letter> must reveal the (hidden by
     /// default) menu bar and hand the very same keystroke to the
     /// `MenuSystem` intercept, which activates the matching top-level menu.
-    /// `handle()` never paints the menu bar itself (out of `render_content`'s
-    /// scope this stage — see the module doc), so the only screen-visible
-    /// effect of `engine.menu_bar_visible` flipping is that
-    /// `build_screen_for_shell_content` reserves one extra row above the
-    /// editor content (`menu_height`) — shifting the marker text down by
-    /// exactly one line is this test's proof the #318 shim actually ran.
+    /// The screen-visible effect of `engine.menu_bar_visible` flipping is
+    /// that `handle()`'s on-the-way-out
+    /// `ShellContext::shell_mut().set_title_bar_visible(true)` sync makes
+    /// `AppShell` reserve its (one-row — see
+    /// `shell_config_hidden_then_revealed_reserves_exactly_one_title_bar_row`
+    /// above) title bar, pushing `main_content_bounds` down — shifting the
+    /// marker text down by exactly one line is this test's proof the #318
+    /// shim actually ran. Uses the minimal `config()` rather than
+    /// `shell_config(false)`; both configure a 1-row title bar, so the shift
+    /// is the same either way.
     #[test]
     fn alt_letter_reveals_menu_bar_via_shell_app() {
         let mut app = TuiShellApp::new(None);

@@ -113,11 +113,23 @@ pub(super) fn build_screen_for_tui(
 /// formula and can't silently drift. `area` is treated directly as the
 /// editor column.
 ///
-/// The menu-bar row is still reserved (so window rects land where the live
-/// path would put them) but not painted — `render_content` doesn't paint a
-/// menu bar this stage (out of scope; TUI's menu bar defaults hidden except
-/// in vscode-mode or via Alt-reveal, tracked with the rest of key dispatch
-/// in #603).
+/// Deliberately does *not* reserve a menu-bar row, unlike
+/// [`build_screen_for_tui`]'s otherwise-identical `content_rows` formula
+/// (#635, Stage 6b item A): `AppShell::compute_layout` (quadraui,
+/// `compose/app_shell.rs`) already carves its title-bar row off the top of
+/// the window (`band_y += h; band_h -= h;`) *before* deriving
+/// `main_content_bounds`, and `TuiShellApp::handle` keeps that reservation
+/// synced to `engine.menu_bar_visible` through
+/// `ShellContext::shell_mut().set_title_bar_visible`. So by the time `area`
+/// (== `layout.main_content_bounds`) reaches here the row is already gone —
+/// subtracting a second, vimcode-local `menu_height` on top of it would
+/// consume 2 rows for a 1-row menu bar and push the editor content down one
+/// row further than the live `draw_frame` path puts it. The row is painted
+/// (menu bar + command centre) by `TuiShellApp::render_content` from
+/// `layout.title_bar_bounds`, not from anything computed here. This also
+/// keeps `content_rows` consistent with
+/// [`bottom_chrome_rects_for_shell_content`]'s `Constraint::Min(0)` editor
+/// chunk over the same `area`, which likewise has no menu term.
 ///
 /// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
 /// (`shell_app.rs`), which nothing outside that module's own
@@ -138,7 +150,8 @@ pub(super) fn build_screen_for_shell_content(
     } else {
         0
     };
-    let menu_height: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+    // No `menu_height` term here — `area` already excludes AppShell's own
+    // title-bar row. See this function's doc comment.
     let dbg_height: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
     let wildmenu_height: u16 = if !engine.wildmenu_items.is_empty() {
         1
@@ -154,13 +167,12 @@ pub(super) fn build_screen_for_shell_content(
         1 + global_status_rows
             + qf_height
             + term_height
-            + menu_height
             + dbg_height
             + wildmenu_height
             + separated_status_rows,
     );
     let editor_origin_x = area.x as f64;
-    let editor_origin_y = area.y as f64 + menu_height as f64;
+    let editor_origin_y = area.y as f64;
     let content_bounds = WindowRect::new(
         editor_origin_x,
         editor_origin_y,
