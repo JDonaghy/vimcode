@@ -23,7 +23,13 @@ fn main() {
 
     // --version / -V: print version and exit
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("VimCode {}", env!("CARGO_PKG_VERSION"));
+        // Name the quadraui this binary is made of (#638): it is a path dep, so
+        // nothing else in the build records which one was used.
+        println!(
+            "VimCode {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            vimcode_core::quadraui_pin::version_line()
+        );
         return;
     }
 

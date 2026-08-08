@@ -43,20 +43,25 @@ line-level confirmation — not the first move.
 6. Run `gh issue list --state open` to see active work and priorities
 7. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
 
-### Stale quadraui checkout — first thing to suspect on a build break
+### Wrong quadraui checkout — the build now tells you (#638)
 
-Vimcode depends on `quadraui` via a **path dependency** to the sibling `~/src/quadraui` checkout (see `Cargo.toml` line ~48), not a crates.io version. There is **no version pinning** — whatever is checked out at `~/src/quadraui` is what gets compiled.
+Vimcode depends on `quadraui` via a **path dependency** to the sibling `~/src/quadraui` checkout (see `Cargo.toml` line ~48), not a crates.io version. Cargo does not pin path deps, so historically whatever was checked out at `~/src/quadraui` is what got compiled — silently.
 
-If `cargo build` on a fresh `develop` (or any branch) fails with errors like "no variant named X found for enum Y", "no method named Z found", or "expected N args, found M" on a `quadraui::*` type, **the most likely cause is that your local quadraui checkout lags behind the API vimcode was written against** — not a vimcode bug.
-
-Before debugging further:
+That is no longer true. **`quadraui-pin.txt` records the exact quadraui commit vimcode is built against, and `build.rs` fails the build if the sibling checkout is on a different one.** So a wrong checkout is now a loud, named error rather than a mystery. Read `quadraui-pin.txt` — it documents the whole workflow. The short version:
 
 ```bash
-cd ~/src/quadraui && git pull && cd -
-cargo build
+# Build against the pin (the normal case):
+git -C ~/src/quadraui fetch origin && git -C ~/src/quadraui checkout "$(grep -v '^[[:space:]]*#' quadraui-pin.txt | grep -v '^[[:space:]]*$' | head -1)"
+
+# Co-developing quadraui on a branch? Opt out for that build only:
+VIMCODE_QUADRAUI_UNPINNED=1 cargo build
 ```
 
-Only investigate the vimcode side if the error persists after pulling quadraui. Do not "fix" vimcode to match a stale quadraui — you'll just undo work that already shipped on the quadraui side.
+**Do not `git pull` in `~/src/quadraui` to fix a build error.** That was the old advice and it is now backwards: pulling moves the checkout *off* the pin and the build will say so. If vimcode genuinely needs a newer quadraui API, **bump the pin** — put the new sha in `quadraui-pin.txt` and run `cargo test`. That one-line commit is the record that quadraui moved, which is exactly what was missing when quadraui#472 silently staled six snapshot tests (#625).
+
+`vimcode --version` / `vcd --version` print the resolved quadraui rev, so "which quadraui?" is answerable from any binary.
+
+Do not "fix" vimcode to match a stale quadraui — you'll just undo work that already shipped on the quadraui side.
 
 ## Conditional Reference Files
 
