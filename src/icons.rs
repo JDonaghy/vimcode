@@ -3,22 +3,39 @@
 //!
 //! Each `Icon` carries a Nerd Font glyph and a standard Unicode/ASCII fallback.
 //! Call `Icon::s()` for `&str` or `Icon::c()` for `char` — these automatically
-//! select the right variant based on the global `use_nerd_fonts` flag.
+//! select the right variant based on the `use_nerd_fonts` flag.
 //!
 //! Set the flag at startup via `set_nerd_fonts(bool)`.
+//!
+//! ## Why thread-local, not process-global (#618)
+//!
+//! The flag is read on every `Icon::s()`/`Icon::c()` call to choose between
+//! the nerd glyph and the ASCII fallback, so it directly determines rendered
+//! output (and width, since the two variants differ in width). Both the GTK
+//! and TUI backends set it once from `engine.settings.use_nerd_fonts` and
+//! then render synchronously on that same thread — there is no cross-thread
+//! rendering in this codebase. Storing it thread-local rather than
+//! process-global means a test that flips the flag (directly or via
+//! `Engine`/`ShellApp` startup) can only ever affect other tests scheduled
+//! on that *same* worker thread, never tests running concurrently on other
+//! threads in the shared `cargo test` process. That closes off the exact
+//! failure shape #615 turned out not to be: a render depending on ambient
+//! process-wide state, passing locally and failing non-deterministically in
+//! CI depending on core count and scheduling.
+use std::cell::Cell;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+thread_local! {
+    static USE_NERD_FONTS: Cell<bool> = const { Cell::new(true) };
+}
 
-static USE_NERD_FONTS: AtomicBool = AtomicBool::new(true);
-
-/// Enable or disable Nerd Font glyphs globally.  When disabled, `Icon::s()`
-/// and `Icon::c()` return the fallback character instead.
+/// Enable or disable Nerd Font glyphs on the current thread. When disabled,
+/// `Icon::s()` and `Icon::c()` return the fallback character instead.
 pub fn set_nerd_fonts(val: bool) {
-    USE_NERD_FONTS.store(val, Ordering::Relaxed);
+    USE_NERD_FONTS.with(|f| f.set(val));
 }
 
 pub fn nerd_fonts_enabled() -> bool {
-    USE_NERD_FONTS.load(Ordering::Relaxed)
+    USE_NERD_FONTS.with(|f| f.get())
 }
 
 /// A UI icon with a Nerd Font glyph and a standard-Unicode fallback.
@@ -33,9 +50,9 @@ impl Icon {
     }
 
     /// Return the icon as a string, selecting nerd or fallback based on the
-    /// global flag.
+    /// current thread's flag (see module docs).
     pub fn s(&self) -> &'static str {
-        if USE_NERD_FONTS.load(Ordering::Relaxed) {
+        if nerd_fonts_enabled() {
             self.nerd
         } else {
             self.fallback
@@ -213,4 +230,78 @@ pub fn detect_nerd_font_windows() -> bool {
 #[cfg(not(target_os = "windows"))]
 pub fn detect_nerd_font_windows() -> bool {
     true // On non-Windows, assume available (GTK bundles, Linux has fontconfig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: Icon = Icon::new("nerd", "fallback");
+
+    /// New threads default to nerd fonts on, matching the old process-global
+    /// default — the thread-local swap (#618) must not change this default.
+    #[test]
+    fn defaults_to_nerd_fonts_enabled_on_a_fresh_thread() {
+        let (enabled, s) = std::thread::spawn(|| (nerd_fonts_enabled(), SAMPLE.s()))
+            .join()
+            .unwrap();
+        assert!(enabled);
+        assert_eq!(s, "nerd");
+    }
+
+    /// The core #618 guarantee: flipping the flag on one thread must not
+    /// leak to a concurrently-running thread. With the old `AtomicBool`
+    /// this test would be flaky-by-construction (a race whose outcome
+    /// depends on scheduling); with thread-local storage each thread's
+    /// view is independent by construction, so it's deterministic.
+    #[test]
+    fn set_nerd_fonts_does_not_leak_across_threads() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let b1 = barrier.clone();
+        let disabling = std::thread::spawn(move || {
+            set_nerd_fonts(false);
+            b1.wait(); // let the other thread observe state while this thread has it disabled
+            b1.wait(); // hold until the other thread has taken its reading
+            nerd_fonts_enabled()
+        });
+
+        let b2 = barrier.clone();
+        let observing = std::thread::spawn(move || {
+            b2.wait(); // wait for the other thread to disable on its own thread
+            let seen = nerd_fonts_enabled(); // must still be this thread's own default: true
+            let icon = SAMPLE.s();
+            b2.wait();
+            (seen, icon)
+        });
+
+        assert!(
+            !disabling.join().unwrap(),
+            "flag should stay disabled on its own thread"
+        );
+        let (seen, icon) = observing.join().unwrap();
+        assert!(
+            seen,
+            "a thread that never called set_nerd_fonts must still see the default"
+        );
+        assert_eq!(icon, "nerd");
+    }
+
+    /// Sanity check that `set_nerd_fonts(true)` after a `false` still works
+    /// on the same thread (round-trip), independent of thread-local storage
+    /// mechanics.
+    #[test]
+    fn set_nerd_fonts_round_trips_on_the_same_thread() {
+        std::thread::spawn(|| {
+            set_nerd_fonts(false);
+            assert!(!nerd_fonts_enabled());
+            assert_eq!(SAMPLE.s(), "fallback");
+
+            set_nerd_fonts(true);
+            assert!(nerd_fonts_enabled());
+            assert_eq!(SAMPLE.s(), "nerd");
+        })
+        .join()
+        .unwrap();
+    }
 }

@@ -47,7 +47,8 @@ pub struct PanelRegistration {
 }
 
 impl PanelRegistration {
-    /// Return the icon to display, respecting the global `use_nerd_fonts` flag.
+    /// Return the icon to display, respecting the current thread's
+    /// `use_nerd_fonts` flag (see `icons` module docs).
     pub fn resolved_icon(&self) -> char {
         if crate::icons::nerd_fonts_enabled() {
             self.icon

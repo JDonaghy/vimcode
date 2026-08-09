@@ -8142,8 +8142,9 @@ fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tre
 ///   any. GTK passes `engine.ext_panel_active.as_deref()`; TUI passes
 ///   `sidebar.ext_panel_name.as_deref()`.
 ///
-/// Icons use `icons::*.s()` which respects the `USE_NERD_FONTS` global flag
-/// set at startup — both GTK and TUI set it from `settings.use_nerd_fonts`.
+/// Icons use `icons::*.s()` which respects the thread-local `USE_NERD_FONTS`
+/// flag (see `icons` module docs) set at startup — both GTK and TUI set it
+/// from `settings.use_nerd_fonts` on their own (single) render thread.
 pub fn build_activity_bar(
     engine: &Engine,
     theme: &Theme,
