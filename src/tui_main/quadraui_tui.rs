@@ -18,12 +18,17 @@
 //! change like the others were.
 
 use super::*;
+// Only the `#[cfg(test)]` legacy paint path below needs raw ratatui types.
+#[cfg(test)]
 use ratatui::buffer::Buffer;
+#[cfg(test)]
 use ratatui::layout::Rect;
+#[cfg(test)]
 use ratatui::style::Color as RatatuiColor;
 
 /// Convert a `quadraui::Color` to the ratatui palette colour used by
 /// `set_cell`.
+#[cfg(test)]
 fn qc(c: quadraui::Color) -> RatatuiColor {
     RatatuiColor::Rgb(c.r, c.g, c.b)
 }
@@ -44,6 +49,7 @@ pub(super) fn q_theme(theme: &Theme) -> quadraui::Theme {
 /// Keyboard-selected items get a full-row selection-bg fill; active
 /// items get a left-edge accent bar (unless keyboard-selected, where
 /// the selection bg takes precedence).
+#[cfg(test)]
 pub(super) fn draw_activity_bar(
     buf: &mut Buffer,
     area: Rect,

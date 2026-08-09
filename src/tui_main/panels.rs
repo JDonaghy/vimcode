@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) fn render_activity_bar(
     buf: &mut ratatui::buffer::Buffer,
     area: Rect,
@@ -17,6 +18,7 @@ pub(super) fn render_activity_bar(
 
 // ─── Sidebar rendering ────────────────────────────────────────────────────────
 
+#[cfg(test)]
 pub(super) fn render_sidebar(
     backend: &mut super::backend::TuiBackend,
     area: Rect,
@@ -1515,6 +1517,7 @@ pub(super) fn render_terminal_toolbar(
 }
 
 /// Render the terminal panel content via quadraui's `draw_terminal`.
+#[cfg(test)]
 pub(super) fn render_terminal_panel(
     frame: &mut ratatui::Frame,
     backend: &mut quadraui::tui::TuiBackend,
