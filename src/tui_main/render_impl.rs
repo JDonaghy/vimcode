@@ -2,6 +2,7 @@ use super::*;
 
 // ─── Screen layout bridging ───────────────────────────────────────────────────
 
+#[cfg(test)]
 pub(super) fn build_screen_for_tui(
     engine: &Engine,
     theme: &Theme,
@@ -294,6 +295,7 @@ pub(super) fn bottom_chrome_rects_for_shell_content(
 // ─── Frame rendering ──────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn draw_frame(
     frame: &mut ratatui::Frame,
     screen: &render::ScreenLayout,

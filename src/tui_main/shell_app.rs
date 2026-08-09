@@ -394,6 +394,13 @@ pub(super) struct TuiShellApp {
     hover_selecting: bool,
     fr_input_dragging: bool,
     last_layout: RefCell<Option<render::ScreenLayout>>,
+    /// Per-group tab-bar visible counts measured by the most recent
+    /// `render_content`. `event_loop` collected these into a `draw_frame`
+    /// out-param and fed them straight to `Engine::post_draw_apply_widths`
+    /// (`mod.rs:1171`, `:1216`); `render_content` is `&self`, so they land
+    /// here and `tick()` applies them on the next pass — see `tick`'s own
+    /// comment for why a one-frame lag replaces the legacy two-pass repaint.
+    tab_visible_counts: RefCell<Vec<(GroupId, usize)>>,
     debug_toolbar_rect: Cell<quadraui::Rect>,
     last_click_time: Cell<Instant>,
     last_click_pos: Cell<(u16, u16)>,
@@ -521,6 +528,7 @@ impl TuiShellApp {
             hover_selecting: false,
             fr_input_dragging: false,
             last_layout: RefCell::new(None),
+            tab_visible_counts: RefCell::new(Vec::new()),
             debug_toolbar_rect: Cell::new(quadraui::Rect::default()),
             last_click_time: Cell::new(now.checked_sub(Duration::from_secs(1)).unwrap_or(now)),
             last_click_pos: Cell::new((0, 0)),
@@ -681,6 +689,16 @@ impl TuiShellApp {
 
         cfg.has_title_bar = menu_bar_visible;
         cfg.title_bar_height_lh = 1.0;
+        // #634: `AppShell` owns the width that carves `main_content_bounds`,
+        // so its defaults have to be vimcode's, not quadraui's generic
+        // 20/8/50 — otherwise the very first frame paints a 20-column
+        // sidebar while every vimcode-side consumer of `self.sidebar_width`
+        // (mouse hit-tests, `tick`'s viewport approximation) assumes 30, and
+        // Alt+Right would silently stop at 50. The bounds match the clamps
+        // `handle_key_pressed`'s Alt+Left/Right arms apply (15..=150).
+        cfg.default_sidebar_width = SIDEBAR_WIDTH as f32;
+        cfg.min_sidebar_width = 15.0;
+        cfg.max_sidebar_width = 150.0;
         cfg
     }
 
@@ -1148,6 +1166,12 @@ impl ShellApp for TuiShellApp {
         // #609, cursor placement #604) and why.
         let theme = self.theme();
 
+        // ── Per-frame nerd-font sync (mirrors mod.rs:1131) ───────────────
+        // `setup()` pushes the flag once; the legacy loop re-pushed it every
+        // frame so a runtime `:set nerdfonts` / `:set nonerdfonts` reaches
+        // the rasterisers on the very next paint instead of never.
+        render::sync_nerd_fonts(backend, &self.engine);
+
         // ── Menu bar + command centre (#635, Stage 6b item A) ────────────
         // Mirrors `draw_frame`'s own `menu_bar_area` block
         // (`render_impl.rs`, the `screen.menu_bar_visible` block right
@@ -1281,14 +1305,21 @@ impl ShellApp for TuiShellApp {
             tui_tbh,
             (area.x as f64, area.y as f64, area.width as f64),
         );
-        for target in &tab_bar_targets {
-            let g_tab = Rect {
-                x: target.rect.x as u16,
-                y: target.rect.y as u16,
-                width: target.rect.width as u16,
-                height: 1,
-            };
-            render_tab_bar(backend, g_tab, target.bar, &theme);
+        {
+            // Reset per-frame: `post_draw_apply_widths` wants this frame's
+            // measurements, not an ever-growing accumulation.
+            let mut counts = self.tab_visible_counts.borrow_mut();
+            counts.clear();
+            for target in &tab_bar_targets {
+                let g_tab = Rect {
+                    x: target.rect.x as u16,
+                    y: target.rect.y as u16,
+                    width: target.rect.width as u16,
+                    height: 1,
+                };
+                let vis = render_tab_bar(backend, g_tab, target.bar, &theme);
+                counts.push((target.group_id, vis));
+            }
         }
         for t in render::breadcrumb_draw_targets(&screen, self.engine.terminal_maximized, 1.0) {
             let bc_rect = Rect {
@@ -1755,6 +1786,26 @@ impl ShellApp for TuiShellApp {
         } else {
             self.engine.toast_layout.replace(None);
         }
+
+        // ── Cache the painted layout for mouse hit-testing (#634) ────────
+        // `event_loop` stashed `build_screen_for_tui`'s result in its
+        // `last_layout` local before drawing (`mod.rs:1133`) and passed it
+        // to `mouse::handle_mouse` on the next mouse event. Without this,
+        // `handle_mouse` gets `None` and every layout-dependent hit test
+        // (click-to-position, tab-bar clicks, gutter, quickfix, find/replace,
+        // terminal geometry) silently does nothing. Written last, once every
+        // borrow of `screen` above has ended, so the value can simply be
+        // moved in rather than cloned.
+        //
+        // Also mirrors `mod.rs:1164`-`:1169`'s popup-disappearance tracking.
+        // The legacy loop followed it with `terminal.clear()`; the shell
+        // runner owns the `Terminal` and exposes no repaint hook, so the flag
+        // is kept (cheap, and the state it records is real) while the clear
+        // itself is an upstream gap — see the Ctrl+L note in
+        // `handle_key_pressed`.
+        self.had_popup_overlay
+            .set(screen.picker.is_some() || self.folder_picker.is_some());
+        *self.last_layout.borrow_mut() = Some(screen);
     }
 
     fn handle(
@@ -1835,7 +1886,59 @@ impl ShellApp for TuiShellApp {
                             self.engine
                                 .open_picker(crate::core::engine::PickerSource::Files);
                         } else {
-                            let _ = self.engine.dispatch_menu_action(&action);
+                            // #634: `dispatch_menu_action` returns an
+                            // `EngineAction` the engine can't complete on its
+                            // own (it needs terminal size / TUI-local state).
+                            // Dropping it — as this arm did while dormant —
+                            // made File▸Quit, File▸Open Folder, File▸Recent,
+                            // Save Workspace As and Terminal▸New all no-ops.
+                            // Mirrors `mod.rs:1450`-`:1498`.
+                            let act = self.engine.dispatch_menu_action(&action);
+                            let cols = viewport.width as u16;
+                            let rows = self.engine.session.terminal_panel_rows;
+                            match act {
+                                EngineAction::OpenTerminal => {
+                                    self.engine.terminal_new_tab(cols, rows);
+                                }
+                                EngineAction::RunInTerminal(cmd) => {
+                                    self.engine.terminal_run_command(&cmd, cols, rows);
+                                }
+                                EngineAction::OpenFolderDialog => {
+                                    self.folder_picker = Some(FolderPickerState::new(
+                                        &self.engine.cwd.clone(),
+                                        FolderPickerMode::OpenFolder,
+                                        self.engine.settings.show_hidden_files,
+                                    ));
+                                }
+                                EngineAction::OpenWorkspaceDialog => {
+                                    self.sidebar = TuiSidebar::new();
+                                    self.engine.explorer_rebuild_rows();
+                                }
+                                EngineAction::SaveWorkspaceAsDialog => {
+                                    let ws_path = self.engine.cwd.join(".vimcode-workspace");
+                                    self.engine.save_workspace_as(&ws_path);
+                                }
+                                EngineAction::OpenRecentDialog => {
+                                    // #274: engine-driven picker; replaces
+                                    // the TUI-local
+                                    // `FolderPickerState::new_recent`.
+                                    if self.engine.session.recent_workspaces.is_empty() {
+                                        self.engine.message = "No recent workspaces".to_string();
+                                    } else {
+                                        self.engine.open_picker(
+                                            crate::core::engine::PickerSource::RecentWorkspaces,
+                                        );
+                                    }
+                                }
+                                EngineAction::QuitWithUnsaved => {
+                                    self.engine.show_quit_confirm();
+                                }
+                                act => {
+                                    if handle_action(&mut self.engine, act) {
+                                        break 'dispatch Reaction::Exit;
+                                    }
+                                }
+                            }
                         }
                         break 'dispatch Reaction::Redraw;
                     }
@@ -1857,20 +1960,58 @@ impl ShellApp for TuiShellApp {
                     repeat,
                 } => {
                     let viewport = backend.viewport();
+                    // The debug/DAP sidebar tier re-dispatches the *event*
+                    // (not the decoded key) into `SidebarSystem::handle` —
+                    // `event_loop` kept a `ui_event_saved` clone for exactly
+                    // this (`mod.rs:1745`). Rebuilt rather than cloned up
+                    // front so non-key events pay nothing.
+                    let dap_event = UiEvent::KeyPressed {
+                        key: key.clone(),
+                        modifiers,
+                        repeat,
+                    };
                     handle_key_pressed(
                         key,
                         modifiers,
                         repeat,
                         &mut self.engine,
                         &mut self.sidebar,
-                        self.sidebar_width,
                         &mut self.folder_picker,
                         self.keyboard_enhanced,
                         viewport.width as u16,
                         viewport.height as u16,
                         backend,
-                        &self.cmd_sel,
+                        &mut KeyDispatchState {
+                            sidebar_width: &mut self.sidebar_width,
+                            quickfix_scroll_top: &mut self.quickfix_scroll_top,
+                            last_clipboard_content: &mut self.last_clipboard_content,
+                            cmd_sel: &self.cmd_sel,
+                            yank_hl_deadline: &self.yank_hl_deadline,
+                            ui_event: &dap_event,
+                        },
                     )
+                }
+                // ── Bracketed paste (mirrors mod.rs:3032-:3035) ─────────
+                // The runner maps crossterm's `Event::Paste` to
+                // `UiEvent::ClipboardPaste`; without this arm a paste into
+                // the TUI is silently dropped.
+                UiEvent::ClipboardPaste(ref text) => {
+                    self.engine.route_paste(text);
+                    sync_tui_clipboard(&mut self.engine, &mut self.last_clipboard_content);
+                    Reaction::Redraw
+                }
+                // ── Resize → PTY resize (mirrors mod.rs:3036-:3045) ─────
+                // The runner already debounces the crossterm resize burst
+                // (`RESIZE_SETTLE`) and re-reads the real terminal size for
+                // painting every frame, so only the embedded shell's own
+                // SIGWINCH needs forwarding here. The legacy loop's
+                // accompanying `terminal.clear()` has no shell-runner
+                // equivalent — see the Ctrl+L note in `handle_key_pressed`.
+                UiEvent::WindowResized { viewport } => {
+                    let term_rows = self.engine.session.terminal_panel_rows;
+                    self.engine
+                        .terminal_resize(viewport.width as u16, term_rows);
+                    Reaction::Redraw
                 }
                 // #602 (gap 2): dispatch through the legacy `mouse::handle_mouse`
                 // now that `Backend::drag_and_modal_mut` (quadraui#467) makes its
@@ -1921,6 +2062,20 @@ impl ShellApp for TuiShellApp {
         ctx.shell_mut()
             .set_title_bar_visible(self.engine.menu_bar_visible);
 
+        // ── Keep `AppShell`'s sidebar width == `self.sidebar_width` (#634) ─
+        // Same problem, same shape as the title-bar sync above: `AppShell`
+        // owns the width that carves `main_content_bounds` (and therefore
+        // everything `render_content` paints), while `self.sidebar_width` is
+        // what `mouse::handle_mouse`'s column math, `tick`'s viewport
+        // approximation and `dispatch_panel_accelerator_sizeless` all read.
+        // `event_loop` had one variable for both. Without this push, Alt+Left
+        // / Alt+Right and a sidebar-divider drag would move vimcode's copy
+        // and leave the painted layout unchanged, so hit tests would land a
+        // few columns off the visible edge. `set_sidebar_width` clamps
+        // internally and is idempotent, so calling it unconditionally on the
+        // way out of every dispatch costs nothing.
+        ctx.shell_mut().set_sidebar_width(self.sidebar_width as f32);
+
         reaction
     }
 
@@ -1943,10 +2098,21 @@ impl ShellApp for TuiShellApp {
     /// band as the `active_accent`/`selection_bg` gap `shell_config`'s doc
     /// comment notes.
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
-        if let quadraui::AppShellEvent::PanelChanged { panel_id } = event {
-            if panel_id.as_str() == HAMBURGER_PANEL_ID {
-                self.engine.menu_bar_visible = true;
+        match event {
+            quadraui::AppShellEvent::PanelChanged { panel_id } => {
+                if panel_id.as_str() == HAMBURGER_PANEL_ID {
+                    self.engine.menu_bar_visible = true;
+                }
             }
+            // #634: the other half of the width sync `handle()` performs on
+            // the way out — when `AppShell` resolves its *own* divider drag
+            // it reports the settled width here, and vimcode's copy has to
+            // follow or the next `handle()` would immediately push the stale
+            // value back and undo the drag.
+            quadraui::AppShellEvent::SidebarResized { new_width } => {
+                self.sidebar_width = new_width.round().max(0.0) as u16;
+            }
+            _ => {}
         }
     }
 
@@ -2003,6 +2169,67 @@ impl ShellApp for TuiShellApp {
             };
             engine.set_viewport_lines(content_rows.saturating_sub(tab_bar_rows).max(1) as usize);
             engine.set_viewport_cols(content_cols.max(1) as usize);
+        }
+
+        // ── Post-paint feedback from the last `render_content` (#634) ─────
+        // `event_loop` did both of these *inside* its draw block, between
+        // building the layout and the `terminal.draw` call (`mod.rs:1139`-
+        // `:1149`) and immediately after it (`:1216`-`:1266`). `render_content`
+        // is `&self` and can't touch `Engine`'s `&mut` API, so both read the
+        // caches it left behind and apply them here — the runner calls `tick`
+        // after every event batch, and returning `Reaction::Redraw` when
+        // anything moved reproduces the legacy two-pass repaint one frame
+        // later instead of within the same one.
+        {
+            let layout = self.last_layout.borrow();
+            if let Some(ref screen) = *layout {
+                // Exact per-window viewport dimensions from paint-time
+                // geometry, so `ensure_cursor_visible` uses real column
+                // counts rather than `tick`'s whole-screen approximation
+                // above (which can't see splits).
+                for rw in &screen.windows {
+                    self.engine.set_viewport_for_window(
+                        rw.window_id,
+                        rw.lines.len().max(1),
+                        rw.text_viewport_cols.max(1),
+                    );
+                }
+            }
+        }
+        {
+            // Apply the per-group tab-bar widths the paint measured and
+            // re-check that every group's active tab is on screen. Shared
+            // across backends — see `Engine::post_draw_apply_widths`.
+            let counts = self.tab_visible_counts.borrow().clone();
+            if !counts.is_empty() && self.engine.post_draw_apply_widths(&counts) {
+                needs_redraw = true;
+            }
+        }
+
+        // ── Terminal chrome the runner doesn't own (mirrors mod.rs:1268-:1286)
+        // Cursor shape per mode and the emulator window title. Both are plain
+        // escape sequences rather than anything ratatui buffers, so writing
+        // them to the shared process stdout between frames is exactly what
+        // `event_loop` did through `terminal.backend_mut()`. Live runs only:
+        // under `driver_with_shell` there is no real terminal, and emitting
+        // control sequences from a test binary would corrupt the harness'
+        // own output.
+        if self.live {
+            let cursor_style = if !self.sidebar.has_focus && self.engine.pending_key == Some('r') {
+                SetCursorStyle::SteadyUnderScore
+            } else if !self.sidebar.has_focus && self.engine.mode == Mode::Insert {
+                SetCursorStyle::BlinkingBar
+            } else {
+                SetCursorStyle::SteadyBlock
+            };
+            let mut out = io::stdout();
+            let _ = execute!(out, cursor_style);
+            let tui_title = self
+                .engine
+                .active_buffer_name()
+                .map(|n| format!("VimCode \u{2014} {}", n))
+                .unwrap_or_else(|| "VimCode".to_string());
+            let _ = execute!(out, SetTitle(tui_title.as_str()));
         }
 
         // ── Idle background work (mirrors `mod.rs:1157`-`:1247`) ───────────
@@ -2302,6 +2529,524 @@ fn dispatch_panel_accelerator_sizeless(
 /// constructs yet — same dormant-scaffold reasoning as the
 /// `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the Stage 6
 /// (#605) entry-point cutover.
+/// The sidebar-focused keyboard tier — `event_loop`'s `mod.rs:1886`-`:2415`,
+/// ported verbatim (#634, closing the last open item of #635's item D).
+///
+/// Split into its own function purely for size: at ~340 lines across eight
+/// per-panel dispatchers plus two prologue blocks it dwarfs every other tier
+/// in [`handle_key_pressed`], and inlining it there would bury the precedence
+/// chain that function's doc comment describes.
+///
+/// **Unconditionally terminal.** The caller checks the outer guard
+/// (`sidebar.has_focus && !picker_open && !terminal_has_focus && !Release`)
+/// and returns whatever this returns — matching the legacy loop, where every
+/// sub-block ends `needs_redraw = true; continue;` and the trailing explorer
+/// block carries no panel guard of its own, so a key that reaches this tier
+/// never falls through to the editor tier.
+///
+/// `ui_event` is the original, un-round-tripped [`UiEvent`]: the debug/DAP
+/// panel re-dispatches it into `SidebarSystem::handle` for its navigation
+/// keys before falling back to the action-key table, which is what
+/// `event_loop`'s `ui_event_saved` clone (`mod.rs:1745`) existed for.
+#[allow(clippy::too_many_arguments)]
+fn handle_sidebar_focused_key(
+    key_event: KeyEvent,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    screen_w: u16,
+    screen_h: u16,
+    backend: &mut dyn quadraui::Backend,
+    ui_event: &UiEvent,
+) -> Reaction {
+    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+
+    // #451: when an explorer context menu is open, intercept j/k/Enter/Esc
+    // HERE — before the panel-specific dispatch below sends j/k to
+    // `dispatch_explorer_key`. Without this, explorer-focused mode hijacks
+    // the keys and the menu's own selection doesn't move.
+    if engine.context_menu.is_some() {
+        let effective_key = match key_event.code {
+            KeyCode::Up => "Up".to_string(),
+            KeyCode::Down => "Down".to_string(),
+            KeyCode::Enter => "Return".to_string(),
+            KeyCode::Esc => "Escape".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            _ => String::new(),
+        };
+        if !effective_key.is_empty() {
+            let ctx = engine.context_menu_target_path();
+            let (consumed, action) = engine.handle_context_menu_key(&effective_key);
+            if consumed {
+                if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
+                    handle_explorer_context_action(
+                        &act,
+                        engine,
+                        sidebar,
+                        Some(Size::new(screen_w, screen_h)),
+                        ctx_path,
+                        ctx_is_dir,
+                    );
+                }
+                return Reaction::Redraw;
+            }
+        }
+    }
+
+    // Ctrl-W prefix: set pending state for window navigation. A Vim chord,
+    // so it stays inline rather than becoming an accelerator.
+    if ctrl && matches!(key_event.code, KeyCode::Char('w') | KeyCode::Char('W')) {
+        sidebar.pending_ctrl_w = true;
+        return Reaction::Redraw;
+    }
+    // Ctrl-W {h,l,Left,Right}: navigate between toolbar / panel / editor.
+    if sidebar.pending_ctrl_w {
+        sidebar.pending_ctrl_w = false;
+        match key_event.code {
+            KeyCode::Char('h') | KeyCode::Left => {
+                // Panel → activity bar toolbar
+                let idx = engine.activity_bar_toolbar_idx_for_active_panel();
+                sidebar.has_focus = false;
+                engine.clear_sidebar_focus();
+                engine.activity_bar_focus_in_at(idx);
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                // Panel → editor
+                sidebar.has_focus = false;
+                engine.clear_sidebar_focus();
+            }
+            _ => {} // Unknown Ctrl-W combo in the sidebar: ignore
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Search panel ────────────────────────────────────────────────────
+    if engine.active_panel_is(PANEL_SEARCH) {
+        // Ctrl+V paste (backend-specific clipboard access)
+        if ctrl && key_event.code == KeyCode::Char('v') {
+            let is_replace =
+                engine.search_panel_form_focus.borrow().as_deref() == Some("search:replace");
+            if let Some(text) = Engine::clipboard_paste() {
+                engine.search_input_paste(is_replace, &text);
+            }
+            return Reaction::Redraw;
+        }
+        let key_name = match key_event.code {
+            KeyCode::Enter => "Return",
+            KeyCode::Backspace => "BackSpace",
+            KeyCode::Delete => "Delete",
+            KeyCode::Left => "Left",
+            KeyCode::Right => "Right",
+            KeyCode::Home => "Home",
+            KeyCode::End => "End",
+            KeyCode::Up => "Up",
+            KeyCode::Down => "Down",
+            KeyCode::Tab => "Tab",
+            KeyCode::BackTab => "BackTab",
+            KeyCode::Esc => "Escape",
+            KeyCode::PageUp => "Page_Up",
+            KeyCode::PageDown => "Page_Down",
+            // Single-char keys use the char as the key name (via `unicode`
+            // below); Ctrl+b is the one that needs an explicit name.
+            KeyCode::Char('b') if ctrl => "b",
+            KeyCode::Char(_) => "",
+            _ => "",
+        };
+        let unicode = match key_event.code {
+            KeyCode::Char(c) if !ctrl => Some(c),
+            _ => None,
+        };
+        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+        let key_str = if key_name.is_empty() {
+            unicode.map(|c| c.to_string()).unwrap_or_default()
+        } else {
+            key_name.to_string()
+        };
+        use crate::core::engine::SearchKeyResult;
+        let result = engine.dispatch_search_sidebar_key_unified(&key_str, ctrl, alt, unicode);
+        if matches!(result, SearchKeyResult::Unfocused) {
+            sidebar.has_focus = false;
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Debug (DAP) panel ───────────────────────────────────────────────
+    if engine.active_panel_is(PANEL_DEBUG) {
+        // Route navigation keys through SidebarSystem first.
+        render::populate_dap_sidebar_system(engine);
+        let rect = engine.dap_sidebar_body_rect.get();
+        let sidebar_event = engine
+            .dap_sidebar_system
+            .borrow_mut()
+            .handle(ui_event, backend, rect);
+        if !engine.dispatch_dap_sidebar_event(sidebar_event) {
+            // Ignored by the MSV — handle action keys via shared dispatch.
+            let key_name = match key_event.code {
+                KeyCode::Char(c) => match c {
+                    'q' => "q",
+                    'x' => "x",
+                    'd' => "d",
+                    'b' if ctrl => {
+                        engine.app_shell.hide_sidebar();
+                        sidebar.has_focus = false;
+                        engine.clear_sidebar_focus();
+                        engine.session.explorer_visible = false;
+                        let _ = engine.session.save();
+                        ""
+                    }
+                    _ => "",
+                },
+                KeyCode::F(n @ 5..=11) => match n {
+                    5 | 9 | 10 | 11 => {
+                        let name = format!("F{n}");
+                        engine.handle_key(&name, None, false);
+                        return Reaction::Redraw;
+                    }
+                    6 => "F6",
+                    _ => "",
+                },
+                code => tui_key_to_engine_name(code).unwrap_or(""),
+            };
+            if engine.dispatch_dap_sidebar_action_key(key_name) {
+                sidebar.has_focus = false;
+            }
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Plugin-provided extension panel ─────────────────────────────────
+    if engine.ext_panel_has_focus && sidebar.ext_panel_name.is_some() {
+        // When the input field is active, characters are input text rather
+        // than navigation commands.
+        if engine.ext_panel_input_active {
+            let (ikey, ich): (&str, Option<char>) = match key_event.code {
+                KeyCode::Esc => ("Escape", None),
+                KeyCode::Enter => ("Return", None),
+                KeyCode::Backspace => ("BackSpace", None),
+                KeyCode::Char(ch) => ("char", Some(ch)),
+                _ => ("", None),
+            };
+            if !ikey.is_empty() {
+                let name = if ikey == "char" {
+                    ich.map(|c| c.to_string()).unwrap_or_default()
+                } else {
+                    ikey.to_string()
+                };
+                engine.handle_ext_panel_input_key(&name, ctrl, ich);
+            }
+            return Reaction::Redraw;
+        }
+        // h/Left: the engine sets `activity_bar_focused` inside
+        // `handle_ext_panel_key`.
+        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+            KeyCode::Char('j') | KeyCode::Down => ("j", None),
+            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+            KeyCode::Char('h') => ("h", None),
+            KeyCode::Left => ("Left", None),
+            KeyCode::Char('g') => ("g", None),
+            KeyCode::Char('G') => ("G", None),
+            KeyCode::Tab => ("Tab", None),
+            KeyCode::Enter => ("Return", None),
+            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
+            KeyCode::Char(ch) => ("char", Some(ch)),
+            _ => ("", None),
+        };
+        if !key_name.is_empty() {
+            let ch = if key_name == "char" { unicode } else { None };
+            let name = if key_name == "char" {
+                ch.map(|c| c.to_string()).unwrap_or_default()
+            } else {
+                key_name.to_string()
+            };
+            engine.handle_ext_panel_key(&name, ctrl, ch);
+            if !engine.ext_panel_has_focus {
+                sidebar.has_focus = false;
+                // Keep `ext_panel_name` when focus moved to the activity bar
+                // (the panel stays visible while the toolbar cursor shows).
+                if !engine.activity_bar_focused {
+                    sidebar.ext_panel_name = None;
+                }
+            }
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Extensions marketplace panel ────────────────────────────────────
+    if engine.active_panel_is(PANEL_EXTENSIONS) {
+        let (key_name, unicode) = match key_event.code {
+            KeyCode::Char(c) => (c.to_string(), Some(c)),
+            code => (
+                tui_key_to_engine_name(code)
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+                None,
+            ),
+        };
+        use crate::core::engine::ExtSidebarKeyResult;
+        match engine.dispatch_ext_sidebar_key_unified(&key_name, unicode) {
+            ExtSidebarKeyResult::Unfocused | ExtSidebarKeyResult::FocusActivityBar => {
+                sidebar.has_focus = false;
+            }
+            ExtSidebarKeyResult::Consumed => {}
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Settings panel ──────────────────────────────────────────────────
+    if engine.active_panel_is(PANEL_SETTINGS) {
+        // h/Left focus-to-activity-bar lives inside `handle_settings_key`:
+        // when the selected row is not an enum, `h` sets
+        // `activity_bar_focused`.
+        // Ctrl-V paste into the search input or an inline edit.
+        if ctrl && key_event.code == KeyCode::Char('v') {
+            if engine.settings_input_active || engine.settings_editing.is_some() {
+                let text = match engine.clipboard_read {
+                    Some(ref cb) => cb().ok(),
+                    None => None,
+                };
+                if let Some(t) = text {
+                    engine.settings_paste(&t);
+                }
+            }
+            return Reaction::Redraw;
+        }
+        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+            KeyCode::Char('j') | KeyCode::Down => ("j", None),
+            KeyCode::Char('k') | KeyCode::Up => ("k", None),
+            KeyCode::Char('l') | KeyCode::Right => ("l", None),
+            KeyCode::Char('h') | KeyCode::Left => ("h", None),
+            KeyCode::Char(' ') => ("Space", None),
+            KeyCode::Char('/') => ("/", None),
+            KeyCode::Char('q') => ("Escape", None),
+            KeyCode::Char(ch) => ("char", Some(ch)),
+            code => (tui_key_to_engine_name(code).unwrap_or(""), None),
+        };
+        if !key_name.is_empty() {
+            let ch = if key_name == "char" { unicode } else { None };
+            engine.handle_settings_key(if key_name == "char" { "" } else { key_name }, ctrl, ch);
+            if !engine.settings_has_focus {
+                sidebar.has_focus = false;
+            }
+            // Keep the selected item visible after j/k navigation.
+            let content_h = screen_h.saturating_sub(4) as usize;
+            if content_h > 0 {
+                if engine.settings_selected >= engine.settings_scroll_top + content_h {
+                    engine.settings_scroll_top = engine.settings_selected - content_h + 1;
+                } else if engine.settings_selected < engine.settings_scroll_top {
+                    engine.settings_scroll_top = engine.settings_selected;
+                }
+            }
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── AI assistant panel ──────────────────────────────────────────────
+    if engine.active_panel_is(PANEL_AI) {
+        // h/Left focus-to-activity-bar lives inside `handle_ai_panel_key`.
+        if ctrl && key_event.code == KeyCode::Char('v') {
+            let text = match engine.clipboard_read {
+                Some(ref cb) => cb().ok(),
+                None => None,
+            };
+            if let Some(t) = text {
+                engine.ai_insert_text(&t);
+            }
+            return Reaction::Redraw;
+        }
+        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
+            KeyCode::Down if !engine.ai_input_active => ("j", None),
+            KeyCode::Up if !engine.ai_input_active => ("k", None),
+            KeyCode::Char('j') if !engine.ai_input_active => ("j", None),
+            KeyCode::Char('k') if !engine.ai_input_active => ("k", None),
+            KeyCode::Char('h') if !engine.ai_input_active && !ctrl => ("h", None),
+            KeyCode::Left if !engine.ai_input_active => ("Left", None),
+            KeyCode::Char('G') if !engine.ai_input_active => ("G", None),
+            KeyCode::Char('g') if !engine.ai_input_active => ("g", None),
+            KeyCode::Char('i') | KeyCode::Char('a') if !engine.ai_input_active => ("i", None),
+            KeyCode::Enter => ("Return", None),
+            KeyCode::Esc => ("Escape", None),
+            KeyCode::Char('q') if !engine.ai_input_active => ("Escape", None),
+            KeyCode::Backspace => ("BackSpace", None),
+            KeyCode::Delete => ("Delete", None),
+            KeyCode::Left => ("Left", None),
+            KeyCode::Right => ("Right", None),
+            KeyCode::Home => ("Home", None),
+            KeyCode::End => ("End", None),
+            KeyCode::Char('c') if ctrl => ("c", None),
+            KeyCode::Char('a') if ctrl => ("a", None), // Ctrl-A → start of input
+            KeyCode::Char('e') if ctrl => ("e", None),
+            KeyCode::Char('k') if ctrl => ("k", None),
+            KeyCode::Char(ch) => ("char", Some(ch)),
+            _ => ("", None),
+        };
+        if !key_name.is_empty() {
+            let (mapped, uni) = if key_name == "char" {
+                ("", unicode)
+            } else {
+                (key_name, None)
+            };
+            engine.handle_ai_panel_key(mapped, ctrl, uni);
+            if !engine.ai_has_focus {
+                sidebar.has_focus = false;
+            }
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Source Control panel ────────────────────────────────────────────
+    if engine.active_panel_is(PANEL_GIT) {
+        // h/Left focus-to-activity-bar lives inside
+        // `dispatch_sc_sidebar_key_unified`. Ctrl+b hides the sidebar.
+        if ctrl && matches!(key_event.code, KeyCode::Char('b')) {
+            engine.app_shell.hide_sidebar();
+            sidebar.has_focus = false;
+            engine.clear_sidebar_focus();
+            engine.session.explorer_visible = false;
+            let _ = engine.session.save();
+            return Reaction::Redraw;
+        }
+        // With keyboard enhancement (kitty protocol), Shift+s arrives as
+        // Char('s') + SHIFT, not Char('S'). Resolve the actual character
+        // before matching the whitelist.
+        let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
+        let (key_str, unicode): (&str, Option<char>) = match key_event.code {
+            KeyCode::Enter => ("Return", None),
+            KeyCode::Esc => ("Escape", None),
+            KeyCode::Backspace => ("BackSpace", None),
+            KeyCode::Delete => ("Delete", None),
+            KeyCode::Up => ("Up", None),
+            KeyCode::Down => ("Down", None),
+            KeyCode::Left => ("Left", None),
+            KeyCode::Right => ("Right", None),
+            KeyCode::Home => ("Home", None),
+            KeyCode::End => ("End", None),
+            KeyCode::Tab => ("Tab", None),
+            KeyCode::BackTab => ("BackTab", None),
+            KeyCode::PageUp => ("Page_Up", None),
+            KeyCode::PageDown => ("Page_Down", None),
+            KeyCode::Char(ch) => {
+                let resolved = if shift && ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                };
+                let name = match resolved {
+                    'j' => "j",
+                    'k' => "k",
+                    'h' => "h",
+                    'l' => "l",
+                    's' => "s",
+                    'S' => "S",
+                    'd' => "d",
+                    'D' => "D",
+                    'c' => "c",
+                    'C' => "C",
+                    'p' => "p",
+                    'P' => "P",
+                    'f' => "f",
+                    'r' => "r",
+                    'b' => "b",
+                    'B' => "B",
+                    'q' => "q",
+                    '?' => "?",
+                    '/' => "/",
+                    _ => "",
+                };
+                (name, Some(resolved))
+            }
+            _ => ("", None),
+        };
+        if !key_str.is_empty() || unicode.is_some() {
+            use crate::core::engine::ScKeyResult;
+            let result = engine.dispatch_sc_sidebar_key_unified(key_str, ctrl, unicode);
+            if matches!(
+                result,
+                ScKeyResult::Unfocused | ScKeyResult::FocusActivityBar
+            ) {
+                sidebar.has_focus = false;
+            }
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Explorer (the fallback: no panel guard) ─────────────────────────
+    {
+        use crate::core::engine::ExplorerKeyResult;
+        if ctrl && key_event.code == KeyCode::Char('b') {
+            engine.app_shell.hide_sidebar();
+            sidebar.has_focus = false;
+            engine.clear_sidebar_focus();
+            engine.session.explorer_visible = false;
+            let _ = engine.session.save();
+        } else {
+            let key_name = match key_event.code {
+                KeyCode::Esc => "Escape",
+                KeyCode::Enter => "Return",
+                KeyCode::Up => "Up",
+                KeyCode::Down => "Down",
+                KeyCode::Left => "Left",
+                KeyCode::Right => "Right",
+                KeyCode::Home => "Home",
+                KeyCode::End => "End",
+                KeyCode::PageUp => "PageUp",
+                KeyCode::PageDown => "PageDown",
+                KeyCode::Char(c) => match c {
+                    'j' => "j",
+                    'k' => "k",
+                    'h' => "h",
+                    'l' => "l",
+                    'q' => "q",
+                    _ => "",
+                },
+                _ => "",
+            };
+            let chr = if let KeyCode::Char(c) = key_event.code {
+                Some(c)
+            } else {
+                None
+            };
+            match engine.dispatch_explorer_key(key_name, chr, ctrl) {
+                // `dispatch_explorer_key` already called
+                // `activity_bar_focus_in_at(1)` for `FocusToolbar`.
+                ExplorerKeyResult::Unfocused | ExplorerKeyResult::FocusToolbar => {
+                    sidebar.has_focus = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    Reaction::Redraw
+}
+
+/// The per-keypress slice of `event_loop`'s loop-local `mut` state that
+/// [`handle_key_pressed`] reads *and* writes (#634).
+///
+/// Bundled into one struct rather than appended as six more positional
+/// parameters: the function already carries eleven, and every one of these
+/// is "the same `let mut` the legacy loop kept across iterations", so
+/// grouping them keeps that provenance legible at the call site.
+///
+/// `ui_event` is the *original* [`UiEvent`] the key was decoded from, not a
+/// re-synthesised one — the debug/DAP sidebar tier re-dispatches it into
+/// `SidebarSystem::handle`, which needs the backend-neutral event, exactly
+/// as `event_loop`'s `ui_event_saved` clone did (`mod.rs:1745`, `:2042`).
+struct KeyDispatchState<'a> {
+    /// `event_loop`'s `sidebar_width` local — mutated by Alt+Left/Right.
+    sidebar_width: &'a mut u16,
+    /// `event_loop`'s `quickfix_scroll_top` local — kept in sync with the
+    /// quickfix selection by the post-key epilogue.
+    quickfix_scroll_top: &'a mut usize,
+    /// `event_loop`'s `last_clipboard_content` local — the change-detection
+    /// key for `sync_tui_clipboard` (`clipboard=unnamedplus`).
+    last_clipboard_content: &'a mut Option<String>,
+    /// Command-line / message-line selection (mouse-populated, keyboard-
+    /// cleared).
+    cmd_sel: &'a Cell<Option<(usize, usize)>>,
+    /// 200 ms yank-highlight expiry, armed here and cleared in `tick`.
+    yank_hl_deadline: &'a Cell<Option<Instant>>,
+    /// See the struct doc — the un-round-tripped source event.
+    ui_event: &'a UiEvent,
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn handle_key_pressed(
@@ -2310,14 +3055,14 @@ fn handle_key_pressed(
     repeat: bool,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
-    sidebar_width: u16,
     folder_picker: &mut Option<FolderPickerState>,
     keyboard_enhanced: bool,
     screen_w: u16,
     screen_h: u16,
     backend: &mut dyn quadraui::Backend,
-    cmd_sel: &Cell<Option<(usize, usize)>>,
+    state: &mut KeyDispatchState<'_>,
 ) -> Reaction {
+    let cmd_sel = state.cmd_sel;
     let Some(key_event) = quadraui::tui::events::synth_keyevent(&key, modifiers, repeat) else {
         return Reaction::Continue;
     };
@@ -2455,17 +3200,29 @@ fn handle_key_pressed(
         return Reaction::Redraw;
     }
 
-    // NOTE: the sidebar-focused keyboard tier (mod.rs:1856-:2385 — search
-    // panel, debug panel, extension panel, source control, and explorer
-    // key handling while `sidebar.has_focus` is set) is NOT yet ported.
-    // It's an order of magnitude larger than the activity-bar tier above
-    // (~500 lines, five nested per-panel dispatchers) and, unlike the
-    // activity-bar tier, isn't self-contained enough to port safely without
-    // a dedicated session budgeted for it. Left as the one open item from
-    // #635's item D — see the module doc's Stage 6 section. Until it lands,
-    // a key press while `sidebar.has_focus` is true falls through to the
-    // general `Engine::handle_key` fallback below, same as before this
-    // stage.
+    // ── Sidebar focused (mirrors mod.rs:1886-:2415) ─────────────────────
+    // #634: the last of #635's item-D tiers. Suppressed while a picker
+    // modal is open and while the terminal has focus (e.g. "Press Enter to
+    // close…" after an extension install), exactly like the legacy loop.
+    if sidebar.has_focus
+        && !engine.picker_open
+        && !engine.terminal_has_focus
+        && key_event.kind != KeyEventKind::Release
+    {
+        // Unlike the tiers above, this one is unconditionally terminal:
+        // every sub-block in `event_loop`'s copy ends `needs_redraw = true;
+        // continue;`, and the trailing explorer block has no panel guard, so
+        // once the outer guard passes the key never reaches the editor tier.
+        return handle_sidebar_focused_key(
+            key_event,
+            engine,
+            sidebar,
+            screen_w,
+            screen_h,
+            backend,
+            state.ui_event,
+        );
+    }
 
     if key_event.kind == KeyEventKind::Release {
         return Reaction::Continue;
@@ -2473,6 +3230,221 @@ fn handle_key_pressed(
     let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) else {
         return Reaction::Continue;
     };
+
+    // ── Ctrl+L: force a full screen redraw (mirrors mod.rs:2429-:2435) ──
+    // The legacy loop called `ratatui::Terminal::clear()`, which resets
+    // ratatui's previous-frame buffer so the next draw re-emits every cell.
+    // The shell runner owns the `Terminal`, and neither `Backend` nor
+    // `ShellApp` exposes a "repaint everything" escape hatch, so all this
+    // can do today is request an ordinary redraw. Tracked as an upstream
+    // gap (a `Backend::request_full_repaint`-shaped hook) alongside the
+    // popup-disappearance clear in `Self::render_content`; see #634's
+    // hand-off notes. Consuming the key here rather than letting it fall
+    // through preserves the legacy behaviour of Ctrl+L *not* reaching
+    // `Engine::handle_key`.
+    if ctrl && matches!(key_event.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+        return Reaction::Redraw;
+    }
+
+    // ── Terminal (PTY) key routing (#351, mirrors mod.rs:2439-:2513) ────
+    // The engine decides the action; the backend performs the clipboard I/O
+    // and the PTY writes.
+    if engine.terminal_has_focus {
+        use crate::core::engine::TerminalKeyAction;
+        let mut tui_fn_buf = String::new();
+        let (kn, uc) = match key_event.code {
+            KeyCode::Enter => ("Return", None),
+            KeyCode::Backspace => ("BackSpace", None),
+            KeyCode::Esc => ("Escape", None),
+            KeyCode::Tab => ("Tab", None),
+            KeyCode::BackTab => ("ISO_Left_Tab", None),
+            KeyCode::Up => ("Up", None),
+            KeyCode::Down => ("Down", None),
+            KeyCode::Left => ("Left", None),
+            KeyCode::Right => ("Right", None),
+            KeyCode::Home => ("Home", None),
+            KeyCode::End => ("End", None),
+            KeyCode::Delete => ("Delete", None),
+            KeyCode::Insert => ("Insert", None),
+            KeyCode::PageUp => ("Page_Up", None),
+            KeyCode::PageDown => ("Page_Down", None),
+            KeyCode::F(n) => {
+                tui_fn_buf = format!("F{n}");
+                (tui_fn_buf.as_str(), None)
+            }
+            KeyCode::Char(c) => ("", Some(c)),
+            _ => ("", None),
+        };
+        let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+        match engine.handle_terminal_key(kn, uc, ctrl, shift, alt) {
+            TerminalKeyAction::CopySelection => {
+                let text = engine.active_terminal().and_then(|t| t.selected_text());
+                if let Some(ref text) = text {
+                    if let Some(ref cb) = engine.clipboard_write {
+                        let _ = cb(text);
+                    }
+                    engine.message = "Copied".to_string();
+                }
+            }
+            TerminalKeyAction::PasteClipboard => {
+                let paste_text = engine
+                    .clipboard_read
+                    .as_ref()
+                    .and_then(|cb| cb().ok())
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| {
+                        engine
+                            .registers
+                            .get(&'+')
+                            .map(|(t, _)| t.clone())
+                            .filter(|t| !t.is_empty())
+                    })
+                    .or_else(|| {
+                        engine
+                            .registers
+                            .get(&'"')
+                            .map(|(t, _)| t.clone())
+                            .filter(|t| !t.is_empty())
+                    });
+                if let Some(text) = paste_text {
+                    engine.terminal_write(b"\x1b[200~");
+                    engine.terminal_write(text.as_bytes());
+                    engine.terminal_write(b"\x1b[201~");
+                    engine.poll_terminal();
+                } else {
+                    engine.message = "Nothing to paste".to_string();
+                }
+            }
+            TerminalKeyAction::SendToPty(data) => {
+                engine.terminal_write(&data);
+                engine.poll_terminal();
+            }
+            TerminalKeyAction::Handled | TerminalKeyAction::Ignore => {}
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Alt-modifier block (mirrors mod.rs:2526-:2601) ──────────────────
+    if key_event.modifiers.contains(KeyModifiers::ALT) {
+        match key_event.code {
+            // Alt+Left / Alt+Right: resize the sidebar.
+            KeyCode::Left => {
+                *state.sidebar_width = state.sidebar_width.saturating_sub(1).max(15);
+                return Reaction::Redraw;
+            }
+            KeyCode::Right => {
+                *state.sidebar_width = (*state.sidebar_width + 1).min(150);
+                return Reaction::Redraw;
+            }
+            // Shift+Alt+F: LSP format document.
+            KeyCode::Char('F') => {
+                if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+                    engine.lsp_format_current();
+                    return Reaction::Redraw;
+                }
+            }
+            // Alt+M: toggle Vim ↔ VSCode editing mode.
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                engine.toggle_editor_mode();
+                return Reaction::Redraw;
+            }
+            // Alt+, / Alt+. — resize the editor group split.
+            KeyCode::Char(',') => {
+                engine.group_resize(-0.05);
+                return Reaction::Redraw;
+            }
+            KeyCode::Char('.') => {
+                engine.group_resize(0.05);
+                return Reaction::Redraw;
+            }
+            // Alt+] / Alt+[ — cycle AI ghost-text alternatives.
+            KeyCode::Char(']') => {
+                if engine.mode == crate::core::Mode::Insert {
+                    engine.ai_ghost_next_alt();
+                    return Reaction::Redraw;
+                }
+            }
+            KeyCode::Char('[') => {
+                if engine.mode == crate::core::Mode::Insert {
+                    engine.ai_ghost_prev_alt();
+                    return Reaction::Redraw;
+                }
+            }
+            // Alt+t is handled earlier (tab switcher).
+            _ => {}
+        }
+        // VSCode mode: encode Alt+key into a key name for engine dispatch.
+        if engine.is_vscode_mode() {
+            let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
+            let alt_key_name = match key_event.code {
+                KeyCode::Up if shift => Some("Alt_Shift_Up"),
+                KeyCode::Down if shift => Some("Alt_Shift_Down"),
+                KeyCode::Up => Some("Alt_Up"),
+                KeyCode::Down => Some("Alt_Down"),
+                KeyCode::Char('z') | KeyCode::Char('Z') if !shift => Some("Alt_z"),
+                _ => None,
+            };
+            if let Some(name) = alt_key_name {
+                engine.handle_key(name, None, false);
+                return Reaction::Redraw;
+            }
+        }
+    }
+
+    // ── Pre-load the system clipboard for paste keys (mirrors
+    // mod.rs:2609-:2615) ─────────────────────────────────────────────────
+    // `p`/`P` in normal/visual, Ctrl+V in VSCode mode. Detection and
+    // register loading are shared engine methods (#381).
+    if engine.needs_clipboard_for_paste(&key_name, unicode, ctrl) {
+        let text = engine.clipboard_read.as_ref().and_then(|cb| cb().ok());
+        engine.prepare_paste_clipboard(text);
+    }
+
+    // ── Ctrl+Shift+V: paste the system clipboard into the buffer (mirrors
+    // mod.rs:2617-:2660) ─────────────────────────────────────────────────
+    // With keyboard enhancement this event reaches the app instead of being
+    // eaten by the terminal emulator. In Vim mode, load the clipboard into
+    // the registers and replay `p`; in insert mode, insert the text.
+    if ctrl && key_name == "V" && !engine.is_vscode_mode() {
+        use crate::core::Mode;
+        if let Some(ref cb_read) = engine.clipboard_read {
+            if let Ok(text) = cb_read() {
+                if !text.is_empty() {
+                    engine.load_clipboard_for_paste(text);
+                    match engine.mode {
+                        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+                            engine.handle_key("", Some('p'), false);
+                        }
+                        Mode::Insert | Mode::Replace => {
+                            if let Some((content, _)) = engine.get_register_content('"') {
+                                for ch in content.chars() {
+                                    engine.handle_key(&ch.to_string(), Some(ch), false);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        return Reaction::Redraw;
+    }
+
+    // ── Shift+F5 → stop, Shift+F11 → stepout (mirrors mod.rs:2662-:2679) ─
+    if key_event.modifiers.contains(KeyModifiers::SHIFT) {
+        match key_event.code {
+            KeyCode::F(5) => {
+                let _ = engine.execute_command("stop");
+                return Reaction::Redraw;
+            }
+            KeyCode::F(11) => {
+                let _ = engine.execute_command("stepout");
+                return Reaction::Redraw;
+            }
+            _ => {}
+        }
+    }
 
     // ── Command-line selection: Ctrl-C copies, any other key clears
     // (mirrors mod.rs:2651-:2701) ─────────────────────────────────────────
@@ -2557,12 +3529,12 @@ fn handle_key_pressed(
     }
 
     if action == EngineAction::OpenTerminal {
-        let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
+        let cols = terminal_panel_cols(engine, screen_w, *state.sidebar_width);
         let rows = engine.session.terminal_panel_rows;
         engine.terminal_new_tab(cols, rows);
     } else if action == EngineAction::ToggleTerminalMaximize {
         let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
+            terminal_cols: terminal_panel_cols(engine, screen_w, *state.sidebar_width),
             terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_h),
         };
         engine.handle_ui_event(
@@ -2599,6 +3571,66 @@ fn handle_key_pressed(
         return Reaction::Exit;
     }
 
+    // ── Post-key epilogue (mirrors mod.rs:2863-:2915) ───────────────────
+    // Seven behaviours the legacy loop ran after *every* editor keypress.
+
+    // Ctrl-W h/l overflow: move focus to the sidebar or the activity bar.
+    if let Some(false) = engine.handle_nav_overflow() {
+        if engine.app_shell.sidebar_visible() {
+            sidebar.has_focus = true;
+        } else {
+            // No sidebar panel visible — focus the activity bar instead.
+            let idx = engine.activity_bar_toolbar_idx_for_active_panel();
+            engine.activity_bar_focus_in_at(idx);
+        }
+    }
+
+    // Auto-hide the sidebar when focus returns to the editor.
+    // (`sidebar_has_focus()` includes `activity_bar_focused`, so autohide is
+    // suppressed while the user navigates the toolbar.)
+    if engine.should_autohide_sidebar() {
+        engine.app_shell.hide_sidebar();
+    }
+
+    // Drain macro playback (`@q`), which can itself request a quit.
+    loop {
+        let (has_more, action) = engine.advance_macro_playback();
+        if handle_action(engine, action) {
+            return Reaction::Exit;
+        }
+        if !has_more {
+            break;
+        }
+    }
+
+    // Sync the unnamed register → system clipboard (`clipboard=unnamedplus`).
+    sync_tui_clipboard(engine, state.last_clipboard_content);
+
+    // Rebuild the explorer tree if a file move just completed.
+    if engine.explorer_needs_refresh {
+        engine.explorer_needs_refresh = false;
+        engine.explorer_rebuild_rows();
+    }
+
+    // Arm the 200 ms yank-highlight expiry (`tick` clears it).
+    if engine.yank_highlight.is_some() {
+        state
+            .yank_hl_deadline
+            .set(Some(Instant::now() + Duration::from_millis(200)));
+    }
+
+    // Keep the selected quickfix entry visible.
+    if engine.quickfix_open {
+        const QF_VISIBLE: usize = 5; // 6 rows − 1 header
+        if engine.quickfix_selected < *state.quickfix_scroll_top {
+            *state.quickfix_scroll_top = engine.quickfix_selected;
+        } else if engine.quickfix_selected >= *state.quickfix_scroll_top + QF_VISIBLE {
+            *state.quickfix_scroll_top = engine.quickfix_selected + 1 - QF_VISIBLE;
+        }
+    } else {
+        *state.quickfix_scroll_top = 0;
+    }
+
     Reaction::Redraw
 }
 
@@ -2622,6 +3654,46 @@ mod tests {
     //! over a bare `&mut Engine`.
     use super::*;
     use quadraui::tui::testing::driver_with_shell;
+
+    /// Owns the values a [`KeyDispatchState`] borrows, so the direct
+    /// (`driver`-bypassing) `handle_key_pressed` tests can build one without
+    /// declaring six locals apiece. Fields stay public to the test module so
+    /// a test can seed (`scratch.cmd_sel.set(..)`) or assert on
+    /// (`scratch.sidebar_width`) any of them.
+    struct KeyScratch {
+        sidebar_width: u16,
+        quickfix_scroll_top: usize,
+        last_clipboard_content: Option<String>,
+        cmd_sel: Cell<Option<(usize, usize)>>,
+        yank_hl_deadline: Cell<Option<Instant>>,
+        /// Only the debug/DAP sidebar tier reads this, and no direct test
+        /// exercises that panel today — any non-key event is inert there.
+        ui_event: UiEvent,
+    }
+
+    impl KeyScratch {
+        fn new() -> Self {
+            Self {
+                sidebar_width: SIDEBAR_WIDTH,
+                quickfix_scroll_top: 0,
+                last_clipboard_content: None,
+                cmd_sel: Cell::new(None),
+                yank_hl_deadline: Cell::new(None),
+                ui_event: UiEvent::WindowFocused(true),
+            }
+        }
+
+        fn state(&mut self) -> KeyDispatchState<'_> {
+            KeyDispatchState {
+                sidebar_width: &mut self.sidebar_width,
+                quickfix_scroll_top: &mut self.quickfix_scroll_top,
+                last_clipboard_content: &mut self.last_clipboard_content,
+                cmd_sel: &self.cmd_sel,
+                yank_hl_deadline: &self.yank_hl_deadline,
+                ui_event: &self.ui_event,
+            }
+        }
+    }
     use quadraui::Backend as _;
 
     fn config() -> quadraui::ShellConfig {
@@ -4126,7 +5198,7 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
-        let cmd_sel = Cell::new(None);
+        let mut scratch = KeyScratch::new();
 
         // "Down" cycles the selected dialog button (`panels.rs`'s
         // `handle_dialog_key`) — proving the key actually reached
@@ -4138,13 +5210,12 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
 
         assert_eq!(reaction, Reaction::Redraw);
@@ -4173,7 +5244,7 @@ mod tests {
             engine.settings.show_hidden_files,
         ));
         let mut backend = backend_at(80.0, 24.0);
-        let cmd_sel = Cell::new(None);
+        let mut scratch = KeyScratch::new();
 
         let reaction = handle_key_pressed(
             quadraui::Key::Char('x'),
@@ -4181,13 +5252,12 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
         assert_eq!(reaction, Reaction::Redraw);
         assert_eq!(
@@ -4203,13 +5273,12 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
         assert_eq!(reaction, Reaction::Redraw);
         assert!(folder_picker.is_none(), "Esc should dismiss the picker");
@@ -4232,7 +5301,7 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
-        let cmd_sel = Cell::new(None);
+        let mut scratch = KeyScratch::new();
 
         let reaction = handle_key_pressed(
             quadraui::Key::Named(quadraui::NamedKey::Enter),
@@ -4240,13 +5309,12 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
 
         assert_eq!(reaction, Reaction::Redraw);
@@ -4273,7 +5341,7 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
-        let cmd_sel = Cell::new(None);
+        let mut scratch = KeyScratch::new();
 
         // 'j' moves the cursor from the hamburger (0) to Explorer (1).
         let reaction = handle_key_pressed(
@@ -4282,13 +5350,12 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
         assert_eq!(reaction, Reaction::Redraw);
         assert!(engine.activity_bar_focused, "still toolbar-focused after j");
@@ -4301,13 +5368,12 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
         assert_eq!(reaction, Reaction::Redraw);
         assert!(
@@ -4334,7 +5400,8 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
-        let cmd_sel = Cell::new(Some((0usize, 4usize))); // "hello"
+        let mut scratch = KeyScratch::new();
+        scratch.cmd_sel.set(Some((0usize, 4usize))); // "hello"
 
         let reaction = handle_key_pressed(
             quadraui::Key::Char('c'),
@@ -4345,17 +5412,19 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
 
         assert_eq!(reaction, Reaction::Redraw);
-        assert!(cmd_sel.get().is_none(), "Ctrl+C should clear the selection");
+        assert!(
+            scratch.cmd_sel.get().is_none(),
+            "Ctrl+C should clear the selection"
+        );
         assert!(
             engine.message.contains("hello"),
             "Ctrl+C should copy the selected substring; message: {}",
@@ -4374,7 +5443,8 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
-        let cmd_sel = Cell::new(Some((0usize, 4usize)));
+        let mut scratch = KeyScratch::new();
+        scratch.cmd_sel.set(Some((0usize, 4usize)));
 
         let _ = handle_key_pressed(
             quadraui::Key::Char('x'),
@@ -4382,17 +5452,16 @@ mod tests {
             false,
             &mut engine,
             &mut sidebar,
-            SIDEBAR_WIDTH,
             &mut folder_picker,
             false,
             80,
             24,
             &mut backend,
-            &cmd_sel,
+            &mut scratch.state(),
         );
 
         assert!(
-            cmd_sel.get().is_none(),
+            scratch.cmd_sel.get().is_none(),
             "any other key should clear the selection"
         );
         assert!(
