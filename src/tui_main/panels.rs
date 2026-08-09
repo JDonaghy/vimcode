@@ -170,12 +170,6 @@ pub(super) fn render_explorer_sidebar_content(
 /// the chat history and [`fill_row`] for its plain chrome rows). See each
 /// function's own doc comment for the specific tradeoffs.
 ///
-/// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
-/// (`shell_app.rs`), which nothing outside that module's own
-/// `#[cfg(test)]` tests constructs yet — same dormant-scaffold reasoning as
-/// the `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the
-/// Stage 6 (#605) entry-point cutover.
-#[allow(dead_code)]
 pub(super) fn render_sidebar_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -1599,12 +1593,6 @@ pub(super) fn render_terminal_panel(
 /// has landed: both panes and the divider paint through the trait,
 /// mirroring `render_terminal_panel`'s live path exactly.
 ///
-/// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
-/// (`shell_app.rs`), which nothing outside that module's own
-/// `#[cfg(test)]` tests constructs yet — same dormant-scaffold reasoning as
-/// the `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the
-/// Stage 6 (#605) entry-point cutover.
-#[allow(dead_code)]
 pub(super) fn render_terminal_panel_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
