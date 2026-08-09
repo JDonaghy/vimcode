@@ -1,12 +1,13 @@
 //! `TuiShellApp` — TUI counterpart to `src/gtk/mod.rs`'s `impl ShellApp for
 //! App` (#493). Tracks vimcode#595.
 //!
-//! **Status: dormant scaffold, not wired into any live entry point.**
-//! `tui_main::run()` / `event_loop()` (`mod.rs:635`/`:787`) remain the live
-//! TUI path — this module compiles alongside them (same "coexistence"
-//! pattern GTK's own #448-B dormant impl used before its live cutover) and
-//! is exercised only by this module's own `#[cfg(test)]` `driver_with_shell`
-//! tests.
+//! **Status: live.** #634 (Stage 6) flipped `main.rs`/`tui_bin.rs` over to
+//! `tui_main::run` → `quadraui::tui::shell_runner::run_with_shell` and
+//! deleted `event_loop()` along with the rest of the hand-rolled bootstrap,
+//! so this module *is* the TUI. Line references to `mod.rs:NNNN` throughout
+//! this file point at the deleted loop as it stood at its final revision
+//! (`509b8fe`) — they document provenance, and `git show 509b8fe:src/
+//! tui_main/mod.rs` is the way to read them.
 //!
 //! # What's fully ported (moved, not rewritten, from `event_loop()`)
 //!
@@ -205,8 +206,8 @@
 //!
 //! Given (2) is now closed by #602, (3) is now closed by #604, and (1) is
 //! now fully closed by #605 + #635 (Stage 6b), `handle()` below implements
-//! every keyboard/mouse dispatch layer except the sidebar-focused tier (see
-//! item D below): panel-key accelerators, the "#318" Alt+menu-letter
+//! every keyboard/mouse dispatch layer the deleted loop had: panel-key
+//! accelerators, the "#318" Alt+menu-letter
 //! "reveal menu bar" shim (mirrors `mod.rs:1319`-`:1338` — sets
 //! `engine.menu_bar_visible = true` on an Alt+<letter> keypress so the same
 //! keystroke both reveals and activates the menu), the `MenuSystem`
@@ -215,10 +216,13 @@
 //! folder-picker-modal / context-menu intercepts, then the general
 //! `Engine::handle_key` fallback that also resolves command-palette and
 //! completion-popup state internally), plus — #635 (Stage 6b, item D) —
-//! activity-bar-focused and command-output-selection (`cmd_sel`) tiers. See
-//! `handle_key_pressed`'s own doc comment for the exact precedence chain,
-//! the sidebar-focused gap's full detail, and for why it's a free function
-//! rather than a `TuiShellApp` method.
+//! activity-bar-focused and command-output-selection (`cmd_sel`) tiers, and
+//! — #634 (Stage 6) — the sidebar-focused tier
+//! ([`handle_sidebar_focused_key`]), terminal/PTY key routing, the
+//! Alt-modifier block, clipboard paste pre-load, Ctrl+Shift+V, the
+//! Shift+F5/F11 debug shortcuts and the post-key epilogue. See
+//! `handle_key_pressed`'s own doc comment for the exact precedence chain and
+//! for why it's a free function rather than a `TuiShellApp` method.
 //!
 //! # Stage 6b (#635) cutover prerequisites: results
 //!
@@ -299,16 +303,15 @@
 //! See the painting section above and each function's own doc comment for
 //! the couple of minor, intentional cosmetic differences.
 //!
-//! **D. The three unported keyboard tiers — two of three done.**
-//! Activity-bar-focused (mirrors `mod.rs:1805`-`:1854`) and `cmd_sel`
-//! (mirrors `mod.rs:2651`-`:2701`) are ported in `handle_key_pressed`. The
-//! **sidebar-focused tier remains open** — at ~500 lines across five nested
-//! per-panel dispatchers (search/debug/extension-panel/source-control/
-//! explorer, plus its own context-menu intercept and Ctrl-W navigation,
-//! `mod.rs:1856`-`:2385`) it's an order of magnitude larger than the other
-//! two and wasn't safely portable in the same pass. Not a regression: a key
-//! press while `sidebar.has_focus` is true falls through to the general
-//! `Engine::handle_key` fallback, exactly as it did before this stage.
+//! **D. The three unported keyboard tiers — done.** Activity-bar-focused
+//! (mirrors `mod.rs:1805`-`:1854`) and `cmd_sel` (mirrors `mod.rs:2651`-
+//! `:2701`) landed in #635. The sidebar-focused tier — eight per-panel
+//! dispatchers (search / debug / plugin extension panel / extensions /
+//! settings / AI / source control / explorer) plus its own context-menu
+//! intercept and Ctrl-W navigation, `mod.rs:1886`-`:2415` — landed in #634
+//! as [`handle_sidebar_focused_key`], since the cutover would otherwise
+//! have dropped every one of those keys through to the general
+//! `Engine::handle_key` fallback.
 //!
 //! **E. `ShellConfig` build-out — done.** [`TuiShellApp::shell_config`]
 //! derives its panel list from the same `PANEL_*` ids
@@ -326,8 +329,9 @@
 //! to `theme.cursor`, so that's still a cosmetic difference, not a
 //! blocker.)
 //!
-//! **F. `run()`'s own non-loop responsibilities — done, as a dormant
-//! sibling.** [`super::run_via_shell`] (`mod.rs`) reproduces `run()`'s panic
+//! **F. `run()`'s own non-loop responsibilities — done.**
+//! [`super::run`] (`mod.rs`, #635's `run_via_shell` renamed when #634 made
+//! it the only entry point) reproduces the old `run()`'s panic
 //! hook, emergency-engine registration, emergency swap flush, and custom
 //! crash message around `run_with_shell` instead of `event_loop` — see its
 //! own doc comment for the exact sequencing, and [`Self::prepare_for_live_run`]
@@ -336,9 +340,8 @@
 //! `setup()` rather than staying in the wrapper: `run_with_shell` takes
 //! `app` *by value* and moves it through several stack frames before it
 //! settles, so a pointer captured before that call would already be stale.
-//! `run_via_shell` is not called from `main.rs`/`tui_bin.rs` yet — same
-//! dormant-scaffold status `TuiShellApp` itself has had since Stage 0 —
-//! wiring it in is #634's job.
+//! #634 wired it into `main.rs`/`tui_bin.rs` and deleted the loop it used
+//! to sit beside.
 //!
 //! Note that none of the above is reachable by `driver_with_shell` in the
 //! sense of proving the *live* TUI works — see the pinned note on #605:
@@ -372,14 +375,6 @@ const HAMBURGER_PANEL_ID: &str = "activity:menu";
 /// etc.) and the render-time caches `Engine` itself already uses
 /// (`sc_panel_layout`, `explorer_tree_rect`, ...).
 ///
-/// `#[allow(dead_code)]`: this is a dormant scaffold (vimcode#595 Stage 0)
-/// — not yet constructed from `main.rs`/`tui_bin.rs`, only from this
-/// module's own `#[cfg(test)]` tests, so a plain (non-test) `cargo build`
-/// sees it as never-constructed. GTK's equivalent dormant impl (#448-B)
-/// didn't need this because `App` was already live-constructed elsewhere;
-/// `TuiShellApp` has no such site yet. Remove once Stage 6 wires this into
-/// the live entry point — see `PLAN.md`'s "Staged plan" for #595.
-#[allow(dead_code)]
 pub(super) struct TuiShellApp {
     pub(super) engine: Engine,
     sidebar: TuiSidebar,
@@ -422,10 +417,6 @@ pub(super) struct TuiShellApp {
     editor_hover_popup_rect: Cell<Option<(u16, u16, u16, u16)>>,
     editor_hover_link_rects: RefCell<HoverLinkRects>,
     editor_hover_scrollbar: RefCell<Option<render::PopupScrollbarHit>>,
-    /// Last cursor position returned by `Backend::draw_editor`, cached for
-    /// whenever a runner-side consumer exists (gap 3 above). Unused today.
-    #[allow(dead_code)]
-    last_editor_cursor: Cell<Option<(u16, u16)>>,
     completion_layout: RefCell<Option<quadraui::CompletionsLayout>>,
     context_menu_layout: RefCell<Option<quadraui::ContextMenuLayout>>,
     dialog_layout: RefCell<Option<quadraui::DialogLayout>>,
@@ -468,7 +459,6 @@ pub(super) struct TuiShellApp {
     live: bool,
 }
 
-#[allow(dead_code)] // see the struct-level #[allow(dead_code)] doc above
 impl TuiShellApp {
     /// Construct the app, running the engine-only startup work that
     /// `tui_main::run()` currently does before entering raw mode
@@ -550,7 +540,6 @@ impl TuiShellApp {
             editor_hover_popup_rect: Cell::new(None),
             editor_hover_link_rects: RefCell::new(Vec::new()),
             editor_hover_scrollbar: RefCell::new(None),
-            last_editor_cursor: Cell::new(None),
             completion_layout: RefCell::new(None),
             context_menu_layout: RefCell::new(None),
             dialog_layout: RefCell::new(None),
@@ -1124,7 +1113,7 @@ impl ShellApp for TuiShellApp {
 
         // ── #635 (Stage 6b item F): live-only setup ──────────────────────
         // Gated on `self.live` (set only by `Self::prepare_for_live_run`,
-        // called only by the not-yet-wired `run_via_shell` wrapper) — see
+        // called only by the live `super::run` wrapper) — see
         // that field's doc comment for why running either of these under
         // `driver_with_shell` would be a real bug (a blocking terminal
         // round-trip, and an unsound dangling-pointer registration),
@@ -1143,7 +1132,7 @@ impl ShellApp for TuiShellApp {
             // calls this `setup`) only ever touches it through `&mut app`
             // from here on, so `self`, and therefore `&self.engine`, is at
             // its final address. `self.live` is `true` only when
-            // `run_via_shell` called `Self::prepare_for_live_run`
+            // `super::run` called `Self::prepare_for_live_run`
             // immediately before moving `self` into `run_with_shell` — see
             // that method's doc comment — so `self.engine` living for the
             // rest of the process (this fn's safety contract) holds.
@@ -2321,13 +2310,7 @@ impl ShellApp for TuiShellApp {
 /// untouched; the next stage that actually deletes `event_loop()` should
 /// collapse these back into one function.
 ///
-/// `#[allow(dead_code)]`: only called from `TuiShellApp::handle` in this
-/// module, which nothing outside this module's own `#[cfg(test)]` tests
-/// constructs yet — same dormant-scaffold reasoning as the
-/// `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the Stage 6
-/// (#605) entry-point cutover.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 fn dispatch_panel_accelerator_sizeless(
     id: &str,
     mods: quadraui::Modifiers,
@@ -2524,11 +2507,6 @@ fn dispatch_panel_accelerator_sizeless(
 /// fields. Structuring the real logic as a free function over borrowed
 /// pieces keeps it directly unit-testable against a bare `Engine`.
 ///
-/// `#[allow(dead_code)]`: only called from `TuiShellApp::handle` in this
-/// module, which nothing outside this module's own `#[cfg(test)]` tests
-/// constructs yet — same dormant-scaffold reasoning as the
-/// `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the Stage 6
-/// (#605) entry-point cutover.
 /// The sidebar-focused keyboard tier — `event_loop`'s `mod.rs:1886`-`:2415`,
 /// ported verbatim (#634, closing the last open item of #635's item D).
 ///
@@ -3048,7 +3026,6 @@ struct KeyDispatchState<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 fn handle_key_pressed(
     key: quadraui::Key,
     modifiers: quadraui::Modifiers,
@@ -5468,6 +5445,237 @@ mod tests {
             !engine.message.contains("Copied") && !engine.message.contains("clipboard"),
             "no copy should happen on a non-Ctrl+C key; message: {}",
             engine.message
+        );
+    }
+
+    // ── #634 (Stage 6): the tiers the cutover would have regressed ──────
+
+    /// The single highest-value regression guard for the cutover: with the
+    /// sidebar focused, a bare letter must be consumed by the sidebar tier,
+    /// not fall through to `Engine::handle_key` as a Vim command. Before
+    /// #634 ported `handle_sidebar_focused_key`, `x` would have deleted a
+    /// character out of the *editor buffer* while the user was navigating
+    /// the file tree.
+    #[test]
+    fn sidebar_focused_key_does_not_reach_the_editor_buffer() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "abcdef");
+        let mut sidebar = TuiSidebar::new();
+        sidebar.has_focus = true;
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let mut scratch = KeyScratch::new();
+
+        let reaction = handle_key_pressed(
+            quadraui::Key::Char('x'),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &mut scratch.state(),
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert_eq!(
+            engine.buffer().to_string(),
+            "abcdef",
+            "a sidebar-focused keypress must not reach Engine::handle_key"
+        );
+    }
+
+    /// Ctrl-W then `l` moves focus from the sidebar back to the editor
+    /// (mirrors `mod.rs:1938`-`:1972`). Two keypresses, because the chord is
+    /// stateful — the first only arms `pending_ctrl_w`.
+    #[test]
+    fn sidebar_focused_ctrl_w_l_returns_focus_to_the_editor() {
+        let mut engine = Engine::new();
+        let mut sidebar = TuiSidebar::new();
+        sidebar.has_focus = true;
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let mut scratch = KeyScratch::new();
+
+        let ctrl = quadraui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        handle_key_pressed(
+            quadraui::Key::Char('w'),
+            ctrl,
+            false,
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &mut scratch.state(),
+        );
+        assert!(sidebar.pending_ctrl_w, "Ctrl-W must arm the chord");
+        assert!(sidebar.has_focus, "Ctrl-W alone must not move focus");
+
+        handle_key_pressed(
+            quadraui::Key::Char('l'),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &mut scratch.state(),
+        );
+        assert!(!sidebar.pending_ctrl_w, "the chord must be consumed");
+        assert!(
+            !sidebar.has_focus,
+            "Ctrl-W l must return focus to the editor"
+        );
+    }
+
+    /// Alt+Right / Alt+Left resize the sidebar and clamp at 15..=150
+    /// (mirrors `mod.rs:2531`-`:2542`). `sidebar_width` lives on
+    /// [`KeyDispatchState`] precisely so this tier can mutate it.
+    #[test]
+    fn alt_arrows_resize_the_sidebar_within_the_legacy_clamps() {
+        let mut engine = Engine::new();
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let mut scratch = KeyScratch::new();
+        let alt = quadraui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+
+        let press = |key,
+                     engine: &mut Engine,
+                     sidebar: &mut TuiSidebar,
+                     folder_picker: &mut Option<FolderPickerState>,
+                     backend: &mut dyn quadraui::Backend,
+                     scratch: &mut KeyScratch| {
+            handle_key_pressed(
+                key,
+                alt,
+                false,
+                engine,
+                sidebar,
+                folder_picker,
+                false,
+                80,
+                24,
+                backend,
+                &mut scratch.state(),
+            );
+        };
+
+        press(
+            quadraui::Key::Named(quadraui::NamedKey::Right),
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            &mut backend,
+            &mut scratch,
+        );
+        assert_eq!(scratch.sidebar_width, SIDEBAR_WIDTH + 1);
+
+        scratch.sidebar_width = 15;
+        press(
+            quadraui::Key::Named(quadraui::NamedKey::Left),
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            &mut backend,
+            &mut scratch,
+        );
+        assert_eq!(scratch.sidebar_width, 15, "Alt+Left must clamp at 15");
+
+        scratch.sidebar_width = 150;
+        press(
+            quadraui::Key::Named(quadraui::NamedKey::Right),
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            &mut backend,
+            &mut scratch,
+        );
+        assert_eq!(scratch.sidebar_width, 150, "Alt+Right must clamp at 150");
+    }
+
+    /// The post-key epilogue (`mod.rs:2863`-`:2915`) — verified through its
+    /// most observable member, the quickfix scroll-into-view clamp. Before
+    /// #634 nothing wrote `quickfix_scroll_top` after construction, so a
+    /// selection past the fifth visible row simply scrolled off screen.
+    #[test]
+    fn post_key_epilogue_scrolls_the_quickfix_selection_into_view() {
+        let mut engine = Engine::new();
+        engine.quickfix_open = true;
+        engine.quickfix_selected = 9;
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let mut scratch = KeyScratch::new();
+
+        handle_key_pressed(
+            // Any key that reaches the general fallback will do; Escape is
+            // inert in Normal mode.
+            quadraui::Key::Named(quadraui::NamedKey::Escape),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &mut scratch.state(),
+        );
+
+        // 6 panel rows − 1 header = 5 visible; selection 9 ⇒ top 5.
+        assert_eq!(scratch.quickfix_scroll_top, 5);
+
+        engine.quickfix_open = false;
+        handle_key_pressed(
+            quadraui::Key::Named(quadraui::NamedKey::Escape),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &mut scratch.state(),
+        );
+        assert_eq!(
+            scratch.quickfix_scroll_top, 0,
+            "closing the quickfix panel resets its scroll"
+        );
+    }
+
+    /// Bracketed paste. The runner turns crossterm's `Event::Paste` into
+    /// `UiEvent::ClipboardPaste`; `TuiShellApp::handle`'s catch-all `_` arm
+    /// used to swallow it, so pasting into the TUI did nothing at all.
+    #[test]
+    fn bracketed_paste_reaches_the_buffer_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.mode = crate::core::Mode::Insert;
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.dispatch(UiEvent::ClipboardPaste("ZQXW_PASTE_MARKER".to_string()));
+        driver.render();
+        assert!(
+            driver.screen_contains("ZQXW_PASTE_MARKER"),
+            "UiEvent::ClipboardPaste must route through Engine::route_paste; screen:\n{}",
+            driver.screen()
         );
     }
 }

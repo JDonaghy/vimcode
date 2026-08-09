@@ -41,7 +41,7 @@ use render_impl::*;
 /// Global debug log file handle, set once at startup via `--debug <path>`.
 static DEBUG_LOG: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
-/// Initialise the debug log.  Call once before the event loop starts.
+/// Initialise the debug log.  Call once before the shell runner starts.
 fn init_debug_log(path: &str) {
     match std::fs::File::create(path) {
         Ok(f) => {
@@ -497,19 +497,23 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
     }
 }
 
-/// #635 (Stage 6b item F): dormant sibling to [`run`], wired the same way
-/// `TuiShellApp` itself has been since Stage 0 (see that struct's module
-/// doc) — not called from `main.rs`/`tui_bin.rs` yet, only compiled.
-/// Flipping the live entry point over to this is #634's job; this issue
-/// only has to make that flip a pure function swap, with nothing left to
-/// figure out about sequencing at that point.
+/// The TUI entry point: initialise the engine and drive it through
+/// `quadraui::tui::shell_runner::run_with_shell`.
 ///
-/// Establishes `run()`'s non-loop responsibilities — the panic hook,
-/// emergency-engine registration, the emergency swap flush, and the custom
-/// crash message — around `quadraui::tui::shell_runner::run_with_shell`
-/// instead of [`event_loop`].
+/// #634 (Stage 6, vimcode#595): this *is* the live path now. It started life
+/// in #635 (Stage 6b item F) as `run_via_shell`, a dormant sibling of the
+/// hand-rolled `run()`/`event_loop()` pair, precisely so that flipping
+/// `main.rs`/`tui_bin.rs` over would be a rename plus a deletion rather than
+/// a re-architecture. The old `run()`, `event_loop()` (~2,130 lines) and
+/// `restore_terminal()` are gone; `git show 509b8fe:src/tui_main/mod.rs`
+/// reads them at their final revision, which is what the `mod.rs:NNNN` line
+/// references scattered through `shell_app.rs` point at.
 ///
-/// Unlike `run()`, this does **not** do its own raw-mode / alternate-screen
+/// Keeps the non-loop responsibilities the old `run()` owned — the panic
+/// hook, emergency-engine registration, the emergency swap flush, and the
+/// custom crash message — around `run_with_shell`.
+///
+/// Unlike the old `run()`, this does **not** do its own raw-mode / alternate-screen
 /// / mouse-capture / keyboard-enhancement terminal setup or teardown:
 /// `run_with_shell` → `quadraui::tui::run::run` (`quadraui/src/tui/run.rs`)
 /// already does all of that internally (`enable_raw_mode`,
@@ -519,8 +523,8 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
 /// via `resume_unwind`. That's exactly what makes wrapping it in a second,
 /// outer `catch_unwind` here safe and sufficient: this closure's
 /// `catch_unwind` still observes the same panic payload, with the terminal
-/// already back to normal, the same guarantee `run()`'s own outer
-/// `catch_unwind` relies on around `event_loop`.
+/// already back to normal, the same guarantee the old `run()`'s own outer
+/// `catch_unwind` relied on around `event_loop`.
 ///
 /// `keyboard_enhanced` (threaded into `translate_key` for Ctrl-combo
 /// disambiguation) and the emergency-engine pointer registration both move
@@ -533,7 +537,6 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
 /// pointer captured here, before that call, would already be stale by the
 /// time anything could read it — `setup()` runs only after all of those
 /// moves are done.
-#[allow(dead_code)]
 pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     if let Some(ref path) = debug_log_path {
         init_debug_log(path);
@@ -545,7 +548,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
 
     // Always install a panic hook that writes crash info to
     // /tmp/vimcode-crash.log AND to the debug log (if --debug is active) —
-    // verbatim copy of `run()`'s own hook above.
+    // verbatim copy of the deleted `run()`'s own hook.
     {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -568,7 +571,7 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     }));
 
     if let Err(e) = result {
-        // Unlike `run()`, there is no locally-owned `engine` left to call
+        // Unlike the deleted `run()`, there is no locally-owned `engine` to call
         // `emergency_swap_flush()` on directly here — `app` (and its
         // `engine`) moved into `run_with_shell` above and is gone by the
         // time a panic unwinds back to this frame. The panic hook already

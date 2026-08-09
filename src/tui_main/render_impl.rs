@@ -132,12 +132,6 @@ pub(super) fn build_screen_for_tui(
 /// [`bottom_chrome_rects_for_shell_content`]'s `Constraint::Min(0)` editor
 /// chunk over the same `area`, which likewise has no menu term.
 ///
-/// `#[allow(dead_code)]`: only called from `TuiShellApp::render_content`
-/// (`shell_app.rs`), which nothing outside that module's own
-/// `#[cfg(test)]` tests constructs yet — same dormant-scaffold reasoning as
-/// the `#[allow(dead_code)]` on `TuiShellApp` itself. Goes live at the
-/// Stage 6 (#605) entry-point cutover.
-#[allow(dead_code)]
 pub(super) fn build_screen_for_shell_content(
     engine: &Engine,
     theme: &Theme,
@@ -223,13 +217,6 @@ pub(super) fn build_screen_for_shell_content(
 /// `draw_frame`, is therefore the only option that doesn't require a much
 /// larger `ShellConfig`/layout-model change.
 ///
-/// `#[allow(dead_code)]` (both this struct and
-/// [`bottom_chrome_rects_for_shell_content`] below): only constructed from
-/// `TuiShellApp::render_content` (`shell_app.rs`), which nothing outside
-/// that module's own `#[cfg(test)]` tests constructs yet — same
-/// dormant-scaffold reasoning as the `#[allow(dead_code)]` on `TuiShellApp`
-/// itself. Goes live at the Stage 6 (#605) entry-point cutover.
-#[allow(dead_code)]
 pub(super) struct BottomChromeRects {
     pub(super) quickfix: Rect,
     pub(super) bottom_panel: Rect,
@@ -240,7 +227,6 @@ pub(super) struct BottomChromeRects {
     pub(super) cmd: Rect,
 }
 
-#[allow(dead_code)]
 pub(super) fn bottom_chrome_rects_for_shell_content(
     engine: &Engine,
     screen: &render::ScreenLayout,
