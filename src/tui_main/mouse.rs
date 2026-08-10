@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::core::engine::TabBarClickTarget;
+
 /// Compute the `grab_offset` to seed [`quadraui::DragTarget::ScrollbarY`]
 /// at click-down time so the thumb doesn't jump out from under the cursor.
 ///
@@ -1498,9 +1500,14 @@ pub(super) fn handle_mouse(
 
         // Right-click on tab bar → open tab context menu.
         //
-        // B5c.2: hit-test via primitive `bar.layout(...).hit_test(...)`
-        // — same code path the rasteriser uses to paint, so click
-        // resolution doesn't drift from the rendered positions.
+        // #654: hit-test via the cached `hit_regions` (built once by
+        // `render::compute_tab_bar_hit_regions` during
+        // `build_screen_layout`) rather than rebuilding the primitive and
+        // re-measuring every tab here. Left-click routing (below) and the
+        // drag-slot map already read those regions, so all three now share
+        // one geometry — the duplicate `name.chars().count() +
+        // TAB_CLOSE_COLS` measurers this replaced had already drifted once
+        // (#477) and were the last hand-rolled tab widths in the TUI.
         if col >= editor_left {
             let rel_col = col - editor_left;
             if let Some(layout) = last_layout {
@@ -1516,36 +1523,9 @@ pub(super) fn handle_mouse(
                         let gw = gtb.bounds.width as u16;
                         if row == tab_bar_row && col >= gx && col < gx + gw {
                             let local_col = col - gx;
-                            let bar = render::build_tab_bar_primitive(
-                                &gtb.tabs,
-                                false,
-                                gtb.diff_toolbar.as_ref(),
-                                gtb.tab_scroll_offset,
-                                None,
-                            );
-                            let tab_widths: Vec<usize> = gtb
-                                .tabs
-                                .iter()
-                                .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
-                                .collect();
-                            let bar_layout = bar.layout(
-                                gw as f32,
-                                1.0,
-                                0.0,
-                                |i| {
-                                    quadraui::TabMeasure::new(
-                                        tab_widths[i] as f32,
-                                        render::TAB_CLOSE_COLS as f32,
-                                    )
-                                },
-                                |i| {
-                                    quadraui::SegmentMeasure::new(
-                                        bar.right_segments[i].width_cells as f32,
-                                    )
-                                },
-                            );
-                            if let quadraui::TabBarHit::Tab(i) | quadraui::TabBarHit::TabClose(i) =
-                                bar_layout.hit_test(local_col as f32, 0.0)
+                            if let Some(
+                                TabBarClickTarget::Tab(i) | TabBarClickTarget::CloseTab(i),
+                            ) = render::resolve_tab_bar_click(&gtb.hit_regions, local_col)
                             {
                                 engine.open_tab_context_menu(gtb.group_id, i, col, row + 1);
                                 return sidebar_width;
@@ -1556,40 +1536,8 @@ pub(super) fn handle_mouse(
                 } else {
                     // Single-group tab bar (row == menu_rows)
                     if row == menu_rows && !engine.is_tab_bar_hidden(engine.active_group) {
-                        let editor_col_width = terminal_size
-                            .map(|s| s.width)
-                            .unwrap_or(80)
-                            .saturating_sub(editor_left);
-                        let bar = render::build_tab_bar_primitive(
-                            &layout.tab_bar,
-                            true,
-                            layout.diff_toolbar.as_ref(),
-                            layout.tab_scroll_offset,
-                            None,
-                        );
-                        let tab_widths: Vec<usize> = layout
-                            .tab_bar
-                            .iter()
-                            .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
-                            .collect();
-                        let bar_layout = bar.layout(
-                            editor_col_width as f32,
-                            1.0,
-                            0.0,
-                            |i| {
-                                quadraui::TabMeasure::new(
-                                    tab_widths[i] as f32,
-                                    render::TAB_CLOSE_COLS as f32,
-                                )
-                            },
-                            |i| {
-                                quadraui::SegmentMeasure::new(
-                                    bar.right_segments[i].width_cells as f32,
-                                )
-                            },
-                        );
-                        if let quadraui::TabBarHit::Tab(i) | quadraui::TabBarHit::TabClose(i) =
-                            bar_layout.hit_test(rel_col as f32, 0.0)
+                        if let Some(TabBarClickTarget::Tab(i) | TabBarClickTarget::CloseTab(i)) =
+                            render::resolve_tab_bar_click(&layout.tab_bar_hit_regions, rel_col)
                         {
                             engine.open_tab_context_menu(engine.active_group, i, col, row + 1);
                             return sidebar_width;
@@ -1821,8 +1769,7 @@ pub(super) fn handle_mouse(
                                 engine,
                                 gtb.group_id,
                                 local_col,
-                                &gtb.tabs,
-                                gtb.tab_scroll_offset,
+                                &gtb.hit_regions,
                             );
                             break;
                         }
@@ -1832,8 +1779,7 @@ pub(super) fn handle_mouse(
                         engine,
                         engine.active_group,
                         rel_col,
-                        &layout.tab_bar,
-                        layout.tab_scroll_offset,
+                        &layout.tab_bar_hit_regions,
                     );
                 }
             }
@@ -2717,7 +2663,6 @@ pub(super) fn handle_mouse(
                         crate::render::resolve_tab_bar_click(&gtb.hit_regions, local_col)
                     });
                 if let Some(target) = hit_target {
-                    use crate::core::engine::TabBarClickTarget;
                     match target {
                         TabBarClickTarget::Tab(_) => {
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
@@ -2756,44 +2701,21 @@ pub(super) fn handle_mouse(
             && layout.editor_group_split.is_none()
             && !engine.is_tab_bar_hidden(engine.active_group)
         {
-            let editor_col_width = terminal_size
-                .map(|s| s.width)
-                .unwrap_or(80)
-                .saturating_sub(editor_left);
-            let bar_width = editor_col_width;
+            // #654: the last hand-rolled tab geometry in the TUI — this used
+            // to rebuild the `TabBar` primitive and re-measure every tab with
+            // `name.chars().count() + TAB_CLOSE_COLS` before calling
+            // `hit_test`. The split-group branch above, the tooltip lookup and
+            // the drag-slot map all already read `hit_regions`, so this now
+            // does too: one geometry, computed once in `build_screen_layout`.
             let local_col = rel_col;
-            let scroll_offset = layout.tab_scroll_offset;
-
-            // B5c.2: hand-rolled tab/diff/split geometry replaced by the
-            // primitive's `hit_test` so the click resolution uses the
-            // exact same layout the rasteriser painted.
-            let bar = render::build_tab_bar_primitive(
-                &layout.tab_bar,
-                true,
-                layout.diff_toolbar.as_ref(),
-                scroll_offset,
-                None,
-            );
-            let tab_widths: Vec<usize> = layout
-                .tab_bar
-                .iter()
-                .map(|t| t.name.chars().count() + render::TAB_CLOSE_COLS as usize)
-                .collect();
-            let bar_layout = bar.layout(
-                bar_width as f32,
-                1.0,
-                0.0,
-                |i| quadraui::TabMeasure::new(tab_widths[i] as f32, render::TAB_CLOSE_COLS as f32),
-                |i| quadraui::SegmentMeasure::new(bar.right_segments[i].width_cells as f32),
-            );
-            match bar_layout.hit_test(local_col as f32, 0.0) {
-                quadraui::TabBarHit::Tab(i) => {
+            match render::resolve_tab_bar_click(&layout.tab_bar_hit_regions, local_col) {
+                Some(TabBarClickTarget::Tab(i)) => {
                     if i < engine.active_group().tabs.len() {
                         engine.goto_tab(i);
                         *tab_drag_start = Some((col, row));
                     }
                 }
-                quadraui::TabBarHit::TabClose(i) => {
+                Some(TabBarClickTarget::CloseTab(i)) => {
                     if i < engine.active_group().tabs.len() {
                         engine.active_group_mut().active_tab = i;
                         engine.line_annotations.clear();
@@ -2804,36 +2726,36 @@ pub(super) fn handle_mouse(
                         }
                     }
                 }
-                quadraui::TabBarHit::RightSegment(id) => {
+                Some(target) => {
                     let has_win = engine.windows.contains_key(&engine.active_window_id());
-                    match id.as_str() {
-                        "tab:diff_prev" => {
+                    match target {
+                        TabBarClickTarget::DiffPrev => {
                             if has_win {
                                 engine.jump_prev_hunk();
                             }
                         }
-                        "tab:diff_next" => {
+                        TabBarClickTarget::DiffNext => {
                             if has_win {
                                 engine.jump_next_hunk();
                             }
                         }
-                        "tab:diff_toggle" => {
+                        TabBarClickTarget::DiffToggle => {
                             engine.diff_toggle_hide_unchanged();
                         }
-                        "tab:split_right" => {
+                        TabBarClickTarget::SplitRight => {
                             engine.open_editor_group(SplitDirection::Vertical);
                         }
-                        "tab:split_down" => {
+                        TabBarClickTarget::SplitDown => {
                             engine.open_editor_group(SplitDirection::Horizontal);
                         }
-                        "tab:action_menu" => {
+                        TabBarClickTarget::ActionMenu => {
                             // #434: pass tab-row height (1.0 row in TUI).
                             engine.open_editor_action_menu(engine.active_group, col, row, 1.0);
                         }
-                        _ => {}
+                        TabBarClickTarget::Tab(_) | TabBarClickTarget::CloseTab(_) => {}
                     }
                 }
-                _ => {}
+                None => {}
             }
             return sidebar_width;
         }
