@@ -78,6 +78,16 @@ pub(super) struct Harness<A: AppLogic> {
     /// — the source for per-editor-window pixel rects (see
     /// [`Self::window_center`]).
     pub screen_layout: Rc<RefCell<Option<crate::render::ScreenLayout>>>,
+    /// Absolute visible tab-slot x-ranges per group (`group_id.0` →
+    /// `[(x0, x1)]`) captured by the last `render_content` pass — the tab-bar
+    /// twin of `screen_layout`'s window rects, so a test can aim a click at the
+    /// tab the rasteriser actually drew instead of guessing pixel offsets
+    /// (#553).
+    pub tab_slots_abs: Rc<RefCell<super::TabSlotsAbsMap>>,
+    /// Absolute close-button (`×`) geometry per group: `(bar_top, bar_bottom,
+    /// per-tab Option<(x0, x1)>)`, keyed by `group_id.0`. Same provenance and
+    /// purpose as [`Self::tab_slots_abs`] (#553).
+    pub tab_close_abs: Rc<RefCell<super::TabCloseAbsMap>>,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -100,6 +110,43 @@ impl<A: AppLogic> Harness<A> {
             (rw.rect.y + rw.rect.height / 2.0) as f32,
         ))
     }
+
+    /// Centre point (absolute pixels) of tab `tab_idx` in `group_id`'s tab bar,
+    /// as the last frame painted it. `None` if that tab was scrolled off or the
+    /// group drew no tab bar.
+    ///
+    /// Like [`Self::window_center`], this reads the geometry the *rasteriser*
+    /// reported (`Backend::tab_bar_layout`), so tests never hardcode tab
+    /// coordinates (#553).
+    pub fn tab_center(
+        &self,
+        group_id: crate::core::window::GroupId,
+        tab_idx: usize,
+    ) -> Option<(f32, f32)> {
+        let (bar_top, bar_bottom, _) = *self.tab_close_abs.borrow().get(&group_id.0)?;
+        let slots = self.tab_slots_abs.borrow();
+        let &(x0, x1) = slots.get(&group_id.0)?.get(tab_idx)?;
+        if x1 <= x0 {
+            return None;
+        }
+        Some(((x0 + x1) / 2.0, ((bar_top + bar_bottom) / 2.0) as f32))
+    }
+
+    /// Centre point (absolute pixels) of tab `tab_idx`'s close (`×`) button.
+    /// `None` if that tab drew no close button this frame (#553).
+    pub fn tab_close_center(
+        &self,
+        group_id: crate::core::window::GroupId,
+        tab_idx: usize,
+    ) -> Option<(f32, f32)> {
+        let close = self.tab_close_abs.borrow();
+        let (bar_top, bar_bottom, per_tab) = close.get(&group_id.0)?;
+        let (x0, x1) = (*per_tab.get(tab_idx)?)?;
+        Some((
+            ((x0 + x1) / 2.0) as f32,
+            ((bar_top + bar_bottom) / 2.0) as f32,
+        ))
+    }
 }
 
 /// Wrap `engine` in the real GTK [`App`] + the live
@@ -114,10 +161,14 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let app = App::new_headless(Rc::clone(&engine));
     let config = super::build_shell_config(&app);
     let screen_layout = Rc::clone(&app.cached_screen_layout);
+    let tab_slots_abs = Rc::clone(&app.cached_tab_slots_abs);
+    let tab_close_abs = Rc::clone(&app.cached_tab_close_abs);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
         screen_layout,
+        tab_slots_abs,
+        tab_close_abs,
     }
 }
 
@@ -239,5 +290,66 @@ mod tests {
                 "wheel over the focused pane must not disturb the other pane"
             );
         }
+    }
+
+    /// Three tabs in the default **single** editor group — the exact shape
+    /// #553 reports as dead (tab clicks came back to life as soon as a second
+    /// group existed).
+    fn engine_with_three_tabs_one_group() -> Engine {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "alpha");
+        engine.new_tab(None);
+        engine.new_tab(None);
+        engine
+    }
+
+    /// #553: with a single tab group, clicking a non-active tab must activate
+    /// it. Regression from the #540 Relm4→ShellApp migration — the split-group
+    /// path worked, the single-group path did not.
+    #[test]
+    fn single_group_tab_click_activates_that_tab() {
+        let mut h = harness(engine_with_three_tabs_one_group(), 1400, 900);
+        let group = h.engine.borrow().active_group;
+        assert_eq!(
+            h.engine.borrow().editor_groups[&group].tabs.len(),
+            3,
+            "fixture must open three tabs in one group"
+        );
+        assert_eq!(
+            h.engine.borrow().editor_groups[&group].active_tab,
+            2,
+            "`new_tab` activates the tab it creates"
+        );
+
+        let (x, y) = h
+            .tab_center(group, 0)
+            .expect("the single-group tab bar must have painted tab 0");
+        h.driver.click(x, y);
+
+        assert_eq!(
+            h.engine.borrow().editor_groups[&group].active_tab,
+            0,
+            "clicking tab 0 in a single-group layout must activate it"
+        );
+    }
+
+    /// #553: with a single tab group, clicking a tab's × must close it.
+    #[test]
+    fn single_group_tab_close_button_closes_that_tab() {
+        let mut h = harness(engine_with_three_tabs_one_group(), 1400, 900);
+        let group = h.engine.borrow().active_group;
+        let before = h.engine.borrow().editor_groups[&group].tabs.len();
+        assert_eq!(before, 3);
+
+        let (x, y) = h
+            .tab_close_center(group, 0)
+            .expect("the single-group tab bar must have painted tab 0's close button");
+        h.driver.click(x, y);
+
+        assert_eq!(
+            h.engine.borrow().editor_groups[&group].tabs.len(),
+            before - 1,
+            "clicking a tab's × in a single-group layout must close it"
+        );
     }
 }
