@@ -118,6 +118,15 @@ impl<A: AppLogic> Harness<A> {
     /// Like [`Self::window_center`], this reads the geometry the *rasteriser*
     /// reported (`Backend::tab_bar_layout`), so tests never hardcode tab
     /// coordinates (#553).
+    ///
+    /// Reads its y-centre from `tab_close_abs` (the bar's `(top, bottom)`) and
+    /// its x-centre from the separate `tab_slots_abs` map — both populated
+    /// together, for the same `group_id`, from the same `render_content` pass
+    /// (`App::cached_tab_close_abs` / `cached_tab_slots_abs` are inserted back
+    /// to back per group in the tab-bar draw loop). If that ever split across
+    /// two passes, a group present in only one map would silently return
+    /// `None` here instead of a stale-but-visible tab centre — acceptable for
+    /// a test helper, but worth knowing if this invariant ever changes.
     pub fn tab_center(
         &self,
         group_id: crate::core::window::GroupId,
