@@ -110,13 +110,13 @@ All non-trivial work should be tracked via GitHub Issues.
 ## Commands & Quality Checks
 
 ```bash
-cargo build                       # Compile
-cargo test --no-default-features  # Run all tests
+cargo build                       # Compile (GUI on — needs GTK4 dev libs)
+cargo test                        # Run all tests, BOTH backends (see Testing)
 cargo clippy -- -D warnings       # Lint (must pass)
 cargo fmt                         # Format
 ```
 
-**MANDATORY before commits:** Run all four commands above. If any fails, fix and re-run. `cargo test --no-default-features --lib` is faster for dev loops but the full suite is the pre-commit gate.
+**MANDATORY before commits:** Run all four commands above. If any fails, fix and re-run. `cargo test --no-default-features --lib` is faster for dev loops, but plain `cargo test` (GUI-on) is the pre-commit gate — the `--no-default-features` variant never compiles `src/gtk/` and cannot catch a GTK regression (#645).
 
 ## Code Style
 - `rustfmt` defaults (4-space indent)
@@ -125,13 +125,42 @@ cargo fmt                         # Format
 - Tests in `#[cfg(test)] mod tests` at file bottom
 
 ## Testing (CRITICAL)
-- **Full test suite:** `cargo test --no-default-features` — lib + integration tests
+- **Full test suite:** `cargo test` (default features, GUI on) — lib + integration tests + the `vimcode` bin's GTK/render unit tests
 - **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only
+
+### Test lanes: which command covers which backend (#645)
+
+| Command | Compiles | Covers |
+|---------|----------|--------|
+| `cargo test` (default = `gui` on) | everything: lib, `vcd`, all integration tests, **plus** the `vimcode` bin (`src/gtk/`, bin-side `render`) | **both backends** — strict superset of the TUI lane |
+| `cargo test --no-default-features` | lib, `vcd`, integration tests only — `src/gtk/` is **never compiled** | TUI/core only |
+
+- The two lanes compile *identical* code for every shared target — no
+  `cfg(feature = "gui")` exists outside the `vimcode` bin target — so the GUI
+  lane is a strict superset of the TUI lane's test coverage. The TUI lane's
+  only unique value is compile-hygiene: proving vimcode still builds on a
+  machine without GTK dev libs (CI keeps a `--no-default-features` job for
+  exactly that).
+- **A green `--no-default-features` run says NOTHING about GTK code.** Reading
+  it as cross-backend coverage is the misread #645 exists to prevent: the Test
+  stage reported `passed` on GTK bug fixes whose GTK code it never compiled.
+- The GUI lane runs **headlessly** — no `DISPLAY` or `WAYLAND_DISPLAY` needed.
+  The GTK tests paint into in-memory Cairo `ImageSurface`s (the quadraui#301
+  `GtkDriver` pattern); nothing calls `gtk::init`.
+- **Display policy:** every test must pass with no `DISPLAY` set. Any future
+  test that genuinely needs a live display must be `#[ignore]`-gated with a
+  comment saying why. As of #645 there are none.
+- Coordinator Test-stage recommendation (measured on a 20-core machine, warm
+  shared dependency cache): fresh-worktree `cargo test` ≈ 50s vs 34s for the
+  TUI lane; incremental after a core edit ≈ 19s vs 15s. The GUI lane's extra
+  cost is small and it subsumes the TUI lane's tests, so the recommended
+  `test_command` is **`cargo test`** (one lane; CI covers no-GTK build
+  hygiene).
 
 ### Coordinator pipeline: the **Test stage** (read this if you are a smoke / test-stage agent)
 The coordinator drives issues through `Work → Test → Review → Merge`. The **Test stage is a separate step from the work that built the branch — do NOT redo the worker's job:**
 - **ALWAYS pull the prebuilt artifact** with `coord pull-artifact <work_aid>`. Do **NOT** run `cargo build` / `cargo test` yourself — the work-stage worker already compiled the binary and ran the full suite before finishing. Rebuilding or re-testing here **pins the CPU for zero new signal**.
-- **Do NOT run the full test suite** (`cargo test --no-default-features`) at the Test stage. It already ran at the Work stage. The Test stage is **black-box behavior validation + user smoke**: drive the *pulled* binary, exercise the changed behavior end-to-end, and confirm it does what the issue asks.
+- **Do NOT run the full test suite** (`cargo test`) at the Test stage. It already ran at the Work stage. The Test stage is **black-box behavior validation + user smoke**: drive the *pulled* binary, exercise the changed behavior end-to-end, and confirm it does what the issue asks.
 - The "**MANDATORY before commits: run all four commands**" rule above is for the **work-stage worker authoring the change**, NOT for the test-stage agent.
 - Record the verdict with `coord test --passed <work_aid>` or `coord test --fail <work_aid> --reason "<full repro: expected vs actual, steps, suspected files>"`.
 
