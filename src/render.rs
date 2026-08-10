@@ -12723,6 +12723,106 @@ pub enum GutterAction {
     ToggleFold(usize),
 }
 
+/// One group's tab-bar hit band: the rectangle a click must land in for
+/// [`screen_zone_hit_test`] to report [`ScreenZone::TabBar`] for that group.
+///
+/// Deliberately mirrors [`TabBarDrawTarget`] on the *click* side (#553 — the
+/// counterpart of #549's draw-loop unification): both are "which groups have a
+/// tab bar this frame, and where is it?", so they must not be re-derived by two
+/// independently-drifting branches. `TabBarDrawTarget` can't just be reused
+/// here because it needs an `&Engine` and the backend's own single-group rect,
+/// neither of which a pure hit-test over a cached `ScreenLayout` has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabBarHitBand {
+    pub group_id: GroupId,
+    /// Left edge of the bar, in the caller's coordinate space.
+    pub x: f64,
+    /// Top edge of the reserved tab-bar band (tab row + breadcrumb row, if on).
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl TabBarHitBand {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        y >= self.y && y < self.y + self.height && x >= self.x && x < self.x + self.width
+    }
+}
+
+/// The tab-bar hit bands for every group that drew a tab bar this frame.
+///
+/// Single-group and split-group layouts used to derive this inline in two
+/// separate `if let Some(split) = ... else { ... }` arms of
+/// [`screen_zone_hit_test`], and drifted: the single-group arm hardcoded the
+/// bar's top at `y >= 0.0` instead of deriving it from the window rects the way
+/// the split arm did, so once #552 gave GTK a persistent menu/title-bar band
+/// (`main_content_bounds.y > 0`) single-group tab clicks — activate *and* close
+/// — silently stopped matching, while split layouts kept working (#546
+/// FAILED-3, #553). Both arms now go through this one function so the two
+/// shapes cannot diverge again.
+///
+/// In both cases the band's top edge comes from the *window content* top edge
+/// minus `tab_bar_height`; the bar is drawn immediately above the content it
+/// belongs to. `single_tab_hidden` is `is_tab_bar_hidden(active_group)`, which
+/// can only be true in single-group mode (it requires `leaf_count() <= 1`), so
+/// the split arm needs no equivalent filter.
+pub fn tab_bar_hit_bands(
+    layout: &ScreenLayout,
+    tab_bar_height: f64,
+    single_tab_hidden: bool,
+    active_group: GroupId,
+) -> Vec<TabBarHitBand> {
+    if let Some(ref split) = layout.editor_group_split {
+        return split
+            .group_tab_bars
+            .iter()
+            .filter(|gtb| gtb.bounds.width > 0.0)
+            .map(|gtb| TabBarHitBand {
+                group_id: gtb.group_id,
+                x: gtb.bounds.x,
+                y: gtb.bounds.y - tab_bar_height,
+                width: gtb.bounds.width,
+                height: tab_bar_height,
+            })
+            .collect();
+    }
+    if single_tab_hidden || layout.tab_bar.is_empty() || layout.windows.is_empty() {
+        return Vec::new();
+    }
+    // Single group: there is no per-group `bounds`, so derive the bar from the
+    // bounding box of the window rects it sits above — the same source of truth
+    // `GroupTabBar::bounds` gives the split arm. `x`/`y` and the window rects
+    // live in whatever space the caller built `ScreenLayout` in; TUI's is
+    // content-relative (window rects start at `tab_bar_height`), GTK's is
+    // absolute screen space anchored at `main_content_bounds`.
+    let min_x = layout
+        .windows
+        .iter()
+        .map(|w| w.rect.x)
+        .fold(f64::MAX, f64::min);
+    let min_y = layout
+        .windows
+        .iter()
+        .map(|w| w.rect.y)
+        .fold(f64::MAX, f64::min);
+    let max_x = layout
+        .windows
+        .iter()
+        .map(|w| w.rect.x + w.rect.width)
+        .fold(f64::MIN, f64::max);
+    let width = max_x - min_x;
+    if width <= 0.0 {
+        return Vec::new();
+    }
+    vec![TabBarHitBand {
+        group_id: active_group,
+        x: min_x,
+        y: min_y - tab_bar_height,
+        width,
+        height: tab_bar_height,
+    }]
+}
+
 /// Determine which top-level screen zone a point falls in.
 ///
 /// `x` and `y` are in the editor content-bounds coordinate system.
@@ -12742,55 +12842,15 @@ pub fn screen_zone_hit_test(
     active_group: GroupId,
 ) -> ScreenZone {
     // 1. Tab bars — check before windows because tab bars sit just above
-    //    the window content area within the same group bounds.
-    if let Some(ref split) = layout.editor_group_split {
-        for gtb in &split.group_tab_bars {
-            let b = &gtb.bounds;
-            let tab_y = b.y - tab_bar_height;
-            if y >= tab_y && y < tab_y + tab_bar_height && x >= b.x && x < b.x + b.width {
-                return ScreenZone::TabBar {
-                    group_id: gtb.group_id,
-                    local_x: x - b.x,
-                    bar_width: b.width,
-                };
-            }
-        }
-    } else if !single_tab_hidden && !layout.tab_bar.is_empty() && !layout.windows.is_empty() {
-        // Derive the bar's bounds from the window rects it sits above —
-        // the same source of truth the multi-group branch above uses via
-        // `GroupTabBar::bounds` — instead of assuming the bar starts at
-        // the coordinate-system origin. `x`/`y` and every window rect
-        // here live in whatever space the caller built `ScreenLayout` in;
-        // TUI's is content-relative (window rects start at `tab_bar_height`,
-        // so this is equivalent to the old `y >= 0.0` shortcut), but GTK's
-        // is absolute screen space (`editor_bounds` is anchored at
-        // `main_content_bounds.x/y`, which is only `(0, 0)` when there is
-        // no chrome above the editor). Since #552 gave GTK a persistent
-        // menu/title-bar band, `main_content_bounds.y` is routinely > 0,
-        // so the old hardcoded-origin check silently stopped matching any
-        // real click — the single-group tab bar (and its close button)
-        // went dead while the multi-group path kept working (#546 FAILED-3).
-        let min_x = layout
-            .windows
-            .iter()
-            .map(|w| w.rect.x)
-            .fold(f64::MAX, f64::min);
-        let min_y = layout
-            .windows
-            .iter()
-            .map(|w| w.rect.y)
-            .fold(f64::MAX, f64::min);
-        let max_x = layout
-            .windows
-            .iter()
-            .map(|w| w.rect.x + w.rect.width)
-            .fold(f64::MIN, f64::max);
-        let tab_y = min_y - tab_bar_height;
-        if y >= tab_y && y < tab_y + tab_bar_height && x >= min_x && x < max_x {
+    //    the window content area within the same group bounds. Split and
+    //    single-group layouts share one derivation (`tab_bar_hit_bands`) so the
+    //    two can't drift apart again the way they did in #546/#553.
+    for band in tab_bar_hit_bands(layout, tab_bar_height, single_tab_hidden, active_group) {
+        if band.contains(x, y) {
             return ScreenZone::TabBar {
-                group_id: active_group,
-                local_x: x - min_x,
-                bar_width: max_x - min_x,
+                group_id: band.group_id,
+                local_x: x - band.x,
+                bar_width: band.width,
             };
         }
     }
@@ -16426,6 +16486,83 @@ mod tests {
             matches!(zone, ScreenZone::Window { .. }),
             "click below the tab bar should hit Window zone, got {zone:?}"
         );
+    }
+
+    /// #553 (click-side counterpart of #549's draw-loop unification): the
+    /// single-group and split-group tab-bar hit bands come out of ONE
+    /// derivation, and in both shapes the band's top edge is
+    /// `window_content_top - tab_bar_height` — never a hardcoded origin.
+    ///
+    /// The regression this guards is asymmetric by construction: with a
+    /// chrome-shifted content origin the split arm kept working (it derived the
+    /// top from `GroupTabBar::bounds`) while the single arm went dead (it
+    /// assumed `y >= 0.0`), which is exactly the "works with 2+ groups, dead
+    /// with 1" symptom #553 reports. So both shapes are asserted here against
+    /// the same offset layout.
+    #[test]
+    fn test_tab_bar_hit_bands_single_and_split_share_one_derivation() {
+        use crate::core::engine::Engine;
+        use crate::core::window::{SplitDirection, WindowRect};
+
+        let line_height = 20.0;
+        let char_width = 8.0;
+        let tbh = tab_bar_height_px(line_height, false);
+        // Chrome-shifted content origin — the #552 menu/title-bar band.
+        let content = WindowRect::new(50.0, 100.0, 800.0, 600.0);
+        let theme = Theme::onedark();
+
+        // ── Single group ──────────────────────────────────────────────────
+        let mut engine = Engine::new();
+        engine.new_tab(None); // 2 tabs, so `hide_single_tab` can't suppress the bar
+        let (rects, _) = engine.calculate_group_window_rects(content, tbh);
+        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let bands = tab_bar_hit_bands(
+            &layout,
+            tbh,
+            engine.is_tab_bar_hidden(engine.active_group),
+            engine.active_group,
+        );
+        assert_eq!(bands.len(), 1, "one group draws one tab bar: {bands:?}");
+        assert_eq!(bands[0].group_id, engine.active_group);
+        assert_eq!(
+            bands[0].y, content.y,
+            "the single-group band must start at the *content* origin minus the bar height, \
+             not at 0.0 (#546 FAILED-3 / #553): {bands:?}"
+        );
+        assert!(bands[0].contains(content.x + 5.0, content.y + 2.0));
+        assert!(
+            !bands[0].contains(content.x + 5.0, content.y - 1.0),
+            "the band must not extend above the reserved chrome"
+        );
+
+        // ── Split groups ──────────────────────────────────────────────────
+        engine.open_editor_group(SplitDirection::Vertical);
+        let (rects, _) = engine.calculate_group_window_rects(content, tbh);
+        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let split_bands = tab_bar_hit_bands(
+            &layout,
+            tbh,
+            engine.is_tab_bar_hidden(engine.active_group),
+            engine.active_group,
+        );
+        assert_eq!(
+            split_bands.len(),
+            2,
+            "two groups draw two tab bars: {split_bands:?}"
+        );
+        for band in &split_bands {
+            assert_eq!(
+                band.y, content.y,
+                "every split band uses the same content-derived top edge as the \
+                 single-group one: {split_bands:?}"
+            );
+            assert!(band.width > 0.0);
+            assert!(band.contains(band.x + 1.0, band.y + 1.0));
+        }
+        // The two bands tile the content width without overlapping.
+        let mut xs: Vec<f64> = split_bands.iter().map(|b| b.x).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(xs[0] < xs[1], "split bands must sit side by side: {xs:?}");
     }
 
     /// Pins that `bc.bounds.y` (row units, matching TUI's convention) shifts
