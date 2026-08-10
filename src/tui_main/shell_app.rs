@@ -3850,6 +3850,46 @@ mod tests {
         cfg
     }
 
+    /// A [`TuiShellApp`] whose sidebar is *deterministically* open.
+    ///
+    /// `TuiShellApp::new` runs the real `Engine::new`, which reads the
+    /// developer's real `~/.config/vimcode` — `settings.json` and the
+    /// global `session.json` — off disk. Sidebar visibility at
+    /// construction is therefore **ambient**, not fixed:
+    ///
+    /// ```text
+    /// // core/engine/mod.rs, Engine::new
+    /// let show_sidebar = if settings.autohide_panels { false }
+    ///     else { session.explorer_visible || settings.explorer_visible_on_startup };
+    /// if !show_sidebar { engine.app_shell.hide_sidebar(); }
+    /// ```
+    ///
+    /// Both inputs default to `false` (`settings.rs`'s
+    /// `default_explorer_visible`, `session.rs`'s `Session` default), so on
+    /// a machine with **no** vimcode config — every CI runner, and any
+    /// fresh checkout — the sidebar boots *hidden*, while on a developer
+    /// box that has ever opened the explorer it boots *visible*. Five tests
+    /// in this module were written on the latter and silently inherited
+    /// "sidebar open" as an unstated precondition; they passed locally and
+    /// failed on CI (#634). Anything that reads `sidebar_visible()`, or
+    /// that measures the editor pane's geometry, must pin this itself
+    /// rather than inherit it.
+    ///
+    /// `show_panel` is the same call the production activity-bar click path
+    /// makes: it sets the active panel *and* `sidebar_visible = true`.
+    /// `session.explorer_visible` is the shadow half that
+    /// `AppShellEvent::SidebarHidden` is supposed to clear, so it is seeded
+    /// too — otherwise a test asserting that it ends up `false` would pass
+    /// vacuously.
+    fn app_with_sidebar_open() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        app.engine.session.explorer_visible = true;
+        app
+    }
+
     fn backend_at(width: f32, height: f32) -> super::super::backend::TuiBackend {
         let mut backend = super::super::backend::TuiBackend::new();
         backend.begin_frame(quadraui::Viewport::new(width, height, 1.0));
@@ -4033,7 +4073,10 @@ mod tests {
     /// autohide, session persistence) keeps believing it's open.
     #[test]
     fn on_shell_event_sidebar_hidden_syncs_shadow() {
-        let mut app = TuiShellApp::new(None);
+        // Sidebar-open is this test's *precondition*, not its subject —
+        // and it is ambient on a bare `TuiShellApp::new`. See
+        // `app_with_sidebar_open`.
+        let mut app = app_with_sidebar_open();
         assert!(app.engine.app_shell.sidebar_visible());
         app.on_shell_event(&quadraui::AppShellEvent::SidebarHidden);
         assert!(!app.engine.app_shell.sidebar_visible());
@@ -4067,7 +4110,10 @@ mod tests {
     /// the loop rather than re-firing forever.
     #[test]
     fn take_requested_panel_reconciles_keyboard_switch_once() {
-        let mut app = TuiShellApp::new(None);
+        // `take_requested_panel` short-circuits to `None` while the sidebar
+        // is hidden, and sidebar visibility on a bare `TuiShellApp::new` is
+        // ambient — see `app_with_sidebar_open`.
+        let mut app = app_with_sidebar_open();
         // Startup reconciliation: runner boots on the hamburger (panel
         // index 0), shadow on Explorer — first poll must correct that.
         let first = app.take_requested_panel();
@@ -4102,7 +4148,11 @@ mod tests {
     /// startup frame, yanking key routing away from the editor).
     #[test]
     fn take_requested_panel_echo_does_not_steal_focus() {
-        let mut app = TuiShellApp::new(None);
+        // Needs the sidebar open, or the `take_requested_panel` below
+        // returns `None`, never arms `suppress_shell_panel_echo`, and the
+        // echo is indistinguishable from a real click — see
+        // `app_with_sidebar_open`.
+        let mut app = app_with_sidebar_open();
         assert!(!app.engine.explorer_has_focus);
         let _ = app.take_requested_panel(); // returns Some(explorer), arms suppress
         app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
@@ -4121,7 +4171,11 @@ mod tests {
     /// one frame at most, not until the next real panel click).
     #[test]
     fn take_requested_panel_restores_runner_after_hamburger_click() {
-        let mut app = TuiShellApp::new(None);
+        // Green on a hidden sidebar too, but only by accident: the first
+        // poll returns `None`, so the echo below is *not* suppressed and
+        // re-runs the click path, which happens to open the sidebar in
+        // time for the real assertion. Pin the precondition instead.
+        let mut app = app_with_sidebar_open();
         // Settle the startup reconciliation first.
         let _ = app.take_requested_panel();
         app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
@@ -4719,7 +4773,12 @@ mod tests {
     /// frame the runner paints for it.
     #[test]
     fn shell_config_hidden_then_revealed_reserves_exactly_one_title_bar_row() {
-        let mut app = TuiShellApp::new(None);
+        // Same ambient-sidebar precondition as
+        // `alt_letter_reveals_menu_bar_via_shell_app` below, for the same
+        // reason: the Alt+F reveal also opens the File dropdown, which
+        // would otherwise paint over the marker this test measures. See
+        // `app_with_sidebar_open`.
+        let mut app = app_with_sidebar_open();
         app.engine.buffer_mut().insert(0, "ZQXW547MARKER");
         assert!(!app.engine.menu_bar_visible);
 
@@ -5552,7 +5611,16 @@ mod tests {
     /// is the same either way.
     #[test]
     fn alt_letter_reveals_menu_bar_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        // Alt+F does not just reveal the bar, it *activates* the File menu,
+        // and that dropdown paints as a 22-column box hard against the left
+        // edge, straight over the top-left of the editor pane — exactly
+        // where a marker inserted at buffer offset 0 lands. With the
+        // sidebar open the editor pane starts to the right of the dropdown
+        // and the marker survives; with it closed the dropdown erases the
+        // marker and the row lookup below panics. Sidebar visibility on a
+        // bare `TuiShellApp::new` is ambient (see `app_with_sidebar_open`),
+        // so pin it — the row shift under test is independent of it.
+        let mut app = app_with_sidebar_open();
         app.engine.buffer_mut().insert(0, "ZQXW_ALT_MARKER");
         let mut driver = driver_with_shell(app, config(), 80, 24);
 
@@ -5585,7 +5653,9 @@ mod tests {
         let after_row = after
             .lines()
             .position(|l| l.contains("ZQXW_ALT_MARKER"))
-            .expect("marker should still paint after the Alt-reveal keypress");
+            .unwrap_or_else(|| {
+                panic!("marker should still paint after the Alt-reveal keypress; after:\n{after}")
+            });
         assert_eq!(
             after_row,
             before_row + 1,
