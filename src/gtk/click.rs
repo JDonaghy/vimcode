@@ -1394,3 +1394,247 @@ mod frame_hit_map_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod single_group_tab_click_dispatch_tests {
+    //! #553 regression, pinned at the GTK **click-dispatch entry point** the
+    //! issue's root-cause hint names (`pixel_to_click_target`, this file):
+    //! with ONE tab group, clicking a non-active tab did not activate it and
+    //! clicking a tab's × did not close it, while two or more groups worked.
+    //!
+    //! The defect lived in `screen_zone_hit_test`'s single-group arm, which
+    //! hardcoded the tab row's top at the coordinate-system origin (`y >= 0.0`)
+    //! instead of deriving it from the window rects the way the split arm did.
+    //! Once #552 gave GTK a persistent menu/title-bar band the content origin
+    //! moved down, so the single-group band pointed at chrome pixels no tab was
+    //! ever drawn on — and every single-group tab click resolved to
+    //! `ScreenZone::None` → `ClickTarget::None`. `render::tab_bar_hit_bands`
+    //! (this PR) is what now forces both shapes through one derivation.
+    //!
+    //! Two things make these tests discriminate where the black-box
+    //! `gtk::testing` pair does not (see the note in that module and in the PR
+    //! description):
+    //!
+    //! 1. `frame_hit_map: None` — forcing the `screen_zone_hit_test` fallback
+    //!    branch. GTK's production routing prefers the cached
+    //!    `quadraui::FrameHitMap` (#449) and only falls back here on a hit-map
+    //!    miss / before the first paint, so a driver-level click never reaches
+    //!    the code under test. Same technique, same rationale as
+    //!    `cross_split_drag_focus_tests::drag_continuation_does_not_steal_focus_to_neighboring_group`
+    //!    above.
+    //! 2. A **synthetic 100px content offset**, matching
+    //!    `render::tests::test_tab_bar_hit_bands_single_and_split_share_one_derivation`.
+    //!    The headless harness's default title-bar chrome only shifts the
+    //!    content origin ~23px, which is small enough that the painted click y
+    //!    falls inside *both* the correct band and the buggy hardcoded one —
+    //!    the offset has to exceed the bar height to separate them.
+    //!
+    //! The activate and close cases are separate `#[test]`s deliberately: with
+    //! the pre-`8fbbf85` bug reinstated in `render::tab_bar_hit_bands`'s
+    //! single-group arm (`y: 0.0` instead of `y: min_y - tab_bar_height`) BOTH
+    //! go red independently with `ClickTarget::None`, which a single test with
+    //! two sequential assertions could not show (it would panic on the first
+    //! and never reach the second). That FAIL/PASS pair is reproduced in the PR
+    //! description.
+    use super::*;
+
+    /// Chrome-shifted editor content origin — the #552 menu/title-bar band, at
+    /// an offset large enough to separate the correct band from the buggy one.
+    const CONTENT_X: f64 = 50.0;
+    const CONTENT_Y: f64 = 100.0;
+    const CONTENT_W: f64 = 800.0;
+    const CONTENT_H: f64 = 600.0;
+    /// Synthetic per-tab pixel width, bar-relative (see [`synthetic_pixel_hits`]).
+    const TAB_W: f64 = 120.0;
+
+    /// The `TabBarPixelHits` the rasteriser would have cached for a single
+    /// group with `tabs` tabs: contiguous `TAB_W`-wide slots from the bar's left
+    /// edge, each with a 15px close (`×`) zone inset near its right edge.
+    ///
+    /// Bar-relative, exactly like `tab_hits_to_pixel_hits`'s output — which is
+    /// what `pixel_to_click_target` matches `ScreenZone::TabBar { local_x }`
+    /// against. Synthetic rather than rasterised so the test states its own
+    /// geometry instead of depending on Pango font metrics.
+    fn synthetic_pixel_hits(tabs: usize) -> TabBarPixelHits {
+        TabBarPixelHits {
+            slots: (0..tabs)
+                .map(|i| (i as f64 * TAB_W, (i + 1) as f64 * TAB_W))
+                .collect(),
+            close: (0..tabs)
+                .map(|i| Some((i as f64 * TAB_W + 100.0, i as f64 * TAB_W + 115.0)))
+                .collect(),
+            segments: Vec::new(),
+        }
+    }
+
+    /// Bar-relative x of a point inside tab `idx`'s body, clear of its × zone.
+    fn tab_body_local_x(idx: usize) -> f64 {
+        idx as f64 * TAB_W + 20.0
+    }
+
+    /// Bar-relative x of a point inside tab `idx`'s × zone.
+    fn tab_close_local_x(idx: usize) -> f64 {
+        idx as f64 * TAB_W + 107.0
+    }
+
+    /// Three tabs in the default SINGLE editor group — the exact shape #553
+    /// reports as dead — laid out at the chrome-shifted content origin, plus
+    /// the cached rasteriser geometry and the empty legacy maps
+    /// `pixel_to_click_target` still takes.
+    ///
+    /// No buffer edits anywhere, so a close click isn't diverted into the
+    /// dirty-buffer confirm dialog.
+    struct Fixture {
+        engine: Engine,
+        group: GroupId,
+        screen: render::ScreenLayout,
+        tab_pixel_hits: TabPixelHitMap,
+        backend: Rc<RefCell<super::super::backend::GtkBackend>>,
+        line_height: f64,
+        char_width: f64,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let mut engine = Engine::new();
+            engine.new_tab(None);
+            engine.new_tab(None);
+            let group = engine.active_group;
+            assert_eq!(engine.editor_groups[&group].tabs.len(), 3);
+            assert_eq!(
+                engine.editor_groups[&group].active_tab, 2,
+                "`new_tab` activates the tab it creates"
+            );
+
+            let theme = Theme::onedark();
+            let line_height: f64 = 20.0;
+            let char_width: f64 = 8.0;
+            let tab_bar_height =
+                render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
+            let content = core::WindowRect::new(CONTENT_X, CONTENT_Y, CONTENT_W, CONTENT_H);
+            let (rects, _) = engine.calculate_group_window_rects(content, tab_bar_height);
+            let screen =
+                build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+            assert!(
+                screen.editor_group_split.is_none(),
+                "these tests must exercise the single-group arm; a split layout would \
+                 take the branch that never regressed"
+            );
+
+            let mut tab_pixel_hits: TabPixelHitMap = HashMap::new();
+            tab_pixel_hits.insert(group.0, synthetic_pixel_hits(3));
+
+            Self {
+                engine,
+                group,
+                screen,
+                tab_pixel_hits,
+                backend: Rc::new(RefCell::new(super::super::backend::GtkBackend::new())),
+                line_height,
+                char_width,
+            }
+        }
+
+        /// The tab row sits immediately ABOVE the window content, i.e. in
+        /// `[CONTENT_Y, CONTENT_Y + tab_bar_height)`. The pre-fix code looked
+        /// for it in `[0, tab_bar_height)`, which at this offset holds no tab
+        /// pixels at all.
+        const CLICK_Y: f64 = CONTENT_Y + 2.0;
+
+        /// Resolve a tab-bar click through the production GTK dispatch entry
+        /// point, with `frame_hit_map: None` to force the `screen_zone_hit_test`
+        /// fallback branch #553 lives in (see this module's doc comment).
+        fn click(&mut self, local_x: f64) -> ClickTarget {
+            pixel_to_click_target(
+                &mut self.engine,
+                &self.backend,
+                CONTENT_X + local_x,
+                Self::CLICK_Y,
+                self.line_height,
+                self.char_width,
+                &self.screen,
+                &self.tab_pixel_hits,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                &HashMap::new(),
+                true, // a genuine click
+            )
+        }
+
+        /// The same pixel driven through the real click handler —
+        /// `handle_mouse_click` is the production caller that turns
+        /// `ClickTarget::CloseTab` into `Engine::close_tab`.
+        fn full_click(&mut self, local_x: f64) -> (Option<bool>, Option<EngineAction>) {
+            handle_mouse_click(
+                &mut self.engine,
+                &self.backend,
+                CONTENT_X + local_x,
+                Self::CLICK_Y,
+                false, // alt
+                self.line_height,
+                self.char_width,
+                &self.screen,
+                &self.tab_pixel_hits,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                None,
+                &HashMap::new(),
+            )
+        }
+    }
+
+    /// #553, half one: clicking a non-active tab in a single-group layout must
+    /// resolve as a tab-bar hit and activate that tab.
+    #[test]
+    fn single_group_tab_click_activates_that_tab_via_click_dispatch() {
+        let mut f = Fixture::new();
+        let group = f.group;
+
+        let target = f.click(tab_body_local_x(0));
+        assert!(
+            matches!(target, ClickTarget::TabBar),
+            "a single-group click on tab 0's body must resolve as a tab-bar hit, got {target:?} \
+             (pre-fix this was ClickTarget::None — the click missed the bar entirely)"
+        );
+        assert_eq!(
+            f.engine.editor_groups[&group].active_tab, 0,
+            "clicking tab 0 in a single-group layout must activate it (#553)"
+        );
+    }
+
+    /// #553, half two: clicking a tab's × in a single-group layout must resolve
+    /// to `CloseTab` for that tab, and actually close it through the production
+    /// click handler.
+    #[test]
+    fn single_group_tab_close_click_targets_and_closes_that_tab_via_click_dispatch() {
+        let mut f = Fixture::new();
+        let group = f.group;
+
+        let target = f.click(tab_close_local_x(1));
+        assert_eq!(
+            target,
+            ClickTarget::CloseTab(group, 1),
+            "a single-group click on tab 1's × must resolve to CloseTab for tab 1 \
+             (pre-fix: ClickTarget::None, so nothing ever closed)"
+        );
+
+        let before = f.engine.editor_groups[&group].tabs.len();
+        let (dirty_confirm, _) = f.full_click(tab_close_local_x(1));
+        assert_eq!(
+            dirty_confirm, None,
+            "fixture buffers are unmodified, so no dirty-buffer confirm should intercept the close"
+        );
+        assert_eq!(
+            f.engine.editor_groups[&group].tabs.len(),
+            before - 1,
+            "clicking a tab's × in a single-group layout must close it (#553)"
+        );
+    }
+}
