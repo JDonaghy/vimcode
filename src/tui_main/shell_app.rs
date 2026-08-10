@@ -434,6 +434,31 @@ pub(super) struct TuiShellApp {
     /// `ShellApp::setup` only queries the real terminal when [`Self::live`]
     /// is set (see that field and `setup`'s own doc comments for why).
     keyboard_enhanced: bool,
+    /// What this app believes the *runner's* `AppShell` (the
+    /// `ShellAdapter`-owned instance that paints the activity bar and
+    /// sidebar header — NOT `engine.app_shell`, the shadow copy
+    /// `render_sidebar_content` reads) currently has as its active panel.
+    /// Updated only from [`ShellApp::on_shell_event`]'s `PanelChanged`
+    /// notifications — the single channel through which the runner reports
+    /// its own state — and compared against the shadow's
+    /// `active_panel_id()` in [`ShellApp::take_requested_panel`] to detect
+    /// keyboard-/tick-driven panel switches the runner would otherwise
+    /// never learn about (the #634 smoke-retry bug: sidebar content stuck
+    /// on Explorer). Seeded to the hamburger — `AppShell::new` activates
+    /// panel index 0, and [`Self::shell_config`] puts the hamburger first —
+    /// so the very first `take_requested_panel` poll reconciles the runner
+    /// onto the engine's real startup panel.
+    last_shell_panel: Option<quadraui::WidgetId>,
+    /// Set by [`ShellApp::take_requested_panel`] just before it returns
+    /// `Some`, consumed by the `PanelChanged` arm of
+    /// [`ShellApp::on_shell_event`]. `ShellAdapter::apply_requested_panel`
+    /// re-notifies the app with the same `PanelChanged` a mouse click
+    /// produces — but for a reconciliation echo the engine *already* holds
+    /// that state (the keyboard tier that moved it also set the right
+    /// focus flags), so the echo must only update [`Self::last_shell_panel`]
+    /// and must NOT re-run the click path below (which would steal focus
+    /// into the sidebar, e.g. `explorer_has_focus = true` on startup).
+    suppress_shell_panel_echo: bool,
     /// Set by [`Self::prepare_for_live_run`], never by anything else — in
     /// particular never by a `driver_with_shell` test. Gates the two
     /// `ShellApp::setup` steps that are unsound or unsafe to run under a
@@ -546,6 +571,8 @@ impl TuiShellApp {
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
+            last_shell_panel: Some(quadraui::WidgetId::new(HAMBURGER_PANEL_ID)),
+            suppress_shell_panel_echo: false,
             keyboard_enhanced: false,
             live: false,
         }
@@ -2065,32 +2092,166 @@ impl ShellApp for TuiShellApp {
         // way out of every dispatch costs nothing.
         ctx.shell_mut().set_sidebar_width(self.sidebar_width as f32);
 
+        // ── #634 smoke retry: keep the runner `AppShell`'s sidebar
+        // *visibility* == the shadow's ──────────────────────────────────────
+        // Same split-state problem as the title-bar and width syncs above:
+        // every keyboard path (Ctrl+B-style toggles, `toggle_sidebar_panel`
+        // via panel accelerators, autohide, Ctrl+W overflow) mutates
+        // `engine.app_shell` — the shadow — while the runner's `AppShell`
+        // owns whether `sidebar_content_bounds` exists at all. `event_loop`
+        // had one instance for both. The active-*panel* half of this sync
+        // lives in `take_requested_panel` (which also covers tick-driven
+        // switches — this method never runs for those); visibility has no
+        // equivalent adapter hook, so it's pushed here on the way out of
+        // every dispatch, unconditionally and idempotently.
+        let shadow_visible = self.engine.app_shell.sidebar_visible();
+        let runner_visible = ctx.shell().sidebar_visible();
+        if runner_visible != shadow_visible {
+            if shadow_visible {
+                if let Some(id) = self.engine.app_shell.active_panel_id().cloned() {
+                    ctx.shell_mut().show_panel(&id);
+                }
+                // `AppShell::show_panel` only searches its top `panels`
+                // list — the Settings cog (a bottom item) and
+                // plugin-provided panels aren't in it, so the call above
+                // can no-op. Force visibility alone in that case; the
+                // runner's active-panel index (header title) is untouched,
+                // the same tolerance band as `shell_config`'s
+                // `active_accent`/`selection_bg` note.
+                if !ctx.shell().sidebar_visible() {
+                    ctx.shell_mut().toggle_sidebar();
+                }
+            } else {
+                ctx.shell_mut().hide_sidebar();
+            }
+        }
+
         reaction
     }
 
-    /// #635 (Stage 6b item E): the menu hamburger is registered as a
-    /// top-row `PanelDefinition` in [`Self::shell_config`] so it keeps its
-    /// place before Explorer in the activity bar — but it isn't a real
-    /// content panel, so a click on it (which `AppShell` reports as an
-    /// ordinary `AppShellEvent::PanelChanged`, same as clicking Explorer or
-    /// Search) shouldn't be treated as a sidebar-panel switch. Reveal the
-    /// menu bar instead, mirroring the Alt+menu-letter shim and
-    /// `MenuSystem` intercept in `handle()` above. `engine.app_shell` (the
-    /// shadow copy `render_sidebar_content` actually reads to decide what
-    /// to paint — see that field's use sites) never observes this event at
-    /// all, so no sidebar content ever switches to "Menu": the only
-    /// consequence of leaving `AppShell`'s own active-panel index pointed
-    /// at the hamburger is a cosmetic "Menu" label in its generic
-    /// sidebar-header row. Nothing resets that index on later frames, so —
-    /// unlike a one-frame flash — it persists across every subsequent
-    /// repaint until the user clicks a real panel, in the same tolerance
-    /// band as the `active_accent`/`selection_bg` gap `shell_config`'s doc
-    /// comment notes.
+    /// #634 smoke retry: the keyboard/tick half of the runner ↔ shadow
+    /// panel sync (see [`Self::on_shell_event`]'s doc comment for the
+    /// two-instance split). `ShellAdapter` polls this after every
+    /// `handle()` *and* every `tick()`, and applies a returned id to the
+    /// runner's `AppShell` via `show_panel` — updating the activity-bar
+    /// highlight and sidebar-header title — then re-notifies
+    /// `on_shell_event` with the same `PanelChanged` a mouse click
+    /// produces. That echo is suppressed from re-running the click path
+    /// via [`Self::suppress_shell_panel_echo`].
+    ///
+    /// Covers: the sidebar-focused / activity-bar-focused keyboard tiers
+    /// (`activity_bar_activate`, `focus_sidebar_panel`), panel
+    /// accelerators, tick-driven reveals (`process_pending_sidebar`'s DAP
+    /// `dap_wants_sidebar`), and the startup frame (the runner boots with
+    /// the hamburger active — `AppShell::new` activates index 0 — while
+    /// the shadow starts on Explorer).
+    fn take_requested_panel(&mut self) -> Option<quadraui::WidgetId> {
+        if !self.engine.app_shell.sidebar_visible() {
+            return None;
+        }
+        let current = self.engine.app_shell.active_panel_id()?.clone();
+        if self.last_shell_panel.as_ref() == Some(&current) {
+            return None;
+        }
+        self.suppress_shell_panel_echo = true;
+        Some(current)
+    }
+
+    /// The app ↔ runner-shell state bridge (#635 item E + the #634 smoke
+    /// retry). Two `AppShell` instances exist on this path:
+    ///
+    /// - the **runner's** (`ShellAdapter`-owned) — hit-tests activity-bar
+    ///   clicks, owns the painted chrome (icon strip, sidebar-header
+    ///   title, divider) and the layout bounds `render_content` receives;
+    /// - the **shadow** (`engine.app_shell`) — what every engine-side
+    ///   consumer reads: `render_sidebar_content`'s panel dispatch,
+    ///   `active_panel_is`, `sidebar_visible()` hit-test gates, session
+    ///   persistence.
+    ///
+    /// `event_loop()` had one instance for both roles; the cutover split
+    /// them, and this method is the click-direction half of keeping them
+    /// converged (the keyboard/tick direction is `take_requested_panel` +
+    /// the end-of-`handle` visibility sync). Without the `PanelChanged` →
+    /// shadow mirror here, an activity-bar click switched only the
+    /// runner's header title while the content pane stayed on Explorer
+    /// forever — the #634 smoke-retry failure.
+    ///
+    /// The menu hamburger stays special (#635 item E): it's registered as
+    /// a top-row `PanelDefinition` in [`Self::shell_config`] so it keeps
+    /// its place before Explorer, but it isn't a real content panel — a
+    /// click on it reveals the menu bar instead of switching the shadow,
+    /// mirroring the Alt+menu-letter shim and `MenuSystem` intercept in
+    /// `handle()` above.
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
         match event {
             quadraui::AppShellEvent::PanelChanged { panel_id } => {
                 if panel_id.as_str() == HAMBURGER_PANEL_ID {
                     self.engine.menu_bar_visible = true;
+                    // The runner's `AppShell` now points at the hamburger
+                    // (`handle_activity_click` treats it as an ordinary
+                    // panel). Recording that here makes the next
+                    // `take_requested_panel` poll see the mismatch against
+                    // the shadow's real panel and steer the runner straight
+                    // back — so the "Menu" sidebar-header label the #635
+                    // tolerance note accepted as persistent now lasts one
+                    // frame instead of until the next real panel click.
+                    self.last_shell_panel = Some(panel_id.clone());
+                    return;
+                }
+                self.last_shell_panel = Some(panel_id.clone());
+                if std::mem::take(&mut self.suppress_shell_panel_echo) {
+                    // Echo of our own `take_requested_panel` reconciliation
+                    // (see that method): the engine already holds this
+                    // state — don't re-run the click path and steal focus.
+                    return;
+                }
+                // ── #634 smoke retry: a real activity-bar click ─────────
+                // `ShellAdapter` consumed the `MouseDown` and only reports
+                // this semantic event, so the legacy `mouse::handle_mouse`
+                // activity-bar arm (which called
+                // `Engine::toggle_sidebar_panel` on the shadow) never runs
+                // on this path. Without the mirror below, only the runner's
+                // own chrome (sidebar-header title) switched while
+                // `render_sidebar_content` — which reads the *shadow*
+                // `engine.app_shell` — kept painting Explorer forever.
+                // Mirrors `mouse.rs`'s `target_panel_id` arm minus the
+                // toggle decision (the runner already made it: a
+                // same-panel-while-visible click arrives as
+                // `SidebarHidden`, not `PanelChanged`).
+                self.sidebar.ext_panel_name = None;
+                self.engine.ext_panel_has_focus = false;
+                self.engine.ext_panel_active = None;
+                self.engine.focus_sidebar_panel(panel_id.as_str());
+                self.sidebar.has_focus = true;
+            }
+            // ── #634 smoke retry: second click on the active panel's icon —
+            // the runner hid its own sidebar; mirror
+            // `Engine::toggle_sidebar_panel`'s hide branch onto the shadow
+            // so `sidebar_visible()` consumers (tick's viewport math,
+            // `mouse::handle_mouse` hit tests, autohide, session
+            // persistence) don't keep believing the sidebar is open.
+            quadraui::AppShellEvent::SidebarHidden => {
+                self.engine.app_shell.hide_sidebar();
+                self.engine.clear_sidebar_focus();
+                self.engine.session.explorer_visible = false;
+                let _ = self.engine.session.save();
+            }
+            // ── #634 smoke retry: the Settings cog is registered as a
+            // *bottom item* (`shell_config`), and `AppShell` doesn't run
+            // its panel toggle for those — it only reports the click. Run
+            // the legacy toggle on the shadow (same call `mouse.rs`'s
+            // `ActivityBarTarget::Settings` arm made); the end-of-`handle`
+            // visibility sync + `take_requested_panel` then carry the
+            // result back to the runner's `AppShell`.
+            quadraui::AppShellEvent::BottomItemClicked { id }
+                if id.as_str() == PANEL_SETTINGS =>
+            {
+                self.sidebar.ext_panel_name = None;
+                self.engine.ext_panel_has_focus = false;
+                self.engine.ext_panel_active = None;
+                self.engine.toggle_sidebar_panel(PANEL_SETTINGS);
+                if self.engine.app_shell.sidebar_visible() {
+                    self.sidebar.has_focus = true;
                 }
             }
             // #634: the other half of the width sync `handle()` performs on
@@ -3818,6 +3979,207 @@ mod tests {
             panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
         });
         assert!(!app.engine.menu_bar_visible);
+    }
+
+    // ── #634 smoke retry: runner-shell → shadow panel sync ──────────────
+    //
+    // The smoke test found activity-bar clicks switching only the runner
+    // `AppShell`'s sidebar-header title while `render_sidebar_content`
+    // (which dispatches on the *shadow* `engine.app_shell`) kept painting
+    // Explorer forever. These tests pin the `on_shell_event` /
+    // `take_requested_panel` bridge that closes the split.
+
+    /// The core smoke-retry failure: a `PanelChanged` for a real panel
+    /// (what `ShellAdapter` reports for an activity-bar click it consumed)
+    /// must switch the shadow `engine.app_shell` — the state
+    /// `render_sidebar_content` actually paints from — not just be ignored.
+    #[test]
+    fn on_shell_event_panel_changed_switches_shadow_sidebar_content() {
+        let mut app = TuiShellApp::new(None);
+        assert!(app.engine.active_panel_is(PANEL_EXPLORER));
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_SEARCH),
+        });
+        assert!(
+            app.engine.active_panel_is(PANEL_SEARCH),
+            "a runner-consumed activity-bar click must reach the shadow \
+             app_shell, or the sidebar content pane stays on Explorer \
+             while the header claims Search (the #634 smoke failure)"
+        );
+        assert!(app.engine.app_shell.sidebar_visible());
+        assert!(app.sidebar.has_focus);
+    }
+
+    /// `render_sidebar_content` checks `sidebar.ext_panel_name` *before*
+    /// the active-panel dispatch, so a lingering plugin-panel takeover
+    /// would keep painting over any panel the user clicks — mirror the
+    /// legacy `mouse.rs` arm's clearing of all three plugin-panel fields.
+    #[test]
+    fn on_shell_event_panel_changed_clears_plugin_ext_panel_takeover() {
+        let mut app = TuiShellApp::new(None);
+        app.sidebar.ext_panel_name = Some("git-insights".to_string());
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.engine.ext_panel_has_focus = true;
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_GIT),
+        });
+        assert!(app.sidebar.ext_panel_name.is_none());
+        assert!(app.engine.ext_panel_active.is_none());
+        assert!(!app.engine.ext_panel_has_focus);
+        assert!(app.engine.active_panel_is(PANEL_GIT));
+    }
+
+    /// Second click on the active icon: the runner hides its own sidebar
+    /// and reports `SidebarHidden` — the shadow must follow, or every
+    /// `sidebar_visible()` consumer (tick viewport math, mouse hit tests,
+    /// autohide, session persistence) keeps believing it's open.
+    #[test]
+    fn on_shell_event_sidebar_hidden_syncs_shadow() {
+        let mut app = TuiShellApp::new(None);
+        assert!(app.engine.app_shell.sidebar_visible());
+        app.on_shell_event(&quadraui::AppShellEvent::SidebarHidden);
+        assert!(!app.engine.app_shell.sidebar_visible());
+        assert!(!app.engine.session.explorer_visible);
+    }
+
+    /// The Settings cog is a *bottom item* (`shell_config`), for which
+    /// `AppShell` runs no panel toggle of its own — `on_shell_event` must
+    /// run the legacy toggle on the shadow, both directions.
+    #[test]
+    fn on_shell_event_settings_bottom_item_toggles_shadow() {
+        let mut app = TuiShellApp::new(None);
+        let ev = quadraui::AppShellEvent::BottomItemClicked {
+            id: quadraui::WidgetId::new(PANEL_SETTINGS),
+        };
+        app.on_shell_event(&ev);
+        assert!(app.engine.active_panel_is(PANEL_SETTINGS));
+        assert!(app.engine.app_shell.sidebar_visible());
+        app.on_shell_event(&ev);
+        assert!(
+            !app.engine.app_shell.sidebar_visible(),
+            "second Settings click must toggle the sidebar closed, \
+             mirroring the legacy mouse.rs ActivityBarTarget::Settings arm"
+        );
+    }
+
+    /// `take_requested_panel` is the keyboard/tick half of the sync:
+    /// after an engine-side switch (keyboard tier, DAP reveal) it must
+    /// hand the runner the new panel exactly once, and the `PanelChanged`
+    /// echo `ShellAdapter::apply_requested_panel` sends back must settle
+    /// the loop rather than re-firing forever.
+    #[test]
+    fn take_requested_panel_reconciles_keyboard_switch_once() {
+        let mut app = TuiShellApp::new(None);
+        // Startup reconciliation: runner boots on the hamburger (panel
+        // index 0), shadow on Explorer — first poll must correct that.
+        let first = app.take_requested_panel();
+        assert_eq!(
+            first.as_ref().map(|w| w.as_str().to_string()),
+            Some(PANEL_EXPLORER.to_string())
+        );
+        // Echo, as apply_requested_panel sends it.
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
+        });
+        assert!(app.take_requested_panel().is_none(), "echo must settle");
+
+        // Keyboard-style switch on the shadow only.
+        app.engine.focus_sidebar_panel(PANEL_SEARCH);
+        let req = app.take_requested_panel();
+        assert_eq!(
+            req.as_ref().map(|w| w.as_str().to_string()),
+            Some(PANEL_SEARCH.to_string()),
+            "an engine-side panel switch must be offered to the runner, or \
+             the activity-bar highlight/header stays on the old panel"
+        );
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_SEARCH),
+        });
+        assert!(app.take_requested_panel().is_none());
+    }
+
+    /// The reconciliation echo must not re-run the click path — the
+    /// engine already holds the state, and re-running it would steal
+    /// focus into the sidebar (e.g. `explorer_has_focus = true` on the
+    /// startup frame, yanking key routing away from the editor).
+    #[test]
+    fn take_requested_panel_echo_does_not_steal_focus() {
+        let mut app = TuiShellApp::new(None);
+        assert!(!app.engine.explorer_has_focus);
+        let _ = app.take_requested_panel(); // returns Some(explorer), arms suppress
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
+        });
+        assert!(
+            !app.engine.explorer_has_focus && !app.sidebar.has_focus,
+            "the apply_requested_panel echo must only update the runner-state \
+             belief, not steal focus like a user click"
+        );
+    }
+
+    /// A hamburger click leaves the runner's active-panel index on the
+    /// hamburger; the next `take_requested_panel` poll must steer it back
+    /// to the shadow's real panel (so the sidebar header shows "Menu" for
+    /// one frame at most, not until the next real panel click).
+    #[test]
+    fn take_requested_panel_restores_runner_after_hamburger_click() {
+        let mut app = TuiShellApp::new(None);
+        // Settle the startup reconciliation first.
+        let _ = app.take_requested_panel();
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
+        });
+        // Hamburger click, as the runner reports it.
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new(HAMBURGER_PANEL_ID),
+        });
+        assert!(app.engine.menu_bar_visible);
+        assert_eq!(
+            app.take_requested_panel()
+                .as_ref()
+                .map(|w| w.as_str().to_string()),
+            Some(PANEL_EXPLORER.to_string())
+        );
+    }
+
+    /// End-to-end through the real `driver_with_shell` harness + live
+    /// config: a mouse click on the Search icon (activity-bar row 2 —
+    /// hamburger@0, Explorer@1, Search@2, no title bar) must switch the
+    /// sidebar *content* pane, and a second click on the same icon must
+    /// toggle the sidebar closed — the exact #634 smoke-retry checklist
+    /// item, driven through `ShellAdapter`'s real click consumption.
+    /// `driver_with_shell` returns an opaque `TuiDriver<impl AppLogic>`
+    /// (no path back to `TuiShellApp`'s fields), so the assertions read
+    /// the painted grid: "Replace…" is the search form's replace-input
+    /// placeholder — content only `render_search_panel` paints, never the
+    /// explorer tree or the runner's own " Search " header chrome (which
+    /// updated even while the content pane was stuck — the smoke bug).
+    #[test]
+    fn driver_click_on_search_icon_switches_and_toggles_sidebar() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        assert!(
+            !driver.screen_contains("Replace…"),
+            "precondition: startup sidebar shows Explorer, not Search"
+        );
+        driver.click(1.0, 2.0);
+        assert!(
+            driver.screen_contains("Replace…"),
+            "clicking the Search icon must switch the sidebar content pane \
+             (render_sidebar_content reads the shadow app_shell), not just \
+             the runner's header title — screen was:\n{}",
+            driver.screen()
+        );
+
+        driver.click(1.0, 2.0);
+        assert!(
+            !driver.screen_contains("Replace…"),
+            "second click on the active icon must toggle the sidebar closed"
+        );
     }
 
     /// #601: `render_content` must actually paint the active editor
