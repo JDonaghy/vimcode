@@ -1779,7 +1779,10 @@ impl Engine {
                 // " N: display_name "
                 let dn = state.display_name();
                 // leading space + digits + ": " + name + trailing space
-                1 + (i + 1).to_string().len() + 2 + dn.chars().count() + 1
+                // Uses cell width, not `.chars().count()`, so double-width
+                // glyphs (CJK, many emoji) in the buffer name are accounted
+                // for correctly — see vimcode#620 / quadraui#472.
+                1 + (i + 1).to_string().len() + 2 + quadraui::tui::display_width(&dn) + 1
             } else {
                 // " N: [No Name] "
                 1 + (i + 1).to_string().len() + 2 + 9 + 1
