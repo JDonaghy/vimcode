@@ -77,3 +77,64 @@ jobs:
     - name: Run tests
       run: |
         cargo test --no-default-features
+
+  # #645: the job above compiles GTK OUT (`--no-default-features`), so a green
+  # run there carries zero information about `src/gtk/`. This job is the lane
+  # that actually compiles and tests the GTK backend. It runs headlessly — no
+  # DISPLAY is set on a GitHub runner and none is needed: the `gtk::*` unit
+  # tests paint into in-memory Cairo ImageSurfaces (the quadraui#301 GtkDriver
+  # pattern) and nothing calls `gtk::init`. The `--no-default-features` job is
+  # kept for the one thing this job can't prove: vimcode still builds on a
+  # machine without GTK dev libs.
+  test-gui:
+    name: Test (Linux, headless, GUI feature on)
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # Same pinned sibling checkout as the TUI job — see the comment there.
+    - name: Check out quadraui (pinned sibling path dependency)
+      run: |
+        set -euo pipefail
+        PIN="$(grep -v '^[[:space:]]*#' quadraui-pin.txt | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
+        echo "quadraui pin (quadraui-pin.txt): $PIN"
+        DEST="$(dirname "$GITHUB_WORKSPACE")/quadraui"
+        git init -q "$DEST"
+        git -C "$DEST" remote add origin https://github.com/JDonaghy/quadraui.git
+        git -C "$DEST" fetch --depth 1 origin "$PIN" || git -C "$DEST" fetch origin
+        git -C "$DEST" checkout -q --detach "$PIN"
+        echo "quadraui checked out at: $(git -C "$DEST" rev-parse HEAD)"
+
+    - name: Install GTK4 dev libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libgtk-4-dev
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        # Distinct key from the TUI job — the target dirs diverge (GTK crates).
+        key: ${{ runner.os }}-cargo-build-target-gui-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run tests (GUI feature on, no DISPLAY)
+      run: |
+        # Guard the lane's whole point: this must be a headless run.
+        test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
+        cargo test
