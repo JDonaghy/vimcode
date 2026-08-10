@@ -34,6 +34,8 @@ mod events;
 mod explorer;
 mod quadraui_gtk;
 mod services;
+#[cfg(test)]
+mod testing;
 mod util;
 
 use click::*;
@@ -486,7 +488,16 @@ struct App {
     /// trackpad deltas are summed here until they exceed one row, so no
     /// scroll event is silently dropped.
     explorer_scroll_accum: Rc<Cell<f64>>,
-    /// Most recent scrollbar rect in DA-local coords, published by
+    /// The editor `DrawingArea` (Relm4-era handle).
+    ///
+    /// **Always `None` under the ShellApp runner** — quadraui's
+    /// `gtk::run` owns the single DrawingArea (#217) and never hands it back,
+    /// and nothing in this file assigns this field. Every `if let Some(da) =
+    /// self.drawing_area…` arm is therefore dead code inherited from the Relm4
+    /// build. Treat a read of this as "never taken" until the per-DA rewiring
+    /// lands; do not gate live behaviour on it (that is how the wheel's
+    /// hovered-window lookup silently died — see #646 and
+    /// [`Self::last_editor_pointer`]).
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
@@ -523,10 +534,20 @@ struct App {
     overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
     cached_line_height: f64,
     cached_char_width: f64,
-    /// Last seen pointer position over the editor `DrawingArea`, in
-    /// DA-local pixels. Updated by `EventControllerMotion`; cleared on
-    /// `leave`. Read by the scroll handler to route wheel events to
-    /// the window under the cursor (#240) — matches TUI behaviour.
+    /// Position of the wheel event currently being handled, in **absolute**
+    /// surface pixels (the same frame `render_content` paints in). Read by
+    /// `Msg::MouseScroll` to route the wheel to the registered scroll surface
+    /// or editor pane under the cursor (#240) — matches TUI behaviour.
+    ///
+    /// Written by `ShellApp::handle`'s `UiEvent::Scroll` arm from the event's
+    /// own `position`. It used to be written by the Relm4 build's
+    /// `EventControllerMotion`; the #540 ShellApp migration removed that
+    /// controller and left no writer, so this stayed `None` forever and every
+    /// wheel event fell through to the focused window while the
+    /// `dispatch_scroll` surface routing (terminal scrollback, editor-hover
+    /// popup, debug output) never ran at all. Sourcing it from the wheel event
+    /// itself — rather than from a preceding motion event — is what makes it
+    /// impossible to regress the same way again (#646).
     last_editor_pointer: Rc<Cell<Option<(f64, f64)>>>,
     /// Cached line height for the UI font (sidebars, panels).
     /// Computed alongside `cached_line_height` in `CacheFontMetrics`.
@@ -730,7 +751,12 @@ struct App {
     /// Cached line height shared with menu_dropdown_da draw/click closures.
     menu_dd_line_height: Rc<Cell<f64>>,
     /// CSS provider registered with the GTK display — updated when colorscheme changes.
-    css_provider: gtk4::CssProvider,
+    ///
+    /// `None` only under the headless test harness ([`App::new_headless`], #646):
+    /// `gtk4::CssProvider::new()` asserts `gtk::init` has run, which it cannot
+    /// with no display, and a provider that is attached to no `GdkDisplay`
+    /// styles nothing anyway. Always `Some` in a live run.
+    css_provider: Option<gtk4::CssProvider>,
     /// Colorscheme name at the time the CSS was last applied.
     last_colorscheme: String,
     /// Cross-backend modal-overlay tracking. Pushed to when a palette /
@@ -1399,7 +1425,7 @@ impl App {
         setup_gtk_clipboard(&mut engine);
 
         let initial_theme = Theme::from_name(&engine.settings.colorscheme);
-        let css_provider = load_css(&initial_theme);
+        let css_provider = Some(load_css(&initial_theme));
         let last_colorscheme = engine.settings.colorscheme.clone();
         if let Some(gtk_settings) = gtk4::Settings::default() {
             gtk_settings.set_gtk_application_prefer_dark_theme(!initial_theme.is_light());
@@ -1433,6 +1459,35 @@ impl App {
                 Err(_) => None,
             };
 
+        Self::assemble(
+            engine,
+            sender,
+            css_provider,
+            last_colorscheme,
+            settings_monitor,
+        )
+    }
+
+    /// Build the `App` struct itself from already-prepared, display-*independent*
+    /// inputs.
+    ///
+    /// Split out of [`App::new`] (#646) so the headless GTK test harness
+    /// ([`App::new_headless`]) can reach the same field initialisation without
+    /// re-running `new`'s display-dependent prologue — `load_css` unwraps
+    /// `gdk::Display::default()` and panics outright with no `DISPLAY`, and
+    /// `register_emergency_engine` would leave a dangling `*const Engine` in a
+    /// process-global once a short-lived test's `App` is dropped (the same
+    /// soundness trap #635 documented on `TuiShellApp::live`).
+    ///
+    /// Everything below this line is plain `Rc`/`Cell`/`RefCell` allocation
+    /// plus a `GtkBackend::new()`; none of it touches GDK.
+    fn assemble(
+        engine: Rc<RefCell<Engine>>,
+        sender: MsgSender,
+        css_provider: Option<gtk4::CssProvider>,
+        last_colorscheme: String,
+        settings_monitor: Option<gio::FileMonitor>,
+    ) -> Self {
         let backend = Rc::new(RefCell::new(backend::GtkBackend::new()));
 
         App {
@@ -1531,6 +1586,45 @@ impl App {
             last_colorscheme,
             backend,
         }
+    }
+
+    /// Build an `App` around a caller-supplied, fully in-memory [`Engine`] with
+    /// **no** display-dependent setup — the GTK twin of `TuiShellApp::new` for
+    /// tests (#646). Feed the result to `crate::gtk::testing::harness`, which
+    /// wraps it in `quadraui::gtk::testing::driver_with_shell`.
+    ///
+    /// Deliberately skips, relative to [`App::new`]:
+    ///
+    /// - `gdk::Display::default()` icon-theme search paths and
+    ///   `install_bundled_icon_font` (writes to `~/.local/share/fonts` and
+    ///   shells out to `fc-cache` — a test must not touch the user's system).
+    /// - `load_css`, which `unwrap()`s `gdk::Display::default()` and therefore
+    ///   panics with no `DISPLAY`. `css_provider` is left `None` — even
+    ///   `gtk4::CssProvider::new()` asserts `gtk::init` has run, and a provider
+    ///   attached to no display styles nothing.
+    /// - `gtk4::Settings::default()` (needs a display).
+    /// - `setup_gtk_clipboard`, which probes X11 / spawns `xclip`.
+    /// - `Engine::startup`, which would restore *the developer's real last
+    ///   session*. Tests pass the exact buffers/groups they mean to assert on.
+    /// - `core::swap::register_emergency_engine`, whose contract is that the
+    ///   engine outlives the process; a test's `App` is dropped at the end of
+    ///   the test function, leaving a dangling `*const Engine` for any later
+    ///   test's panic hook to dereference (#635 documents the same trap on the
+    ///   TUI side).
+    /// - The `gio` settings-file monitor (no runtime main loop to service it).
+    ///
+    /// Takes the engine behind an `Rc` so the caller keeps a handle for
+    /// assertions — `GtkDriver` only exposes the opaque `ShellAdapter`, with no
+    /// accessor back to the concrete `App` (the same constraint the TUI tests
+    /// document on `driver_with_shell`).
+    #[cfg(test)]
+    pub(super) fn new_headless(engine: Rc<RefCell<Engine>>) -> Self {
+        let (use_nerd_fonts, last_colorscheme) = {
+            let e = engine.borrow();
+            (e.settings.use_nerd_fonts, e.settings.colorscheme.clone())
+        };
+        icons::set_nerd_fonts(use_nerd_fonts);
+        Self::assemble(engine, MsgSender::new(), None, last_colorscheme, None)
     }
 }
 
@@ -1888,15 +1982,21 @@ impl App {
                 // a non-window region. Hovering an unfocused group's pane
                 // scrolls *that* pane without changing focus or moving its
                 // cursor — matches TUI behaviour.
-                let hovered_window_id = self.last_editor_pointer.get().and_then(|(x, y)| {
-                    if let Some(da) = self.drawing_area.borrow().as_ref() {
-                        let width = da.width() as f64;
-                        let height = da.height() as f64;
-                        let line_height = self.cached_line_height.max(1.0);
-                        let editor_bottom = gtk_editor_bottom(&engine, width, height, line_height);
-                        let tab_bar_height =
-                            render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-                        let editor_bounds = core::WindowRect::new(0.0, 0.0, width, editor_bottom);
+                // #646: resolve the hovered pane against the bounds
+                // `render_content` actually painted with (`cached_editor_bounds`,
+                // absolute coords including the activity-bar/sidebar x-offset and
+                // the title-bar y-offset), not against a re-derived
+                // `(0, 0, da.width(), …)` rect. `self.drawing_area` is never
+                // assigned under the ShellApp runner — the runner owns the single
+                // DrawingArea — so the old `if let Some(da)` arm never ran and this
+                // was unconditionally `None`; and even had it run, a `(0, 0)`
+                // origin is the exact coordinate-frame mismatch #582 fixed for
+                // divider hit-testing.
+                let hovered_window_id = self
+                    .last_editor_pointer
+                    .get()
+                    .zip(self.cached_editor_bounds.get())
+                    .and_then(|((x, y), (editor_bounds, tab_bar_height))| {
                         let (rects, _) =
                             engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
                         rects
@@ -1905,10 +2005,7 @@ impl App {
                                 x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
                             })
                             .map(|(id, _)| *id)
-                    } else {
-                        None
-                    }
-                });
+                    });
                 if delta_y.abs() > 0.01 {
                     let scroll_count = (delta_y * 3.0).round().abs() as usize;
                     let active_id = engine.active_window_id();
@@ -3029,7 +3126,9 @@ impl App {
             if current != self.last_colorscheme {
                 let theme = Theme::from_name(&current);
                 let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
-                self.css_provider.load_from_data(&combined);
+                if let Some(p) = &self.css_provider {
+                    p.load_from_data(&combined);
+                }
                 // Update GTK dark/light preference for native widgets & menus.
                 if let Some(gtk_settings) = gtk4::Settings::default() {
                     gtk_settings.set_gtk_application_prefer_dark_theme(!theme.is_light());
@@ -6847,6 +6946,13 @@ impl App {
     /// Find the runner-created top-level window once it is mapped/visible.
     /// Returns `None` until then — see `capture_window_and_apply_csd`. (#552)
     fn find_visible_window() -> Option<gtk4::Window> {
+        // `list_toplevels` asserts GTK is initialized, which it never is under
+        // the headless test harness (#646). `run()` calls `gtk4::init()` before
+        // building the `App`, so this is unconditionally `true` in a live run
+        // and the guard costs production nothing.
+        if !gtk4::is_initialized() {
+            return None;
+        }
         gtk4::Window::list_toplevels()
             .into_iter()
             .filter_map(|obj| obj.downcast::<gtk4::Window>().ok())
@@ -7740,10 +7846,13 @@ impl quadraui::ShellApp for App {
             .borrow_mut()
             .set_menus(render::build_menu_defs(is_vscode_mode));
 
-        // Apply initial CSS.
-        let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
-        let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
-        self.css_provider.load_from_data(&combined);
+        // Apply initial CSS (no-op under the headless test harness, which has
+        // no display to attach a provider to — see the field's doc, #646).
+        if let Some(p) = &self.css_provider {
+            let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
+            let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
+            p.load_from_data(&combined);
+        }
 
         // Register the panel-keys accelerator set (toggle sidebar, fuzzy
         // finder, live grep, command palette, ...) on the runner's backend.
@@ -8744,7 +8853,22 @@ impl quadraui::ShellApp for App {
             UiEvent::MouseUp { .. } => {
                 self.dispatch(Msg::MouseUp);
             }
-            UiEvent::Scroll { delta, .. } => {
+            UiEvent::Scroll {
+                delta, position, ..
+            } => {
+                // #646: record where the wheel event happened before dispatching.
+                // `Msg::MouseScroll` carries only the delta, and reads the pointer
+                // back out of `last_editor_pointer` to decide which window (or
+                // registered scroll surface) the wheel targets. Nothing set that
+                // cell after the #540 Relm4→ShellApp migration removed the
+                // `EventControllerMotion` that used to — see the field's doc — so
+                // it was permanently `None` and every wheel event fell through to
+                // the *focused* window regardless of the pointer (#240 behaviour
+                // dead on GTK, still live on TUI). A wheel event carries its own
+                // position, so use that directly rather than depending on a
+                // preceding motion event.
+                self.last_editor_pointer
+                    .set(Some((position.x as f64, position.y as f64)));
                 self.dispatch(Msg::MouseScroll {
                     delta_x: delta.x as f64,
                     delta_y: delta.y as f64,
@@ -9126,6 +9250,18 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     // The runner creates its own GTK Application + window; vimcode's engine
     // and event handling are wired in via impl ShellApp for App above.
     let vimcode_app = App::new(file_path);
+    let config = build_shell_config(&vimcode_app);
+    quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
+}
+
+/// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine state.
+///
+/// Split out of [`run`] (#646) so the headless test harness
+/// (`crate::gtk::testing`) can hand `driver_with_shell` the *same* config the
+/// live runner uses, instead of a hand-written approximation that would drift
+/// from it silently (the failure mode the TUI side's `config()` test helper
+/// already has to work around).
+fn build_shell_config(app: &App) -> quadraui::ShellConfig {
     // Mirror the engine's AppShell panel list into the ShellConfig so the
     // quadraui runner renders the activity bar icons.  The engine stores all
     // panels (including "bottom:settings") in a single `panels()` slice;
@@ -9135,7 +9271,7 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     // AppShell initialises all PanelDefinition.icon fields to "" because the
     // engine itself is backend-agnostic; the GTK runner is responsible for
     // mapping each panel ID to the correct Nerd-Font / fallback glyph.
-    let panels_with_icons: Vec<_> = vimcode_app
+    let panels_with_icons: Vec<_> = app
         .engine
         .borrow()
         .app_shell
@@ -9165,10 +9301,9 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     // it since `run_with_shell` creates an undecorated-chrome-free window.
     // Always on: GTK's menu bar acts as its titlebar (matches pre-#540
     // behaviour), unlike TUI where it's optional.
-    let config = quadraui::ShellConfig::new("VimCode", top_panels)
+    quadraui::ShellConfig::new("VimCode", top_panels)
         .with_bottom_items(bottom_items)
-        .with_title_bar(1.0);
-    quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
+        .with_title_bar(1.0)
 }
 
 #[cfg(test)]
