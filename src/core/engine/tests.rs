@@ -17494,6 +17494,46 @@ fn test_tab_scroll_offset_pulls_back_when_room() {
 }
 
 #[test]
+fn test_tab_scroll_offset_accounts_for_wide_display_name() {
+    // Regression test for vimcode#620 / quadraui#472: tab-width layout must
+    // measure names in terminal display columns, not `.chars().count()`,
+    // or double-width glyphs (CJK, many emoji) make the tab bar under-scroll
+    // and clip the active tab.
+    let mut engine = Engine::new();
+    engine.new_tab(None);
+
+    // Give the second tab a scratch name containing one double-width (CJK)
+    // character. `display_name()` renders it as "[你]": bracket(1) +
+    // wide(2) + bracket(1) = 4 display columns, but only 3 `char`s.
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    let win_id = group.tabs[1].active_window;
+    let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
+    engine.buffer_manager.get_mut(buf_id).unwrap().scratch_name = Some("你".to_string());
+
+    // Tab 0 ("[No Name]", 9 cols) is 7 + 9 = 16 cols. Tab 1 ("[你]") is
+    // 7 + 4 = 11 cols under correct cell-width math, but would be only
+    // 7 + 3 = 10 cols under the old buggy `.chars().count()` math. A bar
+    // width of 26 fits both tabs under the old (wrong) math (16 + 10 = 26)
+    // but not under correct cell-width math (16 + 11 = 27).
+    engine
+        .editor_groups
+        .get_mut(&engine.active_group)
+        .unwrap()
+        .tab_bar_width = 26;
+    engine.ensure_active_tab_visible();
+
+    let group = engine.editor_groups.get(&engine.active_group).unwrap();
+    assert_eq!(group.tabs.len(), 2);
+    assert_eq!(group.active_tab, 1);
+    assert_ne!(
+        group.tab_scroll_offset, 0,
+        "tab 1's CJK name should be measured by display width (4 cols), not \
+         char count (3 cols) — with correct measurement both tabs don't fit \
+         at width 26, so the view must scroll to keep the active tab visible"
+    );
+}
+
+#[test]
 fn test_post_draw_apply_widths_reports_changes() {
     let mut engine = Engine::new();
     let group_id = engine.active_group;
