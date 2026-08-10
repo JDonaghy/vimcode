@@ -4235,36 +4235,37 @@ mod tests {
     }
 
     /// #634 recurring smoke bug — activity-bar click off-by-one after the
-    /// menu bar is revealed at runtime.
+    /// menu bar is revealed at runtime. **Fixed upstream by quadraui#552
+    /// (`7c8209d`); this test is the regression guard.**
     ///
-    /// Root cause is in quadraui, not vimcode: the TUI rasteriser
-    /// (`quadraui/src/tui/activity_bar.rs::draw_activity_bar`) returns
+    /// The root cause was in quadraui, not vimcode: the TUI rasteriser
+    /// (`quadraui/src/tui/activity_bar.rs::draw_activity_bar`) returned
     /// `ActivityBarRowHit`s in **absolute** rows (`y_start: area.y +
     /// vi.bounds.y`), while every other producer — the GTK and macOS
     /// rasterisers and the shared no-paint helper
     /// (`backend.rs::activity_bar_hits`, which `activity_bar_layout` uses)
-    /// — returns **rect-relative** rows. `AppShell::cached_activity_hit`
+    /// — returned **rect-relative** rows. `AppShell::cached_activity_hit`
     /// (and `update_hover`) assume rect-relative and add the cached bar
-    /// bounds' `ab.y` on top. While the menu bar is hidden `ab.y == 0`
-    /// and the double-add is invisible; the moment
-    /// `set_title_bar_visible(true)` reserves the title-bar row,
-    /// `ab.y == 1` and every hit region shifts down one row — a click on
-    /// Search's painted row falls inside Explorer's shifted region, and
-    /// the offset persists for as long as the menu bar stays visible.
-    /// Paint is unaffected (it doesn't read the hit cache), matching the
+    /// bounds' `ab.y` on top. While the menu bar was hidden `ab.y == 0`
+    /// and the double-add was invisible; the moment
+    /// `set_title_bar_visible(true)` reserved the title-bar row,
+    /// `ab.y == 1` and every hit region shifted down one row — a click on
+    /// Search's painted row fell inside Explorer's shifted region, and
+    /// the offset persisted for as long as the menu bar stayed visible.
+    /// Paint was unaffected (it doesn't read the hit cache), matching the
     /// smoke report's "visually correct, click mapping wrong".
     ///
-    /// Per CLAUDE.md's Platform-Neutrality Rule the fix is a quadraui
-    /// change (make the TUI rasteriser return rect-relative hits like its
-    /// three siblings), not a vimcode patch — there is no vimcode-side
-    /// hook anyway: `ShellAdapter::handle` runs `AppShell::handle`'s
-    /// hit-test before the app ever sees the event. Un-ignore this test
-    /// once the quadraui fix lands and `quadraui-pin.txt` moves past it;
-    /// it asserts the *correct* behaviour and fails on today's pin.
+    /// Per CLAUDE.md's Platform-Neutrality Rule the fix belonged in
+    /// quadraui (make the TUI rasteriser return rect-relative hits like
+    /// its three siblings), not in a vimcode patch — there was no
+    /// vimcode-side hook anyway: `ShellAdapter::handle` runs
+    /// `AppShell::handle`'s hit-test before the app ever sees the event.
+    /// quadraui#552 landed exactly that, and #650 moved
+    /// `quadraui-pin.txt` onto it (`f702422` → `f6d27c2`), which is what
+    /// let this test run. It asserts the *correct* behaviour and fails on
+    /// any pin older than the fix — so a red here means the pin went
+    /// backwards, not that vimcode regressed.
     #[test]
-    #[ignore = "blocked on quadraui TUI draw_activity_bar returning absolute \
-                (not rect-relative) hit rows; see doc comment — un-ignore \
-                when quadraui-pin.txt moves past the fix"]
     fn menu_reveal_then_search_icon_click_opens_search_not_explorer() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
