@@ -4185,8 +4185,8 @@ mod tests {
     /// #634 recurring smoke bug — activity-bar click off-by-one after the
     /// menu bar is revealed at runtime.
     ///
-    /// Root cause is in quadraui, not vimcode: the TUI rasteriser
-    /// (`quadraui/src/tui/activity_bar.rs::draw_activity_bar`) returns
+    /// Root cause was in quadraui, not vimcode: the TUI rasteriser
+    /// (`quadraui/src/tui/activity_bar.rs::draw_activity_bar`) returned
     /// `ActivityBarRowHit`s in **absolute** rows (`y_start: area.y +
     /// vi.bounds.y`), while every other producer — the GTK and macOS
     /// rasterisers and the shared no-paint helper
@@ -4202,17 +4202,15 @@ mod tests {
     /// Paint is unaffected (it doesn't read the hit cache), matching the
     /// smoke report's "visually correct, click mapping wrong".
     ///
-    /// Per CLAUDE.md's Platform-Neutrality Rule the fix is a quadraui
-    /// change (make the TUI rasteriser return rect-relative hits like its
-    /// three siblings), not a vimcode patch — there is no vimcode-side
-    /// hook anyway: `ShellAdapter::handle` runs `AppShell::handle`'s
-    /// hit-test before the app ever sees the event. Un-ignore this test
-    /// once the quadraui fix lands and `quadraui-pin.txt` moves past it;
-    /// it asserts the *correct* behaviour and fails on today's pin.
+    /// Per CLAUDE.md's Platform-Neutrality Rule the fix went into quadraui
+    /// (the TUI rasteriser now returns rect-relative hits like its three
+    /// siblings — quadraui commit 098af92, pinned by `quadraui-pin.txt`),
+    /// not a vimcode patch — there is no vimcode-side hook anyway:
+    /// `ShellAdapter::handle` runs `AppShell::handle`'s hit-test before
+    /// the app ever sees the event. This test asserts the correct
+    /// behaviour end-to-end through vimcode's real `TuiShellApp` and
+    /// guards against the pin ever regressing past the fix.
     #[test]
-    #[ignore = "blocked on quadraui TUI draw_activity_bar returning absolute \
-                (not rect-relative) hit rows; see doc comment — un-ignore \
-                when quadraui-pin.txt moves past the fix"]
     fn menu_reveal_then_search_icon_click_opens_search_not_explorer() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
