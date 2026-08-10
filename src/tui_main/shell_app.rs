@@ -4182,6 +4182,80 @@ mod tests {
         );
     }
 
+    /// #634 recurring smoke bug — activity-bar click off-by-one after the
+    /// menu bar is revealed at runtime.
+    ///
+    /// Root cause is in quadraui, not vimcode: the TUI rasteriser
+    /// (`quadraui/src/tui/activity_bar.rs::draw_activity_bar`) returns
+    /// `ActivityBarRowHit`s in **absolute** rows (`y_start: area.y +
+    /// vi.bounds.y`), while every other producer — the GTK and macOS
+    /// rasterisers and the shared no-paint helper
+    /// (`backend.rs::activity_bar_hits`, which `activity_bar_layout` uses)
+    /// — returns **rect-relative** rows. `AppShell::cached_activity_hit`
+    /// (and `update_hover`) assume rect-relative and add the cached bar
+    /// bounds' `ab.y` on top. While the menu bar is hidden `ab.y == 0`
+    /// and the double-add is invisible; the moment
+    /// `set_title_bar_visible(true)` reserves the title-bar row,
+    /// `ab.y == 1` and every hit region shifts down one row — a click on
+    /// Search's painted row falls inside Explorer's shifted region, and
+    /// the offset persists for as long as the menu bar stays visible.
+    /// Paint is unaffected (it doesn't read the hit cache), matching the
+    /// smoke report's "visually correct, click mapping wrong".
+    ///
+    /// Per CLAUDE.md's Platform-Neutrality Rule the fix is a quadraui
+    /// change (make the TUI rasteriser return rect-relative hits like its
+    /// three siblings), not a vimcode patch — there is no vimcode-side
+    /// hook anyway: `ShellAdapter::handle` runs `AppShell::handle`'s
+    /// hit-test before the app ever sees the event. Un-ignore this test
+    /// once the quadraui fix lands and `quadraui-pin.txt` moves past it;
+    /// it asserts the *correct* behaviour and fails on today's pin.
+    #[test]
+    #[ignore = "blocked on quadraui TUI draw_activity_bar returning absolute \
+                (not rect-relative) hit rows; see doc comment — un-ignore \
+                when quadraui-pin.txt moves past the fix"]
+    fn menu_reveal_then_search_icon_click_opens_search_not_explorer() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        assert!(
+            !driver.screen_contains("Replace…"),
+            "precondition: startup sidebar shows Explorer, not Search"
+        );
+        // Benign event first: `ShellAdapter` polls `take_requested_panel`
+        // only after a `handle()`/`tick()`, and the runner boots with the
+        // hamburger active (AppShell::new activates index 0) — the live
+        // loop's constant ticks steer it onto the shadow's Explorer before
+        // any user click, so replicate that here or the first hamburger
+        // click reads as "hide the active panel" instead of PanelChanged.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        // Hamburger is row 0 with the menu bar hidden.
+        driver.click(1.0, 0.0);
+        // The title-bar reservation syncs at the end of
+        // `TuiShellApp::handle` — which `ShellAdapter`'s PanelChanged arm
+        // returns before reaching. Live, the next mouse-move covers it;
+        // here, pump one more benign event.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "menu bar should now be visible; screen:\n{screen}"
+        );
+        // Menu bar visible -> title-bar row reserved -> activity bar starts
+        // at row 1: hamburger@1, Explorer@2, Search@3.
+        driver.click(1.0, 3.0);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Replace…"),
+            "clicking the Search icon (row 3 with menu bar visible) must \
+             open the Search panel; screen was:\n{screen}"
+        );
+    }
+
     /// #601: `render_content` must actually paint the active editor
     /// window's text through the `ShellApp` path — this is the core claim
     /// of the stage, so assert on it directly rather than just "didn't
