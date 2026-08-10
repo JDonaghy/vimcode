@@ -8869,9 +8869,36 @@ impl quadraui::ShellApp for App {
                 // preceding motion event.
                 self.last_editor_pointer
                     .set(Some((position.x as f64, position.y as f64)));
+                // #554: **negate y back to GTK's raw polarity.**
+                //
+                // Two conventions meet at this line and they disagree:
+                //
+                // - GDK's `EventControllerScroll` reports *positive dy = wheel
+                //   down*.
+                // - `UiEvent::Scroll.delta` follows quadraui's convention,
+                //   *positive y = up toward the top of the content*.
+                //   `quadraui::gtk::events::gdk_scroll_to_uievent` is what
+                //   flips one into the other — it constructs
+                //   `ScrollDelta::new(dx, -dy)`.
+                //
+                // Everything downstream of `Msg::MouseScroll` — the
+                // `delta_y > 0.0 => dir = 1` viewport step, the `picker_scroll`
+                // sign, `Engine::handle_terminal_scroll`'s "> 0 = toward live"
+                // policy — was written against GTK's raw polarity and is
+                // unchanged since before the #540 Relm4→ShellApp migration.
+                // Pre-migration the Relm4 `connect_scroll` closure fed it GTK's
+                // `dy` directly (`Msg::MouseScroll { delta_x: dx, delta_y: dy }`)
+                // and *separately* pushed the negated `gdk_scroll_to_uievent`
+                // form onto the backend event queue. The migration deleted that
+                // closure and left the runner's already-negated `UiEvent::Scroll`
+                // as the only source, so every wheel notch reached the engine
+                // with the sign flipped and the editor scrolled backwards.
+                //
+                // Only y is negated: `gdk_scroll_to_uievent` passes `dx`
+                // through unchanged, so `delta.x` is already GTK-raw.
                 self.dispatch(Msg::MouseScroll {
                     delta_x: delta.x as f64,
-                    delta_y: delta.y as f64,
+                    delta_y: -(delta.y as f64),
                 });
             }
             UiEvent::WindowResized { .. } => {

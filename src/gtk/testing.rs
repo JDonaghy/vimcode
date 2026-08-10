@@ -259,11 +259,19 @@ mod tests {
             .window_center(focused)
             .expect("the focused pane must have been painted");
 
+        // #554: a wheel-**down** notch is `delta.y == -1.0`, not `+1.0`.
+        // `UiEvent::Scroll.delta` is in quadraui's convention (positive y = up
+        // toward the top of the content) — see `gdk_scroll_to_uievent`, which
+        // negates GTK's raw `dy` to produce it. This closure previously
+        // dispatched `+1.0` and still asserted `scroll_top` *increases*, which
+        // only held because the GTK `UiEvent::Scroll` arm was passing the
+        // quadraui-convention delta straight through to `Msg::MouseScroll`
+        // (which wants GTK-raw polarity) — the very inversion #554 reports.
         let wheel_down_at = |h: &mut Harness<_>, x: f32, y: f32| {
             h.driver.dispatch(UiEvent::Scroll {
                 widget: None,
                 position: Point::new(x, y),
-                delta: ScrollDelta::new(0.0, 1.0),
+                delta: ScrollDelta::new(0.0, -1.0),
             });
         };
 
@@ -299,6 +307,81 @@ mod tests {
                 "wheel over the focused pane must not disturb the other pane"
             );
         }
+    }
+
+    /// #554: scrolling the wheel **down** must move the viewport **down**.
+    ///
+    /// Drives the *real* GDK translator (`gdk_scroll_to_uievent`, re-exported
+    /// by `super::events` from `quadraui::gtk::events`) rather than a
+    /// hand-built `UiEvent`, so the whole polarity chain is under test in one
+    /// place:
+    ///
+    /// ```text
+    ///   GDK dy  ──gdk_scroll_to_uievent──▶  UiEvent::Scroll.delta.y
+    ///   (+ = down)        (negates)          (+ = up, quadraui convention)
+    ///           ──ShellApp::handle──▶  Msg::MouseScroll.delta_y
+    ///                (negates back)      (+ = down, GTK-raw — what every
+    ///                                     downstream consumer expects)
+    /// ```
+    ///
+    /// The #540 Relm4→ShellApp migration deleted the `connect_scroll` closure
+    /// that fed `Msg::MouseScroll` GTK's raw `dy` and left the runner's
+    /// already-negated `UiEvent::Scroll` as the only source, dropping the
+    /// second negation. Every wheel notch then reached the engine with the
+    /// sign flipped: wheel-down scrolled the text up.
+    ///
+    /// Both halves matter. Asserting the translator alone would stay green
+    /// with the bug (`gdk_scroll_to_uievent` was never wrong); asserting the
+    /// engine alone off a hand-built `UiEvent` would go green again the moment
+    /// someone "fixed" the inversion by flipping the *translator* and breaking
+    /// TUI/macOS, which share it.
+    #[test]
+    fn gdk_wheel_down_scrolls_the_viewport_down_not_up() {
+        use crate::gtk::events::gdk_scroll_to_uievent;
+
+        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        let (x, y) = h
+            .window_center(win)
+            .expect("the editor pane must have been painted");
+
+        // Half 1 — the translation itself. GTK reports positive dy for a
+        // wheel-down notch; `UiEvent::Scroll` carries the negated value.
+        let down = gdk_scroll_to_uievent(0.0, 1.0, x as f64, y as f64);
+        match &down {
+            UiEvent::Scroll {
+                delta, position, ..
+            } => {
+                assert_eq!(
+                    delta.y, -1.0,
+                    "GDK dy=+1 (wheel down) must translate to delta.y=-1 \
+                     (quadraui: positive y = up)"
+                );
+                assert_eq!(delta.x, 0.0, "a pure vertical notch must not pan x");
+                assert_eq!(*position, Point::new(x, y), "the wheel position is lost");
+            }
+            other => panic!("expected UiEvent::Scroll, got {other:?}"),
+        }
+
+        // Half 2 — what that event does to the engine, through production
+        // dispatch. Wheel down ⇒ later lines come into view ⇒ scroll_top rises.
+        h.driver.dispatch(down);
+        let after_down = h.engine.borrow().windows[&win].view.scroll_top;
+        assert!(
+            after_down > 0,
+            "wheel down must move the viewport DOWN (scroll_top 0 -> >0), \
+             got {after_down} — direction is inverted (#554)"
+        );
+
+        // ...and the opposite notch walks it back, so this cannot pass by a
+        // consumer that ignores the sign entirely.
+        h.driver
+            .dispatch(gdk_scroll_to_uievent(0.0, -1.0, x as f64, y as f64));
+        let after_up = h.engine.borrow().windows[&win].view.scroll_top;
+        assert!(
+            after_up < after_down,
+            "wheel up must move the viewport back UP ({after_down} -> {after_up})"
+        );
     }
 
     /// Three tabs in the default **single** editor group — the exact shape
