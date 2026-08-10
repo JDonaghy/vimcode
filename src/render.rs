@@ -12766,6 +12766,22 @@ impl TabBarHitBand {
 /// belongs to. `single_tab_hidden` is `is_tab_bar_hidden(active_group)`, which
 /// can only be true in single-group mode (it requires `leaf_count() <= 1`), so
 /// the split arm needs no equivalent filter.
+///
+/// # How much of the live click path this actually covers
+///
+/// Worth being precise about, since the historical defect above predates the
+/// current routing: [`screen_zone_hit_test`] — and therefore this function —
+/// has exactly one caller, `gtk::click` (`pixel_to_click_target` /
+/// `resolve_tab_right_click`), and there it is the **fallback**. GTK resolves
+/// clicks first through the cached `quadraui::FrameHitMap` (#449), into which
+/// every TabBar surface is pushed on each `render_content` pass, so in steady
+/// state a tab click is answered by the hit map and never reaches here; this
+/// path serves hit-map misses and clicks arriving before the first paint. TUI
+/// does not call it at all — `tui_main::mouse` has its own hit-test. So the
+/// unification below is best read as removing the *shape* of divergence that
+/// produced #546/#553 (one derivation instead of two that can drift), plus
+/// correctness on the pre-paint/miss path — not as repairing an everyday
+/// break for GTK users, which #449's hit map already covers.
 pub fn tab_bar_hit_bands(
     layout: &ScreenLayout,
     tab_bar_height: f64,

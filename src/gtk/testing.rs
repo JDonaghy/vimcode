@@ -315,6 +315,34 @@ mod tests {
     /// #553: with a single tab group, clicking a non-active tab must activate
     /// it. Regression from the #540 Relm4→ShellApp migration — the split-group
     /// path worked, the single-group path did not.
+    ///
+    /// # What this test does NOT prove
+    ///
+    /// This and [`single_group_tab_close_button_closes_that_tab`] are the
+    /// **acceptance** tests #553 asks for (drive a real click through
+    /// production `dispatch_click` and assert the engine's active tab / tab
+    /// count changed). They are *not* regression guards for the specific
+    /// pre-`8fbbf85` hit-band defect — they stay green with that bug
+    /// reinstated, for two independent reasons:
+    ///
+    /// 1. GTK's `pixel_to_click_target` resolves clicks primarily via the
+    ///    cached `quadraui::FrameHitMap` (#449) and only falls back to
+    ///    `screen_zone_hit_test` / `render::tab_bar_hit_bands` on a miss, so
+    ///    a driver-level click never reaches the regressed code at all.
+    /// 2. Even with the fallback forced, this harness's default
+    ///    `ShellConfig::with_title_bar(1.0)` chrome offsets the content origin
+    ///    by only ~23px — less than the tab bar's own height — so the painted
+    ///    click y lands inside *both* the correct band and the buggy
+    ///    origin-anchored one. Separating them needs an offset larger than
+    ///    `tab_bar_height`.
+    ///
+    /// The regression guard at the dispatch layer is
+    /// `gtk::click::single_group_tab_click_dispatch_tests::
+    /// single_group_tab_click_activates_and_close_button_targets_that_tab`,
+    /// which passes `frame_hit_map: None` and a synthetic 100px content offset
+    /// for exactly these reasons; the layout-level guards are
+    /// `render::tests::test_tab_bar_hit_bands_single_and_split_share_one_derivation`
+    /// and `test_single_group_tab_bar_hit_test_with_editor_offset`.
     #[test]
     fn single_group_tab_click_activates_that_tab() {
         let mut h = harness(engine_with_three_tabs_one_group(), 1400, 900);
