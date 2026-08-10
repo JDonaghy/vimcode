@@ -2243,9 +2243,7 @@ impl ShellApp for TuiShellApp {
             // `ActivityBarTarget::Settings` arm made); the end-of-`handle`
             // visibility sync + `take_requested_panel` then carry the
             // result back to the runner's `AppShell`.
-            quadraui::AppShellEvent::BottomItemClicked { id }
-                if id.as_str() == PANEL_SETTINGS =>
-            {
+            quadraui::AppShellEvent::BottomItemClicked { id } if id.as_str() == PANEL_SETTINGS => {
                 self.sidebar.ext_panel_name = None;
                 self.engine.ext_panel_has_focus = false;
                 self.engine.ext_panel_active = None;
