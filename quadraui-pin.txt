@@ -71,9 +71,15 @@
 # Format: the first non-comment, non-blank line is a full 40-char quadraui SHA.
 # ---------------------------------------------------------------------------
 #
-# f702422 — "fix(quadraui): honour ShellConfig::title_bar_height_lh regardless
-# of has_title_bar (#547)". First rev carrying every trait/API addition the
-# open vimcode work depends on: quadraui#531 draw_settings_chrome, #532
-# AppShell::set_title_bar_visible, #533 draw_terminal_divider, #537 WinBackend
-# parity, #545 char_cell_width, #547 title_bar_height_lh.
-f702422e0d6f5b4c34dbfc449494bce2d222cf1d
+# 098af92 — "fix(quadraui): TUI draw_activity_bar returns rect-relative hit
+# rows" (branch vimcode-634-tui-activity-bar-rect-relative-hits, based on
+# develop tip e31258f). Fixes vimcode#634's recurring smoke bug: with the menu
+# bar revealed at runtime, activity-bar clicks landed one icon below their
+# painted row because the TUI rasteriser was the only ActivityBarRowHit
+# producer returning absolute (not rect-relative) rows and
+# AppShell::cached_activity_hit re-added the bar bounds' y. Supersedes
+# f702422 (#547 title_bar_height_lh) and additionally carries the #550
+# DataTable h_scroll hit-test fixes and CI toolchain pins from develop
+# (f702422..e31258f). Once the branch merges, this sha is on develop
+# (fast-forward); bump onward as usual.
+098af921bb3d43653af2482ab6c0faf89f5bec4e
