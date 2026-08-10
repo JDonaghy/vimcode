@@ -31,7 +31,7 @@ fn short(rev: &str) -> &str {
 
 /// One line naming the quadraui this build is made of, for `--version` output.
 ///
-/// Reads `quadraui f702422e0d6f` when pinned, and calls out drift loudly
+/// Reads `quadraui f6d27c239203` when pinned, and calls out drift loudly
 /// otherwise — an unpinned build's rendering differences are not attributable
 /// to vimcode, and the version string should say so.
 pub fn version_line() -> String {
