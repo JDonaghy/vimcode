@@ -445,6 +445,42 @@ const DIFF_BTN_COLS: u16 = 3;
 /// Total columns for all three diff toolbar buttons.
 const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
 
+/// Cell width of one tab in the tab bar: the label plus [`TAB_CLOSE_COLS`]
+/// for the close glyph and its trailing separator.
+///
+/// # Why this counts `char`s and not display columns (#654)
+///
+/// `.chars().count()` is *not* a terminal display width — a CJK ideograph or
+/// a wide emoji occupies two columns. The obvious "fix" is
+/// `quadraui::tui::display_width`, and #654 proposed exactly that. It is
+/// wrong on its own, because the width used here has to agree with the width
+/// the **rasteriser** paints with, and today that is char-based end to end:
+///
+/// * `quadraui::tui::backend::TuiBackend::draw_tab_bar` builds its own layout
+///   with `t.label.chars().count() + close_cols` before painting, and
+/// * `quadraui::tui::draw_tab_bar` walks the label with a flat `x += 1` per
+///   `char` (no [`quadraui::tui::char_cell_width`] stride).
+///
+/// So a tab named `" 1: 日本語.rs "` (11 chars, 14 columns) is painted 13
+/// cells wide and the next tab starts at cell 13 — which is what these
+/// regions already say. Ratatui's `Buffer::diff` skips the cell after each
+/// double-width glyph when it flushes, so on a real terminal the wide glyph
+/// covers its two columns and the tab still ends where this function says it
+/// does. The visible defect for wide names is therefore a *dropped glyph*
+/// (`本` and `.` never reach the screen), not a misplaced hit box — verified
+/// by `tab_hit_regions_match_painted_columns_for_wide_names`.
+///
+/// Switching to `display_width` here without first teaching quadraui to
+/// measure *and paint* in columns would move every hit box right of what is
+/// drawn — introducing the bug #654 set out to remove. When quadraui is
+/// fixed, this one function is the only edit needed on the vimcode side:
+/// #654 routed the tooltip, both context-menu hit-tests, the click router
+/// and the drag-slot map through `compute_tab_bar_hit_regions`, so nothing
+/// else measures a tab any more.
+fn tab_hit_width(t: &TabInfo) -> usize {
+    t.name.chars().count() + TAB_CLOSE_COLS as usize
+}
+
 /// Compute hit regions for a group's tab bar.
 ///
 /// Layout (left to right):
@@ -501,13 +537,11 @@ pub fn compute_tab_bar_hit_regions(
         None,
     );
 
-    // Per-tab width: name chars + TAB_CLOSE_COLS for the close-and-sep glyph.
+    // Per-tab width: see `tab_hit_width` — the single place tab geometry is
+    // measured now that #654 routed every TUI hit-test through these regions.
     // Close hit region is the trailing 2 cells (matches legacy behaviour:
     // clicks on × or the trailing separator count as close).
-    let tab_widths: Vec<usize> = tabs
-        .iter()
-        .map(|t| t.name.chars().count() + TAB_CLOSE_COLS as usize)
-        .collect();
+    let tab_widths: Vec<usize> = tabs.iter().map(tab_hit_width).collect();
 
     let layout = primitive.layout(
         bar_width as f32,

@@ -1282,47 +1282,48 @@ pub(super) fn folder_picker_to_palette(
     }
 }
 
-// ─── Tab bar constants ───────────────────────────────────────────────────────
-
-/// Terminal columns used by each tab's close button (the × itself + trailing space).
-/// The glyph itself lives in `quadraui::tui::TAB_CLOSE_CHAR` since the public
-/// rasteriser owns the painting.
-///
-/// #477: re-export of `render::TAB_CLOSE_COLS` — was a duplicate literal
-/// here, now the shared constant is the single source of truth.
-pub(super) use render::TAB_CLOSE_COLS;
+// ─── Tab bar hit testing ─────────────────────────────────────────────────────
 
 /// Given a column within a group's tab bar, return the shortened file path of
 /// the tab at that column, or `None` if the column doesn't hit a tab with a file.
+///
+/// `hit_regions` are the bar-relative regions cached on `ScreenLayout` /
+/// `GroupTabBar` by `render::build_screen_layout` — the same list
+/// `render::resolve_tab_bar_click` routes real clicks through.
+///
+/// #654: this used to walk the tabs itself, hand-rolling
+/// `name.chars().count() + TAB_CLOSE_COLS` per tab *plus* a `+2` fudge for a
+/// "scroll indicator" that the quadraui TUI tab-bar rasteriser never reserves
+/// space for (see `tab_drag_slots_from_hit_regions`' #477 note — the same
+/// duplicate had already drifted there). The result was a two-column drift
+/// between tooltip and click hit-testing on any tab bar scrolled past tab 0.
+/// Sharing the regions removes the whole class: tooltip, click, and drag now
+/// read the same geometry.
 pub(super) fn tab_tooltip_at_col(
     engine: &Engine,
     group_id: GroupId,
     local_col: u16,
-    tabs: &[render::TabInfo],
-    tab_scroll_offset: usize,
+    hit_regions: &[(
+        crate::core::engine::TabBarHitRegion,
+        crate::core::engine::TabBarClickTarget,
+    )],
 ) -> Option<String> {
-    let overflow_cols: u16 = if tab_scroll_offset > 0 { 2 } else { 0 };
-    let mut x: u16 = overflow_cols;
-    for (i, tab) in tabs.iter().enumerate().skip(tab_scroll_offset) {
-        let name_width = tab.name.chars().count() as u16;
-        let tab_width = name_width + TAB_CLOSE_COLS;
-        if local_col >= x && local_col < x + tab_width {
-            // Found the tab — look up its file path.
-            let group = engine.editor_groups.get(&group_id)?;
-            let tab_data = group.tabs.get(i)?;
-            let window = engine.windows.get(&tab_data.active_window)?;
-            let state = engine.buffer_manager.get(window.buffer_id)?;
-            let raw_path = state.file_path.as_ref()?;
-            let path = crate::core::paths::strip_unc_prefix(raw_path);
-            let home = crate::core::paths::home_dir();
-            if let Ok(rest) = path.strip_prefix(&home) {
-                return Some(format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()));
-            }
-            return Some(path.display().to_string());
-        }
-        x += tab_width;
+    use crate::core::engine::TabBarClickTarget;
+    let i = match render::resolve_tab_bar_click(hit_regions, local_col)? {
+        TabBarClickTarget::Tab(i) | TabBarClickTarget::CloseTab(i) => i,
+        _ => return None,
+    };
+    let group = engine.editor_groups.get(&group_id)?;
+    let tab_data = group.tabs.get(i)?;
+    let window = engine.windows.get(&tab_data.active_window)?;
+    let state = engine.buffer_manager.get(window.buffer_id)?;
+    let raw_path = state.file_path.as_ref()?;
+    let path = crate::core::paths::strip_unc_prefix(raw_path);
+    let home = crate::core::paths::home_dir();
+    if let Ok(rest) = path.strip_prefix(&home) {
+        return Some(format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()));
     }
-    None
+    Some(path.display().to_string())
 }
 
 /// Extract per-tab drag-and-drop slot bounds — `(x_start, x_end)` pairs in
@@ -2277,6 +2278,330 @@ mod tests {
             lines[row].contains(substr),
             "row {row}: expected {substr:?} in {:?}",
             lines[row]
+        );
+    }
+
+    // ── #654: wide (CJK/emoji) tab names ──────────────────────────────────
+    //
+    // These four tests pin the invariant #654 is really about: *every* TUI
+    // tab-bar hit-test — tooltip, left click, right click, drag slots —
+    // resolves to the tab that is actually painted at that column, including
+    // when a tab name contains double-width characters.
+    //
+    // They are deliberately written against the **rendered buffer** rather
+    // than against a recomputed width, so they stay honest if the rasteriser's
+    // measurement ever changes. See `render::tab_hit_width` for why that
+    // measurement is still `chars().count()` today and what has to change in
+    // quadraui before it can become `display_width`.
+
+    /// A tab bar whose first tab has a CJK name and whose second is ASCII.
+    /// Returns the engine with tab 0 active.
+    fn engine_with_wide_named_tab() -> Engine {
+        let mut e = test_engine("content\n");
+        let set_path = |e: &mut Engine, p: &str| {
+            let wid = e.active_window_id();
+            let bid = e.windows.get(&wid).unwrap().buffer_id;
+            e.buffer_manager.get_mut(bid).unwrap().file_path = Some(std::path::PathBuf::from(p));
+        };
+        set_path(&mut e, "/tmp/日本語.rs");
+        e.new_tab(None);
+        set_path(&mut e, "/tmp/second.rs");
+        e.goto_tab(0);
+        assert!(
+            !e.menu_bar_visible,
+            "these tests assume the tab bar is the top row"
+        );
+        e
+    }
+
+    /// `editor_left` as `mouse::handle_mouse` computes it for a visible
+    /// sidebar of width 0 — the geometry `render_tui` renders with.
+    const TEST_EDITOR_LEFT: u16 = ACTIVITY_BAR_WIDTH + 1;
+
+    /// Per-cell symbols of one rendered row. Unlike `render_tui`'s joined
+    /// strings this keeps column indices exact even when a cell holds a
+    /// wide glyph or ratatui's wide-glyph continuation marker.
+    fn render_tui_row_cells(engine: &Engine, width: u16, height: u16, row: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = crate::render::Theme::onedark();
+        let mut sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let screen = build_screen_for_tui(engine, &theme, area, &sidebar, 0);
+        let mut hover_link_rects = Vec::new();
+        let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
+        let mut dbg_toolbar_rect = quadraui::Rect::default();
+        let mut backend = super::backend::TuiBackend::new();
+        terminal
+            .draw(|frame| {
+                super::with_frame_scope(&mut backend, frame, |backend, frame| {
+                    draw_frame(
+                        frame,
+                        &screen,
+                        &theme,
+                        &mut sidebar,
+                        engine,
+                        0,
+                        0,
+                        None,
+                        None,
+                        None,
+                        &mut hover_link_rects,
+                        &mut None,
+                        &mut None,
+                        &mut Vec::new(),
+                        &mut None,
+                        &mut tab_visible_counts,
+                        &mut dbg_toolbar_rect,
+                        &mut None,
+                        &mut None,
+                        &mut None,
+                        backend,
+                        None,
+                        None,
+                        &crate::core::window::DropZone::None,
+                    );
+                });
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..width)
+            .map(|x| buf[(x, row)].symbol().to_string())
+            .collect()
+    }
+
+    /// First column at which `needle` appears as consecutive cells in `cells`.
+    fn painted_col_of(cells: &[String], needle: &str) -> u16 {
+        let joined: String = cells.concat();
+        assert_eq!(
+            joined.chars().count(),
+            cells.len(),
+            "test helper assumes one char per cell"
+        );
+        let byte_idx = joined
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not painted in row {joined:?}"));
+        joined[..byte_idx].chars().count() as u16
+    }
+
+    /// #654 acceptance: with a double-width tab name in front of it, the
+    /// second tab's painted column must resolve to `Tab(1)` — not to the
+    /// first tab and not to nothing.
+    ///
+    /// The expected column is read out of the rendered buffer, so this fails
+    /// for *any* measurement that disagrees with the rasteriser (it catches
+    /// both the pre-#654 hand-rolled walks and a naive `display_width` swap
+    /// made without the matching quadraui change).
+    #[test]
+    fn tab_hit_regions_match_painted_columns_for_wide_names() {
+        use crate::core::engine::TabBarClickTarget;
+        let e = engine_with_wide_named_tab();
+        let theme = crate::render::Theme::onedark();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let screen = build_screen_for_tui(&e, &theme, area, &sidebar, 0);
+        assert!(
+            quadraui::tui::display_width(&screen.tab_bar[0].name)
+                > screen.tab_bar[0].name.chars().count(),
+            "tab 0 must actually contain double-width characters"
+        );
+
+        let cells = render_tui_row_cells(&e, 80, 24, 0);
+        let tab0_col = painted_col_of(&cells, "1:");
+        let tab1_col = painted_col_of(&cells, "2:");
+        assert!(tab1_col > tab0_col);
+
+        let resolve = |abs_col: u16| {
+            render::resolve_tab_bar_click(&screen.tab_bar_hit_regions, abs_col - TEST_EDITOR_LEFT)
+        };
+        assert_eq!(
+            resolve(tab1_col),
+            Some(TabBarClickTarget::Tab(1)),
+            "column {tab1_col} paints tab 1 but hit-tests as {:?}",
+            resolve(tab1_col)
+        );
+        assert_eq!(resolve(tab0_col), Some(TabBarClickTarget::Tab(0)));
+        // The close glyph painted between the two tabs belongs to tab 0.
+        let close_col = painted_col_of(&cells, "×");
+        assert!(close_col > tab0_col && close_col < tab1_col);
+        assert_eq!(resolve(close_col), Some(TabBarClickTarget::CloseTab(0)));
+    }
+
+    /// End-to-end counterpart: a real left click at the second tab's painted
+    /// column, dispatched through `handle_mouse`, activates the second tab.
+    #[test]
+    fn left_click_after_wide_named_tab_activates_the_painted_tab() {
+        let mut e = engine_with_wide_named_tab();
+        let cells = render_tui_row_cells(&e, 80, 24, 0);
+        let tab1_col = painted_col_of(&cells, "2:");
+        let tab0_col = painted_col_of(&cells, "1:");
+
+        assert_eq!(e.active_group().active_tab, 0);
+        dispatch_tab_bar_left_click(&mut e, tab1_col);
+        assert_eq!(
+            e.active_group().active_tab,
+            1,
+            "click at painted column {tab1_col} should activate tab 1"
+        );
+        dispatch_tab_bar_left_click(&mut e, tab0_col);
+        assert_eq!(e.active_group().active_tab, 0);
+    }
+
+    /// Pure-ASCII tab names must be completely unaffected by #654.
+    #[test]
+    fn ascii_tab_names_still_hit_test_at_their_painted_columns() {
+        let mut e = test_engine("content\n");
+        e.new_tab(None);
+        e.new_tab(None);
+        e.goto_tab(0);
+        let cells = render_tui_row_cells(&e, 80, 24, 0);
+        let cols: Vec<u16> = ["1:", "2:", "3:"]
+            .iter()
+            .map(|n| painted_col_of(&cells, n))
+            .collect();
+        for (i, col) in cols.iter().enumerate() {
+            dispatch_tab_bar_left_click(&mut e, *col);
+            assert_eq!(
+                e.active_group().active_tab,
+                i,
+                "ASCII tab {i} painted at column {col} must still activate on click"
+            );
+        }
+    }
+
+    /// The hover tooltip and the click router must name the same tab.
+    ///
+    /// Before #654 `tab_tooltip_at_col` walked the tabs itself and added a
+    /// `+2` "scroll indicator" offset whenever the bar was scrolled — space
+    /// the rasteriser never reserves (the same stale adjustment #477 had
+    /// already removed from the drag-slot map). That put the tooltip two
+    /// columns out of step with the click hit-boxes on any scrolled tab bar.
+    #[test]
+    fn tab_tooltip_agrees_with_click_target_across_the_bar() {
+        use crate::core::engine::TabBarClickTarget;
+        let mut e = test_engine("content\n");
+        // Enough tabs (with wide names) that the bar has to scroll.
+        for i in 0..12 {
+            if i > 0 {
+                e.new_tab(None);
+            }
+            let wid = e.active_window_id();
+            let bid = e.windows.get(&wid).unwrap().buffer_id;
+            e.buffer_manager.get_mut(bid).unwrap().file_path =
+                Some(std::path::PathBuf::from(format!("/tmp/日本語_{i}.rs")));
+        }
+        // Scroll the bar: this is the state the old `+2` "scroll indicator"
+        // fudge in `tab_tooltip_at_col` keyed off.
+        let gid = e.active_group;
+        assert!(e.set_tab_scroll_offset(gid, 4));
+        let theme = crate::render::Theme::onedark();
+        let sidebar = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let screen = build_screen_for_tui(&e, &theme, area, &sidebar, 0);
+        assert!(
+            screen.tab_scroll_offset > 0,
+            "test needs a scrolled tab bar to exercise the stale +2 offset"
+        );
+
+        let mut checked = 0;
+        for local_col in 0..40u16 {
+            let target = render::resolve_tab_bar_click(&screen.tab_bar_hit_regions, local_col);
+            let idx = match target {
+                Some(TabBarClickTarget::Tab(i) | TabBarClickTarget::CloseTab(i)) => i,
+                _ => continue,
+            };
+            let tooltip =
+                tab_tooltip_at_col(&e, e.active_group, local_col, &screen.tab_bar_hit_regions);
+            assert_eq!(
+                tooltip.as_deref(),
+                Some(format!("/tmp/日本語_{idx}.rs").as_str()),
+                "column {local_col} clicks tab {idx} but its tooltip disagrees"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no tab columns were exercised");
+    }
+
+    /// Dispatch a left click on the single-group tab bar row through the real
+    /// `handle_mouse` entry point, with the same layout `render_tui_row_cells`
+    /// rendered from.
+    fn dispatch_tab_bar_left_click(engine: &mut Engine, col: u16) {
+        let theme = crate::render::Theme::onedark();
+        let sidebar_for_layout = TuiSidebar::new();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 24,
+        };
+        let screen = build_screen_for_tui(engine, &theme, area, &sidebar_for_layout, 0);
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut last_click_time = Instant::now();
+        let mut last_click_pos: (u16, u16) = (0, 0);
+        let mut should_quit = false;
+        handle_mouse(
+            ev,
+            &mut sidebar,
+            engine,
+            &Some(Size {
+                width: 80,
+                height: 24,
+            }),
+            0,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut drag_state,
+            &mut modal_stack,
+            Some(&screen),
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut false,
+            &mut None,
+            &mut None,
+            &mut crate::core::window::DropZone::None,
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
         );
     }
 
