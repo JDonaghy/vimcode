@@ -2152,33 +2152,17 @@ mod tests {
     /// Create a hermetic engine for rendering tests.
     fn test_engine(text: &str) -> Engine {
         crate::core::session::suppress_disk_saves();
-        let mut e = Engine::new();
-        e.settings = crate::core::settings::Settings::default();
+        // `Engine::new_for_test()` builds settings/session/history/git_branch
+        // from in-memory defaults instead of loading ambient disk/git state
+        // (#615, #439) — see its doc comment for why call-then-overwrite on
+        // `Engine::new()` doesn't reliably undo `app_shell.hide_sidebar()`.
+        let mut e = Engine::new_for_test();
         e.extension_state = crate::core::session::ExtensionState::default();
         e.ext_registry = None;
         e.mode = crate::core::Mode::Normal;
         e.rebuild_user_keymaps();
-        // #439: Engine::new() reads git::current_branch(cwd), so without
-        // this clear the snapshot tests leak whatever branch name the
-        // test runner happens to be on into the status bar fixture.
-        // Likewise sc_ahead/sc_behind get computed from the surrounding
-        // repo state. Reset all three so snapshots are reproducible.
-        e.git_branch = None;
-        e.sc_ahead = 0;
-        e.sc_behind = 0;
-        // #615: Engine::new() also calls SessionState::load(), which reads
-        // ~/.config/vimcode/session.json from the *test runner's* home
-        // directory. A machine that has run vimcode interactively has
-        // explorer_visible: true there, so the sidebar (and its U+258E
-        // active-accent cell) always renders locally; a fresh CI $HOME has
-        // no such file, defaults to explorer_visible: false, and
-        // Engine::new() calls `app_shell.hide_sidebar()` before we ever get
-        // a chance to sanitize anything. Reset the session state so it no
-        // longer depends on the runner's home, and re-show the sidebar
-        // through the app_shell's own public API (hide_sidebar() already
-        // ran inside Engine::new(), so assigning `e.session` alone would
-        // not undo it) so it matches what the committed snapshots assume.
-        e.session = crate::core::session::SessionState::default();
+        // The committed snapshots assume the sidebar starts visible, which
+        // isn't the default; show it through app_shell's own API.
         e.session.explorer_visible = true;
         if !e.app_shell.sidebar_visible() {
             e.app_shell.toggle_sidebar();
