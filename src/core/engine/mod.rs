@@ -3413,6 +3413,50 @@ pub struct Engine {
 
 impl Engine {
     pub fn new() -> Self {
+        let settings = {
+            // Ensure settings.json exists with defaults
+            Settings::ensure_exists().ok();
+            Settings::load()
+        };
+        let session = SessionState::load();
+        let history = HistoryState::load();
+        let git_branch = {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            git::current_branch(&cwd)
+        };
+        Self::new_from_state(settings, session, history, git_branch)
+    }
+
+    /// Test-only constructor: builds an [`Engine`] entirely from in-memory
+    /// defaults, never touching `~/.config/vimcode/{settings,session,history}.json`
+    /// or shelling out to `git`.
+    ///
+    /// `Engine::new()` reads `Settings::load()`, `SessionState::load()`,
+    /// `HistoryState::load()`, and `git::current_branch()` from ambient disk
+    /// and repo state, then uses `session.explorer_visible` to decide whether
+    /// to call `app_shell.hide_sidebar()` before the constructor returns.
+    /// Tests used to call `Engine::new()` and overwrite the loaded fields
+    /// afterward, but that doesn't reliably undo `hide_sidebar()`'s effect
+    /// (#615) — the sidebar visibility decision has already been baked into
+    /// `app_shell` by the time a post-hoc `e.session = ...` assignment runs.
+    /// This constructor sidesteps the whole class of bug by never loading
+    /// ambient state in the first place.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::new_from_state(
+            Settings::default(),
+            SessionState::default(),
+            HistoryState::default(),
+            None,
+        )
+    }
+
+    fn new_from_state(
+        settings: Settings,
+        session: SessionState,
+        history: HistoryState,
+        git_branch: Option<String>,
+    ) -> Self {
         let mut buffer_manager = BufferManager::new();
         let buffer_id = buffer_manager.create();
 
@@ -3477,11 +3521,6 @@ impl Engine {
             insert_text_buffer: String::new(),
             virtual_replace: false,
             pending_change_motion: None,
-            settings: {
-                // Ensure settings.json exists with defaults
-                Settings::ensure_exists().ok();
-                Settings::load()
-            },
             settings_mtime: {
                 let path = Settings::settings_file_path();
                 std::fs::metadata(&path)
@@ -3489,8 +3528,9 @@ impl Engine {
                     .and_then(|m| m.modified().ok())
             },
             settings_save_revision: crate::core::settings::save_revision(),
-            session: SessionState::load(),
-            history: HistoryState::load(),
+            settings,
+            session,
+            history,
             command_history_index: None,
             command_typing_buffer: String::new(),
             history_search_active: false,
@@ -3503,10 +3543,7 @@ impl Engine {
             macro_playback_queue: VecDeque::new(),
             last_macro_register: None,
             macro_recursion_depth: 0,
-            git_branch: {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                git::current_branch(&cwd)
-            },
+            git_branch,
             last_git_branch_check: None,
             scroll_bind_pairs: Vec::new(),
             completion_candidates: Vec::new(),
