@@ -807,14 +807,11 @@ pub(super) fn render_ext_panel(
             });
         }
 
-        let tooltip = quadraui::Tooltip {
-            id: quadraui::WidgetId::new("ext_panel:help"),
-            text: String::new(),
-            styled_lines: Some(lines),
-            placement: quadraui::TooltipPlacement::default(),
-            bg: Some(render::to_quadraui_color(theme.completion_bg)),
-            fg: Some(q_popup_fg),
-        };
+        let tooltip =
+            quadraui::Tooltip::new(quadraui::WidgetId::new("ext_panel:help"), String::new())
+                .with_styled_lines(lines)
+                .with_bg(render::to_quadraui_color(theme.completion_bg))
+                .with_fg(q_popup_fg);
         let layout = quadraui::TooltipLayout {
             bounds: quadraui::Rect::new(
                 popup_x as f32,

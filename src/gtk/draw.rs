@@ -1375,14 +1375,9 @@ pub(super) fn draw_hover_popup(
     let measured_w = ((max_line_len + 2) as f64 * char_width).max(100.0);
     let measured_h = num_lines * line_height + 4.0;
 
-    let tooltip = quadraui::Tooltip {
-        id: quadraui::WidgetId::new("lsp:hover"),
-        text: text_lines.join("\n"),
-        styled_lines: None,
-        placement: quadraui::TooltipPlacement::Top,
-        bg: None,
-        fg: None,
-    };
+    let tooltip =
+        quadraui::Tooltip::new(quadraui::WidgetId::new("lsp:hover"), text_lines.join("\n"))
+            .with_placement(quadraui::TooltipPlacement::Top);
     let tip_layout = tooltip.layout(
         quadraui::Rect::new(
             anchor_x as f32,
@@ -1664,17 +1659,12 @@ pub(super) fn draw_diff_peek_popup(
         spans: vec![quadraui::StyledSpan::with_fg(action_text, fg)],
     });
 
-    let tooltip = quadraui::Tooltip {
-        id: quadraui::WidgetId::new("diff_peek"),
-        text: String::new(),
-        styled_lines: Some(styled_lines),
+    let tooltip = quadraui::Tooltip::new(quadraui::WidgetId::new("diff_peek"), String::new())
+        .with_styled_lines(styled_lines)
         // Legacy diff peek always rendered below the anchor line —
         // mirror that with placement=Bottom (with primitive fallback
         // to Top when there's no room below).
-        placement: quadraui::TooltipPlacement::Bottom,
-        bg: None,
-        fg: None,
-    };
+        .with_placement(quadraui::TooltipPlacement::Bottom);
     let tip_layout = tooltip.layout(
         quadraui::Rect::new(
             anchor_x as f32,
@@ -1762,14 +1752,9 @@ pub(super) fn draw_signature_popup(
     }
     let styled_line = quadraui::StyledText { spans };
 
-    let tooltip = quadraui::Tooltip {
-        id: quadraui::WidgetId::new("lsp:signature"),
-        text: String::new(),
-        styled_lines: Some(vec![styled_line]),
-        placement: quadraui::TooltipPlacement::Top,
-        bg: None,
-        fg: None,
-    };
+    let tooltip = quadraui::Tooltip::new(quadraui::WidgetId::new("lsp:signature"), String::new())
+        .with_styled_lines(vec![styled_line])
+        .with_placement(quadraui::TooltipPlacement::Top);
     let tip_layout = tooltip.layout(
         quadraui::Rect::new(
             anchor_x as f32,
