@@ -1133,6 +1133,42 @@ pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadrau
 /// aligns the popup's left edge with the cursor cell (as the legacy
 /// hover popup did). `margin=0` matches the legacy 0-cell gap above /
 /// 0-cell gap below the cursor line.
+/// Build a `quadraui::Tooltip` from the two fields every vimcode call
+/// site must supply — `id` and `text` — with every other field at its
+/// behaviour-preserving default (`styled_lines: None`, `placement:
+/// Bottom`, `bg: None`, `fg: None`). Callers that need a non-default
+/// then assign the public field directly.
+///
+/// # Why a local helper and not `quadraui::Tooltip::new` (#661)
+///
+/// quadraui#541 added exactly this constructor upstream, as
+/// `Tooltip::new(id, text)` plus `.with_styled_lines/.with_placement/
+/// .with_bg/.with_fg`. It is **not callable from vimcode yet**: it
+/// landed on quadraui `develop` *after* the rev this repo is pinned to
+/// (`quadraui-pin.txt` = `f6d27c2`), and `build.rs` enforces that pin.
+/// Calling it compiles only once the pin moves, which per
+/// `quadraui-pin.txt` is its own deliberate, `cargo test`-verified
+/// commit — ~70 quadraui commits ride along in `f6d27c2..develop`,
+/// including tooltip-box and tab-label paint changes that restate this
+/// repo's snapshots.
+///
+/// Routing through this helper still buys #661's actual goal today:
+/// vimcode names `Tooltip`'s field set in exactly **one** place instead
+/// of seven exhaustive literals across three modules, so an upstream
+/// field addition is a one-line fix here rather than seven `E0063`s.
+/// When the pin does move, this body becomes a single delegation to
+/// `quadraui::Tooltip::new(id, text)` and every call site is untouched.
+pub fn quadraui_tooltip(id: quadraui::WidgetId, text: impl Into<String>) -> quadraui::Tooltip {
+    quadraui::Tooltip {
+        id,
+        text: text.into(),
+        styled_lines: None,
+        placement: quadraui::TooltipPlacement::default(),
+        bg: None,
+        fg: None,
+    }
+}
+
 pub fn hover_popup_to_quadraui_tooltip(
     hover: &HoverPopup,
     anchor_x: u16,
@@ -1148,8 +1184,8 @@ pub fn hover_popup_to_quadraui_tooltip(
         .unwrap_or(10);
     // +4: 1 left border + 1 left pad + 1 right pad + 1 right border.
     let width = ((max_len + 4) as f32).max(12.0);
-    let tooltip = quadraui::Tooltip::new(quadraui::WidgetId::new("lsp_hover"), hover.text.clone())
-        .with_placement(quadraui::TooltipPlacement::Top);
+    let mut tooltip = quadraui_tooltip(quadraui::WidgetId::new("lsp_hover"), hover.text.clone());
+    tooltip.placement = quadraui::TooltipPlacement::Top;
     // anchor.width = popup width so the primitive's center-on-anchor x
     // math collapses to left-align with the cursor cell.
     let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
@@ -1481,10 +1517,10 @@ pub fn signature_help_to_quadraui_tooltip(
     // Trailing space inside the border.
     spans.push(quadraui::StyledSpan::with_fg(" ", fg));
 
-    let tooltip =
-        quadraui::Tooltip::new(quadraui::WidgetId::new("lsp_signature_help"), String::new())
-            .with_styled_lines(vec![quadraui::StyledText { spans }])
-            .with_placement(quadraui::TooltipPlacement::Top);
+    let mut tooltip =
+        quadraui_tooltip(quadraui::WidgetId::new("lsp_signature_help"), String::new());
+    tooltip.styled_lines = Some(vec![quadraui::StyledText { spans }]);
+    tooltip.placement = quadraui::TooltipPlacement::Top;
     // anchor.width = popup width so centering math left-aligns popup
     // with the cursor cell.
     let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
@@ -4272,12 +4308,12 @@ pub fn diff_peek_to_quadraui_tooltip(
 
     let height = styled_lines.len() as f32;
 
-    let tooltip = quadraui::Tooltip::new(quadraui::WidgetId::new("diff_peek"), String::new())
-        .with_styled_lines(styled_lines)
-        // Legacy diff peek always rendered below the anchor line —
-        // mirror that with placement=Bottom (with primitive fallback
-        // to Top when there's no room below).
-        .with_placement(quadraui::TooltipPlacement::Bottom);
+    let mut tooltip = quadraui_tooltip(quadraui::WidgetId::new("diff_peek"), String::new());
+    tooltip.styled_lines = Some(styled_lines);
+    // Legacy diff peek always rendered below the anchor line — mirror
+    // that with placement=Bottom (with primitive fallback to Top when
+    // there's no room below).
+    tooltip.placement = quadraui::TooltipPlacement::Bottom;
     // anchor.width = popup width so the centering math left-aligns
     // the popup with the cursor cell (matches legacy + hover popup
     // + sig help adapters).
