@@ -269,9 +269,7 @@ impl Engine {
         let mut dialog = Dialog {
             tag: "ssh_passphrase".to_string(),
             title: "SSH Key Passphrase".to_string(),
-            body: vec![format!(
-                "Enter passphrase for SSH key (leave empty if none):"
-            )],
+            body: vec!["Enter passphrase for SSH key (leave empty if none):".to_string()],
             buttons: vec![
                 DialogButton {
                     label: "Cancel".into(),

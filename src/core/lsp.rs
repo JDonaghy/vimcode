@@ -341,7 +341,11 @@ pub fn decode_semantic_tokens(raw: &[u32], legend: &SemanticTokensLegend) -> Vec
     let mut line: u32 = 0;
     let mut start_char: u32 = 0;
 
-    for chunk in raw.chunks_exact(5) {
+    // `as_chunks::<5>().0` rather than `chunks_exact(5)`: same semantics (a
+    // trailing partial group is dropped) but the compiler sees a `&[u32; 5]`,
+    // so the five indexings below need no bounds checks. Required by clippy
+    // 1.98's `chunks_exact_to_as_chunks` lint.
+    for chunk in raw.as_chunks::<5>().0 {
         let delta_line = chunk[0];
         let delta_start = chunk[1];
         let length = chunk[2];

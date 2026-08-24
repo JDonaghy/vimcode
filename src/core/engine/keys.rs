@@ -7428,7 +7428,7 @@ impl Engine {
         }
 
         // No match and no prefix. Replay buffered keys.
-        let buf: Vec<String> = self.keymap_buf.drain(..).collect();
+        let buf: Vec<String> = std::mem::take(&mut self.keymap_buf);
         if buf.len() <= 1 {
             // Single key, no match — fall through to built-in handling
             return None;
