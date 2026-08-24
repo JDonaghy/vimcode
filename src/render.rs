@@ -15107,8 +15107,13 @@ mod tests {
 
     fn test_engine(text: &str) -> Engine {
         crate::core::session::suppress_disk_saves();
-        let mut e = Engine::new();
-        e.settings = crate::core::settings::Settings::default();
+        // `Engine::new_for_test()` builds settings/session/history/git_branch
+        // from in-memory defaults instead of loading ambient disk/git state
+        // (#615, #439, #617) — see its doc comment for why call-then-overwrite
+        // on `Engine::new()` doesn't reliably undo `app_shell.hide_sidebar()`,
+        // and why leaving `git_branch` unset here matters: it feeds the
+        // right-hand status segments rendered by this file's tests.
+        let mut e = Engine::new_for_test();
         e.mode = Mode::Normal;
         if !text.is_empty() {
             e.buffer_mut().insert(0, text);

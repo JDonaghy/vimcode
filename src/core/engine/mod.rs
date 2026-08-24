@@ -3424,7 +3424,13 @@ impl Engine {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             git::current_branch(&cwd)
         };
-        Self::new_from_state(settings, session, history, git_branch)
+        let settings_mtime = {
+            let path = Settings::settings_file_path();
+            std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+        };
+        Self::new_from_state(settings, session, history, git_branch, settings_mtime)
     }
 
     /// Test-only constructor: builds an [`Engine`] entirely from in-memory
@@ -3440,13 +3446,16 @@ impl Engine {
     /// (#615) — the sidebar visibility decision has already been baked into
     /// `app_shell` by the time a post-hoc `e.session = ...` assignment runs.
     /// This constructor sidesteps the whole class of bug by never loading
-    /// ambient state in the first place.
+    /// ambient state in the first place, including `settings_mtime` (also an
+    /// ambient disk read via `Settings::settings_file_path()` +
+    /// `fs::metadata`, left as `None` here rather than snuck back in).
     #[cfg(test)]
     pub fn new_for_test() -> Self {
         Self::new_from_state(
             Settings::default(),
             SessionState::default(),
             HistoryState::default(),
+            None,
             None,
         )
     }
@@ -3456,6 +3465,7 @@ impl Engine {
         session: SessionState,
         history: HistoryState,
         git_branch: Option<String>,
+        settings_mtime: Option<std::time::SystemTime>,
     ) -> Self {
         let mut buffer_manager = BufferManager::new();
         let buffer_id = buffer_manager.create();
@@ -3521,12 +3531,7 @@ impl Engine {
             insert_text_buffer: String::new(),
             virtual_replace: false,
             pending_change_motion: None,
-            settings_mtime: {
-                let path = Settings::settings_file_path();
-                std::fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-            },
+            settings_mtime,
             settings_save_revision: crate::core::settings::save_revision(),
             settings,
             session,
@@ -4078,7 +4083,7 @@ impl Engine {
     /// Create an engine with a file loaded (or empty buffer for new file).
     #[cfg(test)]
     pub fn open(path: &Path) -> Self {
-        let mut engine = Self::new();
+        let mut engine = Self::new_for_test();
 
         // Replace the default empty buffer with the file
         let old_buffer_id = engine.active_buffer_id();

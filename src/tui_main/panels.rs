@@ -1665,17 +1665,20 @@ mod sc_panel_tests {
     use ratatui::backend::TestBackend;
 
     /// Hermetic engine with the Source Control panel active and focused.
-    /// Resets git-derived fields so snapshots don't depend on the repo
-    /// state of whatever machine/branch the test happens to run on.
+    /// `Engine::new_for_test()` builds settings/session/history/git_branch
+    /// from in-memory defaults instead of loading ambient disk/git state
+    /// (#615, #439, #617), so snapshots don't depend on the repo state of
+    /// whatever machine/branch the test happens to run on — see its doc
+    /// comment for why call-then-overwrite on `Engine::new()` doesn't
+    /// reliably undo `app_shell.hide_sidebar()`. `extension_state` and
+    /// `ext_registry` are still loaded from disk/cache unconditionally by
+    /// `new_from_state()`, so they're reset explicitly here, matching
+    /// `render_impl.rs`'s `test_engine()`.
     fn test_engine() -> Engine {
         crate::core::session::suppress_disk_saves();
-        let mut e = Engine::new();
-        e.settings = crate::core::settings::Settings::default();
+        let mut e = Engine::new_for_test();
         e.extension_state = crate::core::session::ExtensionState::default();
         e.ext_registry = None;
-        e.git_branch = None;
-        e.sc_ahead = 0;
-        e.sc_behind = 0;
         e.sc_has_focus = true;
         e.app_shell.show_panel(&quadraui::WidgetId::new(PANEL_GIT));
         e
