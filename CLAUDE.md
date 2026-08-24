@@ -118,6 +118,28 @@ cargo fmt                         # Format
 
 **MANDATORY before commits:** Run all four commands above. If any fails, fix and re-run. `cargo test --no-default-features --lib` is faster for dev loops, but plain `cargo test` (GUI-on) is the pre-commit gate — the `--no-default-features` variant never compiles `src/gtk/` and cannot catch a GTK regression (#645).
 
+### "CI's `Test (Linux, headless)` is red but everything passes locally"
+
+That job is the **only** one that runs `cargo fmt -- --check` and
+`cargo clippy --no-default-features -- -D warnings` (the GUI job runs `cargo test`
+alone), so a *lint or formatting* failure shows up as exactly one red check and
+zero red tests. Before hunting for a phantom test regression, check the
+toolchain: CI uses `dtolnay/rust-toolchain@stable`, i.e. **whatever stable is
+newest on the day the job runs**, while your machine is on whatever you last
+installed. Every six weeks a new clippy adds lints that turn pre-existing,
+previously-clean code into `-D warnings` errors.
+
+```bash
+rustup check                                    # is CI's stable newer than yours?
+rustup toolchain install <newer> --component clippy,rustfmt --profile minimal
+cargo +<newer> fmt -- --check
+cargo +<newer> clippy --no-default-features -- -D warnings
+```
+
+Fix the lints (they are real, just newly reported) — do **not** pin the workflow
+to an old toolchain to make the check go green. Verify the fix still compiles on
+the older stable too, so you don't accidentally raise the MSRV.
+
 ## Code Style
 - `rustfmt` defaults (4-space indent)
 - `PascalCase` types, `snake_case` functions/vars
