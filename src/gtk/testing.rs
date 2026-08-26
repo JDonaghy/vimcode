@@ -1105,4 +1105,60 @@ second line here
             "the explorer must not claim a drag that started in the editor (#544)"
         );
     }
+
+    /// The mirror image of the test above: a drag that *starts* inside the
+    /// sidebar must keep its grab for the rest of the gesture even once the
+    /// pointer wanders out over the editor — a panel scrollbar-thumb or tree
+    /// row drag must not hand off to the editor's own drag handling the
+    /// instant the cursor crosses the sidebar's right edge. Exercises the
+    /// `dragging` branch of `try_route_sidebar_mouse_event` (the "captured but
+    /// out of bounds" path the ordinary not-dragging fallthrough never
+    /// reaches), unlike the test above where the press starts outside the
+    /// sidebar and `sidebar_pointer_captured` is never set.
+    ///
+    /// Uses the debug panel rather than the explorer: `route_debug_sidebar_event`
+    /// sets `dap_sidebar_has_focus` on *any* press inside the body rect
+    /// unconditionally (see `debug_panel_click_gives_the_panel_focus` above),
+    /// so the assertions here don't depend on a real DAP session or tree rows
+    /// existing — only on the routing/capture plumbing under test.
+    #[test]
+    fn a_sidebar_drag_keeps_its_grab_once_it_crosses_into_the_editor() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        engine.buffer_mut().insert(
+            0,
+            "alpha beta gamma
+second line here
+",
+        );
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_DEBUG));
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        let (wx, wy) = h.window_center(win).expect("editor pane must paint");
+        let body = h.engine.borrow().dap_sidebar_body_rect.get();
+        assert!(body.width > 0.0, "the debug panel must have painted a body");
+        let cursor_before = *h.engine.borrow().cursor();
+
+        h.driver.mouse_down(body.x + 20.0, body.y + 4.0);
+        assert!(
+            h.engine.borrow().dap_sidebar_has_focus,
+            "a press inside the sidebar must focus the debug panel"
+        );
+
+        // Follow the gesture out into the editor pane while the button is
+        // still held — this is the same move/up pair the test above uses,
+        // just starting from inside the sidebar instead of outside it.
+        h.driver.mouse_move(wx, wy);
+        h.driver.mouse_up(wx, wy);
+
+        assert_eq!(
+            *h.engine.borrow().cursor(),
+            cursor_before,
+            "a captured sidebar drag must never reach the editor's own click \
+             path, so the buffer cursor must not move even though the \
+             release lands on top of the editor pane (#544)"
+        );
+    }
 }
