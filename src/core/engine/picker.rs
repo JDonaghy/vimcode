@@ -282,14 +282,48 @@ impl Engine {
         }
     }
 
+    /// Focus `group_id` if it exists, so the breadcrumb helpers below (which
+    /// all read the *active* group's buffer and cursor) resolve against the
+    /// bar the user actually clicked (#555).
+    fn focus_breadcrumb_group(&mut self, group_id: GroupId) {
+        if self.active_group != group_id && self.editor_groups.contains_key(&group_id) {
+            self.active_group = group_id;
+        }
+    }
+
     /// Open a scoped picker for the currently selected breadcrumb segment.
     /// Path segments open the file picker for that directory.
     /// Handle a breadcrumb segment click from either backend.
-    /// Rebuilds segments, selects the clicked index, and opens scoped.
-    pub fn handle_breadcrumb_click(&mut self, idx: usize) {
+    /// Focuses the clicked group, rebuilds its segments, selects the clicked
+    /// index, and opens scoped.
+    ///
+    /// `group_id` comes from `render::BreadcrumbClickResult::Hit` — it is the
+    /// group whose *bar* was clicked, which is not necessarily the focused one
+    /// in a split. Resolving the index against the focused group instead was
+    /// the #555 "clicks do nothing" bug: an index valid for the clicked bar
+    /// could be out of range for the focused group's shorter segment list, and
+    /// `breadcrumb_open_scoped` would silently bail.
+    pub fn handle_breadcrumb_click(&mut self, group_id: GroupId, idx: usize) {
+        self.focus_breadcrumb_group(group_id);
         self.rebuild_breadcrumb_segments();
         self.breadcrumb_selected = idx;
         self.breadcrumb_open_scoped();
+    }
+
+    /// Handle a breadcrumb segment *double*-click from either backend.
+    ///
+    /// Same group-resolution contract as [`Self::handle_breadcrumb_click`].
+    /// Symbol segments jump straight to the definition; path segments fall
+    /// back to the single-click behaviour (open the scoped picker).
+    pub fn handle_breadcrumb_double_click(&mut self, group_id: GroupId, idx: usize) {
+        self.focus_breadcrumb_group(group_id);
+        self.rebuild_breadcrumb_segments();
+        let seg = match self.breadcrumb_segments.get(idx) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        self.breadcrumb_selected = idx;
+        self.breadcrumb_double_click(seg.is_symbol, seg.path_prefix.as_deref(), seg.symbol_line);
     }
 
     /// Symbol segments open the `@` symbol picker filtered to siblings

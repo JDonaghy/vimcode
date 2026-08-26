@@ -708,8 +708,17 @@ pub fn breadcrumb_action_index(id: &quadraui::WidgetId) -> Option<usize> {
 /// Result of resolving a breadcrumb click.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BreadcrumbClickResult {
-    /// A clickable segment was hit — carries the segment index.
-    Hit(usize),
+    /// A clickable segment was hit — carries the group whose bar was clicked
+    /// and the segment index *within that group's* breadcrumbs.
+    ///
+    /// The `GroupId` is load-bearing, not decoration (#555): every group's bar
+    /// is scanned here, but the segment list a bare index would be resolved
+    /// against downstream (`Engine::rebuild_breadcrumb_segments`) is the
+    /// **active** group's. With two groups open on files of different path
+    /// depth, clicking the deeper group's third segment while the shallower
+    /// group holds focus produced an out-of-range index and the click silently
+    /// did nothing — the "breadcrumb clicks are dead" report.
+    Hit(GroupId, usize),
     /// Click landed on a breadcrumb bar but not on a segment.
     OnBar,
     /// Click was not on any breadcrumb bar.
@@ -742,7 +751,7 @@ pub fn resolve_breadcrumb_click(
             if let Some(ref layout) = *guard {
                 if let quadraui::StatusBarHit::Segment(ref id) = layout.hit_test(local_x, local_y) {
                     if let Some(idx) = breadcrumb_action_index(id) {
-                        return BreadcrumbClickResult::Hit(idx);
+                        return BreadcrumbClickResult::Hit(bc.group_id, idx);
                     }
                 }
             }

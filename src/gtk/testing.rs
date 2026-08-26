@@ -156,6 +156,38 @@ impl<A: AppLogic> Harness<A> {
             ((bar_top + bar_bottom) / 2.0) as f32,
         ))
     }
+
+    /// Centre point (absolute pixels) of breadcrumb segment `seg_idx` in
+    /// `group_id`'s breadcrumb bar, as the last frame painted it. `None` if
+    /// that group drew no breadcrumb bar or the segment was clipped away.
+    ///
+    /// Same *locate targets, never hardcode coords* rule as
+    /// [`Self::tab_center`]: the x-range comes from the `StatusBarLayout` the
+    /// rasteriser cached during the breadcrumb draw pass (`bc:N` hit
+    /// regions), offset by the bar's own absolute origin (#555).
+    pub fn breadcrumb_segment_center(
+        &self,
+        group_id: crate::core::window::GroupId,
+        seg_idx: usize,
+    ) -> Option<(f32, f32)> {
+        let layout = self.screen_layout.borrow();
+        let bc = layout
+            .as_ref()?
+            .breadcrumbs
+            .iter()
+            .find(|b| b.group_id == group_id)?;
+        let want = quadraui::WidgetId::new(format!("bc:{seg_idx}"));
+        let guard = bc.draw_layout.borrow();
+        let sbl = guard.as_ref()?;
+        let rect = sbl.hit_regions.iter().find_map(|(r, hit)| match hit {
+            quadraui::StatusBarHit::Segment(id) if *id == want => Some(*r),
+            _ => None,
+        })?;
+        Some((
+            bc.bounds.x as f32 + rect.x + rect.width / 2.0,
+            bc.bounds.y as f32 + rect.y + rect.height / 2.0,
+        ))
+    }
 }
 
 /// Wrap `engine` in the real GTK [`App`] + the live
@@ -470,6 +502,172 @@ mod tests {
             h.engine.borrow().editor_groups[&group].tabs.len(),
             before - 1,
             "clicking a tab's × in a single-group layout must close it"
+        );
+    }
+
+    /// An engine whose active buffer has a real (multi-component) file path
+    /// under `cwd`, so `build_breadcrumbs_for_group` produces one clickable
+    /// segment per path component.
+    fn engine_with_breadcrumb_path() -> Engine {
+        let mut engine = Engine::new_for_test();
+        // Use the crate root as cwd so the scoped file picker the dropdown
+        // opens has real entries to list (`picker_populate_files` walks cwd).
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        let buf = engine.active_buffer_id();
+        if let Some(state) = engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(cwd.join("src").join("main.rs"));
+        }
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine
+    }
+
+    /// #555: clicking a breadcrumb segment must open its dropdown (the scoped
+    /// picker) and a selection inside that dropdown must dispatch.
+    ///
+    /// Regression from the #540 Relm4->ShellApp migration: the breadcrumb bar
+    /// went dead because the click handler hit-tests `bc.draw_layout`, which
+    /// only the *paint* pass fills in.
+    #[test]
+    fn breadcrumb_segment_click_opens_the_dropdown_and_selection_dispatches() {
+        let mut h = harness(engine_with_breadcrumb_path(), 1400, 900);
+        assert!(
+            h.engine.borrow().settings.breadcrumbs,
+            "fixture assumes breadcrumbs are on by default"
+        );
+        let group = h.engine.borrow().active_group;
+
+        let (x, y) = h
+            .breadcrumb_segment_center(group, 0)
+            .expect("the breadcrumb bar must have painted segment 0 with a hit region");
+
+        assert!(
+            !h.engine.borrow().picker_open,
+            "no picker should be open before the click"
+        );
+        h.driver.click(x, y);
+        assert!(
+            h.engine.borrow().picker_open,
+            "clicking a breadcrumb segment must open its dropdown (#555)"
+        );
+        assert!(
+            h.driver.screen_contains("Find Files"),
+            "the dropdown must actually paint, not just flip engine state; got {:?}",
+            h.driver.painted_texts()
+        );
+
+        // ...and selecting an entry inside the dropdown dispatches. Aim at a
+        // label only the dropdown paints (the explorer tree shows bare file
+        // names, never a `dir/file` path), so `find` cannot match chrome
+        // underneath the popup.
+        //
+        // The row this lands on sits in the popup's left column, which the
+        // centred popup overlays on top of the sidebar — the exact band
+        // `try_route_sidebar_mouse_event` used to swallow before the press
+        // could reach the picker.
+        let entry = "SUMMARIES/core_modules.md";
+        let (ex, ey) = h
+            .driver
+            .find(entry)
+            .unwrap_or_else(|| panic!("the dropdown must list `{entry}`"));
+        h.driver.click(ex, ey);
+        {
+            let e = h.engine.borrow();
+            let sel = e
+                .picker_items
+                .get(e.picker_selected)
+                .expect("the clicked row must resolve to an item");
+            assert!(
+                sel.display.contains(entry),
+                "clicking a dropdown row must select it; selected `{}` instead",
+                sel.display
+            );
+        }
+
+        // Confirming that selection navigates: the picker closes and the
+        // active buffer is the file the user picked.
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        {
+            let e = h.engine.borrow();
+            assert!(
+                !e.picker_open,
+                "confirming a dropdown entry must close the dropdown"
+            );
+            let path = e
+                .buffer_manager
+                .get(e.active_buffer_id())
+                .and_then(|b| b.file_path.clone())
+                .expect("confirming must open a file into the active buffer");
+            assert!(
+                path.ends_with(entry),
+                "confirming `{entry}` must navigate to it; landed on {path:?}"
+            );
+        }
+    }
+
+    /// Two editor groups whose buffers have breadcrumb paths of *different*
+    /// depths: the active group (A) shows `a.rs` (1 segment), the other group
+    /// (B) shows `src/core/deep.rs` (3 segments). Returns `(engine, group_b)`.
+    fn engine_with_two_groups_different_depths() -> (Engine, crate::core::window::GroupId) {
+        use crate::core::window::SplitDirection;
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut engine = Engine::new_for_test();
+        engine.cwd = cwd.clone();
+        let buf_a = engine.active_buffer_id();
+        if let Some(st) = engine.buffer_manager.get_mut(buf_a) {
+            st.file_path = Some(cwd.join("a.rs"));
+        }
+        let group_a = engine.active_group;
+
+        engine.open_editor_group(SplitDirection::Vertical);
+        let group_b = engine.active_group;
+        assert_ne!(group_a, group_b, "`open_editor_group` must create a group");
+
+        let buf_b = engine.buffer_manager.create();
+        if let Some(st) = engine.buffer_manager.get_mut(buf_b) {
+            st.file_path = Some(cwd.join("src").join("core").join("deep.rs"));
+        }
+        let win_b = engine.active_window_id();
+        if let Some(w) = engine.windows.get_mut(&win_b) {
+            w.buffer_id = buf_b;
+        }
+
+        // Focus goes back to A — the shape the bug needs.
+        engine.active_group = group_a;
+        (engine, group_b)
+    }
+
+    /// #555: a breadcrumb click must act on the group whose bar was clicked.
+    ///
+    /// `resolve_breadcrumb_click` scans *every* group's bar and returned a
+    /// bare segment index, which `Engine::handle_breadcrumb_click` then
+    /// resolved against the **active** group's segments. Click the deeper
+    /// group's third segment while a shallower group holds focus and the
+    /// index is out of range, so `breadcrumb_open_scoped` bails and the click
+    /// does nothing at all — the "clicks dead" half of the report.
+    #[test]
+    fn breadcrumb_click_acts_on_the_clicked_group_not_the_focused_one() {
+        let (engine, group_b) = engine_with_two_groups_different_depths();
+        let mut h = harness(engine, 1600, 900);
+        let group_a = h.engine.borrow().active_group;
+
+        // Segment 2 of B = `deep.rs`; group A's bar only has segment 0.
+        let (x, y) = h
+            .breadcrumb_segment_center(group_b, 2)
+            .expect("group B's breadcrumb bar must have painted three segments");
+
+        h.driver.click(x, y);
+
+        assert!(
+            h.engine.borrow().picker_open,
+            "clicking group B's breadcrumb must open a dropdown even while \
+             group A is focused (#555)"
+        );
+        assert_eq!(
+            h.engine.borrow().active_group,
+            group_b,
+            "the clicked group must take focus, so the dropdown is scoped to \
+             the file the user actually clicked (was {group_a:?})"
         );
     }
 }

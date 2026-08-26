@@ -2596,11 +2596,11 @@ pub(super) fn handle_mouse(
             let bc_x = col as f64;
             let bc_y = row as f64;
             match render::resolve_breadcrumb_click(&layout.breadcrumbs, bc_x, bc_y, 1.0) {
-                render::BreadcrumbClickResult::Hit(idx) => {
+                render::BreadcrumbClickResult::Hit(group_id, idx) => {
                     if !matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                         return sidebar_width;
                     }
-                    engine.handle_breadcrumb_click(idx);
+                    engine.handle_breadcrumb_click(group_id, idx);
                     return sidebar_width;
                 }
                 render::BreadcrumbClickResult::OnBar => {
