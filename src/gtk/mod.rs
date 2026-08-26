@@ -7067,10 +7067,13 @@ impl App {
     /// The panel arms mirror `render_content`'s own `match active_id` — each one
     /// feeds the very controller (`TreeController` / `SidebarSystem` /
     /// `FormController`) that painted the panel, at the rect it painted into.
-    /// That is the whole reason this is 1-3 lines per panel and carries no
-    /// GTK-specific hit-test: the geometry already lives in the shared
-    /// controller, exactly as `tui_main::shell_app`'s equivalent intercepts use
-    /// it.
+    /// That is the whole reason most arms are just a line or two of dispatch
+    /// and carry no GTK-specific hit-test: the geometry already lives in the
+    /// shared controller, exactly as `tui_main::shell_app`'s equivalent
+    /// intercepts use it. A few panels (settings, extensions, debug/git via
+    /// their helper functions below) need a bit more — focus bookkeeping or
+    /// translating a press into a chrome band's local coordinate space — but
+    /// none of them re-derive hit geometry the painter doesn't already own.
     ///
     /// # Drag / release follow-through
     ///
@@ -7177,7 +7180,7 @@ impl App {
         let active_id: String = {
             let engine = self.engine.borrow();
             if let Some(ref name) = engine.ext_panel_active {
-                format!("{EXT_PANEL_ID_PREFIX}{name}")
+                format!("ext:{name}")
             } else {
                 engine
                     .app_shell
@@ -7218,10 +7221,19 @@ impl App {
                 if is_press {
                     engine.settings_has_focus = true;
                 }
+                // `handle_settings_form_ui_event`'s own `bool` return (whether
+                // `FormController` recognized a row/field under the point) is
+                // deliberately ignored here: the position is already confirmed
+                // to be inside the sidebar's content bounds (checked above),
+                // so even a click on empty panel padding belongs to this panel,
+                // not the editor underneath it. Honoring `false` would let that
+                // click fall through to `handle_mouse_click_msg` at sidebar-local
+                // coordinates, which is exactly the leak every other arm in this
+                // match also guards against by returning `true` unconditionally.
                 render::handle_settings_form_ui_event(&mut engine, event, sb);
                 true
             }
-            id if id.starts_with(EXT_PANEL_ID_PREFIX) => {
+            id if is_ext_panel_id(id) => {
                 // Plugin-provided panel: `render_content` paints it through the
                 // same `ext_sidebar_system` at the same rect, so it routes the
                 // same way.
@@ -8684,6 +8696,15 @@ impl quadraui::ShellApp for App {
                                 render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
                             backend.draw_dialog(&dialog, &dlayout);
                         }
+                    } else {
+                        // Git panel is the active tab but there's no repo open
+                        // (e.g. the user closed it, or switched to a non-git
+                        // folder, without also switching sidebar tabs) — nothing
+                        // paints this frame. Clear the cached band geometry so a
+                        // stray click doesn't get resolved against stale
+                        // coordinates from the last time a repo *was* open
+                        // (`route_sc_sidebar_event` reads this cache directly).
+                        self.cached_sc_bands.set(None);
                     }
                 }
                 PANEL_EXTENSIONS => {
