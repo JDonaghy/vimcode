@@ -88,6 +88,13 @@ pub(super) struct Harness<A: AppLogic> {
     /// per-tab Option<(x0, x1)>)`, keyed by `group_id.0`. Same provenance and
     /// purpose as [`Self::tab_slots_abs`] (#553).
     pub tab_close_abs: Rc<RefCell<super::TabCloseAbsMap>>,
+    /// Picker/command-palette popup rect `(x, y, w, h)` the last frame
+    /// actually painted, or `None` if that frame drew no picker — see
+    /// [`Self::picker_popup`] (#555).
+    #[allow(clippy::type_complexity)]
+    pub picker_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Line height the last frame actually painted with (#555).
+    pub painted_line_height: Rc<std::cell::Cell<Option<f64>>>,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -188,6 +195,69 @@ impl<A: AppLogic> Harness<A> {
             bc.bounds.y as f32 + rect.y + rect.height / 2.0,
         ))
     }
+
+    /// The picker / command-palette popup rect `(x, y, w, h)` **the last frame
+    /// actually painted**, or `None` if that frame painted no picker.
+    ///
+    /// This is the same cell `App::compute_picker_popup_bounds` hands the
+    /// click path, and it is written *only* inside `render_content`'s
+    /// `screen.picker` draw branch (and cleared on any frame without one), so
+    /// `Some` here means the popup was drawn — not merely that
+    /// `engine.picker_open` flipped (#555).
+    #[allow(clippy::type_complexity)]
+    pub fn picker_popup(&self) -> Option<(f64, f64, f64, f64)> {
+        self.picker_popup_rect.get()
+    }
+
+    /// Line height the last frame painted with — the value every painted-
+    /// geometry hit-test must measure against (#555).
+    pub fn painted_line_height(&self) -> Option<f64> {
+        self.painted_line_height.get()
+    }
+
+    /// Geometry of the painted picker's result list: `(popup_x, list_w,
+    /// rows_top, line_height)`. `None` before the picker has painted.
+    ///
+    /// Mirrors the row layout `quadraui::gtk::draw_palette` paints with — a
+    /// title row and a query row (`show_query` is always `true` for vimcode's
+    /// picker, see `render::picker_panel_to_palette`) then a 1px separator,
+    /// after which each result row is exactly one line high. It is the same
+    /// arithmetic `handle_mouse_click_msg`'s picker branch hit-tests with, so
+    /// a test that aims here and a user who clicks the pixels resolve to the
+    /// same row.
+    fn picker_rows_geometry(&self) -> Option<(f64, f64, f64, f64)> {
+        let (px, py, pw, _ph) = self.picker_popup()?;
+        let lh = self.painted_line_height()?;
+        let has_preview = self.engine.borrow().picker_preview.is_some();
+        let list_w = if has_preview { (pw * 0.4).round() } else { pw };
+        Some((px, list_w, py + lh * 2.0 + 1.0, lh))
+    }
+
+    /// Click target for on-screen result row `row` of the painted picker:
+    /// a quarter of the way across the result list, vertically centred in the
+    /// row (#555). `row` counts painted rows from the top of the list, so it
+    /// equals the item index only while the list is scrolled to the top.
+    pub fn picker_row_center(&self, row: usize) -> Option<(f32, f32)> {
+        let (px, list_w, rows_top, lh) = self.picker_rows_geometry()?;
+        Some((
+            (px + list_w * 0.25) as f32,
+            (rows_top + lh * (row as f64 + 0.5)) as f32,
+        ))
+    }
+
+    /// Pixel-probe point for on-screen result row `row`: just inside the
+    /// popup's left border, vertically centred in the row.
+    ///
+    /// `draw_palette` fills the selected row's background across the whole
+    /// list column but starts its text at `x + 8`, so this point reads the
+    /// row's *background* — selected vs not — with no glyph in the way (#555).
+    pub fn picker_row_probe(&self, row: usize) -> Option<(i32, i32)> {
+        let (px, _list_w, rows_top, lh) = self.picker_rows_geometry()?;
+        Some((
+            (px + 3.0).round() as i32,
+            (rows_top + lh * (row as f64 + 0.5)).round() as i32,
+        ))
+    }
 }
 
 /// Wrap `engine` in the real GTK [`App`] + the live
@@ -204,12 +274,16 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let screen_layout = Rc::clone(&app.cached_screen_layout);
     let tab_slots_abs = Rc::clone(&app.cached_tab_slots_abs);
     let tab_close_abs = Rc::clone(&app.cached_tab_close_abs);
+    let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
+    let painted_line_height = Rc::clone(&app.painted_line_height);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
         screen_layout,
         tab_slots_abs,
         tab_close_abs,
+        picker_popup_rect,
+        painted_line_height,
     }
 }
 
@@ -528,6 +602,19 @@ mod tests {
     /// Regression from the #540 Relm4->ShellApp migration: the breadcrumb bar
     /// went dead because the click handler hit-tests `bc.draw_layout`, which
     /// only the *paint* pass fills in.
+    ///
+    /// # Why this asserts on pixels rather than `screen_contains`
+    ///
+    /// The dropdown is a `quadraui::Palette`, and `GtkBackend::draw_palette`
+    /// contributes nothing to the painted-text map at the quadraui rev
+    /// `quadraui-pin.txt` pins (paint-time text recording — quadraui's
+    /// `gtk/painted_text.rs` — landed after it). So `screen_contains("Find
+    /// Files")` / `find("<row label>")` cannot see the popup here, exactly as
+    /// this module's header warns: a `None` from `find` means "not recorded",
+    /// not "not drawn". The pixel probes below are rev-independent and are in
+    /// fact the stronger check — they prove the *painted* row the highlight
+    /// moved to is the same row the click resolved to, which a text match
+    /// would not.
     #[test]
     fn breadcrumb_segment_click_opens_the_dropdown_and_selection_dispatches() {
         let mut h = harness(engine_with_breadcrumb_path(), 1400, 900);
@@ -545,44 +632,87 @@ mod tests {
             !h.engine.borrow().picker_open,
             "no picker should be open before the click"
         );
+        assert!(
+            h.picker_popup().is_none(),
+            "no picker popup should have painted before the click"
+        );
+
         h.driver.click(x, y);
+
         assert!(
             h.engine.borrow().picker_open,
             "clicking a breadcrumb segment must open its dropdown (#555)"
         );
+        // `picker_popup` is written only inside `render_content`'s picker draw
+        // branch, so this is paint, not engine bookkeeping.
+        let (px, py, pw, ph) = h
+            .picker_popup()
+            .expect("the dropdown must actually paint, not just flip engine state (#555)");
         assert!(
-            h.driver.screen_contains("Find Files"),
-            "the dropdown must actually paint, not just flip engine state; got {:?}",
-            h.driver.painted_texts()
+            pw > 0.0 && ph > 0.0,
+            "the painted dropdown must have a non-degenerate rect, got {pw}x{ph}"
         );
 
-        // ...and selecting an entry inside the dropdown dispatches. Aim at a
-        // label only the dropdown paints (the explorer tree shows bare file
-        // names, never a `dir/file` path), so `find` cannot match chrome
-        // underneath the popup.
-        //
-        // The row this lands on sits in the popup's left column, which the
-        // centred popup overlays on top of the sidebar — the exact band
-        // `try_route_sidebar_mouse_event` used to swallow before the press
-        // could reach the picker.
-        let entry = "SUMMARIES/core_modules.md";
-        let (ex, ey) = h
-            .driver
-            .find(entry)
-            .unwrap_or_else(|| panic!("the dropdown must list `{entry}`"));
-        h.driver.click(ex, ey);
-        {
+        let lh = h
+            .painted_line_height()
+            .expect("the frame must publish the line height it painted with");
+        let rows_on_screen = ((ph - lh * 2.0 - 1.0 - 4.0) / lh) as usize;
+        let items = h.engine.borrow().picker_items.len();
+        // Row 0 is selected on open; ROW is the row this test clicks. Both must
+        // be painted, and far enough apart to probe independently.
+        const ROW: usize = 3;
+        assert!(
+            items > ROW && rows_on_screen > ROW,
+            "fixture must list more than {ROW} rows and paint them all \
+             ({items} items, {rows_on_screen} rows visible)"
+        );
+
+        // Row 0 is the open-state selection, so its background is the palette's
+        // selection colour and every other row's is the popup background. If
+        // the popup had not painted, both probes would read the same editor
+        // pixel.
+        let (sel_x, sel_y) = h.picker_row_probe(0).expect("row 0 must be painted");
+        let (un_x, un_y) = h.picker_row_probe(ROW).expect("row {ROW} must be painted");
+        let selected_bg = h.driver.pixel(sel_x, sel_y);
+        let unselected_bg = h.driver.pixel(un_x, un_y);
+        assert_ne!(
+            selected_bg, unselected_bg,
+            "the painted dropdown must highlight its selected row (#555); \
+             both probes read {selected_bg:?} at popup ({px}, {py}) {pw}x{ph}"
+        );
+
+        // ...and clicking a row inside the dropdown selects it. The target sits
+        // in the popup's left column, which the centred popup overlays on top of
+        // the sidebar — the exact band `try_route_sidebar_mouse_event` used to
+        // swallow before the press could reach the picker.
+        let (rx, ry) = h
+            .picker_row_center(ROW)
+            .expect("the dropdown's result rows must be locatable");
+        h.driver.click(rx, ry);
+
+        let picked = {
             let e = h.engine.borrow();
-            let sel = e
-                .picker_items
-                .get(e.picker_selected)
-                .expect("the clicked row must resolve to an item");
-            assert!(
-                sel.display.contains(entry),
-                "clicking a dropdown row must select it; selected `{}` instead",
-                sel.display
+            assert_eq!(
+                e.picker_selected, ROW,
+                "clicking painted row {ROW} must select item {ROW}"
             );
-        }
+            e.picker_items[ROW].display.clone()
+        };
+
+        // The highlight must have followed the click in the *painted* frame:
+        // row ROW now reads the selection colour and row 0 the plain one. This
+        // is what pins paint geometry and click geometry to each other — the
+        // "cache at paint, hit-test at click" invariant #555 broke.
+        assert_eq!(
+            h.driver.pixel(un_x, un_y),
+            selected_bg,
+            "the clicked row must paint as selected"
+        );
+        assert_eq!(
+            h.driver.pixel(sel_x, sel_y),
+            unselected_bg,
+            "the previously selected row must paint as unselected"
+        );
 
         // Confirming that selection navigates: the picker closes and the
         // active buffer is the file the user picked.
@@ -599,10 +729,14 @@ mod tests {
                 .and_then(|b| b.file_path.clone())
                 .expect("confirming must open a file into the active buffer");
             assert!(
-                path.ends_with(entry),
-                "confirming `{entry}` must navigate to it; landed on {path:?}"
+                path.ends_with(&picked),
+                "confirming `{picked}` must navigate to it; landed on {path:?}"
             );
         }
+        assert!(
+            h.picker_popup().is_none(),
+            "the frame painted after confirming must draw no dropdown"
+        );
     }
 
     /// Two editor groups whose buffers have breadcrumb paths of *different*
