@@ -340,8 +340,8 @@ fn resolve_charcell_tab_click(
     let regions: &[(
         crate::core::engine::TabBarHitRegion,
         crate::core::engine::TabBarClickTarget,
-    )] = if let Some(ref split) = cached_layout.editor_group_split {
-        split
+    )] = if cached_layout.editor_group_split.is_some() {
+        cached_layout
             .group_tab_bars
             .iter()
             .find(|g| g.group_id == group_id)
@@ -1249,15 +1249,9 @@ mod frame_hit_map_tests {
         let tab_row_h = render_mod::tab_row_height_px(line_height);
         let tab_bar_h = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
         let mut tab_bar_zones: HashMap<usize, (GroupId, quadraui::Rect)> = HashMap::new();
-        for (next_surface_idx, target) in
-            (window_editors.len()..).zip(render_mod::tab_bar_draw_targets(
-                engine,
-                &screen,
-                tab_row_h,
-                tab_bar_h,
-                (0.0, 0.0, 800.0),
-            ))
-        {
+        for (next_surface_idx, target) in (window_editors.len()..).zip(
+            render_mod::tab_bar_draw_targets(engine, &screen, tab_row_h, tab_bar_h),
+        ) {
             hit_frame.push(Surface::TabBar {
                 rect: target.rect,
                 bar: target.bar,

@@ -852,6 +852,15 @@ pub struct TabBarDrawTarget<'a> {
 /// tracks visible tab counts) — that part isn't shareable and stays inline
 /// at each call site.
 ///
+/// #549 unified the *call sites* but kept the split-vs-single branch inside
+/// this function, with a caller-supplied `single_group_rect` for the N=1 case.
+/// #551 deleted that too: `ScreenLayout::group_tab_bars` is now populated for
+/// every group count, so one group is just a split of one and the generic
+/// bounding-box math below produces the identical full-width rect the
+/// hand-written single-group arm used to hard-code. That removes the last
+/// place a single-group tab-bar calculation could silently drift from the
+/// N-group one — the exact failure #547 hit with breadcrumbs.
+///
 /// `tab_row_h` is the height of the tab row itself (GTK: `lh * 1.6` in
 /// pixels; TUI: `1.0` row). `reserved_h` is the *total* space reserved above
 /// the group's window content — the tab row plus, when breadcrumbs are on,
@@ -864,64 +873,48 @@ pub struct TabBarDrawTarget<'a> {
 /// used to carry for TUI's content-area-relative rects was dropped once TUI
 /// started feeding absolute rects like GTK).
 ///
-/// `single_group_rect` is `(x, y, width)` for the single-group tab bar,
-/// already in the caller's output coordinate space (there is no per-group
-/// `bounds` to derive it from in single-group mode — both backends already
-/// compute this exact rect today: GTK's `main_content_bounds` origin, TUI's
-/// `editor_area` origin).
-///
-/// Split-group targets with zero-width bounds (the `min_x == f64::MAX`
-/// fallback in `build_screen_layout` when a group has no matching window
-/// rects, e.g. during a transient group-tree mutation) are filtered out here,
-/// same as `breadcrumb_draw_targets` — TUI's pre-existing call site already
-/// guarded on `tab_w > 0`, but GTK's didn't, so centralizing it removes a
-/// footgun instead of asking every backend to remember it independently.
+/// Targets with zero-width bounds (the `min_x == f64::MAX` fallback in
+/// `build_screen_layout` when a group has no matching window rects, e.g.
+/// during a transient group-tree mutation) are filtered out here, same as
+/// `breadcrumb_draw_targets` — TUI's pre-existing call site already guarded on
+/// `tab_w > 0`, but GTK's didn't, so centralizing it removes a footgun instead
+/// of asking every backend to remember it independently.
 pub fn tab_bar_draw_targets<'a>(
     engine: &Engine,
     screen: &'a ScreenLayout,
     tab_row_h: f64,
     reserved_h: f64,
-    single_group_rect: (f64, f64, f64),
 ) -> Vec<TabBarDrawTarget<'a>> {
-    if let Some(ref split) = screen.editor_group_split {
-        split
-            .group_tab_bars
-            .iter()
-            .filter(|gtb| !engine.is_tab_bar_hidden(gtb.group_id) && gtb.bounds.width > 0.0)
-            .map(|gtb| TabBarDrawTarget {
-                rect: quadraui::Rect::new(
-                    gtb.bounds.x as f32,
-                    (gtb.bounds.y - reserved_h) as f32,
-                    gtb.bounds.width as f32,
-                    tab_row_h as f32,
-                ),
-                bar: &gtb.bar,
-                group_id: gtb.group_id,
-            })
-            .collect()
-    } else if engine.is_tab_bar_hidden(engine.active_group) {
-        Vec::new()
-    } else {
-        let (sx, sy, sw) = single_group_rect;
-        vec![TabBarDrawTarget {
-            rect: quadraui::Rect::new(sx as f32, sy as f32, sw as f32, tab_row_h as f32),
-            bar: &screen.tab_bar_primitive,
-            group_id: engine.active_group,
-        }]
-    }
+    screen
+        .group_tab_bars
+        .iter()
+        .filter(|gtb| !engine.is_tab_bar_hidden(gtb.group_id) && gtb.bounds.width > 0.0)
+        .map(|gtb| TabBarDrawTarget {
+            rect: quadraui::Rect::new(
+                gtb.bounds.x as f32,
+                (gtb.bounds.y - reserved_h) as f32,
+                gtb.bounds.width as f32,
+                tab_row_h as f32,
+            ),
+            bar: &gtb.bar,
+            group_id: gtb.group_id,
+        })
+        .collect()
 }
 
 /// Present when the editor area is split into two or more independent groups.
-/// `ScreenLayout.tab_bar` always contains the first group's tab bar for
-/// backward compat in single-group mode.
+///
+/// This is a *marker* for "2 or more editor groups", not a container for the
+/// per-group chrome: the tab bars and dividers it used to own now live on
+/// `ScreenLayout::group_tab_bars` / `ScreenLayout::group_dividers`, which are
+/// populated uniformly for every group count including one (#551). Backends
+/// draw from those unconditionally; this type only gates the hit-test paths
+/// that genuinely differ between one group and many (single-group tab-bar
+/// clicks resolve through `ScreenLayout::tab_bar_hit_regions`).
 #[derive(Debug, Clone)]
 pub struct EditorGroupSplitData {
-    /// Tab bars for ALL groups (in tree traversal order).
-    pub group_tab_bars: Vec<GroupTabBar>,
     /// ID of the currently focused group.
     pub active_group: GroupId,
-    /// Dividers between groups (for drawing divider lines and drag handling).
-    pub dividers: Vec<GroupDivider>,
     /// Total number of groups (always >= 2 when this is Some).
     pub num_groups: usize,
 }
@@ -3399,8 +3392,8 @@ pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
     }
 
     // Tab bar(s)
-    if let Some(ref split) = layout.editor_group_split {
-        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+    if layout.editor_group_split.is_some() {
+        for (i, _gtb) in layout.group_tab_bars.iter().enumerate() {
             elems.push(UiElement::GroupTabBar { group_idx: i });
         }
         elems.push(UiElement::GroupDividers);
@@ -3413,8 +3406,8 @@ pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
         elems.push(UiElement::DiffToolbar);
     }
     // Diff toolbar (per-group)
-    if let Some(ref split) = layout.editor_group_split {
-        for gtb in &split.group_tab_bars {
+    if layout.editor_group_split.is_some() {
+        for gtb in &layout.group_tab_bars {
             if gtb.diff_toolbar.is_some() {
                 elems.push(UiElement::DiffToolbar);
                 break; // one element is enough to flag presence
@@ -3526,8 +3519,8 @@ pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
     }
 
     // draw_frame(): tab bar(s)
-    if let Some(ref split) = layout.editor_group_split {
-        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+    if layout.editor_group_split.is_some() {
+        for (i, _gtb) in layout.group_tab_bars.iter().enumerate() {
             elems.push(UiElement::GroupTabBar { group_idx: i });
         }
         elems.push(UiElement::GroupDividers);
@@ -3661,8 +3654,8 @@ pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
     if layout.diff_toolbar.is_some() {
         elems.push(UiElement::DiffToolbar);
     }
-    if let Some(ref split) = layout.editor_group_split {
-        for gtb in &split.group_tab_bars {
+    if layout.editor_group_split.is_some() {
+        for gtb in &layout.group_tab_bars {
             if gtb.diff_toolbar.is_some() {
                 elems.push(UiElement::DiffToolbar);
                 break;
@@ -3698,8 +3691,8 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
     }
 
     // Tab bar(s)
-    if let Some(ref split) = layout.editor_group_split {
-        for (i, _gtb) in split.group_tab_bars.iter().enumerate() {
+    if layout.editor_group_split.is_some() {
+        for (i, _gtb) in layout.group_tab_bars.iter().enumerate() {
             elems.push(UiElement::GroupTabBar { group_idx: i });
         }
         elems.push(UiElement::GroupDividers);
@@ -3712,8 +3705,8 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
         elems.push(UiElement::DiffToolbar);
     }
     // Diff toolbar (per-group)
-    if let Some(ref split) = layout.editor_group_split {
-        for gtb in &split.group_tab_bars {
+    if layout.editor_group_split.is_some() {
+        for gtb in &layout.group_tab_bars {
             if gtb.diff_toolbar.is_some() {
                 elems.push(UiElement::DiffToolbar);
                 break;
@@ -3871,9 +3864,26 @@ pub struct ScreenLayout {
     pub picker: Option<PickerPanel>,
     /// Tab switcher popup (Ctrl+Tab MRU list) — `Some` when open.
     pub tab_switcher: Option<TabSwitcherPanel>,
-    /// When the editor is split into two groups, this carries group 1's tab bar
-    /// and split geometry. `None` in the default single-group mode.
+    /// Marker for "the editor area holds 2 or more groups", carrying the
+    /// focused group + group count. `None` in the default single-group mode.
+    /// The per-group chrome it used to own lives on `group_tab_bars` /
+    /// `group_dividers` below, which are populated for *every* group count
+    /// (#551).
     pub editor_group_split: Option<EditorGroupSplitData>,
+    /// Tab bar + bounds for every editor group, in tree traversal order.
+    /// Always populated — a single group is a split of one, so this holds
+    /// exactly one entry in the default unsplit case rather than being empty
+    /// with a parallel single-group field. Backends iterate it unconditionally
+    /// (via `tab_bar_draw_targets`) instead of carrying a hand-written
+    /// "exactly one group" draw path beside the generic N-group one (#551).
+    pub group_tab_bars: Vec<GroupTabBar>,
+    /// Divider lines *between* editor groups (`Ctrl+W v` / `Ctrl+W s`
+    /// boundaries), in tree traversal order. Naturally empty when there is
+    /// only one group — `GroupLayout::Leaf::dividers()` returns `vec![]` — so
+    /// backends can paint it unconditionally (#551). Distinct from
+    /// `window_dividers`, which are the `:split`/`:vsplit` boundaries *within*
+    /// each group.
+    pub group_dividers: Vec<GroupDivider>,
     /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
     pub ext_sidebar: Option<ExtSidebarData>,
     /// AI assistant panel data — `Some` when the AI panel is the active sidebar panel.
@@ -6403,146 +6413,151 @@ pub fn build_screen_layout(
     });
 
     let n = engine.group_layout.leaf_count();
-    let editor_group_split = if n >= 2 {
-        // Build group rects using a dummy content_bounds — backends will compute
-        // their own actual rects, but we need the bounds here for GroupTabBar.
-        // The caller supplies window_rects which already reflect actual bounds.
-        let group_ids = engine.group_layout.group_ids();
-        // Compute group bounds from the window_rects: each group's bounds is
-        // the bounding box of its windows, expanded upward by line_height for tab bar.
-        let group_tab_bars: Vec<GroupTabBar> = group_ids
-            .iter()
-            .map(|&gid| {
-                let tabs = build_tab_bar_for_group_by_id(engine, gid);
-                // Find bounding rect for all windows in this group
-                let mut min_x = f64::MAX;
-                let mut min_y = f64::MAX;
-                let mut max_x = f64::MIN;
-                let mut max_y = f64::MIN;
-                if let Some(group) = engine.editor_groups.get(&gid) {
-                    for wr in window_rects {
-                        if group.active_tab().layout.window_ids().contains(&wr.0) {
-                            min_x = min_x.min(wr.1.x);
-                            min_y = min_y.min(wr.1.y);
-                            max_x = max_x.max(wr.1.x + wr.1.width);
-                            max_y = max_y.max(wr.1.y + wr.1.height);
-                        }
+    // ── Per-group chrome, built uniformly for EVERY group count (#551) ────────
+    // `group_tab_bars` and `group_dividers` used to live inside an
+    // `if n >= 2 { .. } else { None }` block, which forced every backend to
+    // carry a parallel hand-written "exactly one group" draw path beside the
+    // generic N-group one. A single group is just a split of one: the same
+    // bounding-box math produces the identical full-width tab bar rect, and
+    // `GroupLayout::Leaf::dividers()` already returns `vec![]`, so the generic
+    // path covers N=1 with no special case. `editor_group_split` below is now
+    // only a *marker* for "2 or more groups" (it still gates the hit-test
+    // paths that legitimately differ), and no longer the storage for this data
+    // — one source of truth, so a single-group calculation can't silently
+    // drift from the N-group one the way #547's breadcrumb y-offset did.
+    let group_ids = engine.group_layout.group_ids();
+    // Compute group bounds from the window_rects: each group's bounds is
+    // the bounding box of its windows (the tab bar is drawn just above it).
+    let group_tab_bars: Vec<GroupTabBar> = group_ids
+        .iter()
+        .map(|&gid| {
+            let tabs = build_tab_bar_for_group_by_id(engine, gid);
+            // Find bounding rect for all windows in this group
+            let mut min_x = f64::MAX;
+            let mut min_y = f64::MAX;
+            let mut max_x = f64::MIN;
+            let mut max_y = f64::MIN;
+            if let Some(group) = engine.editor_groups.get(&gid) {
+                for wr in window_rects {
+                    if group.active_tab().layout.window_ids().contains(&wr.0) {
+                        min_x = min_x.min(wr.1.x);
+                        min_y = min_y.min(wr.1.y);
+                        max_x = max_x.max(wr.1.x + wr.1.width);
+                        max_y = max_y.max(wr.1.y + wr.1.height);
                     }
                 }
-                if min_x == f64::MAX {
-                    min_x = 0.0;
-                    min_y = 0.0;
-                    max_x = 0.0;
-                    max_y = 0.0;
-                }
-                let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
-                // Populate diff toolbar if this group contains a diff window.
-                let diff_toolbar = if engine.is_in_diff_view() {
-                    if let Some((a, b)) = engine.diff_window_pair {
-                        let group = engine.editor_groups.get(&gid);
-                        let has_diff_win = group.is_some_and(|g| {
-                            let wids = g.active_tab().layout.window_ids();
-                            wids.contains(&a) || wids.contains(&b)
-                        });
-                        if has_diff_win {
-                            let (_, total) = engine.diff_unified_regions();
-                            let change_label = engine
-                                .diff_current_change_index()
-                                .map(|(c, t)| format!("{c} of {t}"));
-                            Some(DiffToolbarData {
-                                change_label,
-                                total_changes: total,
-                                unchanged_hidden: engine.diff_unchanged_hidden,
-                            })
-                        } else {
-                            None
-                        }
+            }
+            if min_x == f64::MAX {
+                min_x = 0.0;
+                min_y = 0.0;
+                max_x = 0.0;
+                max_y = 0.0;
+            }
+            let bounds = WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+            // Populate diff toolbar if this group contains a diff window.
+            let diff_toolbar = if engine.is_in_diff_view() {
+                if let Some((a, b)) = engine.diff_window_pair {
+                    let group = engine.editor_groups.get(&gid);
+                    let has_diff_win = group.is_some_and(|g| {
+                        let wids = g.active_tab().layout.window_ids();
+                        wids.contains(&a) || wids.contains(&b)
+                    });
+                    if has_diff_win {
+                        let (_, total) = engine.diff_unified_regions();
+                        let change_label = engine
+                            .diff_current_change_index()
+                            .map(|(c, t)| format!("{c} of {t}"));
+                        Some(DiffToolbarData {
+                            change_label,
+                            total_changes: total,
+                            unchanged_hidden: engine.diff_unchanged_hidden,
+                        })
                     } else {
                         None
                     }
                 } else {
                     None
-                };
-                let tab_scroll_offset = engine
-                    .editor_groups
-                    .get(&gid)
-                    .map(|g| g.tab_scroll_offset)
-                    .unwrap_or(0);
-                // Hit regions are expressed in char-CELLS so they are
-                // backend-neutral. TUI passes char_width=1.0 (bounds already in
-                // cells); GTK passes pixel bounds + real char_width, so divide to
-                // recover cells. Without this, GTK's right-aligned button regions
-                // (split/diff/action) would land at pixel columns and never match
-                // a cell-converted click. (#515)
-                let bar_width = (bounds.width / char_width).round() as u16;
-                let has_diff_toolbar = diff_toolbar.is_some();
-                let diff_label_cols = diff_toolbar
-                    .as_ref()
-                    .and_then(|dt| dt.change_label.as_ref())
-                    .map(|l| l.len() as u16 + 1)
-                    .unwrap_or(0);
-                let is_active = gid == engine.active_group;
-                let has_split = is_active || engine.is_in_diff_view();
-                let hit_regions = compute_tab_bar_hit_regions(
-                    &tabs,
-                    tab_scroll_offset,
-                    bar_width,
-                    has_diff_toolbar,
-                    diff_label_cols,
-                    has_split,
-                );
-                let accent = if is_active {
-                    Some(to_quadraui_color(theme.tab_active_accent))
-                } else {
-                    None
-                };
-                let bar = build_tab_bar_primitive(
-                    &tabs,
-                    has_split,
-                    diff_toolbar.as_ref(),
-                    tab_scroll_offset,
-                    accent,
-                );
-                GroupTabBar {
-                    group_id: gid,
-                    tabs,
-                    bounds,
-                    diff_toolbar,
-                    tab_scroll_offset,
-                    hit_regions,
-                    bar,
                 }
-            })
-            .collect();
-        // Collect dividers — use the total content bounds from window_rects
-        let content_bounds = if !window_rects.is_empty() {
-            let min_x = window_rects.iter().map(|r| r.1.x).fold(f64::MAX, f64::min);
-            let min_y = window_rects
-                .iter()
-                .map(|r| r.1.y - line_height)
-                .fold(f64::MAX, f64::min);
-            let max_x = window_rects
-                .iter()
-                .map(|r| r.1.x + r.1.width)
-                .fold(f64::MIN, f64::max);
-            let max_y = window_rects
-                .iter()
-                .map(|r| r.1.y + r.1.height)
-                .fold(f64::MIN, f64::max);
-            WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
-        } else {
-            WindowRect::new(0.0, 0.0, 0.0, 0.0)
-        };
-        let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-        Some(EditorGroupSplitData {
-            group_tab_bars,
-            active_group: engine.active_group,
-            dividers,
-            num_groups: n,
+            } else {
+                None
+            };
+            let tab_scroll_offset = engine
+                .editor_groups
+                .get(&gid)
+                .map(|g| g.tab_scroll_offset)
+                .unwrap_or(0);
+            // Hit regions are expressed in char-CELLS so they are
+            // backend-neutral. TUI passes char_width=1.0 (bounds already in
+            // cells); GTK passes pixel bounds + real char_width, so divide to
+            // recover cells. Without this, GTK's right-aligned button regions
+            // (split/diff/action) would land at pixel columns and never match
+            // a cell-converted click. (#515)
+            let bar_width = (bounds.width / char_width).round() as u16;
+            let has_diff_toolbar = diff_toolbar.is_some();
+            let diff_label_cols = diff_toolbar
+                .as_ref()
+                .and_then(|dt| dt.change_label.as_ref())
+                .map(|l| l.len() as u16 + 1)
+                .unwrap_or(0);
+            let is_active = gid == engine.active_group;
+            let has_split = is_active || engine.is_in_diff_view();
+            let hit_regions = compute_tab_bar_hit_regions(
+                &tabs,
+                tab_scroll_offset,
+                bar_width,
+                has_diff_toolbar,
+                diff_label_cols,
+                has_split,
+            );
+            let accent = if is_active {
+                Some(to_quadraui_color(theme.tab_active_accent))
+            } else {
+                None
+            };
+            let bar = build_tab_bar_primitive(
+                &tabs,
+                has_split,
+                diff_toolbar.as_ref(),
+                tab_scroll_offset,
+                accent,
+            );
+            GroupTabBar {
+                group_id: gid,
+                tabs,
+                bounds,
+                diff_toolbar,
+                tab_scroll_offset,
+                hit_regions,
+                bar,
+            }
         })
+        .collect();
+    // Collect dividers — use the total content bounds from window_rects.
+    // `GroupLayout::Leaf::dividers()` returns an empty vec, so this is
+    // naturally empty in single-group mode (#551).
+    let content_bounds = if !window_rects.is_empty() {
+        let min_x = window_rects.iter().map(|r| r.1.x).fold(f64::MAX, f64::min);
+        let min_y = window_rects
+            .iter()
+            .map(|r| r.1.y - line_height)
+            .fold(f64::MAX, f64::min);
+        let max_x = window_rects
+            .iter()
+            .map(|r| r.1.x + r.1.width)
+            .fold(f64::MIN, f64::max);
+        let max_y = window_rects
+            .iter()
+            .map(|r| r.1.y + r.1.height)
+            .fold(f64::MIN, f64::max);
+        WindowRect::new(min_x, min_y, max_x - min_x, max_y - min_y)
     } else {
-        None
+        WindowRect::new(0.0, 0.0, 0.0, 0.0)
     };
+    let group_dividers = engine.group_layout.dividers(content_bounds, &mut 0);
+    let editor_group_split = (n >= 2).then_some(EditorGroupSplitData {
+        active_group: engine.active_group,
+        num_groups: n,
+    });
 
     let ext_sidebar = build_ext_sidebar_data(engine);
     let ai_panel = build_ai_panel_data(engine);
@@ -6596,7 +6611,7 @@ pub fn build_screen_layout(
     };
 
     // Compute diff toolbar for single-group mode (multi-group has it on GroupTabBar).
-    let diff_toolbar = if editor_group_split.is_none() && engine.is_in_diff_view() {
+    let diff_toolbar = if n < 2 && engine.is_in_diff_view() {
         let (_, total) = engine.diff_unified_regions();
         let change_label = engine
             .diff_current_change_index()
@@ -6628,7 +6643,7 @@ pub fn build_screen_layout(
     // divide by char_width so the result is backend-neutral (TUI char_width=1.0).
     // `has_split_buttons = true` mirrors the `true` passed to build_tab_bar_primitive
     // above. Empty in multi-group mode (handled per-group on each GroupTabBar). (#515)
-    let tab_bar_hit_regions = if editor_group_split.is_some() || window_rects.is_empty() {
+    let tab_bar_hit_regions = if n >= 2 || window_rects.is_empty() {
         Vec::new()
     } else {
         let min_x = window_rects
@@ -6715,6 +6730,8 @@ pub fn build_screen_layout(
         }),
         tab_switcher,
         editor_group_split,
+        group_tab_bars,
+        group_dividers,
         window_dividers,
         ext_sidebar,
         ai_panel,
@@ -12852,8 +12869,8 @@ pub fn tab_bar_hit_bands(
     single_tab_hidden: bool,
     active_group: GroupId,
 ) -> Vec<TabBarHitBand> {
-    if let Some(ref split) = layout.editor_group_split {
-        return split
+    if layout.editor_group_split.is_some() {
+        return layout
             .group_tab_bars
             .iter()
             .filter(|gtb| gtb.bounds.width > 0.0)
@@ -12947,9 +12964,10 @@ pub fn screen_zone_hit_test(
         }
     }
 
-    // 3. Group dividers.
-    if let Some(ref split) = layout.editor_group_split {
-        for div in &split.dividers {
+    // 3. Group dividers. Naturally a no-op in single-group mode —
+    // `group_dividers` is empty there (#551).
+    {
+        for div in &layout.group_dividers {
             let hit = match div.direction {
                 SplitDirection::Vertical => {
                     let div_x = div.position;
@@ -13568,57 +13586,40 @@ pub fn build_tab_drop_groups(
     (groups, effective_tbh)
 }
 
-/// Build [`DropGroupBounds`] from a `ScreenLayout`, applying an
-/// editor-area offset. Both TUI and GTK call this when the
-/// `ScreenLayout` is available (draw path, or TUI's cached layout).
+/// Build [`DropGroupBounds`] from a `ScreenLayout`. Both TUI and GTK call
+/// this when the `ScreenLayout` is available (draw path, or TUI's cached
+/// layout).
 ///
-/// `editor_origin` / `editor_size` describe the *whole* editor region as
-/// callers naturally have it on hand — top-left at the single global tab
-/// bar's row/pixel (see e.g. the TUI comment "tab bar at row 0 of
-/// editor_area, windows at row 1+"), full height including that bar.
+/// [`DropGroupBounds`] (and `build_tab_drop_groups`, which reconstructs the
+/// tab-bar band by subtracting `tab_bar_height` back out) expects
+/// **content-area** bounds — i.e. already past the tab bar — which is exactly
+/// what every `GroupTabBar::bounds` is ("content area of this group; tab bar
+/// drawn at top edge"), in absolute screen space (#550).
 ///
-/// [`DropGroupBounds`] (and `build_tab_drop_groups`, which reconstructs
-/// the tab-bar band by subtracting `tab_bar_height` back out) expects
-/// **content-area** bounds — i.e. already past the tab bar — matching
-/// what the multi-group branch below gets for free from each
-/// `GroupTabBar::bounds` (documented as "content area of this group;
-/// tab bar drawn at top edge"). The single-group branch has no such
-/// per-group content rect to draw from, so it must derive one by
-/// skipping `tab_bar_height` off the top of the whole-region origin/size
-/// itself (#477 fix iteration 1: omitting this produced a negative
-/// `bounds.y` that put the cursor's tab-bar row just *above* the
-/// computed tab-bar band, so drops always fell through to the
-/// Split(Top) branch instead of TabReorder).
-pub fn screen_to_drop_group_bounds(
-    screen: &ScreenLayout,
-    engine: &crate::core::engine::Engine,
-    editor_origin: (f32, f32),
-    editor_size: (f32, f32),
-    tab_bar_height: f32,
-) -> Vec<DropGroupBounds> {
-    if let Some(ref split) = screen.editor_group_split {
-        split
-            .group_tab_bars
-            .iter()
-            .map(|gtb| DropGroupBounds {
-                group_id: gtb.group_id,
-                x: editor_origin.0 + gtb.bounds.x as f32,
-                y: editor_origin.1 + gtb.bounds.y as f32,
-                width: gtb.bounds.width as f32,
-                content_height: gtb.bounds.height as f32,
-                tab_scroll_offset: gtb.tab_scroll_offset,
-            })
-            .collect()
-    } else {
-        vec![DropGroupBounds {
-            group_id: engine.active_group,
-            x: editor_origin.0,
-            y: editor_origin.1 + tab_bar_height,
-            width: editor_size.0,
-            content_height: (editor_size.1 - tab_bar_height).max(0.0),
-            tab_scroll_offset: screen.tab_scroll_offset,
-        }]
-    }
+/// #551: this used to branch on `editor_group_split`, with a single-group arm
+/// that re-derived the content rect from a caller-supplied
+/// `editor_origin`/`editor_size`/`tab_bar_height` triple because there was no
+/// per-group `bounds` to read in that mode (#477 fix iteration 1: omitting the
+/// `tab_bar_height` skip there produced a negative `bounds.y` that put the
+/// cursor's tab-bar row just *above* the computed tab-bar band, so drops
+/// always fell through to `Split(Top)` instead of `TabReorder`).
+/// `ScreenLayout::group_tab_bars` is now populated for one group too, so the
+/// generic arm covers it and those three parameters — plus the
+/// `if split.is_some() { (0,0) } else { editor origin }` dance every caller
+/// had to perform to feed them (#515) — are gone.
+pub fn screen_to_drop_group_bounds(screen: &ScreenLayout) -> Vec<DropGroupBounds> {
+    screen
+        .group_tab_bars
+        .iter()
+        .map(|gtb| DropGroupBounds {
+            group_id: gtb.group_id,
+            x: gtb.bounds.x as f32,
+            y: gtb.bounds.y as f32,
+            width: gtb.bounds.width as f32,
+            content_height: gtb.bounds.height as f32,
+            tab_scroll_offset: gtb.tab_scroll_offset,
+        })
+        .collect()
 }
 
 pub fn compute_tab_drop_zone(
@@ -14491,14 +14492,15 @@ mod tests {
         let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
 
         // Both group tab bars should have diff_toolbar populated.
-        let split = layout
-            .editor_group_split
-            .expect("should have editor group split");
         assert!(
-            split.group_tab_bars.len() >= 2,
+            layout.editor_group_split.is_some(),
+            "should have editor group split"
+        );
+        assert!(
+            layout.group_tab_bars.len() >= 2,
             "should have 2+ group tab bars"
         );
-        for gtb in &split.group_tab_bars {
+        for gtb in &layout.group_tab_bars {
             assert!(
                 gtb.diff_toolbar.is_some(),
                 "group {:?} should have diff toolbar, but it's None",
@@ -16772,12 +16774,15 @@ mod tests {
     }
 
     /// Direct unit test for `tab_bar_draw_targets` (#549, follow-up to
-    /// #547's `breadcrumb_draw_targets`). Covers the single-group rect
-    /// pass-through, the split-group `reserved_h` subtraction against
-    /// already-absolute bounds (#550 — the `origin_offset` translation this
-    /// used to carry was dropped once both backends feed absolute window
-    /// rects), the `is_tab_bar_hidden` filter in both modes, and the
-    /// zero-width fallback filter in split mode.
+    /// #547's `breadcrumb_draw_targets`; rewritten for #551).
+    ///
+    /// The single-group case used to be served by a hand-written `else` arm
+    /// that painted a caller-supplied `(x, y, width)` rect. #551 deleted it:
+    /// `ScreenLayout::group_tab_bars` now holds one entry for one group, and
+    /// the generic `bounds.y - reserved_h` math must reproduce *exactly* the
+    /// full-width editor-top rect the deleted arm hard-coded. That equivalence
+    /// is the whole point of the refactor, so it is asserted explicitly below
+    /// against the `content_bounds` the caller laid the frame out with.
     #[test]
     fn test_tab_bar_draw_targets_single_and_split() {
         use crate::core::engine::Engine;
@@ -16790,18 +16795,31 @@ mod tests {
         let reserved_h = 32.0; // no breadcrumbs: reserved == tab row height
 
         // ── Single-group mode ───────────────────────────────────────────
+        // Non-zero origin so "the generic path reproduces the old hard-coded
+        // editor-origin rect" is a real claim, not a zero-origin coincidence.
         let mut engine = Engine::new();
-        let content_bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
+        let content_bounds = WindowRect::new(10.0, 20.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, reserved_h);
         let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
         assert!(screen.editor_group_split.is_none());
+        // #551: the per-group chrome is populated even with a single group.
+        assert_eq!(
+            screen.group_tab_bars.len(),
+            1,
+            "one group must still produce one GroupTabBar (split-of-1)"
+        );
+        assert!(
+            screen.group_dividers.is_empty(),
+            "one group has no inter-group dividers"
+        );
 
-        let targets =
-            tab_bar_draw_targets(&engine, &screen, tab_row_h, reserved_h, (10.0, 20.0, 800.0));
+        let targets = tab_bar_draw_targets(&engine, &screen, tab_row_h, reserved_h);
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].rect.x, 10.0);
-        assert_eq!(targets[0].rect.y, 20.0);
-        assert_eq!(targets[0].rect.width, 800.0);
+        // Exactly the rect the deleted single-group arm used to hard-code from
+        // the caller's editor origin/width.
+        assert_eq!(targets[0].rect.x, content_bounds.x as f32);
+        assert_eq!(targets[0].rect.y, content_bounds.y as f32);
+        assert_eq!(targets[0].rect.width, content_bounds.width as f32);
         assert_eq!(targets[0].rect.height, tab_row_h as f32);
         assert_eq!(targets[0].group_id, engine.active_group);
 
@@ -16809,13 +16827,7 @@ mod tests {
         engine.settings.hide_single_tab = true;
         let screen_hidden =
             build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
-        let targets = tab_bar_draw_targets(
-            &engine,
-            &screen_hidden,
-            tab_row_h,
-            reserved_h,
-            (10.0, 20.0, 800.0),
-        );
+        let targets = tab_bar_draw_targets(&engine, &screen_hidden, tab_row_h, reserved_h);
         assert!(
             targets.is_empty(),
             "a hidden single-group tab bar must not be drawn"
@@ -16830,22 +16842,21 @@ mod tests {
         let content_bounds = WindowRect::new(5.0, 7.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, reserved_h);
         let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
-        let split = screen
-            .editor_group_split
-            .as_ref()
-            .expect("2 groups must produce Some(editor_group_split)");
-        assert_eq!(split.group_tab_bars.len(), 2);
+        assert!(
+            screen.editor_group_split.is_some(),
+            "2 groups must produce Some(editor_group_split)"
+        );
+        assert_eq!(screen.group_tab_bars.len(), 2);
+        assert_eq!(
+            screen.group_dividers.len(),
+            1,
+            "a 2-group split has exactly one inter-group divider"
+        );
 
         // Rect derived from the already-absolute `bounds.y - reserved_h`.
-        let targets = tab_bar_draw_targets(
-            &engine,
-            &screen,
-            tab_row_h,
-            reserved_h,
-            (0.0, 0.0, 0.0), // unused in split mode
-        );
+        let targets = tab_bar_draw_targets(&engine, &screen, tab_row_h, reserved_h);
         assert_eq!(targets.len(), 2);
-        for (target, gtb) in targets.iter().zip(split.group_tab_bars.iter()) {
+        for (target, gtb) in targets.iter().zip(screen.group_tab_bars.iter()) {
             assert_eq!(target.group_id, gtb.group_id);
             assert_eq!(target.rect.x, gtb.bounds.x as f32);
             assert_eq!(target.rect.y, (gtb.bounds.y - reserved_h) as f32);
@@ -16856,32 +16867,112 @@ mod tests {
         // Note: `is_tab_bar_hidden` only ever returns true in single-group
         // mode (`hide_single_tab` + `leaf_count() <= 1`, see
         // `Engine::is_tab_bar_hidden`), so there's no reachable per-group
-        // "hidden" state to exercise here in split mode — the split arm's
-        // `is_tab_bar_hidden` check is defensive, matching what the
+        // "hidden" state to exercise here in split mode — the
+        // `is_tab_bar_hidden` filter is defensive, matching what the
         // pre-existing per-backend loops did.
 
         // Zero-width bounds (the `min_x == f64::MAX` fallback) are filtered
-        // out in split mode too, mirroring `breadcrumb_draw_targets`.
+        // out too, mirroring `breadcrumb_draw_targets`.
         let mut screen_zero_width =
             build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
-        screen_zero_width
-            .editor_group_split
-            .as_mut()
-            .unwrap()
-            .group_tab_bars[0]
-            .bounds
-            .width = 0.0;
-        let targets = tab_bar_draw_targets(
-            &engine,
-            &screen_zero_width,
-            tab_row_h,
-            reserved_h,
-            (0.0, 0.0, 0.0),
-        );
+        screen_zero_width.group_tab_bars[0].bounds.width = 0.0;
+        let targets = tab_bar_draw_targets(&engine, &screen_zero_width, tab_row_h, reserved_h);
         assert_eq!(
             targets.len(),
             1,
             "a zero-width group tab bar must not be drawn"
+        );
+    }
+
+    /// #551: the single `GroupTabBar` synthesised for an unsplit editor must
+    /// carry byte-for-byte the same tab content the old single-group-only
+    /// fields did. If these ever diverge, the unified draw path would silently
+    /// paint a *different* tab bar than the pre-#551 code did — the exact
+    /// class of regression #547 hit when a single-group calculation drifted
+    /// from the generic one.
+    #[test]
+    fn test_single_group_tab_bar_matches_legacy_single_group_fields() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let theme = Theme::onedark();
+        let mut engine = Engine::new();
+        // More than one tab so tab labels/active flags are non-trivial.
+        engine.execute_command("tabnew");
+        engine.execute_command("tabnew");
+        assert_eq!(engine.group_layout.leaf_count(), 1);
+
+        let content_bounds = WindowRect::new(3.0, 4.0, 120.0, 40.0);
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, 1.0);
+        let screen = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+
+        assert_eq!(screen.group_tab_bars.len(), 1);
+        let gtb = &screen.group_tab_bars[0];
+        assert_eq!(gtb.group_id, engine.active_group);
+        assert_eq!(
+            gtb.tabs.len(),
+            screen.tab_bar.len(),
+            "group tab list must match the legacy single-group tab list"
+        );
+        for (a, b) in gtb.tabs.iter().zip(screen.tab_bar.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.active, b.active);
+            assert_eq!(a.dirty, b.dirty);
+        }
+        assert_eq!(gtb.tab_scroll_offset, screen.tab_scroll_offset);
+        // `TabBarHitRegion`/`TabBarClickTarget` are `Debug` but not `PartialEq`,
+        // so compare their debug renderings pairwise.
+        assert_eq!(
+            gtb.hit_regions.len(),
+            screen.tab_bar_hit_regions.len(),
+            "group hit regions must match the legacy single-group hit regions"
+        );
+        for ((ra, ta), (rb, tb)) in gtb
+            .hit_regions
+            .iter()
+            .zip(screen.tab_bar_hit_regions.iter())
+        {
+            assert_eq!(format!("{ra:?}"), format!("{rb:?}"));
+            assert_eq!(format!("{ta:?}"), format!("{tb:?}"));
+        }
+        // The group's bounds must be the editor content area, i.e. the tab row
+        // recovered from it lands exactly on the editor's top edge.
+        assert_eq!(gtb.bounds.x, content_bounds.x);
+        assert_eq!(gtb.bounds.y - 1.0, content_bounds.y);
+        assert_eq!(gtb.bounds.width, content_bounds.width);
+    }
+
+    /// #551: `screen_to_drop_group_bounds` lost its
+    /// origin/size/tab-bar-height parameters along with the single-group arm
+    /// that needed them. The bounds it returns for an unsplit editor must
+    /// still be the *content* area (past the tab bar), which is what
+    /// `build_tab_drop_groups` reconstructs the tab-bar band from — the #477
+    /// regression this pins.
+    #[test]
+    fn test_drop_group_bounds_single_group_is_content_area() {
+        use crate::core::engine::Engine;
+        use crate::core::window::WindowRect;
+
+        let theme = Theme::onedark();
+        let engine = Engine::new();
+        let content_bounds = WindowRect::new(6.0, 2.0, 90.0, 30.0);
+        let tab_bar_height = 1.0;
+        let (rects, _) = engine.calculate_group_window_rects(content_bounds, tab_bar_height);
+        let screen = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+
+        let bounds = screen_to_drop_group_bounds(&screen);
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].group_id, engine.active_group);
+        assert_eq!(bounds[0].x, content_bounds.x as f32);
+        assert_eq!(
+            bounds[0].y,
+            (content_bounds.y + tab_bar_height) as f32,
+            "drop bounds start below the tab bar"
+        );
+        assert_eq!(bounds[0].width, content_bounds.width as f32);
+        assert_eq!(
+            bounds[0].content_height,
+            (content_bounds.height - tab_bar_height) as f32
         );
     }
 

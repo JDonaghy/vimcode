@@ -8189,7 +8189,7 @@ impl quadraui::ShellApp for App {
         let mut tab_bar_zones: HashMap<usize, (core::window::GroupId, quadraui::Rect)> =
             HashMap::new();
         for (next_surface_idx, target) in (window_editors.len()..).zip(
-            render::tab_bar_draw_targets(&engine, screen, tab_row_h, tab_bar_h, (x, y, w)),
+            render::tab_bar_draw_targets(&engine, screen, tab_row_h, tab_bar_h),
         ) {
             let tb_rect = target.rect;
             let hover = self
@@ -8459,24 +8459,16 @@ impl quadraui::ShellApp for App {
         // stash them so the drag hit-test (handle_mouse_drag_msg) and the overlay
         // below use one identical source.
         //
-        // Origin convention: in multi-group mode `gtb.bounds` are already absolute
-        // (built from absolute window rects), so the origin offset must be (0,0) —
-        // adding (x,y) again would double-count it and shift the highlight off the
-        // group (the prior "covers half the group" bug). Single-group mode returns
-        // (origin, size) directly, so it needs the real editor origin (x,y). (#515)
+        // Origin convention: `gtb.bounds` are always absolute (built from absolute
+        // window rects), so there is no origin offset to apply — adding (x,y)
+        // again would double-count it and shift the highlight off the group (the
+        // prior "covers half the group" bug, #515). This used to branch on
+        // `editor_group_split.is_some()` because the single-group arm of
+        // `screen_to_drop_group_bounds` derived its rect from a caller-supplied
+        // origin/size instead; `group_tab_bars` now covers one group too, so both
+        // the branch and the parameters it fed are gone (#551).
         {
-            let drop_origin = if screen.editor_group_split.is_some() {
-                (0.0, 0.0)
-            } else {
-                (x as f32, y as f32)
-            };
-            let bounds = render::screen_to_drop_group_bounds(
-                screen,
-                &engine,
-                drop_origin,
-                (w as f32, editor_area_h as f32),
-                tab_bar_h as f32,
-            );
+            let bounds = render::screen_to_drop_group_bounds(screen);
             // Per-tab slot x-positions (absolute) were captured while drawing the
             // tab bars above. Feeding them here makes a drag inside a group's own
             // tab bar resolve to a `TabReorder` (insertion bar) instead of falling

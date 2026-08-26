@@ -1435,13 +1435,7 @@ impl ShellApp for TuiShellApp {
         } else {
             1.0
         };
-        let tab_bar_targets = render::tab_bar_draw_targets(
-            &self.engine,
-            &screen,
-            1.0,
-            tui_tbh,
-            (area.x as f64, area.y as f64, area.width as f64),
-        );
+        let tab_bar_targets = render::tab_bar_draw_targets(&self.engine, &screen, 1.0, tui_tbh);
         {
             // Reset per-frame: `post_draw_apply_widths` wants this frame's
             // measurements, not an ever-growing accumulation.
@@ -1472,15 +1466,21 @@ impl ShellApp for TuiShellApp {
         // ── Group divider lines (#609) ───────────────────────────────────
         // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed to
         // `render_all_windows`'s within-group `render_separators` above) —
-        // only present when the editor is split into multiple groups.
+        // only present when the editor is split into multiple groups, which
+        // `screen.group_dividers` expresses by simply being empty otherwise,
+        // so no `editor_group_split.is_some()` gate is needed (#551).
         // Mirrors `draw_frame`'s own divider block, ported to
         // `Backend::draw_status_bar` via `render_group_dividers` (see its
         // doc comment, and `group_divider_cells`'s for how the #481
         // phantom-divider-beside-scrollbar guard became a pure data
         // computation instead of a `Buffer` read-back).
-        if let Some(ref split) = screen.editor_group_split {
-            render_group_dividers(backend, &split.dividers, &screen.windows, area, &theme);
-        }
+        render_group_dividers(
+            backend,
+            &screen.group_dividers,
+            &screen.windows,
+            area,
+            &theme,
+        );
 
         // ── Tab-drag ghost overlay (#609) ────────────────────────────────
         // Drag state (`tui_drag_source`/`tui_drag_cursor`/
@@ -1493,7 +1493,6 @@ impl ShellApp for TuiShellApp {
             render_tab_drag_overlay(
                 backend,
                 &self.engine,
-                area,
                 &screen,
                 &theme,
                 self.tui_drag_source,
@@ -4744,6 +4743,67 @@ mod tests {
             occurrences, 2,
             "expected the marker text to paint once per split pane; screen:\n{screen}"
         );
+    }
+
+    /// #551: the unsplit (single editor group) case must still paint exactly
+    /// one full-width tab bar on the editor's top row, and no group divider.
+    ///
+    /// This is the black-box guard for collapsing the single-group draw arm
+    /// into the generic N-group one. Both backends used to carry a
+    /// hand-written `else { /* exactly one group */ }` block; the tab bar is
+    /// now drawn from `ScreenLayout::group_tab_bars` (one entry) and the
+    /// dividers from `ScreenLayout::group_dividers` (empty) for every group
+    /// count. If the split-of-1 bounds ever stopped reproducing the old
+    /// hard-coded editor-origin rect, the tab label would move off row 0 or
+    /// vanish — which is exactly what this asserts through the real
+    /// `driver_with_shell` paint path.
+    ///
+    /// Paired with `render_content_paints_group_divider_via_shell_app` below,
+    /// which pins the N >= 2 half of the same unified path.
+    #[test]
+    fn render_content_paints_single_group_tab_bar_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "short\n");
+        assert_eq!(
+            app.engine.group_layout.leaf_count(),
+            1,
+            "this test covers the unsplit case"
+        );
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+
+        let tab_row = lines[0];
+        let starts: Vec<usize> = tab_row
+            .match_indices("[No Name]")
+            .map(|(i, _)| tab_row[..i].chars().count())
+            .collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "an unsplit editor must paint exactly one tab bar, on row 0; row:\n{tab_row}"
+        );
+
+        // No editor-group divider exists with one group, so no '│' may appear
+        // at or right of the tab label. (The sidebar, entirely to the left of
+        // the tab label, paints its own unrelated '│' indent guides — those
+        // are not the glyph under test, same carve-out the split-group test
+        // makes.)
+        let tab_start = starts[0];
+        for (y, line) in lines.iter().enumerate().skip(1).take(15) {
+            let stray = line
+                .chars()
+                .enumerate()
+                .skip(tab_start)
+                .find(|(_, c)| *c == '│')
+                .map(|(i, _)| i);
+            assert!(
+                stray.is_none(),
+                "row {y}: unexpected group-divider glyph at col {:?} with a \
+                 single editor group; line:\n{line}",
+                stray
+            );
+        }
     }
 
     /// #609: `render_content` must also paint the *group-level* divider
