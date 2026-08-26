@@ -7020,12 +7020,6 @@ impl App {
         }
         if let Some(w) = Self::find_visible_window() {
             w.set_decorated(false);
-            // Per-window icon hint for window managers that read
-            // `_NET_WM_ICON` / the `icon-name` property rather than matching
-            // the toplevel's app-id against an installed `.desktop` file
-            // (#556). The app-id itself is stamped on the process by
-            // `apply_app_identity` before the toplevel is realized.
-            w.set_icon_name(Some(ICON_NAME));
             self.window = Some(w);
         }
     }
@@ -7903,13 +7897,6 @@ impl quadraui::ShellApp for App {
         // calls `window.present()`, so it is very likely not yet mapped and
         // this lookup finds nothing. `tick()` retries every frame until the
         // window is mapped, which is the reliable path (#552).
-        //
-        // Re-assert the process app-id first: the runner's
-        // `gtk4::Application` has already started up by the time `setup()`
-        // runs, and `setup()` is still ahead of `window.present()` — so this
-        // is the last hook before the toplevel is realized and its
-        // Wayland `app_id` / X11 `WM_CLASS` are latched from prgname (#556).
-        apply_app_identity();
         self.capture_window_and_apply_csd();
 
         // GTK draws its own VSCode-style menu bar (File/Edit/View/...) — it
@@ -9370,12 +9357,6 @@ pub(crate) fn run(file_path: Option<PathBuf>) {
     // with the ShellApp runner it happens inside gapp.run() which is called
     // by run_with_shell() — too late for App::new().
     gtk4::init().expect("Failed to initialize GTK");
-    // Stamp the freedesktop app-id / icon-name onto the process before any
-    // toplevel exists, so the WM can match the window to the `.desktop` file
-    // written just above. The quadraui runner hard-codes `org.quadraui.app`
-    // as its `gtk4::Application` id and exposes no override — see
-    // `apply_app_identity`'s doc comment (#556).
-    apply_app_identity();
     // Create the App and run via the quadraui ShellApp runner.
     // The runner creates its own GTK Application + window; vimcode's engine
     // and event handling are wired in via impl ShellApp for App above.
