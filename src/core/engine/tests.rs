@@ -18335,6 +18335,52 @@ fn test_breadcrumb_double_click_no_line_falls_back() {
     assert_eq!(e.picker_query, "@");
 }
 
+/// #555: `handle_breadcrumb_click` must resolve the segment index against
+/// the group whose bar was clicked, not whichever group happens to hold
+/// focus. Both backends hand it the `GroupId` that
+/// `render::resolve_breadcrumb_click` reports.
+///
+/// Backend-agnostic guard for the same defect the GTK harness test
+/// `breadcrumb_click_acts_on_the_clicked_group_not_the_focused_one` covers
+/// end-to-end — TUI routes through this identical engine entry point.
+#[test]
+fn test_breadcrumb_click_resolves_against_the_clicked_group() {
+    let dir = std::env::temp_dir().join(format!("vc_bc_group_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(dir.join("src").join("core"));
+    let shallow = dir.join("a.rs");
+    let deep = dir.join("src").join("core").join("deep.rs");
+    let _ = std::fs::write(&shallow, "fn a() {}\n");
+    let _ = std::fs::write(&deep, "fn d() {}\n");
+
+    let mut e = Engine::new_for_test();
+    e.cwd = dir.clone();
+    let buf_a = e.active_buffer_id();
+    e.buffer_manager.get_mut(buf_a).unwrap().file_path = Some(shallow.clone());
+    let group_a = e.active_group;
+
+    e.open_editor_group(SplitDirection::Vertical);
+    let group_b = e.active_group;
+    let buf_b = e.buffer_manager.create();
+    e.buffer_manager.get_mut(buf_b).unwrap().file_path = Some(deep.clone());
+    let win_b = e.active_window_id();
+    e.windows.get_mut(&win_b).unwrap().buffer_id = buf_b;
+
+    // Focus A (1 path segment); click B's segment 2 (`deep.rs`).
+    e.active_group = group_a;
+    e.handle_breadcrumb_click(group_b, 2);
+
+    assert_eq!(
+        e.active_group, group_b,
+        "the clicked group must take focus so its segments are the ones resolved"
+    );
+    assert!(
+        e.picker_open,
+        "an index valid for the clicked group must open its dropdown, not bail"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Breadcrumb focus mode tests ────────────────────────────────────────
 
 #[test]

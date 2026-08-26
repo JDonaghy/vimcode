@@ -741,6 +741,14 @@ struct App {
     /// handler. (B.5b Stage 7.)
     #[allow(clippy::type_complexity)]
     tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Picker/command-palette popup rect `(x, y, w, h)` **as the last frame
+    /// actually painted it** — see [`App::compute_picker_popup_bounds`] for
+    /// why the click path must not re-derive it (#555).
+    #[allow(clippy::type_complexity)]
+    picker_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Line height the last frame actually painted with, published by
+    /// `render_content` — see [`App::painted_line_height`] (#555).
+    painted_line_height: Rc<Cell<Option<f64>>>,
     /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
     #[allow(clippy::type_complexity)]
     editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
@@ -1579,6 +1587,8 @@ impl App {
             completion_layout: Rc::new(RefCell::new(None)),
             context_menu_layout: Rc::new(RefCell::new(None)),
             tab_switcher_popup_rect: Rc::new(Cell::new(None)),
+            picker_popup_rect: Rc::new(Cell::new(None)),
+            painted_line_height: Rc::new(Cell::new(None)),
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
             menu_dd_line_height: Rc::new(Cell::new(24.0)),
@@ -1811,27 +1821,30 @@ impl App {
                     }
                     self.draw_needed.set(true);
                 } else {
+                    // Breadcrumb double-click: same shared resolution as the
+                    // single-click path above (#555). This used to re-derive
+                    // the bar's geometry by hand — `y >= lh && y < lh * 2.0`
+                    // plus a per-`char_width` walk over the *active* group's
+                    // segments — which is pre-#540 Relm4 geometry: under the
+                    // ShellApp runner the breadcrumb row sits below the title
+                    // bar, the menu bar and a `1.6 * lh` tab row, so that band
+                    // never contained it (double-click was dead) while still
+                    // matching chrome rows that could fire the wrong segment.
                     let mut bc_handled = false;
                     if engine.settings.breadcrumbs {
-                        let lh = self.cached_line_height.max(1.0);
-                        let cw = self.cached_char_width.max(1.0);
-                        if y >= lh && y < lh * 2.0 {
-                            let segments =
-                                crate::render::build_breadcrumbs_for_active_group(&engine);
-                            let sep_w = " › ".chars().count() as f64 * cw;
-                            let mut seg_x = cw;
-                            for seg in &segments {
-                                let label_w = seg.label.chars().count() as f64 * cw;
-                                if x >= seg_x && x < seg_x + label_w {
-                                    engine.breadcrumb_double_click(
-                                        seg.is_symbol,
-                                        seg.path_prefix.as_deref(),
-                                        seg.symbol_line,
-                                    );
+                        let lh = self.painted_line_height();
+                        let layout_ref = self.cached_screen_layout.borrow();
+                        if let Some(ref layout) = *layout_ref {
+                            match render::resolve_breadcrumb_click(&layout.breadcrumbs, x, y, lh) {
+                                render::BreadcrumbClickResult::Hit(group_id, idx) => {
+                                    drop(layout_ref);
+                                    engine.handle_breadcrumb_double_click(group_id, idx);
                                     bc_handled = true;
-                                    break;
                                 }
-                                seg_x += label_w + sep_w;
+                                render::BreadcrumbClickResult::OnBar => {
+                                    bc_handled = true;
+                                }
+                                render::BreadcrumbClickResult::Miss => {}
                             }
                         }
                     }
@@ -3993,7 +4006,7 @@ impl App {
                 }
 
                 if hit_modal {
-                    let lh = self.cached_line_height.max(1.0);
+                    let lh = self.painted_line_height();
                     let has_preview = self.engine.borrow().picker_preview.is_some();
                     let list_w = if has_preview {
                         (popup_w * 0.4_f64).round()
@@ -4102,12 +4115,15 @@ impl App {
         {
             let engine = self.engine.borrow();
             if engine.settings.breadcrumbs {
-                let lh = self.cached_line_height.max(1.0);
+                let lh = self.painted_line_height();
                 if let Some(ref screen) = *self.cached_screen_layout.borrow() {
                     match render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh) {
-                        render::BreadcrumbClickResult::Hit(idx) => {
+                        render::BreadcrumbClickResult::Hit(group_id, idx) => {
                             drop(engine);
-                            self.engine.borrow_mut().handle_breadcrumb_click(idx);
+                            self.engine
+                                .borrow_mut()
+                                .handle_breadcrumb_click(group_id, idx);
+                            self.draw_needed.set(true);
                             return;
                         }
                         render::BreadcrumbClickResult::OnBar => return,
@@ -4716,10 +4732,43 @@ impl App {
         } // close else (dialog not open)
     }
 
+    /// Line height the last frame actually painted with, falling back to the
+    /// `setup()`-seeded `cached_line_height` before the first frame.
+    ///
+    /// Every click hit-test that measures *painted* geometry must use this
+    /// rather than `cached_line_height` (#555) — see the note where
+    /// `render_content` publishes it.
+    fn painted_line_height(&self) -> f64 {
+        self.painted_line_height
+            .get()
+            .unwrap_or(self.cached_line_height)
+            .max(1.0)
+    }
+
     /// Compute the picker popup's bounds in DA-local pixels. Shared by
     /// the click handler (to push into the modal stack) and the drag
     /// guard (to decide if a drag started inside the popup).
+    ///
+    /// Prefers the rect the last frame **actually painted**
+    /// (`picker_popup_rect`), and only re-derives from `width`/`height` when
+    /// no frame has painted the picker yet.
+    ///
+    /// #555: re-deriving was wrong on two counts, and together they put the
+    /// hit rect in a different place than the pixels. `render_content` centres
+    /// the popup in `backend.viewport()` (the whole window) at
+    /// `gtk_picker_sizing(line_height)`, whereas both callers here pass the
+    /// `width`/`height` of `ctx.layout.main_content_bounds` — the editor area
+    /// only, minus activity bar / sidebar / title bar — anchored at `(0, 0)`,
+    /// and a `line_h: 1.0, header_h: 0.0` sizing. So with any shell chrome
+    /// present the modal rect pushed onto the `ModalStack` was both offset and
+    /// differently sized from the visible popup: clicks on the painted
+    /// dropdown either missed the modal entirely or resolved to the wrong
+    /// result row. That is what made the breadcrumb dropdown look inert once
+    /// it finally started painting.
     fn compute_picker_popup_bounds(&self, width: f64, height: f64) -> (f64, f64, f64, f64) {
+        if let Some(rect) = self.picker_popup_rect.get() {
+            return rect;
+        }
         let engine = self.engine.borrow();
         let has_preview = engine.picker_preview.is_some();
         drop(engine);
@@ -7006,6 +7055,23 @@ impl App {
             return false;
         }
 
+        // An open picker / command palette is painted *over* the sidebar and
+        // owns every press while it is up (#555). `render_content` centres the
+        // popup on the whole window, so with the sidebar open its left half
+        // sits on top of the explorer tree — and without this the tree's row
+        // hit-test underneath ate those presses before they could reach
+        // `handle_mouse_click_msg`'s picker block. The dropdown a breadcrumb
+        // click opens therefore looked completely inert on its left half:
+        // rows highlighted nothing, selection never moved.
+        //
+        // Falling through is also what makes *dismissal* correct: a press on
+        // the sidebar while the picker is up reaches the picker's own
+        // modal-stack dispatch, which resolves it as an outside-click and
+        // closes the popup (rather than silently driving the tree beneath it).
+        if self.engine.borrow().picker_open {
+            return false;
+        }
+
         // An engine-drawn context menu (editor / tab-bar / explorer — they
         // all share `engine.context_menu`) takes priority over the sidebar's
         // own click routing. An explorer-sourced menu typically renders
@@ -7880,6 +7946,15 @@ impl quadraui::ShellApp for App {
 
         let lh = self.cached_line_height.max(backend.line_height() as f64);
         let cw = self.cached_char_width.max(backend.char_width() as f64);
+        // Publish the value this frame paints with so click-time hit-tests can
+        // use it (#555). `render_content` takes `&self`, so it cannot write
+        // the plain `cached_line_height` field — which is seeded once in
+        // `setup()` from the runner's *default* metrics and can therefore be
+        // smaller than the `lh` every frame actually paints with. Hit-testing
+        // painted geometry against the smaller value put row boundaries in the
+        // wrong place (the picker resolved clicks two rows off) and clipped
+        // the bottom of every single-row band, breadcrumbs included.
+        self.painted_line_height.set(Some(lh));
 
         let main = layout.main_content_bounds;
         let (x, y, w, h) = (
@@ -8491,6 +8566,15 @@ impl quadraui::ShellApp for App {
                 palette: &palette,
             });
             frame.draw(backend);
+            // Hand the *painted* rect to the click/drag handlers (#555).
+            self.picker_popup_rect.set(Some((
+                geo.popup_x as f64,
+                geo.popup_y as f64,
+                geo.popup_w as f64,
+                geo.popup_h as f64,
+            )));
+        } else {
+            self.picker_popup_rect.set(None);
         }
 
         if let Some(ref panel) = screen.dialog {
