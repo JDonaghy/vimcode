@@ -217,12 +217,12 @@ pub(super) fn draw_editor(
         let mut slots = tab_slot_positions_out.borrow_mut();
         slots.clear();
     }
-    if let Some(ref split) = screen.editor_group_split {
+    if screen.editor_group_split.is_some() {
         // Draw divider lines first (behind tab bars).
         let (sr, sg, sb) = theme.separator.to_cairo();
         cr.set_source_rgb(sr, sg, sb);
         cr.set_line_width(1.0);
-        for div in &split.dividers {
+        for div in &screen.group_dividers {
             match div.direction {
                 crate::core::window::SplitDirection::Vertical => {
                     cr.move_to(div.position, div.cross_start);
@@ -237,7 +237,7 @@ pub(super) fn draw_editor(
             }
         }
         // Draw each group's tab bar ON TOP of dividers.
-        for gtb in &split.group_tab_bars {
+        for gtb in &screen.group_tab_bars {
             if engine.is_tab_bar_hidden(gtb.group_id) {
                 continue;
             }

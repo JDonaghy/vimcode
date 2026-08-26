@@ -493,130 +493,106 @@ pub(super) fn draw_frame(
     }
 
     // ── Render editor ─────────────────────────────────────────────────────────
+    // ONE code path for every editor-group count (#551). This used to be an
+    // `if let Some(split) = screen.editor_group_split { .. } else { .. }` with
+    // a hand-written "exactly one group" arm beside the generic N-group one —
+    // not a different feature, just a second implementation of the same thing,
+    // which is precisely how #547's single-group breadcrumb y-offset drifted
+    // out of sync with the generic calculation. A single group is now a split
+    // of one: `screen.group_tab_bars` holds its tab bar and
+    // `screen.group_dividers` is empty, so the generic loops below cover both.
+    //
     // Skip-condition + rect math (including the zero-width fallback filter
     // and the reserved-height subtraction that recovers the tab row's own
     // top edge from `GroupTabBar::bounds.y`) come from
     // `render::tab_bar_draw_targets`, shared with GTK, so the two backends
     // can't drift apart (#549, follow-up to #547's `breadcrumb_draw_targets`).
-    // Each arm below still does its own draw call + `tab_visible_counts_out`
-    // bookkeeping, and picks where in the window-render order to draw (split
-    // draws windows first so tab bars paint on top at group boundaries;
-    // single draws the tab bar first then windows below it).
+    // The draw call + `tab_visible_counts_out` bookkeeping stay here.
+    //
+    // Draw order is the old split arm's: windows first, then tab bars on top,
+    // which prevents window content from overwriting an adjacent group's tab
+    // bar in horizontal splits. The single-group arm used to draw its tab bar
+    // *before* the windows; that ordering was interchangeable because the tab
+    // row and the window rects never overlap (the row is reserved out of the
+    // group's content bounds), so unifying on windows-first is a no-op there.
     let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
         2.0
     } else {
         1.0
     };
-    let tab_bar_targets = render::tab_bar_draw_targets(
-        engine,
-        screen,
-        1.0,
-        tui_tbh,
-        (
-            editor_area.x as f64,
-            editor_area.y as f64,
-            editor_area.width as f64,
-        ),
+    let tab_bar_targets = render::tab_bar_draw_targets(engine, screen, 1.0, tui_tbh);
+    debug_log!(
+        "draw_frame: editor_area=({},{},{}x{}) groups={}",
+        editor_area.x,
+        editor_area.y,
+        editor_area.width,
+        editor_area.height,
+        screen.group_tab_bars.len()
     );
-    if let Some(ref split) = screen.editor_group_split {
+    for (idx, gtb) in screen.group_tab_bars.iter().enumerate() {
         debug_log!(
-            "draw_frame split: editor_area=({},{},{}x{}) groups={}",
-            editor_area.x,
-            editor_area.y,
-            editor_area.width,
-            editor_area.height,
-            split.group_tab_bars.len()
+            "  group[{}] id={:?} bounds=({:.1},{:.1},{:.1}x{:.1}) tabs={}",
+            idx,
+            gtb.group_id,
+            gtb.bounds.x,
+            gtb.bounds.y,
+            gtb.bounds.width,
+            gtb.bounds.height,
+            gtb.tabs.len()
         );
-        for (idx, gtb) in split.group_tab_bars.iter().enumerate() {
-            debug_log!(
-                "  group[{}] id={:?} bounds=({:.1},{:.1},{:.1}x{:.1}) tabs={}",
-                idx,
-                gtb.group_id,
-                gtb.bounds.x,
-                gtb.bounds.y,
-                gtb.bounds.width,
-                gtb.bounds.height,
-                gtb.tabs.len()
-            );
-        }
-        // Render windows first so tab bars draw on top (prevents window content
-        // from overwriting an adjacent group's tab bar in horizontal splits).
-        render_all_windows(backend, Some(frame), &screen.windows, theme);
-        // Draw each group's tab bar.  Tab bar sits tab_bar_height rows above
-        // the group's window content (bounds.y - tab_bar_height).
-        for target in &tab_bar_targets {
-            let g_tab = Rect {
-                x: target.rect.x as u16,
-                y: target.rect.y as u16,
-                width: target.rect.width as u16,
-                height: 1,
-            };
-            let vis = render_tab_bar(backend, g_tab, target.bar, theme);
-            tab_visible_counts_out.push((target.group_id, vis));
-        }
-        // Draw breadcrumb bars (below each group's tab bar). Hidden while the
-        // terminal panel is maximized so it can claim the row. Skip
-        // conditions + rect math (including the zero-width fallback filter)
-        // come from `render::breadcrumb_draw_targets`, shared with GTK, so
-        // the two backends can't drift apart (#547).
-        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, 1.0) {
-            let bc_rect = Rect {
-                x: t.rect.x as u16,
-                y: t.rect.y as u16,
-                width: t.rect.width as u16,
-                height: 1,
-            };
-            let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
-            *t.draw_layout.borrow_mut() = Some(layout);
-        }
-        // Draw divider lines between editor groups. `div.position`/
-        // `.cross_start` are already absolute terminal-screen coordinates
-        // (#550), matching `editor_area`'s own coordinate space — no offset
-        // addition needed. #609: routed through `Backend::draw_status_bar`
-        // (via `render_group_dividers`/`group_divider_cells`) instead of a
-        // raw `Buffer` write, so `TuiShellApp::render_content` — which has
-        // no `Buffer`/`Frame` to write into — can paint the exact same
-        // dividers; see `group_divider_cells`'s doc comment for how the old
-        // `frame.buffer_mut()[(div_x - 1, y)]` read-back (the #481
-        // phantom-divider-beside-scrollbar guard) became a pure data
-        // computation both call sites now share.
-        render_group_dividers(
-            backend,
-            &split.dividers,
-            &screen.windows,
-            editor_area,
-            theme,
-        );
-    } else {
-        // Single group: tab bar at row 0 of editor_area, windows at row 1+.
-        for target in &tab_bar_targets {
-            let tab_rect = Rect {
-                x: target.rect.x as u16,
-                y: target.rect.y as u16,
-                width: target.rect.width as u16,
-                height: 1,
-            };
-            let vis = render_tab_bar(backend, tab_rect, target.bar, theme);
-            tab_visible_counts_out.push((target.group_id, vis));
-        }
-        // Draw breadcrumb bar for the single group. Hidden while the terminal
-        // panel is maximized. `bc.bounds.y` (via `breadcrumb_draw_targets`)
-        // already accounts for a hidden tab bar — `calculate_group_window_rects`
-        // → `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
-        // therefore the derived breadcrumb bounds) up by one row in that case,
-        // so this no longer needs its own `is_tab_bar_hidden` special case (#547).
-        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, 1.0) {
-            let bc_rect = Rect {
-                x: t.rect.x as u16,
-                y: t.rect.y as u16,
-                width: t.rect.width as u16,
-                height: 1,
-            };
-            let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
-            *t.draw_layout.borrow_mut() = Some(layout);
-        }
-        render_all_windows(backend, Some(frame), &screen.windows, theme);
     }
+    render_all_windows(backend, Some(frame), &screen.windows, theme);
+    // Draw each group's tab bar. The tab bar sits `tui_tbh` rows above the
+    // group's window content (`bounds.y - tui_tbh`, applied inside
+    // `tab_bar_draw_targets`); with one group that resolves to row 0 of
+    // `editor_area`, exactly what the deleted single-group arm hard-coded.
+    for target in &tab_bar_targets {
+        let g_tab = Rect {
+            x: target.rect.x as u16,
+            y: target.rect.y as u16,
+            width: target.rect.width as u16,
+            height: 1,
+        };
+        let vis = render_tab_bar(backend, g_tab, target.bar, theme);
+        tab_visible_counts_out.push((target.group_id, vis));
+    }
+    // Draw breadcrumb bars (below each group's tab bar). Hidden while the
+    // terminal panel is maximized so it can claim the row. Skip conditions +
+    // rect math (including the zero-width fallback filter) come from
+    // `render::breadcrumb_draw_targets`, shared with GTK, so the two backends
+    // can't drift apart (#547). `bc.bounds.y` already accounts for a hidden
+    // tab bar — `calculate_group_window_rects` →
+    // `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
+    // therefore the derived breadcrumb bounds) up by one row in that case.
+    for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, 1.0) {
+        let bc_rect = Rect {
+            x: t.rect.x as u16,
+            y: t.rect.y as u16,
+            width: t.rect.width as u16,
+            height: 1,
+        };
+        let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
+        *t.draw_layout.borrow_mut() = Some(layout);
+    }
+    // Draw divider lines between editor groups — empty, hence a no-op, when
+    // there is only one group (#551). `div.position`/`.cross_start` are
+    // already absolute terminal-screen coordinates (#550), matching
+    // `editor_area`'s own coordinate space — no offset addition needed. #609:
+    // routed through `Backend::draw_status_bar` (via
+    // `render_group_dividers`/`group_divider_cells`) instead of a raw `Buffer`
+    // write, so `TuiShellApp::render_content` — which has no `Buffer`/`Frame`
+    // to write into — can paint the exact same dividers; see
+    // `group_divider_cells`'s doc comment for how the old
+    // `frame.buffer_mut()[(div_x - 1, y)]` read-back (the #481
+    // phantom-divider-beside-scrollbar guard) became a pure data computation
+    // both call sites now share.
+    render_group_dividers(
+        backend,
+        &screen.group_dividers,
+        &screen.windows,
+        editor_area,
+        theme,
+    );
 
     // Register the editor viewport as a scroll surface so dispatch_scroll
     // routes scroll wheel events to it (per-window routing done in handler).
@@ -639,7 +615,6 @@ pub(super) fn draw_frame(
         render_tab_drag_overlay(
             backend,
             engine,
-            editor_area,
             screen,
             theme,
             tab_drag_source,
@@ -1361,34 +1336,27 @@ fn tab_drag_slots_from_hit_regions(
 }
 
 /// Build the per-group tab-drag slot map consumed by the drag overlay and
-/// drop-zone hit testing. Both branches reuse hit regions already cached on
-/// `ScreenLayout` by `render::build_screen_layout()` (from
-/// `compute_tab_bar_hit_regions()`) instead of recomputing tab positions:
-/// multi-group splits use each group's `GroupTabBar::hit_regions`, and the
-/// single-group bar uses `ScreenLayout::tab_bar_hit_regions` (#515).
+/// drop-zone hit testing. Reuses the hit regions already cached on each
+/// `GroupTabBar` by `render::build_screen_layout()` (from
+/// `compute_tab_bar_hit_regions()`) instead of recomputing tab positions
+/// (#515).
+///
+/// #551: this used to branch, reading `ScreenLayout::tab_bar_hit_regions` at
+/// `editor_x` for the single-group case. `group_tab_bars` now carries one
+/// entry in that case too, built from the same tabs/scroll-offset/bar-width
+/// inputs as the single-group field and with `bounds.x == editor_x`, so the
+/// generic arm reproduces it exactly and the special case is gone.
 fn build_tui_tab_slots(
     screen: &render::ScreenLayout,
-    engine: &Engine,
-    editor_x: f32,
 ) -> std::collections::HashMap<usize, Vec<(f32, f32)>> {
     let mut map = std::collections::HashMap::new();
-    if let Some(ref split) = screen.editor_group_split {
-        for gtb in &split.group_tab_bars {
-            // #550: `gtb.bounds` is already absolute terminal-screen space
-            // (same convention as GTK), so no `editor_x` offset addition.
-            let abs_x = gtb.bounds.x as f32;
-            map.insert(
-                gtb.group_id.0,
-                tab_drag_slots_from_hit_regions(&gtb.hit_regions, abs_x),
-            );
-        }
-    } else {
-        // Single-group bar spans the editor area's own left edge; hit
-        // regions are bar-relative offsets, not window-rect-derived, so
-        // `editor_x` is still the correct base here.
+    for gtb in &screen.group_tab_bars {
+        // #550: `gtb.bounds` is already absolute terminal-screen space
+        // (same convention as GTK), so no `editor_x` offset addition.
+        let abs_x = gtb.bounds.x as f32;
         map.insert(
-            engine.active_group.0,
-            tab_drag_slots_from_hit_regions(&screen.tab_bar_hit_regions, editor_x),
+            gtb.group_id.0,
+            tab_drag_slots_from_hit_regions(&gtb.hit_regions, abs_x),
         );
     }
     map
@@ -1403,37 +1371,23 @@ fn build_tui_tab_slots(
 pub(super) fn render_tab_drag_overlay(
     backend: &mut dyn quadraui::Backend,
     engine: &Engine,
-    editor_area: Rect,
     screen: &render::ScreenLayout,
     theme: &render::Theme,
     tab_drag_source: Option<(crate::core::window::GroupId, usize)>,
     tab_drag_cursor: Option<(f64, f64)>,
     tab_drop_zone: &crate::core::window::DropZone,
 ) {
-    let tab_slots = build_tui_tab_slots(screen, engine, editor_area.x as f32);
+    let tab_slots = build_tui_tab_slots(screen);
     let tbh_f = if engine.settings.breadcrumbs {
         2.0f32
     } else {
         1.0
     };
-    // #550/#515: in split mode `gtb.bounds` is already absolute (built from
-    // absolute window rects, matching GTK), so the origin here must be
-    // (0,0) — adding `editor_area`'s origin again would double-count it,
-    // the same bug GTK's #515 fix addressed for its own call site.
-    // Single-group mode returns the origin directly (no `gtb.bounds` to
-    // derive it from), so it still needs the real editor origin.
-    let drop_origin = if screen.editor_group_split.is_some() {
-        (0.0, 0.0)
-    } else {
-        (editor_area.x as f32, editor_area.y as f32)
-    };
-    let bounds = render::screen_to_drop_group_bounds(
-        screen,
-        engine,
-        drop_origin,
-        (editor_area.width as f32, editor_area.height as f32),
-        tbh_f,
-    );
+    // #550/#515/#551: `gtb.bounds` is always absolute (built from absolute
+    // window rects, matching GTK) for every group count, so
+    // `screen_to_drop_group_bounds` needs no origin argument and this call
+    // site no longer has to pick one based on split-vs-single.
+    let bounds = render::screen_to_drop_group_bounds(screen);
     let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
     let cursor = tab_drag_cursor
         .map(|(mx, my)| (mx as f32, my as f32))
@@ -1535,33 +1489,21 @@ pub(super) fn compute_tui_tab_drop_zone(
     if col < editor_left {
         return crate::core::window::DropZone::None;
     }
-    let ts = match terminal_size {
-        Some(s) => s,
-        None => return crate::core::window::DropZone::None,
-    };
-    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-    let editor_w = ts.width.saturating_sub(editor_left);
-    let editor_h = ts.height.saturating_sub(menu_rows + 2);
-    let tab_slots = build_tui_tab_slots(layout, engine, editor_left as f32);
+    // Group bounds now come entirely from `layout.group_tab_bars` (#551), so
+    // the terminal size is no longer an input — but a frame with no known
+    // size still means "nothing has been laid out yet", so keep rejecting it.
+    if terminal_size.is_none() {
+        return crate::core::window::DropZone::None;
+    }
+    let tab_slots = build_tui_tab_slots(layout);
     let tbh_f = if engine.settings.breadcrumbs {
         2.0f32
     } else {
         1.0
     };
-    // #550/#515: same double-count hazard as `render_tab_drag_overlay` above —
-    // split-mode `gtb.bounds` is already absolute, so the origin must be (0,0).
-    let drop_origin = if layout.editor_group_split.is_some() {
-        (0.0, 0.0)
-    } else {
-        (editor_left as f32, menu_rows as f32)
-    };
-    let bounds = render::screen_to_drop_group_bounds(
-        layout,
-        engine,
-        drop_origin,
-        (editor_w as f32, editor_h as f32),
-        tbh_f,
-    );
+    // #550/#515/#551: `gtb.bounds` is always absolute for every group count,
+    // so no origin argument and no split-vs-single choice here.
+    let bounds = render::screen_to_drop_group_bounds(layout);
     let (groups, tbh) = render::build_tab_drop_groups(&bounds, engine, tbh_f, &tab_slots);
     render::compute_tab_drop_zone(col as f32, row as f32, &groups, tbh)
 }
@@ -2645,7 +2587,7 @@ mod tests {
             "test setup must stay a single tab group"
         );
 
-        let slots = build_tui_tab_slots(&screen, &e, 0.0);
+        let slots = build_tui_tab_slots(&screen);
         let group_slots = slots
             .get(&e.active_group.0)
             .expect("single-group tab slots must be keyed by the active group id");

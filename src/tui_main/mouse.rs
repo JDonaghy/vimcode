@@ -984,8 +984,14 @@ pub(super) fn handle_mouse(
             // terminal-screen coordinates, so `col`/`row` compare directly
             // with no editor-origin subtraction.
             if let Some(split_index) = *dragging_group_divider {
-                if let Some(split) = last_layout.and_then(|l| l.editor_group_split.as_ref()) {
-                    if let Some(div) = split.dividers.iter().find(|d| d.split_index == split_index)
+                if let Some(layout) = last_layout {
+                    // #551: `group_dividers` is empty in single-group mode, so
+                    // the `editor_group_split.is_some()` gate this used to sit
+                    // behind is redundant — nothing can match.
+                    if let Some(div) = layout
+                        .group_dividers
+                        .iter()
+                        .find(|d| d.split_index == split_index)
                     {
                         let new_ratio = render::divider_ratio_from_pos(div, col as f64, row as f64);
                         engine
@@ -1511,9 +1517,9 @@ pub(super) fn handle_mouse(
         if col >= editor_left {
             let rel_col = col - editor_left;
             if let Some(layout) = last_layout {
-                if let Some(ref split) = layout.editor_group_split {
+                if layout.editor_group_split.is_some() {
                     let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-                    for gtb in split.group_tab_bars.iter() {
+                    for gtb in layout.group_tab_bars.iter() {
                         // #550: `gtb.bounds` is already absolute
                         // terminal-screen space, so no `menu_rows`/
                         // `editor_left` offset addition — compare directly
@@ -1755,9 +1761,9 @@ pub(super) fn handle_mouse(
                 let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                 let rel_col = col - editor_left;
 
-                if let Some(ref split) = layout.editor_group_split {
+                if layout.editor_group_split.is_some() {
                     let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-                    for gtb in split.group_tab_bars.iter() {
+                    for gtb in layout.group_tab_bars.iter() {
                         // #550: `gtb.bounds` is already absolute — compare
                         // against raw `col`, not `rel_col`/`menu_rows`.
                         let tab_bar_row = (gtb.bounds.y as u16).saturating_sub(click_tbh);
@@ -2621,7 +2627,7 @@ pub(super) fn handle_mouse(
             // Tab bar sits tab_bar_height rows above the group's window content.
             let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
             let mut matched_group = None;
-            for gtb in split.group_tab_bars.iter() {
+            for gtb in layout.group_tab_bars.iter() {
                 if engine.is_tab_bar_hidden(gtb.group_id) {
                     continue;
                 }
@@ -2655,7 +2661,7 @@ pub(super) fn handle_mouse(
             )) = matched_group
             {
                 // Use pre-computed hit regions from the GroupTabBar.
-                let hit_target = split
+                let hit_target = layout
                     .group_tab_bars
                     .iter()
                     .find(|gtb| gtb.group_id == group_id)
@@ -2777,20 +2783,20 @@ pub(super) fn handle_mouse(
     // entire tab-bar block (per render_impl.rs:359). When breadcrumbs are
     // on the block is 2 rows tall — accept a click on either row (the
     // asymmetric `(0.0, tab_bar_rows)` horizontal tolerance below).
+    // #551: no `editor_group_split.is_some()` gate needed — `group_dividers`
+    // is empty with one group, so the hit test can never match there.
     if let Some(layout) = last_layout {
-        if let Some(ref split) = layout.editor_group_split {
-            let tab_bar_rows: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-            if let Some(i) = render::divider_hit_test(
-                &split.dividers,
-                col as f64,
-                row as f64,
-                (0.0, 1.0),
-                (0.0, tab_bar_rows as f64),
-                true,
-            ) {
-                *dragging_group_divider = Some(split.dividers[i].split_index);
-                return sidebar_width;
-            }
+        let tab_bar_rows: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
+        if let Some(i) = render::divider_hit_test(
+            &layout.group_dividers,
+            col as f64,
+            row as f64,
+            (0.0, 1.0),
+            (0.0, tab_bar_rows as f64),
+            true,
+        ) {
+            *dragging_group_divider = Some(layout.group_dividers[i].split_index);
+            return sidebar_width;
         }
     }
 
@@ -3525,12 +3531,12 @@ mod tests {
             &sidebar,
             SIDEBAR_WIDTH,
         );
-        let split = screen
-            .editor_group_split
-            .as_ref()
-            .expect("vertical split must produce Some(editor_group_split)");
-        let div = split
-            .dividers
+        assert!(
+            screen.editor_group_split.is_some(),
+            "vertical split must produce Some(editor_group_split)"
+        );
+        let div = screen
+            .group_dividers
             .first()
             .expect("a vertical split has exactly one divider");
         assert_eq!(div.direction, crate::core::window::SplitDirection::Vertical);
@@ -3983,11 +3989,11 @@ mod tests {
             &sidebar,
             SIDEBAR_WIDTH,
         );
-        let split = screen
-            .editor_group_split
-            .as_ref()
-            .expect("vertical split must produce Some(editor_group_split)");
-        let gtb = split
+        assert!(
+            screen.editor_group_split.is_some(),
+            "vertical split must produce Some(editor_group_split)"
+        );
+        let gtb = screen
             .group_tab_bars
             .first()
             .expect("a 2-group split has two group tab bars");
