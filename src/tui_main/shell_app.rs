@@ -718,6 +718,28 @@ impl TuiShellApp {
         cfg
     }
 
+    /// [`Self::shell_config`] plus the *current* set of plugin-provided
+    /// extension panels (#557).
+    ///
+    /// `shell_config` is deliberately static — it describes the panels that
+    /// exist for every session — but extension panels are per-session data
+    /// living in `engine.ext_panels`, so the live runner has to derive its
+    /// config from an actual `Engine`. Without this, the migrated `AppShell`
+    /// activity bar painted only the seven built-ins and an extension like
+    /// `git-insights` had no icon at all, even though
+    /// `render::build_activity_bar` (the legacy `draw_frame` path) had been
+    /// appending one since #133.
+    ///
+    /// Plugins can register panels at *any* time (`plugins.rs`'s
+    /// `ctx.panel_registrations` drain runs after every Lua callback), so this
+    /// only seeds frame zero — [`Self::sync_ext_activity_panels`] keeps the
+    /// live `AppShell` converged from there.
+    pub(super) fn live_shell_config(engine: &Engine) -> quadraui::ShellConfig {
+        let mut cfg = Self::shell_config(engine.menu_bar_visible);
+        cfg.panels.extend(engine.ext_activity_panels());
+        cfg
+    }
+
     /// #602 (gap 2): translate a mouse-shaped [`UiEvent`] back into the
     /// crossterm [`MouseEvent`] `mouse::handle_mouse` — the ~4,100-line
     /// legacy handler `event_loop()` still drives — expects, and dispatch
@@ -1122,6 +1144,105 @@ impl TuiShellApp {
         // Mouse events (clicks, drags) almost always change visual state —
         // mirrors `event_loop`'s own unconditional post-mouse redraw.
         Reaction::Redraw
+    }
+
+    /// #557: reconcile the runner `AppShell`'s top-panel list with
+    /// `engine.ext_panels` so plugin-provided panels contribute an
+    /// activity-bar icon.
+    ///
+    /// [`Self::live_shell_config`] seeds frame zero, but a plugin can register
+    /// (or a `:PluginReload` can drop) a panel at any point in the session —
+    /// `Engine::apply_plugin_ctx` drains `ctx.panel_registrations` after every
+    /// Lua callback — so the list has to be re-derived rather than assumed
+    /// static. Called unconditionally on the way out of every dispatch, like
+    /// the title-bar/width/visibility syncs beside it; the early return makes
+    /// the steady state (nothing changed) a cheap id+icon comparison and no
+    /// `AppShell` mutation at all.
+    ///
+    /// Reconciles by *rebuilding* the `"ext:"`-prefixed tail rather than
+    /// diffing element-wise: the desired list is sorted by name, so a newly
+    /// registered panel can land anywhere in it, and `AppShell::add_panel`
+    /// only ever appends. Rebuilding keeps painted order == the sort order
+    /// `Engine::activity_bar_activate`'s keyboard indices assume. Built-in
+    /// panels never match the prefix and are left untouched, so the rebuild
+    /// can't disturb the fixed part of the bar.
+    fn sync_ext_activity_panels(&self, ctx: &ShellContext<'_>) {
+        use crate::core::engine::sidebar::EXT_PANEL_ID_PREFIX;
+
+        let desired = self.engine.ext_activity_panels();
+        let is_ext = |p: &quadraui::PanelDefinition| p.id.as_str().starts_with(EXT_PANEL_ID_PREFIX);
+        let unchanged = {
+            let shell = ctx.shell();
+            let current: Vec<_> = shell
+                .panels()
+                .iter()
+                .filter(|p| is_ext(p))
+                .map(|p| (p.id.as_str(), p.icon.as_str()))
+                .collect();
+            current.len() == desired.len()
+                && current
+                    .iter()
+                    .zip(desired.iter())
+                    .all(|((id, icon), d)| *id == d.id.as_str() && *icon == d.icon.as_str())
+        };
+        if unchanged {
+            return;
+        }
+
+        let mut shell = ctx.shell_mut();
+        let stale: Vec<quadraui::WidgetId> = shell
+            .panels()
+            .iter()
+            .filter(|p| is_ext(p))
+            .map(|p| p.id.clone())
+            .collect();
+        for id in stale {
+            shell.remove_panel(&id);
+        }
+        for def in desired {
+            shell.add_panel(def);
+        }
+
+        // Re-assert the highlight: removing the active panel clears/clamps
+        // `AppShell::active_panel`, so an open extension panel would otherwise
+        // lose its icon highlight (and the sidebar header its title) on any
+        // rebuild. `take_requested_panel` can't cover this — it compares
+        // against `last_shell_panel`, which already holds this id.
+        if self.engine.app_shell.sidebar_visible() {
+            if let Some(name) = self.engine.ext_panel_active.as_deref() {
+                shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::ext_panel_id(name),
+                ));
+            }
+        }
+    }
+
+    /// #557: open the plugin-provided panel `name` in the sidebar.
+    ///
+    /// Verbatim mirror of `mouse::handle_mouse`'s
+    /// `ActivityBarTarget::ExtensionPanel` "open" branch minus its
+    /// toggle-vs-open decision — on the `ShellApp` path `AppShell` has already
+    /// made that call and reports a *second* click on the open panel's icon as
+    /// [`quadraui::AppShellEvent::SidebarHidden`], not `PanelChanged`.
+    ///
+    /// The `clear_sidebar_focus()` first is the #637 fix: a plugin panel
+    /// taking over the sidebar body has to drop whatever built-in panel's
+    /// focus flag was left set, or e.g. a stale `ext_sidebar_has_focus` from
+    /// an earlier Extensions-marketplace visit keeps claiming clicks meant for
+    /// this panel.
+    fn activate_ext_panel(&mut self, name: &str) {
+        self.engine.clear_sidebar_focus();
+        self.sidebar.ext_panel_name = Some(name.to_string());
+        if !self.engine.app_shell.sidebar_visible() {
+            self.engine.toggle_sidebar();
+        }
+        self.sidebar.has_focus = true;
+        self.engine.ext_panel_active = Some(name.to_string());
+        self.engine.ext_panel_has_focus = true;
+        self.engine.ext_panel_selected = 0;
+        self.engine.plugin_event("panel_focus", name);
+        self.engine.session.explorer_visible = self.engine.app_shell.sidebar_visible();
+        let _ = self.engine.session.save();
     }
 }
 
@@ -2092,6 +2213,14 @@ impl ShellApp for TuiShellApp {
         // way out of every dispatch costs nothing.
         ctx.shell_mut().set_sidebar_width(self.sidebar_width as f32);
 
+        // ── #557: keep the runner `AppShell`'s extension-panel icons ==
+        // `engine.ext_panels` ───────────────────────────────────────────────
+        // Same split-state shape as the three syncs around it, except the
+        // drift here is in the panel *list* rather than a scalar. Runs before
+        // the visibility sync below so a `show_panel` for a freshly-registered
+        // extension panel can actually find it.
+        self.sync_ext_activity_panels(ctx);
+
         // ── #634 smoke retry: keep the runner `AppShell`'s sidebar
         // *visibility* == the shadow's ──────────────────────────────────────
         // Same split-state problem as the title-bar and width syncs above:
@@ -2108,13 +2237,24 @@ impl ShellApp for TuiShellApp {
         let runner_visible = ctx.shell().sidebar_visible();
         if runner_visible != shadow_visible {
             if shadow_visible {
-                if let Some(id) = self.engine.app_shell.active_panel_id().cloned() {
+                // #557: while a plugin panel is open the shadow's
+                // active-panel id still names the built-in that preceded it
+                // (extension panels never touch it), so reveal *that* panel
+                // and the runner's highlight jumps off the extension icon —
+                // same reason `take_requested_panel` prefers
+                // `ext_panel_active`.
+                let id = self
+                    .engine
+                    .ext_panel_active
+                    .as_deref()
+                    .map(|n| quadraui::WidgetId::new(crate::core::engine::sidebar::ext_panel_id(n)))
+                    .or_else(|| self.engine.app_shell.active_panel_id().cloned());
+                if let Some(id) = id {
                     ctx.shell_mut().show_panel(&id);
                 }
                 // `AppShell::show_panel` only searches its top `panels`
-                // list — the Settings cog (a bottom item) and
-                // plugin-provided panels aren't in it, so the call above
-                // can no-op. Force visibility alone in that case; the
+                // list — the Settings cog is a bottom item, so the call
+                // above can no-op. Force visibility alone in that case; the
                 // runner's active-panel index (header title) is untouched,
                 // the same tolerance band as `shell_config`'s
                 // `active_accent`/`selection_bg` note.
@@ -2148,6 +2288,23 @@ impl ShellApp for TuiShellApp {
     fn take_requested_panel(&mut self) -> Option<quadraui::WidgetId> {
         if !self.engine.app_shell.sidebar_visible() {
             return None;
+        }
+        // #557: an extension panel takes over the sidebar body *without*
+        // touching the shadow `app_shell`'s active-panel id (`mouse.rs`'s
+        // `ActivityBarTarget::ExtensionPanel` arm and
+        // `Engine::activity_bar_activate`'s `8 + idx` arm both leave it
+        // alone), so `engine.ext_panel_active` — not `active_panel_id()` — is
+        // what the runner has to follow while one is open. Without this the
+        // reconciliation would immediately steer the runner back onto
+        // whatever built-in panel was last active and the extension icon's
+        // highlight would flicker off on the very next dispatch.
+        if let Some(name) = self.engine.ext_panel_active.as_deref() {
+            let id = quadraui::WidgetId::new(crate::core::engine::sidebar::ext_panel_id(name));
+            if self.last_shell_panel.as_ref() == Some(&id) {
+                return None;
+            }
+            self.suppress_shell_panel_echo = true;
+            return Some(id);
         }
         let current = self.engine.app_shell.active_panel_id()?.clone();
         if self.last_shell_panel.as_ref() == Some(&current) {
@@ -2199,6 +2356,25 @@ impl ShellApp for TuiShellApp {
                     return;
                 }
                 self.last_shell_panel = Some(panel_id.clone());
+                // #557: a plugin-provided panel is now a real
+                // `PanelDefinition` in the runner's `AppShell`
+                // (`sync_ext_activity_panels`), so its icon click arrives here
+                // like any other. It is *not* a shadow-`app_shell` panel
+                // though — `render_sidebar_content` dispatches on
+                // `sidebar.ext_panel_name`, not on the active panel id — so
+                // mirror `mouse.rs`'s `ActivityBarTarget::ExtensionPanel` arm
+                // instead of `focus_sidebar_panel`, which would fall through
+                // to the explorer.
+                if let Some(name) =
+                    crate::core::engine::sidebar::ext_panel_name_from_id(panel_id.as_str())
+                {
+                    let name = name.to_string();
+                    if std::mem::take(&mut self.suppress_shell_panel_echo) {
+                        return;
+                    }
+                    self.activate_ext_panel(&name);
+                    return;
+                }
                 if std::mem::take(&mut self.suppress_shell_panel_echo) {
                     // Echo of our own `take_requested_panel` reconciliation
                     // (see that method): the engine already holds this
@@ -2231,6 +2407,15 @@ impl ShellApp for TuiShellApp {
             // `mouse::handle_mouse` hit tests, autohide, session
             // persistence) don't keep believing the sidebar is open.
             quadraui::AppShellEvent::SidebarHidden => {
+                // #557: this is also how a *second* click on an open
+                // extension panel's icon arrives, so drop the plugin-panel
+                // state here too — `mouse.rs`'s `ExtensionPanel` arm clears
+                // the same three fields in its own hide branch. Leaving them
+                // set would make `take_requested_panel` keep steering the
+                // runner back onto a panel whose sidebar the user just closed.
+                self.sidebar.ext_panel_name = None;
+                self.engine.ext_panel_has_focus = false;
+                self.engine.ext_panel_active = None;
                 self.engine.app_shell.hide_sidebar();
                 self.engine.clear_sidebar_focus();
                 self.engine.session.explorer_visible = false;
@@ -4232,6 +4417,213 @@ mod tests {
             !driver.screen_contains("Replace…"),
             "second click on the active icon must toggle the sidebar closed"
         );
+    }
+
+    // ── #557: extension panels in the migrated activity bar ─────────────
+    //
+    // The Git Insights extension registers a display name *and* an icon
+    // (`core/extensions.rs`), and `render::build_activity_bar` — the legacy
+    // `draw_frame` path — has appended an `ActivityItem` for it since #133.
+    // The migrated `AppShell` bar is driven by `ShellConfig`/`PanelDefinition`
+    // instead, and nothing fed extension panels into it, so the icon vanished
+    // entirely on the `ShellApp` path.
+
+    /// The single distinguishing glyph these tests look for on the painted
+    /// screen. Deliberately not a Nerd Font glyph: `resolved_icon()` returns
+    /// the *fallback* when Nerd Fonts are off, and these tests pin that flag
+    /// off so the assertion can't depend on the developer's `use_nerd_fonts`
+    /// setting (the ambient-config trap `app_with_sidebar_open`'s doc comment
+    /// documents for sidebar visibility).
+    const EXT_ICON: char = 'Ж';
+
+    fn ext_panel_reg(name: &str, title: &str) -> crate::core::plugin::PanelRegistration {
+        crate::core::plugin::PanelRegistration {
+            name: name.to_string(),
+            title: title.to_string(),
+            icon: '\u{f113}',
+            fallback_icon: Some(EXT_ICON),
+            sections: Vec::new(),
+        }
+    }
+
+    /// A `TuiShellApp` whose *only* extension panel is a synthetic
+    /// "git-insights", with Nerd Fonts pinned off.
+    ///
+    /// `ext_panels` is cleared first because `TuiShellApp::new` runs the real
+    /// `Engine::new`, which loads whatever plugins the developer has installed
+    /// — on a machine with the real Git Insights extension the map would
+    /// already be populated and the assertions would be measuring that instead
+    /// of this fixture.
+    fn app_with_ext_panel() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = false;
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            ext_panel_reg("git-insights", "Git Insights"),
+        );
+        app
+    }
+
+    /// #557, the headline acceptance: a plugin-registered panel must
+    /// contribute a **visible** activity-bar icon on the `ShellApp` path.
+    /// Black-box through the real `driver_with_shell` harness and the live
+    /// config — the assertion reads the painted grid, not
+    /// `ShellConfig::panels`, so a definition that is registered but never
+    /// rasterised would still fail.
+    #[test]
+    fn driver_paints_a_registered_extension_panels_activity_bar_icon() {
+        let app = app_with_ext_panel();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let driver = driver_with_shell(app, cfg, 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains(EXT_ICON),
+            "an extension-registered panel must paint an activity-bar icon \
+             (#557: the Git Insights icon was missing entirely); screen:\n{screen}"
+        );
+    }
+
+    /// The same claim for a panel registered *after* startup — plugins can
+    /// register at any time (`Engine::apply_plugin_ctx` drains
+    /// `ctx.panel_registrations` after every Lua callback), so seeding
+    /// `ShellConfig` alone is not enough. Constructed with the *static*
+    /// `shell_config` (no extension panels at all), which is exactly the
+    /// runner's state at the moment a plugin registers mid-session; only
+    /// `handle()`'s `sync_ext_activity_panels` can make the icon appear.
+    #[test]
+    fn driver_paints_an_extension_panel_registered_after_the_first_frame() {
+        let app = app_with_ext_panel();
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        assert!(
+            !driver.screen().contains(EXT_ICON),
+            "precondition: the static config carries no extension panels"
+        );
+
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains(EXT_ICON),
+            "a panel registered after startup must be synced into the live \
+             AppShell on the next dispatch; screen:\n{screen}"
+        );
+    }
+
+    /// End-to-end: clicking the extension panel's icon must open *that*
+    /// panel's body. Row 7 = hamburger@0, explorer@1, search@2, debug@3,
+    /// git@4, extensions@5, ai@6, ext@7 — the same index
+    /// `resolve_activity_bar_click` (the legacy mouse path) assigns, since
+    /// `Engine::ext_activity_panels` appends in the same sorted order.
+    /// "Git Insights" is the panel *title*, which only `render_ext_panel`
+    /// paints into the sidebar body.
+    #[test]
+    fn driver_click_on_extension_icon_opens_the_plugin_panel() {
+        let app = app_with_ext_panel();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        // The runner boots with the hamburger active; one benign event lets
+        // `take_requested_panel` steer it onto the shadow's real panel first
+        // (see `menu_reveal_then_search_icon_click_opens_search_not_explorer`).
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        driver.click(1.0, 7.0);
+        let screen = driver.screen();
+        assert!(
+            screen.to_uppercase().contains("GIT INSIGHTS"),
+            "clicking an extension panel's activity-bar icon must open its \
+             sidebar body; screen:\n{screen}"
+        );
+    }
+
+    /// Unit half of the click path: `AppShell` reports an extension icon
+    /// click as an ordinary `PanelChanged` (it has no notion of "extension"),
+    /// so `on_shell_event` must recognise the `"ext:"` id and run the
+    /// plugin-panel bookkeeping — `focus_sidebar_panel` would fall through to
+    /// the explorer, leaving the sidebar painting the file tree under a
+    /// highlighted extension icon.
+    #[test]
+    fn on_shell_event_extension_panel_changed_opens_the_plugin_panel() {
+        let mut app = app_with_ext_panel();
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new("ext:git-insights"),
+        });
+        assert_eq!(app.sidebar.ext_panel_name.as_deref(), Some("git-insights"));
+        assert_eq!(app.engine.ext_panel_active.as_deref(), Some("git-insights"));
+        assert!(app.engine.ext_panel_has_focus);
+        assert!(app.engine.app_shell.sidebar_visible());
+        assert!(
+            !app.engine.explorer_has_focus,
+            "the explorer must not also claim focus — `focus_sidebar_panel` \
+             is the wrong call for an extension id"
+        );
+    }
+
+    /// The second click on an open extension panel's icon arrives as
+    /// `SidebarHidden` (the runner made the toggle decision itself), which
+    /// must drop the plugin-panel state too — otherwise
+    /// `take_requested_panel` keeps steering the runner back onto a panel
+    /// whose sidebar the user just closed.
+    #[test]
+    fn on_shell_event_sidebar_hidden_clears_extension_panel_state() {
+        let mut app = app_with_ext_panel();
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new("ext:git-insights"),
+        });
+        app.on_shell_event(&quadraui::AppShellEvent::SidebarHidden);
+        assert!(app.sidebar.ext_panel_name.is_none());
+        assert!(app.engine.ext_panel_active.is_none());
+        assert!(!app.engine.ext_panel_has_focus);
+        assert!(!app.engine.app_shell.sidebar_visible());
+    }
+
+    /// While an extension panel is open the shadow `app_shell`'s active-panel
+    /// id still names whatever built-in panel preceded it (extension panels
+    /// deliberately never touch it), so `take_requested_panel` has to follow
+    /// `ext_panel_active` instead — or every dispatch would offer the runner
+    /// the *old* built-in panel and the extension icon's highlight would drop
+    /// off on the very next event.
+    #[test]
+    fn take_requested_panel_follows_the_open_extension_panel() {
+        let mut app = app_with_sidebar_open();
+        app.last_shell_panel = Some(quadraui::WidgetId::new(PANEL_EXPLORER));
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        assert_eq!(
+            app.take_requested_panel()
+                .as_ref()
+                .map(|w| w.as_str().to_string()),
+            Some("ext:git-insights".to_string())
+        );
+        app.last_shell_panel = Some(quadraui::WidgetId::new("ext:git-insights"));
+        assert!(
+            app.take_requested_panel().is_none(),
+            "the reconciliation must settle once the runner is on the \
+             extension panel"
+        );
+    }
+
+    /// `live_shell_config` == `shell_config` + the extension panels, in that
+    /// order: the built-in ids must keep their positions (every activity-bar
+    /// row index in this module's other tests depends on it) and the
+    /// extensions must land after them.
+    #[test]
+    fn live_shell_config_appends_extension_panels_after_the_builtins() {
+        let app = app_with_ext_panel();
+        let base: Vec<String> = TuiShellApp::shell_config(false)
+            .panels
+            .iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+        let live: Vec<String> = TuiShellApp::live_shell_config(&app.engine)
+            .panels
+            .iter()
+            .map(|p| p.id.as_str().to_string())
+            .collect();
+        let mut expected = base;
+        expected.push("ext:git-insights".to_string());
+        assert_eq!(live, expected);
     }
 
     /// #634 recurring smoke bug — activity-bar click off-by-one after the

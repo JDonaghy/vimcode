@@ -27478,6 +27478,47 @@ fn test_activity_bar_resolve_extension_panels() {
     assert_eq!(resolve_activity_bar_click(9, 30, &ext_names), None);
 }
 
+/// #557: `ext_activity_panels` is the shared list both backends' `ShellConfig`
+/// builders append to the activity bar, so its **order** has to be the same
+/// name-sorted order `resolve_activity_bar_click` (above) and
+/// `activity_bar_activate`'s `8 + idx` arm assume — otherwise a click on the
+/// painted icon opens a different extension's panel. `ext_panels` is a
+/// `HashMap`, so insertion order is explicitly not it.
+#[test]
+fn ext_activity_panels_are_sorted_by_name_with_ext_prefixed_ids() {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    engine.ext_panels.clear();
+    for (name, title, icon) in [
+        ("todo-panel", "Todo", 'T'),
+        ("git-insights", "Git Insights", 'G'),
+    ] {
+        engine.ext_panels.insert(
+            name.to_string(),
+            PanelRegistration {
+                name: name.to_string(),
+                title: title.to_string(),
+                icon,
+                fallback_icon: Some(icon),
+                sections: vec![],
+            },
+        );
+    }
+
+    let defs = engine.ext_activity_panels();
+    assert_eq!(
+        defs.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec!["ext:git-insights", "ext:todo-panel"]
+    );
+    assert_eq!(
+        defs.iter().map(|d| d.title.as_str()).collect::<Vec<_>>(),
+        vec!["Git Insights", "Todo"]
+    );
+    // Every panel must carry a non-empty glyph — an empty `icon` is exactly
+    // what "the icon is missing from the activity bar" looks like from here.
+    assert!(defs.iter().all(|d| !d.icon.is_empty()));
+}
+
 #[test]
 fn test_ext_panel_h_focuses_activity_bar() {
     use crate::core::plugin::PanelRegistration;

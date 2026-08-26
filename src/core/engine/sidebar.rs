@@ -17,6 +17,33 @@ pub const PANEL_EXTENSIONS: &str = "panel:extensions";
 pub const PANEL_AI: &str = "panel:ai";
 pub const PANEL_SETTINGS: &str = "bottom:settings";
 
+/// Panel-id prefix for plugin-provided ("extension") sidebar panels — e.g. the
+/// `git-insights` extension's panel is `"ext:git-insights"` (#557).
+///
+/// This is the id both backends already synthesise by hand for extension
+/// panels (GTK's `current_active_panel_id`/`Msg::SwitchPanel`), promoted to a
+/// shared constant so [`Engine::ext_activity_panels`] can hand *the same* ids
+/// to each backend's `ShellConfig` builder.
+///
+/// Not to be confused with the `"activity:ext:"` ids
+/// `render::build_activity_bar` mints: those name *`ActivityItem`s on the
+/// legacy `draw_frame` path*, a separate `activity:`-namespaced id space that
+/// also covers the built-ins (`"activity:explorer"` vs `PANEL_EXPLORER`).
+/// These are sidebar **panel** ids, the same space `PANEL_EXPLORER` and
+/// friends live in.
+pub const EXT_PANEL_ID_PREFIX: &str = "ext:";
+
+/// The activity-bar/sidebar panel id for a plugin-registered panel `name`.
+pub fn ext_panel_id(name: &str) -> String {
+    format!("{EXT_PANEL_ID_PREFIX}{name}")
+}
+
+/// Inverse of [`ext_panel_id`]: the plugin panel name inside an `"ext:"` id,
+/// or `None` when `id` names a built-in panel.
+pub fn ext_panel_name_from_id(id: &str) -> Option<&str> {
+    id.strip_prefix(EXT_PANEL_ID_PREFIX)
+}
+
 /// The single source of truth for the fixed (non-hamburger, non-settings,
 /// non-dynamic-extension) activity-bar panel order. `render::build_activity_bar`'s
 /// `fixed` array and `tui_main::shell_app::TuiShellApp::shell_config`'s
@@ -33,6 +60,39 @@ pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 6] = [
 ];
 
 impl Engine {
+    /// Activity-bar [`quadraui::PanelDefinition`]s for every plugin-registered
+    /// extension panel, sorted by name (#557).
+    ///
+    /// Both backends' `ShellConfig` builders — `tui_main::shell_app::
+    /// TuiShellApp::live_shell_config` and `gtk::build_shell_config` — append
+    /// this to their static panel list, and the TUI additionally re-syncs it
+    /// into the live `AppShell` after every dispatch so a plugin that
+    /// registers a panel *after* startup still gets an icon. Without it the
+    /// migrated `AppShell` activity bar renders only the built-in panels and
+    /// e.g. the Git Insights extension has no icon at all.
+    ///
+    /// Sorted by name to match the order `render::build_activity_bar` (the
+    /// legacy `draw_frame` path) and `Engine::activity_bar_activate`'s `8 +
+    /// idx` extension arm both use, so keyboard index and painted position
+    /// agree on either path.
+    ///
+    /// The icon is [`crate::core::plugin::PanelRegistration::resolved_icon`],
+    /// so it honours the caller thread's Nerd-Fonts flag; callers that rebuild
+    /// this list per frame therefore pick up a runtime `:set nonerdfonts`.
+    pub fn ext_activity_panels(&self) -> Vec<quadraui::PanelDefinition> {
+        let mut panels: Vec<_> = self.ext_panels.values().collect();
+        panels.sort_by(|a, b| a.name.cmp(&b.name));
+        panels
+            .into_iter()
+            .map(|p| quadraui::PanelDefinition {
+                id: quadraui::WidgetId::new(ext_panel_id(&p.name)),
+                icon: p.resolved_icon().to_string(),
+                tooltip: p.title.clone(),
+                title: p.title.clone(),
+            })
+            .collect()
+    }
+
     /// Toggle a sidebar panel. If `panel_id` matches the active panel and the
     /// sidebar is already visible, hide it. Otherwise switch to the panel and
     /// show the sidebar. Focus flags are set/cleared automatically.
