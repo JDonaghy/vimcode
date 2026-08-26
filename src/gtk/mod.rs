@@ -9047,13 +9047,47 @@ impl quadraui::ShellApp for App {
         use quadraui::AppShellEvent;
         match event {
             AppShellEvent::PanelChanged { panel_id } => {
+                // #557: plugin-provided panels are now real `PanelDefinition`s
+                // in the runner's `AppShell` (`build_shell_config`), so their
+                // icon clicks arrive here like any built-in panel's. They are
+                // *not* engine-`AppShell` panels though — `render_content`
+                // dispatches on `engine.ext_panel_active`, which
+                // `show_panel` would leave untouched (and, since the engine's
+                // AppShell has no such panel, it would no-op entirely) — so
+                // route them through the existing `Msg::SwitchPanel` handler
+                // that owns the ext-panel focus/toggle bookkeeping.
+                if is_ext_panel_id(panel_id.as_str()) {
+                    self.handle_sidebar_panel_msg(Msg::SwitchPanel(panel_id.as_str().to_string()));
+                    return;
+                }
                 // Sync the runner's active panel into the engine's AppShell so
                 // render_content() draws the correct sidebar panel content.
-                self.engine.borrow_mut().app_shell.show_panel(panel_id);
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.app_shell.show_panel(panel_id);
+                    // Switching to a built-in panel has to drop the plugin
+                    // panel's claim on the sidebar body, or
+                    // `current_active_panel_id` keeps synthesising
+                    // `ext:{name}` and the built-in panel never paints.
+                    engine.ext_panel_active = None;
+                    engine.ext_panel_has_focus = false;
+                }
                 self.draw_needed.set(true);
             }
             AppShellEvent::SidebarHidden => {
-                self.engine.borrow_mut().app_shell.hide_sidebar();
+                {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.app_shell.hide_sidebar();
+                    // #557: this is also how a *second* click on an open
+                    // extension panel's icon arrives, so drop the plugin
+                    // panel's claim too (`Msg::SwitchPanel`'s own toggle
+                    // branch clears the same two fields). Re-opening still
+                    // works: `AppShell::handle_activity_click` reports a click
+                    // on the active panel as `PanelChanged`, not
+                    // `SidebarHidden`, once the sidebar is hidden.
+                    engine.ext_panel_active = None;
+                    engine.ext_panel_has_focus = false;
+                }
                 self.draw_needed.set(true);
             }
             AppShellEvent::SidebarResized { new_width } => {
@@ -9403,9 +9437,16 @@ fn build_shell_config(app: &App) -> quadraui::ShellConfig {
             p
         })
         .collect();
-    let (top_panels, bottom_items): (Vec<_>, Vec<_>) = panels_with_icons
+    let (mut top_panels, bottom_items): (Vec<_>, Vec<_>) = panels_with_icons
         .into_iter()
         .partition(|p| !p.id.as_str().starts_with("bottom:"));
+    // #557: plugin-provided panels (e.g. the Git Insights extension) live in
+    // `engine.ext_panels`, not in the engine's `AppShell` — nothing registers
+    // them there — so they have to be appended explicitly or the runner's
+    // activity bar renders no icon for them at all. `ext_activity_panels`
+    // already carries each panel's resolved icon, so the id→glyph match above
+    // deliberately doesn't need an arm for them.
+    top_panels.extend(app.engine.borrow().ext_activity_panels());
     // (#552) Reserve a full-width title-bar band across the top of the shell
     // (above activity bar + sidebar + main content, not just main content) —
     // GTK draws its own client-side menu bar + inline window controls into

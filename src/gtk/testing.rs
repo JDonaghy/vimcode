@@ -804,4 +804,80 @@ mod tests {
              the file the user actually clicked (was {group_a:?})"
         );
     }
+
+    /// #557: a plugin-registered ("extension") panel must contribute a
+    /// **visible** activity-bar icon on the GTK `ShellApp` path.
+    ///
+    /// `build_shell_config` derives the runner's panel list from the engine's
+    /// `AppShell`, which only ever holds the seven built-ins — extension
+    /// panels live in `engine.ext_panels` and were dropped entirely, so e.g.
+    /// the Git Insights extension registered a display name and an icon and
+    /// nothing rendered for it.
+    ///
+    /// `use_nerd_fonts` is pinned off (and `ext_panels` cleared of whatever
+    /// the developer has actually installed) so the glyph painted is the
+    /// registration's plain-ASCII *fallback*, which any font can render —
+    /// a Nerd Font codepoint would make this depend on the test machine
+    /// having Symbols Nerd Font installed.
+    ///
+    /// Asserted **in pixels**, not painted text: quadraui's GTK activity-bar
+    /// rasteriser draws its glyphs straight to the Cairo context
+    /// (`quadraui/src/gtk/activity_bar.rs`) rather than through the recorded
+    /// `draw_text` path, so `painted_texts()` cannot see the icon strip at
+    /// all. Rather than hard-code the icon's row (fragile against `AppShell`'s
+    /// own layout constants), this renders the *same* app twice — once with
+    /// the extension registered, once without — and requires the activity-bar
+    /// column to differ. Only the extra icon can account for that: everything
+    /// else in the strip, including which panel is active, is identical.
+    #[test]
+    fn extension_panel_contributes_an_activity_bar_icon() {
+        /// Plain ASCII so the assertion doesn't depend on an installed font.
+        const EXT_ICON: char = 'X';
+        /// Comfortably inside the activity bar (3 line-heights wide) and
+        /// below the title-bar band, so only the icon strip is sampled.
+        const STRIP_W: i32 = 40;
+        const STRIP_Y: std::ops::Range<i32> = 100..800;
+
+        fn activity_bar_strip(with_ext: bool) -> Vec<(u8, u8, u8)> {
+            let mut engine = Engine::new();
+            engine.settings.use_nerd_fonts = false;
+            engine.ext_panels.clear();
+            if with_ext {
+                engine.ext_panels.insert(
+                    "git-insights".to_string(),
+                    crate::core::plugin::PanelRegistration {
+                        name: "git-insights".to_string(),
+                        title: "Git Insights".to_string(),
+                        icon: '\u{f113}',
+                        fallback_icon: Some(EXT_ICON),
+                        sections: Vec::new(),
+                    },
+                );
+            }
+            let mut h = harness(engine, 1400, 900);
+            let mut px = Vec::new();
+            for y in STRIP_Y.step_by(2) {
+                for x in (0..STRIP_W).step_by(2) {
+                    px.push(h.driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        let without = activity_bar_strip(false);
+        let with = activity_bar_strip(true);
+        let differing = with
+            .iter()
+            .zip(without.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing > 0,
+            "registering an extension panel must change what the activity bar \
+             paints — the Git Insights icon was missing entirely (#557); \
+             {}/{} sampled pixels differed",
+            differing,
+            with.len()
+        );
+    }
 }

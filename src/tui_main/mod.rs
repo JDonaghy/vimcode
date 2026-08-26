@@ -564,7 +564,11 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         }));
     }
 
-    let config = shell_app::TuiShellApp::shell_config(app.engine.menu_bar_visible);
+    // #557: `live_shell_config`, not the static `shell_config` — plugins have
+    // already registered their sidebar panels by the time `App::new` returns,
+    // so frame zero can paint their activity-bar icons rather than waiting for
+    // the first dispatch's `sync_ext_activity_panels` to add them.
+    let config = shell_app::TuiShellApp::live_shell_config(&app.engine);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         quadraui::tui::shell_runner::run_with_shell(app, config);
