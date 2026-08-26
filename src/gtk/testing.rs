@@ -95,6 +95,11 @@ pub(super) struct Harness<A: AppLogic> {
     pub picker_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
     /// Line height the last frame actually painted with (#555).
     pub painted_line_height: Rc<std::cell::Cell<Option<f64>>>,
+    /// The sidebar content rect the last frame painted the active panel into,
+    /// or `None` if the sidebar was hidden. The sidebar twin of
+    /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
+    /// than at guessed offsets (#544).
+    pub painted_sidebar_bounds: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -276,6 +281,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let tab_close_abs = Rc::clone(&app.cached_tab_close_abs);
     let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
     let painted_line_height = Rc::clone(&app.painted_line_height);
+    let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -284,6 +290,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         tab_close_abs,
         picker_popup_rect,
         painted_line_height,
+        painted_sidebar_bounds,
     }
 }
 
@@ -878,6 +885,224 @@ mod tests {
              {}/{} sampled pixels differed",
             differing,
             with.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod sidebar_panel_clicks {
+    //! #544 (#448-D): under the ShellApp runner every sidebar panel except the
+    //! file explorer silently dropped mouse input.
+    //!
+    //! The Relm4 build gave each panel its own `DrawingArea` and GDK delivered
+    //! clicks straight to it. The #540 migration collapsed all of them into the
+    //! runner's single surface, so panels are now painted by
+    //! `render_content` into `layout.sidebar_content_bounds` and every event
+    //! arrives at `ShellApp::handle`. Only the explorer was re-wired there;
+    //! search / git / debug / extensions / settings presses fell through to the
+    //! editor click path, matched no editor zone, and were discarded — hence
+    //! "settings panel clicks, search sidebar clicks, git sidebar clicks" all
+    //! reported dead.
+    //!
+    //! These drive the real `App` through `GtkDriver`, so they exercise
+    //! `ShellApp::handle`'s routing and the controllers that painted the panel,
+    //! and every click is aimed at the rect the frame *actually* painted
+    //! (`painted_sidebar_bounds`) rather than a guessed offset.
+    use super::*;
+    use crate::core::engine::sidebar::*;
+    use quadraui::{Point, ScrollDelta, UiEvent};
+
+    /// A harness showing `panel` in the sidebar. `show_panel` is used directly
+    /// rather than `focus_sidebar_panel`/`toggle_sidebar_panel` because those
+    /// persist `session.explorer_visible` to the developer's real session file.
+    /// Nerd fonts are pinned off so nothing depends on the test machine having
+    /// a Nerd Font installed.
+    fn panel_harness(panel: &str) -> Harness<impl AppLogic> {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(panel));
+        harness(engine, 1400, 900)
+    }
+
+    /// Settings: a click on a category row must expand/collapse it.
+    ///
+    /// The pre-fix path reached `Msg::SettingsClick`, whose geometry was read
+    /// off `settings_da_ref` — a `DrawingArea` that is `None` for the whole
+    /// life of a ShellApp run, so panel width/height came back `0` and every
+    /// row test failed even when the message was dispatched. Nothing dispatched
+    /// it either. Now the press goes to the same `FormController` that painted
+    /// the rows.
+    #[test]
+    fn settings_panel_click_toggles_the_clicked_category() {
+        let mut h = panel_harness(PANEL_SETTINGS);
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the settings panel must have painted into a sidebar rect");
+        assert!(
+            matches!(
+                h.engine.borrow().settings_flat_list().first(),
+                Some(crate::core::engine::SettingsRow::CoreCategory(0))
+            ),
+            "this test aims at the first row expecting it to be category 0"
+        );
+        let before = h.engine.borrow().settings_collapsed[0];
+
+        h.driver.click(sb.x + 20.0, sb.y + 4.0);
+
+        assert_eq!(
+            h.engine.borrow().settings_collapsed[0],
+            !before,
+            "clicking the first settings category must toggle it (#544)"
+        );
+        assert_eq!(
+            h.engine.borrow().settings_selected,
+            0,
+            "the clicked row must also become the selection"
+        );
+    }
+
+    /// Settings: the wheel must scroll the panel, not the editor behind it.
+    #[test]
+    fn settings_panel_scrolls_under_the_wheel() {
+        let mut h = panel_harness(PANEL_SETTINGS);
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        assert_eq!(h.engine.borrow().settings_scroll_top, 0);
+
+        h.driver.dispatch(UiEvent::Scroll {
+            widget: None,
+            // Negative y = wheel down in quadraui's convention.
+            delta: ScrollDelta::new(0.0, -1.0),
+            position: Point::new(sb.x + 20.0, sb.y + 100.0),
+        });
+
+        assert!(
+            h.engine.borrow().settings_scroll_top > 0,
+            "a wheel notch over the settings panel must scroll it (#544)"
+        );
+    }
+
+    /// Search: clicking the query box at the top of the panel must focus it.
+    ///
+    /// `search_panel_form_focus` is what the renderer reads to draw the caret
+    /// and what keystrokes are routed by, so a `None` here is the "typing goes
+    /// nowhere after clicking the search box" half of the report.
+    #[test]
+    fn search_panel_click_focuses_the_query_field() {
+        let mut h = panel_harness(PANEL_SEARCH);
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        // Clear the panel's default focus so the assertion below can only pass
+        // because the click put it back.
+        h.engine.borrow().search_panel_form_focus.replace(None);
+        h.engine.borrow_mut().search_set_focus(false);
+
+        h.driver.click(sb.x + 20.0, sb.y + 4.0);
+
+        assert_eq!(
+            h.engine
+                .borrow()
+                .search_panel_form_focus
+                .borrow()
+                .as_deref(),
+            Some("search:query"),
+            "clicking the search panel's query field must focus it (#544)"
+        );
+        assert!(
+            h.engine.borrow().search_has_focus,
+            "and the panel itself must take focus"
+        );
+    }
+
+    /// Git: the commit-message box must activate when clicked, and the header
+    /// row above it must not.
+    ///
+    /// This is the band geometry (`render::sc_sidebar_bands`) the painter and
+    /// the router now share. The pre-fix handler assumed `DrawingArea`-local
+    /// coordinates with the panel top at `y == 0`, which the ShellApp painter
+    /// never produces — under the sidebar's real origin every band test landed
+    /// in the wrong band even if the event had reached it.
+    ///
+    /// Skipped when the checkout isn't a git repo: without a `SourceControl`
+    /// screen the panel paints nothing at all and there are no bands to hit.
+    #[test]
+    fn git_panel_click_activates_the_commit_box_but_not_the_header() {
+        let mut h = panel_harness(PANEL_GIT);
+        if h.engine.borrow().sc_panel_layout.borrow().is_none() {
+            return;
+        }
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        let lh = h.painted_line_height.get().unwrap() as f32;
+        let bands = crate::render::sc_sidebar_bands(
+            &h.engine.borrow().sc_commit_message.clone(),
+            sb,
+            lh,
+            super::super::SC_COMMIT_BORDER_PX,
+        );
+
+        h.driver.click(
+            bands.commit_input.x + 20.0,
+            bands.commit_input.y + bands.commit_input.height / 2.0,
+        );
+        assert!(
+            h.engine.borrow().sc_commit_input_active,
+            "clicking the commit-message box must put the caret in it (#544)"
+        );
+
+        h.driver.click(
+            bands.header.x + 20.0,
+            bands.header.y + bands.header.height / 2.0,
+        );
+        assert!(
+            !h.engine.borrow().sc_commit_input_active,
+            "clicking the header row above it must take the caret back out"
+        );
+    }
+
+    /// Debug: a press in the panel body must reach the panel at all — before
+    /// #544 it was swallowed by the editor click path, which left
+    /// `dap_sidebar_has_focus` false so every subsequent keystroke went to the
+    /// buffer instead of the debug tree.
+    #[test]
+    fn debug_panel_click_gives_the_panel_focus() {
+        let mut h = panel_harness(PANEL_DEBUG);
+        let body = h.engine.borrow().dap_sidebar_body_rect.get();
+        assert!(body.width > 0.0, "the debug panel must have painted a body");
+        assert!(!h.engine.borrow().dap_sidebar_has_focus);
+
+        h.driver.click(body.x + 20.0, body.y + 4.0);
+
+        assert!(
+            h.engine.borrow().dap_sidebar_has_focus,
+            "a click in the debug panel body must focus it (#544)"
+        );
+    }
+
+    /// An editor text-selection drag that wanders over the sidebar must still
+    /// finalise in the editor: only a press that a panel *claimed* captures the
+    /// rest of the gesture. Guards the `sidebar_pointer_captured` follow-through
+    /// added for panel scrollbar drags from swallowing unrelated releases.
+    #[test]
+    fn an_editor_drag_crossing_the_sidebar_is_not_stolen_by_a_panel() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        engine.buffer_mut().insert(
+            0,
+            "alpha beta gamma
+second line here
+",
+        );
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        let (wx, wy) = h.window_center(win).expect("editor pane must paint");
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+
+        h.driver.mouse_down(wx, wy);
+        h.driver.mouse_move(sb.x + 10.0, sb.y + 10.0);
+        h.driver.mouse_up(sb.x + 10.0, sb.y + 10.0);
+
+        assert!(
+            !h.engine.borrow().explorer_has_focus,
+            "the explorer must not claim a drag that started in the editor (#544)"
         );
     }
 }

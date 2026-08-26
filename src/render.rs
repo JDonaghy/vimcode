@@ -7116,6 +7116,53 @@ pub fn sc_commit_input_box_height(commit_message: &str) -> u16 {
     sc_commit_input_row_count(commit_message) + 2
 }
 
+/// The three fixed bands the git ("source control") sidebar stacks inside its
+/// content area, top to bottom: the header status bar, the commit-message
+/// `TextInput` box, and the toolbar-slab + section list that fills the rest.
+///
+/// Returned by [`sc_sidebar_bands`] so a backend's *painter* and its *click
+/// router* read one derivation instead of two. Both used to inline this
+/// arithmetic separately, which is exactly how the pre-#544 GTK click path
+/// ended up hit-testing against DrawingArea-local `y` (`0` at the panel top)
+/// while the ShellApp painter drew at absolute window coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScSidebarBands {
+    /// Header row (branch name + summary).
+    pub header: quadraui::Rect,
+    /// Commit-message input box, including its border.
+    pub commit_input: quadraui::Rect,
+    /// Everything below: the toolbar slab and the change sections.
+    pub slab: quadraui::Rect,
+}
+
+/// Split a git-sidebar content rect into its [`ScSidebarBands`].
+///
+/// `row_height` is one text row in the caller's native unit (pixels on GTK,
+/// cells on TUI). `commit_border` is what the `TextInput` primitive's 1-unit
+/// border on top *and* bottom costs in that same unit — 2.0 px on GTK, 2.0
+/// rows on TUI (see [`sc_commit_input_box_height`], which is the row-unit
+/// spelling of the same constant).
+pub fn sc_sidebar_bands(
+    commit_message: &str,
+    rect: quadraui::Rect,
+    row_height: f32,
+    commit_border: f32,
+) -> ScSidebarBands {
+    let header_h = row_height;
+    let commit_h = sc_commit_input_row_count(commit_message) as f32 * row_height + commit_border;
+    let slab_y = rect.y + header_h + commit_h;
+    ScSidebarBands {
+        header: quadraui::Rect::new(rect.x, rect.y, rect.width, header_h),
+        commit_input: quadraui::Rect::new(rect.x, rect.y + header_h, rect.width, commit_h),
+        slab: quadraui::Rect::new(
+            rect.x,
+            slab_y,
+            rect.width,
+            (rect.y + rect.height - slab_y).max(0.0),
+        ),
+    }
+}
+
 /// Adapt the SC commit-message state into a `quadraui::TextInput` (#480,
 /// migrating the hand-rolled `set_cell` commit-row painter to the shared
 /// primitive shipped in quadraui#222).
@@ -9137,6 +9184,100 @@ pub fn populate_settings_form_controller(engine: &Engine) {
     fc.set_form(form);
     fc.set_scroll_offset(engine.settings_scroll_top);
     fc.set_has_focus(engine.settings_has_focus);
+}
+
+/// Route a pointer event over the Settings panel through the shared
+/// `quadraui::FormController` and apply the result to engine state.
+///
+/// `rect` is the panel's content area in the caller's own coordinate space —
+/// the *same* rect the last frame passed to
+/// `FormController::render_and_cache`, since `handle_cached` re-derives its
+/// row layout from it. Returns `true` when the event was consumed.
+///
+/// This is the click twin of [`populate_settings_form_controller`], and it
+/// exists so neither backend has to re-derive the panel's row geometry by
+/// hand: before #544 GTK computed `row_h = line_height * 1.4`, a header/search
+/// band and a scrollbar gutter from a `DrawingArea`'s own width/height, none of
+/// which survive the ShellApp migration (there is no per-panel DrawingArea any
+/// more, so every one of those numbers read back `0`). `FormController` already
+/// owns all of it and is the only thing that painted the rows.
+///
+/// Activation policy matches the keyboard path and the pre-migration GTK/TUI
+/// mouse paths: a `Toggle` field flips on a single click, a category header
+/// expands/collapses on a single click, and a value row selects on a single
+/// click but only *activates* (opens the inline editor / cycles an enum) on a
+/// double click.
+pub fn handle_settings_form_ui_event(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+) -> bool {
+    use crate::core::engine::SettingsRow;
+
+    // `FormController` has no `DoubleClick` arm — probe with the equivalent
+    // press and remember that the caller asked for activation.
+    let (probe, activate_row) = match event {
+        quadraui::UiEvent::DoubleClick { widget, position } => (
+            quadraui::UiEvent::MouseDown {
+                widget: widget.clone(),
+                button: quadraui::MouseButton::Left,
+                position: *position,
+                modifiers: quadraui::Modifiers::default(),
+            },
+            true,
+        ),
+        other => (other.clone(), false),
+    };
+
+    populate_settings_form_controller(engine);
+    let result = engine
+        .settings_form_controller
+        .borrow_mut()
+        .handle_cached(&probe, rect);
+
+    let sync_scroll = |engine: &mut Engine| {
+        let offset = engine.settings_form_controller.borrow().scroll_offset();
+        engine.settings_scroll_top = offset;
+    };
+
+    match result {
+        quadraui::FormControllerEvent::Ignored => false,
+        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+            sync_scroll(engine);
+            true
+        }
+        quadraui::FormControllerEvent::FormAction(action) => {
+            let (id, activates) = match action {
+                quadraui::FormEvent::ToggleChanged { id, .. } => (id, true),
+                quadraui::FormEvent::ButtonClicked { id } => (id, true),
+                quadraui::FormEvent::FocusChanged { id } => (id, activate_row),
+                _ => return true,
+            };
+            // The form's fields are built 1:1 from `settings_flat_list()`
+            // (see `settings_to_form`), so the field's position *is* the flat
+            // index `settings_selected` indexes — read it off the controller
+            // rather than re-parsing the id string, so the two can't drift.
+            let idx = engine
+                .settings_form_controller
+                .borrow()
+                .form()
+                .and_then(|f| f.fields.iter().position(|field| field.id == id));
+            let Some(idx) = idx else {
+                return true;
+            };
+            engine.settings_has_focus = true;
+            engine.settings_selected = idx;
+            sync_scroll(engine);
+            let is_category = matches!(
+                engine.settings_flat_list().get(idx),
+                Some(SettingsRow::CoreCategory(_)) | Some(SettingsRow::ExtCategory(_))
+            );
+            if activates || is_category {
+                engine.handle_settings_key("Return", false, None);
+            }
+            true
+        }
+    }
 }
 
 /// Adapt the quickfix panel data into a generic `quadraui::ListView`.

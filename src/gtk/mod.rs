@@ -90,6 +90,13 @@ const CLOSE_TAB_PAD: f64 = 14.0;
 const CLOSE_TAB_OUTER_GAP: f64 = 1.0;
 const CLOSE_HOVER_PAD: f64 = 2.0;
 
+/// What the git sidebar's commit-message `TextInput` border costs vertically in
+/// GTK's native unit: 1px on top + 1px on bottom. TUI's whole-cell equivalent
+/// is `render::sc_commit_input_box_height`'s `+ 2` rows. Fed to
+/// `render::sc_sidebar_bands` by both the painter and the click router so the
+/// two agree (#544).
+const SC_COMMIT_BORDER_PX: f32 = 2.0;
+
 /// Trim a *padded* close-button hit zone `(start, end)` — as reported by
 /// `quadraui::Backend::tab_bar_layout` — down to the tight × glyph box the
 /// rasteriser actually draws (including its 2px hover halo). Leading
@@ -634,6 +641,22 @@ struct App {
     /// by the real global `idx` instead of position fixes that regardless
     /// of how many editor windows precede the tab bars.
     cached_tab_bar_zones: Rc<RefCell<HashMap<usize, (core::window::GroupId, quadraui::Rect)>>>,
+    /// A sidebar panel claimed the current press, so the rest of the gesture
+    /// (`MouseMoved` with the left button held, then `MouseUp`) belongs to it —
+    /// that is what lets a panel scrollbar thumb or a tree drag keep tracking
+    /// once the pointer strays outside the sidebar. Cleared on release. An
+    /// *unclaimed* drag is never intercepted, so an editor text-selection drag
+    /// that wanders over the sidebar still finalises in the editor (#544).
+    sidebar_pointer_captured: Cell<bool>,
+    /// Git-sidebar band geometry (header / commit input / toolbar slab) as the
+    /// last `render_content` pass painted it, from `render::sc_sidebar_bands`.
+    /// `route_sc_sidebar_event` resolves presses against this so the click and
+    /// paint derivations cannot drift (#544).
+    cached_sc_bands: Cell<Option<render::ScSidebarBands>>,
+    /// Debug-sidebar action-button row rect as last painted. The hit regions in
+    /// `engine.dap_sidebar_action_hits` are relative to this rect's origin, so
+    /// the router needs it to translate an absolute press (#544).
+    cached_dap_action_rect: Cell<Option<quadraui::Rect>>,
     /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
     /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
     /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
@@ -749,6 +772,13 @@ struct App {
     /// Line height the last frame actually painted with, published by
     /// `render_content` — see [`App::painted_line_height`] (#555).
     painted_line_height: Rc<Cell<Option<f64>>>,
+    /// The sidebar content area the last frame painted a panel into
+    /// (`ShellContext::layout.sidebar_content_bounds`), or `None` when the
+    /// sidebar was hidden. Published purely so the headless harness can aim a
+    /// click at the panel the renderer actually drew instead of guessing pixel
+    /// offsets — the same "locate targets, never hardcode coords" rule
+    /// `screen_layout` / `tab_slots_abs` exist for (#544).
+    painted_sidebar_bounds: Rc<Cell<Option<quadraui::Rect>>>,
     /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
     #[allow(clippy::type_complexity)]
     editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
@@ -1558,6 +1588,9 @@ impl App {
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             cached_screen_layout: Rc::new(RefCell::new(None)),
             cached_frame_hit_map: Rc::new(RefCell::new(None)),
+            sidebar_pointer_captured: Cell::new(false),
+            cached_sc_bands: Cell::new(None),
+            cached_dap_action_rect: Cell::new(None),
             cached_tab_bar_zones: Rc::new(RefCell::new(HashMap::new())),
             cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
             cached_drop_tbh: Rc::new(Cell::new(0.0)),
@@ -1588,6 +1621,7 @@ impl App {
             context_menu_layout: Rc::new(RefCell::new(None)),
             tab_switcher_popup_rect: Rc::new(Cell::new(None)),
             picker_popup_rect: Rc::new(Cell::new(None)),
+            painted_sidebar_bounds: Rc::new(Cell::new(None)),
             painted_line_height: Rc::new(Cell::new(None)),
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
@@ -7026,11 +7060,26 @@ impl App {
 
     /// Forward a pointer event over the sidebar content area to the active panel's
     /// controller. In ShellApp mode the sidebar has no dedicated per-panel
-    /// `DrawingArea`, so events the Relm4 build delivered straight to the explorer
-    /// DA must be routed here instead. Currently wires the file explorer through
-    /// its shared `quadraui::TreeController` (via `Msg::ExplorerUiEvent`); other
-    /// panels have their own routing or are keyboard-driven. Returns `true` when
-    /// the event was consumed. (#540 ShellApp port)
+    /// `DrawingArea`, so events the Relm4 build delivered straight to each panel's
+    /// DA must be routed here instead. Returns `true` when the event was
+    /// consumed. (#540 ShellApp port, #544 non-explorer panels)
+    ///
+    /// The panel arms mirror `render_content`'s own `match active_id` — each one
+    /// feeds the very controller (`TreeController` / `SidebarSystem` /
+    /// `FormController`) that painted the panel, at the rect it painted into.
+    /// That is the whole reason this is 1-3 lines per panel and carries no
+    /// GTK-specific hit-test: the geometry already lives in the shared
+    /// controller, exactly as `tui_main::shell_app`'s equivalent intercepts use
+    /// it.
+    ///
+    /// # Drag / release follow-through
+    ///
+    /// A press claimed here sets `sidebar_pointer_captured`, and while that is
+    /// set the subsequent `MouseMoved`(left held) / `MouseUp` are routed to the
+    /// same panel so scrollbar thumbs and tree drags track the pointer. An
+    /// *unclaimed* move/release is deliberately left alone, so an editor
+    /// text-drag that happens to cross into the sidebar still finalizes through
+    /// the editor's own mouse-up path.
     fn try_route_sidebar_mouse_event(
         &mut self,
         event: &quadraui::UiEvent,
@@ -7039,21 +7088,46 @@ impl App {
         use quadraui::UiEvent;
 
         let Some(sb) = ctx.layout.sidebar_content_bounds else {
+            self.sidebar_pointer_captured.set(false);
             return false;
         };
-        // Intercept only interaction-starting events (press / double-click) and
-        // wheel scroll. MouseMoved/MouseUp are deliberately NOT intercepted so an
-        // editor text-drag that happens to cross into the sidebar still finalizes
-        // through the editor's own mouse-up path.
+        let dragging = self.sidebar_pointer_captured.get();
         let pos = match event {
             UiEvent::MouseDown { position, .. }
             | UiEvent::DoubleClick { position, .. }
             | UiEvent::Scroll { position, .. } => *position,
+            // Follow-through only: never *start* an interaction from a move or
+            // a release (see the doc comment above).
+            UiEvent::MouseUp { position, .. } if dragging => {
+                self.sidebar_pointer_captured.set(false);
+                *position
+            }
+            UiEvent::MouseMoved {
+                position,
+                buttons: quadraui::ButtonMask { left: true, .. },
+            } if dragging => *position,
             _ => return false,
         };
-        if pos.x < sb.x || pos.x >= sb.x + sb.width || pos.y < sb.y || pos.y >= sb.y + sb.height {
+        // A captured drag keeps its grab even when the pointer leaves the
+        // sidebar — otherwise dragging a scrollbar thumb sideways would silently
+        // hand the rest of the gesture to the editor.
+        let starts_interaction =
+            !matches!(event, UiEvent::MouseUp { .. } | UiEvent::MouseMoved { .. });
+        if starts_interaction
+            && (pos.x < sb.x
+                || pos.x >= sb.x + sb.width
+                || pos.y < sb.y
+                || pos.y >= sb.y + sb.height)
+        {
             return false;
         }
+        // Only a *press* moves keyboard focus into the panel. A wheel notch is
+        // deliberately excluded: hovering-and-scrolling must not steal focus,
+        // the same rule the editor's own wheel path follows (#240/#646).
+        let is_press = matches!(
+            event,
+            UiEvent::MouseDown { .. } | UiEvent::DoubleClick { .. }
+        );
 
         // An open picker / command palette is painted *over* the sidebar and
         // owns every press while it is up (#555). `render_content` centres the
@@ -7097,23 +7171,200 @@ impl App {
             return true;
         }
 
-        // Only the file explorer panel is wired through here. When no panel id is
-        // set the explorer is the default (mirrors render_content).
-        let explorer_active = {
+        // Which panel owns the sidebar body? Derived exactly as
+        // `render_content` derives it, so the click router and the painter can
+        // never disagree about who is on screen.
+        let active_id: String = {
             let engine = self.engine.borrow();
-            engine.ext_panel_active.is_none()
-                && engine
+            if let Some(ref name) = engine.ext_panel_active {
+                format!("{EXT_PANEL_ID_PREFIX}{name}")
+            } else {
+                engine
                     .app_shell
                     .active_panel_id()
-                    .map(|id| id.as_str() == PANEL_EXPLORER)
-                    .unwrap_or(true)
+                    .map(|id| id.as_str().to_string())
+                    .unwrap_or_else(|| PANEL_EXPLORER.to_string())
+            }
         };
-        if !explorer_active {
+
+        let consumed = match active_id.as_str() {
+            PANEL_EXPLORER => {
+                self.dispatch(Msg::ExplorerUiEvent(event.clone()));
+                true
+            }
+            PANEL_SEARCH => {
+                let mut engine = self.engine.borrow_mut();
+                if is_press {
+                    engine.search_set_focus(true);
+                }
+                engine.handle_search_sidebar_ui_event(event.clone());
+                true
+            }
+            PANEL_DEBUG => self.route_debug_sidebar_event(event),
+            PANEL_GIT => self.route_sc_sidebar_event(event),
+            PANEL_EXTENSIONS => {
+                let mut engine = self.engine.borrow_mut();
+                if is_press {
+                    engine.ext_sidebar_has_focus = true;
+                }
+                engine.handle_ext_sidebar_ui_event(event.clone());
+                if matches!(event, UiEvent::DoubleClick { .. }) {
+                    engine.ext_open_selected_readme();
+                }
+                true
+            }
+            PANEL_SETTINGS => {
+                let mut engine = self.engine.borrow_mut();
+                if is_press {
+                    engine.settings_has_focus = true;
+                }
+                render::handle_settings_form_ui_event(&mut engine, event, sb);
+                true
+            }
+            id if id.starts_with(EXT_PANEL_ID_PREFIX) => {
+                // Plugin-provided panel: `render_content` paints it through the
+                // same `ext_sidebar_system` at the same rect, so it routes the
+                // same way.
+                let mut engine = self.engine.borrow_mut();
+                if is_press {
+                    engine.ext_sidebar_has_focus = true;
+                }
+                engine.handle_ext_sidebar_ui_event(event.clone());
+                true
+            }
+            // PANEL_AI and unknowns are not painted through `render_content`
+            // yet (same `_ =>` holdout that arm has), so there is nothing for a
+            // click to hit — let it fall through rather than swallow it.
+            _ => false,
+        };
+
+        if consumed {
+            if starts_interaction {
+                self.sidebar_pointer_captured
+                    .set(matches!(event, UiEvent::MouseDown { .. }));
+            }
+            self.draw_needed.set(true);
+        }
+        consumed
+    }
+
+    /// Sidebar routing for the Debug panel (#544).
+    ///
+    /// `render_content` stacks two chrome rows above the body: a title bar and
+    /// an action-button bar whose `StatusBarLayout` it stashes in
+    /// `engine.dap_sidebar_action_hits`. Those hit regions are **bar-relative**
+    /// (`StatusBar::layout` lays out from `0,0`; `quadraui::gtk::draw_status_bar`
+    /// returns them verbatim), so the press has to be translated into the action
+    /// row's own space before hit-testing. Everything below goes to the shared
+    /// `SidebarSystem` at the body rect it painted into.
+    fn route_debug_sidebar_event(&mut self, event: &quadraui::UiEvent) -> bool {
+        let action_rect = self.cached_dap_action_rect.get();
+        let body_rect = self.engine.borrow().dap_sidebar_body_rect.get();
+        if body_rect.width <= 0.0 {
             return false;
         }
+        let starts_interaction = matches!(
+            event,
+            quadraui::UiEvent::MouseDown { .. } | quadraui::UiEvent::DoubleClick { .. }
+        );
+        let pos = match event {
+            quadraui::UiEvent::MouseDown { position, .. }
+            | quadraui::UiEvent::DoubleClick { position, .. }
+            | quadraui::UiEvent::MouseUp { position, .. }
+            | quadraui::UiEvent::MouseMoved { position, .. }
+            | quadraui::UiEvent::Scroll { position, .. } => *position,
+            _ => return false,
+        };
+        let mut engine = self.engine.borrow_mut();
+        if starts_interaction {
+            engine.dap_sidebar_has_focus = true;
+        }
+        // Chrome band (title + action row) — above the body rect.
+        if starts_interaction && pos.y < body_rect.y {
+            let matched = action_rect.is_some_and(|ar| {
+                let hits = engine.dap_sidebar_action_hits.borrow();
+                hits.as_ref().is_some_and(|l| {
+                    matches!(
+                        l.hit_test(pos.x - ar.x, pos.y - ar.y),
+                        quadraui::StatusBarHit::Segment(_)
+                    )
+                })
+            });
+            if matched {
+                engine.handle_dap_sidebar_action_click();
+            }
+            // Claimed either way: the press landed on this panel's own chrome,
+            // so it must not leak through to the editor beneath (#637's rule
+            // for the TUI twin of this intercept).
+            return true;
+        }
+        render::populate_dap_sidebar_system(&engine);
+        let backend_rc = self.backend.clone();
+        let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+            event,
+            &mut *backend_rc.borrow_mut(),
+            body_rect,
+        );
+        engine.dispatch_dap_sidebar_event(sidebar_event);
+        true
+    }
 
-        self.dispatch(Msg::ExplorerUiEvent(event.clone()));
-        self.draw_needed.set(true);
+    /// Sidebar routing for the git ("source control") panel (#544).
+    ///
+    /// The panel is three stacked bands — header, commit-message input, and the
+    /// toolbar slab + change sections. `render_content` derives them via
+    /// `render::sc_sidebar_bands` and caches the result here, so this resolves a
+    /// press against the exact geometry that was painted rather than
+    /// re-deriving it (the pre-#544 handler assumed `DrawingArea`-local
+    /// coordinates with the panel top at `y == 0`, which the ShellApp painter
+    /// never produces).
+    fn route_sc_sidebar_event(&mut self, event: &quadraui::UiEvent) -> bool {
+        let Some(bands) = self.cached_sc_bands.get() else {
+            return false;
+        };
+        let starts_interaction = matches!(
+            event,
+            quadraui::UiEvent::MouseDown { .. } | quadraui::UiEvent::DoubleClick { .. }
+        );
+        let pos = match event {
+            quadraui::UiEvent::MouseDown { position, .. }
+            | quadraui::UiEvent::DoubleClick { position, .. }
+            | quadraui::UiEvent::MouseUp { position, .. }
+            | quadraui::UiEvent::MouseMoved { position, .. }
+            | quadraui::UiEvent::Scroll { position, .. } => *position,
+            _ => return false,
+        };
+        let mut engine = self.engine.borrow_mut();
+        if starts_interaction {
+            engine.sc_set_focus(true);
+        }
+        if starts_interaction {
+            let commit_bottom = bands.commit_input.y + bands.commit_input.height;
+            if pos.y < bands.header.y + bands.header.height {
+                engine.sc_commit_input_active = false;
+                return true;
+            }
+            if pos.y < commit_bottom {
+                engine.sc_commit_input_active = true;
+                engine.sc_commit_cursor = engine.sc_commit_message.len();
+                return true;
+            }
+            engine.sc_commit_input_active = false;
+            // Toolbar buttons live in the slab above the section list; the
+            // cached `SidebarPanelLayout` is in absolute space because
+            // `render_content` painted it at an absolute `slab_rect`.
+            let hit = {
+                let layout = engine.sc_panel_layout.borrow();
+                layout.as_ref().map(|l| l.hit_test(pos.x, pos.y))
+            };
+            if let Some(quadraui::SidebarPanelHit::ToolbarButton(_)) = hit {
+                if let Some(idx) = engine.sc_button_hit(pos.x, pos.y) {
+                    engine.sc_activate_button(idx);
+                }
+                return true;
+            }
+        }
+        engine.handle_sc_sidebar_ui_event(event.clone());
         true
     }
 
@@ -8302,6 +8553,8 @@ impl quadraui::ShellApp for App {
         // ── Draw sidebar panel content ─────────────────────────────────────────
         // The quadraui AppShell chrome (activity bar + sidebar header) is rendered
         // by the runner; we fill only the content area it exposes.
+        self.painted_sidebar_bounds
+            .set(layout.sidebar_content_bounds);
         if let Some(q_sb) = layout.sidebar_content_bounds {
             // Which panel is active?  Extension panels bypass AppShell.
             let active_id: String = if let Some(ref name) = engine.ext_panel_active {
@@ -8344,6 +8597,9 @@ impl quadraui::ShellApp for App {
                     let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
                     let hits = backend.draw_status_bar(action_rect, &action_bar, None, None);
                     engine.dap_sidebar_action_hits.replace(Some(hits));
+                    // `hits` are relative to `action_rect`'s origin; the click
+                    // router needs the rect to translate into that space (#544).
+                    self.cached_dap_action_rect.set(Some(action_rect));
                     engine.dap_sidebar_body_rect.set(body_rect);
                     render::populate_dap_sidebar_system(&engine);
                     engine
@@ -8363,30 +8619,30 @@ impl quadraui::ShellApp for App {
                         // real now that quadraui#222 (TextInput) has landed,
                         // through the same `render::sc_*` adapters TUI uses
                         // so the two renderers can't drift.
-                        let header_h = lh as f32;
-                        let header_rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, header_h);
+                        // Band geometry (header / commit box / slab) comes from
+                        // the shared `render::sc_sidebar_bands` so the click
+                        // router in `try_route_sidebar_mouse_event` resolves a
+                        // press against the *same* derivation that painted it
+                        // (#544). `SC_COMMIT_BORDER_PX` is the primitive's 1px
+                        // border top+bottom — GTK's native unit is pixels,
+                        // unlike TUI's whole-cell border (see
+                        // `render::sc_commit_input_box_height` doc).
+                        let bands = render::sc_sidebar_bands(
+                            &sc.commit_message,
+                            q_sb,
+                            lh as f32,
+                            SC_COMMIT_BORDER_PX,
+                        );
+                        self.cached_sc_bands.set(Some(bands));
                         let header_bar = render::sc_header_status_bar(sc, &theme);
-                        let _ = backend.draw_status_bar(header_rect, &header_bar, None, None);
+                        let _ = backend.draw_status_bar(bands.header, &header_bar, None, None);
 
                         let ti = render::sc_commit_message_to_text_input(sc);
-                        let commit_rows = render::sc_commit_input_row_count(&sc.commit_message);
-                        // +2px for the primitive's 1px border top+bottom — GTK's
-                        // native unit is pixels, unlike TUI's whole-cell border
-                        // (see `render::sc_commit_input_box_height` doc).
-                        let commit_h = commit_rows as f32 * lh as f32 + 2.0;
-                        let ti_rect =
-                            quadraui::Rect::new(q_sb.x, q_sb.y + header_h, q_sb.width, commit_h);
-                        backend.draw_text_input(ti_rect, &ti);
+                        backend.draw_text_input(bands.commit_input, &ti);
 
                         // Render the toolbar-slab + section list below the
                         // header + commit input.
-                        let slab_y = q_sb.y + header_h + commit_h;
-                        let slab_rect = quadraui::Rect::new(
-                            q_sb.x,
-                            slab_y,
-                            q_sb.width,
-                            (q_sb.height - header_h - commit_h).max(0.0),
-                        );
+                        let slab_rect = bands.slab;
                         render::draw_sc_sidebar_panel(backend, &engine, sc, slab_rect);
                         let body_rect = engine
                             .sc_panel_layout
