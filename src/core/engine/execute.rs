@@ -1822,10 +1822,11 @@ impl Engine {
             // Display jump list
             "jumps" => {
                 let mut lines: Vec<String> = Vec::new();
-                lines.push(" jump line  col  file/text".to_string());
-                for (i, (path, line, col)) in self.jump_list.iter().enumerate() {
+                lines.push(" jump line  col  tab  file/text".to_string());
+                for (i, entry) in self.jump_list.iter().enumerate() {
                     let marker = if i == self.jump_list_pos { ">" } else { " " };
-                    let path_str = path
+                    let path_str = entry
+                        .file
                         .as_ref()
                         .map(|p| {
                             p.file_name()
@@ -1833,12 +1834,25 @@ impl Engine {
                                 .unwrap_or_default()
                         })
                         .unwrap_or_default();
+                    // "tab" column: the recorded pane's TabId when it still
+                    // exists (i.e. `Ctrl-O`/`Ctrl-I` would switch to it),
+                    // or "x" when that tab/split has since been closed and
+                    // this entry would fall back to reopening `file` (#674).
+                    let tab_str = if self
+                        .locate_jump_pane(entry.group_id, entry.tab_id, entry.window_id)
+                        .is_some()
+                    {
+                        entry.tab_id.0.to_string()
+                    } else {
+                        "x".to_string()
+                    };
                     lines.push(format!(
-                        "{} {:4}  {:4}  {:3}  {}",
+                        "{} {:4}  {:4}  {:3}  {:>3}  {}",
                         marker,
                         i,
-                        line + 1,
-                        col,
+                        entry.line + 1,
+                        entry.col,
+                        tab_str,
                         path_str
                     ));
                 }

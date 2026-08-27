@@ -110,6 +110,7 @@ impl Engine {
         // Remove window from windows map and any scroll-bind pairs that referenced it.
         let closed_buf_id = self.windows.get(&window_id).map(|w| w.buffer_id);
         self.windows.remove(&window_id);
+        self.prune_jump_list_windows(&[window_id]);
         self.scroll_bind_pairs
             .retain(|&(a, b)| a != window_id && b != window_id);
         if let Some((a, b)) = self.diff_window_pair.take() {
@@ -131,6 +132,7 @@ impl Engine {
                         }
                     }
                     self.windows.remove(&partner);
+                    self.prune_jump_list_windows(&[partner]);
                     self.scroll_bind_pairs
                         .retain(|&(x, y)| x != partner && y != partner);
                 }
@@ -185,6 +187,7 @@ impl Engine {
         tab.layout = WindowLayout::leaf(active_window_id);
 
         // Remove closed windows and any scroll-bind pairs referencing them.
+        self.prune_jump_list_windows(&windows_to_close);
         for id in windows_to_close {
             self.windows.remove(&id);
             self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
@@ -354,6 +357,8 @@ impl Engine {
             .filter_map(|wid| self.windows.get(wid).map(|w| w.buffer_id))
             .collect();
 
+        self.prune_jump_list_windows(&window_ids);
+
         // Remove all windows in this tab
         for window_id in &window_ids {
             self.windows.remove(window_id);
@@ -515,6 +520,7 @@ impl Engine {
             if let Some(g) = self.editor_groups.get(&group_id) {
                 let window_ids: Vec<WindowId> =
                     g.tabs.iter().flat_map(|t| t.window_ids()).collect();
+                self.prune_jump_list_windows(&window_ids);
                 for wid in window_ids {
                     self.windows.remove(&wid);
                 }
@@ -1621,6 +1627,97 @@ impl Engine {
         }
     }
 
+    // =======================================================================
+    // Jump list pane lookup (#674)
+    // =======================================================================
+
+    /// Find where a jump-list entry's pane now lives. Returns the
+    /// `(GroupId, tab index)` to activate, or `None` when the window itself
+    /// no longer exists (its tab or split was closed).
+    ///
+    /// Tolerates a tab that moved to a different editor group since the
+    /// jump was recorded (`move_tab_to_other_group`) by falling back to a
+    /// search across all groups — mirrors the reasoning in that function's
+    /// doc comment about `tab_mru`/`tab_nav_history` entries simply not
+    /// matching after a move rather than being misread.
+    pub(crate) fn locate_jump_pane(
+        &self,
+        group_id: GroupId,
+        tab_id: TabId,
+        window_id: WindowId,
+    ) -> Option<(GroupId, usize)> {
+        if !self.windows.contains_key(&window_id) {
+            return None;
+        }
+        let tab_has_window = |group: &EditorGroup| {
+            group
+                .tabs
+                .iter()
+                .position(|t| t.id == tab_id && t.window_ids().contains(&window_id))
+        };
+        if let Some(group) = self.editor_groups.get(&group_id) {
+            if let Some(idx) = tab_has_window(group) {
+                return Some((group_id, idx));
+            }
+        }
+        for (&gid, group) in &self.editor_groups {
+            if let Some(idx) = tab_has_window(group) {
+                return Some((gid, idx));
+            }
+        }
+        None
+    }
+
+    /// Switch to a specific pane (group/tab/window) located by
+    /// `locate_jump_pane`. Mirrors `tab_nav_switch_to`, but also focuses the
+    /// exact window (split) the jump was recorded in, not just the tab.
+    pub(crate) fn switch_to_jump_pane(
+        &mut self,
+        group_id: GroupId,
+        tab_idx: usize,
+        window_id: WindowId,
+    ) {
+        self.active_group = group_id;
+        self.active_group_mut().active_tab = tab_idx;
+        self.active_tab_mut().active_window = window_id;
+        self.line_annotations.clear();
+        self.blame_annotations_active = false;
+        self.tab_mru_touch();
+        self.lsp_ensure_active_buffer();
+        self.ensure_active_tab_visible();
+        self.explorer_reveal_active_file();
+    }
+
+    /// Drop jump-list entries whose window was just closed, re-clamping
+    /// `jump_list_pos` so it keeps pointing at the same logical entry (or
+    /// the nearest one) — mirrors the `tab_nav_history`/`tab_mru`
+    /// retain-and-clamp pattern used for tab close. Called from every path
+    /// that removes windows from `self.windows` (split close, tab close,
+    /// group close) so `Ctrl-O`/`Ctrl-I` skip dead entries instead of
+    /// reopening a closed file or panicking (#674).
+    pub(crate) fn prune_jump_list_windows(&mut self, removed: &[WindowId]) {
+        if removed.is_empty() || self.jump_list.is_empty() {
+            return;
+        }
+        let removed_set: std::collections::HashSet<WindowId> = removed.iter().copied().collect();
+        let old_pos = self.jump_list_pos;
+        let mut removed_before_pos = 0usize;
+        let mut kept = Vec::with_capacity(self.jump_list.len());
+        for (i, entry) in self.jump_list.iter().enumerate() {
+            if removed_set.contains(&entry.window_id) {
+                if i < old_pos {
+                    removed_before_pos += 1;
+                }
+                continue;
+            }
+            kept.push(entry.clone());
+        }
+        self.jump_list = kept;
+        self.jump_list_pos = old_pos
+            .saturating_sub(removed_before_pos)
+            .min(self.jump_list.len());
+    }
+
     /// Whether back navigation is available (across all editor groups).
     pub fn tab_nav_can_go_back(&self) -> bool {
         self.tab_nav_index > 0
@@ -2099,6 +2196,7 @@ impl Engine {
         if let Some(group) = self.editor_groups.get(&closing) {
             let window_ids: Vec<WindowId> =
                 group.tabs.iter().flat_map(|t| t.window_ids()).collect();
+            self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
             }
@@ -2327,6 +2425,7 @@ impl Engine {
         if let Some(group) = self.editor_groups.get(&group_id) {
             let window_ids: Vec<WindowId> =
                 group.tabs.iter().flat_map(|t| t.window_ids()).collect();
+            self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
             }
