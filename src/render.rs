@@ -12149,16 +12149,6 @@ pub fn resolve_status_bar_click(
 
 // ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────
 
-/// Build a `quadraui::TabBar` primitive from the render-level tab args.
-/// Shared by TUI and GTK backends — the primitive is layout-agnostic;
-/// backends interpret it against their own measurement / drawing models.
-///
-/// Right-side segment order (mirrors the pre-migration layout):
-/// `[diff label?] [diff prev] [diff next] [diff fold?] [split right] [split down] [action menu]`
-///
-/// `active_accent` carries the active-tab accent colour only when the group
-/// is focused. TUI interprets as underline; GTK as 2px top bar.
-/// `width_cells` on each segment is a TUI hint; GTK measures with Pango.
 /// The `WidgetId` every editor tab bar paints under.
 ///
 /// Backends cache a resolved `quadraui::TabBarLayout` per `WidgetId` at paint
@@ -12174,6 +12164,16 @@ pub fn resolve_status_bar_click(
 /// `App` side for production click routing.
 pub const EDITOR_TAB_BAR_WIDGET_ID: &str = "tabs:group";
 
+/// Build a `quadraui::TabBar` primitive from the render-level tab args.
+/// Shared by TUI and GTK backends — the primitive is layout-agnostic;
+/// backends interpret it against their own measurement / drawing models.
+///
+/// Right-side segment order (mirrors the pre-migration layout):
+/// `[diff label?] [diff prev] [diff next] [diff fold?] [split right] [split down] [action menu]`
+///
+/// `active_accent` carries the active-tab accent colour only when the group
+/// is focused. TUI interprets as underline; GTK as 2px top bar.
+/// `width_cells` on each segment is a TUI hint; GTK measures with Pango.
 pub fn build_tab_bar_primitive(
     tabs: &[TabInfo],
     show_split_btns: bool,

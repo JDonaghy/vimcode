@@ -71,7 +71,23 @@
 # Format: the first non-comment, non-blank line is a full 40-char quadraui SHA.
 # ---------------------------------------------------------------------------
 #
-# 3ad869a — "fix(quadraui#595): gate the sidebar_reveal examples on their
+# 5a418ca — "feat(quadraui#455): detect ModalStack entries registered but never
+# painted". Bumped by vimcode#659's smoke-retry: the sibling quadraui checkout
+# is shared between agents and had been moved forward onto `develop`, so a
+# build pinned at 3ad869a failed with QUADRAUI PIN MISMATCH in the smoke
+# worktree even though nothing in vimcode had changed. Only **two** quadraui
+# commits ride along in 3ad869a..5a418ca, both on `develop` and both additive:
+#
+#   * 659a30a — folder-picker keeps its "Confirmed:" line visible under long
+#     paths (painted chrome inside quadraui's own folder picker).
+#   * 5a418ca — quadraui#455 debug detection for `ModalStack` entries that are
+#     registered but never painted.
+#
+# Neither touches an API vimcode calls, and the full `cargo test` suite is
+# green on this rev. The #594 / #595 rationale for the original #659 bump is
+# unchanged and recorded immediately below.
+#
+# Previous pin: 3ad869a — "fix(quadraui#595): gate the sidebar_reveal examples on their
 # backend feature". Bumped by vimcode#659 to adopt the two helpers that were
 # *promoted out of this repo* into quadraui:
 #
@@ -98,7 +114,7 @@
 # commits both move painted chrome, so exercise tooltips and sidebar panel
 # clicks on a live display before treating this rev as settled.
 #
-# Previous pin: f6d27c2 — "fix(quadraui): address #552 review — downstream
+# Pin before that: f6d27c2 — "fix(quadraui): address #552 review — downstream
 # impact + dangling
 # test refs". Bumped by vimcode#650 to adopt quadraui#552, which pins the TUI
 # activity bar's hit regions to bar-relative space. Before it, the TUI
@@ -122,10 +138,10 @@
 # that file is a rustup per-directory override and quadraui is a *sibling*, not
 # an ancestor, of this checkout, so it does not move vimcode's toolchain.
 #
-# Pin before that: f702422 — "fix(quadraui): honour ShellConfig::
+# And before that: f702422 — "fix(quadraui): honour ShellConfig::
 # title_bar_height_lh regardless of has_title_bar (#547)". First rev carrying
 # every trait/API addition the open vimcode work depends on: quadraui#531
 # draw_settings_chrome, #532 AppShell::set_title_bar_visible, #533
 # draw_terminal_divider, #537 WinBackend parity, #545 char_cell_width, #547
 # title_bar_height_lh.
-3ad869a89f10bf324f6b9ead33f4ad6ce7d203b8
+5a418cac9f9a5cb5a8470a6bf011c4358a7f1704
