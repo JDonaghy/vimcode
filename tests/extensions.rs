@@ -2294,18 +2294,85 @@ fn gcc_is_undoable() {
 
 use vimcode_core::core::plugin::{PluginCallContext, PluginManager};
 
-fn plugin_with(code: &str) -> PluginManager {
-    let dir = std::env::temp_dir().join(format!(
-        "vc_git_api_test_{}",
-        code.len() // simple discriminator
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+/// A scratch plugin directory that is unique to this call.
+///
+/// This used to be keyed on `code.len()`, which is not a discriminator at all:
+/// two scripts of the same length share a directory. `git_api_stash_list_returns_table`
+/// and `git_api_blame_file_returns_table` both hashed to `vc_git_api_test_174`, so
+/// under cargo's parallel test threads one test's `remove_dir_all` could delete the
+/// other's `test.lua` in the window before `load_plugins_dir` read it. `read_dir`
+/// then fails silently (see `PluginManager::load_plugins_dir`), no command is
+/// registered, and the victim's `assert!(found)` panics — a harness race that reads
+/// like a real regression.
+///
+/// Keying on pid + a monotonic counter makes every call site its own directory, so
+/// no two tests can ever contend for one path.
+fn plugin_test_dir() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!(
+        "vc_git_api_test_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Load `code` as a one-file plugin, returning the manager and the scratch
+/// directory it was loaded from (so tests can assert on path uniqueness).
+fn plugin_with_dir(code: &str) -> (PluginManager, std::path::PathBuf) {
+    let dir = plugin_test_dir();
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("test.lua");
     std::fs::write(&path, code).unwrap();
     let mut pm = PluginManager::new().unwrap();
     pm.load_plugins_dir(&dir, &[]);
-    pm
+    // `load_plugins_dir` reads and executes eagerly, so the files are no longer
+    // needed once it returns — clean up rather than leaking a dir per call.
+    let _ = std::fs::remove_dir_all(&dir);
+    (pm, dir)
+}
+
+fn plugin_with(code: &str) -> PluginManager {
+    plugin_with_dir(code).0
+}
+
+#[test]
+fn plugin_with_uses_a_distinct_dir_for_same_length_scripts() {
+    // Regression guard for the flake described on `plugin_test_dir`. These two
+    // scripts are deliberately the same byte length — the exact condition that
+    // aliased two tests onto `/tmp/vc_git_api_test_174` and let one test's
+    // `remove_dir_all` race the other's `load_plugins_dir`.
+    //
+    // Against the old `code.len()` keying this assertion is deterministically
+    // red: both calls resolve to the identical path. Verified by reinstating
+    // the old scheme locally before committing.
+    let a = "vimcode.command(\"TestAaa\", function(_) vimcode.message(\"a\") end)";
+    let b = "vimcode.command(\"TestBbb\", function(_) vimcode.message(\"b\") end)";
+    assert_eq!(a.len(), b.len(), "fixture scripts must be the same length");
+
+    let (pm_a, dir_a) = plugin_with_dir(a);
+    let (pm_b, dir_b) = plugin_with_dir(b);
+    assert_ne!(
+        dir_a, dir_b,
+        "same-length scripts must not share a scratch dir"
+    );
+
+    // …and both plugins really did load from their own directory.
+    let (found_a, ctx_a) = pm_a.call_command("TestAaa", "", PluginCallContext::default());
+    assert!(found_a, "first plugin's command should be registered");
+    assert_eq!(ctx_a.message.as_deref(), Some("a"));
+
+    let (found_b, ctx_b) = pm_b.call_command("TestBbb", "", PluginCallContext::default());
+    assert!(found_b, "second plugin's command should be registered");
+    assert_eq!(ctx_b.message.as_deref(), Some("b"));
+}
+
+#[test]
+fn plugin_scratch_dirs_are_cleaned_up() {
+    // The old helper left one dir per distinct script length behind in /tmp;
+    // the unique-path scheme would leak one per call if we did not clean up.
+    let (_pm, dir) = plugin_with_dir("vimcode.command(\"TestTmp\", function(_) end)");
+    assert!(!dir.exists(), "scratch dir {dir:?} should be removed");
 }
 
 #[test]
