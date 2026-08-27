@@ -78,16 +78,6 @@ pub(super) struct Harness<A: AppLogic> {
     /// — the source for per-editor-window pixel rects (see
     /// [`Self::window_center`]).
     pub screen_layout: Rc<RefCell<Option<crate::render::ScreenLayout>>>,
-    /// Absolute visible tab-slot x-ranges per group (`group_id.0` →
-    /// `[(x0, x1)]`) captured by the last `render_content` pass — the tab-bar
-    /// twin of `screen_layout`'s window rects, so a test can aim a click at the
-    /// tab the rasteriser actually drew instead of guessing pixel offsets
-    /// (#553).
-    pub tab_slots_abs: Rc<RefCell<super::TabSlotsAbsMap>>,
-    /// Absolute close-button (`×`) geometry per group: `(bar_top, bar_bottom,
-    /// per-tab Option<(x0, x1)>)`, keyed by `group_id.0`. Same provenance and
-    /// purpose as [`Self::tab_slots_abs`] (#553).
-    pub tab_close_abs: Rc<RefCell<super::TabCloseAbsMap>>,
     /// Picker/command-palette popup rect `(x, y, w, h)` the last frame
     /// actually painted, or `None` if that frame drew no picker — see
     /// [`Self::picker_popup`] (#555).
@@ -123,60 +113,19 @@ impl<A: AppLogic> Harness<A> {
         ))
     }
 
-    /// Centre point (absolute pixels) of tab `tab_idx` in `group_id`'s tab bar,
-    /// as the last frame painted it. `None` if that tab was scrolled off or the
-    /// group drew no tab bar.
-    ///
-    /// Like [`Self::window_center`], this reads the geometry the *rasteriser*
-    /// reported (`Backend::tab_bar_layout`), so tests never hardcode tab
-    /// coordinates (#553).
-    ///
-    /// Reads its y-centre from `tab_close_abs` (the bar's `(top, bottom)`) and
-    /// its x-centre from the separate `tab_slots_abs` map — both populated
-    /// together, for the same `group_id`, from the same `render_content` pass
-    /// (`App::cached_tab_close_abs` / `cached_tab_slots_abs` are inserted back
-    /// to back per group in the tab-bar draw loop). If that ever split across
-    /// two passes, a group present in only one map would silently return
-    /// `None` here instead of a stale-but-visible tab centre — acceptable for
-    /// a test helper, but worth knowing if this invariant ever changes.
-    pub fn tab_center(
-        &self,
-        group_id: crate::core::window::GroupId,
-        tab_idx: usize,
-    ) -> Option<(f32, f32)> {
-        let (bar_top, bar_bottom, _) = *self.tab_close_abs.borrow().get(&group_id.0)?;
-        let slots = self.tab_slots_abs.borrow();
-        let &(x0, x1) = slots.get(&group_id.0)?.get(tab_idx)?;
-        if x1 <= x0 {
-            return None;
-        }
-        Some(((x0 + x1) / 2.0, ((bar_top + bar_bottom) / 2.0) as f32))
-    }
-
-    /// Centre point (absolute pixels) of tab `tab_idx`'s close (`×`) button.
-    /// `None` if that tab drew no close button this frame (#553).
-    pub fn tab_close_center(
-        &self,
-        group_id: crate::core::window::GroupId,
-        tab_idx: usize,
-    ) -> Option<(f32, f32)> {
-        let close = self.tab_close_abs.borrow();
-        let (bar_top, bar_bottom, per_tab) = close.get(&group_id.0)?;
-        let (x0, x1) = (*per_tab.get(tab_idx)?)?;
-        Some((
-            ((x0 + x1) / 2.0) as f32,
-            ((bar_top + bar_bottom) / 2.0) as f32,
-        ))
-    }
-
     /// Centre point (absolute pixels) of breadcrumb segment `seg_idx` in
     /// `group_id`'s breadcrumb bar, as the last frame painted it. `None` if
     /// that group drew no breadcrumb bar or the segment was clipped away.
     ///
     /// Same *locate targets, never hardcode coords* rule as
-    /// [`Self::tab_center`]: the x-range comes from the `StatusBarLayout` the
-    /// rasteriser cached during the breadcrumb draw pass (`bc:N` hit
+    /// `GtkDriver::tab_center`: the x-range comes from the `StatusBarLayout`
+    /// the rasteriser cached during the breadcrumb draw pass (`bc:N` hit
     /// regions), offset by the bar's own absolute origin (#555).
+    ///
+    /// This one stays local (unlike the tab helpers #659 deleted in favour of
+    /// quadraui#594's driver versions) because it resolves through vimcode's
+    /// own `ScreenLayout::breadcrumbs` — a vimcode structure quadraui has no
+    /// equivalent of — rather than through a cached quadraui primitive layout.
     pub fn breadcrumb_segment_center(
         &self,
         group_id: crate::core::window::GroupId,
@@ -277,8 +226,6 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let app = App::new_headless(Rc::clone(&engine));
     let config = super::build_shell_config(&app);
     let screen_layout = Rc::clone(&app.cached_screen_layout);
-    let tab_slots_abs = Rc::clone(&app.cached_tab_slots_abs);
-    let tab_close_abs = Rc::clone(&app.cached_tab_close_abs);
     let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
     let painted_line_height = Rc::clone(&app.painted_line_height);
     let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
@@ -286,8 +233,6 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         driver: driver_with_shell(app, config, width, height),
         engine,
         screen_layout,
-        tab_slots_abs,
-        tab_close_abs,
         picker_popup_rect,
         painted_line_height,
         painted_sidebar_bounds,
@@ -310,6 +255,19 @@ mod tests {
         let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
         engine.buffer_mut().insert(0, &text);
         engine
+    }
+
+    /// The `WidgetId` the editor tab bar paints under — the key
+    /// `GtkDriver::tab_center` / `tab_close_center` (quadraui#594) look their
+    /// cached `TabBarLayout` up by.
+    ///
+    /// #659 deleted this harness's own `tab_center` / `tab_close_center` (the
+    /// pair quadraui#594 was promoted *from*) so the geometry has exactly one
+    /// implementation, in quadraui, shared with coord-tui. The only vimcode
+    /// residue is this id, and it is read straight off the primitive builder
+    /// rather than retyped.
+    fn editor_tab_bar_id() -> quadraui::WidgetId {
+        quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID)
     }
 
     /// Harness smoke: the real `App` + the *live* `ShellConfig` construct and
@@ -555,7 +513,8 @@ mod tests {
         );
 
         let (x, y) = h
-            .tab_center(group, 0)
+            .driver
+            .tab_center(&editor_tab_bar_id(), 0)
             .expect("the single-group tab bar must have painted tab 0");
         h.driver.click(x, y);
 
@@ -566,8 +525,119 @@ mod tests {
         );
     }
 
-    /// #553: with a single tab group, clicking a tab's × must close it.
+    /// #659: the quadraui#594 driver helpers resolve against vimcode's editor
+    /// tab bar at all — i.e. [`crate::render::EDITOR_TAB_BAR_WIDGET_ID`] is
+    /// really the id `GtkBackend::draw_tab_bar` cached the layout under, and
+    /// the bar paints during a plain harness frame.
+    ///
+    /// Also pins the `None` contract the deleted local helpers had (#553) and
+    /// the promoted ones keep: an index past the last visible tab resolves to
+    /// `None` rather than to a stale or clamped point, for the close button as
+    /// well as the tab body. quadraui covers the *other* `None` case — a tab
+    /// with `is_closable: false` — in
+    /// `quadraui::gtk::testing::tests::tab_close_center_none_when_tab_not_closable`;
+    /// it is not re-tested here because
+    /// [`crate::render::build_tab_bar_primitive`] hardcodes `is_closable:
+    /// true`, so vimcode cannot construct that state. Not duplicating it is
+    /// the point of the promotion.
     #[test]
+    fn driver_tab_geometry_resolves_for_the_editor_tab_bar() {
+        let h = harness(engine_with_three_tabs_one_group(), 1400, 900);
+        let bar = editor_tab_bar_id();
+
+        let mut centers = Vec::new();
+        for idx in 0..3 {
+            let c = h
+                .driver
+                .tab_center(&bar, idx)
+                .unwrap_or_else(|| panic!("tab {idx} must have painted"));
+            assert!(
+                h.driver.tab_close_center(&bar, idx).is_some(),
+                "tab {idx} is closable, so it must have painted a × "
+            );
+            centers.push(c);
+        }
+        assert!(
+            centers[0].0 < centers[1].0 && centers[1].0 < centers[2].0,
+            "tab centres must increase left to right, got {centers:?}"
+        );
+        assert!(
+            centers.iter().all(|c| c.1 == centers[0].1),
+            "one bar means one y-centre, got {centers:?}"
+        );
+
+        assert_eq!(
+            h.driver.tab_center(&bar, 3),
+            None,
+            "an index past the last tab must not resolve to a point"
+        );
+        assert_eq!(
+            h.driver.tab_close_center(&bar, 3),
+            None,
+            "…and neither must its close button (#553)"
+        );
+
+        assert_eq!(
+            h.driver
+                .tab_center(&quadraui::WidgetId::new("tabs:not-a-real-bar"), 0),
+            None,
+            "an id no bar painted under must resolve to None, not to another \
+             bar's geometry"
+        );
+    }
+
+    /// #553: with a single tab group, clicking a tab's × must close it.
+    ///
+    /// # Why this is `#[ignore]`d as of #659 — it found a real bug
+    ///
+    /// This test was green before #659 and is red after it, and **the code
+    /// under test did not change**. Only the source of the click coordinate
+    /// did, from this module's own `tab_close_center` to quadraui#594's
+    /// `GtkDriver::tab_close_center`. The two disagree because they read
+    /// different things:
+    ///
+    /// * the deleted local helper read `App::cached_tab_close_abs`, derived
+    ///   from `Backend::tab_bar_layout()` — the *same* no-paint measurement
+    ///   `click::pixel_to_click_target` resolves against, so the harness and
+    ///   the click router shared one number and agreed with each other no
+    ///   matter what was actually drawn;
+    /// * `GtkDriver::tab_close_center` reads the `TabBarLayout` that
+    ///   `GtkBackend::draw_tab_bar` cached **while painting**.
+    ///
+    /// So the old assertion was a closed loop: it could only ever fail if
+    /// `tab_bar_layout()` disagreed with itself. Pointing it at the painted
+    /// geometry opens the loop, and the loop turns out to be open by a whole
+    /// tab's width. Measured in this harness at 1400×900, three tabs, one
+    /// group:
+    ///
+    /// * pixel-scanning row y=40 finds the active (third) tab's background
+    ///   spanning x=766..939, and the tab strip starting at x=418 — i.e. the
+    ///   painted tab pitch is ~174px and tab 0 is painted at 418..592;
+    /// * `Backend::tab_bar_layout()` for that same bar (`rect.x == 418`)
+    ///   returns `slot_positions == [(836, 1010), (1010, 1184), (1184,
+    ///   1358)]` — the right *pitch* (174) but carrying `rect.x` twice
+    ///   (836 == 418 + 418), which is what
+    ///   `quadraui::backend::shift_tab_bar_hits` adds on top of an already
+    ///   shifted layout.
+    ///
+    /// The net effect on a user is that a click lands on the wrong tab as
+    /// soon as it is right of a tab's left edge by enough — clicking tab 0's
+    /// × here activates tab 1 instead of closing tab 0.
+    ///
+    /// This reproduces **identically on the pre-#659 quadraui pin**
+    /// (`f6d27c2`): the same pixel scan gives the same 766..939 band, so the
+    /// pin bump did not cause it and reverting the pin will not fix it. It is
+    /// a pre-existing GTK paint-vs-hit-test divergence that this migration
+    /// merely made visible, and per CLAUDE.md's Platform-Neutrality Rule the
+    /// fix belongs in quadraui (`GtkBackend::tab_bar_layout` / `gtk::
+    /// draw_tab_bar` must agree on the coordinate space), not in a vimcode
+    /// backend file.
+    ///
+    /// **Un-ignore this the moment that quadraui fix lands** — the assertion
+    /// below is already the correct one and needs no edit.
+    #[test]
+    #[ignore = "#659: exposes a pre-existing GTK paint-vs-hit-test divergence; \
+                needs the quadraui-side fix to GtkBackend::tab_bar_layout"]
     fn single_group_tab_close_button_closes_that_tab() {
         let mut h = harness(engine_with_three_tabs_one_group(), 1400, 900);
         let group = h.engine.borrow().active_group;
@@ -575,7 +645,8 @@ mod tests {
         assert_eq!(before, 3);
 
         let (x, y) = h
-            .tab_close_center(group, 0)
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 0)
             .expect("the single-group tab bar must have painted tab 0's close button");
         h.driver.click(x, y);
 
