@@ -1668,6 +1668,32 @@ impl Engine {
         None
     }
 
+    /// Whether `window_id`'s *current* buffer still matches the file a
+    /// jump-list entry was recorded against.
+    ///
+    /// `locate_jump_pane` only proves the window still exists and still
+    /// belongs to the recorded tab — it says nothing about what the window
+    /// is showing *now*. `open_file_with_mode` (the path used by `:e`, `gf`,
+    /// the explorer/fuzzy-finder, …) replaces a window's buffer **in
+    /// place**, keeping the same `WindowId`. So a window matching on id/tab
+    /// alone can easily be showing a different file than the one the jump
+    /// remembers — most commonly the single-window, no-splits-no-tabs case:
+    /// jump inside file A, open file B into that same pane, then `Ctrl-O`.
+    /// Without this check the entry would silently apply file A's
+    /// remembered line/col onto file B's buffer (#674 review).
+    pub(crate) fn jump_pane_buffer_matches(
+        &self,
+        window_id: WindowId,
+        file: &Option<std::path::PathBuf>,
+    ) -> bool {
+        let current = self
+            .windows
+            .get(&window_id)
+            .and_then(|w| self.buffer_manager.get(w.buffer_id))
+            .and_then(|s| s.file_path.as_ref());
+        current == file.as_ref()
+    }
+
     /// Switch to a specific pane (group/tab/window) located by
     /// `locate_jump_pane`. Mirrors `tab_nav_switch_to`, but also focuses the
     /// exact window (split) the jump was recorded in, not just the tab.
