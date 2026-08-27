@@ -17034,6 +17034,121 @@ fn test_close_across_two_groups_picks_correct_successor_per_group() {
     );
 }
 
+#[test]
+fn test_close_tab_at_active_tab_of_unfocused_group_uses_own_mru_successor() {
+    // Right-click "Close" on the *active* tab of a background (unfocused)
+    // split group must route through `close_active_tab_of_background_group`,
+    // not `close_tab` (`close_tab` only ever closes `self.active_group`'s own
+    // active tab). It must (a) never move global focus or touch the focused
+    // group's own active tab, and (b) pick its successor from that
+    // background group's own MRU stack. This reuses the same non-adjacent
+    // repro as `test_close_tab_picks_mru_successor_not_positional_neighbour`
+    // so the MRU -- not adjacency -- is what's actually discriminating.
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new(); // group1: X, idx 0
+    engine.new_tab(None); // A, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+    engine.goto_tab(1); // active = A
+    let a_id = engine.active_tab().id;
+    let group1 = engine.active_group;
+
+    engine.new_tab(None); // B, idx 4, active
+    engine.new_tab(None); // C, idx 5, active
+    assert_eq!(engine.active_group().tabs.len(), 6);
+
+    // Split off a second group and focus it. group1 is now the background
+    // group; nothing from here on touches group1's MRU (tab_mru_touch only
+    // ever records `self.active_group`).
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group2 = engine.active_group;
+    assert_ne!(group1, group2);
+    let focused_active_before = engine.active_tab().id; // group2's only tab, P
+
+    // Right-click close on group1's active tab (C) while group2 is focused.
+    let closed = engine.close_tab_at(group1, 5);
+    assert!(closed);
+    assert_eq!(
+        engine.active_group, group2,
+        "closing a background group's active tab must not move global focus"
+    );
+    assert_eq!(
+        engine.active_tab().id,
+        focused_active_before,
+        "the focused group's own active tab must be untouched"
+    );
+    assert_eq!(engine.editor_groups[&group1].tabs.len(), 5);
+    let g1_active_idx = engine.editor_groups[&group1].active_tab;
+
+    // Close again: group1's active tab is now B. The MRU-correct successor
+    // is A (active before B/C were opened); positional adjacency alone
+    // would instead land on Z.
+    let closed2 = engine.close_tab_at(group1, g1_active_idx);
+    assert!(closed2);
+    assert_eq!(
+        engine.active_group, group2,
+        "second background close must also not move global focus"
+    );
+    assert_eq!(engine.active_tab().id, focused_active_before);
+    let g1 = &engine.editor_groups[&group1];
+    assert_eq!(g1.tabs.len(), 4);
+    assert_eq!(
+        g1.tabs[g1.active_tab].id, a_id,
+        "background group's active-tab close must pick its own MRU \
+         successor (A), not positional adjacency (which would land on Z)"
+    );
+}
+
+#[test]
+fn test_close_tab_at_last_tab_of_unfocused_group_removes_whole_group() {
+    // Right-click "Close" on the active tab of a background group that is
+    // down to its last tab must remove the whole group -- mirroring
+    // `close_editor_group`'s single-tab-group fallback -- without touching
+    // global focus, and must prune that group's tab_mru/tab_nav_history
+    // entries so a stale group id can never surface as a successor later.
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new();
+    let group1 = engine.active_group;
+    // Touch nav history / MRU for group1 before splitting so we can assert
+    // they're pruned once the group is gone.
+    engine.goto_tab(0);
+    assert!(engine.tab_nav_history.iter().any(|&(g, _)| g == group1));
+    assert!(engine.tab_mru.iter().any(|&(g, _)| g == group1));
+
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group2 = engine.active_group;
+    assert_ne!(group1, group2);
+    let focused_active_before = engine.active_tab().id;
+
+    assert_eq!(engine.editor_groups[&group1].tabs.len(), 1);
+    let closed = engine.close_tab_at(group1, 0);
+    assert!(closed);
+
+    assert!(
+        !engine.editor_groups.contains_key(&group1),
+        "closing the last tab of a background group must remove the whole group"
+    );
+    assert_eq!(
+        engine.active_group, group2,
+        "removing a background group must not move global focus"
+    );
+    assert_eq!(
+        engine.active_tab().id,
+        focused_active_before,
+        "the focused group's own active tab must be untouched"
+    );
+    assert!(
+        engine.tab_mru.iter().all(|&(g, _)| g != group1),
+        "tab_mru must be pruned of the removed group's entries"
+    );
+    assert!(
+        engine.tab_nav_history.iter().all(|&(g, _)| g != group1),
+        "tab_nav_history must be pruned of the removed group's entries"
+    );
+}
+
 // ── Git branch picker tests ─────────────────────────────────────────────────
 
 #[test]
