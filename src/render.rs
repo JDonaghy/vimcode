@@ -8278,11 +8278,21 @@ pub fn build_activity_bar(
     active_ext_panel: Option<&str>,
 ) -> quadraui::ActivityBar {
     use crate::core::engine::sidebar::{
-        PANEL_AI, PANEL_DEBUG, PANEL_EXPLORER, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH,
-        PANEL_SETTINGS,
+        ext_panel_id, HAMBURGER_PANEL_ID, PANEL_AI, PANEL_DEBUG, PANEL_EXPLORER, PANEL_EXTENSIONS,
+        PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
     };
 
-    let kbd_sel = |idx: u16| engine.activity_bar_focused && engine.activity_bar_selected == idx;
+    // #536: the keyboard ring is matched by *panel id*, not by re-deriving each
+    // item's numeric toolbar index at the paint site. `Engine` owns the single
+    // index↔id table (`activity_bar_item_id`), and the stepping itself is
+    // quadraui's `AppShell` cursor (quadraui#386) — so the painted order and
+    // the navigable order cannot drift apart here.
+    let kbd_sel_id = if engine.activity_bar_focused {
+        engine.activity_bar_selected_item_id()
+    } else {
+        None
+    };
+    let kbd_sel = |panel_id: &str| kbd_sel_id.as_deref() == Some(panel_id);
     let sb_visible = engine.app_shell.sidebar_visible();
     let has_ext = active_ext_panel.is_some();
     let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
@@ -8291,54 +8301,42 @@ pub fn build_activity_bar(
 
     if include_hamburger {
         top.push(quadraui::ActivityItem {
-            id: quadraui::WidgetId::new("activity:menu"),
+            id: quadraui::WidgetId::new(HAMBURGER_PANEL_ID),
             icon: icons::HAMBURGER.s().to_string(),
             tooltip: "Menu".to_string(),
             is_active: false,
-            is_keyboard_selected: kbd_sel(0),
+            is_keyboard_selected: kbd_sel(HAMBURGER_PANEL_ID),
         });
     }
 
-    // (toolbar_idx, panel_id, icon, tooltip, activity_id)
-    // Toolbar-keyboard selection indices:
-    //   0 = hamburger (TUI only), 1-6 = fixed panels, 7 = settings, 8+ = ext panels.
-    let fixed: [(u16, &str, &str, &str, &str); 6] = [
+    // (panel_id, icon, tooltip, activity_id)
+    let fixed: [(&str, &str, &str, &str); 6] = [
         (
-            1,
             PANEL_EXPLORER,
             icons::EXPLORER.s(),
             "Explorer (Ctrl+Shift+E)",
             "activity:explorer",
         ),
         (
-            2,
             PANEL_SEARCH,
             icons::SEARCH.s(),
             "Search (Ctrl+Shift+F)",
             "activity:search",
         ),
-        (3, PANEL_DEBUG, icons::DEBUG.s(), "Debug", "activity:debug"),
+        (PANEL_DEBUG, icons::DEBUG.s(), "Debug", "activity:debug"),
         (
-            4,
             PANEL_GIT,
             icons::GIT_BRANCH.s(),
             "Source Control",
             "activity:git",
         ),
         (
-            5,
             PANEL_EXTENSIONS,
             icons::EXTENSIONS.s(),
             "Extensions",
             "activity:extensions",
         ),
-        (
-            6,
-            PANEL_AI,
-            icons::AI_CHAT.s(),
-            "AI Assistant",
-            "activity:ai",
-        ),
+        (PANEL_AI, icons::AI_CHAT.s(), "AI Assistant", "activity:ai"),
     ];
 
     // #635 (Stage 6b): `tui_main::shell_app::TuiShellApp::shell_config` derives
@@ -8349,34 +8347,34 @@ pub fn build_activity_bar(
     // apart: a reordering here without updating the shared constant now trips
     // in any test that exercises `build_activity_bar` (every one does).
     debug_assert_eq!(
-        fixed.map(|(_, panel_id, _, _, _)| panel_id),
+        fixed.map(|(panel_id, _, _, _)| panel_id),
         crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS,
         "build_activity_bar's `fixed` panel-id order must match \
          sidebar::FIXED_ACTIVITY_PANEL_IDS"
     );
 
-    for (toolbar_idx, panel_id, icon, tooltip, activity_id) in fixed {
+    for (panel_id, icon, tooltip, activity_id) in fixed {
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(activity_id),
             icon: icon.to_string(),
             tooltip: tooltip.to_string(),
             is_active: sb_visible && !has_ext && active_id == Some(panel_id),
-            is_keyboard_selected: kbd_sel(toolbar_idx),
+            is_keyboard_selected: kbd_sel(panel_id),
         });
     }
 
-    // Dynamic extension panels (sorted by name; toolbar indices 8+).
+    // Dynamic extension panels, sorted by name — the same order
+    // `Engine::ext_activity_panels` (and therefore the keyboard ring) uses.
     let mut ext_panels: Vec<_> = engine.ext_panels.values().collect();
     ext_panels.sort_by(|a, b| a.name.cmp(&b.name));
-    for (i, panel) in ext_panels.iter().enumerate() {
-        let toolbar_idx = 8 + i as u16;
+    for panel in ext_panels.iter() {
         let is_active = sb_visible && active_ext_panel == Some(panel.name.as_str());
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
             icon: panel.resolved_icon().to_string(),
             tooltip: panel.title.clone(),
             is_active,
-            is_keyboard_selected: kbd_sel(toolbar_idx),
+            is_keyboard_selected: kbd_sel(&ext_panel_id(&panel.name)),
         });
     }
 
@@ -8385,7 +8383,7 @@ pub fn build_activity_bar(
         icon: icons::SETTINGS.s().to_string(),
         tooltip: "Settings".to_string(),
         is_active: sb_visible && !has_ext && active_id == Some(PANEL_SETTINGS),
-        is_keyboard_selected: kbd_sel(7),
+        is_keyboard_selected: kbd_sel(PANEL_SETTINGS),
     }];
 
     quadraui::ActivityBar {
