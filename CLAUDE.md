@@ -147,6 +147,36 @@ the older stable too, so you don't accidentally raise the MSRV.
 - Tests in `#[cfg(test)] mod tests` at file bottom
 
 ## Testing (CRITICAL)
+
+### Black-box coverage is the acceptance bar (MANDATORY)
+
+**Every PR that changes user-visible behaviour must ship a black-box test that drives the
+running app and asserts on its rendered output.** Both backends have a driver — there is no
+"no harness here" excuse:
+
+| Backend | Driver | Where the test goes |
+|---|---|---|
+| TUI | quadraui `TuiDriver` (ratatui `TestBackend`) | **in-crate**, `#[cfg(test)]`, reusing the existing `make_test_app` / `make_app_with_*` fixtures |
+| GTK | `GtkDriver` (`src/gtk/testing.rs`, harness from #646) | in-crate; paints into in-memory Cairo `ImageSurface`s, headless |
+
+Pure refactors and internal-only changes are exempt — **say so in the PR** if that applies.
+The adversarial reviewer reads this file and **rejects** behaviour-changing PRs that lack one.
+
+**Two rules that exist because they were learned the expensive way:**
+
+1. **Assert on rendered output — never on state being populated.** `ScreenLayout.picker` was
+   populated on GTK for months while nothing painted it; the symptom read as an input bug and
+   burned ~5 sessions before #587 found it was paint, and #592 then found 13 more fields in the
+   same state. A test asserting the field is `Some` passes against the bug. Locate targets with
+   `find` / `screen_contains`, or probe pixels when the content is icon glyphs (#555) — never
+   hardcode coordinates.
+2. **State in the PR that the new test fails against unfixed `develop`.** #553 shipped
+   black-box tests that stayed green with the bug reinstated. A test that cannot fail is not
+   coverage. Remove the fix, re-run, confirm red, restore — then say so in the PR.
+
+If the change touches a surface both backends render, the multi-backend rule above applies to
+the tests too: cover both.
+
 - **Full test suite:** `cargo test` (default features, GUI on) — lib + integration tests + the `vimcode` bin's GTK/render unit tests
 - **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only
 
