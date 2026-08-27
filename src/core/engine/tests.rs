@@ -9261,21 +9261,27 @@ fn test_norm_undo_single_group() {
 #[test]
 fn test_fuzzy_score_empty_query() {
     // Empty query always matches with score 0
-    assert_eq!(Engine::fuzzy_score("src/main.rs", ""), Some(0));
-    assert_eq!(Engine::fuzzy_score("anything", ""), Some(0));
+    assert_eq!(
+        quadraui::text_util::fuzzy_score("src/main.rs", "").map(|(s, _)| s),
+        Some(0)
+    );
+    assert_eq!(
+        quadraui::text_util::fuzzy_score("anything", "").map(|(s, _)| s),
+        Some(0)
+    );
 }
 
 #[test]
 fn test_fuzzy_score_no_match() {
     // Query chars not present as subsequence → None
-    assert_eq!(Engine::fuzzy_score("src/main.rs", "xyz"), None);
-    assert_eq!(Engine::fuzzy_score("foo.rs", "bar"), None);
+    assert!(quadraui::text_util::fuzzy_score("src/main.rs", "xyz").is_none());
+    assert!(quadraui::text_util::fuzzy_score("foo.rs", "bar").is_none());
 }
 
 #[test]
 fn test_fuzzy_score_exact() {
     // Exact prefix should score positively
-    let score = Engine::fuzzy_score("engine.rs", "engine");
+    let score = quadraui::text_util::fuzzy_score("engine.rs", "engine").map(|(s, _)| s);
     assert!(score.is_some());
     assert!(score.unwrap() > 0);
 }
@@ -9284,8 +9290,12 @@ fn test_fuzzy_score_exact() {
 fn test_fuzzy_score_consecutive_bonus() {
     // Consecutive matches incur no gap penalty; widely scattered matches do.
     // Use paths without underscores to avoid word-boundary bonus interference.
-    let consecutive = Engine::fuzzy_score("abcdef.rs", "abc").unwrap();
-    let scattered = Engine::fuzzy_score("aXXbXXc.rs", "abc").unwrap();
+    let consecutive = quadraui::text_util::fuzzy_score("abcdef.rs", "abc")
+        .unwrap()
+        .0;
+    let scattered = quadraui::text_util::fuzzy_score("aXXbXXc.rs", "abc")
+        .unwrap()
+        .0;
     assert!(
         consecutive >= scattered,
         "consecutive={} scattered={}",
@@ -9569,18 +9579,18 @@ fn test_picker_commands_source() {
 #[test]
 fn test_fuzzy_score_with_positions() {
     // Exact prefix
-    let result = Engine::fuzzy_score_with_positions("src/main.rs", "main");
+    let result = quadraui::text_util::fuzzy_score("src/main.rs", "main");
     assert!(result.is_some());
     let (score, positions) = result.unwrap();
     assert!(score > 0);
     assert_eq!(positions.len(), 4);
 
     // No match
-    let result = Engine::fuzzy_score_with_positions("src/main.rs", "xyz");
+    let result = quadraui::text_util::fuzzy_score("src/main.rs", "xyz");
     assert!(result.is_none());
 
     // Empty query
-    let result = Engine::fuzzy_score_with_positions("anything", "");
+    let result = quadraui::text_util::fuzzy_score("anything", "");
     assert!(result.is_some());
     let (score, positions) = result.unwrap();
     assert_eq!(score, 0);
