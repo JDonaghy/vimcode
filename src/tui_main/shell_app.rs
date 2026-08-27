@@ -6637,4 +6637,134 @@ mod tests {
             driver.screen()
         );
     }
+
+    /// #673 black-box regression: closing a tab must activate the MRU
+    /// successor, not whatever tab is positionally adjacent to the closed
+    /// slot. Read through the *rendered* tab bar (not just engine state) so
+    /// the test proves what the user actually sees.
+    ///
+    /// The naive repro ([A, B, C], close C then B => A) passes by adjacency
+    /// accident even with the bug fully present (see the issue), so this
+    /// uses a non-adjacent prior tab: tabs [W, X, A, Y, Z], active pinned to
+    /// A, then open B and C (both far from A) and close them in turn. The
+    /// MRU-correct successor is A; pure positional adjacency lands on Z.
+    ///
+    /// The active tab is distinguished in the tab bar only by background
+    /// colour (`theme.tab_active_bg` vs `theme.tab_bar_bg` — see
+    /// `quadraui::tui::tab_bar::draw_tab_bar`'s doc comment), not by any
+    /// text difference, so this reads `style_at` on the resolved tab-label
+    /// cell rather than scanning `screen()` for a marker.
+    #[test]
+    fn close_tab_after_close_reactivates_mru_tab_not_positional_neighbour() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_close_tab_673_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str| -> std::path::PathBuf {
+            let p = dir.join(name);
+            std::fs::write(&p, "content").unwrap();
+            p
+        };
+        let tab_w = make("tab_w.txt");
+        let tab_x = make("tab_x.txt");
+        let tab_a = make("tab_a.txt");
+        let tab_y = make("tab_y.txt");
+        let tab_z = make("tab_z.txt");
+        let tab_b = make("tab_b.txt");
+        let tab_c = make("tab_c.txt");
+
+        let mut app = TuiShellApp::new(None);
+        // Tabs open in order after the pre-existing [No Name] tab:
+        // [No Name], W, X, A, Y, Z.
+        app.engine.new_tab(Some(&tab_w));
+        app.engine.new_tab(Some(&tab_x));
+        app.engine.new_tab(Some(&tab_a));
+        app.engine.new_tab(Some(&tab_y));
+        app.engine.new_tab(Some(&tab_z));
+
+        // Pin the active tab to A — not adjacent to where B/C will land.
+        let a_idx = app
+            .engine
+            .active_group()
+            .tabs
+            .iter()
+            .position(|t| {
+                app.engine
+                    .windows
+                    .get(&t.active_window)
+                    .and_then(|w| app.engine.buffer_manager.get(w.buffer_id))
+                    .and_then(|s| s.file_path.as_ref())
+                    == Some(&tab_a)
+            })
+            .expect("tab_a.txt should be open");
+        app.engine.goto_tab(a_idx);
+
+        app.engine.new_tab(Some(&tab_b));
+        app.engine.new_tab(Some(&tab_c));
+
+        // Close C then B — the buggy adjacency-only logic lands on Z here;
+        // the MRU-aware fix lands back on A.
+        assert!(app.engine.close_tab());
+        assert!(app.engine.close_tab());
+
+        let driver = driver_with_shell(app, config(), 200, 24);
+        let screen = driver.screen();
+
+        // Only B and C were closed — X, A, Y, Z all remain in the tab bar
+        // throughout; this test is about which one is *active*, not which
+        // ones survive.
+        assert!(
+            driver.find_bounds("tab_b.txt").is_none(),
+            "tab_b.txt should have been closed; screen:\n{screen}"
+        );
+        assert!(
+            driver.find_bounds("tab_c.txt").is_none(),
+            "tab_c.txt should have been closed; screen:\n{screen}"
+        );
+
+        let a_bounds = driver
+            .find_bounds("tab_a.txt")
+            .unwrap_or_else(|| panic!("tab_a.txt should still be open; screen:\n{screen}"));
+        let x_bounds = driver
+            .find_bounds("tab_x.txt")
+            .unwrap_or_else(|| panic!("tab_x.txt should still be open; screen:\n{screen}"));
+        let z_bounds = driver
+            .find_bounds("tab_z.txt")
+            .unwrap_or_else(|| panic!("tab_z.txt should still be open; screen:\n{screen}"));
+
+        let a_style = driver
+            .style_at(a_bounds.x as u16, a_bounds.y as u16)
+            .expect("a_bounds should be on-screen");
+        // tab_x.txt is never touched after its initial open, so it is
+        // guaranteed inactive throughout — the reference "inactive" style.
+        // Comparing A only against Z (the buggy answer) would pass either
+        // way the bug resolves (whichever one is active simply differs
+        // from the other) — see #553 on tests that pass regardless of the
+        // bug. Anchoring on a third, definitely-inactive tab breaks that
+        // symmetry: A must differ from it (A is active) and Z must match
+        // it (Z is *not* active, unlike what the adjacency bug would do).
+        let x_style = driver
+            .style_at(x_bounds.x as u16, x_bounds.y as u16)
+            .expect("x_bounds should be on-screen");
+        let z_style = driver
+            .style_at(z_bounds.x as u16, z_bounds.y as u16)
+            .expect("z_bounds should be on-screen");
+        assert_ne!(
+            a_style.bg, x_style.bg,
+            "tab_a.txt must be painted with the active-tab background — \
+             the MRU successor after closing C then B is A; screen:\n{screen}"
+        );
+        assert_eq!(
+            z_style.bg, x_style.bg,
+            "tab_z.txt must NOT be painted as active — that's the wrong \
+             answer pure positional adjacency would pick; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

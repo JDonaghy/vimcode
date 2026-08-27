@@ -16841,6 +16841,199 @@ fn test_tab_nav_cross_group() {
     assert!(reached_group2, "forward nav should cross groups");
 }
 
+// ── #673: close-tab MRU successor ───────────────────────────────────────────
+//
+// `Engine::close_tab` used to pick the next active tab by index arithmetic
+// alone: whatever tab shifted into the closed slot became active. The
+// `tab_mru` stack was maintained on every activation but never consulted.
+// These tests pin the fix: the successor comes from `tab_mru` (falling back
+// to positional adjacency only when the MRU has nothing usable), and
+// `tab_mru` itself is keyed by `TabId` rather than a positional index so
+// reordering/moving tabs can't silently repoint an entry at the wrong tab.
+
+#[test]
+fn test_close_tab_picks_mru_successor_not_positional_neighbour() {
+    // The naive repro ([A, B, C], close C then B => A) passes by adjacency
+    // accident even with the bug fully present — see the issue's own
+    // warning about this. This uses a *non-adjacent* prior tab so the
+    // defect actually shows:
+    //
+    //   tabs: [X, A, Y, Z]     active = A
+    //   open B  -> [X, A, Y, Z, B]      active = B
+    //   open C  -> [X, A, Y, Z, B, C]   active = C
+    //   close C -> active = B           (adjacency: idx 5 clamped to 4)
+    //   close B -> MRU-correct: A       (buggy adjacency: idx 4 clamped to
+    //                                    3, landing on Z instead)
+    let mut engine = Engine::new(); // X, idx 0
+    engine.new_tab(None); // A, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+    engine.goto_tab(1); // back to A
+    let a_id = engine.active_tab().id;
+    assert_eq!(engine.active_group().active_tab, 1);
+
+    engine.new_tab(None); // B, idx 4, active
+    engine.new_tab(None); // C, idx 5, active
+    assert_eq!(engine.active_group().tabs.len(), 6);
+    assert_eq!(engine.active_group().active_tab, 5);
+
+    assert!(engine.close_tab(), "closing C should succeed"); // close C
+    assert_eq!(engine.active_group().tabs.len(), 5);
+
+    assert!(engine.close_tab(), "closing B should succeed"); // close B
+    assert_eq!(engine.active_group().tabs.len(), 4);
+    assert_eq!(
+        engine.active_tab().id,
+        a_id,
+        "closing B should reactivate A (the MRU successor), not whichever \
+         tab happens to shift into the closed slot"
+    );
+}
+
+#[test]
+fn test_close_tab_at_background_tab_does_not_change_active_tab() {
+    // Right-click "Close" on a tab that is not the group's active tab must
+    // not steal focus. `close_tab_at` used to switch to the target
+    // group/tab *before* closing it, which activated the closed tab's
+    // neighbour as a side effect and polluted the MRU/nav-history stacks on
+    // the way out.
+    let mut engine = Engine::new();
+    engine.new_tab(None); // idx 1
+    engine.new_tab(None); // idx 2
+    engine.new_tab(None); // idx 3, active
+    engine.goto_tab(1); // make idx 1 active
+    let active_id = engine.active_tab().id;
+    let group = engine.active_group;
+
+    let closed = engine.close_tab_at(group, 3); // background tab, idx 3
+    assert!(closed);
+    assert_eq!(engine.active_group().tabs.len(), 3);
+    assert_eq!(
+        engine.active_tab().id,
+        active_id,
+        "closing a background tab must not change the active tab"
+    );
+    assert_eq!(
+        engine.active_group().active_tab,
+        1,
+        "active index is unaffected when the removed tab was positioned after it"
+    );
+}
+
+#[test]
+fn test_close_tab_at_background_tab_shifts_active_index_when_before_it() {
+    // A background tab positioned *before* the active tab still must not
+    // change which tab is active — but the active tab's numeric index has
+    // to shift down by one to keep pointing at the same tab.
+    let mut engine = Engine::new();
+    engine.new_tab(None); // idx 1
+    engine.new_tab(None); // idx 2, active
+    let active_id = engine.active_tab().id;
+    let group = engine.active_group;
+
+    let closed = engine.close_tab_at(group, 0); // background tab, idx 0
+    assert!(closed);
+    assert_eq!(engine.active_tab().id, active_id);
+    assert_eq!(engine.active_group().active_tab, 1);
+}
+
+#[test]
+fn test_reorder_tab_does_not_corrupt_close_successor() {
+    // #673 defect 3: `tab_mru` used to store a positional `(GroupId,
+    // usize)` index, so dragging a tab elsewhere in the bar silently
+    // repointed every MRU entry sitting at or after the moved slot. This
+    // reproduces exactly that shape: record that A is the desired successor
+    // while A sits at index 1, then reorder the tab list so a *different*
+    // tab (Y) ends up at index 1. If `tab_mru` were still index-keyed, the
+    // successor lookup would resolve to Y; keyed by `TabId`, it must still
+    // resolve to A.
+    let mut engine = Engine::new(); // W, idx 0
+    engine.new_tab(None); // X, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+
+    engine.goto_tab(1); // active = X, MRU front = X
+    let x_id = engine.active_tab().id;
+    engine.goto_tab(3); // active = Z, MRU: [Z, X, ...]
+    let z_id = engine.active_tab().id;
+
+    let group = engine.active_group;
+    // Drag W (idx 0) to the end. After this, X sits at idx 0 (a completely
+    // different index than when its MRU entry was recorded) and Y — a tab
+    // that was never the intended successor — moves into X's *old* slot
+    // (idx 1). (Dragging also focuses the moved tab, W, per normal
+    // drag-and-drop UX — unrelated to the MRU logic under test here.)
+    engine.reorder_tab_in_group(group, 0, 3);
+    assert_eq!(
+        engine.active_group().tabs.iter().position(|t| t.id == x_id),
+        Some(0),
+        "X should now be at index 0 after the drag"
+    );
+
+    // Navigate to Z (now at idx 2, not its pre-drag idx 3) and close it.
+    // Z's MRU successor, recorded while X sat at idx 1, is X — even though
+    // the tab now sitting at idx 1 is Y, not X.
+    let z_idx = engine
+        .active_group()
+        .tabs
+        .iter()
+        .position(|t| t.id == z_id)
+        .unwrap();
+    engine.goto_tab(z_idx);
+    engine.close_tab(); // close Z
+    assert_eq!(
+        engine.active_tab().id,
+        x_id,
+        "the close successor must resolve X by TabId even though a drag \
+         moved a different tab into X's old positional slot"
+    );
+}
+
+#[test]
+fn test_close_across_two_groups_picks_correct_successor_per_group() {
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new();
+    // Group 1: the same non-adjacent repro as above.
+    engine.new_tab(None); // A, idx 1
+    engine.new_tab(None); // Y, idx 2
+    engine.new_tab(None); // Z, idx 3
+    engine.goto_tab(1); // active = A
+    let a_id = engine.active_tab().id;
+    let group1 = engine.active_group;
+
+    // Split into a second group (starts with one tab, P).
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group2 = engine.active_group;
+    assert_ne!(group1, group2);
+    let p_id = engine.active_tab().id;
+    engine.new_tab(None); // Q, active in group 2
+    let q_id = engine.active_tab().id;
+
+    // Back in group 1: replay the B/C open-then-close sequence. Group 2's
+    // MRU entries must not leak into group 1's successor decision.
+    engine.active_group = group1;
+    engine.new_tab(None); // B
+    engine.new_tab(None); // C
+    engine.close_tab(); // close C -> B
+    engine.close_tab(); // close B -> A
+    assert_eq!(
+        engine.active_tab().id,
+        a_id,
+        "group 1's own MRU should resolve the successor, unaffected by group 2"
+    );
+
+    // Group 2: closing Q must fall back to P via group 2's own MRU.
+    engine.active_group = group2;
+    assert_eq!(engine.active_tab().id, q_id);
+    engine.close_tab();
+    assert_eq!(
+        engine.active_tab().id,
+        p_id,
+        "group 2's successor must come from its own MRU, not group 1's"
+    );
+}
+
 // ── Git branch picker tests ─────────────────────────────────────────────────
 
 #[test]

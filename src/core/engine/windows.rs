@@ -341,22 +341,14 @@ impl Engine {
         }
     }
 
-    /// Close the current tab. Returns true if closed.
-    pub fn close_tab(&mut self) -> bool {
-        if self.active_group().tabs.len() <= 1 {
-            // If there is a second group, close this group instead of erroring.
-            if !self.group_layout.is_single_group() {
-                self.close_editor_group();
-                return true;
-            }
-            self.message = "Cannot close last tab".to_string();
-            return false;
-        }
-
+    /// Remove tab `tab_idx` from `group_id`: tears down its windows, cleans
+    /// up orphaned buffers, and strips it from nav history and the MRU
+    /// stack. Does **not** decide or touch `active_tab` / global focus —
+    /// callers own that policy. Returns the `TabId` that was removed.
+    fn remove_tab_raw(&mut self, group_id: GroupId, tab_idx: usize) -> TabId {
         // Collect the buffer IDs of windows being closed so we can clean them
         // up from the buffer manager if nothing else references them.
-        let active_tab_idx = self.active_group().active_tab;
-        let window_ids: Vec<WindowId> = self.active_group().tabs[active_tab_idx].window_ids();
+        let window_ids: Vec<WindowId> = self.editor_groups[&group_id].tabs[tab_idx].window_ids();
         let closed_buffer_ids: Vec<BufferId> = window_ids
             .iter()
             .filter_map(|wid| self.windows.get(wid).map(|w| w.buffer_id))
@@ -377,35 +369,24 @@ impl Engine {
             }
         }
 
-        let closed_group = self.active_group;
-        let closed_tab_id = self.active_group().tabs[active_tab_idx].id;
-        self.active_group_mut().tabs.remove(active_tab_idx);
+        let closed_tab_id = self.editor_groups[&group_id].tabs[tab_idx].id;
+        self.editor_groups
+            .get_mut(&group_id)
+            .unwrap()
+            .tabs
+            .remove(tab_idx);
 
         // Remove the closed tab from nav history.
         self.tab_nav_history
-            .retain(|&(g, t)| !(g == closed_group && t == closed_tab_id));
+            .retain(|&(g, t)| !(g == group_id && t == closed_tab_id));
         if self.tab_nav_index >= self.tab_nav_history.len() {
             self.tab_nav_index = self.tab_nav_history.len().saturating_sub(1);
         }
 
-        // Remove the closed tab from MRU and adjust indices
+        // Remove the closed tab from MRU. No index fixup needed — entries
+        // are keyed by TabId, so removing one tab never repoints another.
         self.tab_mru
-            .retain(|&(g, idx)| !(g == closed_group && idx == active_tab_idx));
-        for entry in &mut self.tab_mru {
-            if entry.0 == closed_group && entry.1 > active_tab_idx {
-                entry.1 -= 1;
-            }
-        }
-
-        // Adjust active tab index
-        let tabs_len = self.active_group().tabs.len();
-        if self.active_group().active_tab >= tabs_len {
-            self.active_group_mut().active_tab = tabs_len - 1;
-        }
-        self.tab_mru_touch();
-        // Ensure the new active tab's window state is consistent.
-        self.repair_active_window();
-        self.ensure_active_tab_visible();
+            .retain(|&(g, t)| !(g == group_id && t == closed_tab_id));
 
         // Remove any buffers that are no longer referenced by any window.
         // This prevents orphaned dirty buffers from falsely triggering `:qa`
@@ -423,34 +404,147 @@ impl Engine {
             }
         }
 
+        closed_tab_id
+    }
+
+    /// Determine which tab should become active in `group_id` after closing
+    /// `closed_tab_id`. Reads the MRU stack for the most recently used tab
+    /// that still exists in the group (other than the one being closed) and
+    /// returns `None` when the MRU has nothing usable, so the caller can
+    /// fall back to positional adjacency (#673).
+    pub(crate) fn successor_tab_after_close(
+        &self,
+        group_id: GroupId,
+        closed_tab_id: TabId,
+    ) -> Option<TabId> {
+        let group = self.editor_groups.get(&group_id)?;
+        self.tab_mru.iter().find_map(|&(g, tid)| {
+            (g == group_id && tid != closed_tab_id && group.tabs.iter().any(|t| t.id == tid))
+                .then_some(tid)
+        })
+    }
+
+    /// Close the current tab. Returns true if closed.
+    pub fn close_tab(&mut self) -> bool {
+        if self.active_group().tabs.len() <= 1 {
+            // If there is a second group, close this group instead of erroring.
+            if !self.group_layout.is_single_group() {
+                self.close_editor_group();
+                return true;
+            }
+            self.message = "Cannot close last tab".to_string();
+            return false;
+        }
+
+        let group_id = self.active_group;
+        let active_tab_idx = self.active_group().active_tab;
+        let closed_tab_id = self.active_group().tabs[active_tab_idx].id;
+
+        // Decide the successor before mutating the tab list: MRU-first,
+        // falling back to whatever adjacency shifts into the closed slot.
+        let successor = self.successor_tab_after_close(group_id, closed_tab_id);
+
+        self.remove_tab_raw(group_id, active_tab_idx);
+
+        let tabs_len = self.active_group().tabs.len();
+        let new_idx = successor
+            .and_then(|tid| self.active_group().tabs.iter().position(|t| t.id == tid))
+            .unwrap_or_else(|| active_tab_idx.min(tabs_len.saturating_sub(1)));
+        self.active_group_mut().active_tab = new_idx;
+
+        self.tab_mru_touch();
+        // Ensure the new active tab's window state is consistent.
+        self.repair_active_window();
+        self.ensure_active_tab_visible();
+
         true
     }
 
-    /// Close a specific tab by group and index. Used for right-click "Close" on non-active tabs.
+    /// Close a specific tab by group and index. Used for right-click "Close"
+    /// on a tab bar entry.
+    ///
+    /// Closing a tab that is **not** the group's active tab never changes
+    /// `active_tab` or steals global focus (#673) — it just removes the tab
+    /// in place. Closing a group's own active tab picks a successor the same
+    /// way `close_tab` does, but only moves global focus to `group_id` when
+    /// that group was already focused.
     pub fn close_tab_at(&mut self, group_id: GroupId, tab_idx: usize) -> bool {
-        // Switch to the target group/tab, then close it.
-        if !self.editor_groups.contains_key(&group_id) {
+        let Some(group) = self.editor_groups.get(&group_id) else {
+            return false;
+        };
+        if tab_idx >= group.tabs.len() {
             return false;
         }
-        let tabs_len = self.editor_groups[&group_id].tabs.len();
-        if tab_idx >= tabs_len {
-            return false;
+
+        if tab_idx == group.active_tab {
+            if group_id == self.active_group {
+                return self.close_tab();
+            }
+            return self.close_active_tab_of_background_group(group_id);
         }
-        let prev_group = self.active_group;
-        let prev_tab = self.active_group().active_tab;
-        self.active_group = group_id;
-        self.editor_groups.get_mut(&group_id).unwrap().active_tab = tab_idx;
-        let closed = self.close_tab();
-        // If we didn't close (last tab), restore.
-        if !closed {
-            self.active_group = prev_group;
-            if let Some(g) = self.editor_groups.get_mut(&prev_group) {
-                if prev_tab < g.tabs.len() {
-                    g.active_tab = prev_tab;
-                }
+
+        // Closing a background tab: remove it in place. Active tab index,
+        // MRU order, and global focus are all left untouched aside from the
+        // index shift needed to keep `active_tab` pointing at the same tab.
+        self.remove_tab_raw(group_id, tab_idx);
+        if let Some(g) = self.editor_groups.get_mut(&group_id) {
+            if tab_idx < g.active_tab {
+                g.active_tab -= 1;
             }
         }
-        closed
+        if group_id == self.active_group {
+            self.ensure_active_tab_visible();
+        }
+        true
+    }
+
+    /// Close the active tab of a group that is not the globally focused
+    /// group, without moving focus there. Mirrors `close_tab`'s successor
+    /// policy and last-tab-in-group handling, scoped to `group_id`.
+    fn close_active_tab_of_background_group(&mut self, group_id: GroupId) -> bool {
+        let Some(group) = self.editor_groups.get(&group_id) else {
+            return false;
+        };
+        let active_tab_idx = group.active_tab;
+
+        if group.tabs.len() <= 1 {
+            if self.group_layout.is_single_group() {
+                return false;
+            }
+            // Remove the whole (unfocused) group; global focus is untouched.
+            if let Some(g) = self.editor_groups.get(&group_id) {
+                let window_ids: Vec<WindowId> =
+                    g.tabs.iter().flat_map(|t| t.window_ids()).collect();
+                for wid in window_ids {
+                    self.windows.remove(&wid);
+                }
+            }
+            self.editor_groups.remove(&group_id);
+            self.group_layout.remove(group_id);
+            self.tab_mru.retain(|&(g, _)| g != group_id);
+            self.tab_nav_history.retain(|&(g, _)| g != group_id);
+            if self.tab_nav_index >= self.tab_nav_history.len() {
+                self.tab_nav_index = self.tab_nav_history.len().saturating_sub(1);
+            }
+            return true;
+        }
+
+        let closed_tab_id = group.tabs[active_tab_idx].id;
+        let successor = self.successor_tab_after_close(group_id, closed_tab_id);
+
+        self.remove_tab_raw(group_id, active_tab_idx);
+
+        let tabs_len = self.editor_groups[&group_id].tabs.len();
+        let new_idx = successor
+            .and_then(|tid| {
+                self.editor_groups[&group_id]
+                    .tabs
+                    .iter()
+                    .position(|t| t.id == tid)
+            })
+            .unwrap_or_else(|| active_tab_idx.min(tabs_len.saturating_sub(1)));
+        self.editor_groups.get_mut(&group_id).unwrap().active_tab = new_idx;
+        true
     }
 
     /// Close all tabs in the current group except the active one.
@@ -1426,9 +1520,9 @@ impl Engine {
         }
     }
 
-    /// Record the current (group, tab_index) as the most recently used tab.
+    /// Record the current (group, tab_id) as the most recently used tab.
     pub fn tab_mru_touch(&mut self) {
-        let entry = (self.active_group, self.active_group().active_tab);
+        let entry = (self.active_group, self.active_tab().id);
         self.tab_mru.retain(|e| *e != entry);
         self.tab_mru.insert(0, entry);
     }
@@ -1556,13 +1650,13 @@ impl Engine {
     /// Calling again toggles back (Vim behaviour).
     pub fn goto_last_accessed_tab(&mut self) {
         // Prune stale entries
-        self.tab_mru.retain(|&(g, idx)| {
+        self.tab_mru.retain(|&(g, tid)| {
             self.editor_groups
                 .get(&g)
-                .is_some_and(|grp| idx < grp.tabs.len())
+                .is_some_and(|grp| grp.tabs.iter().any(|t| t.id == tid))
         });
         // Ensure current is at index 0
-        let current = (self.active_group, self.active_group().active_tab);
+        let current = (self.active_group, self.active_tab().id);
         if self.tab_mru.first() != Some(&current) {
             self.tab_mru.retain(|e| *e != current);
             self.tab_mru.insert(0, current);
@@ -1570,8 +1664,12 @@ impl Engine {
         if self.tab_mru.len() < 2 {
             return; // No previous tab to jump to
         }
-        let (group_id, tab_idx) = self.tab_mru[1];
-        if self.editor_groups.contains_key(&group_id) {
+        let (group_id, tab_id) = self.tab_mru[1];
+        let tab_idx = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.iter().position(|t| t.id == tab_id));
+        if let Some(tab_idx) = tab_idx {
             self.active_group = group_id;
             self.active_group_mut().active_tab = tab_idx;
             self.line_annotations.clear();
@@ -1590,22 +1688,22 @@ impl Engine {
         self.dismiss_editor_hover();
 
         // Build a clean MRU list: only include entries that still exist
-        self.tab_mru.retain(|&(g, idx)| {
+        self.tab_mru.retain(|&(g, tid)| {
             self.editor_groups
                 .get(&g)
-                .is_some_and(|grp| idx < grp.tabs.len())
+                .is_some_and(|grp| grp.tabs.iter().any(|t| t.id == tid))
         });
         // Ensure the current tab is at index 0
-        let current = (self.active_group, self.active_group().active_tab);
+        let current = (self.active_group, self.active_tab().id);
         if self.tab_mru.first() != Some(&current) {
             self.tab_mru.retain(|e| *e != current);
             self.tab_mru.insert(0, current);
         }
         // Also add any tabs not yet in MRU (e.g. from before MRU tracking started)
         for (&gid, group) in &self.editor_groups {
-            for idx in 0..group.tabs.len() {
-                if !self.tab_mru.contains(&(gid, idx)) {
-                    self.tab_mru.push((gid, idx));
+            for tab in &group.tabs {
+                if !self.tab_mru.contains(&(gid, tab.id)) {
+                    self.tab_mru.push((gid, tab.id));
                 }
             }
         }
@@ -1653,8 +1751,12 @@ impl Engine {
             return;
         }
         let idx = self.tab_switcher_selected;
-        if let Some(&(group_id, tab_idx)) = self.tab_mru.get(idx) {
-            if self.editor_groups.contains_key(&group_id) {
+        if let Some(&(group_id, tab_id)) = self.tab_mru.get(idx) {
+            let tab_idx = self
+                .editor_groups
+                .get(&group_id)
+                .and_then(|g| g.tabs.iter().position(|t| t.id == tab_id));
+            if let Some(tab_idx) = tab_idx {
                 self.active_group = group_id;
                 self.active_group_mut().active_tab = tab_idx;
                 self.tab_mru_touch();
@@ -1732,9 +1834,9 @@ impl Engine {
     pub fn tab_switcher_items(&self) -> Vec<(String, String, bool)> {
         self.tab_mru
             .iter()
-            .filter_map(|&(gid, tab_idx)| {
+            .filter_map(|&(gid, tab_id)| {
                 let group = self.editor_groups.get(&gid)?;
-                let tab = group.tabs.get(tab_idx)?;
+                let tab = group.tabs.iter().find(|t| t.id == tab_id)?;
                 let win = self.windows.get(&tab.active_window)?;
                 let state = self.buffer_manager.get(win.buffer_id)?;
                 let name = state.display_name();
@@ -2001,6 +2103,12 @@ impl Engine {
     }
 
     /// Move the current tab from the active group to the next group.
+    ///
+    /// Any `tab_mru`/`tab_nav_history` entry for this tab still names the
+    /// old group; since both stacks are keyed by `(GroupId, TabId)` (#673),
+    /// such an entry simply stops matching anything (the tab isn't in that
+    /// group anymore) rather than being misread as pointing at whatever tab
+    /// now occupies its old slot. No explicit fixup is required.
     pub fn move_tab_to_other_group(&mut self) {
         if self.group_layout.is_single_group() {
             return;
@@ -2055,6 +2163,9 @@ impl Engine {
     }
 
     /// Move a tab from one group to another at a specific insertion index.
+    ///
+    /// See `move_tab_to_other_group` re: `tab_mru` — stale cross-group
+    /// entries harmlessly stop matching rather than repointing (#673).
     pub fn move_tab_to_target_group_at(
         &mut self,
         src_group: GroupId,
@@ -2093,6 +2204,9 @@ impl Engine {
     }
 
     /// Move a tab out of its group into a new split adjacent to `target_group`.
+    ///
+    /// See `move_tab_to_other_group` re: `tab_mru` — stale cross-group
+    /// entries harmlessly stop matching rather than repointing (#673).
     pub fn move_tab_to_new_split(
         &mut self,
         src_group: GroupId,
@@ -2171,6 +2285,10 @@ impl Engine {
     }
 
     /// Reorder a tab within its group.
+    ///
+    /// No `tab_mru` fixup is needed here: the MRU stack is keyed by `TabId`
+    /// (#673), and reordering never changes a tab's id — only its position
+    /// in `tabs`, which the MRU doesn't track.
     pub fn reorder_tab_in_group(&mut self, group_id: GroupId, from_idx: usize, to_idx: usize) {
         if let Some(g) = self.editor_groups.get_mut(&group_id) {
             if from_idx >= g.tabs.len() {
