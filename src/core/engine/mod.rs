@@ -2686,9 +2686,11 @@ pub struct Engine {
     pub tab_switcher_open: bool,
     /// Index of the currently highlighted item in the MRU list.
     pub tab_switcher_selected: usize,
-    /// MRU-ordered list of (group_id, tab_index) pairs.
-    /// Most recently used is at index 0.
-    pub tab_mru: Vec<(GroupId, usize)>,
+    /// MRU-ordered list of (group_id, tab_id) pairs.
+    /// Most recently used is at index 0. Keyed by `TabId` (not a positional
+    /// index) so reordering or moving tabs between groups can never silently
+    /// repoint an entry at the wrong tab (#673).
+    pub tab_mru: Vec<(GroupId, TabId)>,
 
     /// Back/forward tab navigation history.
     /// Each entry is (GroupId, TabId) at the time of the switch.
@@ -3668,7 +3670,7 @@ impl Engine {
             cwd,
             tab_switcher_open: false,
             tab_switcher_selected: 0,
-            tab_mru: vec![(GroupId(0), 0)],
+            tab_mru: vec![(GroupId(0), TabId(1))],
             tab_nav_history: vec![(GroupId(0), TabId(1))],
             tab_nav_index: 0,
             tab_nav_navigating: false,
