@@ -448,37 +448,35 @@ const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
 /// Cell width of one tab in the tab bar: the label plus [`TAB_CLOSE_COLS`]
 /// for the close glyph and its trailing separator.
 ///
-/// # Why this counts `char`s and not display columns (#654)
+/// # Why this counts display columns and not `char`s (#654, quadraui#554)
 ///
 /// `.chars().count()` is *not* a terminal display width — a CJK ideograph or
-/// a wide emoji occupies two columns. The obvious "fix" is
-/// `quadraui::tui::display_width`, and #654 proposed exactly that. It is
-/// wrong on its own, because the width used here has to agree with the width
-/// the **rasteriser** paints with, and today that is char-based end to end:
+/// a wide emoji occupies two columns. The width used here has to agree with
+/// the width the **rasteriser** paints with, so for as long as quadraui's TUI
+/// tab bar measured *and* painted per-`char` this function had to as well,
+/// and #654 documented that at length rather than "fixing" it into a
+/// mismatch.
 ///
-/// * `quadraui::tui::backend::TuiBackend::draw_tab_bar` builds its own layout
-///   with `t.label.chars().count() + close_cols` before painting, and
-/// * `quadraui::tui::draw_tab_bar` walks the label with a flat `x += 1` per
-///   `char` (no [`quadraui::tui::char_cell_width`] stride).
+/// quadraui#554 (`77a5142`, in the pin bumped by #659) fixed both quadraui
+/// sides together: `TuiBackend::draw_tab_bar` / `tab_bar_layout` now measure
+/// with `display_width`, and `quadraui::tui::draw_tab_bar` strides the
+/// label-paint loop by [`quadraui::tui::char_cell_width`] instead of a flat
+/// `x += 1`. That commit names this function as its downstream follow-up,
+/// and #654's own note said this would be the single edit needed on the
+/// vimcode side — #654 had already routed the tooltip, both context-menu
+/// hit-tests, the click router and the drag-slot map through
+/// [`compute_tab_bar_hit_regions`], so nothing else measures a tab.
 ///
-/// So a tab named `" 1: 日本語.rs "` (11 chars, 14 columns) is painted 13
-/// cells wide and the next tab starts at cell 13 — which is what these
-/// regions already say. Ratatui's `Buffer::diff` skips the cell after each
-/// double-width glyph when it flushes, so on a real terminal the wide glyph
-/// covers its two columns and the tab still ends where this function says it
-/// does. The visible defect for wide names is therefore a *dropped glyph*
-/// (`本` and `.` never reach the screen), not a misplaced hit box — verified
-/// by `tab_hit_regions_match_painted_columns_for_wide_names`.
-///
-/// Switching to `display_width` here without first teaching quadraui to
-/// measure *and paint* in columns would move every hit box right of what is
-/// drawn — introducing the bug #654 set out to remove. When quadraui is
-/// fixed, this one function is the only edit needed on the vimcode side:
-/// #654 routed the tooltip, both context-menu hit-tests, the click router
-/// and the drag-slot map through `compute_tab_bar_hit_regions`, so nothing
-/// else measures a tab any more.
+/// A tab named `" 1: 日本語.rs "` (11 chars, 14 columns) is now both measured
+/// and painted 14 cells wide, so the next tab starts at cell 14 and every hit
+/// box lands on the glyph it covers. Reverting this to `.chars().count()`
+/// against a post-#554 quadraui shifts every hit box *left* of what is drawn
+/// — the mirror image of the pre-#554 hazard, and caught by
+/// `tui_main::render_impl::tests::
+/// tab_hit_regions_match_painted_columns_for_wide_names`, which reads the
+/// expected columns out of the rendered buffer.
 fn tab_hit_width(t: &TabInfo) -> usize {
-    t.name.chars().count() + TAB_CLOSE_COLS as usize
+    quadraui::tui::display_width(&t.name) + TAB_CLOSE_COLS as usize
 }
 
 /// Compute hit regions for a group's tab bar.
@@ -12161,6 +12159,21 @@ pub fn resolve_status_bar_click(
 /// `active_accent` carries the active-tab accent colour only when the group
 /// is focused. TUI interprets as underline; GTK as 2px top bar.
 /// `width_cells` on each segment is a TUI hint; GTK measures with Pango.
+/// The `WidgetId` every editor tab bar paints under.
+///
+/// Backends cache a resolved `quadraui::TabBarLayout` per `WidgetId` at paint
+/// time, and quadraui#594's `GtkDriver::tab_center` / `tab_close_center` look
+/// the layout back up by that id — so a test aiming a click at a specific tab
+/// needs this exact string. Named here rather than spelled out at each call
+/// site so the harness and the primitive cannot drift apart (#659).
+///
+/// Note this is a *per-bar* id, not a per-group one: in a split every group's
+/// tab bar paints under the same id, so the cached layout is whichever group
+/// painted last. That is fine for the single-group tests that consume it and
+/// is why [`crate::core::window::GroupId`]-keyed geometry still exists on the
+/// `App` side for production click routing.
+pub const EDITOR_TAB_BAR_WIDGET_ID: &str = "tabs:group";
+
 pub fn build_tab_bar_primitive(
     tabs: &[TabInfo],
     show_split_btns: bool,
@@ -12256,7 +12269,7 @@ pub fn build_tab_bar_primitive(
     });
 
     quadraui::TabBar {
-        id: quadraui::WidgetId::new("tabs:group"),
+        id: quadraui::WidgetId::new(EDITOR_TAB_BAR_WIDGET_ID),
         tabs: tab_items,
         scroll_offset: tab_scroll_offset,
         right_segments: right,

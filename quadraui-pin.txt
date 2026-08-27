@@ -71,7 +71,35 @@
 # Format: the first non-comment, non-blank line is a full 40-char quadraui SHA.
 # ---------------------------------------------------------------------------
 #
-# f6d27c2 — "fix(quadraui): address #552 review — downstream impact + dangling
+# 3ad869a — "fix(quadraui#595): gate the sidebar_reveal examples on their
+# backend feature". Bumped by vimcode#659 to adopt the two helpers that were
+# *promoted out of this repo* into quadraui:
+#
+#   * quadraui#594 (26c7cde) — `TabBarLayout::tab_center` /
+#     `tab_close_center`, plus `TuiDriver` / `GtkDriver` wrappers keyed by the
+#     tab bar's `WidgetId`. `src/gtk/testing.rs`'s private `tab_center` /
+#     `tab_close_center` (#553) were the literal source for that promotion, so
+#     this bump is what lets vimcode delete its copy instead of maintaining a
+#     second one that drifts.
+#   * quadraui#595 (c6c9556, 02aae99, 3ad869a) — `SidebarSystem::reveal`,
+#     the generic "select + expand + scroll into view" composition whose
+#     reference implementation is `Engine::explorer_reveal_path`. NOTE: it
+#     landed on `SidebarSystem` only; there is no `TreeController::reveal`,
+#     and vimcode's explorer drives a bare `TreeController`, so the vimcode
+#     side of that adoption is still blocked — see #659's closing note.
+#
+# **Eighty quadraui commits ride along in f6d27c2..3ad869a** and only three of
+# them are the two features above. This is by far the largest single pin move
+# to date; the rest is quadraui's own #493 macOS driver work, #541 tooltip
+# chrome, #555 vt100 conformance observer, #467 `drag_and_modal_mut`, #544
+# sidebar-panel routing and a long tail of review fixes. Nothing in that tail
+# touches an API vimcode calls (the full `cargo test` suite is green on it),
+# but "green suite" is not "smoke-tested" — the tooltip and sidebar-panel
+# commits both move painted chrome, so exercise tooltips and sidebar panel
+# clicks on a live display before treating this rev as settled.
+#
+# Previous pin: f6d27c2 — "fix(quadraui): address #552 review — downstream
+# impact + dangling
 # test refs". Bumped by vimcode#650 to adopt quadraui#552, which pins the TUI
 # activity bar's hit regions to bar-relative space. Before it, the TUI
 # rasteriser returned *absolute* rows while GTK/macOS/the no-paint helper
@@ -94,10 +122,10 @@
 # that file is a rustup per-directory override and quadraui is a *sibling*, not
 # an ancestor, of this checkout, so it does not move vimcode's toolchain.
 #
-# Previous pin: f702422 — "fix(quadraui): honour ShellConfig::
+# Pin before that: f702422 — "fix(quadraui): honour ShellConfig::
 # title_bar_height_lh regardless of has_title_bar (#547)". First rev carrying
 # every trait/API addition the open vimcode work depends on: quadraui#531
 # draw_settings_chrome, #532 AppShell::set_title_bar_visible, #533
 # draw_terminal_divider, #537 WinBackend parity, #545 char_cell_width, #547
 # title_bar_height_lh.
-f6d27c239203e28525ac1798d07a31a9dbe9729a
+3ad869a89f10bf324f6b9ead33f4ad6ce7d203b8
