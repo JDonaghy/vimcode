@@ -565,6 +565,13 @@ impl Engine {
             // After closing, the active_tab might have shifted.
         }
         // Ensure the originally active tab (now the only one) is selected.
+        // Each `close_tab()` call above already ran the MRU-successor logic
+        // and its own `tab_mru_touch()` for the *intermediate* tabs this
+        // loop temporarily made active — those entries are transient and get
+        // overwritten below. The final `tab_mru_touch()` call MUST stay
+        // after this `active_tab = 0` assignment; reordering them would
+        // leave the front of the MRU stack pointing at a tab this function
+        // never intended to keep active.
         self.active_group_mut().active_tab = 0;
         self.tab_mru_touch();
         self.repair_active_window();
@@ -582,6 +589,10 @@ impl Engine {
             self.active_group_mut().active_tab = i;
             self.close_tab();
         }
+        // As in `close_other_tabs`: this `tab_mru_touch()` must stay after
+        // pinning `active_tab` back to the original tab, so it overwrites
+        // whatever transient MRU entries the loop's intermediate closes
+        // wrote for tabs that were never meant to end up active.
         self.active_group_mut().active_tab = active_tab_idx;
         self.tab_mru_touch();
         self.repair_active_window();
@@ -599,6 +610,7 @@ impl Engine {
             self.active_group_mut().active_tab = 0;
             self.close_tab();
         }
+        // See `close_other_tabs`: pin-then-touch ordering is load-bearing.
         self.active_group_mut().active_tab = 0;
         self.tab_mru_touch();
         self.repair_active_window();
@@ -635,6 +647,9 @@ impl Engine {
             self.close_tab();
         }
         // Recalculate the active tab (original one shifted down by removed tabs below it).
+        // See `close_other_tabs`: this `tab_mru_touch()` must stay after the
+        // active-tab recalculation above, so it overwrites the transient MRU
+        // entries the loop's intermediate closes wrote along the way.
         let remaining = self.active_group().tabs.len();
         if self.active_group().active_tab >= remaining {
             self.active_group_mut().active_tab = remaining.saturating_sub(1);
