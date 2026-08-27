@@ -156,7 +156,7 @@ running app and asserts on its rendered output.** Both backends have a driver �
 
 | Backend | Driver | Where the test goes |
 |---|---|---|
-| TUI | quadraui `TuiDriver` (ratatui `TestBackend`) | **in-crate**, `#[cfg(test)]`, reusing the existing `make_test_app` / `make_app_with_*` fixtures |
+| TUI | quadraui `TuiDriver` via `quadraui::tui::testing::driver_with_shell(TuiShellApp, ...)` | **in-crate** in `src/tui_main/shell_app.rs`, `#[cfg(test)]` — reuse the local fixtures there (`app_with_sidebar_open`, `app_with_ext_panel`, …) and follow the existing `render_content_paints_*_via_shell_app` tests |
 | GTK | `GtkDriver` (`src/gtk/testing.rs`, harness from #646) | in-crate; paints into in-memory Cairo `ImageSurface`s, headless |
 
 Pure refactors and internal-only changes are exempt — **say so in the PR** if that applies.
