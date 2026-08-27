@@ -71,7 +71,28 @@
 # Format: the first non-comment, non-blank line is a full 40-char quadraui SHA.
 # ---------------------------------------------------------------------------
 #
-# 5a418ca — "feat(quadraui#455): detect ModalStack entries registered but never
+# 6a8a959 — "fix(quadraui#615): stop double-shifting GtkBackend::tab_bar_layout
+# hits". Bumped by vimcode#679 to adopt the upstream fix for the GTK
+# paint-vs-hit-test divergence that vimcode#659 diagnosed and pinned down.
+#
+# `GtkBackend::tab_bar_layout` added `rect.x` to every hit range twice — once
+# via quadraui#552's `shift_tab_bar_hits`, once via an older hand-rolled
+# `x_off` loop that #552 left in place — while `gtk::draw_tab_bar` (the paint
+# path) shifted exactly once. Whenever the tab bar did not start at x == 0
+# (i.e. any time the sidebar/activity bar was open) every entry in
+# `App::cached_tab_pixel_hits` was one `rect.x` too far right, so clicking a
+# tab's × did nothing at all. 6a8a959 drops the duplicate shift.
+#
+# Exactly **one** quadraui commit rides along in 5a418ca..6a8a959 — this one —
+# so the bump is as narrow as a pin move gets. Its arrival is what un-ignores
+# `src/gtk/testing.rs::single_group_tab_close_button_closes_that_tab`, the real
+# acceptance test for "clicking a tab's × closes it", whose assertion needed no
+# edit; #659's deliberate red-on-fix guard
+# (`tab_close_click_divergence_is_still_present_pending_the_quadraui_fix`) was
+# deleted by the same commit that moves this line, exactly as designed.
+#
+# Previous pin: 5a418ca — "feat(quadraui#455): detect ModalStack entries
+# registered but never
 # painted". Bumped by vimcode#659's smoke-retry: the sibling quadraui checkout
 # is shared between agents and had been moved forward onto `develop`, so a
 # build pinned at 3ad869a failed with QUADRAUI PIN MISMATCH in the smoke
@@ -104,7 +125,8 @@
 # compile. The fix is always on the checkout side:
 #
 #     git -C ~/src/quadraui fetch origin
-#     git -C ~/src/quadraui checkout 5a418cac9f9a5cb5a8470a6bf011c4358a7f1704
+#     git -C ~/src/quadraui checkout <the sha on the data line at the bottom of
+#                                     this file — 6a8a959… as of #679>
 #
 # Bump this line only to adopt a quadraui commit vimcode actually needs — never
 # to make a mismatched worktree go quiet.
@@ -166,4 +188,4 @@
 # draw_settings_chrome, #532 AppShell::set_title_bar_visible, #533
 # draw_terminal_divider, #537 WinBackend parity, #545 char_cell_width, #547
 # title_bar_height_lh.
-5a418cac9f9a5cb5a8470a6bf011c4358a7f1704
+6a8a959d76deea0baa63b49c30ec2cf0f268cf16
