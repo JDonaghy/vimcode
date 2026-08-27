@@ -6,7 +6,7 @@
 > line. The `Platform-Neutrality Rule` at the top of `CLAUDE.md` is the *operational
 > rule*; **this file is the source of truth for *intent* and *sequencing*.**
 >
-> _Last updated: 2026-07-21_
+> _Last updated: 2026-08-26_
 
 ## 🎯 North star
 
@@ -41,7 +41,6 @@ The work splits cleanly across **two milestones**. Don't conflate them:
 | Milestone | Repo | What it is |
 |---|---|---|
 | **#5 Cross-Platform UI Crate** | `JDonaghy/vimcode` (tracking) + `JDonaghy/quadraui` | **Build quadraui itself** — new primitives, validation consumers, the macOS/Windows backends. The *supply* side. |
-| **quadraui #9 "vimcode Platform-Neutral blockers"** | `JDonaghy/quadraui` | **The exact supply-side infra that gates #7 below.** Tightly scoped: only the remaining open blockers (#223 ButtonBar, #224 dual-mode Palette, #225 Dialog rich content, #375 TabGroup drag panic). |
 | **#7 Platform-Neutral** | `JDonaghy/vimcode` | **vimcode adopts a shipped quadraui API and deletes its bespoke per-backend code.** The *consume* side — this north star's execution surface. |
 
 A typical feature flows: gap found → quadraui issue (#5 / quadraui repo) → infra
@@ -49,89 +48,139 @@ lands → **vimcode-side adoption issue (#7) deletes the old per-backend code.**
 recurring failure mode this doc exists to fix: **infra lands in quadraui but the #7
 adoption issue never gets picked up**, so the bespoke code lingers as tech debt.
 
-## Critical path — #7 Platform-Neutral adoption
+> quadraui milestone **#9 "vimcode Platform-Neutral blockers"** is **CLOSED OUT**
+> (0 open / 5 closed) — #223/#224/#225/#375 all shipped. There is currently no
+> quadraui work gating a #7 issue except quadraui#596/#597 (see #658 below). When a
+> new #7 issue turns out to be supply-blocked, file the gap on `JDonaghy/quadraui`
+> and re-open that milestone rather than letting the block go untracked.
 
-**Ready now** — the quadraui infra already exists; these are pure vimcode-side
-deletions waiting to be picked up:
+## ✅ The two structural migrations are DONE
 
-| Issue | Migration | Note |
+Both backends now run the same quadraui-owned loop. This was the bulk of the north
+star's architectural work and it closed on **2026-08-26**:
+
+| Epic | Milestone | Outcome |
 |---|---|---|
-| **#512** | `:vert diffsplit` → `quadraui::DiffView` | 🟢 **quadraui#294 LANDED** — the flagship "lifted but not adopted" case. Best first pick. |
-| **#448** | GTK event dispatch → `ShellApp::handle(UiEvent)` | shell runner already forwards `UiEvent` |
-| **#449** | GTK click dispatch → `FrameHitMap` | |
-| **#454** | toast render + click dispatch in GTK | |
-| **#459** | context-menu dispatch → `ModalStack` | deletes the 4 TUI panel-intercept gates |
-| **#477** | TUI tab-bar drag slots → cached `TabBar` hit regions | |
-| **#478** | TUI sidebar-item hover popup → shared tooltip builder | |
-| **#133** | unified sidebar rendering → `ScreenLayout` | (was tracked under Crate Extraction) |
-| **#146** | Lua plugin API → expose quadraui primitives | weakest fit — re-triage if it drifts |
-| **#479** | TUI Settings inline-edit → `FormController` | 🟢 quadraui#221/#157/#222 LANDED |
-| **#481** | TUI window-sep scrollbar + tab-drop overlay → primitives | 🟢 quadraui#226 + #121 LANDED |
-| **#493** | Full GTK `run_with_shell` migration (collapse 14 DAs → 1, strip Relm4) | 🟢 quadraui#217 LANDED |
-| **#508** | TUI text-selection + OSC52 clipboard; delete bespoke plumbing | 🟢 quadraui#269 + #283 LANDED |
+| **#448** GTK event dispatch → `ShellApp::handle(UiEvent)` | #8 | ✅ Closed. Relm4 stripped (#540); regressions D–J all fixed. `impl ShellApp for App` at `src/gtk/mod.rs:8565`. |
+| **#595** TUI → `ShellApp` + `run_with_shell` | #9 | ✅ Closed. All ten stages landed; **`fn event_loop` no longer exists in `src/`** (#634). `TuiShellApp` at `src/tui_main/shell_app.rs:1128`. |
 
-**Ready once a quadraui fix lands** (feature exists, but with an open correctness bug):
+Every issue in the old "Ready now" table — #512, #449, #454, #459, #477, #478,
+#133, #479, #481, #493, #508, #515, #480 — is **closed**. #7 Platform-Neutral now
+stands at 21 closed.
+
+## Critical path — what is actually left
+
+**The remaining work is debt left behind by those migrations, not more migration.**
+Three groups, in priority order.
+
+### 1. The orphaned GTK paint path — the biggest single item (#592, epic)
+
+`src/gtk/draw.rs` is **3,733 lines under a file-level `#![allow(dead_code)]`**. Of
+its 29 exported `pub(super) fn`s, **zero have a live caller** — it was orphaned by
+#540 and nothing noticed, because that file-level allow muted the only warning that
+would have said so. The user-visible cost: **13 populated `ScreenLayout` fields the
+GTK live path silently drops**, each a feature that works on TUI and paints nothing
+on GTK. #587 burned roughly five agent sessions on *one* of them (the command
+palette) because the symptom points at input while the fault is paint.
+
+Staged 2026-08-26 into four dispatchable children, chained **A → B → C → D**
+(all three of A/B/C declare the same three files, so they cannot run concurrently):
+
+| Issue | Scope |
+|---|---|
+| **#669** (A) | overlay popups: `completion`, `hover`, `editor_hover`, `diff_peek`, `signature_help` |
+| **#670** (B) | panels: `quickfix`, `bottom_tabs`, `debug_toolbar`, `panel_hover`, `ai_panel` |
+| **#671** (C) | chrome: `find_replace`, `tab_switcher`, `separated_status_line`, `tab_tooltip` |
+| **#672** (D) | register scroll surfaces + hit-test caches on the live path, **then delete `draw.rs`** |
+
+**#593** (`Ctrl+V` no-ops on GTK) is the same root cause on the *event* side rather
+than the paint side — quadraui emits `UiEvent::ClipboardPaste` and vimcode has no
+arm for it. Hold it until #672 lands; it also needs live smoke on a display-capable
+machine (no GTK acceptance driver existed when it was filed — #646 has since
+shipped one, so re-scope it rather than assuming manual smoke).
+
+### 2. The dedup sweep — infra landed, adoption never happened
+
+This is precisely the failure mode this doc exists to catch. All four are **ready
+now**; the supply side is already closed.
+
+| Issue | Migration | Supply gate |
+|---|---|---|
+| **#621** | delete local `fuzzy_score` / `fuzzy_score_with_positions` → `quadraui::text_util` | 🟢 quadraui#474 LANDED |
+| **#659** | driver tab geometry + `SidebarSystem::reveal` | 🟢 quadraui#594 + #595 CLOSED |
+| **#660** | retire 4 duplicates: tab scroll, tab measure, hit shim, split tree → `SplitTree` | 🟢 quadraui already ships all four |
+| **#536** | activity-bar keyboard nav → `AppShell` cursor | 🟢 quadraui#386 CLOSED (the issue body's "blocked by" was stale until 2026-08-26) |
+
+⚠ **#660 carries a live trap:** `SplitDirection` is *inverted* between the two
+crates — vimcode's `Horizontal` means top/bottom, quadraui's means side-by-side. A
+mechanical swap rotates every split 90° **and compiles**. Assert orientation on a
+rendered grid, never on the enum name.
+
+**Blocked on quadraui — the only one:**
 
 | Issue | Migration | Waiting on |
 |---|---|---|
-| **#515** | editor-group drag-and-drop → `TabGroupController` | quadraui#349 LANDED, but **quadraui#375** (TUI drag-start panics) must be fixed before adoption is safe |
+| **#658** | preview-tab tier → `WorkspaceController` | quadraui#597 (which needs quadraui#596) — both OPEN |
 
-**Blocked on quadraui** — genuinely waiting on unbuilt infra: none currently. **#480
-(the last entry here) shipped 2026-07-21** — quadraui#223/#224/#225 all closed, TUI
-*and* GTK migrated to `TextInput`/dual-mode `Palette`/`Dialog`+`DialogTable` (GTK's
-git-sidebar chrome had been silently unpainted under `ShellApp` since #493 — fixed
-in the same pass). PR open, pending merge. When a new #7 issue is discovered to be
-supply-blocked, add its row back here.
+Until #658 lands there are **two implementations of vimcode's own preview policy** —
+the original here and the port in quadraui — which defeats the reason the port
+happened.
+
+### 3. Residual per-backend surface — not yet issue-shaped
+
+Worth knowing when scoping; file issues as these become concrete.
+
+- **GTK still routes through a private `enum Msg` bus** (`src/gtk/mod.rs:990-1319`,
+  302 `Msg::` sites) that `ShellApp::handle` translates into before calling
+  `fn dispatch` (`:1670`). The Relm4-era bus outlived its framework. TUI has no
+  equivalent. #592-D's "Out of scope" flags it deliberately.
+- **Raw size.** On `origin/develop` 2026-08-26: `src/gtk/` = 17,136 lines,
+  `src/tui_main/` = 16,842, against `src/render.rs` = 17,041 shared. Roughly a
+  quarter of each backend is in-crate tests, and `draw.rs`'s 3,733 dead lines come
+  out with #672 — but "thin event-to-engine wiring" is still a long way off.
+- **#146** (Lua plugin API → quadraui primitives) is the last survivor of the
+  original #7 seeding and remains the weakest fit. Re-triage or drop it.
 
 ## Architecture milestones — beyond primitive-by-primitive adoption
 
-Two larger, multi-session items surfaced 2026-07-21 while scoping #480's follow-on
-work. Both are sequencing/architecture questions, not single-primitive swaps, so
-they're tracked here rather than in the per-issue tables above:
-
 | Issue | What | Status |
 |---|---|---|
-| **vimcode#595** | TUI → `quadraui::ShellApp` + `run_with_shell`, mirroring GTK's landed #493 migration. Closes the largest remaining GTK/TUI architectural divergence (TUI's ~2,100-line hand-rolled `event_loop()` vs. GTK's quadraui-owned runner). Large refactor — not a quick pick, do not claim without reading the issue body's suggested incremental-landing approach. | 📋 Filed, unscoped-for-dispatch |
-| **quadraui#465** | macOS backend: add `ShellApp` + `run_with_shell` composition support (mirrors the TUI/GTK `shell_runner.rs` pattern). All macOS chrome *primitives* already exist (`activity_bar`, `sidebar_panel`, `tab_bar`, …) — this is purely the composition/runner wiring, analogous to what #595 does for TUI. **This, not #595, is the actual gate on "macOS port is a thin wrapper"** — TUI already runs on macOS via crossterm and doesn't need porting for reach. | 📋 Filed on quadraui, supply-side (#5) |
+| **quadraui#465** | macOS backend: `ShellApp` + `run_with_shell` composition support. All macOS chrome *primitives* already exist — this is purely the composition/runner wiring, the macOS analogue of what #595 did for TUI. **This is the actual gate on "the macOS port is a thin wrapper."** | 📋 OPEN, supply-side (#5) |
+| **#657** | Put vimcode on the oracle loop: promote `gtk`/`render`/`tui_main` into `vimcode_core`, then seal a `tests/acceptance/` suite | 📋 OPEN, `tier:large` |
 
-Neither blocks the other. #595 is pure vimcode-side convergence value (kills a bug
-class); quadraui#465 is pure quadraui-side supply work that unblocks a *future*
-native macOS backend adopting vimcode's `App: ShellApp` impl with zero new vimcode
-code, once it exists.
+**#657 is the trust gate under everything above.** vimcode's tests today are written
+by the same worker that writes the fix, and #553 is the in-repo proof: its first
+attempt shipped GtkDriver tests that **stayed green with the bug reinstated**, and
+only the adversarial review caught it. A self-authored oracle caught by review is
+luck, not a gate. Note the false blocker recorded in #657's body — "vimcode needs a
+GTK acceptance driver first" is **wrong**, and chasing it costs a large piece of
+work that isn't needed.
 
-## Status (2026-07-21)
+## Status (2026-08-26)
 
-- ✅ **#480 shipped — the "Blocked on quadraui" table is now empty.** All #223/#224/
-  #225-blocked TUI work is done; GTK got a bonus fix in the same pass (git-sidebar
-  header/commit-input had been unpainted since #493, see above). Filed vimcode#595
-  (TUI `ShellApp` migration) and quadraui#465 (macOS `ShellApp` support) as the next
-  two architecture-level items — see "Architecture milestones" above. Neither is a
-  quick #7-table pick; **#512 is still the best next quick pick** (below).
-- ✅ **Milestone #7 "Platform-Neutral" created** and seeded with 15 adoption issues
-  (11 pulled out of #5, #133 out of Crate Extraction, + #146/#512/#515 from
-  no-milestone). #5 is now scoped to pure quadraui-build. All 15 sent to the coord
-  Pipeline:New (`coord` + `status:ready`).
-- 🔎 **Supply audit (2026-06-26): the supply side is ~80% already built.** Of the 6
-  issues first thought "blocked on quadraui", **4 are actually unblocked** (#479/#481/
-  #493/#508 — infra closed, `~/src/quadraui` current), **#515 is unblocked but unsafe**
-  until quadraui#375's drag panic is fixed, and **only #480 truly waits** on unbuilt
-  quadraui infra (#223/#224/#225).
-- ✅ **quadraui milestone #9 "vimcode Platform-Neutral blockers" created** — the
-  supply-side counterpart, scoped to exactly #223/#224/#225 (gate #480) + #375
-  (gate #515). When those close, the whole #7 milestone is unblocked.
-- 📋 **Next pick:** #512 — quadraui#294 (`DiffView`) has landed; highest-value first
-  deletion. Then sweep the rest of "Ready now" (#479/#481/#493/#508 are also free now).
+- ✅ **#448 and #595 both closed.** The two `ShellApp` migrations are done; both
+  backends run the quadraui-owned loop and `event_loop()` is deleted.
+- ✅ **quadraui milestone #9 cleared** (0 open / 5 closed) — no supply-side work
+  gates #7 except quadraui#596/#597 for #658.
+- 🔨 **#592 staged into #669/#670/#671/#672** and queued A→B→C→D. This is the
+  highest-value remaining item: it deletes ~3.7k dead lines *and* fixes 13
+  user-visible GTK gaps.
+- 🔨 **Dedup sweep queued:** #621, #659, #660, #536 — all ready, all pure deletion.
+- 📋 **Next after that:** #593 (after #672), then #658 once quadraui#596/#597 land.
+- ⚠️ **#657 remains the trust gate.** Everything above is being verified by
+  worker-authored tests until it lands.
 
 ## How to use this doc
 
 - **Agents:** treat this as the standing objective behind all planning and triage.
-  Bias toward clearing the "Ready now" block; never write new per-backend code
-  (`CLAUDE.md` Platform-Neutrality Rule). When you adopt a quadraui API, **delete**
-  the old backend code in the same PR — a migration that leaves both paths is not done.
+  Bias toward clearing the "what is actually left" block; never write new
+  per-backend code (`CLAUDE.md` Platform-Neutrality Rule). When you adopt a quadraui
+  API, **delete** the old backend code in the same PR — a migration that leaves both
+  paths is not done.
 - **Humans:** edit freely as priorities shift; keep it short, re-date Status. When
-  quadraui infra lands, move the corresponding #7 issue from "Blocked" to "Ready now".
+  quadraui infra lands, move the corresponding #7 issue out of "Blocked on quadraui".
 - **Milestone discipline:** new "delete vimcode's bespoke X for shared Y" work →
   **#7 Platform-Neutral**. A quadraui gap that *blocks* a #7 issue → file it on
-  `JDonaghy/quadraui` and add it to **quadraui milestone #9 "vimcode Platform-Neutral
+  `JDonaghy/quadraui` and re-open **quadraui milestone #9 "vimcode Platform-Neutral
   blockers"** (general quadraui-build that isn't a #7 blocker → vimcode #5 / the
   quadraui repo's own milestones).
