@@ -4747,6 +4747,81 @@ mod tests {
         );
     }
 
+    /// #674: `Ctrl-O` across tabs must *activate* the tab the jump was
+    /// recorded in, not reopen the file into whatever pane happens to be
+    /// current. Drives real key input (`ctrl_char('o')`) through the
+    /// `TuiDriver` and asserts on the rendered tab bar and editor body —
+    /// the black-box tier the #674 acceptance criteria calls for, not just
+    /// an `Engine`-internal check that `jump_list` got populated.
+    ///
+    /// This fails against unfixed `develop`: the old
+    /// `apply_jump_list_entry` only compared `(file, line, col)`, so the
+    /// second `Ctrl-O` would move the cursor inside tab B's own buffer
+    /// instead of switching back to tab A — the painted screen would still
+    /// show `BBB674`, not `AAA674`.
+    #[test]
+    fn ctrl_o_activates_original_tab_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_674_shell_app_jumplist_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a674.txt");
+        let file_b = dir.join("b674.txt");
+        let content_a: String = (0..30).map(|i| format!("AAA674 line {}\n", i)).collect();
+        let content_b: String = (0..30).map(|i| format!("BBB674 line {}\n", i)).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.handle_key("G", Some('G'), false); // push jump in tab A; cursor -> bottom
+
+        app.engine.new_tab(Some(&file_b));
+        app.engine.handle_key("G", Some('G'), false); // push jump in tab B; cursor -> bottom
+        assert_eq!(app.engine.active_group().active_tab, 1);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        // First Ctrl-O stays inside tab B's own history.
+        driver.ctrl_char('o');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BBB674"),
+            "first Ctrl-O should stay in tab B; screen:\n{screen}"
+        );
+
+        // Second Ctrl-O must switch back to tab A: the tab bar keeps
+        // exactly one entry per file (no fresh reopen), and the editor
+        // body paints A's text, not a stale copy of B's.
+        driver.ctrl_char('o');
+        let screen = driver.screen();
+        let tab_row = screen.lines().next().unwrap_or_default();
+        assert_eq!(
+            tab_row.matches("a674.txt").count(),
+            1,
+            "tab bar should show exactly one a674.txt tab (no fresh reopen); row:\n{tab_row}"
+        );
+        assert_eq!(
+            tab_row.matches("b674.txt").count(),
+            1,
+            "tab bar should still show exactly one b674.txt tab; row:\n{tab_row}"
+        );
+        assert!(
+            screen.contains("AAA674"),
+            "second Ctrl-O should activate tab A's own pane and paint its text; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("BBB674"),
+            "tab A's pane must not still be showing tab B's text; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #551: the unsplit (single editor group) case must still paint exactly
     /// one full-width tab bar on the editor's top row, and no group divider.
     ///

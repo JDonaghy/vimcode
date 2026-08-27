@@ -186,13 +186,27 @@ See [README.md](README.md) for full feature documentation.
 | `'.` | Jump to last edit line | ✅ | |
 | `` `. `` | Jump to last edit position | ✅ | |
 | `'<` / `'>` | Jump to visual selection | ✅ | |
-| `CTRL-O` | Jump list back | ✅ | |
-| `CTRL-I` | Jump list forward | ✅ | |
+| `CTRL-O` | Jump list back | ✅ | Carries tab/split identity (#674); see note below |
+| `CTRL-I` | Jump list forward | ✅ | Carries tab/split identity (#674); see note below |
 | `g;` | Older change position | ✅ | |
 | `g,` | Newer change position | ✅ | |
 | `g'` / `` g` `` | Mark jump without jumplist | ✅ | |
 
 **Search & Marks: 26/26 (100%)**
+
+**Known deviation — jumplist scope (#674):** stock Vim keeps one jumplist
+*per window* (`:help jumplist`): `CTRL-O`/`CTRL-I` never cross a window or
+tab boundary on their own, even though each entry still records which
+buffer it was in. VimCode's jumplist is intentionally **global** instead —
+one timeline shared across every tab and split. Each entry additionally
+records the group/tab/window it was made in, and `CTRL-O`/`CTRL-I` restore
+by *switching to that pane* when it still exists (falling back to
+reopening the file only if the pane was closed), rather than reopening the
+file into whichever pane is currently focused. This was a deliberate
+choice, not an oversight: the reported use case is explicitly cross-tab —
+"jump back to a tab I visited a few minutes earlier, then forward again" —
+which a strictly per-window jumplist cannot do. A tab/split closing prunes
+its entries from the list so `CTRL-O`/`CTRL-I` keep working afterward.
 
 ---
 

@@ -2276,6 +2276,24 @@ pub struct DiffPeekState {
     pub hunk: git::Hunk,
 }
 
+/// One entry in the jump list (`Ctrl-O` / `Ctrl-I`).
+///
+/// Besides the cursor position, an entry carries the *pane identity* it was
+/// recorded in — group, tab and window — so `apply_jump_list_entry` can
+/// restore by switching back to that pane when it still exists, rather than
+/// re-opening the file into whichever pane happens to be active now (#674).
+/// `file` is kept for display (`:jumps`) and as the path used by the
+/// recovery-path fallback when the pane is gone.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JumpEntry {
+    pub file: Option<PathBuf>,
+    pub line: usize,
+    pub col: usize,
+    pub group_id: GroupId,
+    pub tab_id: TabId,
+    pub window_id: WindowId,
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -2589,8 +2607,10 @@ pub struct Engine {
     leader_partial: Option<String>,
 
     // --- Jump list ---
-    /// List of (file_path, line, col) jump positions. Max 100 entries.
-    jump_list: Vec<(Option<PathBuf>, usize, usize)>,
+    /// List of jump positions, each carrying the pane (group/tab/window) it
+    /// was recorded in. Max 100 entries. Global across tabs/splits — see
+    /// `apply_jump_list_entry` doc comment for why this isn't per-window.
+    jump_list: Vec<JumpEntry>,
     /// Current position in jump list (points past the last entry when at newest).
     jump_list_pos: usize,
 

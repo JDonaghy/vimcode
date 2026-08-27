@@ -8801,6 +8801,197 @@ fn test_jump_list_paragraph_motion() {
     assert!(after_back < after_brace);
 }
 
+// --- #674: jumplist carries pane (tab/split) identity -----------------
+
+/// Reproduces the issue's headline scenario: jump inside tab A, open a
+/// second tab with file B, jump inside B, then walk `Ctrl-O` back. The old
+/// code compared only `(file, line, col)` — with both buffers unnamed
+/// (`file: None`) it never told the tabs apart, so `Ctrl-O` just moved the
+/// cursor inside whichever tab was already active instead of switching
+/// back to tab A. This fails against unfixed `develop`: the second
+/// `Ctrl-O`'s `active_tab` assertion sees `1` (still tab B), not `0`.
+#[test]
+fn test_jump_list_ctrl_o_returns_to_original_tab() {
+    let mut engine = Engine::new();
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content_a);
+    press_char(&mut engine, 'G'); // pushes (tab A, line 0); cursor -> last line
+    let tab_a_id = engine.active_tab().id;
+
+    engine.new_tab(None); // tab B, active
+    let content_b: String = (0..30).map(|i| format!("BBB line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content_b);
+    press_char(&mut engine, 'G'); // pushes (tab B, line 0); cursor -> last line
+    let tab_b_id = engine.active_tab().id;
+    assert_ne!(tab_a_id, tab_b_id);
+    assert_eq!(engine.active_group().active_tab, 1);
+
+    // First Ctrl-O stays within tab B's own history.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(
+        engine.active_group().active_tab,
+        1,
+        "first Ctrl-O should stay in tab B"
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+    assert!(engine.buffer().to_string().starts_with("BBB"));
+
+    // Second Ctrl-O exhausts B's history and must *activate* tab A —
+    // not open a fresh copy of A's content into tab B's pane.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(
+        engine.active_group().active_tab,
+        0,
+        "second Ctrl-O should switch back to tab A"
+    );
+    assert_eq!(engine.active_tab().id, tab_a_id);
+    assert_eq!(engine.view().cursor.line, 0);
+    assert!(
+        engine.buffer().to_string().starts_with("AAA"),
+        "Ctrl-O should have activated tab A's own buffer"
+    );
+    assert_eq!(
+        engine.active_group().tabs.len(),
+        2,
+        "Ctrl-O must not create a third tab"
+    );
+
+    // Ctrl-I retraces forward, back into tab B — still just 2 tabs.
+    press_ctrl(&mut engine, 'i');
+    assert_eq!(engine.active_group().active_tab, 1);
+    assert_eq!(engine.active_group().tabs.len(), 2);
+}
+
+/// Same identity-based restore, but across two splits in one tab rather
+/// than two tabs — both windows share the *same* buffer, so this can only
+/// pass if `apply_jump_list_entry` is switching on window identity, not on
+/// file path. Fails against unfixed `develop`: the old code never changes
+/// `active_window`, so the second `Ctrl-O` leaves the cursor in split B.
+#[test]
+fn test_jump_list_ctrl_o_returns_to_original_split() {
+    let mut engine = Engine::new();
+    let content: String = (0..30).map(|i| format!("line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content);
+    press_char(&mut engine, 'G'); // pushes (split A, line 0); cursor -> last line
+    let window_a_id = engine.active_window_id();
+
+    engine.split_window(SplitDirection::Vertical, None); // split B, active
+    let window_b_id = engine.active_window_id();
+    assert_ne!(window_a_id, window_b_id);
+
+    engine.view_mut().cursor.line = 5;
+    press_char(&mut engine, 'G'); // pushes (split B, line 5); cursor -> last line
+
+    // First Ctrl-O stays in split B.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(engine.active_window_id(), window_b_id);
+    assert_eq!(engine.view().cursor.line, 5);
+
+    // Second Ctrl-O must switch focus back to split A.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(
+        engine.active_window_id(),
+        window_a_id,
+        "second Ctrl-O should switch focus back to split A"
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
+/// Closing a tab that appears in the jumplist must not resurrect it: the
+/// dead entry is pruned, and `Ctrl-O` keeps working by skipping straight
+/// over it rather than reopening the closed file or panicking.
+#[test]
+fn test_jump_list_prunes_entry_on_tab_close() {
+    let mut engine = Engine::new();
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    engine.buffer_mut().insert(0, &content_a);
+    press_char(&mut engine, 'G'); // entry 1: (tab A, line 0)
+    let tab_a_id = engine.active_tab().id;
+    let bottom_a = engine.view().cursor.line;
+
+    engine.new_tab(None); // tab B
+    engine
+        .buffer_mut()
+        .insert(0, "BBB doomed tab, should never come back\n");
+    press_char(&mut engine, 'G'); // entry 2: (tab B, line 0) — will be pruned
+    let tab_b_id = engine.active_tab().id;
+    let tab_b_window = engine.active_window_id();
+
+    engine.goto_tab(0); // back to tab A without going through the jumplist
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'g'); // entry 3: (tab A, bottom_a); cursor -> line 0
+
+    // Close tab B — its jumplist entry must be pruned.
+    engine.goto_tab(1);
+    assert_eq!(engine.active_tab().id, tab_b_id);
+    engine.close_tab();
+    assert!(
+        !engine
+            .jump_list
+            .iter()
+            .any(|e| e.tab_id == tab_b_id || e.window_id == tab_b_window),
+        "closing tab B must drop its jumplist entry"
+    );
+    assert_eq!(engine.active_tab().id, tab_a_id, "only tab A remains");
+
+    // Ctrl-O must keep working: first hop goes to (tab A, bottom_a) — the
+    // entry recorded by the `gg` above — never touching the pruned entry.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(engine.active_tab().id, tab_a_id);
+    assert_eq!(engine.view().cursor.line, bottom_a);
+
+    // Second hop goes further back to (tab A, line 0) — still no panic,
+    // still no attempt to reopen the closed tab B.
+    press_ctrl(&mut engine, 'o');
+    assert_eq!(engine.active_tab().id, tab_a_id);
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.active_group().tabs.len(),
+        1,
+        "no tab should have been reopened while walking the jumplist"
+    );
+}
+
+/// `:jumps` must reflect the widened entries: a `tab` column showing the
+/// still-alive pane's `TabId`, or `x` once that pane has been closed.
+#[test]
+fn test_ex_jumps_shows_tab_identity() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    press_char(&mut engine, 'G');
+    let tab_a_id = engine.active_tab().id;
+
+    engine.new_tab(None);
+    engine.buffer_mut().insert(0, "four\nfive\nsix\n");
+    press_char(&mut engine, 'G');
+
+    engine.execute_command("jumps");
+    assert!(
+        engine.message.contains(&format!("{}", tab_a_id.0)),
+        ":jumps should list tab A's TabId while it's alive; message:\n{}",
+        engine.message
+    );
+
+    // A pane that's gone (normally pruned away entirely on close — see
+    // `test_jump_list_prunes_entry_on_tab_close`) must still render safely
+    // as "x" rather than crashing or claiming a dead pane is reachable.
+    // Fabricate one directly to pin down that defensive display path.
+    engine.jump_list.push(JumpEntry {
+        file: None,
+        line: 0,
+        col: 0,
+        group_id: GroupId(9999),
+        tab_id: TabId(9999),
+        window_id: WindowId(9999),
+    });
+    engine.execute_command("jumps");
+    assert!(
+        engine.message.contains(" x  "),
+        ":jumps should mark an unreachable pane's entry as dead; message:\n{}",
+        engine.message
+    );
+}
+
 // =======================================================================
 // Tests: Indent / Dedent (>> / <<)
 // =======================================================================

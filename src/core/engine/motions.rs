@@ -4933,6 +4933,19 @@ impl Engine {
         self.change_list_pos = self.change_list.len();
     }
 
+    /// Build a `JumpEntry` snapshot of the engine's current cursor position
+    /// and the pane (group/tab/window) it's in.
+    fn current_jump_entry(&self) -> JumpEntry {
+        JumpEntry {
+            file: self.active_buffer_state().file_path.clone(),
+            line: self.view().cursor.line,
+            col: self.view().cursor.col,
+            group_id: self.active_group,
+            tab_id: self.active_tab().id,
+            window_id: self.active_window_id(),
+        }
+    }
+
     /// Push the current cursor position onto the jump list.
     pub fn push_jump_location(&mut self) {
         // Save pre-jump position for '' / `` marks
@@ -4940,9 +4953,7 @@ impl Engine {
         let col = self.view().cursor.col;
         self.last_jump_pos = Some((line, col));
 
-        let file = self.active_buffer_state().file_path.clone();
-        let line = self.view().cursor.line;
-        let col = self.view().cursor.col;
+        let entry = self.current_jump_entry();
 
         // Truncate forward history when a new jump is made
         if self.jump_list_pos < self.jump_list.len() {
@@ -4950,13 +4961,11 @@ impl Engine {
         }
 
         // Don't push a duplicate of the current top entry
-        if let Some(last) = self.jump_list.last() {
-            if last.0 == file && last.1 == line && last.2 == col {
-                return;
-            }
+        if self.jump_list.last() == Some(&entry) {
+            return;
         }
 
-        self.jump_list.push((file, line, col));
+        self.jump_list.push(entry);
 
         // Cap at 100 entries
         if self.jump_list.len() > 100 {
@@ -4975,15 +4984,10 @@ impl Engine {
                 self.message = "Already at oldest position in jump list".to_string();
                 return;
             }
-            let file = self.active_buffer_state().file_path.clone();
-            let line = self.view().cursor.line;
-            let col = self.view().cursor.col;
-            #[allow(clippy::unnecessary_map_or)] // is_none_or requires Rust 1.82+
-            let should_push = self.jump_list.last().map_or(true, |last| {
-                last.0 != file || last.1 != line || last.2 != col
-            });
+            let entry = self.current_jump_entry();
+            let should_push = self.jump_list.last() != Some(&entry);
             if should_push {
-                self.jump_list.push((file, line, col));
+                self.jump_list.push(entry);
                 if self.jump_list.len() > 100 {
                     self.jump_list.remove(0);
                 }
@@ -5021,26 +5025,44 @@ impl Engine {
     }
 
     /// Move to the position stored at the given jump list index.
+    ///
+    /// Restores **by lookup, not by open** (#674): if the entry's
+    /// group/tab/window still exist, switch to that exact pane — the same
+    /// tab/split gets activated, not a fresh copy of the file opened into
+    /// whatever pane is currently focused. Only when the pane is gone
+    /// (its tab or split was closed) does this fall back to
+    /// `open_file_with_mode`, which opens the file into the *current*
+    /// window; that fallback is the recovery path, not the normal one.
+    ///
+    /// The jump list is deliberately global rather than per-window (stock
+    /// Vim keeps one jumplist per window — see `:help jumplist`). This repo
+    /// chose global because the reported use case is explicitly
+    /// cross-tab/cross-pane: walking Ctrl-O back through time should surface
+    /// the tab you were in a few jumps ago, not stop dead at the pane
+    /// boundary. See VIM_COMPATIBILITY.md for the recorded decision.
     pub(crate) fn apply_jump_list_entry(&mut self, idx: usize) {
         let entry = match self.jump_list.get(idx) {
             Some(e) => e.clone(),
             None => return,
         };
 
-        let (file, line, col) = entry;
-
-        // If cross-file, open the file
-        let current_file = self.active_buffer_state().file_path.clone();
-        if file != current_file {
-            if let Some(path) = &file {
-                let path = path.clone();
-                let _ = self.open_file_with_mode(&path, OpenMode::Permanent);
+        if let Some((group_id, tab_idx)) =
+            self.locate_jump_pane(entry.group_id, entry.tab_id, entry.window_id)
+        {
+            self.switch_to_jump_pane(group_id, tab_idx, entry.window_id);
+        } else {
+            // Pane is gone — recover by opening the file into the current window.
+            let current_file = self.active_buffer_state().file_path.clone();
+            if entry.file != current_file {
+                if let Some(path) = &entry.file {
+                    let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                }
             }
         }
 
         let max_line = self.buffer().len_lines().saturating_sub(1);
-        self.view_mut().cursor.line = line.min(max_line);
-        self.view_mut().cursor.col = col;
+        self.view_mut().cursor.line = entry.line.min(max_line);
+        self.view_mut().cursor.col = entry.col;
         self.clamp_cursor_col();
     }
 
