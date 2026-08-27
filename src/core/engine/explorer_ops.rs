@@ -72,6 +72,41 @@ impl Engine {
         }
     }
 
+    /// Expand every ancestor of `target`, rebuild the flattened row list,
+    /// select `target`'s row and scroll it into view.
+    ///
+    /// # Why this still calls `TreeController::scroll_to_visible` (#659)
+    ///
+    /// #659 asked for the select-and-scroll half of this to be re-expressed on
+    /// top of the composition quadraui#595 promoted *from this function*. That
+    /// adoption is blocked, and the block is an altitude mismatch rather than
+    /// a missing bump: quadraui#595 landed `reveal` on
+    /// [`quadraui::SidebarSystem`] only —
+    /// `SidebarSystem::reveal(section, path, rect)` — and there is no
+    /// `TreeController::reveal`. `SidebarSystem::reveal` needs a
+    /// `SidebarSystem` with `set_backend_info` already called and a viewport
+    /// `Rect` to measure row capacity from; the explorer drives a bare
+    /// `TreeController` (`self.explorer_tree`) with a pre-computed
+    /// `self.explorer_viewport_rows`, and is not a `SidebarSystem` section at
+    /// all — unlike `ext_sidebar_system` / `sc_sidebar_system` /
+    /// `dap_sidebar_system`, which are.
+    ///
+    /// So the two ways to close this are: (a) quadraui factors the generic
+    /// half of `SidebarSystem::reveal` down onto `TreeController` — something
+    /// like `TreeController::reveal(&mut self, path: &TreePath, viewport_rows:
+    /// usize)`, with `SidebarSystem::reveal` then being "expand the section,
+    /// measure the viewport, delegate" — after which the three lines below
+    /// collapse into one call; or (b) vimcode migrates the explorer onto
+    /// `SidebarSystem`, which is a behaviour-bearing refactor #659 explicitly
+    /// puts out of scope. (a) is the one that matches the promotion's intent,
+    /// because the duplication quadraui#595 exists to remove is precisely
+    /// *this* select-then-scroll pair, not the section bookkeeping around it.
+    ///
+    /// Until then this stays as-is on purpose: it is the reference
+    /// composition, and rewriting it to *look* shared while still owning the
+    /// math would be worse than leaving it honestly local. Per CLAUDE.md the
+    /// next step is a quadraui issue for `TreeController::reveal`, not a
+    /// vimcode-side approximation.
     pub fn explorer_reveal_path(&mut self, target: &Path) {
         let root = self.cwd.clone();
         if let Ok(rel) = target.strip_prefix(&root) {
