@@ -87,6 +87,28 @@
 # green on this rev. The #594 / #595 rationale for the original #659 bump is
 # unchanged and recorded immediately below.
 #
+# Do NOT bump this line again to chase the shared checkout (#659 smoke round 2)
+# -----------------------------------------------------------------------------
+# The #659 smoke re-run failed with QUADRAUI PIN MISMATCH a *second* time, in
+# the other direction: pinned 5a418ca, checkout HEAD f6d27c2. The smoke ran in
+# `~/.coord/confirm-worktrees/…`, which has no sibling `../quadraui`, so
+# `build.rs` fell back to the machine-wide `~/src/quadraui` — a checkout shared
+# between concurrently running agents, and at that moment still parked on the
+# old pin. Nothing in vimcode was wrong; the working tree was simply pointed at
+# a quadraui that predates the two APIs this branch adopts.
+#
+# 5a418ca is a hard *floor*, not a preference: `src/render.rs::tab_hit_width`
+# needs quadraui#554's column-measuring tab bar and `src/gtk/testing.rs` needs
+# quadraui#594's `GtkDriver::tab_center` / `tab_close_center`, neither of which
+# exists at f6d27c2. Moving this line back to satisfy a stale checkout does not
+# compile. The fix is always on the checkout side:
+#
+#     git -C ~/src/quadraui fetch origin
+#     git -C ~/src/quadraui checkout 5a418cac9f9a5cb5a8470a6bf011c4358a7f1704
+#
+# Bump this line only to adopt a quadraui commit vimcode actually needs — never
+# to make a mismatched worktree go quiet.
+#
 # Previous pin: 3ad869a — "fix(quadraui#595): gate the sidebar_reveal examples on their
 # backend feature". Bumped by vimcode#659 to adopt the two helpers that were
 # *promoted out of this repo* into quadraui:
