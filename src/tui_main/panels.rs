@@ -1823,3 +1823,230 @@ mod sc_panel_tests {
         let _ = render_sc(&e, 10, 3);
     }
 }
+
+// ─── Activity-bar keyboard ring (#536) ───────────────────────────────────────
+//
+// Black-box coverage for the migration of the activity-bar keyboard cursor
+// onto quadraui's `AppShell` (quadraui#386). Every assertion reads the
+// **rasterised** activity-bar strip — the row whose background is the
+// selection colour — rather than `Engine::activity_bar_selected`, so a
+// selection index that moves correctly but paints on the wrong icon (the
+// #587/#592 failure mode: state populated, nothing painted) still fails here.
+//
+// The ring's ordering is the thing under test: hamburger, the six fixed
+// panels, the dynamic extension panels spliced in *before* Settings, and
+// Settings pinned last — while the legacy `activity_bar_selected` index space
+// numbers Settings at 7 and extension panels at 8+. Before #536 that mismatch
+// was reconciled by a hand-rolled `if sel < 6 { … } else if sel == 6 && …`
+// chain in `core::engine::sidebar`; it is now `AppShell`'s cursor.
+#[cfg(test)]
+mod activity_bar_keyboard_ring_tests {
+    use super::*;
+    use crate::core::plugin::PanelRegistration;
+    use ratatui::buffer::Buffer;
+
+    const BAR_W: u16 = 3;
+    const BAR_H: u16 = 12;
+
+    fn ring_engine() -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new_for_test();
+        e.extension_state = crate::core::session::ExtensionState::default();
+        e.ext_registry = None;
+        e.ext_panels.clear();
+        e
+    }
+
+    fn add_ext(e: &mut Engine, name: &str, icon: char) {
+        e.ext_panels.insert(
+            name.to_string(),
+            PanelRegistration {
+                name: name.to_string(),
+                title: name.to_string(),
+                icon,
+                fallback_icon: Some(icon),
+                sections: vec![],
+            },
+        );
+    }
+
+    /// Paint the activity bar and return `(row, icon_char)` for the single row
+    /// carrying the keyboard-selection background, or `None` when no row does.
+    ///
+    /// `draw_activity_bar` fills the selected row with `bar.selection_bg`
+    /// (`theme.cursor`) and every other row with `theme.tab_bar_bg`, so the
+    /// probe is "which row's background is the cursor colour" — the same thing
+    /// a user sees. The icon glyph comes back with it so the assertions can
+    /// name the item rather than a bare row number (#555: probe, don't
+    /// hardcode).
+    fn painted_ring(engine: &Engine) -> Option<(u16, char)> {
+        let theme = crate::render::Theme::onedark();
+        let sel = ratatui::style::Color::Rgb(theme.cursor.r, theme.cursor.g, theme.cursor.b);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: BAR_W,
+            height: BAR_H,
+        };
+        let mut buf = Buffer::empty(area);
+        let sidebar = TuiSidebar::new();
+        render_activity_bar(&mut buf, area, &sidebar, &theme, false, engine);
+
+        let mut hit = None;
+        for y in 0..BAR_H {
+            if buf[(0, y)].bg == sel {
+                assert!(
+                    hit.is_none(),
+                    "more than one row painted the selection ring"
+                );
+                hit = Some((y, buf[(1, y)].symbol().chars().next().unwrap_or(' ')));
+            }
+        }
+        hit
+    }
+
+    /// The ring only paints while the bar holds keyboard focus, and `j` walks
+    /// the fixed panels top-down from the hamburger.
+    #[test]
+    fn ring_paints_only_when_focused_and_j_walks_the_fixed_panels() {
+        let mut e = ring_engine();
+        assert_eq!(
+            painted_ring(&e),
+            None,
+            "no ring should paint while the activity bar is unfocused"
+        );
+
+        e.activity_bar_focus_in_at(0);
+        let (hamburger_row, _) = painted_ring(&e).expect("focusing the bar must paint a ring");
+        assert_eq!(hamburger_row, 0, "index 0 is the hamburger, the top row");
+
+        for expected_row in 1..=6 {
+            e.activity_bar_move_down();
+            let (row, _) = painted_ring(&e).expect("ring must stay painted while stepping");
+            assert_eq!(
+                row,
+                expected_row,
+                "j from row {} must land on row {expected_row}",
+                expected_row - 1
+            );
+        }
+    }
+
+    /// With no extension panels, `j` past the last fixed panel (AI) lands on
+    /// Settings — which paints *pinned to the bottom edge*, not on row 7 — and
+    /// saturates there. `k` comes straight back to AI.
+    #[test]
+    fn ring_steps_from_ai_to_bottom_pinned_settings_and_saturates() {
+        let mut e = ring_engine();
+        e.activity_bar_focus_in_at(6); // AI, the last fixed panel
+        assert_eq!(painted_ring(&e).map(|(r, _)| r), Some(6));
+
+        e.activity_bar_move_down();
+        assert_eq!(
+            painted_ring(&e).map(|(r, _)| r),
+            Some(BAR_H - 1),
+            "Settings is bottom-pinned, so the ring must jump to the last row"
+        );
+        assert_eq!(e.activity_bar_selected, 7, "Settings is toolbar index 7");
+
+        e.activity_bar_move_down();
+        assert_eq!(
+            painted_ring(&e).map(|(r, _)| r),
+            Some(BAR_H - 1),
+            "j on the bottom-most item must saturate, not wrap to the top"
+        );
+
+        e.activity_bar_move_up();
+        assert_eq!(
+            painted_ring(&e).map(|(r, _)| r),
+            Some(6),
+            "k from Settings with no extension panels returns to AI"
+        );
+    }
+
+    /// `k` on the top-most item saturates rather than wrapping to Settings.
+    #[test]
+    fn ring_saturates_at_the_hamburger() {
+        let mut e = ring_engine();
+        e.activity_bar_focus_in_at(0);
+        e.activity_bar_move_up();
+        assert_eq!(painted_ring(&e).map(|(r, _)| r), Some(0));
+        assert_eq!(e.activity_bar_selected, 0);
+    }
+
+    /// The headline ordering claim: extension panels splice in **between** AI
+    /// and Settings in painted order (sorted by name), even though the legacy
+    /// index space numbers them *after* Settings. Walking `j` from AI must
+    /// visit both extension icons and only then reach Settings.
+    #[test]
+    fn ring_splices_extension_panels_between_ai_and_settings() {
+        let mut e = ring_engine();
+        add_ext(&mut e, "zz-last", 'Z');
+        add_ext(&mut e, "aa-first", 'A');
+        e.activity_bar_focus_in_at(6); // AI
+
+        e.activity_bar_move_down();
+        assert_eq!(
+            painted_ring(&e),
+            Some((7, 'A')),
+            "j from AI must land on the first extension panel (sorted by name)"
+        );
+        assert_eq!(e.activity_bar_selected, 8, "…which is toolbar index 8");
+
+        e.activity_bar_move_down();
+        assert_eq!(
+            painted_ring(&e),
+            Some((8, 'Z')),
+            "j must then land on the second extension panel"
+        );
+        assert_eq!(e.activity_bar_selected, 9);
+
+        e.activity_bar_move_down();
+        assert_eq!(
+            painted_ring(&e).map(|(r, _)| r),
+            Some(BAR_H - 1),
+            "only after the last extension panel does j reach bottom-pinned Settings"
+        );
+        assert_eq!(e.activity_bar_selected, 7);
+
+        // …and `k` from Settings walks back onto the *last* extension panel.
+        e.activity_bar_move_up();
+        assert_eq!(painted_ring(&e), Some((8, 'Z')));
+        assert_eq!(e.activity_bar_selected, 9);
+
+        e.activity_bar_move_up();
+        assert_eq!(painted_ring(&e), Some((7, 'A')));
+
+        e.activity_bar_move_up();
+        assert_eq!(
+            painted_ring(&e).map(|(r, _)| r),
+            Some(6),
+            "k off the first extension panel returns to AI, not to Settings"
+        );
+        assert_eq!(e.activity_bar_selected, 6);
+    }
+
+    /// A selection left pointing at an extension panel that has since been
+    /// unregistered (`:PluginReload`) must not wedge the cursor: the next
+    /// `k` has to move somewhere real. Pre-#536 the bespoke `sel > 8` arm
+    /// stepped to 8; the `AppShell` cursor clamps to the last item first and
+    /// then steps, landing in the same place.
+    #[test]
+    fn ring_recovers_from_a_stale_extension_index() {
+        let mut e = ring_engine();
+        add_ext(&mut e, "only-one", 'O');
+        e.activity_bar_focus_in_at(9); // second ext panel — no longer exists
+        assert_eq!(
+            painted_ring(&e),
+            None,
+            "a selection naming no item paints no ring"
+        );
+
+        e.activity_bar_move_up();
+        assert_eq!(
+            e.activity_bar_selected, 8,
+            "k must recover onto the one extension panel that does exist"
+        );
+        assert_eq!(painted_ring(&e).map(|(r, _)| r), Some(7));
+    }
+}

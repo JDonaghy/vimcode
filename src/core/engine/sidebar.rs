@@ -17,6 +17,21 @@ pub const PANEL_EXTENSIONS: &str = "panel:extensions";
 pub const PANEL_AI: &str = "panel:ai";
 pub const PANEL_SETTINGS: &str = "bottom:settings";
 
+/// Activity-bar item id for the hamburger (menu) slot — keyboard index 0.
+///
+/// The TUI registers this as `panels[0]` of its live [`quadraui::AppShell`]
+/// (`tui_main::shell_app::TuiShellApp::live_shell_config`) and
+/// `render::build_activity_bar` mints the same id for its hamburger
+/// `ActivityItem`, so it is the one activity-bar id that is *already* shared
+/// across the two id spaces described on [`EXT_PANEL_ID_PREFIX`]. Promoted out
+/// of `tui_main::shell_app` (#536) so [`Engine::activity_bar_item_id`] can name
+/// the slot without the core depending on a backend module.
+///
+/// GTK paints no hamburger (`include_hamburger = false`), but the slot still
+/// exists in the keyboard sequence there — `k` from Explorer lands on it and
+/// `l`/Enter toggles the menu bar. That predates #536 and is preserved by it.
+pub const HAMBURGER_PANEL_ID: &str = "activity:menu";
+
 /// Panel-id prefix for plugin-provided ("extension") sidebar panels — e.g. the
 /// `git-insights` extension's panel is `"ext:git-insights"` (#557).
 ///
@@ -58,6 +73,25 @@ pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 6] = [
     PANEL_EXTENSIONS,
     PANEL_AI,
 ];
+
+/// Keyboard (toolbar) index of the bottom-pinned Settings item.
+///
+/// The activity bar's *painted* order is hamburger, the fixed panels, the
+/// dynamic extension panels, then Settings pinned to the bottom — but the
+/// legacy `activity_bar_selected` index space numbers Settings **before** the
+/// extension panels, because extension panels were added after the built-in
+/// indices had already been baked into call sites like
+/// `Engine::activity_bar_focus_in_at(7)`. That mismatch is exactly why the
+/// up/down stepping used to need bespoke arithmetic; since #536 the stepping
+/// is done by quadraui's `AppShell` cursor over the *painted* order and these
+/// two constants are all that remains of the index space — a lookup table,
+/// not a sequencing rule.
+pub const TOOLBAR_IDX_SETTINGS: u16 = FIXED_ACTIVITY_PANEL_IDS.len() as u16 + 1;
+
+/// First keyboard (toolbar) index occupied by a dynamic extension panel.
+/// See [`TOOLBAR_IDX_SETTINGS`] for why extension panels sit *after* Settings
+/// in the index space while painting *before* it.
+pub const TOOLBAR_IDX_EXT_BASE: u16 = TOOLBAR_IDX_SETTINGS + 1;
 
 impl Engine {
     /// Activity-bar [`quadraui::PanelDefinition`]s for every plugin-registered
@@ -245,16 +279,14 @@ impl Engine {
             .active_panel_id()
             .map(|w| w.as_str())
             .unwrap_or("");
-        match id {
-            PANEL_EXPLORER => 1,
-            PANEL_SEARCH => 2,
-            PANEL_DEBUG => 3,
-            PANEL_GIT => 4,
-            PANEL_EXTENSIONS => 5,
-            PANEL_AI => 6,
-            PANEL_SETTINGS => 7,
-            _ => 1,
+        if id == PANEL_SETTINGS {
+            return TOOLBAR_IDX_SETTINGS;
         }
+        FIXED_ACTIVITY_PANEL_IDS
+            .iter()
+            .position(|p| *p == id)
+            .map(|i| i as u16 + 1)
+            .unwrap_or(1)
     }
 
     /// Remove activity bar keyboard focus (return focus to the editor).
@@ -262,40 +294,158 @@ impl Engine {
         self.activity_bar_focused = false;
     }
 
+    /// The activity bar's items **in painted order**, as a throwaway
+    /// [`quadraui::AppShell`] whose keyboard cursor (quadraui#386) does the
+    /// stepping for [`Self::activity_bar_move_down`] / [`Self::activity_bar_move_up`].
+    ///
+    /// Panel list and bottom-item list mirror the TUI's live `ShellConfig`
+    /// (`tui_main::shell_app::TuiShellApp::live_shell_config`) exactly:
+    /// hamburger, the fixed panels, the dynamic extension panels sorted by
+    /// name, then Settings pinned to the bottom. `AppShell`'s cursor spans
+    /// `panels` then `bottom_items` as one sequence and saturates at both ends,
+    /// which *is* vimcode's ordering — so no vimcode-side arithmetic is left.
+    ///
+    /// Built on demand rather than cached as a field: the ext-panel list is
+    /// derived from `self.ext_panels`, which a plugin can mutate at any point
+    /// in the session, so deriving it per keypress is what makes it impossible
+    /// for the nav sequence to go stale. It is a `Vec` of ~8 empty-metadata
+    /// `PanelDefinition`s built once per `j`/`k`, which is not worth caching.
+    ///
+    /// Only ids matter here, so icon/tooltip/title are left empty — nothing
+    /// paints this shell.
+    fn activity_nav_shell(&self) -> quadraui::AppShell {
+        fn def(id: &str) -> quadraui::PanelDefinition {
+            quadraui::PanelDefinition {
+                id: quadraui::WidgetId::new(id),
+                icon: String::new(),
+                tooltip: String::new(),
+                title: String::new(),
+            }
+        }
+        let mut panels = Vec::with_capacity(1 + FIXED_ACTIVITY_PANEL_IDS.len());
+        panels.push(def(HAMBURGER_PANEL_ID));
+        panels.extend(FIXED_ACTIVITY_PANEL_IDS.into_iter().map(def));
+        // Same list, same sort order, that both backends' `ShellConfig`
+        // builders and `render::build_activity_bar` use.
+        panels.extend(self.ext_activity_panels());
+        quadraui::AppShell::new(panels, 0.0).with_bottom_items(vec![def(PANEL_SETTINGS)])
+    }
+
+    /// The activity-bar item id at keyboard (toolbar) index `idx`, or `None`
+    /// when `idx` names no item (e.g. a stale extension index after a
+    /// `:PluginReload` dropped the panel).
+    ///
+    /// Index mapping: 0 = hamburger, 1..=6 = [`FIXED_ACTIVITY_PANEL_IDS`],
+    /// [`TOOLBAR_IDX_SETTINGS`] = Settings, [`TOOLBAR_IDX_EXT_BASE`]`+ k` =
+    /// the `k`-th extension panel (sorted by name).
+    pub fn activity_bar_item_id(&self, idx: u16) -> Option<String> {
+        if idx == 0 {
+            return Some(HAMBURGER_PANEL_ID.to_string());
+        }
+        if idx == TOOLBAR_IDX_SETTINGS {
+            return Some(PANEL_SETTINGS.to_string());
+        }
+        if idx < TOOLBAR_IDX_SETTINGS {
+            return Some(FIXED_ACTIVITY_PANEL_IDS[idx as usize - 1].to_string());
+        }
+        let k = (idx - TOOLBAR_IDX_EXT_BASE) as usize;
+        self.sorted_ext_panel_names()
+            .get(k)
+            .map(|n| ext_panel_id(n))
+    }
+
+    /// Inverse of [`Self::activity_bar_item_id`].
+    pub fn activity_bar_idx_for_item_id(&self, id: &str) -> Option<u16> {
+        if id == HAMBURGER_PANEL_ID {
+            return Some(0);
+        }
+        if id == PANEL_SETTINGS {
+            return Some(TOOLBAR_IDX_SETTINGS);
+        }
+        if let Some(i) = FIXED_ACTIVITY_PANEL_IDS.iter().position(|p| *p == id) {
+            return Some(i as u16 + 1);
+        }
+        let name = ext_panel_name_from_id(id)?;
+        self.sorted_ext_panel_names()
+            .iter()
+            .position(|n| n == name)
+            .map(|i| i as u16 + TOOLBAR_IDX_EXT_BASE)
+    }
+
+    /// The activity-bar item id currently under the keyboard cursor.
+    ///
+    /// `render::build_activity_bar` compares each `ActivityItem`'s panel id
+    /// against this to set `is_keyboard_selected`, instead of re-deriving the
+    /// item's numeric toolbar index at the paint site (#536).
+    pub fn activity_bar_selected_item_id(&self) -> Option<String> {
+        self.activity_bar_item_id(self.activity_bar_selected)
+    }
+
+    /// Extension panel names in the order they are painted (sorted by name),
+    /// matching [`Self::ext_activity_panels`].
+    fn sorted_ext_panel_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.ext_panels.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// Move the keyboard cursor one position down in the activity bar.
     pub fn activity_bar_move_down(&mut self) {
-        let ext_count = self.ext_panels.len() as u16;
-        let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
-        let sel = self.activity_bar_selected;
-        if sel < 6 {
-            self.activity_bar_selected = sel + 1;
-        } else if sel == 6 && ext_count > 0 {
-            self.activity_bar_selected = 8; // first ext panel
-        } else if sel == 6 {
-            self.activity_bar_selected = 7; // settings
-        } else if sel >= 8 && sel < max_ext {
-            self.activity_bar_selected = sel + 1;
-        } else if sel >= 8 && sel == max_ext {
-            self.activity_bar_selected = 7; // settings
-        }
-        // sel == 7 (settings) → no movement (already at bottom)
+        self.activity_bar_step(true);
     }
 
     /// Move the keyboard cursor one position up in the activity bar.
     pub fn activity_bar_move_up(&mut self) {
-        let ext_count = self.ext_panels.len() as u16;
-        let max_ext = if ext_count > 0 { 7 + ext_count } else { 0 };
-        let sel = self.activity_bar_selected;
-        if sel == 7 && ext_count > 0 {
-            self.activity_bar_selected = max_ext; // settings → last ext
-        } else if sel == 7 {
-            self.activity_bar_selected = 6; // settings → AI
-        } else if sel == 8 {
-            self.activity_bar_selected = 6; // first ext → AI
-        } else if sel > 8 {
-            self.activity_bar_selected = sel - 1;
+        self.activity_bar_step(false);
+    }
+
+    /// Step the activity-bar keyboard cursor by delegating to
+    /// [`quadraui::AppShell`]'s `activity_select_next`/`activity_select_prev`
+    /// (quadraui#386) over [`Self::activity_nav_shell`].
+    ///
+    /// Translates the stored `activity_bar_selected` index into the shell's
+    /// painted-order cursor, steps, and translates the resulting *item id*
+    /// back.
+    ///
+    /// A selection that names no item — a stale extension index left behind
+    /// when `:PluginReload` dropped a panel — is clamped to the last item
+    /// before stepping, mirroring what `AppShell::remove_panel` does to its
+    /// own cursor. Without that the cursor would be wedged: every subsequent
+    /// `j`/`k` would find no id to start from and refuse to move.
+    fn activity_bar_step(&mut self, forward: bool) {
+        let mut shell = self.activity_nav_shell();
+        let np = shell.panels().len();
+        let total = np + shell.bottom_items().len();
+        if total == 0 {
+            return;
+        }
+        let cursor = self
+            .activity_bar_selected_item_id()
+            .and_then(|cur_id| {
+                shell
+                    .panels()
+                    .iter()
+                    .position(|p| p.id.as_str() == cur_id)
+                    .or_else(|| {
+                        shell
+                            .bottom_items()
+                            .iter()
+                            .position(|p| p.id.as_str() == cur_id)
+                            .map(|i| np + i)
+                    })
+            })
+            .unwrap_or(total - 1);
+        shell.activity_set_cursor(cursor);
+        if forward {
+            shell.activity_select_next();
         } else {
-            self.activity_bar_selected = sel.saturating_sub(1);
+            shell.activity_select_prev();
+        }
+        let Some(next_id) = shell.activity_selected_id().map(|w| w.as_str().to_string()) else {
+            return;
+        };
+        if let Some(idx) = self.activity_bar_idx_for_item_id(&next_id) {
+            self.activity_bar_selected = idx;
         }
     }
 
@@ -306,53 +456,38 @@ impl Engine {
     /// `ActivityBarActivation` to perform any backend-specific follow-up
     /// (e.g. setting `sidebar.has_focus`, closing TUI menu).
     pub fn activity_bar_activate(&mut self) -> ActivityBarActivation {
-        let sel = self.activity_bar_selected;
         self.activity_bar_focused = false;
-        match sel {
-            0 => {
-                self.toggle_menu_bar();
-                ActivityBarActivation::MenuToggled
-            }
-            1..=6 => {
-                let panel_id = match sel {
-                    1 => PANEL_EXPLORER,
-                    2 => PANEL_SEARCH,
-                    3 => PANEL_DEBUG,
-                    4 => PANEL_GIT,
-                    5 => PANEL_EXTENSIONS,
-                    _ => PANEL_AI,
-                };
-                self.ext_panel_has_focus = false;
-                self.ext_panel_active = None;
-                self.focus_sidebar_panel(panel_id);
-                ActivityBarActivation::PanelFocused
-            }
-            7 => {
-                self.ext_panel_has_focus = false;
-                self.ext_panel_active = None;
-                self.focus_sidebar_panel(PANEL_SETTINGS);
-                ActivityBarActivation::PanelFocused
-            }
-            idx => {
-                let ext_idx = (idx - 8) as usize;
-                let mut ext_names: Vec<_> = self.ext_panels.keys().cloned().collect();
-                ext_names.sort();
-                if ext_idx < ext_names.len() {
-                    let name = ext_names[ext_idx].clone();
-                    if !self.app_shell.sidebar_visible() {
-                        self.app_shell.show_panel(&quadraui::WidgetId::new(&name));
-                        self.session.explorer_visible = true;
-                        let _ = self.session.save();
-                    }
-                    self.ext_panel_active = Some(name.clone());
-                    self.ext_panel_has_focus = true;
-                    self.ext_panel_selected = 0;
-                    self.plugin_event("panel_focus", &name);
-                    ActivityBarActivation::ExtPanelFocused(name)
-                } else {
-                    ActivityBarActivation::NoOp
-                }
-            }
+        // #536: dispatch on the item *id* rather than re-deriving `sel - 8`
+        // here. `activity_bar_item_id` owns the one index↔id table, so an
+        // out-of-range selection (stale extension index) yields `None` → NoOp,
+        // exactly as the old `ext_idx < ext_names.len()` guard did.
+        let Some(id) = self.activity_bar_selected_item_id() else {
+            return ActivityBarActivation::NoOp;
+        };
+
+        if id == HAMBURGER_PANEL_ID {
+            self.toggle_menu_bar();
+            return ActivityBarActivation::MenuToggled;
         }
+
+        if let Some(name) = ext_panel_name_from_id(&id) {
+            let name = name.to_string();
+            if !self.app_shell.sidebar_visible() {
+                self.app_shell.show_panel(&quadraui::WidgetId::new(&name));
+                self.session.explorer_visible = true;
+                let _ = self.session.save();
+            }
+            self.ext_panel_active = Some(name.clone());
+            self.ext_panel_has_focus = true;
+            self.ext_panel_selected = 0;
+            self.plugin_event("panel_focus", &name);
+            return ActivityBarActivation::ExtPanelFocused(name);
+        }
+
+        // A built-in panel: one of `FIXED_ACTIVITY_PANEL_IDS`, or Settings.
+        self.ext_panel_has_focus = false;
+        self.ext_panel_active = None;
+        self.focus_sidebar_panel(&id);
+        ActivityBarActivation::PanelFocused
     }
 }

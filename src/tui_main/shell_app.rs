@@ -361,12 +361,14 @@ use super::*;
 /// clippy's `type_complexity` lint.
 type HoverLinkRects = Vec<(u16, u16, u16, u16, String)>;
 
-/// Activity-bar item id for the menu hamburger — must match the literal
-/// `render::build_activity_bar` uses for its own hamburger `ActivityItem`
-/// (`"activity:menu"`, `render.rs:8147`) so [`TuiShellApp::shell_config`]'s
-/// `PanelDefinition` and [`ShellApp::on_shell_event`]'s hamburger check stay
-/// in lockstep with the live `draw_frame` path.
-const HAMBURGER_PANEL_ID: &str = "activity:menu";
+/// Activity-bar item id for the menu hamburger.
+///
+/// #536 promoted the literal to `core::engine::sidebar` — it is now shared by
+/// `render::build_activity_bar`'s hamburger `ActivityItem`, this module's
+/// `ShellConfig` `PanelDefinition`, [`ShellApp::on_shell_event`]'s hamburger
+/// check, *and* `Engine::activity_bar_item_id`'s keyboard-index-0 slot, so
+/// there is exactly one definition rather than one per call site.
+use crate::core::engine::sidebar::HAMBURGER_PANEL_ID;
 
 /// TUI counterpart to GTK's `App` struct. Owns everything that is a local
 /// `mut` variable in `event_loop()` today. Fields the (`&self`)
