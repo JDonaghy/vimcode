@@ -616,13 +616,37 @@ mod tests {
     /// * `Backend::tab_bar_layout()` for that same bar (`rect.x == 418`)
     ///   returns `slot_positions == [(836, 1010), (1010, 1184), (1184,
     ///   1358)]` — the right *pitch* (174) but carrying `rect.x` twice
-    ///   (836 == 418 + 418), which is what
-    ///   `quadraui::backend::shift_tab_bar_hits` adds on top of an already
-    ///   shifted layout.
+    ///   (836 == 418 + 418).
     ///
-    /// The net effect on a user is that a click lands on the wrong tab as
-    /// soon as it is right of a tab's left edge by enough — clicking tab 0's
-    /// × here activates tab 1 instead of closing tab 0.
+    /// # Exact quadraui defect (confirmed by instrumenting `render_content`)
+    ///
+    /// `GtkBackend::tab_bar_layout` (`quadraui/src/gtk/backend.rs`) adds
+    /// `rect.x` to every hit range **twice**, at the pinned rev `5a418ca`:
+    ///
+    /// 1. `crate::backend::shift_tab_bar_hits(&mut hits, rect.x as f64)`,
+    ///    added by quadraui#552 right after `tab_bar_layout_to_hits` (whose
+    ///    own doc comment says its spans are bar-relative and the caller owes
+    ///    exactly one `shift_tab_bar_hits`);
+    /// 2. the older hand-rolled `let x_off = rect.x as f64; …` loop at the
+    ///    bottom of the same function, which #552 left in place — it walks
+    ///    `slot_positions`, `close_bounds` and `right_segment_bounds` and adds
+    ///    `x_off` to each a second time.
+    ///
+    /// Deleting either one fixes it. `gtk::draw_tab_bar` (the paint path, in
+    /// `quadraui/src/gtk/tab_bar.rs`) shifts exactly once, which is why the
+    /// painted glyphs and `GtkDriver::tab_close_center` agree with each other
+    /// and only the no-paint query is wrong.
+    ///
+    /// The net effect on a user is that *whenever the tab bar does not start
+    /// at x == 0* — i.e. any time the sidebar/activity bar is open — every
+    /// entry in `App::cached_tab_pixel_hits` is one `rect.x` too far right, so
+    /// `click::resolve_pixel_tab_click` matches nothing and GTK silently falls
+    /// back to `resolve_charcell_tab_click`. That fallback is a monospace
+    /// approximation of a proportional-font bar: it lands close enough to keep
+    /// *selecting* a tab roughly right (which is why
+    /// `single_group_tab_click_activates_that_tab` still passes) but it never
+    /// resolves the narrow × zone, so clicking a tab's close button does
+    /// nothing at all.
     ///
     /// This reproduces **identically on the pre-#659 quadraui pin**
     /// (`f6d27c2`): the same pixel scan gives the same 766..939 band, so the
@@ -654,6 +678,49 @@ mod tests {
             h.engine.borrow().editor_groups[&group].tabs.len(),
             before - 1,
             "clicking a tab's × in a single-group layout must close it"
+        );
+    }
+
+    /// Durable tracking for the `#[ignore]` above — **this test is designed to
+    /// fail** the moment quadraui drops the duplicate `rect.x` shift in
+    /// `GtkBackend::tab_bar_layout`.
+    ///
+    /// An `#[ignore]`d test is invisible: nothing tells anyone when the
+    /// upstream fix lands, so the acceptance test for a real user-facing bug
+    /// (clicking a tab's × does nothing whenever the sidebar is open) could sit
+    /// disabled indefinitely. This asserts the *current, wrong* behaviour
+    /// instead, so the fix announces itself as a red test with a message
+    /// naming what to do next, rather than being noticed by chance.
+    ///
+    /// It deliberately does not re-derive the geometry: it drives the exact
+    /// same production click as
+    /// [`single_group_tab_close_button_closes_that_tab`] and asserts the
+    /// opposite outcome, so the two cannot drift apart.
+    ///
+    /// **When this fails:** delete this test and remove the `#[ignore]` from
+    /// [`single_group_tab_close_button_closes_that_tab`]. Nothing else needs
+    /// to change.
+    #[test]
+    fn tab_close_click_divergence_is_still_present_pending_the_quadraui_fix() {
+        let mut h = harness(engine_with_three_tabs_one_group(), 1400, 900);
+        let group = h.engine.borrow().active_group;
+        let before = h.engine.borrow().editor_groups[&group].tabs.len();
+        assert_eq!(before, 3);
+
+        let (x, y) = h
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 0)
+            .expect("the single-group tab bar must have painted tab 0's close button");
+        h.driver.click(x, y);
+
+        assert_eq!(
+            h.engine.borrow().editor_groups[&group].tabs.len(),
+            before,
+            "quadraui's GtkBackend::tab_bar_layout appears to have stopped \
+             double-shifting rect.x — the GTK tab × is reachable again. Delete \
+             this guard and un-ignore \
+             `single_group_tab_close_button_closes_that_tab`, which is the real \
+             acceptance test (#659)."
         );
     }
 
