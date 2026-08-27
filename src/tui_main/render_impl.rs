@@ -1094,9 +1094,17 @@ pub(super) fn paint_editor_popups(
             let vis_col = hover.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise.
-            let (tooltip, layout) =
-                render::hover_popup_to_quadraui_tooltip(hover, popup_x, popup_y, viewport);
+            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
+            // scale is 1.0/1.0 — TUI coordinates are already cell-native
+            // (#669 widened this adapter to also serve GTK's pixel space).
+            let (tooltip, layout) = render::hover_popup_to_quadraui_tooltip(
+                hover,
+                popup_x as f32,
+                popup_y as f32,
+                viewport,
+                1.0,
+                1.0,
+            );
             backend.draw_tooltip(&tooltip, &layout);
         }
     }
@@ -1141,9 +1149,17 @@ pub(super) fn paint_editor_popups(
             // anchor at the cursor's own row; placement=Bottom (with
             // primitive fallback to Top) puts the popup just below it.
             let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise.
-            let (tooltip, layout) =
-                render::diff_peek_to_quadraui_tooltip(peek, popup_x, popup_y, viewport, theme);
+            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
+            // scale 1.0/1.0 — see the hover popup's comment above (#669).
+            let (tooltip, layout) = render::diff_peek_to_quadraui_tooltip(
+                peek,
+                popup_x as f32,
+                popup_y as f32,
+                viewport,
+                theme,
+                1.0,
+                1.0,
+            );
             backend.draw_tooltip(&tooltip, &layout);
         }
     }
@@ -1162,9 +1178,17 @@ pub(super) fn paint_editor_popups(
             let vis_col = sig.anchor_col.saturating_sub(active_win.scroll_left) as u16;
             let popup_x = win_x + gutter_w + vis_col;
             let popup_y = win_y + anchor_view;
-            // Per D6: build quadraui::Tooltip + layout + rasterise.
-            let (tooltip, layout) =
-                render::signature_help_to_quadraui_tooltip(sig, popup_x, popup_y, viewport, theme);
+            // Per D6: build quadraui::Tooltip + layout + rasterise. Unit
+            // scale 1.0/1.0 — see the hover popup's comment above (#669).
+            let (tooltip, layout) = render::signature_help_to_quadraui_tooltip(
+                sig,
+                popup_x as f32,
+                popup_y as f32,
+                viewport,
+                theme,
+                1.0,
+                1.0,
+            );
             backend.draw_tooltip(&tooltip, &layout);
         }
     }

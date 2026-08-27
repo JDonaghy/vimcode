@@ -1169,11 +1169,20 @@ pub fn quadraui_tooltip(id: quadraui::WidgetId, text: impl Into<String>) -> quad
     }
 }
 
+/// `unit_w` / `unit_h` scale a single character cell / text row into the
+/// caller's coordinate space — `1.0, 1.0` for TUI (already cell-native) or
+/// `char_width, line_height` in pixels for GTK (#669). `anchor_x`/`anchor_y`
+/// must already be expressed in that same space. `Tooltip::layout`'s own
+/// anchor/viewport/measure arithmetic is unit-agnostic (plain `Rect` math),
+/// so scaling only the chars/rows-derived sizes here is sufficient — no
+/// backend-specific geometry needed at call sites.
 pub fn hover_popup_to_quadraui_tooltip(
     hover: &HoverPopup,
-    anchor_x: u16,
-    anchor_y: u16,
+    anchor_x: f32,
+    anchor_y: f32,
     viewport: quadraui::Rect,
+    unit_w: f32,
+    unit_h: f32,
 ) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
     let text_lines: Vec<&str> = hover.text.lines().take(20).collect();
     let num_lines = text_lines.len().max(1) as f32;
@@ -1183,13 +1192,14 @@ pub fn hover_popup_to_quadraui_tooltip(
         .max()
         .unwrap_or(10);
     // +4: 1 left border + 1 left pad + 1 right pad + 1 right border.
-    let width = ((max_len + 4) as f32).max(12.0);
+    let width = ((max_len + 4) as f32).max(12.0) * unit_w;
+    let height = num_lines * unit_h;
     let mut tooltip = quadraui_tooltip(quadraui::WidgetId::new("lsp_hover"), hover.text.clone());
     tooltip.placement = quadraui::TooltipPlacement::Top;
     // anchor.width = popup width so the primitive's center-on-anchor x
     // math collapses to left-align with the cursor cell.
-    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
-    let measure = quadraui::TooltipMeasure::new(width, num_lines);
+    let anchor = quadraui::Rect::new(anchor_x, anchor_y, width, unit_h);
+    let measure = quadraui::TooltipMeasure::new(width, height);
     let layout = tooltip.layout(anchor, viewport, measure, 0.0);
     (tooltip, layout)
 }
@@ -1346,6 +1356,97 @@ pub fn editor_hover_to_quadraui_rich_text(
     }
 }
 
+/// Build, rasterise and hit-region-extract the editor hover popup via the
+/// `quadraui::RichTextPopup` primitive. Shared by both backends' paint
+/// paths (#669) — GTK previously duplicated this in the now-dead
+/// `src/gtk/draw.rs::draw_editor_hover_popup`, with an added Pango-exact
+/// link-width measure; that precision isn't reachable from
+/// `render_content`'s `&mut dyn Backend`-only signature (no raw
+/// `pango::Layout`, same class of gap TUI's own `render_editor_hover_popup`
+/// hit for the raw `Frame` — see `PLAN.md`), so both backends now use the
+/// same char-count-based `link_widths` closure, scaled by `unit_w`. This
+/// only affects link *hit-region* precision, not paint — the rasteriser
+/// re-measures glyphs itself when drawing.
+///
+/// `unit_w` / `unit_h` are `1.0, 1.0` for TUI (cell-native) or
+/// `char_width, line_height` in pixels for GTK. `popup_x` / `popup_y` /
+/// `viewport` must already be expressed in that same space.
+///
+/// Returns `(link_rects, popup_bounds, scrollbar_hit)` in the caller's
+/// units, for mouse hit-testing — mirrors
+/// `tui_main::panels::render_editor_hover_popup`'s return shape.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn editor_hover_popup_paint(
+    backend: &mut dyn quadraui::Backend,
+    eh: &EditorHoverPopupData,
+    popup_x: f32,
+    popup_y: f32,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+    unit_w: f32,
+    unit_h: f32,
+) -> (
+    Vec<(f32, f32, f32, f32, String)>,
+    Option<(f32, f32, f32, f32)>,
+    Option<PopupScrollbarHit>,
+) {
+    if eh.rendered.lines.is_empty() {
+        return (vec![], None, None);
+    }
+    let popup = editor_hover_to_quadraui_rich_text(eh, theme);
+    let content_w = ((eh.popup_width as f32) * unit_w)
+        .max(10.0 * unit_w)
+        .min((viewport.width - 4.0 * unit_w).max(10.0 * unit_w));
+    let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
+    let layout = popup.layout(
+        popup_x,
+        popup_y,
+        viewport,
+        measure,
+        |line_idx, start_byte, end_byte| {
+            popup
+                .line_text
+                .get(line_idx)
+                .map(|t| {
+                    t[start_byte.min(t.len())..end_byte.min(t.len())]
+                        .chars()
+                        .count() as f32
+                })
+                .unwrap_or(0.0)
+                * unit_w
+        },
+    );
+
+    backend.draw_rich_text_popup(&popup, &layout);
+
+    let link_rects: Vec<(f32, f32, f32, f32, String)> = layout
+        .link_hit_regions
+        .iter()
+        .map(|(rect, idx)| {
+            let url = popup
+                .links
+                .get(*idx)
+                .map(|l| l.url.clone())
+                .unwrap_or_default();
+            (rect.x, rect.y, rect.width, rect.height, url)
+        })
+        .collect();
+
+    let popup_rect = Some((
+        layout.bounds.x,
+        layout.bounds.y,
+        layout.bounds.width,
+        layout.bounds.height,
+    ));
+    let scrollbar_hit = layout.scrollbar.map(|sb| PopupScrollbarHit {
+        track: sb.track,
+        thumb: sb.thumb,
+        visible_rows: EDITOR_HOVER_MAX_ROWS,
+        total: popup.lines.len(),
+    });
+    (link_rects, popup_rect, scrollbar_hit)
+}
+
 /// Flatten one rendered hover line (text + markdown spans + tree-sitter
 /// code highlights) into a `quadraui::StyledText` whose spans correspond
 /// to contiguous runs sharing fg/bold/italic.
@@ -1469,12 +1570,17 @@ pub struct SignatureHelp {
 /// given `width = popup_width` so the primitive's horizontal-centering
 /// math aligns the popup's left edge with the cursor cell (matching
 /// legacy behavior).
+/// `unit_w` / `unit_h` scale cell/row-derived sizes into the caller's
+/// coordinate space — see [`hover_popup_to_quadraui_tooltip`]'s doc for why
+/// this is enough to make the one adapter serve both backends (#669).
 pub fn signature_help_to_quadraui_tooltip(
     sig: &SignatureHelp,
-    anchor_x: u16,
-    anchor_y: u16,
+    anchor_x: f32,
+    anchor_y: f32,
     viewport: quadraui::Rect,
     theme: &Theme,
+    unit_w: f32,
+    unit_h: f32,
 ) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
     let label = &sig.label;
     // Display adds a leading + trailing space inside the border, so
@@ -1482,7 +1588,7 @@ pub fn signature_help_to_quadraui_tooltip(
     let label_chars = label.chars().count();
     let display_len = label_chars + 2;
     // +2 for the two side borders.
-    let width = ((display_len + 2) as f32).max(12.0);
+    let width = ((display_len + 2) as f32).max(12.0) * unit_w;
 
     // Build styled spans. The label's active parameter (if any) is
     // highlighted in theme.keyword. Offsets in `sig.params` are byte
@@ -1523,8 +1629,8 @@ pub fn signature_help_to_quadraui_tooltip(
     tooltip.placement = quadraui::TooltipPlacement::Top;
     // anchor.width = popup width so centering math left-aligns popup
     // with the cursor cell.
-    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
-    let measure = quadraui::TooltipMeasure::new(width, 1.0);
+    let anchor = quadraui::Rect::new(anchor_x, anchor_y, width, unit_h);
+    let measure = quadraui::TooltipMeasure::new(width, unit_h);
     let layout = tooltip.layout(anchor, viewport, measure, 0.0);
     (tooltip, layout)
 }
@@ -4285,12 +4391,17 @@ pub struct DiffPeekPopup {
 /// rows total (action bar included). Placement `Top` with fallback
 /// `Bottom`. Anchor width set to popup width so the centering math
 /// left-aligns with the cursor cell — matches the legacy popup.
+/// `unit_w` / `unit_h` scale cell/row-derived sizes into the caller's
+/// coordinate space — see [`hover_popup_to_quadraui_tooltip`]'s doc for why
+/// this is enough to make the one adapter serve both backends (#669).
 pub fn diff_peek_to_quadraui_tooltip(
     peek: &DiffPeekPopup,
-    anchor_x: u16,
-    anchor_y: u16,
+    anchor_x: f32,
+    anchor_y: f32,
     viewport: quadraui::Rect,
     theme: &Theme,
+    unit_w: f32,
+    unit_h: f32,
 ) -> (quadraui::Tooltip, quadraui::TooltipLayout) {
     let fg = to_q_color(theme.hover_fg);
     let added = to_q_color(theme.git_added);
@@ -4303,7 +4414,7 @@ pub fn diff_peek_to_quadraui_tooltip(
     let action_text = "[s] Stage  [r] Revert  [q] Close";
     let max_len = max_len.max(action_text.chars().count());
     // +4 = 1 left border + 1 left pad + 1 right pad + 1 right border.
-    let width = ((max_len + 4) as f32).max(20.0);
+    let width = ((max_len + 4) as f32).max(20.0) * unit_w;
 
     let mut styled_lines: Vec<quadraui::StyledText> = Vec::with_capacity(visible.len() + 1);
     for hline in &visible {
@@ -4323,7 +4434,7 @@ pub fn diff_peek_to_quadraui_tooltip(
         spans: vec![quadraui::StyledSpan::with_fg(action_text, fg)],
     });
 
-    let height = styled_lines.len() as f32;
+    let height = styled_lines.len() as f32 * unit_h;
 
     let mut tooltip = quadraui_tooltip(quadraui::WidgetId::new("diff_peek"), String::new());
     tooltip.styled_lines = Some(styled_lines);
@@ -4334,7 +4445,7 @@ pub fn diff_peek_to_quadraui_tooltip(
     // anchor.width = popup width so the centering math left-aligns
     // the popup with the cursor cell (matches legacy + hover popup
     // + sig help adapters).
-    let anchor = quadraui::Rect::new(anchor_x as f32, anchor_y as f32, width, 1.0);
+    let anchor = quadraui::Rect::new(anchor_x, anchor_y, width, unit_h);
     let measure = quadraui::TooltipMeasure::new(width, height);
     let layout = tooltip.layout(anchor, viewport, measure, 0.0);
     (tooltip, layout)
@@ -16282,7 +16393,8 @@ mod tests {
             anchor_col: 10,
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
-        let (tooltip, layout) = hover_popup_to_quadraui_tooltip(&hover, 30, 20, viewport);
+        let (tooltip, layout) =
+            hover_popup_to_quadraui_tooltip(&hover, 30.0, 20.0, viewport, 1.0, 1.0);
 
         // Plain multi-line path: styled_lines is None, text carries newlines.
         assert!(tooltip.styled_lines.is_none());
@@ -16308,7 +16420,8 @@ mod tests {
             anchor_col: 20,
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
-        let (tooltip, layout) = signature_help_to_quadraui_tooltip(&sig, 40, 15, viewport, &theme);
+        let (tooltip, layout) =
+            signature_help_to_quadraui_tooltip(&sig, 40.0, 15.0, viewport, &theme, 1.0, 1.0);
 
         // Styled path is active.
         let lines = tooltip.styled_lines.as_ref().expect("styled spans");
@@ -16345,7 +16458,8 @@ mod tests {
             anchor_col: 0,
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
-        let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
+        let (tooltip, _layout) =
+            signature_help_to_quadraui_tooltip(&sig, 10.0, 5.0, viewport, &theme, 1.0, 1.0);
 
         let lines = tooltip.styled_lines.as_ref().expect("styled spans");
         assert_eq!(lines.len(), 1);
@@ -16550,7 +16664,8 @@ mod tests {
             ],
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
-        let (tooltip, layout) = diff_peek_to_quadraui_tooltip(&peek, 30, 10, viewport, &theme);
+        let (tooltip, layout) =
+            diff_peek_to_quadraui_tooltip(&peek, 30.0, 10.0, viewport, &theme, 1.0, 1.0);
 
         // Multi-line styled path active.
         let lines = tooltip.styled_lines.as_ref().expect("styled_lines");
@@ -16598,7 +16713,8 @@ mod tests {
             anchor_col: 0,
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 200.0, 50.0);
-        let (tooltip, _layout) = signature_help_to_quadraui_tooltip(&sig, 10, 5, viewport, &theme);
+        let (tooltip, _layout) =
+            signature_help_to_quadraui_tooltip(&sig, 10.0, 5.0, viewport, &theme, 1.0, 1.0);
         let lines = tooltip.styled_lines.as_ref().expect("styled spans");
         assert_eq!(lines.len(), 1);
         let styled = &lines[0];

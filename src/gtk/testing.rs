@@ -85,6 +85,15 @@ pub(super) struct Harness<A: AppLogic> {
     pub picker_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
     /// Line height the last frame actually painted with (#555).
     pub painted_line_height: Rc<std::cell::Cell<Option<f64>>>,
+    /// Completion popup layout the last frame painted, or `None` if that
+    /// frame drew no completion popup — the completion twin of
+    /// [`Self::picker_popup_rect`] (#669).
+    pub completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
+    /// Editor hover (rich markdown) popup bounds `(x, y, w, h)` the last
+    /// frame painted, or `None` if that frame drew no editor hover popup
+    /// (#669).
+    #[allow(clippy::type_complexity)]
+    pub editor_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
     /// The sidebar content rect the last frame painted the active panel into,
     /// or `None` if the sidebar was hidden. The sidebar twin of
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
@@ -229,6 +238,8 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
     let painted_line_height = Rc::clone(&app.painted_line_height);
     let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
+    let completion_layout = Rc::clone(&app.completion_layout);
+    let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -236,6 +247,8 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         picker_popup_rect,
         painted_line_height,
         painted_sidebar_bounds,
+        completion_layout,
+        editor_hover_popup_rect,
     }
 }
 
@@ -1261,5 +1274,199 @@ second line here
              path, so the buffer cursor must not move even though the \
              release lands on top of the editor pane (#544)"
         );
+    }
+}
+
+/// #669: the five editor-anchored popups (completion, LSP hover, editor
+/// hover, diff peek, signature help) painted through the pre-#540 Relm4
+/// `draw.rs` path and stopped painting once `render_content` became the
+/// live GTK draw path — the `screen.*` fields these read were (and still
+/// are) populated correctly by the engine the whole time, so nothing but
+/// the paint call itself was missing (#592's root-cause finding). Each
+/// test below builds two independently-constructed harnesses over
+/// otherwise-identical engine state, differing only in the one
+/// `screen.*`-feeding field that turns the popup on, and requires at
+/// least one sampled pixel near the cursor to differ — deleting the
+/// corresponding paint block in `render_content` turns every one of
+/// these red.
+///
+/// Two *independent* harnesses, not one harness rendered twice: probed
+/// (see prior investigation on #669) and confirmed that re-`render()`ing
+/// the *same* `GtkDriver` a second time is not guaranteed pixel-stable
+/// even with zero engine-state change, while two freshly-constructed
+/// harnesses over identical state paint byte-identically. This mirrors
+/// `extension_panel_contributes_an_activity_bar_icon`'s established
+/// with/without-harness comparison above, for the same reason.
+#[cfg(test)]
+mod editor_popups {
+    use super::*;
+
+    /// A minimal buffer with an active editor window — these tests only
+    /// need *some* text under the cursor, not a scrollable one.
+    fn small_engine() -> Engine {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "fn main() {\n    println!(\"hi\");\n}\n");
+        engine
+    }
+
+    /// Sample a pixel region big enough to catch any of the five popups
+    /// regardless of Top/Bottom placement fallback: several rows above and
+    /// many rows below the active window's top edge, spanning most of its
+    /// width. `configure` mutates the engine to (or not to) activate a
+    /// popup before the harness's first (and only) render.
+    fn popup_region_pixels(configure: impl FnOnce(&mut Engine)) -> Vec<(u8, u8, u8)> {
+        let mut engine = small_engine();
+        configure(&mut engine);
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        let rect = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active window must have painted")
+                .rect
+        };
+        let lh = h.painted_line_height.get().unwrap_or(20.0);
+        let x0 = (rect.x + 4.0) as i32;
+        let x1 = (rect.x + rect.width - 4.0).max(rect.x + 40.0) as i32;
+        let y0 = rect.y as i32;
+        let y1 = (rect.y + lh * 12.0).min(rect.y + rect.height) as i32;
+        let mut px = Vec::new();
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                px.push(h.driver.pixel(x, y));
+                x += 3;
+            }
+            y += 2;
+        }
+        px
+    }
+
+    /// Assert that activating a popup changed at least one sampled pixel
+    /// near the cursor, relative to the same region with the popup off.
+    fn assert_region_changed(without: &[(u8, u8, u8)], with: &[(u8, u8, u8)], what: &str) {
+        let differing = with
+            .iter()
+            .zip(without.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing > 0,
+            "{what} must paint new pixels near the cursor; \
+             {differing}/{} sampled pixels differed",
+            with.len()
+        );
+    }
+
+    #[test]
+    fn completion_popup_paints_and_caches_a_hit_testable_layout() {
+        let without = popup_region_pixels(|_| {});
+        let with = popup_region_pixels(|e| {
+            e.completion_candidates = vec![
+                "println".to_string(),
+                "print".to_string(),
+                "process".to_string(),
+            ];
+            e.completion_idx = Some(0);
+            e.completion_start_col = 0;
+        });
+        assert_region_changed(&without, &with, "an active completion menu");
+
+        // Also verify the layout is cached for the click handler's
+        // hit-testing (B.5b Stage 5), separately from the paint proof above.
+        let mut engine = small_engine();
+        engine.completion_candidates = vec![
+            "println".to_string(),
+            "print".to_string(),
+            "process".to_string(),
+        ];
+        engine.completion_idx = Some(0);
+        engine.completion_start_col = 0;
+        let h = harness(engine, 1400, 900);
+        let layout_cell = h.completion_layout.borrow();
+        let layout = layout_cell
+            .as_ref()
+            .expect("completion popup must cache its CompletionsLayout for click hit-testing");
+        assert!(layout.bounds.width > 0.0 && layout.bounds.height > 0.0);
+    }
+
+    #[test]
+    fn hover_popup_paints() {
+        let without = popup_region_pixels(|_| {});
+        let with = popup_region_pixels(|e| {
+            e.lsp_hover_text = Some("fn foo() -> i32".to_string());
+        });
+        assert_region_changed(&without, &with, "an active LSP hover popup");
+    }
+
+    #[test]
+    fn signature_help_popup_paints() {
+        let without = popup_region_pixels(|_| {});
+        let with = popup_region_pixels(|e| {
+            e.lsp_signature_help = Some(crate::core::lsp::SignatureHelpData {
+                label: "fn foo(x: i32, y: i32)".to_string(),
+                params: vec![(7, 13)],
+                active_param: Some(0),
+            });
+        });
+        assert_region_changed(&without, &with, "active signature help");
+    }
+
+    #[test]
+    fn diff_peek_popup_paints() {
+        let without = popup_region_pixels(|_| {});
+        let with = popup_region_pixels(|e| {
+            e.diff_peek = Some(crate::core::engine::DiffPeekState {
+                hunk_index: 0,
+                anchor_line: 1,
+                hunk_lines: vec!["-old line".to_string(), "+new line".to_string()],
+                file_header: String::new(),
+                hunk: crate::core::git::Hunk {
+                    header: "@@ -2 +2,2 @@".to_string(),
+                    lines: vec!["-old line".to_string(), "+new line".to_string()],
+                },
+            });
+        });
+        assert_region_changed(&without, &with, "an open diff-peek popup");
+    }
+
+    #[test]
+    fn editor_hover_popup_paints_and_caches_bounds_for_click() {
+        let without = popup_region_pixels(|_| {});
+        let with = popup_region_pixels(|e| {
+            e.show_editor_hover(
+                1,
+                4,
+                "**println!** — entry point",
+                crate::core::engine::EditorHoverSource::Lsp,
+                false,
+                false,
+            );
+        });
+        assert_region_changed(&without, &with, "an open editor-hover popup");
+
+        // Also verify bounds are cached for the click + drag handlers (#215).
+        let mut engine = small_engine();
+        engine.show_editor_hover(
+            1,
+            4,
+            "**println!** — entry point",
+            crate::core::engine::EditorHoverSource::Lsp,
+            false,
+            false,
+        );
+        let h = harness(engine, 1400, 900);
+        let (_, _, pw, ph) = h.editor_hover_popup_rect.get().expect(
+            "editor hover popup must cache its bounds for the click + drag handlers (#215)",
+        );
+        assert!(pw > 0.0 && ph > 0.0);
     }
 }

@@ -8510,6 +8510,166 @@ impl quadraui::ShellApp for App {
             *t.draw_layout.borrow_mut() = Some(backend.status_bar_layout(t.rect, t.bar));
         }
 
+        // ── Draw editor-anchored popups (on top of everything else) ────────────
+        // Completion menu, LSP hover, editor hover (rich markdown), diff peek,
+        // signature help. (#669) Ported from the dead `src/gtk/draw.rs` path —
+        // same class of gap as the breadcrumb note above (#547): the #540
+        // Relm4->ShellApp migration dropped this paint step even though the
+        // engine has populated these `screen.*` fields unchanged the whole
+        // time. Content comes from the same shared `render::` adapters TUI's
+        // `paint_editor_popups` uses (`completion_menu_to_quadraui_completions`,
+        // `hover_popup_to_quadraui_tooltip`, `signature_help_to_quadraui_tooltip`,
+        // `diff_peek_to_quadraui_tooltip`, `editor_hover_popup_paint`); geometry
+        // is expressed in GTK's native pixel units (`lh`/`cw`) rather than TUI's
+        // cell units, which those adapters accept as an explicit `unit_w`/
+        // `unit_h` scale — mirroring how `Completions::layout`/
+        // `RichTextPopup::layout` already take an explicit `line_height`/
+        // `row_height` rather than assuming cells.
+        if let Some(active_win) = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+        {
+            let gutter_w = active_win.gutter_char_width as f64 * cw;
+            let h_scroll = active_win.scroll_left as f64 * cw;
+            let win_x = active_win.rect.x;
+            let win_y = active_win.rect.y;
+            let win_viewport = quadraui::Rect::new(
+                active_win.rect.x as f32,
+                active_win.rect.y as f32,
+                active_win.rect.width as f32,
+                active_win.rect.height as f32,
+            );
+            let main_viewport = quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
+
+            // Completion popup — cache the layout so the click handler
+            // (B.5b Stage 5) can hit-test items and register the popup on
+            // the modal stack.
+            *self.completion_layout.borrow_mut() = None;
+            if let (Some(menu), Some((cursor_pos, _))) = (&screen.completion, &active_win.cursor) {
+                let cursor_x = win_x + gutter_w + cursor_pos.col as f64 * cw - h_scroll;
+                let cursor_y = win_y + cursor_pos.view_line as f64 * lh;
+                // Longest candidate + 2 cells of padding/border, floored at 100px.
+                let popup_w = ((menu.max_width + 2) as f64 * cw).max(100.0);
+                let max_popup_h = 10.0 * lh;
+                let completions = render::completion_menu_to_quadraui_completions(menu);
+                let q_layout = completions.layout(
+                    cursor_x as f32,
+                    cursor_y as f32,
+                    lh as f32,
+                    win_viewport,
+                    popup_w as f32,
+                    max_popup_h as f32,
+                    |_| quadraui::CompletionItemMeasure::new(lh as f32),
+                );
+                let mut frame = QSL::new();
+                frame.push(Surface::Completions {
+                    completions: &completions,
+                    layout: &q_layout,
+                });
+                frame.draw(backend);
+                *self.completion_layout.borrow_mut() = Some(q_layout);
+            }
+
+            // Simple LSP hover popup (plain text, non-interactive).
+            if let Some(ref hover) = screen.hover {
+                let anchor_view = hover.anchor_line.saturating_sub(active_win.scroll_top) as f64;
+                let anchor_x = win_x + gutter_w + hover.anchor_col as f64 * cw - h_scroll;
+                let anchor_y = win_y + anchor_view * lh;
+                let (tooltip, tip_layout) = render::hover_popup_to_quadraui_tooltip(
+                    hover,
+                    anchor_x as f32,
+                    anchor_y as f32,
+                    main_viewport,
+                    cw as f32,
+                    lh as f32,
+                );
+                let mut frame = QSL::new();
+                frame.push(Surface::Tooltip {
+                    tooltip: &tooltip,
+                    layout: &tip_layout,
+                });
+                frame.draw(backend);
+            }
+
+            // Signature-help popup (insert mode, cursor inside a call).
+            if let Some(ref sig) = screen.signature_help {
+                let anchor_view = sig.anchor_line.saturating_sub(active_win.scroll_top) as f64;
+                let anchor_x = win_x + gutter_w + sig.anchor_col as f64 * cw - h_scroll;
+                let anchor_y = win_y + anchor_view * lh;
+                let (tooltip, tip_layout) = render::signature_help_to_quadraui_tooltip(
+                    sig,
+                    anchor_x as f32,
+                    anchor_y as f32,
+                    main_viewport,
+                    &theme,
+                    cw as f32,
+                    lh as f32,
+                );
+                let mut frame = QSL::new();
+                frame.push(Surface::Tooltip {
+                    tooltip: &tooltip,
+                    layout: &tip_layout,
+                });
+                frame.draw(backend);
+            }
+
+            // Diff-peek popup (inline git hunk preview).
+            if let Some(ref peek) = screen.diff_peek {
+                let anchor_view = peek.anchor_line.saturating_sub(active_win.scroll_top) as f64;
+                let anchor_x = win_x + gutter_w;
+                let anchor_y = win_y + anchor_view * lh;
+                let (tooltip, tip_layout) = render::diff_peek_to_quadraui_tooltip(
+                    peek,
+                    anchor_x as f32,
+                    anchor_y as f32,
+                    main_viewport,
+                    &theme,
+                    cw as f32,
+                    lh as f32,
+                );
+                let mut frame = QSL::new();
+                frame.push(Surface::Tooltip {
+                    tooltip: &tooltip,
+                    layout: &tip_layout,
+                });
+                frame.draw(backend);
+            }
+
+            // Editor hover popup (rich markdown; `gh` key, diagnostic/
+            // annotation/plugin hovers, or mouse dwell). Bounds/link rects/
+            // scrollbar geometry are cached for the click + drag handlers
+            // (#215), same as `draw.rs::draw_editor_hover_popup` did.
+            self.editor_hover_popup_rect.set(None);
+            self.editor_hover_link_rects.borrow_mut().clear();
+            self.editor_hover_scrollbar.set(None);
+            if let Some(ref eh) = screen.editor_hover {
+                let anchor_view = eh.anchor_line.saturating_sub(eh.frozen_scroll_top) as f64;
+                let vis_col = eh.anchor_col.saturating_sub(eh.frozen_scroll_left) as f64;
+                let anchor_x = win_x + gutter_w + vis_col * cw;
+                let anchor_y = win_y + anchor_view * lh;
+                let (links, rect, sb) = render::editor_hover_popup_paint(
+                    backend,
+                    eh,
+                    anchor_x as f32,
+                    anchor_y as f32,
+                    win_viewport,
+                    &theme,
+                    cw as f32,
+                    lh as f32,
+                );
+                self.editor_hover_popup_rect
+                    .set(rect.map(|(rx, ry, rw, rh)| (rx as f64, ry as f64, rw as f64, rh as f64)));
+                *self.editor_hover_link_rects.borrow_mut() = links
+                    .into_iter()
+                    .map(|(lx, ly, lw, lh2, url)| {
+                        (lx as f64, ly as f64, lw as f64, lh2 as f64, url)
+                    })
+                    .collect();
+                self.editor_hover_scrollbar.set(sb);
+            }
+        }
+
         // ── Draw global status bar / wildmenu ─────────────────────────────────
         let status_y =
             y + h - el.terminal_h - el.debug_toolbar_h - el.separated_status_h - status_bar_h;
