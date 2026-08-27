@@ -987,7 +987,7 @@ pub struct BreadcrumbSegmentInfo {
 pub struct PickerItem {
     /// Text shown in the result list.
     pub display: String,
-    /// Text matched against the query by `fuzzy_score`.
+    /// Text matched against the query by `quadraui::text_util::fuzzy_score`.
     pub filter_text: String,
     /// Right-aligned hint (shortcut, line number, etc.).
     pub detail: Option<String>,

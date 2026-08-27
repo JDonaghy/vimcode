@@ -1,82 +1,8 @@
 use super::*;
 
-// ─── Fuzzy score (shared utility, used by tab switcher + unified picker) ──────
-
-impl Engine {
-    /// Compute a fuzzy match score of `query` against `text`.
-    /// Returns `None` if not all query characters appear as a subsequence.
-    pub fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
-        if query.is_empty() {
-            return Some(0);
-        }
-        let text_lc = text.to_lowercase();
-        let query_lc = query.to_lowercase();
-        let tb = text_lc.as_bytes();
-        let qb = query_lc.as_bytes();
-        let mut qi = 0usize;
-        let mut score = 100i32;
-        let mut last_ti = 0usize;
-        for ti in 0..tb.len() {
-            if qi < qb.len() && tb[ti] == qb[qi] {
-                if qi > 0 {
-                    score -= (ti - last_ti - 1) as i32; // penalize gaps
-                }
-                if ti == 0 || matches!(tb[ti - 1], b'/' | b'_' | b'-' | b'.') {
-                    score += 5;
-                }
-                last_ti = ti;
-                qi += 1;
-            }
-        }
-        if qi < qb.len() {
-            None
-        } else {
-            Some(score - tb.len() as i32 / 20)
-        }
-    }
-}
-
 // ─── Unified Picker ───────────────────────────────────────────────────────────
 
 impl Engine {
-    /// Compute a fuzzy match score and record the byte positions in `text` that matched.
-    /// Returns `None` if not all query characters appear as a subsequence.
-    pub fn fuzzy_score_with_positions(text: &str, query: &str) -> Option<(i32, Vec<usize>)> {
-        if query.is_empty() {
-            return Some((0, Vec::new()));
-        }
-        let text_lc = text.to_lowercase();
-        let query_lc = query.to_lowercase();
-        let tb = text_lc.as_bytes();
-        let qb = query_lc.as_bytes();
-        let mut qi = 0usize;
-        let mut score = 100i32;
-        let mut last_ti = 0usize;
-        let mut positions = Vec::with_capacity(qb.len());
-        for ti in 0..tb.len() {
-            if qi < qb.len() && tb[ti] == qb[qi] {
-                if qi > 0 {
-                    score -= (ti - last_ti - 1) as i32; // penalize gaps
-                }
-                if ti == 0 || matches!(tb[ti - 1], b'/' | b'_' | b'-' | b'.') {
-                    score += 5;
-                }
-                // Map back to the original text's byte position.
-                // Since to_lowercase() can change byte lengths for non-ASCII,
-                // we use char-index mapping for safety, but for ASCII paths
-                // the positions are identical.
-                positions.push(ti);
-                last_ti = ti;
-                qi += 1;
-            }
-        }
-        if qi < qb.len() {
-            None
-        } else {
-            Some((score - tb.len() as i32 / 20, positions))
-        }
-    }
-
     /// Open the unified picker with a given source.
     pub fn open_picker(&mut self, source: PickerSource) {
         // Opening a picker is a "user is now focused on this modal"
@@ -816,17 +742,17 @@ impl Engine {
         if query.is_empty() {
             *out = all_items.iter().take(cap).cloned().collect();
         } else {
+            let query_lc = query.to_lowercase();
             let mut scored: Vec<PickerItem> = all_items
                 .iter()
                 .filter_map(|item| {
-                    Self::fuzzy_score_with_positions(&item.filter_text, query).map(
-                        |(s, positions)| {
+                    quadraui::text_util::fuzzy_score(&item.filter_text.to_lowercase(), &query_lc)
+                        .map(|(s, positions)| {
                             let mut item = item.clone();
                             item.score = s;
                             item.match_positions = positions;
                             item
-                        },
-                    )
+                        })
                 })
                 .collect();
             scored.sort_by_key(|b| std::cmp::Reverse(b.score));

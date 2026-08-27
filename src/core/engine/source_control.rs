@@ -856,12 +856,14 @@ impl Engine {
     }
 
     pub fn sc_branch_picker_filtered(&self) -> Vec<(usize, i32)> {
-        let q = &self.sc_branch_picker_query;
+        let q = self.sc_branch_picker_query.to_lowercase();
         let mut results: Vec<(usize, i32)> = self
             .sc_branch_picker_branches
             .iter()
             .enumerate()
-            .filter_map(|(i, b)| Self::fuzzy_score(&b.name, q).map(|s| (i, s)))
+            .filter_map(|(i, b)| {
+                quadraui::text_util::fuzzy_score(&b.name.to_lowercase(), &q).map(|(s, _)| (i, s))
+            })
             .collect();
         results.sort_by_key(|b| std::cmp::Reverse(b.1));
         results.truncate(50);
