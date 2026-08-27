@@ -8897,6 +8897,63 @@ fn test_jump_list_ctrl_o_returns_to_original_split() {
     assert_eq!(engine.view().cursor.line, 0);
 }
 
+/// Reproduces the review finding on #674: a jump-list entry's *window*
+/// surviving is not the same as its *buffer* surviving. `open_file_with_mode`
+/// (the path used by `:e`, `gf`, and the explorer/fuzzy-finder) replaces a
+/// window's buffer **in place**, keeping the same `WindowId` — the single
+/// most common jumplist workflow (no splits, no tabs, just switching files
+/// in one pane). Jump inside file A, open file B into that *same* window,
+/// then `Ctrl-O`: the old (unfixed) code saw the recorded window still
+/// existing and still in the same tab, trusted the pane match, and applied
+/// file A's remembered line/col directly onto file B's buffer — silently
+/// corrupting B's cursor instead of reopening A. Fails against unfixed
+/// `develop`: the buffer-content assertion sees "BBB" instead of "AAA".
+#[test]
+fn test_jump_list_ctrl_o_reopens_file_when_buffer_swapped_in_place() {
+    let dir = std::env::temp_dir().join("vimcode_jumplist_swap_in_place");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a_swap.txt");
+    let file_b = dir.join("file_b_swap.txt");
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    std::fs::write(&file_a, &content_a).unwrap();
+    std::fs::write(&file_b, "BBB only line\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    let window_id = engine.active_window_id();
+
+    press_char(&mut engine, 'G'); // pushes (window, file A, line 0); cursor -> last line
+
+    // Open file B into the *same* window — buffer swapped in place, same
+    // WindowId, exactly what `:e`/`gf`/explorer-click do.
+    engine
+        .open_file_with_mode(&file_b, OpenMode::Permanent)
+        .unwrap();
+    assert_eq!(
+        engine.active_window_id(),
+        window_id,
+        "opening B into the single window must reuse the same WindowId"
+    );
+    assert!(engine.buffer().to_string().starts_with("BBB"));
+
+    // Ctrl-O must recognise the recorded pane no longer holds file A and
+    // reopen A into this window, rather than trusting the stale window
+    // match and applying A's line/col onto B's buffer.
+    press_ctrl(&mut engine, 'o');
+    assert!(
+        engine.buffer().to_string().starts_with("AAA"),
+        "Ctrl-O should have reopened file A, not left B's buffer with A's cursor; buffer starts with:\n{}",
+        engine.buffer().to_string().lines().next().unwrap_or("")
+    );
+    assert_eq!(
+        engine.active_buffer_state().file_path.as_deref(),
+        Some(file_a.as_path())
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+}
+
 /// Closing a tab that appears in the jumplist must not resurrect it: the
 /// dead entry is pruned, and `Ctrl-O` keeps working by skipping straight
 /// over it rather than reopening the closed file or panicking.

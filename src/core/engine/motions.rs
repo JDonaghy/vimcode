@@ -5034,6 +5034,15 @@ impl Engine {
     /// `open_file_with_mode`, which opens the file into the *current*
     /// window; that fallback is the recovery path, not the normal one.
     ///
+    /// A recorded window can also still exist, still belong to the same
+    /// tab, and yet no longer show the recorded file — `:e`, `gf`, and the
+    /// explorer/fuzzy-finder all replace a window's buffer **in place**,
+    /// keeping the `WindowId` the same. `jump_pane_buffer_matches` catches
+    /// that case (most commonly: single window, no splits/tabs, file A then
+    /// file B opened into the same pane) and re-opens the recorded file
+    /// into that exact window rather than trusting a pane match that no
+    /// longer holds the right buffer.
+    ///
     /// The jump list is deliberately global rather than per-window (stock
     /// Vim keeps one jumplist per window — see `:help jumplist`). This repo
     /// chose global because the reported use case is explicitly
@@ -5046,12 +5055,16 @@ impl Engine {
             None => return,
         };
 
-        if let Some((group_id, tab_idx)) =
-            self.locate_jump_pane(entry.group_id, entry.tab_id, entry.window_id)
-        {
+        let pane = self
+            .locate_jump_pane(entry.group_id, entry.tab_id, entry.window_id)
+            .filter(|_| self.jump_pane_buffer_matches(entry.window_id, &entry.file));
+
+        if let Some((group_id, tab_idx)) = pane {
             self.switch_to_jump_pane(group_id, tab_idx, entry.window_id);
         } else {
-            // Pane is gone — recover by opening the file into the current window.
+            // Pane is gone, or it exists but its buffer was swapped in
+            // place since the jump was recorded — recover by opening the
+            // file into the current window.
             let current_file = self.active_buffer_state().file_path.clone();
             if entry.file != current_file {
                 if let Some(path) = &entry.file {
