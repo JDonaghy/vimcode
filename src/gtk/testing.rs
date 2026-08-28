@@ -55,13 +55,13 @@
 //! - **No main loop.** `tick()` is never pumped by the driver, so timer-driven
 //!   work (LSP polling, toasts, the settings-file monitor) does not advance.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use quadraui::gtk::testing::{driver_with_shell, GtkDriver};
 use quadraui::AppLogic;
 
-use super::App;
+use super::{App, StatusSegmentMap};
 use crate::core::Engine;
 
 /// A headless GTK driver plus the `Rc` handle to the engine it drives.
@@ -109,6 +109,15 @@ pub(super) struct Harness<A: AppLogic> {
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
     /// than at guessed offsets (#544).
     pub painted_sidebar_bounds: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
+    /// Cached per-window (and separated-line) status bar segment hit zones
+    /// (#672) — `window_id.0 -> [(start_x, end_x, StatusAction)]`, local to
+    /// each bar's own rect. Populated live by `render_content`; see
+    /// [`Self::status_segment_center`].
+    pub status_segment_map: Rc<RefCell<StatusSegmentMap>>,
+    /// Painted rect of the separated status line's status bar, or `None` if
+    /// the last frame drew no separated line (#672). See
+    /// [`Self::separated_status_segment_center`].
+    pub separated_status_bar_rect: Rc<Cell<Option<quadraui::Rect>>>,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -130,6 +139,74 @@ impl<A: AppLogic> Harness<A> {
             (rw.rect.x + rw.rect.width / 2.0) as f32,
             (rw.rect.y + rw.rect.height / 2.0) as f32,
         ))
+    }
+
+    /// Centre point (absolute pixels) of the `action` segment in
+    /// `window_id`'s **per-window** status bar, as the last frame painted it
+    /// via `status_segment_map` (#672). `None` if that window has no status
+    /// bar, wasn't painted, or doesn't currently show a segment for `action`
+    /// (e.g. `ChangeLanguage` when the buffer's filetype is empty).
+    ///
+    /// `status_segment_map` stores `(start_x, end_x)` local to the bar's own
+    /// rect (`window_zone_hit_test`'s `local_x` contract — see `click.rs`),
+    /// so this resolves the bar's absolute origin from the same painted
+    /// `screen_layout` window rect `window_center` uses, then re-derives the
+    /// bar's y-band the identical way `render_content`/`window_zone_hit_test`
+    /// do: the bottom `line_height` pixels of the window.
+    pub fn status_segment_center(
+        &self,
+        window_id: crate::core::WindowId,
+        action: crate::core::engine::StatusAction,
+    ) -> Option<(f32, f32)> {
+        let local_x = {
+            let map = self.status_segment_map.borrow();
+            let zones = map.get(&window_id.0)?;
+            let (start, end) = zones
+                .iter()
+                .find(|(_, _, a)| *a == action)
+                .map(|(s, e, _)| (*s, *e))?;
+            (start + end) / 2.0
+        };
+        let layout = self.screen_layout.borrow();
+        let rw = layout
+            .as_ref()?
+            .windows
+            .iter()
+            .find(|w| w.window_id == window_id)?;
+        let lh = self.painted_line_height()?;
+        Some((
+            (rw.rect.x + local_x) as f32,
+            (rw.rect.y + rw.rect.height - lh / 2.0) as f32,
+        ))
+    }
+
+    /// Centre point (absolute pixels) of the `action` segment in the
+    /// **separated status line** (#671/#672) — the full-width bar shown
+    /// above the terminal/status band when `window_status_line` is on but
+    /// `status_line_above_terminal` is off. `None` if that line wasn't
+    /// painted this frame or shows no segment for `action`.
+    ///
+    /// Keyed by `active_window_id` (the separated line always shows the
+    /// active window's status — see `render_content`'s insertion site), and
+    /// located via `separated_status_bar_rect`, the painted rect cached
+    /// purely so a test can find this bar without re-deriving
+    /// `compute_editor_layout`'s panel-stacking arithmetic.
+    pub fn separated_status_segment_center(
+        &self,
+        active_window_id: crate::core::WindowId,
+        action: crate::core::engine::StatusAction,
+    ) -> Option<(f32, f32)> {
+        let local_x = {
+            let map = self.status_segment_map.borrow();
+            let zones = map.get(&active_window_id.0)?;
+            let (start, end) = zones
+                .iter()
+                .find(|(_, _, a)| *a == action)
+                .map(|(s, e, _)| (*s, *e))?;
+            (start + end) / 2.0
+        };
+        let bar = self.separated_status_bar_rect.get()?;
+        Some((bar.x + local_x as f32, bar.y + bar.height / 2.0))
     }
 
     /// Centre point (absolute pixels) of breadcrumb segment `seg_idx` in
@@ -252,6 +329,8 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
     let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
+    let status_segment_map = Rc::clone(&app.status_segment_map);
+    let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -263,6 +342,8 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         editor_hover_popup_rect,
         panel_hover_popup_rect,
         tab_switcher_popup_rect,
+        status_segment_map,
+        separated_status_bar_rect,
     }
 }
 
@@ -535,6 +616,121 @@ mod tests {
              registered `scroll_surfaces` entry (scroll_top stayed 0 — \
              the surface list is empty or the scroll fell through to the \
              editor viewport instead)"
+        );
+    }
+
+    /// #672: the per-window status bar's segment click hit-test
+    /// (`click.rs::pixel_to_click_target`'s `WindowZone::StatusBar` arm)
+    /// reads `status_segment_map`, but under `ShellApp` nothing ever
+    /// populated it before this fix — the dead
+    /// `draw.rs::draw_window_status_bar` was the map's only writer, so
+    /// every segment click (goto-line, change-language, switch-branch, ...)
+    /// silently resolved to `ClickTarget::None`. This drives a real click at
+    /// the "Ln N, Col N" segment's painted `(start_x, end_x)` — recovered
+    /// live from `status_segment_map`, not guessed — and asserts the picker
+    /// it opens actually *paints* (not just an engine flag flip): this test
+    /// fails red against an empty map, because the click then falls through
+    /// to the editor's `TextArea` zone instead and never reaches
+    /// `StatusAction::GoToLine`.
+    #[test]
+    fn status_bar_segment_click_opens_go_to_line_picker() {
+        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        assert!(
+            h.engine.borrow().settings.window_status_line,
+            "fixture assumes the per-window status bar is on by default"
+        );
+
+        assert!(
+            !h.engine.borrow().picker_open,
+            "no picker should be open before the click"
+        );
+        assert!(
+            h.picker_popup().is_none(),
+            "no picker popup should have painted before the click"
+        );
+
+        let (x, y) = h
+            .status_segment_center(win, crate::core::engine::StatusAction::GoToLine)
+            .expect(
+                "the per-window status bar must have painted a GoToLine \
+                 (\"Ln N, Col N\") segment into status_segment_map",
+            );
+        h.driver.click(x, y);
+
+        assert!(
+            h.engine.borrow().picker_open,
+            "clicking the status bar's Ln/Col segment must open the \
+             go-to-line picker (#672)"
+        );
+        assert_eq!(
+            h.engine.borrow().picker_source,
+            crate::core::engine::PickerSource::CommandCenter,
+            "GoToLine routes through the CommandCenter picker with a `:` \
+             query prefix (Engine::handle_status_action)"
+        );
+        // `picker_popup_rect` is written only inside `render_content`'s
+        // picker draw branch, so this proves the popup actually painted —
+        // not merely that engine state flipped (mirrors
+        // `breadcrumb_segment_click_opens_the_dropdown_and_selection_dispatches`,
+        // #555).
+        let (_, _, pw, ph) = h
+            .picker_popup()
+            .expect("the go-to-line picker must actually paint, not just flip engine state");
+        assert!(
+            pw > 0.0 && ph > 0.0,
+            "the painted picker popup must have a non-degenerate rect, got {pw}x{ph}"
+        );
+    }
+
+    /// #672's separated-status-line twin of
+    /// [`status_bar_segment_click_opens_go_to_line_picker`]: with
+    /// `status_line_above_terminal` off and a bottom panel open, the active
+    /// window's status is extracted into the full-width `separated_status_line`
+    /// bar instead of living inside the window (`render::build_screen_layout`'s
+    /// `separate_status` branch — the window itself paints no status bar in
+    /// this mode). That bar's segment hit zones are inserted into the *same*
+    /// `status_segment_map`, keyed by `active_window_id`, at the second call
+    /// site the review flagged (mod.rs's "Draw separated status line" block) —
+    /// exercising it here, separately from the per-window path above, is what
+    /// proves *both* flagged insertion sites are wired live, not just one.
+    #[test]
+    fn separated_status_line_segment_click_opens_go_to_line_picker() {
+        let mut engine = engine_with_long_buffer();
+        engine.settings.status_line_above_terminal = false;
+        engine.terminal_open = true;
+        engine.session.terminal_panel_rows = 10;
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+
+        assert!(
+            !h.engine.borrow().picker_open,
+            "no picker should be open before the click"
+        );
+        assert!(
+            h.picker_popup().is_none(),
+            "no picker popup should have painted before the click"
+        );
+
+        let (x, y) = h
+            .separated_status_segment_center(win, crate::core::engine::StatusAction::GoToLine)
+            .expect(
+                "the separated status line must have painted a GoToLine \
+                 (\"Ln N, Col N\") segment into status_segment_map",
+            );
+        h.driver.click(x, y);
+
+        assert!(
+            h.engine.borrow().picker_open,
+            "clicking the separated status line's Ln/Col segment must open \
+             the go-to-line picker (#672)"
+        );
+        let (_, _, pw, ph) = h
+            .picker_popup()
+            .expect("the go-to-line picker must actually paint, not just flip engine state");
+        assert!(
+            pw > 0.0 && ph > 0.0,
+            "the painted picker popup must have a non-degenerate rect, got {pw}x{ph}"
         );
     }
 
