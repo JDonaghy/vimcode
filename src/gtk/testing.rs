@@ -1907,4 +1907,103 @@ mod chrome_surfaces {
             "an active tab-hover tooltip",
         );
     }
+
+    /// Positional guard for the tooltip's Y offset (#671 review fix): a
+    /// broad "did *some* pixel change" scan (like `tab_hover_tooltip_paints`
+    /// above) stays green even if the tooltip paints in the wrong place, so
+    /// this test pins the exact band.
+    ///
+    /// GTK's tab row is `tab_row_h = (lh * 1.6).ceil()` tall — `1.6x` a line
+    /// height, unlike TUI's exactly-one-cell-row tab bar where `area.y + 1`
+    /// cleanly clears it. An earlier version of the GTK paint call offset
+    /// the tooltip by one `lh` instead of `tab_row_h`, landing its top edge
+    /// *inside* the tab row's own vertical span — painting over tab labels
+    /// instead of sitting in a clean band below the tab bar. Verified this
+    /// test fails red against that `lh`-only offset before restoring the
+    /// `tab_row_h` fix.
+    ///
+    /// Breadcrumbs are explicitly turned **off** here so `tab_bar_h ==
+    /// tab_row_h` and the first painted window's rect — `windows[0].rect.y`
+    /// (`main.y + tab_bar_h`, the editor content's top edge) — is
+    /// unambiguously "right where the tab row ends", with no separate
+    /// breadcrumb row to account for. (With breadcrumbs on, the correct,
+    /// fixed offset — `tab_row_h`, matching TUI's `area.y + 1`, which is
+    /// likewise breadcrumb-height-agnostic — actually lands *on* the
+    /// breadcrumb row rather than below it, which is TUI-parity-correct but
+    /// would make this test's "must not paint above `editor_top`" band
+    /// ambiguous; disabling breadcrumbs removes that variable entirely.)
+    #[test]
+    fn tab_hover_tooltip_paints_below_tab_row_not_inside_it() {
+        let width = 1400;
+        let height = 900;
+
+        // Discover the painted line height and the editor content's top
+        // edge once; neither depends on whether the tooltip text itself is
+        // present.
+        let (lh, editor_top) = {
+            let mut engine = small_engine();
+            engine.settings.breadcrumbs = false;
+            engine.tab_hover_tooltip = Some("main.rs".to_string());
+            let h = harness(engine, width, height);
+            let lh = h
+                .painted_line_height()
+                .expect("line height must be painted");
+            let top = h
+                .screen_layout
+                .borrow()
+                .as_ref()
+                .expect("screen layout must be painted")
+                .windows
+                .first()
+                .expect("at least one window painted")
+                .rect
+                .y;
+            (lh, top)
+        };
+        let editor_top_i = editor_top.round() as i32;
+        let lh_i = lh.round() as i32;
+        // Breadcrumbs are off, so `editor_top == main.y + tab_row_h`
+        // exactly; halfway back up from there is solidly inside the tab
+        // row's own span (`tab_row_h = 1.6 * lh`, so half a line height of
+        // slack never crosses its top edge at `main.y`) yet still within
+        // the old buggy `lh`-only offset's paint band, so it catches the
+        // regression without depending on the theme's tab-row/gutter colors
+        // matching by coincidence.
+        let inside_tab_row_y = (editor_top_i - lh_i / 2).max(0);
+
+        let region = |tooltip: Option<&str>, y0: i32, y1: i32| -> Vec<(u8, u8, u8)> {
+            let mut engine = small_engine();
+            engine.settings.breadcrumbs = false;
+            engine.tab_hover_tooltip = tooltip.map(|s| s.to_string());
+            let mut h = harness(engine, width, height);
+            let mut px = Vec::new();
+            let mut y = y0;
+            while y < y1 {
+                let mut x = 0;
+                while x < width {
+                    px.push(h.driver.pixel(x, y));
+                    x += 3;
+                }
+                y += 1;
+            }
+            px
+        };
+
+        // Inside the tab row's own vertical span -- the tooltip must not
+        // paint there.
+        assert_eq!(
+            region(Some("main.rs"), inside_tab_row_y, inside_tab_row_y + 2),
+            region(None, inside_tab_row_y, inside_tab_row_y + 2),
+            "tooltip must not paint inside the tab row's own vertical span \
+             -- it should sit below the tab row, not overlap tab labels"
+        );
+
+        // Immediately below the tab row (the editor content's top edge) is
+        // where the tooltip should land.
+        assert_ne!(
+            region(Some("main.rs"), editor_top_i, editor_top_i + lh_i),
+            region(None, editor_top_i, editor_top_i + lh_i),
+            "tooltip must paint in the band immediately below the tab row"
+        );
+    }
 }
