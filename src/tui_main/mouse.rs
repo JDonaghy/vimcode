@@ -196,6 +196,17 @@ pub(super) fn handle_mouse(
     let row = ev.row;
     let term_height = terminal_size.map(|s| s.height).unwrap_or(24);
 
+    // #695: the row offset every hit test below must subtract for the
+    // menu-bar band, derived *once* here from `engine.menu_bar_rect` — the
+    // same cache `TuiShellApp::render_content` populated this frame from
+    // `layout.title_bar_bounds` (the shell's actual reservation) — instead
+    // of each call site independently re-deriving `engine.menu_bar_visible
+    // ? 1 : 0`. That per-site re-derivation (previously duplicated across
+    // eight places in this function) assumed the flag and the reservation
+    // always agree; caching what was actually painted removes the
+    // assumption instead of just hoping it holds.
+    let menu_rows: u16 = engine.menu_bar_rect.get().height.round() as u16;
+
     // ── Quit-confirm overlay click interception ─────────────────────────────
     // Route clicks through DialogLayout::hit_test. Swallow all clicks while
     // the overlay is visible so they don't fall through to the editor.
@@ -877,7 +888,6 @@ pub(super) fn handle_mouse(
         MouseEventKind::Drag(MouseButton::Left) => {
             // Explorer drag-and-drop: activate or update target row.
             if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
-                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                 if sb_visible
                     && engine.active_panel_is(PANEL_EXPLORER)
                     && col >= ab_width
@@ -970,8 +980,7 @@ pub(super) fn handle_mouse(
                 let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
                 let available = term_height.saturating_sub(row + bottom_chrome + qf_h);
                 // Leave at least 4 editor lines visible (+ menu/tab bar chrome)
-                let mr: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                let min_editor_chrome = 4 + mr + 1; // 4 lines + menu + tab bar
+                let min_editor_chrome = 4 + menu_rows + 1; // 4 lines + menu + tab bar
                 let max_rows = term_height
                     .saturating_sub(bottom_chrome + qf_h + min_editor_chrome + 2) // +2 for terminal tab bar + header
                     .max(5);
@@ -1465,8 +1474,6 @@ pub(super) fn handle_mouse(
         // Close any existing context menu first.
         engine.close_context_menu();
 
-        let menu_rows = if engine.menu_bar_visible { 1_u16 } else { 0 };
-
         // Right-click on explorer sidebar → open explorer context menu.
         // #575: strictly gate on the Explorer actually being the active
         // panel. #451 relaxed this to `active_panel_is(PANEL_EXPLORER) ||
@@ -1730,7 +1737,6 @@ pub(super) fn handle_mouse(
 
     // ── Ext panel hover (mouse moved) ───────────────────────────────────────
     if matches!(ev.kind, MouseEventKind::Moved) {
-        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         if sb_visible
             && sidebar.ext_panel_name.is_some()
             && col >= ab_width
@@ -1758,7 +1764,6 @@ pub(super) fn handle_mouse(
         let mut tooltip: Option<String> = None;
         if col >= editor_left {
             if let Some(layout) = last_layout {
-                let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
                 let rel_col = col - editor_left;
 
                 if layout.editor_group_split.is_some() {
@@ -1973,7 +1978,14 @@ pub(super) fn handle_mouse(
     // Menu bar item clicks and dropdown clicks are handled by
     // MenuSystem::handle() in the UiEvent intercept (mod.rs).
     // The command center (nav arrows + search box) is still separate.
-    if engine.menu_bar_visible && row == 0 {
+    //
+    // #695: `row == engine.menu_bar_rect.get().y` instead of a hardcoded
+    // `row == 0` — the bar's row today is always the shell's top row (`y ==
+    // 0`), but that's a fact about the current layout, not a guarantee this
+    // call site should hardcode; reading it from the same cache paint wrote
+    // keeps this arm correct if that ever changes, for free.
+    let menu_bar_row = engine.menu_bar_rect.get().y.round() as u16;
+    if engine.menu_bar_visible && menu_rows > 0 && row == menu_bar_row {
         let cc_hit = engine
             .command_center_layout
             .borrow()
@@ -2221,7 +2233,6 @@ pub(super) fn handle_mouse(
     // ── Activity bar ──────────────────────────────────────────────────────────
     if col < ab_width {
         // Activity bar spans full height below the menu bar row (matching GTK layout).
-        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         if row < menu_rows {
             return sidebar_width;
         }
@@ -2313,7 +2324,6 @@ pub(super) fn handle_mouse(
     if engine.app_shell.sidebar_visible() && col < ab_width + sidebar_width {
         // Account for menu bar: when visible it occupies absolute row 0, so the
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
-        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
         let sidebar_row = row.saturating_sub(menu_rows);
         // Extension panel must be checked FIRST — ext_panel_name overrides active_panel
         if sidebar.ext_panel_name.is_some() {
@@ -2592,8 +2602,8 @@ pub(super) fn handle_mouse(
     }
 
     // The menu bar (if visible) occupies absolute row 0, pushing the tab bar
-    // and editor content down by `menu_rows`.
-    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+    // and editor content down by `menu_rows` (computed once, near the top of
+    // this function).
 
     // ── Breadcrumb click ────────────────────────────────────────────────────
     if engine.settings.breadcrumbs {
@@ -3435,6 +3445,17 @@ mod tests {
         e.settings = crate::core::settings::Settings::default();
         e.mode = crate::core::Mode::Normal;
         e.menu_bar_visible = true;
+        // #695: `handle_mouse`'s `menu_rows` now reads `engine.menu_bar_rect`
+        // (the single source of truth both paint and hit-test consume in
+        // the live `TuiShellApp::render_content` pipeline) rather than
+        // re-deriving a row count from `menu_bar_visible` alone. This
+        // hermetic fixture drives `handle_mouse` directly, bypassing
+        // `render_content`, so it must seed the same cache `render_content`
+        // would have populated by now — otherwise `menu_rows` reads back 0
+        // even though `menu_bar_visible` is true, defeating this fixture's
+        // whole point (maximizing the editor-area offset).
+        e.menu_bar_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 120.0, 1.0));
         if !e.app_shell.sidebar_visible() {
             e.toggle_sidebar();
         }
@@ -3593,6 +3614,17 @@ mod tests {
         e.settings = crate::core::settings::Settings::default();
         e.mode = crate::core::Mode::Normal;
         e.menu_bar_visible = true;
+        // #695: `handle_mouse`'s `menu_rows` now reads `engine.menu_bar_rect`
+        // (the single source of truth both paint and hit-test consume in
+        // the live `TuiShellApp::render_content` pipeline) rather than
+        // re-deriving a row count from `menu_bar_visible` alone. This
+        // hermetic fixture drives `handle_mouse` directly, bypassing
+        // `render_content`, so it must seed the same cache `render_content`
+        // would have populated by now — otherwise `menu_rows` reads back 0
+        // even though `menu_bar_visible` is true, defeating this fixture's
+        // whole point (maximizing the editor-area offset).
+        e.menu_bar_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 120.0, 1.0));
         if !e.app_shell.sidebar_visible() {
             e.toggle_sidebar();
         }
@@ -3793,6 +3825,17 @@ mod tests {
         e.settings = crate::core::settings::Settings::default();
         e.mode = crate::core::Mode::Normal;
         e.menu_bar_visible = true;
+        // #695: `handle_mouse`'s `menu_rows` now reads `engine.menu_bar_rect`
+        // (the single source of truth both paint and hit-test consume in
+        // the live `TuiShellApp::render_content` pipeline) rather than
+        // re-deriving a row count from `menu_bar_visible` alone. This
+        // hermetic fixture drives `handle_mouse` directly, bypassing
+        // `render_content`, so it must seed the same cache `render_content`
+        // would have populated by now — otherwise `menu_rows` reads back 0
+        // even though `menu_bar_visible` is true, defeating this fixture's
+        // whole point (maximizing the editor-area offset).
+        e.menu_bar_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 120.0, 1.0));
         if !e.app_shell.sidebar_visible() {
             e.toggle_sidebar();
         }
