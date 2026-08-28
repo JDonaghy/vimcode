@@ -1326,58 +1326,68 @@ impl ShellApp for TuiShellApp {
         // popup, as opposed to this horizontal bar) paints separately,
         // last, near the end of this function — see that block's comment
         // for why.
+        //
+        // #695: `layout.title_bar_bounds` is cached into
+        // `engine.menu_bar_rect` unconditionally (mirrors GTK's
+        // `self.menu_row_rect.set(...)`, `gtk/mod.rs:8299`-`:8300`) *before*
+        // gating on `menu_bar_visible`, so the cache always reflects exactly
+        // what the shell reserved this frame — empty when nothing was
+        // reserved. `handle()`'s MenuSystem intercept and every `mouse.rs`
+        // hit test now read this one value instead of separately
+        // re-deriving "is there a menu-bar row" from `menu_bar_visible`
+        // alone, which is what let paint and hit-test disagree (#695).
+        let menu_bar_rect = layout.title_bar_bounds.unwrap_or_default();
+        self.engine.menu_bar_rect.set(menu_bar_rect);
         if self.engine.menu_bar_visible {
-            if let Some(tb) = layout.title_bar_bounds {
+            if menu_bar_rect.width >= 1.0 && menu_bar_rect.height >= 1.0 {
                 let tb_area = Rect {
-                    x: tb.x.round() as u16,
-                    y: tb.y.round() as u16,
-                    width: tb.width.round() as u16,
-                    height: tb.height.round() as u16,
+                    x: menu_bar_rect.x.round() as u16,
+                    y: menu_bar_rect.y.round() as u16,
+                    width: menu_bar_rect.width.round() as u16,
+                    height: menu_bar_rect.height.round() as u16,
                 };
-                if tb_area.width >= 1 && tb_area.height >= 1 {
-                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
-                    let bar = self.engine.menu_system.borrow().menu_bar();
-                    let bar_rect = quadraui::Rect::new(
-                        tb_area.x as f32,
-                        tb_area.y as f32,
-                        tb_area.width as f32,
-                        tb_area.height as f32,
-                    );
-                    let mb_layout = backend.draw_menu_bar(bar_rect, &bar);
+                backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                let bar = self.engine.menu_system.borrow().menu_bar();
+                let bar_rect = quadraui::Rect::new(
+                    tb_area.x as f32,
+                    tb_area.y as f32,
+                    tb_area.width as f32,
+                    tb_area.height as f32,
+                );
+                let mb_layout = backend.draw_menu_bar(bar_rect, &bar);
 
-                    let menu_end: u16 = mb_layout
-                        .visible_items
-                        .last()
-                        .map(|vi| tb_area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
-                        .unwrap_or(tb_area.x);
+                let menu_end: u16 = mb_layout
+                    .visible_items
+                    .last()
+                    .map(|vi| tb_area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
+                    .unwrap_or(tb_area.x);
 
-                    let title = self
-                        .engine
-                        .cwd
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "VimCode".to_string());
-                    let cc = render::build_command_center_view(
-                        self.engine.tab_nav_can_go_back(),
-                        self.engine.tab_nav_can_go_forward(),
-                        &title,
-                    );
-                    let cc_area = Rect {
-                        x: menu_end,
-                        y: tb_area.y,
-                        width: tb_area.width.saturating_sub(menu_end - tb_area.x),
-                        height: tb_area.height,
-                    };
-                    let cc_q_rect = quadraui::Rect::new(
-                        cc_area.x as f32,
-                        cc_area.y as f32,
-                        cc_area.width as f32,
-                        cc_area.height as f32,
-                    );
-                    let cc_layout = backend.draw_command_center(cc_q_rect, &cc);
-                    self.engine.command_center_layout.replace(Some(cc_layout));
-                }
+                let title = self
+                    .engine
+                    .cwd
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "VimCode".to_string());
+                let cc = render::build_command_center_view(
+                    self.engine.tab_nav_can_go_back(),
+                    self.engine.tab_nav_can_go_forward(),
+                    &title,
+                );
+                let cc_area = Rect {
+                    x: menu_end,
+                    y: tb_area.y,
+                    width: tb_area.width.saturating_sub(menu_end - tb_area.x),
+                    height: tb_area.height,
+                };
+                let cc_q_rect = quadraui::Rect::new(
+                    cc_area.x as f32,
+                    cc_area.y as f32,
+                    cc_area.width as f32,
+                    cc_area.height as f32,
+                );
+                let cc_layout = backend.draw_command_center(cc_q_rect, &cc);
+                self.engine.command_center_layout.replace(Some(cc_layout));
             }
         } else {
             self.engine.command_center_layout.replace(None);
@@ -1896,17 +1906,14 @@ impl ShellApp for TuiShellApp {
         // before the toast overlay). `MenuSystem::render` was already a
         // trait call; the only reason this couldn't paint before was the
         // same missing `layout.title_bar_bounds` reservation the menu bar
-        // block above now provides — reuse the same rect here rather than
-        // recomputing it, since `MenuSystem::render` anchors the dropdown
-        // relative to the bar it was opened from.
+        // block above now provides. #695: read the same
+        // `engine.menu_bar_rect` cache the bar-paint block above just wrote,
+        // rather than re-reading `layout.title_bar_bounds` a second time —
+        // one write, every reader downstream (paint and hit-test alike)
+        // consumes it verbatim.
         if self.engine.menu_bar_visible {
-            if let Some(tb) = layout.title_bar_bounds {
-                let bar_rect = quadraui::Rect::new(
-                    tb.x.round(),
-                    tb.y.round(),
-                    tb.width.round(),
-                    tb.height.round(),
-                );
+            let bar_rect = self.engine.menu_bar_rect.get();
+            if bar_rect.width >= 1.0 && bar_rect.height >= 1.0 {
                 self.engine.menu_system.borrow().render(backend, bar_rect);
             }
         }
@@ -2012,9 +2019,44 @@ impl ShellApp for TuiShellApp {
             }
 
             // ── MenuSystem intercept (mirrors `mod.rs:1296`-`:1304`) ────────────
-            if self.engine.menu_bar_visible {
+            // #695: gate mirrors GTK's `menu_bar_visible || menu_system.is_open()`
+            // (`gtk/mod.rs:9671`) rather than `menu_bar_visible` alone. Without
+            // the `is_open()` arm, hiding the bar (`:set nomenu`, or the #318
+            // Alt-letter shim's reveal never firing) while a dropdown is still
+            // open would leave it painted — `render_content`'s dropdown block
+            // above paints on `menu_bar_visible` too, so in practice the two
+            // states track together — but unclickable the instant they ever
+            // don't, since this intercept is what routes clicks/keys into it.
+            // `bar_rect` reads the same `engine.menu_bar_rect` cache
+            // `render_content` just wrote this frame (mirrors GTK's
+            // `self.menu_row_rect.get()`, `gtk/mod.rs:9672`) instead of
+            // hardcoding a `(0, 0, viewport.width, 1)` guess that only matched
+            // by coincidence — the shell's title-bar band isn't always at the
+            // screen origin (sidebar/activity-bar reservations, multi-row
+            // bands), so a hardcoded rect silently drifts the moment that
+            // assumption stops holding.
+            //
+            // Exception: the #318 Alt-letter shim just above can flip
+            // `menu_bar_visible` from false to true and this intercept can
+            // fire in the *same* dispatch — before `render_content` ever
+            // runs again to refresh the cache, so `menu_bar_rect` can still
+            // hold the stale empty rect from the last frame the bar was
+            // hidden. Handing quadraui's `MenuSystem::handle` an empty rect
+            // makes it lay out zero visible items and then index into that
+            // empty list assuming at least one fits — a panic, not a no-op
+            // (regression caught by `alt_letter_reveals_menu_bar_via_shell_app`).
+            // Fall back to the same full-width single-row rect the paint
+            // path below always uses (`title_bar_height_lh = 1.0`,
+            // `Self::shell_config`'s doc comment) for exactly this one
+            // just-revealed-but-not-yet-painted frame.
+            if self.engine.menu_bar_visible || self.engine.menu_system.borrow().is_open() {
                 let viewport = backend.viewport();
-                let bar_rect = quadraui::Rect::new(0.0, 0.0, viewport.width, 1.0);
+                let cached_bar_rect = self.engine.menu_bar_rect.get();
+                let bar_rect = if cached_bar_rect.height >= 1.0 {
+                    cached_bar_rect
+                } else {
+                    quadraui::Rect::new(0.0, 0.0, viewport.width, 1.0)
+                };
                 let menu_system = self.engine.menu_system.clone();
                 let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
                 match menu_event {
@@ -5326,6 +5368,60 @@ mod tests {
         assert!(
             screen.contains("File"),
             "menu bar should paint via TuiShellApp::render_content when menu_bar_visible; screen:\n{screen}"
+        );
+    }
+
+    /// #695 regression: `handle()`'s MenuSystem intercept now reads
+    /// `engine.menu_bar_rect` (populated once per frame by
+    /// `render_content`, mirroring GTK's `menu_row_rect` cache,
+    /// `gtk/mod.rs:8299`-`:8300`) instead of freshly computing
+    /// `Rect::new(0.0, 0.0, viewport.width, 1.0)` on every dispatch. That
+    /// cache is empty (zero height) on the very first dispatch that reveals
+    /// the bar — the #318 Alt-letter shim sets `engine.menu_bar_visible =
+    /// true` and this intercept can run in the *same* `handle()` call,
+    /// before `render_content` ever repaints and refreshes the cache.
+    /// quadraui's `MenuSystem::handle` lays out zero visible items against
+    /// an empty rect and then indexes into that empty list — a panic, not a
+    /// silent no-op. Caught during #695's own development (this exact
+    /// scenario panicked before the `cached_bar_rect.height >= 1.0` fallback
+    /// in `handle()` was added) and pinned here as permanent coverage: the
+    /// same-frame Alt+F reveal-and-activate must keep working every time
+    /// `menu_bar_rect` gains a new reader.
+    #[test]
+    fn alt_letter_reveal_and_activate_survives_empty_menu_bar_rect_cache_shell_app() {
+        // Sidebar closed (bare `TuiShellApp::new`'s ambient default is
+        // fine here — this test's assertion doesn't depend on sidebar
+        // geometry) so `engine.menu_bar_rect` starts at its `Rect::default()`
+        // seed (`Engine::new_from_state`) with no prior paint to populate it.
+        let app = TuiShellApp::new(None);
+        assert!(!app.engine.menu_bar_visible);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // First frame's paint already ran (`driver_with_shell` == `TuiDriver::
+        // new`, which paints once after `setup`), with the bar hidden — so
+        // `engine.menu_bar_rect` is still the zero-height default. Alt+F both
+        // reveals `menu_bar_visible` *and* activates the File menu in this
+        // one dispatch (mirrors `alt_letter_reveals_menu_bar_via_shell_app`
+        // above), which is exactly the same-frame edge case described above.
+        let reaction = driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        assert_eq!(
+            reaction,
+            Reaction::Redraw,
+            "Alt+F should reveal + activate the File menu without panicking"
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New Tab"),
+            "the File dropdown's first item should paint after the same-frame \
+             reveal-and-activate; screen:\n{screen}"
         );
     }
 

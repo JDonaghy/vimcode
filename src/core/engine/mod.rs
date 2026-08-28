@@ -2883,6 +2883,20 @@ pub struct Engine {
     /// quadraui MenuSystem — owns all menu bar + dropdown state and logic.
     /// Both TUI and GTK call `menu_system.render()` and `menu_system.handle()`.
     pub menu_system: std::rc::Rc<std::cell::RefCell<quadraui::MenuSystem>>,
+    /// Cached menu-bar band rect from the last paint (#695). GTK already had
+    /// this as a backend-local `Cell<Rect>` (`GtkShell::menu_row_rect`,
+    /// `gtk/mod.rs`) since paint and hit-test both live in the same file
+    /// there; TUI's equivalents are split across `shell_app.rs` (paint +
+    /// event dispatch) and `mouse.rs` (the legacy mouse dispatcher, a
+    /// separate file that only ever sees `&mut Engine`), so the cache lives
+    /// here instead so both can read the *one* rect the frame actually
+    /// painted from — `layout.title_bar_bounds`, quadraui's single source of
+    /// truth for the reserved band — rather than each re-deriving their own
+    /// notion of "is there a menu-bar row" (previously `engine.menu_bar_visible
+    /// ? 1 : 0`, independently, in nine places across the two files, per
+    /// #695). Empty rect (`width`/`height` 0) means "not currently painted",
+    /// matching GTK's `unwrap_or_default()` convention.
+    pub menu_bar_rect: std::cell::Cell<quadraui::Rect>,
     /// quadraui SidebarSystem — owns debug sidebar (4 sections: Variables,
     /// Watch, Call Stack, Breakpoints) selection, scroll, keyboard nav, and
     /// mouse handling. Both TUI and GTK call `render()` and `handle()`.
@@ -3751,6 +3765,7 @@ impl Engine {
             menu_system: std::rc::Rc::new(std::cell::RefCell::new(quadraui::MenuSystem::new(
                 Vec::new(),
             ))),
+            menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
             dap_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("vars", "VARIABLES"),
