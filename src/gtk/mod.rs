@@ -20,7 +20,7 @@ use crate::render;
 use core::engine::EngineAction;
 use core::settings::LineNumberMode;
 use core::{Engine, OpenMode, WindowRect};
-use render::{build_screen_layout, Theme};
+use render::Theme;
 
 use copypasta_ext::ClipboardProviderExt;
 use std::collections::HashMap;
@@ -1413,12 +1413,7 @@ fn sync_scrollbar_positions(
     if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
         return;
     }
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
+    let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let editor_bounds = core::WindowRect::new(
         0.0,
         0.0,
@@ -1569,7 +1564,8 @@ impl App {
             pending_file_dialog: Cell::new(None),
             explorer_sidebar_da_ref: Rc::new(RefCell::new(None)),
             activity_bar_da_ref: Rc::new(RefCell::new(None)),
-            explorer_row_height_cell: Rc::new(Cell::new(28.0)),
+            // #700: matches VS Code's `list.rowHeight` (was 28.0).
+            explorer_row_height_cell: Rc::new(Cell::new(22.0)),
             explorer_line_height_cell: Rc::new(Cell::new(20.0)),
             explorer_char_width_cell: Rc::new(Cell::new(8.0)),
             explorer_ctx_menu_layout: Rc::new(RefCell::new(None)),
@@ -2644,12 +2640,7 @@ impl App {
         }
 
         let line_height = self.cached_line_height;
-        let tab_row_height = (line_height * 1.6).ceil();
-        let tab_bar_height = if engine.settings.breadcrumbs {
-            tab_row_height + line_height
-        } else {
-            tab_row_height
-        };
+        let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
         let editor_bounds = WindowRect::new(
             0.0,
             0.0,
@@ -8376,7 +8367,7 @@ impl quadraui::ShellApp for App {
             };
 
         // ── Layout ────────────────────────────────────────────────────────────
-        let tab_row_h = (lh * 1.6).ceil();
+        let tab_row_h = render::tab_row_height_px(lh);
         let tab_bar_h = render::tab_bar_height_px(lh, engine.settings.breadcrumbs);
         let per_window_status = engine.settings.window_status_line;
         let el = render::compute_editor_layout(&engine, h, lh, false);
@@ -8404,7 +8395,21 @@ impl quadraui::ShellApp for App {
         let (window_rects, _dividers) =
             engine.calculate_group_window_rects(editor_bounds, tab_bar_h);
 
-        let screen = build_screen_layout(&engine, &theme, &window_rects, lh, cw, false);
+        // #700: the breadcrumb row's own painted bounds must agree with the
+        // fixed-pixel space `tab_bar_h` (above) already reserved for it above
+        // the window content — plain `build_screen_layout` would assume the
+        // breadcrumb row is exactly one `lh`-tall editor text line, which is
+        // no longer true now that the row is a fixed 22px regardless of
+        // `settings.font_size`.
+        let screen = render::build_screen_layout_with_breadcrumb_row(
+            &engine,
+            &theme,
+            &window_rects,
+            lh,
+            cw,
+            false,
+            render::BREADCRUMB_ROW_HEIGHT_PX,
+        );
 
         // Cache for click handlers (move into RefCell, then borrow back for drawing).
         *self.cached_screen_layout.borrow_mut() = Some(screen);
@@ -8627,7 +8632,7 @@ impl quadraui::ShellApp for App {
         // step was never ported over, so breadcrumbs stopped rendering even
         // though layout space for them was still reserved (`tab_bar_h`
         // above) and clicks were still hit-tested against them.
-        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, lh) {
+        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized) {
             let mut frame = QSL::new();
             frame.push(Surface::StatusBar {
                 rect: t.rect,
@@ -10204,12 +10209,7 @@ fn compute_editor_window_rects(
     da_height: f64,
     line_height: f64,
 ) -> Vec<(core::WindowId, core::WindowRect)> {
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
+    let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let editor_bounds = core::WindowRect::new(
         0.0,
         0.0,
@@ -10343,12 +10343,8 @@ fn tab_tooltip_hit_test(
     line_height: f64,
     char_width: f64,
 ) -> Option<String> {
-    let tab_row_height = (line_height * 1.6).ceil();
-    let tab_bar_height = if engine.settings.breadcrumbs {
-        tab_row_height + line_height
-    } else {
-        tab_row_height
-    };
+    let tab_row_height = render::tab_row_height_px(line_height);
+    let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let editor_bottom = gtk_editor_bottom(engine, da_w, da_h, line_height);
     let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
     let mut group_rects = engine
@@ -10373,20 +10369,20 @@ fn tab_tooltip_hit_test(
         let local_x = mx - grect.x;
         if let Some(group) = engine.editor_groups.get(gid) {
             let mut tab_x = 0.0;
-            for (i, tab) in group.tabs.iter().enumerate() {
+            for tab in group.tabs.iter() {
                 let wid = tab.active_window;
                 let (name, file_path) = if let Some(window) = engine.windows.get(&wid) {
                     if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
                         let dirty = if state.dirty { "*" } else { "" };
                         (
-                            format!(" {}: {}{} ", i + 1, state.display_name(), dirty),
+                            format!("{}{}", state.display_name(), dirty),
                             state.file_path.clone(),
                         )
                     } else {
-                        (format!(" {}: [No Name] ", i + 1), None)
+                        ("[No Name]".to_string(), None)
                     }
                 } else {
-                    (format!(" {}: [No Name] ", i + 1), None)
+                    ("[No Name]".to_string(), None)
                 };
                 let tab_w = name.chars().count() as f64 * char_width;
                 let slot_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad + tab_outer_gap;

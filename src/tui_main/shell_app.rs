@@ -1464,7 +1464,7 @@ impl ShellApp for TuiShellApp {
                 counts.push((target.group_id, vis));
             }
         }
-        for t in render::breadcrumb_draw_targets(&screen, self.engine.terminal_maximized, 1.0) {
+        for t in render::breadcrumb_draw_targets(&screen, self.engine.terminal_maximized) {
             let bc_rect = Rect {
                 x: t.rect.x as u16,
                 y: t.rect.y as u16,
@@ -5038,8 +5038,11 @@ mod tests {
     /// `AppShell`'s own activity-bar/sidebar layout constants), the
     /// expected column is derived from the actual painted screen: both
     /// panes' tab bars share row 0 (`"[No Name]"` once per pane), so the
-    /// divider must land strictly between the two tab labels' start
-    /// columns on every row of the editor body.
+    /// divider must land at or after the left pane's own tab label and no
+    /// further right than the right pane's tab label — inclusive on the
+    /// right because #700 dropped the tab label's leading `" N: "` pad, so
+    /// a pane's tab text now starts in the *same* column its body divider
+    /// occupies, rather than one-plus columns to the right of it.
     #[test]
     fn render_content_paints_group_divider_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -5079,9 +5082,9 @@ mod tests {
             };
             found_divider = true;
             assert!(
-                col > left_tab_start && col < right_tab_start,
-                "row {y}: divider at col {col} should land strictly between the \
-                 two panes' tab labels (cols {left_tab_start}..{right_tab_start}); \
+                col > left_tab_start && col <= right_tab_start,
+                "row {y}: divider at col {col} should land between the two \
+                 panes' tab labels (cols {left_tab_start}..={right_tab_start}); \
                  line:\n{line}"
             );
         }
