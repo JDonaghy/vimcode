@@ -94,6 +94,10 @@ pub(super) struct Harness<A: AppLogic> {
     /// (#669).
     #[allow(clippy::type_complexity)]
     pub editor_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Sidebar-item hover popup bounds `(x, y, w, h)` the last frame painted,
+    /// or `None` if that frame drew no panel-hover popup (#670).
+    #[allow(clippy::type_complexity)]
+    pub panel_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
     /// The sidebar content rect the last frame painted the active panel into,
     /// or `None` if the sidebar was hidden. The sidebar twin of
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
@@ -240,6 +244,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
     let completion_layout = Rc::clone(&app.completion_layout);
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
+    let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -249,6 +254,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         painted_sidebar_bounds,
         completion_layout,
         editor_hover_popup_rect,
+        panel_hover_popup_rect,
     }
 }
 
@@ -1468,5 +1474,211 @@ mod editor_popups {
             "editor hover popup must cache its bounds for the click + drag handlers (#215)",
         );
         assert!(pw > 0.0 && ph > 0.0);
+    }
+}
+
+/// Black-box paint proof for the four panel-region surfaces #670 ported from
+/// the dead `src/gtk/draw.rs` path onto `render_content`: quickfix, the
+/// bottom panel (terminal/debug output), the debug toolbar, and the
+/// sidebar-item hover popup. `ai_panel` — the fifth surface #670 originally
+/// scoped — turned out to need a genuinely new `render.rs` adapter (no
+/// existing `Backend::draw_message_list`-based chrome to port, unlike these
+/// four which all had one) and was split into its own follow-up issue per
+/// #670's own escape hatch, so it has no test here.
+///
+/// Same two-independent-harnesses methodology as `editor_popups` above
+/// (see its module doc for why re-rendering one `GtkDriver` isn't safe to
+/// compare against itself): each test renders once with the feature off and
+/// once with it on, over otherwise-identical engine state, and asserts
+/// sampled pixels differ. Each was verified to fail red by temporarily
+/// commenting out its paint call in `render_content` and confirming the
+/// `assert_region_changed` panic before restoring it.
+#[cfg(test)]
+mod panel_surfaces {
+    use super::*;
+
+    fn small_engine() -> Engine {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "fn main() {\n    println!(\"hi\");\n}\n");
+        engine
+    }
+
+    /// Sample a band spanning the bottom of the whole window — where
+    /// quickfix/bottom-panel/debug-toolbar all paint, below the editor's
+    /// windows — across the full width. Wide enough to catch any of these
+    /// bands regardless of their exact height for a given fixture.
+    fn bottom_region_pixels(
+        width: i32,
+        height: i32,
+        configure: impl FnOnce(&mut Engine),
+    ) -> Vec<(u8, u8, u8)> {
+        let mut engine = small_engine();
+        configure(&mut engine);
+        let mut h = harness(engine, width, height);
+        let mut px = Vec::new();
+        let y0 = (height as f64 * 0.5) as i32;
+        let mut y = y0;
+        while y < height {
+            let mut x = 0;
+            while x < width {
+                px.push(h.driver.pixel(x, y));
+                x += 3;
+            }
+            y += 2;
+        }
+        px
+    }
+
+    fn assert_region_changed(without: &[(u8, u8, u8)], with: &[(u8, u8, u8)], what: &str) {
+        let differing = with
+            .iter()
+            .zip(without.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing > 0,
+            "{what} must paint new pixels in the bottom chrome region; \
+             {differing}/{} sampled pixels differed",
+            with.len()
+        );
+    }
+
+    fn make_qf_item(path: &str) -> crate::core::project_search::ProjectMatch {
+        crate::core::project_search::ProjectMatch {
+            file: std::path::PathBuf::from(path),
+            line: 1,
+            col: 1,
+            line_text: "fn main() {".to_string(),
+        }
+    }
+
+    // Note: these three all compare *two open/visible* states rather than
+    // open-vs-closed. Opening any of these panels reserves its band by
+    // shrinking `editor_area_h` (the #670 layout fix), so an open-vs-closed
+    // comparison sampled over this region would pass even with the actual
+    // `Backend::draw_*` call deleted — the mere reservation swaps "editor
+    // text" for "panel background", which alone is enough to make sampled
+    // pixels differ. Comparing two same-reservation states that differ only
+    // in *content* isolates the paint call itself: it can only differ if
+    // that content is actually painted. Verified each still goes red by
+    // temporarily deleting its `Backend::draw_*` call and confirming the
+    // `assert_region_changed` panic, then restoring it.
+
+    #[test]
+    fn quickfix_panel_paints() {
+        let region = |selected: usize| {
+            bottom_region_pixels(1400, 900, move |e| {
+                e.quickfix_items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+                e.quickfix_open = true;
+                e.quickfix_has_focus = true;
+                e.quickfix_selected = selected;
+            })
+        };
+        assert_region_changed(
+            &region(0),
+            &region(1),
+            "moving the quickfix selection between two open, reserved-identically panels",
+        );
+    }
+
+    #[test]
+    fn bottom_terminal_panel_paints() {
+        // Same `terminal_open` (so `el.terminal_h` — and therefore
+        // `editor_area_h` — is identical either way); only the *active* tab
+        // and its content differ: the terminal grid (`Backend::draw_terminal`)
+        // vs. the debug-output text display (`Backend::draw_text_display`),
+        // plus which tab is highlighted in the strip `Backend::draw_tab_bar`
+        // paints above them.
+        let region = |kind: crate::render::BottomPanelKind| {
+            bottom_region_pixels(1400, 900, move |e| {
+                e.terminal_open = true;
+                e.session.terminal_panel_rows = 10;
+                e.dap_output_lines = vec!["stack trace line 1".to_string(), "line 2".to_string()];
+                e.bottom_panel_kind = kind;
+            })
+        };
+        assert_region_changed(
+            &region(crate::render::BottomPanelKind::Terminal),
+            &region(crate::render::BottomPanelKind::DebugOutput),
+            "switching the bottom panel's active tab between terminal and debug output",
+        );
+    }
+
+    #[test]
+    fn debug_toolbar_paints() {
+        // Same `debug_toolbar_visible` (so the reserved band is identical);
+        // only the buttons' `enabled` state differs — several toggle from
+        // disabled to enabled once a session is active and stopped, which
+        // `render::debug_toolbar` reflects as different button styling.
+        let region = |session_active: bool| {
+            bottom_region_pixels(1400, 900, move |e| {
+                e.debug_toolbar_visible = true;
+                if session_active {
+                    e.dap_session_active = true;
+                    e.dap_stopped_thread = Some(1);
+                }
+            })
+        };
+        assert_region_changed(
+            &region(false),
+            &region(true),
+            "an active+stopped debug session changing the toolbar's button states",
+        );
+    }
+
+    /// Unlike the other three surfaces here (all in the fixed bottom-of-
+    /// window band), the panel-hover popup anchors next to whatever sidebar
+    /// item triggered it — near the *top* of the sidebar for `item_index:
+    /// 0`, not the bottom — so `bottom_region_pixels` can't see it. Instead
+    /// this samples the popup's own cached bounds (`panel_hover_popup_rect`,
+    /// the same cache a future click handler would read) against an
+    /// identical harness with no popup open, proving both that a popup
+    /// caches non-empty bounds and that painting them actually changed
+    /// pixels there — not just that the cache field was written.
+    #[test]
+    fn panel_hover_popup_paints_and_caches_bounds() {
+        let mut engine = small_engine();
+        engine.show_panel_hover(
+            "source_control",
+            "item0",
+            0,
+            "**M** `src/main.rs` — modified",
+        );
+        let mut with_h = harness(engine, 1400, 900);
+        let (px, py, pw, ph) = with_h
+            .panel_hover_popup_rect
+            .get()
+            .expect("panel hover popup must cache its bounds for a future click handler");
+        assert!(pw > 0.0 && ph > 0.0);
+
+        let mut without_h = harness(small_engine(), 1400, 900);
+        assert!(
+            without_h.panel_hover_popup_rect.get().is_none(),
+            "no popup rect should be cached when none is open"
+        );
+
+        let (x0, x1) = (px as i32, (px + pw) as i32);
+        let (y0, y1) = (py as i32, (py + ph) as i32);
+        let mut differing = 0;
+        let mut total = 0;
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                total += 1;
+                if with_h.driver.pixel(x, y) != without_h.driver.pixel(x, y) {
+                    differing += 1;
+                }
+                x += 3;
+            }
+            y += 2;
+        }
+        assert!(
+            differing > 0,
+            "panel hover popup must paint new pixels within its own cached bounds; \
+             {differing}/{total} sampled pixels differed"
+        );
     }
 }

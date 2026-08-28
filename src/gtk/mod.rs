@@ -8280,17 +8280,21 @@ impl quadraui::ShellApp for App {
         let tab_row_h = (lh * 1.6).ceil();
         let tab_bar_h = render::tab_bar_height_px(lh, engine.settings.breadcrumbs);
         let per_window_status = engine.settings.window_status_line;
-        let wildmenu_px = if engine.wildmenu_items.is_empty() {
-            0.0
-        } else {
-            lh
-        };
-        let status_rows = if per_window_status { 1.0 } else { 2.0 };
-        let status_bar_h = lh * status_rows + wildmenu_px;
         let el = render::compute_editor_layout(&engine, h, lh, false);
-        let editor_area_h =
-            (h - el.terminal_h - el.debug_toolbar_h - el.separated_status_h - status_bar_h)
-                .max(0.0);
+        // `el.status_bar_h` is `compute_editor_layout`'s single source of
+        // truth for this (identical formula to the `wildmenu_px`/
+        // `status_rows` locals this replaced); reusing it here — instead of
+        // recomputing a second copy — is what makes `editor_area_h` below
+        // `el.editor_bottom` correctly reserve quickfix's band too.
+        let status_bar_h = el.status_bar_h;
+        // `el.editor_bottom` already subtracts quickfix_h/terminal_h/
+        // debug_toolbar_h/separated_status_h/status_bar_h from `h` (menu_h
+        // is 0 for GTK — the menu bar lives outside `main_content_bounds`,
+        // see `compute_editor_layout`'s `menu_in_viewport` doc). Before
+        // #670 this was hand-rolled here without the `quickfix_h` term, so
+        // an open quickfix panel never reserved space and editor content
+        // painted straight through where the panel now paints.
+        let editor_area_h = el.editor_bottom.max(0.0);
 
         let editor_bounds = WindowRect::new(x, y, w, editor_area_h);
         // Hand the exact bounds/tab-bar-height this frame painted with to the
@@ -8670,9 +8674,244 @@ impl quadraui::ShellApp for App {
             }
         }
 
+        // ── Draw quickfix panel + bottom panel (terminal/debug output) +
+        //    debug toolbar (#670) ────────────────────────────────────────────
+        // Ported from the dead `src/gtk/draw.rs` path (no live callers since
+        // the #540 Relm4->ShellApp migration) onto `render_content` — same
+        // class of gap as the editor-popup block above (#669): the
+        // `screen.quickfix` / `screen.bottom_tabs` / `screen.debug_toolbar`
+        // fields were (and still are) populated by the engine the whole
+        // time, only the paint calls were missing. The adapters
+        // (`quickfix_to_list_view`, `build_bottom_panel_tab_bar`,
+        // `build_terminal_toolbar`, `build_terminal_draw_data`,
+        // `debug_output_to_text_display`, `draw_debug_toolbar`) are the same
+        // `render::` functions TUI's own `TuiShellApp::render_content`
+        // (`shell_app.rs`) already routes through — only the geometry below
+        // is GTK-pixel-native, mirroring `compute_editor_layout`'s
+        // `unit_h = line_height` convention.
+        //
+        // Stacking (top to bottom, matching TUI's `bottom_chrome_rects_for_
+        // shell_content` v_chunks order exactly): editor | quickfix |
+        // terminal/debug-output | debug toolbar | separated-status (not
+        // painted here, #592-C) | status bar. `editor_area_h` above
+        // (`el.editor_bottom`) already reserves all of this, so these bands
+        // sit directly below it with no gap and no overlap with `status_y`.
+        let quickfix_y = y + editor_area_h;
+        if let Some(ref qf) = screen.quickfix {
+            // Scroll-to-selection: reserve one row for the header, then keep
+            // the selected item within the remaining visible rows — matches
+            // the dead `draw.rs::draw_quickfix_panel`'s behaviour. GTK has no
+            // persistent `quickfix_scroll_top` field to update from key
+            // events (unlike TUI's `TuiShellApp`), so this recomputes a
+            // stateless "keep selection visible" scroll each frame instead.
+            let visible_rows = ((el.quickfix_h / lh) as usize).saturating_sub(1);
+            let scroll_top = if visible_rows == 0 {
+                0
+            } else {
+                (qf.selected_idx + 1).saturating_sub(visible_rows)
+            };
+            let mut list = render::quickfix_to_list_view(qf);
+            list.scroll_offset = scroll_top;
+            backend.draw_list(
+                quadraui::Rect::new(x as f32, quickfix_y as f32, w as f32, el.quickfix_h as f32),
+                &list,
+            );
+        }
+
+        let terminal_y = quickfix_y + el.quickfix_h;
+        if el.terminal_h > 0.0 {
+            engine
+                .bottom_panel_geometry
+                .replace(Some(crate::core::engine::BottomPanelGeometry {
+                    top_y: terminal_y,
+                    height: el.terminal_h,
+                    toolbar_y: lh,
+                    content_y: 2.0 * lh,
+                    content_row_h: lh,
+                }));
+            let tab_bar = render::build_bottom_panel_tab_bar(
+                &screen.bottom_tabs.active,
+                engine.terminal_open,
+                !screen.bottom_tabs.output_lines.is_empty(),
+            );
+            let hits = backend.draw_tab_bar(
+                quadraui::Rect::new(x as f32, terminal_y as f32, w as f32, lh as f32),
+                &tab_bar,
+                None,
+            );
+            engine.bottom_tab_bar_hits.replace(Some(hits));
+            let content_y = terminal_y + 2.0 * lh;
+            let content_h = (el.terminal_h - 2.0 * lh).max(0.0);
+            match screen.bottom_tabs.active {
+                render::BottomPanelKind::Terminal => {
+                    if let Some(ref term_panel) = screen.bottom_tabs.terminal {
+                        let toolbar_y = terminal_y + lh;
+                        let toolbar_rect =
+                            quadraui::Rect::new(x as f32, toolbar_y as f32, w as f32, lh as f32);
+                        let hits = match render::build_terminal_toolbar(term_panel, &theme) {
+                            render::TerminalToolbar::FindBar(bar) => {
+                                let _ = backend.draw_status_bar(toolbar_rect, &bar, None, None);
+                                // No raw `pango::Layout` is reachable from this
+                                // `&mut dyn Backend`-only signature (same gap
+                                // #669's `editor_hover_popup_paint` doc comment
+                                // hit), so segment widths are approximated by
+                                // char count * `cw` rather than exact glyph
+                                // measurement — affects hit-region precision
+                                // only, not paint.
+                                let sb_layout = bar.layout(w as f32, lh as f32, 16.0, |seg| {
+                                    quadraui::StatusSegmentMeasure::new(
+                                        seg.text.chars().count() as f32 * cw as f32,
+                                    )
+                                });
+                                crate::core::engine::TerminalToolbarHits::FindBar {
+                                    layout: sb_layout,
+                                    origin_x: x,
+                                }
+                            }
+                            render::TerminalToolbar::TabStrip(bar) => {
+                                let hits = backend.draw_tab_bar(toolbar_rect, &bar, None);
+                                crate::core::engine::TerminalToolbarHits::TabStrip(hits)
+                            }
+                        };
+                        engine.terminal_toolbar_hits.replace(Some(hits));
+
+                        if content_h > 0.0 {
+                            let visible_rows = (content_h / lh) as usize;
+                            let q_area = quadraui::Rect::new(
+                                x as f32,
+                                content_y as f32,
+                                w as f32,
+                                content_h as f32,
+                            );
+                            let td = render::build_terminal_draw_data(
+                                term_panel,
+                                q_area,
+                                cw as f32,
+                                lh as f32,
+                                visible_rows,
+                                Some(6),
+                            );
+                            engine.terminal_split_layout.replace(td.split);
+                            if let Some(split) = &td.split {
+                                let left = td.left.as_ref().unwrap();
+                                let right = td.right.as_ref().unwrap();
+                                backend.draw_terminal(split.left, left);
+                                backend.draw_terminal(split.right, right);
+                                backend.draw_terminal_divider(quadraui::Rect::new(
+                                    split.divider_x,
+                                    content_y as f32,
+                                    1.0,
+                                    content_h as f32,
+                                ));
+                            } else if let Some(ref term) = td.single {
+                                backend.draw_terminal(q_area, term);
+                            }
+                            let geom =
+                                render::terminal_scrollbar_geometry(term_panel, visible_rows);
+                            let surface_sb = geom.map(|g| {
+                                let sb_w = 6.0;
+                                let sb_x = w - sb_w;
+                                let thumb_t = g.thumb_top_frac * content_h;
+                                let thumb_h = (g.thumb_height_frac * content_h).max(4.0);
+                                quadraui::SurfaceScrollbar {
+                                    axis: quadraui::ScrollAxis::Vertical,
+                                    track_bounds: quadraui::Rect::new(
+                                        (x + sb_x) as f32,
+                                        content_y as f32,
+                                        sb_w as f32,
+                                        content_h as f32,
+                                    ),
+                                    thumb_bounds: quadraui::Rect::new(
+                                        (x + sb_x + 1.0) as f32,
+                                        (content_y + thumb_t) as f32,
+                                        (sb_w - 2.0) as f32,
+                                        thumb_h as f32,
+                                    ),
+                                    total_items: g.total_items,
+                                    visible_items: g.visible_items,
+                                    scroll_offset: term_panel.scroll_offset,
+                                    inverted: true,
+                                }
+                            });
+                            engine
+                                .scroll_surfaces
+                                .borrow_mut()
+                                .push(quadraui::ScrollSurface {
+                                    id: quadraui::WidgetId::new("terminal_scrollback"),
+                                    bounds: q_area,
+                                    scrollbar: surface_sb,
+                                });
+                        }
+                    }
+                }
+                render::BottomPanelKind::DebugOutput => {
+                    if content_h > 0.0 {
+                        let td = render::debug_output_to_text_display(
+                            &screen.bottom_tabs.output_lines,
+                            engine.debug_output_scroll,
+                            engine.debug_output_auto_scroll,
+                        );
+                        let q_rect = quadraui::Rect::new(
+                            x as f32,
+                            content_y as f32,
+                            w as f32,
+                            content_h as f32,
+                        );
+                        let td_layout = backend.text_display_layout(q_rect, &td);
+                        backend.draw_text_display(q_rect, &td);
+                        let scrollbar = td_layout.scrollbar_bounds.zip(td_layout.thumb_bounds).map(
+                            |(track, thumb)| quadraui::SurfaceScrollbar {
+                                axis: quadraui::ScrollAxis::Vertical,
+                                track_bounds: quadraui::Rect::new(
+                                    q_rect.x + track.x,
+                                    q_rect.y + track.y,
+                                    track.width,
+                                    track.height,
+                                ),
+                                thumb_bounds: quadraui::Rect::new(
+                                    q_rect.x + thumb.x,
+                                    q_rect.y + thumb.y,
+                                    thumb.width,
+                                    thumb.height,
+                                ),
+                                total_items: td.lines.len(),
+                                visible_items: td_layout.visible_lines.len(),
+                                scroll_offset: td_layout.resolved_scroll_offset,
+                                inverted: false,
+                            },
+                        );
+                        engine
+                            .scroll_surfaces
+                            .borrow_mut()
+                            .push(quadraui::ScrollSurface {
+                                id: quadraui::WidgetId::new("debug_output"),
+                                bounds: q_rect,
+                                scrollbar,
+                            });
+                    }
+                }
+            }
+        } else {
+            engine.bottom_panel_geometry.replace(None);
+        }
+
+        let debug_toolbar_y = terminal_y + el.terminal_h;
+        if screen.debug_toolbar.is_some() {
+            let rect = quadraui::Rect::new(x as f32, debug_toolbar_y as f32, w as f32, lh as f32);
+            render::draw_debug_toolbar(backend, &engine, rect);
+            self.debug_toolbar_y_offset.set(debug_toolbar_y);
+            self.debug_toolbar_height.set(lh);
+        } else {
+            self.debug_toolbar_y_offset.set(0.0);
+            self.debug_toolbar_height.set(0.0);
+        }
+
         // ── Draw global status bar / wildmenu ─────────────────────────────────
-        let status_y =
-            y + h - el.terminal_h - el.debug_toolbar_h - el.separated_status_h - status_bar_h;
+        // Simplified to `h - status_bar_h`: quickfix/terminal/debug-toolbar/
+        // separated-status all stack *above* this point now (see the
+        // quickfix/bottom-panel/debug-toolbar block above), so the status
+        // bar's own band no longer needs to re-subtract them.
+        let status_y = y + h - status_bar_h;
         if let Some(ref bar) = screen.global_status_bar {
             let sb_rect = quadraui::Rect::new(x as f32, status_y as f32, w as f32, lh as f32);
             let mut frame = QSL::new();
@@ -8886,8 +9125,46 @@ impl quadraui::ShellApp for App {
                     engine.ext_sidebar_system.borrow().render(backend, q_sb);
                 }
                 _ => {
-                    // PANEL_AI and unknowns: not yet migrated to Backend primitives.
+                    // PANEL_AI and unknowns: not yet migrated to Backend
+                    // primitives (#670 scoped only the other four panel
+                    // surfaces — quickfix/bottom_tabs/debug_toolbar/
+                    // panel_hover — and left AI for a follow-up issue; see
+                    // that issue's own "no PANEL_AI arm at all" note).
                 }
+            }
+
+            // ── Sidebar-item hover popup (#670) ─────────────────────────────
+            // Source-control / extension-panel item dwell tooltip, rendered
+            // markdown. Ported from the dead `draw.rs::draw_panel_hover_popup`
+            // (raw Cairo/Pango, no live callers) onto the shared
+            // `quadraui::RichTextPopup` path via `render::panel_hover_popup_
+            // paint` — the same primitive TUI's `render_panel_hover_popup`
+            // already uses. Paints after the panel body above (same
+            // paint-after-content z-order the dead code used), clamped
+            // against the full content viewport so it can extend rightward
+            // into the editor area past the sidebar's own bounds.
+            self.panel_hover_popup_rect.set(None);
+            self.panel_hover_link_rects.borrow_mut().clear();
+            if screen.panel_hover.is_some() {
+                let hover_viewport = quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
+                let (links, rect) = render::panel_hover_popup_paint(
+                    backend,
+                    screen,
+                    &theme,
+                    q_sb.x + q_sb.width,
+                    q_sb.y,
+                    hover_viewport,
+                    cw as f32,
+                    lh as f32,
+                );
+                self.panel_hover_popup_rect
+                    .set(rect.map(|(rx, ry, rw, rh)| (rx as f64, ry as f64, rw as f64, rh as f64)));
+                *self.panel_hover_link_rects.borrow_mut() = links
+                    .into_iter()
+                    .map(|(lx, ly, lw, lh2, url, is_native)| {
+                        (lx as f64, ly as f64, lw as f64, lh2 as f64, url, is_native)
+                    })
+                    .collect();
             }
         }
 
