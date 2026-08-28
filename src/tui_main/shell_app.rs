@@ -5637,6 +5637,164 @@ mod tests {
         assert_eq!(reaction, Reaction::Redraw);
     }
 
+    // ── #694 investigation: hamburger-reveal freeze ─────────────────────
+    //
+    // #694 reports vimcode intermittently freezing (terminal stops
+    // responding, has to be killed) when the menu bar is exposed via the
+    // AppShell hamburger — sometimes instead producing the separately
+    // tracked "invisible menu bar" symptom. Both share one trigger: the
+    // hamburger click terminates in `ShellAdapter`'s own `PanelChanged`
+    // arm (`quadraui/src/shell_adapter.rs::handle`, the `AppShellEvent::
+    // PanelChanged { .. } => { ...; return Reaction::Redraw; }` branch)
+    // and never reaches `TuiShellApp::handle` at all for that event — the
+    // `handle` tail's shell-state syncs (title-bar reservation, sidebar
+    // visibility) and `ShellAdapter::apply_requested_panel`'s
+    // `take_requested_panel` poll (also only reachable from inside
+    // `handle`/`tick`) are both skipped for the click itself and only run
+    // on the *next* dispatch.
+    //
+    // These tests drive that exact sequence through the real
+    // `driver_with_shell` → `ShellAdapter` → `TuiShellApp` pipeline (not
+    // `on_shell_event` called directly, which the pre-existing
+    // `on_shell_event_hamburger_click_reveals_menu_bar` family above
+    // already covers) across every variation #694 calls out as changing
+    // which branch the click takes: sidebar open vs. closed beforehand,
+    // hamburger clicked twice in a row, and a dynamic extension panel
+    // active. None of them panics or hangs — which rules out the
+    // `menu_system` `RefCell` double-borrow candidate from #694's "still
+    // open" list for this exact reachable ordering: `handle`'s menu-bar
+    // arm (`self.engine.menu_system.clone().borrow_mut().handle(...)`,
+    // this file's `handle` method) only ever holds the `RefMut` for the
+    // duration of that one statement — it is a temporary, not bound to a
+    // name, so it drops before `dispatch_menu_action` runs, and
+    // `probe_694_hamburger_click_then_key*` below exercise precisely that
+    // borrow (the first real key after the click, which is what actually
+    // opens the `MenuSystem` dispatch — the hamburger click itself never
+    // reaches it, per the `ShellAdapter` early-return above).
+    //
+    // This does **not** close #694: `TuiDriver` renders to `TestBackend`
+    // and never parses real ANSI (see this file's module doc, "raw-mode,
+    // SGR mouse... stay outside its reach"), so it cannot exercise
+    // anything specific to the live terminal — raw-mode escape sequence
+    // parsing, a real PTY, `supports_keyboard_enhancement()`'s blocking
+    // round-trip, or genuine OS-level blocking/deadlock. A live-terminal
+    // repro attempt (this session: `vcd` under `tmux`, real SGR mouse
+    // byte sequences, ~150+ hamburger interactions across the same
+    // variations plus rapid randomized fuzzing and deliberately malformed
+    // mouse-down-without-mouse-up sequences) also did not reproduce a
+    // hang, crash, or CPU spike — so the bug remains genuinely
+    // intermittent and unreproduced; do not read the green tests below as
+    // a fix or a closed investigation.
+
+    /// Hamburger click with the sidebar closed beforehand (the ambient
+    /// state on a bare `TuiShellApp::new` — see `app_with_sidebar_open`'s
+    /// doc comment) must not panic through the real dispatch pipeline.
+    #[test]
+    fn driver_hamburger_click_sidebar_closed_does_not_panic() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        let _ = driver.click(1.0, 0.0);
+        let _ = driver.screen();
+    }
+
+    /// Hamburger clicked twice in a row: the second click lands on the
+    /// runner `AppShell`'s now-active hamburger item and reports
+    /// `SidebarHidden` instead of a second `PanelChanged` (`handle_
+    /// activity_click`'s same-active-panel branch) — a different code
+    /// path from the first click, and #694 calls out double-clicking as
+    /// one of the dimensions worth varying.
+    #[test]
+    fn driver_hamburger_click_twice_does_not_panic() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        let _ = driver.click(1.0, 0.0);
+        let _ = driver.click(1.0, 0.0);
+        let _ = driver.screen();
+    }
+
+    /// Hamburger click with the sidebar already open on a real panel
+    /// (Explorer) beforehand — the shadow/runner sidebar-visibility
+    /// divergence #694 discusses (the runner's `AppShell` reveals its
+    /// sidebar for the hamburger "panel" while the shadow `engine.
+    /// app_shell` never does) must not panic.
+    #[test]
+    fn driver_hamburger_click_with_sidebar_open_does_not_panic() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        let _ = driver.click(1.0, 1.0); // explorer icon -> opens sidebar
+        let _ = driver.click(1.0, 0.0); // hamburger
+        let _ = driver.screen();
+    }
+
+    /// The first real key event *after* a hamburger click is what
+    /// actually reaches `TuiShellApp::handle`'s `MenuSystem` dispatch
+    /// (`self.engine.menu_system.clone().borrow_mut().handle(...)`) —
+    /// the click itself never does, per this block's doc comment above.
+    /// Exercises the `RefCell` double-borrow candidate from #694's "still
+    /// open" list directly: it does not panic.
+    #[test]
+    fn driver_hamburger_click_then_key_does_not_panic() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        let _ = driver.click(1.0, 0.0); // hamburger
+        let _ = driver.press(quadraui::Key::Char('j'));
+        let _ = driver.screen();
+    }
+
+    /// Same as [`driver_hamburger_click_then_key_does_not_panic`], with
+    /// the sidebar open on a real panel beforehand — combines two of
+    /// #694's variation dimensions in one sequence.
+    #[test]
+    fn driver_hamburger_click_then_key_with_sidebar_open_does_not_panic() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        let _ = driver.click(1.0, 1.0); // explorer icon -> opens sidebar
+        let _ = driver.click(1.0, 0.0); // hamburger
+        let _ = driver.press(quadraui::Key::Char('j'));
+        let _ = driver.screen();
+    }
+
+    /// Hamburger click while a dynamic plugin-provided extension panel is
+    /// active (`engine.ext_panel_active`) — the `take_requested_panel`
+    /// non-convergence candidate from #694's "still open" list is
+    /// specifically reachable via this arm (see that method's doc
+    /// comment). Must not panic or infinite-loop; `driver.press` returning
+    /// at all after the click proves the sequence converges rather than
+    /// looping forever inside a single `handle`/`tick` call.
+    #[test]
+    fn driver_hamburger_click_with_ext_panel_active_does_not_panic() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.sidebar.ext_panel_name = Some("git-insights".to_string());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let _ = driver.click(1.0, 0.0); // hamburger
+        let _ = driver.press(quadraui::Key::Char('j'));
+        let _ = driver.screen();
+    }
+
     // ── Review fix (#602 iteration 1): the four panel intercepts ported
     // into `handle_mouse_event` ─────────────────────────────────────────
     //
