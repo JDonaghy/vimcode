@@ -482,6 +482,62 @@ mod tests {
         );
     }
 
+    /// #672: the debug-output bottom panel's scroll wheel routes through
+    /// `quadraui::dispatch_scroll` against `engine.scroll_surfaces` — a list
+    /// that, under `ShellApp`, only the dead `src/gtk/draw.rs` ever pushed
+    /// to. `Msg::MouseScroll` hit-tests it (mod.rs `"debug_output" =>` arm)
+    /// but nothing populated it, so this scroll was a silent no-op with the
+    /// panel visible and painted. This test fails red against an empty list
+    /// (falls through to the generic active-window viewport scroll instead,
+    /// leaving `debug_output_scroll` at 0) and only passes once
+    /// `render_content` registers the surface every frame, the way TUI's
+    /// `render_impl.rs` always has.
+    #[test]
+    fn wheel_scrolls_the_debug_output_panel_via_registered_scroll_surface() {
+        let mut engine = Engine::new();
+        engine.bottom_panel_open = true;
+        engine.bottom_panel_kind = crate::core::engine::BottomPanelKind::DebugOutput;
+        engine.dap_output_lines = (0..200).map(|i| format!("line {i}")).collect();
+        let mut h = harness(engine, 1400, 900);
+
+        let geometry = h
+            .engine
+            .borrow()
+            .bottom_panel_geometry
+            .borrow()
+            .expect("the debug output panel must have painted geometry");
+        let win_x = h
+            .screen_layout
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.windows.first())
+            .map(|w| w.rect.x)
+            .expect("the editor window must have painted a rect");
+
+        // Aim inside the panel's content band: one content row below its top
+        // (skips the tab-bar + toolbar rows `content_y` already accounts for).
+        let x = (win_x + 50.0) as f32;
+        let y = (geometry.top_y + geometry.content_y + geometry.content_row_h) as f32;
+
+        // Quadraui-convention delta: negative y = scroll down (see the
+        // polarity test above). `handle_debug_output_scroll` interprets a
+        // positive GTK-raw `delta.y` (what `ShellApp::handle` negates this
+        // back into) as "scroll down, toward newer output".
+        h.driver.dispatch(UiEvent::Scroll {
+            widget: None,
+            position: Point::new(x, y),
+            delta: ScrollDelta::new(0.0, -1.0),
+        });
+
+        assert!(
+            h.engine.borrow().debug_output_scroll > 0,
+            "wheel over the debug output panel must scroll it via the \
+             registered `scroll_surfaces` entry (scroll_top stayed 0 — \
+             the surface list is empty or the scroll fell through to the \
+             editor viewport instead)"
+        );
+    }
+
     /// Three tabs in the default **single** editor group — the exact shape
     /// #553 reports as dead (tab clicks came back to life as soon as a second
     /// group existed).
