@@ -2033,27 +2033,19 @@ impl Engine {
         name_len + 2 // +1 close button + 1 separator
     }
 
-    /// Count how many tabs fit in the available width starting from `offset`.
-    fn tabs_fitting_from(&self, group: &EditorGroup, offset: usize, width: usize) -> usize {
-        let mut used = 0;
-        let mut count = 0;
-        for i in offset..group.tabs.len() {
-            let tw = self.tab_display_width(group, i);
-            if used + tw > width {
-                break;
-            }
-            used += tw;
-            count += 1;
-        }
-        count
-    }
-
     /// Adjust `tab_scroll_offset` on the active group so that the active tab
     /// is visible in the tab bar, while showing as many tabs as possible.
     ///
-    /// Strategy: start from offset 0 (maximize visible tabs), then only
-    /// increase the offset if the active tab wouldn't fit.  Uses actual
-    /// tab name widths and the reported tab bar width for accuracy.
+    /// The fit algorithm itself (try offset 0 first, else walk backwards
+    /// from the active tab accumulating widths) is
+    /// `quadraui::TabBar::fit_active_scroll_offset` — this is the
+    /// char-cell-measured, backend-agnostic caller of it that keeps engine
+    /// state internally consistent even before any backend has painted a
+    /// frame (see vimcode#660: the engine used to carry its own copy of
+    /// this exact algorithm, hardcoded to `tab_display_width`'s char-cell
+    /// estimate; GTK/Win-GUI compute their own pixel-accurate offset via
+    /// the same quadraui helper and write it back through
+    /// `set_tab_scroll_offset` instead of relying on this method).
     pub(crate) fn ensure_active_tab_visible(&mut self) {
         let group = match self.editor_groups.get(&self.active_group) {
             Some(g) => g,
@@ -2061,36 +2053,16 @@ impl Engine {
         };
         let active = group.active_tab;
         let width = group.tab_bar_width;
+        let tab_count = group.tabs.len();
 
-        // How many tabs fit starting from offset 0?
-        let from_zero = self.tabs_fitting_from(group, 0, width);
+        let offset = quadraui::TabBar::fit_active_scroll_offset(active, tab_count, width, |i| {
+            self.tab_display_width(group, i)
+        });
 
-        if active < from_zero {
-            // Active tab is visible from offset 0 — use it.
-            self.editor_groups
-                .get_mut(&self.active_group)
-                .unwrap()
-                .tab_scroll_offset = 0;
-            return;
-        }
-
-        // Active tab doesn't fit from offset 0.  Find the smallest offset
-        // that makes the active tab visible (i.e. at the right edge).
-        // Walk backwards from the active tab, accumulating widths.
-        let mut used = 0;
-        let mut best_offset = active;
-        for i in (0..=active).rev() {
-            let tw = self.tab_display_width(group, i);
-            if used + tw > width {
-                break;
-            }
-            used += tw;
-            best_offset = i;
-        }
         self.editor_groups
             .get_mut(&self.active_group)
             .unwrap()
-            .tab_scroll_offset = best_offset;
+            .tab_scroll_offset = offset;
     }
 
     /// Called by the renderer to report the available tab bar width in
