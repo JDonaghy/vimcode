@@ -5478,10 +5478,11 @@ mod tests {
     /// rule: `"New Tab"` disappearing after F10 proves the dropdown stops
     /// *painting* once the bar is hidden (the paint block is still gated on
     /// `menu_bar_visible` alone — only the intercept gate widened), and a
-    /// second `"[No Name]"` tab appearing after Enter is the only way to
-    /// observe that the key still reached `MenuSystem` while invisible.
-    /// Revert the gate to `menu_bar_visible` alone and this goes red: Enter
-    /// falls through instead, and the second tab never appears.
+    /// second `"[No Name]"` tab appearing **in the tab-bar row** after Enter
+    /// is the only way to observe that the key still reached `MenuSystem`
+    /// while invisible. Revert the gate to `menu_bar_visible` alone and this
+    /// goes red: Enter falls through instead, and the second tab never
+    /// appears.
     #[test]
     fn menu_intercept_routes_via_is_open_when_bar_hidden_with_dropdown_open_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -5503,15 +5504,10 @@ mod tests {
             repeat: false,
         });
         let screen = driver.screen();
-        let before = screen.matches("[No Name]").count();
         assert!(
             screen.contains("New Tab"),
             "Alt+F should reveal the menu bar and open the File dropdown; \
              screen:\n{screen}"
-        );
-        assert_eq!(
-            before, 1,
-            "a fresh session starts with exactly one untitled tab; screen:\n{screen}"
         );
 
         // F10: MenuSystem doesn't recognise it, so it falls through to
@@ -5525,18 +5521,38 @@ mod tests {
              though it stays logically open underneath; screen:\n{screen}"
         );
 
+        // Count tabs on the **tab-bar row only**, not the whole screen —
+        // the status line also renders the active buffer's name, so a
+        // whole-screen `matches("[No Name]")` count is a mix of two
+        // unrelated surfaces and its absolute value depends on ambient
+        // settings (an operator `~/.config/vimcode/settings.json` changes
+        // what the status line renders, so a developer machine and a clean
+        // CI runner disagree — that divergence is exactly what turned this
+        // assertion red in CI while it stayed green locally). With the bar
+        // hidden the tab bar is back on screen row 0 with no dropdown
+        // overlaying it, so row 0 is the tab bar verbatim (same
+        // `screen.lines().next()` idiom as
+        // `ctrl_o_twice_returns_to_the_first_tab_via_shell_app` above).
+        let tab_row = screen.lines().next().unwrap_or_default().to_string();
+        let before = tab_row.matches("[No Name]").count();
+        assert_eq!(
+            before, 1,
+            "a fresh session starts with exactly one untitled tab; row:\n{tab_row}"
+        );
+
         // Enter only reaches MenuSystem (and activates File > New Tab) if
         // the intercept gate still routes to it with menu_bar_visible now
         // false — i.e. only if the #695 `is_open()` widening is in effect.
         driver.press_named(quadraui::NamedKey::Enter);
         let screen = driver.screen();
-        let after = screen.matches("[No Name]").count();
+        let tab_row = screen.lines().next().unwrap_or_default().to_string();
+        let after = tab_row.matches("[No Name]").count();
         assert_eq!(
             after,
             before + 1,
             "Enter should have reached MenuSystem via the widened \
              `menu_bar_visible || is_open()` gate and activated File > New \
-             Tab, opening a second [No Name] tab; screen:\n{screen}"
+             Tab, opening a second [No Name] tab in the tab bar; screen:\n{screen}"
         );
     }
 
