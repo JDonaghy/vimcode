@@ -8524,14 +8524,22 @@ impl quadraui::ShellApp for App {
         // `render::tab_hover_tooltip_paint` (mirrors TUI's
         // `render_tab_hover_tooltip`, just called with GTK's `cw`/`lh` pixel
         // scale instead of TUI's 1.0/1.0 cell scale) so paint logic isn't
-        // reimplemented per backend. Positioned one line below the top of
-        // the editor column, mirroring `TuiShellApp::render_content`'s
-        // `area.y + 1`.
+        // reimplemented per backend. Positioned one *tab row* below the top
+        // of the editor column — `tab_row_h` (computed above), not `lh` —
+        // mirroring TUI's `area.y + 1`: TUI's tab bar is exactly one
+        // *cell row* tall regardless of the breadcrumbs setting (see
+        // `mouse.rs`'s `tab_bar_rows`), so its `+1` clears only the tab row
+        // itself, same as GTK's `tab_row_h` here (as opposed to
+        // `tab_bar_h`, which also reserves the breadcrumb row when that
+        // setting is on — using `lh` alone landed the tooltip's top edge
+        // inside the tab row's own vertical span, painting over tab labels
+        // instead of below them, since GTK's tab row is `1.6×` a line
+        // height, not `1×` like TUI's).
         if let Some(ref tooltip_text) = screen.tab_tooltip {
             render::tab_hover_tooltip_paint(
                 backend,
                 x as f32,
-                (y + lh) as f32,
+                (y + tab_row_h) as f32,
                 w as f32,
                 tooltip_text,
                 &theme,
