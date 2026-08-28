@@ -13086,6 +13086,57 @@ pub fn window_status_line_to_status_bar(
     }
 }
 
+/// Paint the tab-hover tooltip (the small popup shown when the mouse
+/// hovers a tab and lingers, naming the buffer under the cursor) through
+/// `Backend::draw_status_bar` — the same "single-segment `StatusBar` stands
+/// in for a plain text row" trick TUI's now-retired `draw_rule_row_q` used
+/// (#609), generalized with an explicit `unit_w`/`unit_h` scale (#671)
+/// mirroring the convention `editor_hover_popup_paint` /
+/// `hover_popup_to_quadraui_tooltip` established in #669: `1.0`/`1.0` for
+/// TUI's cell-native space, `char_width`/`line_height` in pixels for GTK.
+/// `x`/`y`/`max_width` are in the *same* native units as `unit_w`/`unit_h`
+/// (cells for TUI, pixels for GTK).
+#[allow(clippy::too_many_arguments)]
+pub fn tab_hover_tooltip_paint(
+    backend: &mut dyn quadraui::Backend,
+    x: f32,
+    y: f32,
+    max_width: f32,
+    tooltip_text: &str,
+    theme: &Theme,
+    unit_w: f32,
+    unit_h: f32,
+) {
+    if tooltip_text.is_empty() {
+        return;
+    }
+    let uw = unit_w.max(0.001);
+    let len = tooltip_text.chars().count() as f32;
+    let max_chars = (max_width / uw).floor().max(0.0);
+    let w_chars = len.min(max_chars);
+    if w_chars <= 0.0 {
+        return;
+    }
+    let text: String = tooltip_text.chars().take(w_chars as usize).collect();
+    backend.set_theme(to_quadraui_theme(theme));
+    let bar = quadraui::StatusBar {
+        // Shares one literal ID across every call the way `draw_rule_row_q`'s
+        // "tui:rule" ID did — inert today since every caller discards the
+        // returned hit-region layout.
+        id: quadraui::WidgetId::new("tooltip:tab"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text,
+            fg: to_quadraui_color(theme.hover_fg),
+            bg: to_quadraui_color(theme.hover_bg),
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![],
+    };
+    let rect = quadraui::Rect::new(x, y, w_chars * uw, unit_h);
+    let _ = backend.draw_status_bar(rect, &bar, None, None);
+}
+
 fn build_command_line(engine: &Engine) -> CommandLineData {
     let (text, right_align, show_cursor, cursor_anchor_text) = match engine.mode {
         Mode::Command if engine.history_search_active => {

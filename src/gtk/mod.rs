@@ -8514,6 +8514,32 @@ impl quadraui::ShellApp for App {
             *t.draw_layout.borrow_mut() = Some(backend.status_bar_layout(t.rect, t.bar));
         }
 
+        // ── Tab-hover tooltip (#671) ─────────────────────────────────────────
+        // Small popup shown when the mouse lingers over a tab, naming the
+        // buffer under the cursor. `screen.tab_tooltip` was populated by the
+        // engine the whole time (#592's root cause) but had no GTK painter at
+        // all — unlike quickfix/panel_hover (#670) there was no dead
+        // `draw.rs` version to port either; `draw.rs:425` painted it with raw
+        // Cairo/Pango, never through `Backend`. Routed through the new shared
+        // `render::tab_hover_tooltip_paint` (mirrors TUI's
+        // `render_tab_hover_tooltip`, just called with GTK's `cw`/`lh` pixel
+        // scale instead of TUI's 1.0/1.0 cell scale) so paint logic isn't
+        // reimplemented per backend. Positioned one line below the top of
+        // the editor column, mirroring `TuiShellApp::render_content`'s
+        // `area.y + 1`.
+        if let Some(ref tooltip_text) = screen.tab_tooltip {
+            render::tab_hover_tooltip_paint(
+                backend,
+                x as f32,
+                (y + lh) as f32,
+                w as f32,
+                tooltip_text,
+                &theme,
+                cw as f32,
+                lh as f32,
+            );
+        }
+
         // ── Draw editor-anchored popups (on top of everything else) ────────────
         // Completion menu, LSP hover, editor hover (rich markdown), diff peek,
         // signature help. (#669) Ported from the dead `src/gtk/draw.rs` path —
@@ -8906,6 +8932,40 @@ impl quadraui::ShellApp for App {
             self.debug_toolbar_height.set(0.0);
         }
 
+        // ── Draw separated status line (#671) ───────────────────────────────
+        // Shown above the terminal/status band when `window_status_line` is
+        // on but `status_line_above_terminal` is off (`bp_open` guarded, see
+        // `compute_editor_layout`'s `has_separated`). Never had a GTK
+        // painter — `screen.separated_status_line` was populated by the
+        // engine but nothing drew it (#592's root cause). Reuses the exact
+        // `render::window_status_line_to_status_bar` adapter the per-window
+        // status bar above (and TUI's `render_window_status_line`) already
+        // routes through, so this can't drift from either. `el.editor_bottom`
+        // already reserved `el.separated_status_h` of vertical space right
+        // here — between the debug toolbar and `status_y` below — so this
+        // band sits exactly where `compute_editor_layout` accounted for it.
+        let separated_status_y = debug_toolbar_y + el.debug_toolbar_h;
+        if let Some(ref status) = screen.separated_status_line {
+            let sb_rect = quadraui::Rect::new(
+                x as f32,
+                separated_status_y as f32,
+                w as f32,
+                el.separated_status_h as f32,
+            );
+            let bar = render::window_status_line_to_status_bar(
+                status,
+                quadraui::WidgetId::new("status:separated"),
+            );
+            let mut frame = QSL::new();
+            frame.push(Surface::StatusBar {
+                rect: sb_rect,
+                bar: &bar,
+                hovered: None,
+                pressed: None,
+            });
+            frame.draw(backend);
+        }
+
         // ── Draw global status bar / wildmenu ─────────────────────────────────
         // Simplified to `h - status_bar_h`: quickfix/terminal/debug-toolbar/
         // separated-status all stack *above* this point now (see the
@@ -9244,6 +9304,26 @@ impl quadraui::ShellApp for App {
         let popup_vp = backend.viewport();
         let popup_viewport = quadraui::Rect::new(0.0, 0.0, popup_vp.width, popup_vp.height);
 
+        // ── Find/replace overlay (#671) ─────────────────────────────────────
+        // Confirmed by #592 to open in engine state (`KEYDBG: OVERLAY STATE
+        // OPEN: ["find_replace"]`) with nothing painting on GTK. Unlike
+        // quickfix/panel_hover (#670) there *was* a dead painter to port —
+        // `draw.rs::draw_find_replace_popup` — but it routed through
+        // `Surface::FindReplace` with a rect the rasteriser ignores; calling
+        // `Backend::draw_find_replace` directly (same trait method TUI's
+        // `TuiShellApp::render_content` calls) is simpler and identical in
+        // effect. The GTK rasteriser positions the panel from its own
+        // `panel.group_bounds` (already absolute pixel coordinates — #550,
+        // same as TUI's absolute cell coordinates) and reads
+        // `current_line_height`/`current_char_width` off the backend
+        // (set once per frame by quadraui's GTK runner before
+        // `render_content` runs), so the `rect` argument here is unused by
+        // the GTK rasteriser too; passed for parity with the trait's
+        // signature and the TUI call site.
+        if let Some(ref find_replace) = screen.find_replace {
+            backend.draw_find_replace(popup_viewport, find_replace);
+        }
+
         // ── Picker / command-palette overlay (#587) ───────────────────────────
         // Same class of bug #546 fixed for dialog/context-menu: the palette was
         // painted only by the dead legacy `draw_editor` Cairo path
@@ -9281,6 +9361,39 @@ impl quadraui::ShellApp for App {
             )));
         } else {
             self.picker_popup_rect.set(None);
+        }
+
+        // ── Tab switcher popup (Ctrl+Tab MRU list) (#671) ───────────────────
+        // `self.tab_switcher_popup_rect` already exists and is read by
+        // `handle_mouse_press`'s "Tab switcher modal arbitration" block
+        // (added ahead of this painter, expecting to be fed) — this is the
+        // first frame that actually sets it. Sizing/positioning ported from
+        // the dead `draw.rs::draw_tab_switcher_popup_list` (pixel-tuned
+        // clamp(350, 600) width, unlike TUI's percent-of-terminal-columns
+        // sizing, which wouldn't make sense in pixel space); content comes
+        // from the same shared `render::tab_switcher_to_quadraui_list_view`
+        // adapter TUI's `TuiShellApp::render_content` uses, through
+        // `Backend::draw_list`.
+        self.tab_switcher_popup_rect.set(None);
+        if let Some(ref ts) = screen.tab_switcher {
+            if !ts.items.is_empty() {
+                let max_visible = ((popup_vp.height as f64 * 0.6) / lh) as usize;
+                let visible = ts.items.len().min(max_visible).min(20);
+                let popup_w = (popup_vp.width as f64 * 0.40).clamp(350.0, 600.0);
+                let popup_h = (visible as f64 + 1.5) * lh;
+                let popup_x = (popup_vp.width as f64 - popup_w) / 2.0;
+                let popup_y = (popup_vp.height as f64 - popup_h) / 2.0;
+                let list = render::tab_switcher_to_quadraui_list_view(ts, visible);
+                let q_rect = quadraui::Rect::new(
+                    popup_x as f32,
+                    popup_y as f32,
+                    popup_w as f32,
+                    popup_h as f32,
+                );
+                backend.draw_list(q_rect, &list);
+                self.tab_switcher_popup_rect
+                    .set(Some((popup_x, popup_y, popup_w, popup_h)));
+            }
         }
 
         if let Some(ref panel) = screen.dialog {
