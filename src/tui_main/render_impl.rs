@@ -1488,13 +1488,19 @@ pub(super) fn render_tab_hover_tooltip(
     tooltip_text: &str,
     theme: &Theme,
 ) {
-    let len = tooltip_text.chars().count() as u16;
-    let w = len.min(max_width);
-    if w == 0 {
-        return;
-    }
-    let text: String = tooltip_text.chars().take(w as usize).collect();
-    draw_rule_row(backend, x, y, &text, theme.hover_fg, theme.hover_bg, theme);
+    // #671: geometry now lives in `render::tab_hover_tooltip_paint`, shared
+    // with GTK's `render_content` — TUI passes `unit_w`/`unit_h` = 1.0/1.0
+    // (cell-native), matching this function's pre-#671 behavior exactly.
+    render::tab_hover_tooltip_paint(
+        backend,
+        x as f32,
+        y as f32,
+        max_width as f32,
+        tooltip_text,
+        theme,
+        1.0,
+        1.0,
+    );
 }
 
 /// Compute the drop zone for a tab drag in TUI based on cursor cell position.

@@ -98,6 +98,12 @@ pub(super) struct Harness<A: AppLogic> {
     /// or `None` if that frame drew no panel-hover popup (#670).
     #[allow(clippy::type_complexity)]
     pub panel_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Tab-switcher popup bounds `(x, y, w, h)` the last frame painted, or
+    /// `None` if that frame drew no tab switcher (#671). Same field
+    /// `handle_mouse_press`'s "Tab switcher modal arbitration" block reads
+    /// for click routing (`App::tab_switcher_popup_rect`).
+    #[allow(clippy::type_complexity)]
+    pub tab_switcher_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
     /// The sidebar content rect the last frame painted the active panel into,
     /// or `None` if the sidebar was hidden. The sidebar twin of
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
@@ -245,6 +251,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let completion_layout = Rc::clone(&app.completion_layout);
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
     let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
+    let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -255,6 +262,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         completion_layout,
         editor_hover_popup_rect,
         panel_hover_popup_rect,
+        tab_switcher_popup_rect,
     }
 }
 
@@ -1679,6 +1687,224 @@ mod panel_surfaces {
             differing > 0,
             "panel hover popup must paint new pixels within its own cached bounds; \
              {differing}/{total} sampled pixels differed"
+        );
+    }
+}
+
+/// Black-box paint proof for the four #592 chrome/transient surfaces #671
+/// ports onto `render_content`: the find/replace overlay, the tab switcher
+/// popup, the separated status line, and the tab-hover tooltip. Unlike the
+/// #669/#670 surfaces, two of these (`separated_status_line`, `tab_tooltip`)
+/// never had a GTK painter at all — see the `#671` comments at each call
+/// site in `render_content` for what each one now routes through
+/// (`Backend::draw_find_replace`/`draw_list` directly for the first two,
+/// the new `render::tab_hover_tooltip_paint` shared adapter for the
+/// tooltip, `render::window_status_line_to_status_bar` — already shared
+/// with the per-window status bar — for the separated status line).
+///
+/// Each test was verified to fail red by temporarily commenting out its
+/// paint call in `render_content` and confirming the assertion panics,
+/// then restoring it.
+#[cfg(test)]
+mod chrome_surfaces {
+    use super::*;
+
+    fn small_engine() -> Engine {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "fn main() {\n    println!(\"hi\");\n}\n");
+        engine
+    }
+
+    fn assert_region_changed(without: &[(u8, u8, u8)], with: &[(u8, u8, u8)], what: &str) {
+        let differing = with
+            .iter()
+            .zip(without.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing > 0,
+            "{what} must paint new pixels; {differing}/{} sampled pixels differed",
+            with.len()
+        );
+    }
+
+    /// Sample a band hugging the top-right corner of the active editor
+    /// window, in absolute pixels — where `gtk::find_replace::
+    /// draw_find_replace` anchors the panel (`popup_x = gb.x + gb.width -
+    /// popup_w - 10`, `popup_y = gb.y + 2`).
+    fn find_replace_region_pixels(configure: impl FnOnce(&mut Engine)) -> Vec<(u8, u8, u8)> {
+        let mut engine = small_engine();
+        configure(&mut engine);
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        let rect = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active window must have painted")
+                .rect
+        };
+        let x1 = (rect.x + rect.width) as i32;
+        let x0 = (x1 - 700).max(rect.x as i32);
+        let y0 = rect.y as i32;
+        let y1 = (rect.y + 150.0).min(rect.y + rect.height) as i32;
+        let mut px = Vec::new();
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                px.push(h.driver.pixel(x, y));
+                x += 3;
+            }
+            y += 2;
+        }
+        px
+    }
+
+    #[test]
+    fn find_replace_overlay_paints() {
+        let without = find_replace_region_pixels(|_| {});
+        let with = find_replace_region_pixels(|e| {
+            e.open_find_replace();
+            e.find_replace_query = "hi".to_string();
+        });
+        assert_region_changed(&without, &with, "an open find/replace overlay");
+    }
+
+    /// Two tabs so `open_tab_switcher` has more than one MRU entry to show
+    /// (it no-ops — leaves `tab_switcher_open` false — with only one).
+    fn engine_with_two_tabs() -> Engine {
+        let mut engine = small_engine();
+        engine.new_tab(None);
+        engine
+    }
+
+    #[test]
+    fn tab_switcher_popup_paints_and_caches_bounds() {
+        let mut engine = engine_with_two_tabs();
+        engine.open_tab_switcher();
+        assert!(
+            engine.tab_switcher_open,
+            "fixture must actually open the switcher"
+        );
+        let mut with_h = harness(engine, 1400, 900);
+        let (px, py, pw, ph) = with_h
+            .tab_switcher_popup_rect
+            .get()
+            .expect("tab switcher popup must cache its bounds for click routing (#671)");
+        assert!(pw > 0.0 && ph > 0.0);
+
+        let mut without_h = harness(engine_with_two_tabs(), 1400, 900);
+        assert!(
+            without_h.tab_switcher_popup_rect.get().is_none(),
+            "no tab switcher rect should be cached when the switcher is closed"
+        );
+
+        let (x0, x1) = (px as i32, (px + pw) as i32);
+        let (y0, y1) = (py as i32, (py + ph) as i32);
+        let mut differing = 0;
+        let mut total = 0;
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                total += 1;
+                if with_h.driver.pixel(x, y) != without_h.driver.pixel(x, y) {
+                    differing += 1;
+                }
+                x += 3;
+            }
+            y += 2;
+        }
+        assert!(
+            differing > 0,
+            "tab switcher popup must paint new pixels within its own cached bounds; \
+             {differing}/{total} sampled pixels differed"
+        );
+    }
+
+    /// Sample a band spanning the bottom half of the whole window — where
+    /// the separated status line paints, above the terminal panel. Wide
+    /// enough to catch it regardless of the fixture's exact chrome heights.
+    fn bottom_region_pixels(
+        width: i32,
+        height: i32,
+        configure: impl FnOnce(&mut Engine),
+    ) -> Vec<(u8, u8, u8)> {
+        let mut engine = small_engine();
+        configure(&mut engine);
+        let mut h = harness(engine, width, height);
+        let mut px = Vec::new();
+        let y0 = (height as f64 * 0.5) as i32;
+        let mut y = y0;
+        while y < height {
+            let mut x = 0;
+            while x < width {
+                px.push(h.driver.pixel(x, y));
+                x += 3;
+            }
+            y += 2;
+        }
+        px
+    }
+
+    /// Same `terminal_open`/`status_line_above_terminal` in both variants
+    /// (so the separated-status band's own reservation — `el.separated_status_h`
+    /// — is identical either way, per the same isolation rationale
+    /// `panel_surfaces` documents above); only the active buffer's `dirty`
+    /// flag differs, which `build_window_status_line` reflects as an extra
+    /// `" [+]"` segment. Isolates the paint call from the layout reservation
+    /// it sits inside.
+    #[test]
+    fn separated_status_line_paints() {
+        let region = |dirty: bool| {
+            bottom_region_pixels(1400, 900, move |e| {
+                e.settings.status_line_above_terminal = false;
+                e.terminal_open = true;
+                e.session.terminal_panel_rows = 10;
+                if dirty {
+                    let id = e.active_buffer_id();
+                    if let Some(buf) = e.buffer_manager.get_mut(id) {
+                        buf.dirty = true;
+                    }
+                }
+            })
+        };
+        assert_region_changed(
+            &region(false),
+            &region(true),
+            "the active buffer's dirty flag changing the separated status line's content",
+        );
+    }
+
+    #[test]
+    fn tab_hover_tooltip_paints() {
+        let region = |tooltip: Option<&str>| {
+            let mut engine = small_engine();
+            engine.tab_hover_tooltip = tooltip.map(|s| s.to_string());
+            let mut h = harness(engine, 1400, 900);
+            let mut px = Vec::new();
+            let mut y = 0;
+            while y < 200 {
+                let mut x = 0;
+                while x < 1400 {
+                    px.push(h.driver.pixel(x, y));
+                    x += 3;
+                }
+                y += 2;
+            }
+            px
+        };
+        assert_region_changed(
+            &region(None),
+            &region(Some("main.rs")),
+            "an active tab-hover tooltip",
         );
     }
 }
