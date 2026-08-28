@@ -2049,10 +2049,23 @@ impl ShellApp for TuiShellApp {
             // path below always uses (`title_bar_height_lh = 1.0`,
             // `Self::shell_config`'s doc comment) for exactly this one
             // just-revealed-but-not-yet-painted frame.
+            //
+            // Checks both `width` and `height` against the cached rect —
+            // matching the paint block above's own `bar_rect.width >= 1.0
+            // && bar_rect.height >= 1.0` guard exactly (review, #695
+            // iteration 1) rather than `height` alone. A `title_bar_bounds`
+            // that were ever `Some` with zero width but non-zero height
+            // (e.g. a viewport whose computed width collapses to 0) would
+            // otherwise hand `MenuSystem::handle` a real-but-zero-width
+            // rect instead of falling back to the full-viewport-width one,
+            // risking the same "lay out zero visible items, then index into
+            // that empty list" panic the same-frame case above is guarded
+            // against — while paint itself would have skipped drawing
+            // anything for that frame.
             if self.engine.menu_bar_visible || self.engine.menu_system.borrow().is_open() {
                 let viewport = backend.viewport();
                 let cached_bar_rect = self.engine.menu_bar_rect.get();
-                let bar_rect = if cached_bar_rect.height >= 1.0 {
+                let bar_rect = if cached_bar_rect.width >= 1.0 && cached_bar_rect.height >= 1.0 {
                     cached_bar_rect
                 } else {
                     quadraui::Rect::new(0.0, 0.0, viewport.width, 1.0)
@@ -5422,6 +5435,108 @@ mod tests {
             screen.contains("New Tab"),
             "the File dropdown's first item should paint after the same-frame \
              reveal-and-activate; screen:\n{screen}"
+        );
+    }
+
+    /// #695 review (iteration 1): black-box coverage for the widened
+    /// intercept gate — `menu_bar_visible || menu_system.borrow().is_open()`
+    /// instead of `menu_bar_visible` alone — added so hiding the bar while
+    /// a dropdown is open doesn't strand the dropdown painted-but-
+    /// unclickable (mirrors GTK's identical gate, `gtk/mod.rs:9671`).
+    ///
+    /// The obvious repro, clicking the status-line `StatusAction::
+    /// ToggleMenuBar` segment while the dropdown is open, is a dead end:
+    /// quadraui's `MenuSystem::handle` `MouseDown` arm treats *any* click
+    /// outside the bar/dropdown as "click outside → close" and consumes the
+    /// event first (before it can ever reach the status-line hit-test), so
+    /// a mouse-based test can never observe the widened gate — every
+    /// attempt just closes the dropdown instead of hiding the bar under it.
+    ///
+    /// `Engine::toggle_menu_bar`'s own doc comment ("Does NOT close any
+    /// open dropdown — callers with backend access should call
+    /// `menu_system.close()` when hiding") names the real caller
+    /// (`StatusAction::ToggleMenuBar`, `execute.rs:3358`) but not a second,
+    /// keyboard-only path to it: VSCode-mode F10 (`vscode.rs:1283`) also
+    /// calls `toggle_menu_bar()` directly, and F10 is a `KeyPressed` variant
+    /// `MenuSystem::handle` doesn't recognise (none of its `Key` patterns
+    /// match `NamedKey::F(10)`, so it falls to the `_ => Ignored` catch-all)
+    /// — meaning it passes through untouched by the dropdown's click-
+    /// outside-closes behaviour and reaches `Engine::handle_key`'s vscode
+    /// dispatch instead.
+    ///
+    /// Sequence: Alt+F opens the File dropdown (`menu_bar_visible=true`,
+    /// `is_open()=true`). F10 flips `menu_bar_visible` to `false` without
+    /// touching the dropdown (`is_open()` stays `true`) — exactly the state
+    /// the widened gate exists for. Enter is dispatched last: before #695's
+    /// widening, `menu_bar_visible` alone would read `false` here and Enter
+    /// would fall through to ordinary vscode key handling instead of
+    /// `MenuSystem`; with the widening it still reaches `MenuSystem` and
+    /// activates the still-selected first item — File ▸ New Tab (`action:
+    /// "tabnew"`) — opening a second tab.
+    ///
+    /// Asserts on rendered output throughout, per this repo's black-box
+    /// rule: `"New Tab"` disappearing after F10 proves the dropdown stops
+    /// *painting* once the bar is hidden (the paint block is still gated on
+    /// `menu_bar_visible` alone — only the intercept gate widened), and a
+    /// second `"[No Name]"` tab appearing after Enter is the only way to
+    /// observe that the key still reached `MenuSystem` while invisible.
+    /// Revert the gate to `menu_bar_visible` alone and this goes red: Enter
+    /// falls through instead, and the second tab never appears.
+    #[test]
+    fn menu_intercept_routes_via_is_open_when_bar_hidden_with_dropdown_open_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        // VSCode mode is required to reach F10 -> toggle_menu_bar() via
+        // Engine::handle_key (vscode.rs:1283) — the #318 Alt-letter reveal
+        // shim and the MenuSystem intercept above it are both mode-
+        // independent, so opening the dropdown below is unaffected.
+        app.engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // Alt+F reveals + opens the File dropdown in one dispatch (mirrors
+        // `alt_letter_reveals_menu_bar_via_shell_app`).
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let screen = driver.screen();
+        let before = screen.matches("[No Name]").count();
+        assert!(
+            screen.contains("New Tab"),
+            "Alt+F should reveal the menu bar and open the File dropdown; \
+             screen:\n{screen}"
+        );
+        assert_eq!(
+            before, 1,
+            "a fresh session starts with exactly one untitled tab; screen:\n{screen}"
+        );
+
+        // F10: MenuSystem doesn't recognise it, so it falls through to
+        // Engine::handle_key -> handle_vscode_key -> toggle_menu_bar(),
+        // which flips menu_bar_visible false WITHOUT closing the dropdown.
+        driver.press_named(quadraui::NamedKey::F(10));
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("New Tab"),
+            "hiding the bar must stop the dropdown from painting, even \
+             though it stays logically open underneath; screen:\n{screen}"
+        );
+
+        // Enter only reaches MenuSystem (and activates File > New Tab) if
+        // the intercept gate still routes to it with menu_bar_visible now
+        // false — i.e. only if the #695 `is_open()` widening is in effect.
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        let after = screen.matches("[No Name]").count();
+        assert_eq!(
+            after,
+            before + 1,
+            "Enter should have reached MenuSystem via the widened \
+             `menu_bar_visible || is_open()` gate and activated File > New \
+             Tab, opening a second [No Name] tab; screen:\n{screen}"
         );
     }
 
