@@ -5689,6 +5689,18 @@ mod tests {
     /// Hamburger click with the sidebar closed beforehand (the ambient
     /// state on a bare `TuiShellApp::new` — see `app_with_sidebar_open`'s
     /// doc comment) must not panic through the real dispatch pipeline.
+    ///
+    /// The benign `WindowFocused` dispatch + render before the click is
+    /// not decorative: `driver_with_shell`'s runner `AppShell` boots with
+    /// `active_panel = Some(0)` (the hamburger) *and* `sidebar_visible =
+    /// true` (`AppShell::new`), and `ShellAdapter::setup`/`render` never
+    /// converge that onto the shadow `engine.app_shell`'s real state —
+    /// only `handle`/`tick` do. Without this priming step, the click
+    /// below would be the runner's first-ever interaction and would hit
+    /// `handle_activity_click`'s "already active" branch, returning
+    /// `SidebarHidden` instead of `PanelChanged` — silently testing the
+    /// wrong code path (see `menu_reveal_then_search_icon_click_opens_
+    /// search_not_explorer`'s identical priming, above).
     #[test]
     fn driver_hamburger_click_sidebar_closed_does_not_panic() {
         let mut driver = driver_with_shell(
@@ -5697,16 +5709,34 @@ mod tests {
             80,
             24,
         );
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
         let _ = driver.click(1.0, 0.0);
-        let _ = driver.screen();
+        // The title-bar reservation syncs at the end of `TuiShellApp::
+        // handle`, which `ShellAdapter`'s `PanelChanged` arm returns
+        // before reaching (see `menu_reveal_then_search_icon_click_opens_
+        // search_not_explorer` above) — pump one more benign event before
+        // asserting on the rendered menu bar.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "hamburger click should have reached PanelChanged and opened \
+             the menu bar; screen:\n{screen}"
+        );
     }
 
-    /// Hamburger clicked twice in a row: the second click lands on the
-    /// runner `AppShell`'s now-active hamburger item and reports
-    /// `SidebarHidden` instead of a second `PanelChanged` (`handle_
-    /// activity_click`'s same-active-panel branch) — a different code
-    /// path from the first click, and #694 calls out double-clicking as
-    /// one of the dimensions worth varying.
+    /// Hamburger clicked twice in a row, primed first (see the previous
+    /// test's doc comment for why priming is required — without it, click
+    /// 1 would hit the runner `AppShell`'s hard-coded "hamburger already
+    /// active" default and report `SidebarHidden`, not `PanelChanged`).
+    /// With priming, click 1 opens the menu (`PanelChanged`, `active_panel`
+    /// becomes the hamburger), so click 2 lands on the now-active hamburger
+    /// item and reports `SidebarHidden` instead of a second `PanelChanged`
+    /// (`handle_activity_click`'s same-active-panel branch) — a different
+    /// code path from the first click, and #694 calls out double-clicking
+    /// as one of the dimensions worth varying.
     #[test]
     fn driver_hamburger_click_twice_does_not_panic() {
         let mut driver = driver_with_shell(
@@ -5715,7 +5745,19 @@ mod tests {
             80,
             24,
         );
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
         let _ = driver.click(1.0, 0.0);
+        // Pump the title-bar reservation sync (see the previous test's
+        // comment) before asserting the first click actually opened the
+        // menu.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "first hamburger click should open the menu bar; screen:\n{screen}"
+        );
         let _ = driver.click(1.0, 0.0);
         let _ = driver.screen();
     }
@@ -5744,6 +5786,15 @@ mod tests {
     /// the click itself never does, per this block's doc comment above.
     /// Exercises the `RefCell` double-borrow candidate from #694's "still
     /// open" list directly: it does not panic.
+    ///
+    /// Primed first (see `driver_hamburger_click_sidebar_closed_does_not_
+    /// panic`'s doc comment) so the click actually takes the `PanelChanged`
+    /// branch and sets `menu_bar_visible = true` — without priming, the
+    /// click would report `SidebarHidden` instead, `menu_bar_visible`
+    /// would stay `false`, and the `press` below would never reach the
+    /// `menu_system` borrow this test claims to exercise. The assertion
+    /// after the click makes that reachability failure loud instead of
+    /// silent.
     #[test]
     fn driver_hamburger_click_then_key_does_not_panic() {
         let mut driver = driver_with_shell(
@@ -5752,7 +5803,23 @@ mod tests {
             80,
             24,
         );
-        let _ = driver.click(1.0, 0.0); // hamburger
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        // hamburger
+        let _ = driver.click(1.0, 0.0);
+        // Pump the title-bar reservation sync (see the priming test above)
+        // before asserting the click actually opened the menu — otherwise
+        // this would silently pass even if the click took the wrong
+        // (`SidebarHidden`) branch, exactly the failure mode this test
+        // exists to catch.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "hamburger click must open the menu bar so the following key \
+             press reaches the menu_system RefCell borrow; screen:\n{screen}"
+        );
         let _ = driver.press(quadraui::Key::Char('j'));
         let _ = driver.screen();
     }
@@ -5781,6 +5848,13 @@ mod tests {
     /// comment). Must not panic or infinite-loop; `driver.press` returning
     /// at all after the click proves the sequence converges rather than
     /// looping forever inside a single `handle`/`tick` call.
+    ///
+    /// Primed first (see `driver_hamburger_click_sidebar_closed_does_not_
+    /// panic`'s doc comment) for the same reason: a bare first click on a
+    /// freshly-built driver reads as `SidebarHidden`, not `PanelChanged`,
+    /// regardless of the ext-panel setup above, so without priming this
+    /// test would never actually reach the `take_requested_panel`
+    /// convergence path it claims to exercise.
     #[test]
     fn driver_hamburger_click_with_ext_panel_active_does_not_panic() {
         let mut app = TuiShellApp::new(None);
@@ -5790,6 +5864,8 @@ mod tests {
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
         let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
         let _ = driver.click(1.0, 0.0); // hamburger
         let _ = driver.press(quadraui::Key::Char('j'));
         let _ = driver.screen();
