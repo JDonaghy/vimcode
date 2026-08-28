@@ -2051,6 +2051,186 @@ pub fn panel_hover_to_quadraui_rich_text(
     }
 }
 
+/// Vertical anchor (top of the hovered row, in the caller's line units) for
+/// [`panel_hover_popup_paint`]. Lifted from the now-dead
+/// `src/gtk/draw.rs::draw_panel_hover_popup`'s source-control section walk
+/// (#670) so both backends can share it instead of GTK re-deriving its own
+/// copy. The non-source-control branch is generalized to take an explicit
+/// `sidebar_top_y` rather than assuming the sidebar starts at row/pixel 0 —
+/// true in the pre-#552 single-DA GTK architecture that dead code was
+/// written against, no longer true now that a title-bar row can sit above
+/// the sidebar.
+fn panel_hover_anchor_y(
+    screen: &ScreenLayout,
+    hover: &PanelHoverPopupData,
+    sidebar_top_y: f32,
+    unit_h: f32,
+) -> f32 {
+    if hover.panel_name != "source_control" {
+        return sidebar_top_y + unit_h + hover.item_index as f32 * unit_h;
+    }
+    // SC layout: `section_top` is read from the cached `SidebarPanelLayout`
+    // (`sc_sections_start_y`, already an absolute coordinate — see its own
+    // field doc) so this doesn't re-derive it; falls back to a one-frame-lag
+    // estimate from the commit box's line count when that cache is still
+    // empty (e.g. the very first frame the SC panel is shown).
+    let item_height = (unit_h * 1.4).round();
+    let section_top = screen
+        .source_control
+        .as_ref()
+        .and_then(|sc| sc.sc_sections_start_y)
+        .unwrap_or_else(|| {
+            let gap = (unit_h * 0.3).round();
+            let commit_rows = screen
+                .source_control
+                .as_ref()
+                .map(|sc| sc.commit_message.split('\n').count().max(1))
+                .unwrap_or(1) as f32;
+            unit_h + gap + commit_rows * unit_h + unit_h
+        });
+    let Some(ref sc) = screen.source_control else {
+        return section_top + hover.item_index as f32 * unit_h;
+    };
+    // Walk sections to find the accumulated Y offset for the hovered flat
+    // index. Headers occupy one row; expanded items occupy `item_height`
+    // each. Staged + Unstaged always show; Worktrees only when there's more
+    // than one; Log always shows — mirrors the SC sidebar's own section
+    // list.
+    let show_worktrees = sc.worktrees.len() > 1;
+    let mut sections: Vec<(usize, bool)> = vec![
+        (sc.staged.len(), sc.sections_expanded[0]),
+        (sc.unstaged.len(), sc.sections_expanded[1]),
+    ];
+    if show_worktrees {
+        sections.push((sc.worktrees.len(), sc.sections_expanded[2]));
+    }
+    sections.push((sc.log.len(), sc.sections_expanded[3]));
+
+    let mut y_off = section_top;
+    let mut fi = 0usize;
+    'outer: for &(count, expanded) in &sections {
+        if fi == hover.item_index {
+            break;
+        }
+        y_off += unit_h;
+        fi += 1;
+        if expanded {
+            for _ in 0..count {
+                if fi == hover.item_index {
+                    break 'outer;
+                }
+                y_off += item_height;
+                fi += 1;
+            }
+        }
+    }
+    y_off
+}
+
+/// Paint the sidebar-item hover popup (source-control / extension-panel item
+/// dwell tooltip, rendered markdown) through the shared
+/// `quadraui::RichTextPopup` primitive — the panel-hover twin of
+/// [`editor_hover_popup_paint`] (#670). GTK previously hand-rolled this in
+/// raw Cairo/Pango (`src/gtk/draw.rs::draw_panel_hover_popup`, no live
+/// callers since the #540 Relm4->ShellApp migration); this instead reuses
+/// the same `RichTextPopup` / `Backend::draw_rich_text_popup` path TUI's
+/// `tui_main::panels::render_panel_hover_popup` already routes through, so
+/// the two backends can't drift on the markdown rendering itself — only the
+/// anchor geometry (source-control section walk vs. uniform per-row offset)
+/// is backend-specific, and that's shared too via [`panel_hover_anchor_y`].
+///
+/// `unit_w` / `unit_h` are `1.0, 1.0` for TUI (cell-native) or `char_width,
+/// line_height` in pixels for GTK. `popup_x` / `sidebar_top_y` / `viewport`
+/// must already be expressed in that same space. As with
+/// `editor_hover_popup_paint`, `RichTextPopup::layout`'s own
+/// `PopupPlacement::Below` clamping against `viewport` means callers don't
+/// need to pre-check whether the popup fits — it re-clamps precisely.
+///
+/// Returns `(link_rects, popup_bounds)` in the caller's units. Link rects
+/// carry a trailing `is_native` flag — `true` for the source-control panel's
+/// trusted links (open directly), `false` for extension-provided ones
+/// (confirm before opening) — mirroring `Msg::PanelHoverClick`'s two
+/// branches.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub fn panel_hover_popup_paint(
+    backend: &mut dyn quadraui::Backend,
+    screen: &ScreenLayout,
+    theme: &Theme,
+    popup_x: f32,
+    sidebar_top_y: f32,
+    viewport: quadraui::Rect,
+    unit_w: f32,
+    unit_h: f32,
+) -> (
+    Vec<(f32, f32, f32, f32, String, bool)>,
+    Option<(f32, f32, f32, f32)>,
+) {
+    let Some(ref hover) = screen.panel_hover else {
+        return (vec![], None);
+    };
+    if hover.rendered.lines.is_empty() {
+        return (vec![], None);
+    }
+    let is_native = hover.panel_name == "source_control";
+    let popup = panel_hover_to_quadraui_rich_text(hover, theme);
+    let max_len = popup
+        .line_text
+        .iter()
+        .map(|t| t.chars().count())
+        .max()
+        .unwrap_or(10) as f32;
+    let avail_w = (viewport.x + viewport.width - popup_x).max(10.0 * unit_w);
+    let content_w = ((max_len + 2.0) * unit_w)
+        .max(10.0 * unit_w)
+        .min((avail_w - 2.0 * unit_w).max(10.0 * unit_w));
+    let anchor_y = panel_hover_anchor_y(screen, hover, sidebar_top_y, unit_h);
+    let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
+    // `Placement::Below` adds one row height to the anchor, so subtract it
+    // here to land the box's top border exactly on `anchor_y` — same trick
+    // `editor_hover_popup_paint`/TUI's `render_panel_hover_popup` use.
+    let layout = popup.layout(
+        popup_x,
+        anchor_y - unit_h,
+        viewport,
+        measure,
+        |line_idx, start_byte, end_byte| {
+            popup
+                .line_text
+                .get(line_idx)
+                .map(|t| {
+                    t[start_byte.min(t.len())..end_byte.min(t.len())]
+                        .chars()
+                        .count() as f32
+                })
+                .unwrap_or(0.0)
+                * unit_w
+        },
+    );
+
+    backend.draw_rich_text_popup(&popup, &layout);
+
+    let link_rects: Vec<(f32, f32, f32, f32, String, bool)> = layout
+        .link_hit_regions
+        .iter()
+        .map(|(rect, idx)| {
+            let url = popup
+                .links
+                .get(*idx)
+                .map(|l| l.url.clone())
+                .unwrap_or_default();
+            (rect.x, rect.y, rect.width, rect.height, url, is_native)
+        })
+        .collect();
+
+    let popup_rect = Some((
+        layout.bounds.x,
+        layout.bounds.y,
+        layout.bounds.width,
+        layout.bounds.height,
+    ));
+    (link_rects, popup_rect)
+}
+
 // ─── AiPanelData ─────────────────────────────────────────────────────────────
 
 /// A single message in the AI conversation history, pre-formatted for rendering.
