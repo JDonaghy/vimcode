@@ -3,9 +3,8 @@
 #![allow(deprecated)]
 
 use gio::prelude::{FileExt, FileMonitorExt};
-use gtk4::cairo::Context;
 use gtk4::gdk;
-use gtk4::pango::{self, AttrColor, AttrList, FontDescription};
+use gtk4::pango::{self, FontDescription};
 use gtk4::prelude::*;
 use pangocairo::functions as pangocairo;
 use std::cell::{Cell, RefCell};
@@ -21,7 +20,7 @@ use crate::render;
 use core::engine::EngineAction;
 use core::settings::LineNumberMode;
 use core::{Engine, OpenMode, WindowRect};
-use render::{build_screen_layout, CommandLineData, RenderedWindow, Theme};
+use render::{build_screen_layout, Theme};
 
 use copypasta_ext::ClipboardProviderExt;
 use std::collections::HashMap;
@@ -29,10 +28,8 @@ use std::collections::HashMap;
 mod backend;
 mod click;
 mod css;
-mod draw;
 mod events;
 mod explorer;
-mod quadraui_gtk;
 mod services;
 #[cfg(test)]
 mod testing;
@@ -40,7 +37,6 @@ mod util;
 
 use click::*;
 use css::*;
-use draw::*;
 use util::*;
 
 use crate::core::engine::sidebar::*;
@@ -54,7 +50,46 @@ fn ext_panel_name(id: &str) -> Option<&str> {
 }
 
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
-type TabCloseMap = HashMap<usize, Vec<Option<(f64, f64)>>>;
+
+/// Pango font family for UI panels (menu bar, sidebars, dropdown,
+/// dialogs, hover popups). Size is appended at use via [`UI_FONT`]
+/// from the configured `settings.ui_font_size` (#217).
+///
+/// Re-homed from the deleted `src/gtk/draw.rs` (#672) — draw.rs was
+/// dead under `ShellApp`, but this const and its three siblings below
+/// were still live (read by the raw-Pango chrome `render_content`
+/// paints directly, e.g. the menu-bar font and the breadcrumb-heading
+/// font), so they moved rather than being deleted with the rest of
+/// the file.
+const UI_FONT_FAMILY: &str = "Segoe UI, Ubuntu, Droid Sans, Sans";
+
+/// Process-global UI font size (points). Synced from
+/// `settings.ui_font_size` at the start of each frame by
+/// [`sync_ui_font_size`]. Read everywhere a Pango font description
+/// is built — avoids threading `&Settings` through every draw
+/// function for what's effectively one shared knob (#217).
+static UI_FONT_SIZE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(10);
+
+/// Update the process-global UI font size from `settings`. Called
+/// once per frame at the top of [`App::render_content`] (#672 —
+/// `draw.rs::draw_editor`'s only live caller before the delete).
+fn sync_ui_font_size(settings: &core::settings::Settings) {
+    UI_FONT_SIZE.store(
+        settings.ui_font_size.max(6),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Pango font description string for UI chrome at the currently
+/// configured size. Call sites do `FontDescription::from_string(&UI_FONT())`.
+#[allow(non_snake_case)]
+fn UI_FONT() -> String {
+    format!(
+        "{} {}",
+        UI_FONT_FAMILY,
+        UI_FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed)
+    )
+}
 
 /// Absolute per-group close-glyph hit rects captured during `render_content`.
 /// Keyed by `group_id.0` → `(bar_y_top, bar_y_bottom, per-tab Some((x0, x1)))`.
@@ -242,24 +277,10 @@ type SplitBtnMap = HashMap<usize, (f64, f64)>;
 type ActionBtnMap = HashMap<usize, (f64, f64)>;
 
 /// Cached per-window status segment hit zones: window_id -> Vec<(start_x, end_x, action)>.
-/// Populated by draw_window_status_bar, consumed by click hit-testing.
+/// Populated in `render_content`'s per-window/separated status bar paint
+/// (#672 — re-homed off the dead `draw.rs::draw_window_status_bar`),
+/// consumed by click hit-testing.
 type StatusSegmentMap = HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
-
-/// Return type of draw_tab_bar: (tab_slot_positions, close_bounds,
-/// diff_btn_positions, split_btn_widths, visible_tab_count, action_btn,
-/// correct_scroll_offset).
-/// `correct_scroll_offset` is the offset that would make the active tab
-/// visible given THIS frame's pixel measurements; the caller compares to
-/// the engine's stored value and triggers a repaint if they differ.
-type TabBarDrawResult = (
-    Vec<(f64, f64)>,
-    Vec<Option<(f64, f64)>>, // per-tab close-button bounds (None for sentinels)
-    Option<(f64, f64, f64, f64, f64, f64)>,
-    Option<(f64, f64)>,
-    usize,
-    Option<(f64, f64)>, // action menu button (start_x, end_x)
-    usize,              // correct_scroll_offset (per-group, in pixels-aware units)
-);
 
 // ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
@@ -8206,6 +8227,32 @@ impl quadraui::ShellApp for App {
         // (#547) Re-synced every frame so runtime toggles (`:set
         // nonerdfonts`) take effect immediately, matching TUI.
         render::sync_nerd_fonts(backend, &engine);
+        // Re-synced every frame so a runtime `:set guifont`/font-size change
+        // takes effect immediately (#217/#672). Ported from the dead
+        // `draw.rs::draw_editor`'s top-of-frame call, which was the only
+        // live caller — `UI_FONT()` (used a few paint calls below for the
+        // raw-Pango chrome that doesn't go through `Backend::set_ui_font`)
+        // read the process-global atomic this writes, so before this port it
+        // silently stayed pinned at the default size forever.
+        sync_ui_font_size(&engine.settings);
+
+        // #672: scroll surfaces are re-registered from scratch every frame
+        // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)
+        // so a panel that closes — or moves — doesn't leave a stale entry
+        // behind for `dispatch_scroll`/`dispatch_click` to hit-test against.
+        // Ported from the dead `draw.rs::draw_editor`'s equivalent top-of-frame
+        // clear, which was this list's only writer under `ShellApp` (#592/#672).
+        engine.scroll_surfaces.borrow_mut().clear();
+        // Per-window status bar segment hit zones (#672): `click.rs`'s
+        // `pixel_to_click_target` reads this to resolve `WindowZone::StatusBar`
+        // clicks (goto-line, change-language, switch-branch, ...) to a
+        // `StatusAction`, but under `ShellApp` nothing ever populated it — the
+        // dead `draw.rs::draw_window_status_bar` was the only writer, so every
+        // per-window status bar segment click silently resolved to
+        // `ClickTarget::None`. Cleared here and re-inserted per window below
+        // (and for the separated status line further down) so a window that
+        // closes doesn't leave a stale, now-wrong entry keyed by its id.
+        self.status_segment_map.borrow_mut().clear();
 
         let lh = self.cached_line_height.max(backend.line_height() as f64);
         let cw = self.cached_char_width.max(backend.char_width() as f64);
@@ -8389,6 +8436,32 @@ impl quadraui::ShellApp for App {
                     pressed: None,
                 });
                 frame.draw(backend);
+
+                // #672: recover segment hit zones the same way the dead
+                // `draw.rs::draw_window_status_bar` did, so
+                // `pixel_to_click_target`'s `WindowZone::StatusBar` arm has a
+                // real `status_segment_map` entry to resolve against instead
+                // of an always-empty one. `status_bar_layout` lays segments
+                // out bar-relative from `(0, 0)` regardless of `sb_rect`'s own
+                // origin (see `route_debug_sidebar_event`'s doc comment above
+                // for the same "`StatusBar::layout` always starts at 0,0"
+                // contract), which is exactly the window-relative `local_x`
+                // `window_zone_hit_test` hit-tests with — no coordinate
+                // translation needed.
+                let sb_layout = backend.status_bar_layout(sb_rect, &win_bar);
+                let mut zones = Vec::new();
+                for (rect, hit) in &sb_layout.hit_regions {
+                    if let quadraui::StatusBarHit::Segment(ref id) = hit {
+                        if let Some(action) = render::status_action_from_id(id.as_str()) {
+                            let start = rect.x as f64;
+                            let end = start + rect.width as f64;
+                            zones.push((start, end, action));
+                        }
+                    }
+                }
+                self.status_segment_map
+                    .borrow_mut()
+                    .insert(rw.window_id.0, zones);
             }
         }
 
@@ -8972,6 +9045,26 @@ impl quadraui::ShellApp for App {
                 pressed: None,
             });
             frame.draw(backend);
+
+            // #672: same segment hit-zone recovery as the per-window status
+            // bar above, keyed by `active_window_id` — the separated line
+            // shows the active window's status, so that's the id
+            // `pixel_to_click_target` looks its zones up under, matching the
+            // dead `draw.rs::draw_window_status_bar` call site this replaces.
+            let sb_layout = backend.status_bar_layout(sb_rect, &bar);
+            let mut zones = Vec::new();
+            for (rect, hit) in &sb_layout.hit_regions {
+                if let quadraui::StatusBarHit::Segment(ref id) = hit {
+                    if let Some(action) = render::status_action_from_id(id.as_str()) {
+                        let start = rect.x as f64;
+                        let end = start + rect.width as f64;
+                        zones.push((start, end, action));
+                    }
+                }
+            }
+            self.status_segment_map
+                .borrow_mut()
+                .insert(screen.active_window_id.0, zones);
         }
 
         // ── Draw global status bar / wildmenu ─────────────────────────────────

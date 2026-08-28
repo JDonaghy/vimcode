@@ -868,7 +868,7 @@ mod emoji_click_column_tests {
             let editor = render::to_q_editor(rw);
             let rect = editor.rect;
             let mut b = backend.borrow_mut();
-            b.set_current_theme(super::quadraui_gtk::q_theme(&theme));
+            b.set_current_theme(render::to_quadraui_theme(&theme));
             b.set_current_line_height(line_height);
             b.set_current_char_width(char_width);
             b.enter_frame_scope(&cr, &layout, |b| {
