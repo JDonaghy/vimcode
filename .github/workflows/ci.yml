@@ -17,32 +17,12 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # Cargo.toml has two path-deps on a *sibling* quadraui checkout:
-    #   quadraui = { path = "../quadraui/quadraui" }
-    #   vt100    = { path = "../quadraui/vendor/vt100-0.16.2-patched" }
-    # actions/checkout cannot write outside the workspace, so clone it by hand.
-    # quadraui is public and vendors the patched vt100, so no token is needed.
-    #
-    # #638: check out the *pinned* rev from `quadraui-pin.txt`, not `develop`.
-    # Cargo cannot pin path deps, so tracking `develop` here meant an upstream
-    # quadraui merge could restate vimcode's rendering with zero vimcode commits
-    # — the root cause behind #625, and the reason six snapshot tests sat red
-    # behind a `--skip` list for weeks. `build.rs` enforces the same pin
-    # locally, so CI and dev machines can no longer silently disagree.
-    # Bumping the pin is a one-line, reviewable commit to `quadraui-pin.txt`.
-    - name: Check out quadraui (pinned sibling path dependency)
-      run: |
-        set -euo pipefail
-        PIN="$(grep -v '^[[:space:]]*#' quadraui-pin.txt | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
-        echo "quadraui pin (quadraui-pin.txt): $PIN"
-        DEST="$(dirname "$GITHUB_WORKSPACE")/quadraui"
-        git init -q "$DEST"
-        git -C "$DEST" remote add origin https://github.com/JDonaghy/quadraui.git
-        # GitHub allows fetching a bare SHA; fall back to a full fetch if the
-        # pin is ever unreachable that way (e.g. a rev only on a fork's branch).
-        git -C "$DEST" fetch --depth 1 origin "$PIN" || git -C "$DEST" fetch origin
-        git -C "$DEST" checkout -q --detach "$PIN"
-        echo "quadraui checked out at: $(git -C "$DEST" rev-parse HEAD)"
+    # #691: quadraui is a git dependency pinned to a `rev` in Cargo.toml
+    # (`quadraui = { git = ..., rev = ... }`), resolved and locked in
+    # Cargo.lock. Cargo fetches it itself on the first cargo invocation below
+    # — no separate checkout step needed. (Formerly a hand-cloned sibling path
+    # dep pinned out-of-band via `quadraui-pin.txt`; see git history / #638 /
+    # #625 for why that existed and why it was retired.)
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -93,18 +73,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # Same pinned sibling checkout as the TUI job — see the comment there.
-    - name: Check out quadraui (pinned sibling path dependency)
-      run: |
-        set -euo pipefail
-        PIN="$(grep -v '^[[:space:]]*#' quadraui-pin.txt | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')"
-        echo "quadraui pin (quadraui-pin.txt): $PIN"
-        DEST="$(dirname "$GITHUB_WORKSPACE")/quadraui"
-        git init -q "$DEST"
-        git -C "$DEST" remote add origin https://github.com/JDonaghy/quadraui.git
-        git -C "$DEST" fetch --depth 1 origin "$PIN" || git -C "$DEST" fetch origin
-        git -C "$DEST" checkout -q --detach "$PIN"
-        echo "quadraui checked out at: $(git -C "$DEST" rev-parse HEAD)"
+    # #691: quadraui fetched by Cargo itself, same as the TUI job — see the
+    # comment there.
 
     - name: Install GTK4 dev libraries
       run: |

@@ -45,18 +45,21 @@ gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
 # default in the dependency line; the GTK feature ships gated behind
 # vimcode's own `gui` feature above.
 # Quadraui lives in its own repo since Session 346 extraction (see PLAN.md).
-# Path-dep to a sibling checkout: clone https://github.com/JDonaghy/quadraui
-# next to vimcode (i.e. `~/src/quadraui` and `~/src/vimcode` as siblings).
-# CI must clone quadraui as a sibling before any cargo step, because
-# actions/checkout cannot write outside the workspace — see the
-# "Check out quadraui" step in `.github/workflows/ci.yml`.
 #
-# Cargo does NOT pin path deps (Cargo.lock has no entry for them), so the exact
-# quadraui commit is pinned out-of-band in `quadraui-pin.txt` and enforced by
-# `build.rs`; CI checks out that same rev. Read `quadraui-pin.txt` before
-# changing anything here — including how to build against a local quadraui
-# branch (`VIMCODE_QUADRAUI_UNPINNED=1`) and how to bump the pin. (#638)
-quadraui = { path = "../quadraui/quadraui", features = ["tui", "terminal"] }
+# #691: pinned to a quadraui git rev (was a relative path to a sibling
+# checkout, which built against whatever happened to be checked out in
+# `~/src/quadraui` — a directory shared by every concurrently-running agent
+# on this machine, so one agent's checkout was another agent's broken build;
+# see `quadraui-pin.txt`'s history and #625 / #638 / #659 for the incidents
+# this caused). Bumping the rev is now a deliberate, reviewable commit —
+# edit `rev` below and re-run `cargo test`; `cargo update -p quadraui` alone
+# will NOT move a rev-pinned git dep. To build against a local quadraui
+# checkout during co-development, copy
+# `cargo-config-local-quadraui.toml.example` to `.cargo/config.toml` (see
+# that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
+# replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
+# not build backwards drift (a checkout older than a rev vimcode requires).
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "6a8a959d76deea0baa63b49c30ec2cf0f268cf16", features = ["tui", "terminal"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 pangocairo = { version = "0.18", optional = true }
 ropey = "1.6.1"
@@ -112,13 +115,13 @@ cc = "1.0"
 # `[patch]` section declared in the root manifest of the workspace actually
 # being built, so quadraui's patch has zero effect here; this repo's own
 # `[patch.crates-io]` entry (pointing at the same vendored copy, which
-# lives at the quadraui monorepo root, a sibling of the `quadraui` crate
-# path-dep above) is required too. See
-# ../quadraui/vendor/vt100-0.16.2-patched/README-PATCH.md and
-# ../quadraui/quadraui/docs/LESSONS.md for the full rationale — do not
-# remove this without reading both first.
+# lives at the quadraui monorepo root) is required too. See
+# vendor/vt100-0.16.2-patched/README-PATCH.md (in the quadraui repo, at the
+# rev pinned above) and quadraui's docs/LESSONS.md for the full rationale —
+# do not remove this without reading both first. #691: same rev as the
+# `quadraui` dep above, resolved via git instead of a sibling path.
 [patch.crates-io]
-vt100 = { path = "../quadraui/vendor/vt100-0.16.2-patched" }
+vt100 = { git = "https://github.com/JDonaghy/quadraui.git", rev = "6a8a959d76deea0baa63b49c30ec2cf0f268cf16" }
 
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible
