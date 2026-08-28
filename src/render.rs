@@ -1145,12 +1145,12 @@ pub fn completion_menu_to_quadraui_completions(menu: &CompletionMenu) -> quadrau
 /// `Tooltip::new(id, text)` plus `.with_styled_lines/.with_placement/
 /// .with_bg/.with_fg`. It is **not callable from vimcode yet**: it
 /// landed on quadraui `develop` *after* the rev this repo is pinned to
-/// (`quadraui-pin.txt` = `f6d27c2`), and `build.rs` enforces that pin.
-/// Calling it compiles only once the pin moves, which per
-/// `quadraui-pin.txt` is its own deliberate, `cargo test`-verified
-/// commit — ~70 quadraui commits ride along in `f6d27c2..develop`,
-/// including tooltip-box and tab-label paint changes that restate this
-/// repo's snapshots.
+/// (the `rev` on the `quadraui` dependency in `Cargo.toml`, formerly
+/// `quadraui-pin.txt` = `f6d27c2`; see #691). Calling it compiles only
+/// once the pin moves, which is its own deliberate, `cargo test`-verified
+/// commit — ~70 quadraui commits rode along in `f6d27c2..develop` at the
+/// time this was written, including tooltip-box and tab-label paint
+/// changes that restate this repo's snapshots.
 ///
 /// Routing through this helper still buys #661's actual goal today:
 /// vimcode names `Tooltip`'s field set in exactly **one** place instead

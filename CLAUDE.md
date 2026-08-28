@@ -43,25 +43,29 @@ line-level confirmation — not the first move.
 6. Run `gh issue list --state open` to see active work and priorities
 7. Prompt user to update `PROJECT_STATE.md` and `PLAN.md` after significant tasks
 
-### Wrong quadraui checkout — the build now tells you (#638)
+### quadraui is a pinned git dependency, not a sibling checkout (#691)
 
-Vimcode depends on `quadraui` via a **path dependency** to the sibling `~/src/quadraui` checkout (see `Cargo.toml` line ~48), not a crates.io version. Cargo does not pin path deps, so historically whatever was checked out at `~/src/quadraui` is what got compiled — silently.
-
-That is no longer true. **`quadraui-pin.txt` records the exact quadraui commit vimcode is built against, and `build.rs` fails the build if the sibling checkout is on a different one.** So a wrong checkout is now a loud, named error rather than a mystery. Read `quadraui-pin.txt` — it documents the whole workflow. The short version:
+Vimcode depends on `quadraui` via a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }`, and `[patch.crates-io] vt100` is pinned the same way. Cargo clones the pinned rev into `~/.cargo/git/` itself and locks the resolved SHA in `Cargo.lock`. **`~/src/quadraui` is not consulted by a normal build at all** — a plain `cargo build` is reproducible regardless of what's checked out there, including on a machine running several agents concurrently.
 
 ```bash
-# Build against the pin (the normal case):
-git -C ~/src/quadraui fetch origin && git -C ~/src/quadraui checkout "$(grep -v '^[[:space:]]*#' quadraui-pin.txt | grep -v '^[[:space:]]*$' | head -1)"
+# Build against the pin (the normal case, and the only case for a plain checkout):
+cargo build
 
-# Co-developing quadraui on a branch? Opt out for that build only:
-VIMCODE_QUADRAUI_UNPINNED=1 cargo build
+# Bump the pin: edit `rev = "..."` in Cargo.toml (the quadraui dependency AND
+# the [patch.crates-io] vt100 entry — they must match), then:
+cargo test    # updates Cargo.lock and re-runs snapshots against the new rev
+
+# Co-developing quadraui on a local branch? Opt in per-checkout, not per-env-var:
+cp cargo-config-local-quadraui.toml.example .cargo/config.toml   # git-ignored
+# ... edit ~/src/quadraui, rebuild ...
+rm .cargo/config.toml   # back to the pinned rev
 ```
 
-**Do not `git pull` in `~/src/quadraui` to fix a build error.** That was the old advice and it is now backwards: pulling moves the checkout *off* the pin and the build will say so. If vimcode genuinely needs a newer quadraui API, **bump the pin** — put the new sha in `quadraui-pin.txt` and run `cargo test`. That one-line commit is the record that quadraui moved, which is exactly what was missing when quadraui#472 silently staled six snapshot tests (#625).
+`cargo update -p quadraui` alone will **not** move a rev-pinned git dep — the `Cargo.toml` edit is the bump, and it is deliberately a reviewable one-line diff for the same reason `quadraui-pin.txt` used to be one (see `docs/QUADRAUI_GUIDE.md` for the #625/#638/#659 history this replaced).
 
 `vimcode --version` / `vcd --version` print the resolved quadraui rev, so "which quadraui?" is answerable from any binary.
 
-Do not "fix" vimcode to match a stale quadraui — you'll just undo work that already shipped on the quadraui side.
+Do not "fix" vimcode to match a stale local quadraui checkout — with the git dep, "stale local checkout" can no longer affect a normal build in the first place; if you see it, check for a stray `.cargo/config.toml`.
 
 ## Conditional Reference Files
 

@@ -1,26 +1,30 @@
-//! Which quadraui is this build actually made of? (#638)
+//! Which quadraui is this build actually made of? (#691, formerly #638)
 //!
-//! quadraui is a *relative sibling path dependency*, so Cargo cannot pin it and
-//! `Cargo.lock` has no entry for it. Historically that meant an upstream
-//! quadraui merge could restate vimcode's rendering with zero vimcode commits —
-//! the root cause behind #625, where quadraui#472's `char_cell_width` change
-//! staled six `snapshot_*` tests on every machine simultaneously and was
-//! misdiagnosed for weeks as CI flakiness.
+//! quadraui is a **git dependency pinned to a `rev`** in `Cargo.toml` (see the
+//! dependency comment there). `Cargo.lock` records the fully-resolved 40-char
+//! SHA, so unlike the old sibling path dep, the exact commit vimcode was built
+//! against is always attributable from tracked files alone — no separate pin
+//! file or build-time checkout comparison needed.
 //!
-//! `build.rs` resolves the sibling checkout's `HEAD` and compares it against
-//! `quadraui-pin.txt`, failing the build on a mismatch. This module surfaces
-//! both revs at runtime so the answer to "which quadraui?" is *in the output*
-//! rather than something a human has to think to go and ask.
+//! Before #691, quadraui was a *relative sibling path dependency*: Cargo
+//! cannot pin those, so `Cargo.lock` had no entry for quadraui at all, and an
+//! upstream quadraui merge could restate vimcode's rendering with **zero
+//! vimcode commits**. That was the root cause of #625 — quadraui#472's
+//! `char_cell_width` change staled six `snapshot_*` tests on every machine at
+//! once, misdiagnosed as CI flakiness for weeks — and of two separate
+//! `QUADRAUI PIN MISMATCH` incidents during #659's smoke, both caused purely
+//! by `~/src/quadraui` (a checkout shared by every concurrently-running agent
+//! on the machine) moving underneath a build with nothing wrong in vimcode
+//! either time. A git rev pin closes that gap at the source: Cargo resolves
+//! and locks it, so there is nothing left for a shared directory to disturb.
+//!
+//! `build.rs` bakes the resolved rev into the binary so the answer to "which
+//! quadraui?" is in the output rather than something a human has to think to
+//! go and ask.
 
-/// The quadraui commit recorded in `quadraui-pin.txt` — what vimcode's
-/// behaviour and snapshots were produced against.
-pub const PINNED_REV: &str = env!("VIMCODE_QUADRAUI_PINNED_REV");
-
-/// The quadraui commit this binary was *actually* compiled against, or
-/// `"unknown"` when the sibling checkout is not a git repository.
-///
-/// Equal to [`PINNED_REV`] unless the build opted out with
-/// `VIMCODE_QUADRAUI_UNPINNED=1`.
+/// The quadraui commit this binary was compiled against — the resolved rev
+/// from `Cargo.lock` (or, if no lockfile existed yet at build time, the `rev`
+/// pinned in `Cargo.toml`). `"unknown"` only if neither file was readable.
 pub const RESOLVED_REV: &str = env!("VIMCODE_QUADRAUI_REV");
 
 /// First 12 characters of a rev, or the whole string if it is shorter (e.g.
@@ -30,68 +34,13 @@ fn short(rev: &str) -> &str {
 }
 
 /// One line naming the quadraui this build is made of, for `--version` output.
-///
-/// Reads `quadraui f6d27c239203` when pinned, and calls out drift loudly
-/// otherwise — an unpinned build's rendering differences are not attributable
-/// to vimcode, and the version string should say so.
 pub fn version_line() -> String {
-    if RESOLVED_REV == PINNED_REV {
-        format!("quadraui {}", short(PINNED_REV))
-    } else {
-        format!(
-            "quadraui {} (UNPINNED — pin is {})",
-            short(RESOLVED_REV),
-            short(PINNED_REV)
-        )
-    }
+    format!("quadraui {}", short(RESOLVED_REV))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The pin file must hold a real, full-length SHA. A truncated or
-    /// placeholder value would let `build.rs` compare against garbage.
-    #[test]
-    fn pinned_rev_is_a_full_sha() {
-        assert_eq!(PINNED_REV.len(), 40, "pin must be a full 40-char sha");
-        assert!(
-            PINNED_REV.chars().all(|c| c.is_ascii_hexdigit()),
-            "pin must be hex"
-        );
-    }
-
-    /// The load-bearing assertion of #638.
-    ///
-    /// A test run against an off-pin quadraui produces failures that look
-    /// exactly like vimcode regressions — that is precisely how #625 cost
-    /// weeks. Fail here, first and by name, so the next person reads
-    /// "quadraui moved" instead of hunting a phantom snapshot bug.
-    ///
-    /// Deliberately unpinned co-development builds are exempt: `build.rs`
-    /// already warned loudly at compile time.
-    #[test]
-    fn test_run_is_against_the_pinned_quadraui() {
-        if std::env::var("VIMCODE_QUADRAUI_UNPINNED").is_ok_and(|v| !v.is_empty() && v != "0") {
-            eprintln!(
-                "vimcode: VIMCODE_QUADRAUI_UNPINNED set; {} — snapshot failures in \
-                 this run are not necessarily vimcode's fault.",
-                version_line()
-            );
-            return;
-        }
-
-        // Surface the rev unconditionally: `cargo test -- --nocapture` should
-        // answer "which quadraui?" without anyone having to go looking.
-        eprintln!("vimcode: built against {}", version_line());
-
-        assert_eq!(
-            RESOLVED_REV, PINNED_REV,
-            "this build used quadraui {RESOLVED_REV}, but quadraui-pin.txt pins \
-             {PINNED_REV}. Rendering/behaviour differences in this run are \
-             attributable to quadraui, not to vimcode. See quadraui-pin.txt."
-        );
-    }
 
     #[test]
     fn version_line_names_the_pin() {
