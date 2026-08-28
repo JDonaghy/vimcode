@@ -527,7 +527,6 @@ struct App {
     /// hovered-window lookup silently died — see #646 and
     /// [`Self::last_editor_pointer`]).
     drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    menu_bar_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Line height the debug-sidebar draw closure last computed via
     /// `pangocairo::create_context(cr).metrics(...)`. Click / scroll /
@@ -761,7 +760,10 @@ struct App {
     menu_row_rect: Cell<quadraui::Rect>,
     /// Rect of the drawn inline window-control buttons (minimize/maximize/
     /// close), to the right of the menu items within `menu_row_rect`. (#552)
-    title_bar_rect: Cell<quadraui::Rect>,
+    /// `Rc`-wrapped (like `picker_popup_rect` etc.) so the headless test
+    /// harness can clone a handle and assert the Command Center (#676)
+    /// never overlaps it.
+    title_bar_rect: Rc<Cell<quadraui::Rect>>,
     /// Hover/press/click tracker for the window-control buttons, shared with
     /// quadraui's own `full_chrome_demo` reference title bar (quadraui#402)
     /// — replaces a hand-rolled `StatusBarLayout::hit_test` call with the
@@ -1574,7 +1576,6 @@ impl App {
             ctx_menu_overlay_da: Rc::new(RefCell::new(None)),
             explorer_scroll_accum: Rc::new(Cell::new(0.0)),
             drawing_area: Rc::new(RefCell::new(None)),
-            menu_bar_da: Rc::new(RefCell::new(None)),
             debug_sidebar_da_ref: Rc::new(RefCell::new(None)),
             debug_sidebar_lh: Rc::new(Cell::new(20.0)),
             git_sidebar_da_ref: Rc::new(RefCell::new(None)),
@@ -1642,7 +1643,7 @@ impl App {
             window: None,
             cached_editor_bounds: Cell::new(None),
             menu_row_rect: Cell::new(quadraui::Rect::default()),
-            title_bar_rect: Cell::new(quadraui::Rect::default()),
+            title_bar_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             title_bar_interaction: RefCell::new(quadraui::StatusBarInteraction::new()),
             last_sc_refresh: std::time::Instant::now(),
             last_tree_indicator_update: std::time::Instant::now(),
@@ -2166,12 +2167,6 @@ impl App {
                 self.char_width_cell.set(char_width);
                 // Keep menu dropdown overlay in sync with current line height.
                 self.menu_dd_line_height.set(line_height);
-                // Sync menu bar height to font metrics
-                if let Some(ref da) = *self.menu_bar_da.borrow() {
-                    if self.engine.borrow().menu_bar_visible {
-                        da.set_height_request(line_height as i32);
-                    }
-                }
                 // If cached_char_width changed significantly (e.g. on first draw after startup
                 // when the initial default of 9.0 differed from the actual font metric),
                 // resize any open terminal panes so their PTY col count matches the display.
@@ -5488,17 +5483,11 @@ impl App {
             da.set_can_target(is_open);
             da.queue_draw();
         }
-        if let Some(ref da) = *self.menu_bar_da.borrow() {
-            da.queue_draw();
-        }
     }
 
     fn handle_menu_msg(&mut self, msg: Msg) {
         match msg {
             Msg::ToggleMenuBar => {
-                if let Some(ref da) = *self.menu_bar_da.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::MruNavBack => {
@@ -7567,10 +7556,10 @@ impl App {
                 let activation = self.engine.borrow_mut().activity_bar_activate();
                 match activation {
                     ActivityBarActivation::MenuToggled => {
-                        // Re-draw menu bar overlay.
-                        if let Some(ref da) = *self.menu_bar_da.borrow() {
-                            da.queue_draw();
-                        }
+                        // Menu bar is repainted every frame by
+                        // `render_content`'s `ShellApp` path (no dedicated
+                        // overlay DA to invalidate under the #540 cutover).
+                        self.draw_needed.set(true);
                     }
                     ActivityBarActivation::PanelFocused => {
                         self.sync_sidebar_from_engine();
@@ -8317,29 +8306,74 @@ impl quadraui::ShellApp for App {
         // `render()` repaints `draw_menu_bar` across the entire band and erases
         // them (#552 round-2/3 "buttons render blank"). So we only stash the
         // target rect now and paint the buttons *after* `render()` below.
-        let controls_rect = if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
-            let bar = engine.menu_system.borrow().menu_bar();
-            let mb_layout = backend.menu_bar_layout(menu_row_rect, &bar);
-            // `vi.bounds.x` is already absolute (quadraui's `MenuBar::layout`
-            // starts its cursor at `bounds.x`, the rect passed above) — do not
-            // add `menu_row_rect.x` again.
-            let menu_end = mb_layout
-                .visible_items
-                .last()
-                .map(|vi| vi.bounds.x + vi.bounds.width)
-                .unwrap_or(menu_row_rect.x);
-            let rect = quadraui::Rect::new(
-                menu_end,
-                menu_row_rect.y,
-                (menu_row_rect.x + menu_row_rect.width - menu_end).max(0.0),
-                menu_row_rect.height,
-            );
-            self.title_bar_rect.set(rect);
-            Some(rect)
-        } else {
-            self.title_bar_rect.set(quadraui::Rect::default());
-            None
-        };
+        let (controls_rect, command_center_rect) =
+            if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
+                let bar = engine.menu_system.borrow().menu_bar();
+                let mb_layout = backend.menu_bar_layout(menu_row_rect, &bar);
+                // `vi.bounds.x` is already absolute (quadraui's `MenuBar::layout`
+                // starts its cursor at `bounds.x`, the rect passed above) — do not
+                // add `menu_row_rect.x` again.
+                let menu_end = mb_layout
+                    .visible_items
+                    .last()
+                    .map(|vi| vi.bounds.x + vi.bounds.width)
+                    .unwrap_or(menu_row_rect.x);
+                let full_rect = quadraui::Rect::new(
+                    menu_end,
+                    menu_row_rect.y,
+                    (menu_row_rect.x + menu_row_rect.width - menu_end).max(0.0),
+                    menu_row_rect.height,
+                );
+                // #676: narrow the controls rect to the window-control buttons'
+                // *actual* painted width instead of handing them the entire
+                // menu_end→right-edge band. That full band, background-filled
+                // end-to-end by `window_controls_status_bar` (via
+                // `Backend::draw_status_bar`), is exactly what silently ate the
+                // VS Code-style Command Center's real estate after the #540
+                // Relm4→ShellApp cutover dropped it. `status_bar_layout` mirrors
+                // `draw_status_bar`'s own measurement (its doc comment: "audited
+                // under #552 and ruled out" — paint and no-paint agree), so this
+                // is the same width the buttons paint at, a few hundred lines
+                // below.
+                let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+                let controls_bar = render::window_controls_status_bar(&theme, maximized);
+                let controls_layout = backend.status_bar_layout(full_rect, &controls_bar);
+                let controls_start = controls_layout
+                    .visible_segments
+                    .iter()
+                    .map(|vs| vs.bounds.x)
+                    .fold(f32::INFINITY, f32::min);
+                let controls_start = if controls_start.is_finite() {
+                    controls_start
+                } else {
+                    full_rect.width
+                };
+                let rect = quadraui::Rect::new(
+                    full_rect.x + controls_start,
+                    full_rect.y,
+                    (full_rect.width - controls_start).max(0.0),
+                    full_rect.height,
+                );
+                self.title_bar_rect.set(rect);
+
+                // The gap freed up between the last menu label and the
+                // now-narrow window controls is exactly where the VS Code-style
+                // Command Center (nav arrows + search box) belongs — painted via
+                // `render::build_command_center_view` / `Backend::draw_command_center`
+                // after `menu_system.render()` below (same ordering constraint
+                // as the window controls: that call repaints the full
+                // `menu_row_rect` band and would erase anything painted first).
+                let cc_rect = quadraui::Rect::new(
+                    menu_end,
+                    menu_row_rect.y,
+                    (rect.x - menu_end).max(0.0),
+                    menu_row_rect.height,
+                );
+                (Some(rect), Some(cc_rect))
+            } else {
+                self.title_bar_rect.set(quadraui::Rect::default());
+                (None, None)
+            };
 
         // ── Layout ────────────────────────────────────────────────────────────
         let tab_row_h = (lh * 1.6).ceil();
@@ -9407,6 +9441,36 @@ impl quadraui::ShellApp for App {
             engine.menu_system.borrow().render(backend, menu_row_rect);
         }
 
+        // ── Command Center: nav arrows + search box (#676) ────────────────────
+        // Painted *after* `menu_system.render()` above, which repaints
+        // `draw_menu_bar` across the entire `menu_row_rect` band and would
+        // erase anything drawn here first — the identical ordering hazard
+        // documented on the window controls below (#552 round-2/3 "buttons
+        // render blank"). This is the VS Code-style Command Center dropped
+        // by the #540 Relm4→ShellApp cutover and never re-wired: it used to
+        // live in the deleted `impl SimpleComponent for App` `view!`
+        // scaffolding. Cached into `engine.command_center_layout` for
+        // `handle()`'s click hit-test, mirroring TUI's `shell_app.rs`
+        // (#635 Stage 6b item A) and `mouse.rs`'s "Menu bar row click —
+        // command center only".
+        if let Some(cc_rect) = command_center_rect.filter(|r| r.width >= 1.0) {
+            let title = engine
+                .cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "VimCode".to_string());
+            let cc = render::build_command_center_view(
+                engine.tab_nav_can_go_back(),
+                engine.tab_nav_can_go_forward(),
+                &title,
+            );
+            let cc_layout = backend.draw_command_center(cc_rect, &cc);
+            engine.command_center_layout.replace(Some(cc_layout));
+        } else {
+            engine.command_center_layout.replace(None);
+        }
+
         // ── Dialog + context-menu popups (#546) ───────────────────────────────
         // The ShellApp render path never painted `screen.dialog` /
         // `screen.context_menu` at all — their draw + click-geometry caches
@@ -9618,6 +9682,51 @@ impl quadraui::ShellApp for App {
                     return quadraui::Reaction::Redraw;
                 }
                 quadraui::MenuEvent::Ignored => {}
+            }
+        }
+
+        // ── Command Center: nav arrows + search box (#676) ────────────────────
+        // Checked before the window-control buttons below and the CSD
+        // titlebar drag-to-move fallback further down, so a click in the
+        // command center (which sits inside the title-bar band the
+        // drag-to-move check would otherwise claim) routes to tab-nav / the
+        // picker instead of starting a window drag. Mirrors TUI's
+        // `mouse.rs` "Menu bar row click — command center only" precedence.
+        // `MruNavBack` / `MruNavForward` / `OpenCommandCenter` are the
+        // pre-#540 Relm4 `Msg` variants for this exact action — already
+        // wired end-to-end in `handle_menu_msg` but never dispatched from
+        // anywhere since the cutover; this is their first live caller.
+        if let UiEvent::MouseDown {
+            button: MouseButton::Left,
+            position,
+            ..
+        } = &event
+        {
+            let cc_hit = self
+                .engine
+                .borrow()
+                .command_center_layout
+                .borrow()
+                .as_ref()
+                .map(|l| l.hit_test(position.x, position.y));
+            match cc_hit {
+                Some(quadraui::CommandCenterHit::Back) => {
+                    self.dispatch(Msg::MruNavBack);
+                    return quadraui::Reaction::Redraw;
+                }
+                Some(quadraui::CommandCenterHit::Forward) => {
+                    self.dispatch(Msg::MruNavForward);
+                    return quadraui::Reaction::Redraw;
+                }
+                Some(quadraui::CommandCenterHit::SearchBox) => {
+                    self.dispatch(Msg::OpenCommandCenter);
+                    return quadraui::Reaction::Redraw;
+                }
+                // `Bar` (command-center background, not an interactive
+                // segment) and `Outside`/`None` fall through so the
+                // drag-to-move fallback below still works for genuine
+                // empty-band clicks.
+                _ => {}
             }
         }
 

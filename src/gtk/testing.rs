@@ -118,6 +118,12 @@ pub(super) struct Harness<A: AppLogic> {
     /// the last frame drew no separated line (#672). See
     /// [`Self::separated_status_segment_center`].
     pub separated_status_bar_rect: Rc<Cell<Option<quadraui::Rect>>>,
+    /// Rect of the drawn inline window-control buttons (minimize/maximize/
+    /// close) the last frame painted, or a default (zero) rect before the
+    /// first frame / when the menu bar is hidden (#676). The Command Center
+    /// (nav arrows + search box) must never paint past this rect's left
+    /// edge — see `command_center_does_not_overlap_window_controls`.
+    pub title_bar_rect: Rc<Cell<quadraui::Rect>>,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -331,6 +337,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
     let status_segment_map = Rc::clone(&app.status_segment_map);
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
+    let title_bar_rect = Rc::clone(&app.title_bar_rect);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -344,6 +351,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         tab_switcher_popup_rect,
         status_segment_map,
         separated_status_bar_rect,
+        title_bar_rect,
     }
 }
 
@@ -2256,6 +2264,251 @@ mod chrome_surfaces {
             region(Some("main.rs"), editor_top_i, editor_top_i + lh_i),
             region(None, editor_top_i, editor_top_i + lh_i),
             "tooltip must paint in the band immediately below the tab row"
+        );
+    }
+}
+
+/// Black-box paint + click-routing proof for the VS Code-style Command
+/// Center (`◀ ▶` nav arrows + centered `🔍 <project>` search box) dropped by
+/// the #540 Relm4->ShellApp cutover and never re-wired (#676).
+///
+/// `engine.command_center_layout` sat permanently `None` on GTK before this
+/// fix — nothing painted the strip and nothing hit-tested it — even though
+/// `render::build_command_center_view` / `Backend::draw_command_center` were
+/// already shared, working code (TUI has used them since #635). The whole
+/// `menu_end..right-edge` band was instead claimed end-to-end by
+/// `window_controls_status_bar`'s background fill, which is what silently
+/// ate the Command Center's real estate.
+///
+/// Each test below was verified to fail red against the pre-fix tree (paint
+/// call absent from `render_content`, hit-test absent from `handle()`,
+/// `controls_rect` spanning the full band) before this module was added.
+#[cfg(test)]
+mod command_center {
+    use super::*;
+    use crate::core::engine::PickerSource;
+
+    /// Engine with a real `cwd` (so the search box's title isn't empty) and
+    /// two tabs wired into `tab_nav_history` at index 1, so `tab_nav_back`
+    /// has somewhere to go and `tab_nav_can_go_back()` reads `true` the
+    /// moment the frame paints. `tab_nav_push` is what normally populates
+    /// this on real navigation; this fixture pokes the (pub) fields
+    /// directly instead of routing through disk I/O, mirroring
+    /// `engine_with_breadcrumb_path`'s style above.
+    fn engine_with_tab_history() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        let group = engine.active_group;
+        let tab0 = engine.active_tab().id;
+        engine.new_tab(None);
+        let tab1 = engine.active_tab().id;
+        assert_ne!(tab0, tab1, "fixture needs two distinct tabs");
+        engine.tab_nav_history = vec![(group, tab0), (group, tab1)];
+        engine.tab_nav_index = 1;
+        engine
+    }
+
+    /// `true` iff any pixel in `rect` (absolute, scanned on a coarse grid to
+    /// keep the test fast) differs from `bg`. Scanning a region rather than
+    /// probing one point avoids a flaky false-negative if the single probed
+    /// pixel happens to land on inter-glyph whitespace that still reads as
+    /// background — the same reasoning `chrome_surfaces::assert_region_changed`
+    /// documents above.
+    fn region_has_non_background_pixel(
+        driver: &mut quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        rect: quadraui::Rect,
+        bg: (u8, u8, u8),
+    ) -> bool {
+        let (x0, y0) = (rect.x.round() as i32, rect.y.round() as i32);
+        let (x1, y1) = (
+            (rect.x + rect.width).round() as i32,
+            (rect.y + rect.height).round() as i32,
+        );
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                if driver.pixel(x, y) != bg {
+                    return true;
+                }
+                x += 1;
+            }
+            y += 1;
+        }
+        false
+    }
+
+    #[test]
+    fn command_center_paints_between_menu_labels_and_window_controls() {
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        // `harness()`/`driver_with_shell` already painted a first frame at
+        // construction, but repaint explicitly so this test doesn't depend
+        // on that construction-time detail.
+        h.driver.render();
+
+        let layout = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect(
+                "menu_bar_visible is forced true on GTK (App::setup), so the \
+                 Command Center must paint every frame and cache its layout \
+                 for click dispatch (#676) -- it must never be permanently None",
+            );
+
+        let back = layout
+            .back_bounds
+            .expect("the back arrow must have a painted bounds");
+        let fwd = layout
+            .forward_bounds
+            .expect("the forward arrow must have a painted bounds");
+        let search = layout
+            .search_bounds
+            .expect("the search box must have a painted bounds (non-empty title)");
+
+        assert!(
+            back.x < fwd.x && fwd.x + fwd.width <= search.x,
+            "arrows and search box must lay out left-to-right without \
+             overlapping: back={back:?} forward={fwd:?} search={search:?}"
+        );
+
+        // The core #676 regression: window controls used to claim the
+        // *entire* menu_end..right-edge band, so the Command Center must
+        // never paint past where the (now-narrowed) controls actually
+        // start.
+        let controls = h.title_bar_rect.get();
+        assert!(
+            controls.width > 0.0,
+            "window controls must have painted a non-degenerate rect"
+        );
+        assert!(
+            search.x + search.width <= controls.x + 0.5,
+            "the Command Center must not overlap the window-control buttons \
+             -- search box ends at {} but controls start at {}",
+            search.x + search.width,
+            controls.x
+        );
+        assert!(
+            back.x >= 0.0 && back.x < controls.x,
+            "the Command Center must sit entirely left of the window controls"
+        );
+
+        // Pixel-probe (not painted text): the arrow glyphs are Unicode ◀/▶
+        // and the search box is an icon + rounded border, so — per this
+        // issue's black-box test note — assert on rasterised pixels rather
+        // than on `GtkDriver::find`/`screen_contains`.
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = {
+            let c = crate::render::to_quadraui_color(theme.tab_bar_bg);
+            (c.r, c.g, c.b)
+        };
+        assert!(
+            region_has_non_background_pixel(&mut h.driver, back, bg),
+            "the back arrow must paint pixels distinguishable from the bar's own background"
+        );
+        assert!(
+            region_has_non_background_pixel(&mut h.driver, fwd, bg),
+            "the forward arrow must paint pixels distinguishable from the bar's own background"
+        );
+        assert!(
+            region_has_non_background_pixel(&mut h.driver, search, bg),
+            "the search box must paint pixels (border/icon/text) distinguishable \
+             from the bar's own background"
+        );
+    }
+
+    #[test]
+    fn command_center_click_routes_nav_and_opens_picker() {
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().tab_nav_can_go_back(),
+            "fixture must start with back-navigation available"
+        );
+        assert!(
+            !h.engine.borrow().tab_nav_can_go_forward(),
+            "fixture must start at the end of history"
+        );
+        let tab_before = h.engine.borrow().active_tab().id;
+
+        let layout = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("command center must have painted");
+        let back = layout.back_bounds.expect("back arrow must be painted");
+        let fwd = layout
+            .forward_bounds
+            .expect("forward arrow must be painted");
+        let search = layout.search_bounds.expect("search box must be painted");
+
+        // Back arrow -> tab-nav history moves backward (#676).
+        h.driver
+            .click(back.x + back.width / 2.0, back.y + back.height / 2.0);
+        assert_ne!(
+            h.engine.borrow().active_tab().id,
+            tab_before,
+            "clicking the back arrow must navigate tab history"
+        );
+        assert!(h.engine.borrow().tab_nav_can_go_forward());
+
+        // Forward arrow -> undoes the back navigation (#676).
+        h.driver
+            .click(fwd.x + fwd.width / 2.0, fwd.y + fwd.height / 2.0);
+        assert_eq!(
+            h.engine.borrow().active_tab().id,
+            tab_before,
+            "clicking the forward arrow must undo the back navigation"
+        );
+
+        assert!(
+            !h.engine.borrow().picker_open,
+            "no picker should be open before the search box is clicked"
+        );
+
+        // Search box -> opens the unified Command Center picker (#676).
+        h.driver.click(
+            search.x + search.width / 2.0,
+            search.y + search.height / 2.0,
+        );
+        assert!(
+            h.engine.borrow().picker_open,
+            "clicking the search box must open the picker"
+        );
+        assert_eq!(
+            h.engine.borrow().picker_source,
+            PickerSource::CommandCenter,
+            "the search box must open the picker with the CommandCenter source"
+        );
+    }
+
+    /// #676 design note: GTK forces `menu_bar_visible = true` at startup
+    /// (`App::setup`), unlike TUI where it's optional, so in practice the
+    /// Command Center is always visible on GTK. This guards the other half
+    /// of that contract anyway (mirroring TUI's identical gate): when the
+    /// flag is off, the layout cache must clear rather than keep serving a
+    /// stale hit-region for clicks to resolve against geometry that no
+    /// longer paints.
+    #[test]
+    fn command_center_layout_clears_when_menu_bar_is_hidden() {
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.driver.render();
+        assert!(
+            h.engine.borrow().command_center_layout.borrow().is_some(),
+            "must be painted while the menu bar is visible"
+        );
+
+        h.engine.borrow_mut().menu_bar_visible = false;
+        h.driver.render();
+        assert!(
+            h.engine.borrow().command_center_layout.borrow().is_none(),
+            "hiding the menu bar must clear the cached Command Center layout"
         );
     }
 }
