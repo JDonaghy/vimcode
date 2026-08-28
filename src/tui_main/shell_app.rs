@@ -2191,12 +2191,13 @@ impl ShellApp for TuiShellApp {
         // pre-dispatch sync would have meant Alt+F painting no menu bar at
         // all until the next keystroke.
         //
-        // The one path that still lags a frame is `on_shell_event`'s
+        // The one path this method can never reach is `on_shell_event`'s
         // hamburger reveal: `ShellAdapter::handle` consumes
         // `AppShellEvent::PanelChanged` itself and returns without ever
-        // calling this method, and `on_shell_event` receives no
-        // `ShellContext` to sync through. The next dispatch's sync (this one)
-        // picks it up.
+        // calling this method. #693: that path now runs its own copy of
+        // this same sync from [`Self::on_shell_event_ctx`] (the
+        // `ShellContext`-aware notification quadraui#617 added), so it no
+        // longer waits for a later, unrelated dispatch to land it.
         ctx.shell_mut()
             .set_title_bar_visible(self.engine.menu_bar_visible);
 
@@ -2340,6 +2341,20 @@ impl ShellApp for TuiShellApp {
     /// click on it reveals the menu bar instead of switching the shadow,
     /// mirroring the Alt+menu-letter shim and `MenuSystem` intercept in
     /// `handle()` above.
+    ///
+    /// #693: `ShellAdapter::handle` consumes `AppShellEvent::PanelChanged`
+    /// itself and returns immediately after calling this notification — it
+    /// never falls through to `Self::handle`, so the title-bar sync at the
+    /// end of that method (`ctx.shell_mut().set_title_bar_visible(...)`)
+    /// never runs for a hamburger click. Before quadraui#617 landed
+    /// `ShellApp::on_shell_event_ctx`, there was no way to reach the
+    /// `ShellContext` from here at all, so the reveal was invisible —
+    /// `engine.menu_bar_visible` flipped, but `AppShell` never reserved the
+    /// row, so `render_content`'s `layout.title_bar_bounds` stayed `None`
+    /// and nothing painted — until some unrelated later dispatch happened
+    /// to run `handle()`'s sync. [`Self::on_shell_event_ctx`] below pushes
+    /// the sync itself, on the same frame the click fires, closing that
+    /// gap without waiting for a second event.
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
         match event {
             quadraui::AppShellEvent::PanelChanged { panel_id } => {
@@ -2448,6 +2463,40 @@ impl ShellApp for TuiShellApp {
             }
             _ => {}
         }
+    }
+
+    /// #693: the `ShellContext`-aware half of the runner ↔ shadow bridge.
+    /// Runs the exact same dispatch [`Self::on_shell_event`] always has
+    /// (calling it directly rather than duplicating its match), then —
+    /// unconditionally, mirroring `handle()`'s own end-of-dispatch sync
+    /// comment — pushes `engine.menu_bar_visible` into the *runner's*
+    /// `AppShell` via `ctx.shell_mut().set_title_bar_visible(...)`.
+    ///
+    /// This is the one notification `ShellAdapter` delivers *outside* a
+    /// `Self::handle` dispatch (`ShellAdapter::handle`'s `PanelChanged` arm
+    /// returns right after calling it), so it is also the one place
+    /// `handle()`'s own title-bar sync can never reach. Before
+    /// quadraui#617 added the `ShellContext` parameter here, a hamburger
+    /// click could only flip the engine flag and wait for some later,
+    /// unrelated dispatch to reach `handle()` and paint the reservation —
+    /// in a purely event-driven TUI with no further input, that frame
+    /// might never come, so the menu bar stayed invisible indefinitely
+    /// while still hit-testing as open (`handle()`'s `MenuSystem`
+    /// intercept reads `engine.menu_bar_visible` directly, independent of
+    /// what's painted). Pushing the sync here closes the gap on the same
+    /// frame the click fires, the same way `handle()` already does for
+    /// every other reveal path (Alt+<letter>, `:set menu`, panel
+    /// accelerators).
+    ///
+    /// Unconditional rather than gated on the hamburger arm specifically
+    /// (mirroring `handle()`'s reasoning) so any future `on_shell_event`
+    /// arm that ends up flipping `menu_bar_visible` gets the same
+    /// same-frame guarantee for free.
+    fn on_shell_event_ctx(&mut self, event: &quadraui::AppShellEvent, ctx: &ShellContext<'_>) {
+        #[allow(deprecated)]
+        self.on_shell_event(event);
+        ctx.shell_mut()
+            .set_title_bar_visible(self.engine.menu_bar_visible);
     }
 
     fn tick(&mut self, backend: &mut dyn quadraui::Backend) -> Reaction {
@@ -4184,6 +4233,13 @@ mod tests {
     /// directly (mirrors `handle_key_pressed_dialog_intercepts_all_keys`'s
     /// approach below) since `ShellAdapter`'s fields are `pub(crate)` and
     /// there is no accessor from `driver_with_shell` back to this event.
+    // #693 (quadraui#617): `on_shell_event` is `deprecated` in favour of
+    // `on_shell_event_ctx`, kept purely for back-compat and now delegated
+    // to by this file's `on_shell_event_ctx` override. This test drives
+    // the deprecated hook directly on purpose (see its doc comment above)
+    // rather than through a `ShellContext`, which has no public
+    // constructor outside quadraui.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_hamburger_click_reveals_menu_bar() {
         let mut app = TuiShellApp::new(None);
@@ -4196,6 +4252,9 @@ mod tests {
 
     /// A `PanelChanged` for a real panel must NOT trip the hamburger
     /// special-case.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_real_panel_click_does_not_reveal_menu_bar() {
         let mut app = TuiShellApp::new(None);
@@ -4217,6 +4276,9 @@ mod tests {
     /// (what `ShellAdapter` reports for an activity-bar click it consumed)
     /// must switch the shadow `engine.app_shell` — the state
     /// `render_sidebar_content` actually paints from — not just be ignored.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_panel_changed_switches_shadow_sidebar_content() {
         let mut app = TuiShellApp::new(None);
@@ -4238,6 +4300,9 @@ mod tests {
     /// the active-panel dispatch, so a lingering plugin-panel takeover
     /// would keep painting over any panel the user clicks — mirror the
     /// legacy `mouse.rs` arm's clearing of all three plugin-panel fields.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_panel_changed_clears_plugin_ext_panel_takeover() {
         let mut app = TuiShellApp::new(None);
@@ -4257,6 +4322,9 @@ mod tests {
     /// and reports `SidebarHidden` — the shadow must follow, or every
     /// `sidebar_visible()` consumer (tick viewport math, mouse hit tests,
     /// autohide, session persistence) keeps believing it's open.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_sidebar_hidden_syncs_shadow() {
         // Sidebar-open is this test's *precondition*, not its subject —
@@ -4272,6 +4340,9 @@ mod tests {
     /// The Settings cog is a *bottom item* (`shell_config`), for which
     /// `AppShell` runs no panel toggle of its own — `on_shell_event` must
     /// run the legacy toggle on the shadow, both directions.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_settings_bottom_item_toggles_shadow() {
         let mut app = TuiShellApp::new(None);
@@ -4294,6 +4365,9 @@ mod tests {
     /// hand the runner the new panel exactly once, and the `PanelChanged`
     /// echo `ShellAdapter::apply_requested_panel` sends back must settle
     /// the loop rather than re-firing forever.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn take_requested_panel_reconciles_keyboard_switch_once() {
         // `take_requested_panel` short-circuits to `None` while the sidebar
@@ -4332,6 +4406,9 @@ mod tests {
     /// engine already holds the state, and re-running it would steal
     /// focus into the sidebar (e.g. `explorer_has_focus = true` on the
     /// startup frame, yanking key routing away from the editor).
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn take_requested_panel_echo_does_not_steal_focus() {
         // Needs the sidebar open, or the `take_requested_panel` below
@@ -4355,6 +4432,9 @@ mod tests {
     /// hamburger; the next `take_requested_panel` poll must steer it back
     /// to the shadow's real panel (so the sidebar header shows "Menu" for
     /// one frame at most, not until the next real panel click).
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn take_requested_panel_restores_runner_after_hamburger_click() {
         // Green on a hidden sidebar too, but only by accident: the first
@@ -4545,6 +4625,9 @@ mod tests {
     /// plugin-panel bookkeeping — `focus_sidebar_panel` would fall through to
     /// the explorer, leaving the sidebar painting the file tree under a
     /// highlighted extension icon.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_extension_panel_changed_opens_the_plugin_panel() {
         let mut app = app_with_ext_panel();
@@ -4567,6 +4650,9 @@ mod tests {
     /// must drop the plugin-panel state too — otherwise
     /// `take_requested_panel` keeps steering the runner back onto a panel
     /// whose sidebar the user just closed.
+    // #693 (quadraui#617): see the `#[allow(deprecated)]` note on
+    // `on_shell_event_hamburger_click_reveals_menu_bar`, above.
+    #[allow(deprecated)]
     #[test]
     fn on_shell_event_sidebar_hidden_clears_extension_panel_state() {
         let mut app = app_with_ext_panel();
@@ -5642,16 +5728,23 @@ mod tests {
     // #694 reports vimcode intermittently freezing (terminal stops
     // responding, has to be killed) when the menu bar is exposed via the
     // AppShell hamburger — sometimes instead producing the separately
-    // tracked "invisible menu bar" symptom. Both share one trigger: the
-    // hamburger click terminates in `ShellAdapter`'s own `PanelChanged`
-    // arm (`quadraui/src/shell_adapter.rs::handle`, the `AppShellEvent::
-    // PanelChanged { .. } => { ...; return Reaction::Redraw; }` branch)
-    // and never reaches `TuiShellApp::handle` at all for that event — the
-    // `handle` tail's shell-state syncs (title-bar reservation, sidebar
-    // visibility) and `ShellAdapter::apply_requested_panel`'s
-    // `take_requested_panel` poll (also only reachable from inside
-    // `handle`/`tick`) are both skipped for the click itself and only run
-    // on the *next* dispatch.
+    // tracked "invisible menu bar" symptom (#693, fixed: see
+    // `TuiShellApp::on_shell_event_ctx` and
+    // `hamburger_click_paints_menu_bar_immediately_via_shell_app` below).
+    // Both shared one trigger: the hamburger click terminates in
+    // `ShellAdapter`'s own `PanelChanged` arm (`quadraui/src/
+    // shell_adapter.rs::handle`, the `AppShellEvent::PanelChanged { .. }
+    // => { ...; return Reaction::Redraw; }` branch) and never reaches
+    // `TuiShellApp::handle` at all for that event — the `handle` tail's
+    // shell-state syncs (title-bar reservation, sidebar visibility) and
+    // `ShellAdapter::apply_requested_panel`'s `take_requested_panel` poll
+    // (also only reachable from inside `handle`/`tick`) were both skipped
+    // for the click itself. #693 closed the title-bar half of that gap
+    // by pushing the same sync from `on_shell_event_ctx` (quadraui#617's
+    // `ShellContext`-aware notification) instead of waiting on the next
+    // dispatch; `take_requested_panel` convergence still lags a dispatch,
+    // which is why the tests below still prime/pump around it — that part
+    // is #694's territory, not #693's.
     //
     // These tests drive that exact sequence through the real
     // `driver_with_shell` → `ShellAdapter` → `TuiShellApp` pipeline (not
@@ -6489,6 +6582,92 @@ mod tests {
             .position(|l| l.contains("ZQXW_ALT_MARKER"))
             .unwrap_or_else(|| {
                 panic!("marker should still paint after the Alt-reveal keypress; after:\n{after}")
+            });
+        assert_eq!(
+            after_row,
+            before_row + 1,
+            "revealing the menu bar should reserve one more row above the \
+             editor content, shifting the marker down by exactly one line; \
+             before:\n{before}\nafter:\n{after}"
+        );
+    }
+
+    /// #693 acceptance: the hamburger reveal must paint on the very frame
+    /// the click lands — the same behaviour
+    /// `alt_letter_reveals_menu_bar_via_shell_app` (above) already locks in
+    /// for the Alt+<letter> reveal path. Before the fix, a hamburger click
+    /// only flipped `engine.menu_bar_visible`: `ShellAdapter::handle`
+    /// consumes `AppShellEvent::PanelChanged` in its own arm and returns
+    /// without ever reaching `TuiShellApp::handle`, so the title-bar
+    /// reservation sync at the end of that method — the thing that makes
+    /// `layout.title_bar_bounds` `Some` so `render_content` actually paints
+    /// the strip — never ran for this click. The bar stayed invisible
+    /// (while still hit-testing as open, since the `MenuSystem` intercept
+    /// reads `engine.menu_bar_visible` directly) until some unrelated later
+    /// dispatch happened to reach `handle`; in a purely event-driven TUI
+    /// with no further input, that frame might never come.
+    ///
+    /// This delivers the click through the real `driver_with_shell` →
+    /// `ShellAdapter` → `TuiShellApp` pipeline (not `on_shell_event` called
+    /// directly, which only proves the engine flag flips — see
+    /// `on_shell_event_hamburger_click_reveals_menu_bar`, above) and
+    /// asserts on `driver.screen()` immediately after the click, with no
+    /// intervening "pump" dispatch of the kind the `#694 investigation`
+    /// tests below use to work around this exact gap. Must fail on
+    /// `develop` today for the reason above — reverting
+    /// `TuiShellApp::on_shell_event_ctx`'s `set_title_bar_visible` push
+    /// turns this red while leaving `on_shell_event_hamburger_click_
+    /// reveals_menu_bar` green, which is the point: that test alone can't
+    /// catch this bug.
+    #[test]
+    fn hamburger_click_paints_menu_bar_immediately_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        app.engine.buffer_mut().insert(0, "ZQXW_HAMBURGER_MARKER");
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+
+        // Prime the runner off the hamburger's default-active slot
+        // (`AppShell::new` activates panel index 0, the hamburger) so the
+        // click under test actually takes the `PanelChanged` branch
+        // instead of `handle_activity_click`'s "already active"
+        // `SidebarHidden` branch — see
+        // `driver_hamburger_click_sidebar_closed_does_not_panic`'s doc
+        // comment for why an unprimed first hamburger click hits the wrong
+        // branch. This priming exercises no part of the bug under test —
+        // it runs before the click, not after it.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let before = driver.screen();
+        assert!(
+            !before.contains("File"),
+            "menu bar must start hidden; before:\n{before}"
+        );
+        let before_row = before
+            .lines()
+            .position(|l| l.contains("ZQXW_HAMBURGER_MARKER"))
+            .expect("marker should paint before the hamburger click");
+
+        let reaction = driver.click(1.0, 0.0); // hamburger, top of activity bar
+        assert_eq!(
+            reaction,
+            Reaction::Redraw,
+            "hamburger click should reveal the menu bar and redraw"
+        );
+
+        // No priming, no extra dispatch — the frame the click itself
+        // produced is what's under test.
+        let after = driver.screen();
+        assert!(
+            after.contains("File") && after.contains("Edit"),
+            "hamburger click should paint the File/Edit menu strip on row \
+             0 on the same frame, with no further event needed to reveal \
+             it; after:\n{after}"
+        );
+        let after_row = after
+            .lines()
+            .position(|l| l.contains("ZQXW_HAMBURGER_MARKER"))
+            .unwrap_or_else(|| {
+                panic!("marker should still paint after the hamburger click; after:\n{after}")
             });
         assert_eq!(
             after_row,
