@@ -1134,6 +1134,126 @@ mod tests {
         );
     }
 
+    // ── #700: VS Code chrome-metrics parity ─────────────────────────────────
+
+    /// #700 item 4: a tab paints as its bare filename (`"main.rs"`), not the
+    /// old `" 1: main.rs "` ordinal-prefixed label — and the close glyph
+    /// still hit-tests, proving `quadraui::TabItem`'s "filename after the
+    /// last `\": \"`" underline contract and `tighten_close_bounds`'s
+    /// geometry both degrade correctly with no `": "` in the label at all
+    /// (`rfind(": ").unwrap_or(0)` underlines/measures from byte 0, i.e. the
+    /// whole label, when there's no separator — see `render.rs`'s
+    /// `TabInfo::name` doc).
+    ///
+    /// RED-first: reinstating the old `format!(" {}: {} ", i + 1, name)`
+    /// makes `screen_contains("main.rs")` still pass (it's a substring of
+    /// `" 1: main.rs "`) but `!screen_contains(": main.rs")` goes red, and
+    /// `find("1:")` starts resolving — this test's actual regression guard.
+    #[test]
+    fn tab_label_paints_without_ordinal_prefix_and_close_glyph_still_hit_tests() {
+        let h = harness(engine_with_breadcrumb_path(), 1400, 900);
+        assert!(
+            h.driver.screen_contains("main.rs"),
+            "the tab must paint its filename; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains(": main.rs") && !h.driver.screen_contains("1:"),
+            "#700: the tab label must not carry an ordinal prefix; painted \
+             texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let bar = editor_tab_bar_id();
+        assert!(
+            h.driver.tab_center(&bar, 0).is_some(),
+            "the (only) tab must have painted"
+        );
+        assert!(
+            h.driver.tab_close_center(&bar, 0).is_some(),
+            "the close glyph must still hit-test with no ordinal prefix in \
+             the label"
+        );
+    }
+
+    /// #700 items 2/3: the tab-bar row and the breadcrumb row are fixed-pixel
+    /// chrome, not `ceil(line_height * 1.6)` / `+ line_height`. This harness
+    /// cannot vary `settings.font_size` and observe a painted difference —
+    /// vimcode's GTK runner paints the editor at a hardcoded "Monospace 11"
+    /// regardless of `settings.font_size`/`font_family` (see the
+    /// `build_editor_click_context` call site's doc comment in
+    /// `App::render_content`), so `render::tests::
+    /// test_tab_bar_height_px_independent_of_font_size` (varying the
+    /// `line_height` parameter those helpers actually take) is the real
+    /// font-size-independence proof; this test instead pins that the fixed
+    /// pixel constants actually reach the live paint pipeline, and that
+    /// breadcrumbs add exactly [`crate::render::BREADCRUMB_ROW_HEIGHT_PX`] —
+    /// not a whole `line_height`-tall row — above the window content.
+    ///
+    /// RED-first: reinstating the old `tab_bar_height = tab_row_height +
+    /// line_height` formula makes `with_breadcrumbs_y - without_breadcrumbs_y`
+    /// equal the harness's painted `line_height` instead of `22.0`; the
+    /// assertion below that those two differ is what proves the harness's
+    /// `line_height` isn't coincidentally `22.0` already.
+    #[test]
+    fn breadcrumb_row_adds_a_fixed_22px_not_a_whole_line_height() {
+        let h_on = harness(engine_with_breadcrumb_path(), 1400, 900);
+        assert!(h_on.engine.borrow().settings.breadcrumbs);
+        let win_on = h_on.engine.borrow().active_window_id();
+        h_on.window_center(win_on)
+            .expect("editor pane must paint with breadcrumbs on");
+        let on_top = {
+            let layout = h_on.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_on)
+                .unwrap()
+                .rect
+                .y
+        };
+
+        let mut engine_off = engine_with_breadcrumb_path();
+        engine_off.settings.breadcrumbs = false;
+        let h_off = harness(engine_off, 1400, 900);
+        let win_off = h_off.engine.borrow().active_window_id();
+        h_off
+            .window_center(win_off)
+            .expect("editor pane must paint with breadcrumbs off");
+        let off_top = {
+            let layout = h_off.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_off)
+                .unwrap()
+                .rect
+                .y
+        };
+
+        let delta = on_top - off_top;
+        let lh = h_on
+            .painted_line_height()
+            .expect("frame must publish the line height it painted with");
+        assert_ne!(
+            lh, 22.0,
+            "test setup sanity: the harness's painted line_height must not \
+             coincidentally equal BREADCRUMB_ROW_HEIGHT_PX, or this test \
+             cannot distinguish the fix from the old `+ line_height` bug"
+        );
+        assert!(
+            (delta - crate::render::BREADCRUMB_ROW_HEIGHT_PX).abs() < 0.5,
+            "breadcrumbs must reserve exactly BREADCRUMB_ROW_HEIGHT_PX \
+             ({}) above the window content, not line_height ({lh}); got \
+             delta {delta} (on_top={on_top}, off_top={off_top})",
+            crate::render::BREADCRUMB_ROW_HEIGHT_PX
+        );
+    }
+
     /// Two editor groups whose buffers have breadcrumb paths of *different*
     /// depths: the active group (A) shows `a.rs` (1 segment), the other group
     /// (B) shows `src/core/deep.rs` (3 segments). Returns `(engine, group_b)`.

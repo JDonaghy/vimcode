@@ -2118,6 +2118,14 @@ mod tests {
         assert_eq!(settings.line_numbers, LineNumberMode::None);
         assert_eq!(settings.font_family, "Monospace");
         assert_eq!(settings.font_size, 14);
+        // #700 item 6: VS Code draws indent guides by default; nothing
+        // previously pinned this, so a future edit to
+        // `default_indent_guides()` could silently flip it back off with no
+        // test catching it.
+        assert!(
+            settings.indent_guides,
+            "indent guides must default on, matching VS Code"
+        );
     }
 
     #[test]

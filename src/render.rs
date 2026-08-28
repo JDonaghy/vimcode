@@ -386,7 +386,9 @@ pub struct SelectionRange {
 /// Display information for a single tab-bar entry.
 #[derive(Debug, Clone)]
 pub struct TabInfo {
-    /// Display label, e.g. `" 1: main.rs "`.
+    /// Display label, e.g. `"main.rs"` (#700: no ordinal prefix, matching
+    /// VS Code — `quadraui::TabItem`'s own padding/close-glyph geometry
+    /// supplies the surrounding space).
     pub name: String,
     /// Whether this is the currently active tab.
     pub active: bool,
@@ -467,8 +469,8 @@ const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
 /// hit-tests, the click router and the drag-slot map through
 /// [`compute_tab_bar_hit_regions`], so nothing else measures a tab.
 ///
-/// A tab named `" 1: 日本語.rs "` (11 chars, 14 columns) is now both measured
-/// and painted 14 cells wide, so the next tab starts at cell 14 and every hit
+/// A tab named `"日本語.rs"` (9 chars, 12 columns) is now both measured
+/// and painted 12 cells wide, so the next tab starts at cell 12 and every hit
 /// box lands on the glyph it covers. Reverting this to `.chars().count()`
 /// against a post-#554 quadraui shifts every hit box *left* of what is drawn
 /// — the mirror image of the pre-#554 hazard, and caught by
@@ -793,10 +795,15 @@ pub struct BreadcrumbDrawTarget<'a> {
 /// left to each caller: TUI's pre-existing call sites already guarded on
 /// `rect.width > 0.0`, but GTK's new one didn't, so centralizing it removes a
 /// footgun instead of asking every backend to remember it independently.
+///
+/// The painted rect's height is `bc.bounds.height` — whatever
+/// `build_screen_layout`/`build_screen_layout_with_breadcrumb_row` computed
+/// the breadcrumb row at (#700: fixed-pixel on GTK, one row on TUI) — not a
+/// separate `line_height` argument, so paint can never drift from the space
+/// actually reserved above the window content.
 pub fn breadcrumb_draw_targets(
     screen: &ScreenLayout,
     terminal_maximized: bool,
-    line_height: f64,
 ) -> Vec<BreadcrumbDrawTarget<'_>> {
     if terminal_maximized {
         return Vec::new();
@@ -810,7 +817,7 @@ pub fn breadcrumb_draw_targets(
                 bc.bounds.x as f32,
                 bc.bounds.y as f32,
                 bc.bounds.width as f32,
-                line_height as f32,
+                bc.bounds.height as f32,
             ),
             bar: &bc.bar,
             draw_layout: &bc.draw_layout,
@@ -3262,7 +3269,21 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
         .iter()
         .map(|(name, _alt, items)| quadraui::MenuDef {
             id: quadraui::WidgetId::new(*name),
-            label: format!("&{name}"),
+            // #700 item 5: VS Code only reveals menu-bar mnemonic underlines
+            // while Alt is held; quadraui's GTK menu bar
+            // (`quadraui/src/gtk/menu_bar.rs`) underlines unconditionally
+            // with no Alt-held gate in the `Backend`/`MenuDef` API, and this
+            // call site has no reach into GTK's Alt-key state (`MenuDef` is
+            // built once per frame from static `MENU_STRUCTURE`, independent
+            // of key-event handling). Per the issue's documented fallback,
+            // drop the `&` rather than add per-backend Alt-tracking code
+            // here — this does NOT fully fix the underline (quadraui's
+            // `alt_char_byte_range` falls back to underlining char 0 when a
+            // label has no `&` at all, so the first letter of every menu
+            // still underlines regardless); that fallback is the real gap
+            // and needs a quadraui-side fix (an Alt-held gate, or "no `&`
+            // means no underline") before this is genuinely conditional.
+            label: name.to_string(),
             disabled: false,
             items: items
                 .iter()
@@ -6296,6 +6317,42 @@ pub fn build_screen_layout(
     char_width: f64,
     color_headings: bool,
 ) -> ScreenLayout {
+    // Breadcrumb row height defaults to `line_height` — correct for TUI's
+    // row-based model (`line_height` is always `1.0`, i.e. exactly one row)
+    // and for any GTK call site that hasn't opted into the fixed-pixel
+    // breadcrumb row via `build_screen_layout_with_breadcrumb_row` (#700).
+    build_screen_layout_with_breadcrumb_row(
+        engine,
+        theme,
+        window_rects,
+        line_height,
+        char_width,
+        color_headings,
+        line_height,
+    )
+}
+
+/// Like [`build_screen_layout`], but lets the caller decouple the breadcrumb
+/// bar's own height/position from `line_height` (#700).
+///
+/// GTK's tab-bar and breadcrumb rows are fixed-pixel chrome
+/// (`tab_row_height_px`/`BREADCRUMB_ROW_HEIGHT_PX`) independent of
+/// `settings.font_size` — raising the editor font must not inflate the
+/// breadcrumb row along with it. The space reserved above the window
+/// content (`window_rects`, computed by the caller via
+/// `calculate_group_window_rects` using the same fixed row heights) already
+/// reflects that; this variant makes the breadcrumb bar's own painted
+/// `bounds` agree, instead of assuming (as plain `line_height` would) that
+/// the reserved breadcrumb space is exactly one editor text line tall.
+pub fn build_screen_layout_with_breadcrumb_row(
+    engine: &Engine,
+    theme: &Theme,
+    window_rects: &[(WindowId, WindowRect)],
+    line_height: f64,
+    char_width: f64,
+    color_headings: bool,
+    breadcrumb_row_h: f64,
+) -> ScreenLayout {
     let active_window_id = engine.active_window_id();
     let multi_window = engine.windows.len() > 1;
 
@@ -6876,10 +6933,12 @@ pub fn build_screen_layout(
                     min_y = 0.0;
                     max_x = 0.0;
                 }
-                // Place bounds at the actual breadcrumb row (one line_height
-                // above the window content top).
-                let bc_y = (min_y - line_height).max(0.0);
-                let bounds = WindowRect::new(min_x, bc_y, max_x - min_x, line_height);
+                // Place bounds at the actual breadcrumb row, `breadcrumb_row_h`
+                // above the window content top — NOT `line_height` (#700):
+                // GTK's breadcrumb row is fixed-pixel and can differ from the
+                // editor's text line height.
+                let bc_y = (min_y - breadcrumb_row_h).max(0.0);
+                let bounds = WindowRect::new(min_x, bc_y, max_x - min_x, breadcrumb_row_h);
                 let bar = breadcrumbs_to_quadraui_status_bar(
                     &segments,
                     theme,
@@ -10013,16 +10072,12 @@ fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) -> Vec<TabI
             let window_id = tab.active_window;
             let (name, dirty, preview) = if let Some(window) = engine.windows.get(&window_id) {
                 if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                    (
-                        format!(" {}: {} ", i + 1, state.display_name()),
-                        state.dirty,
-                        state.preview,
-                    )
+                    (state.display_name().to_string(), state.dirty, state.preview)
                 } else {
-                    (format!(" {}: [No Name] ", i + 1), false, false)
+                    ("[No Name]".to_string(), false, false)
                 }
             } else {
-                (format!(" {}: [No Name] ", i + 1), false, false)
+                ("[No Name]".to_string(), false, false)
             };
             TabInfo {
                 name,
@@ -13970,20 +14025,43 @@ pub fn compute_editor_layout(
     }
 }
 
-/// Compute the tab bar row height in pixels (the row containing tab labels).
+/// Fixed tab-bar row height in pixels, matching VS Code's `35px` tab height.
 /// Used by GTK and Win-GUI backends.
-pub fn tab_row_height_px(line_height: f64) -> f64 {
-    (line_height * 1.6).ceil()
+///
+/// #700: deliberately a constant, not derived from `line_height`. It used to
+/// be `ceil(line_height * 1.6)`, so raising `settings.font_size` inflated the
+/// tab-bar chrome right along with the editor text — VS Code's tab height is
+/// fixed regardless of the editor's font size.
+pub const TAB_ROW_HEIGHT_PX: f64 = 35.0;
+
+/// Fixed breadcrumb row height in pixels, matching VS Code's compact
+/// breadcrumb chrome. Used by GTK and Win-GUI backends.
+///
+/// #700: deliberately a constant, not `line_height` — same reasoning as
+/// [`TAB_ROW_HEIGHT_PX`]. Only the row's reserved *height* is decoupled here;
+/// the breadcrumb text itself still paints through
+/// `Backend::draw_status_bar`, which has no per-call font override in the
+/// pinned quadraui rev (unlike `draw_dialog`/`draw_rich_text_popup`, which
+/// already take a `ui_font` description) — so breadcrumb text size still
+/// tracks `settings.font_size` until that quadraui gap is closed.
+pub const BREADCRUMB_ROW_HEIGHT_PX: f64 = 22.0;
+
+/// Compute the tab bar row height in pixels (the row containing tab labels).
+/// Used by GTK and Win-GUI backends. `line_height` is accepted for call-site
+/// stability but no longer affects the result — see [`TAB_ROW_HEIGHT_PX`].
+pub fn tab_row_height_px(_line_height: f64) -> f64 {
+    TAB_ROW_HEIGHT_PX
 }
 
 /// Compute the full tab bar height including optional breadcrumb row.
-/// Used by GTK and Win-GUI backends.
-pub fn tab_bar_height_px(line_height: f64, breadcrumbs: bool) -> f64 {
-    let row_h = tab_row_height_px(line_height);
+/// Used by GTK and Win-GUI backends. `line_height` is accepted for
+/// call-site stability but no longer affects the result — see
+/// [`TAB_ROW_HEIGHT_PX`]/[`BREADCRUMB_ROW_HEIGHT_PX`].
+pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
     if breadcrumbs {
-        row_h + line_height
+        TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX
     } else {
-        row_h
+        TAB_ROW_HEIGHT_PX
     }
 }
 
@@ -15546,11 +15624,29 @@ mod tests {
 
     #[test]
     fn test_tab_bar_height_px() {
-        let lh = 20.0;
-        let no_bc = tab_bar_height_px(lh, false);
-        let with_bc = tab_bar_height_px(lh, true);
-        assert_eq!(no_bc, (lh * 1.6).ceil());
-        assert_eq!(with_bc, (lh * 1.6).ceil() + lh);
+        let no_bc = tab_bar_height_px(20.0, false);
+        let with_bc = tab_bar_height_px(20.0, true);
+        assert_eq!(no_bc, TAB_ROW_HEIGHT_PX);
+        assert_eq!(with_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
+    }
+
+    /// #700: raising `line_height` (a stand-in for `settings.font_size`
+    /// inflating editor text metrics) must NOT change the tab-bar or
+    /// breadcrumb row height — VS Code's chrome stays fixed regardless of
+    /// editor font size. RED-first check: reinstating the old
+    /// `ceil(line_height * 1.6)` formula makes this fail because `40.0` and
+    /// `20.0` no longer produce equal row heights.
+    #[test]
+    fn test_tab_bar_height_px_independent_of_font_size() {
+        let small = tab_row_height_px(14.0);
+        let large = tab_row_height_px(40.0);
+        assert_eq!(small, large);
+        assert_eq!(small, TAB_ROW_HEIGHT_PX);
+
+        let small_bc = tab_bar_height_px(14.0, true);
+        let large_bc = tab_bar_height_px(40.0, true);
+        assert_eq!(small_bc, large_bc);
+        assert_eq!(small_bc, TAB_ROW_HEIGHT_PX + BREADCRUMB_ROW_HEIGHT_PX);
     }
 
     #[test]
@@ -17336,14 +17432,14 @@ mod tests {
         assert!(screen.breadcrumbs[0].bounds.width > 0.0);
 
         // `terminal_maximized` short-circuits to empty.
-        let targets = breadcrumb_draw_targets(&screen, true, line_height);
+        let targets = breadcrumb_draw_targets(&screen, true);
         assert!(
             targets.is_empty(),
             "terminal_maximized must suppress all breadcrumb targets"
         );
 
         // Not maximized: one target, matching the already-absolute bounds.
-        let targets = breadcrumb_draw_targets(&screen, false, line_height);
+        let targets = breadcrumb_draw_targets(&screen, false);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].rect.x, screen.breadcrumbs[0].bounds.x as f32);
         assert_eq!(targets[0].rect.y, screen.breadcrumbs[0].bounds.y as f32);
@@ -17356,7 +17452,7 @@ mod tests {
         // Empty segments are filtered out even when not maximized.
         let mut screen_no_segments = build_screen();
         screen_no_segments.breadcrumbs[0].segments.clear();
-        let targets = breadcrumb_draw_targets(&screen_no_segments, false, line_height);
+        let targets = breadcrumb_draw_targets(&screen_no_segments, false);
         assert!(
             targets.is_empty(),
             "a breadcrumb bar with no segments must not be drawn"
@@ -17367,7 +17463,7 @@ mod tests {
         // its own `rect.width > 0.0` guard (unlike TUI's pre-existing one).
         let mut screen_zero_width = build_screen();
         screen_zero_width.breadcrumbs[0].bounds.width = 0.0;
-        let targets = breadcrumb_draw_targets(&screen_zero_width, false, line_height);
+        let targets = breadcrumb_draw_targets(&screen_zero_width, false);
         assert!(
             targets.is_empty(),
             "a zero-width breadcrumb bar must not be drawn"

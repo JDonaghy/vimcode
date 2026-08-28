@@ -737,6 +737,7 @@ mod emoji_click_column_tests {
     //! span byte-offset pipeline feeding Pango's attributes) fails a
     //! `cargo test`, not just a manual click in the running app.
     use super::*;
+    use crate::render::build_screen_layout;
     use ::pangocairo::cairo::{Context, Format, ImageSurface};
 
     fn headless_pango_layout() -> pango::Layout {
@@ -1085,6 +1086,7 @@ mod cross_split_drag_focus_tests {
     //! `active_group`/`active_window_id()` untouched, while a genuine click
     //! (`mutate_focus: true`) still focuses the pane it lands in.
     use super::*;
+    use crate::render::build_screen_layout;
 
     fn empty_maps() -> (
         TabPixelHitMap,
@@ -1245,6 +1247,7 @@ mod frame_hit_map_tests {
     //! pre-existing `screen_zone_hit_test` fallback (as the two tests in
     //! `cross_split_drag_focus_tests` above do by passing `None, &[]`).
     use super::*;
+    use crate::render::build_screen_layout;
     use quadraui::{ScreenLayout as QSL, Surface};
 
     /// Lay out a single window / single (unsplit) tab bar and build the
@@ -1465,6 +1468,7 @@ mod single_group_tab_click_dispatch_tests {
     //! and never reach the second). That FAIL/PASS pair is reproduced in the PR
     //! description.
     use super::*;
+    use crate::render::build_screen_layout;
 
     /// Chrome-shifted editor content origin — the #552 menu/title-bar band, at
     /// an offset large enough to separate the correct band from the buggy one.

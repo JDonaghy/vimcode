@@ -564,7 +564,7 @@ pub(super) fn draw_frame(
     // tab bar — `calculate_group_window_rects` →
     // `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
     // therefore the derived breadcrumb bounds) up by one row in that case.
-    for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized, 1.0) {
+    for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized) {
         let bc_rect = Rect {
             x: t.rect.x as u16,
             y: t.rect.y as u16,
@@ -2373,8 +2373,10 @@ mod tests {
         );
 
         let cells = render_tui_row_cells(&e, 80, 24, 0);
-        let tab0_col = painted_col_of(&cells, "1:");
-        let tab1_col = painted_col_of(&cells, "2:");
+        // #700: tab labels no longer carry an ordinal prefix ("1:"/"2:"), so
+        // locate each tab by a substring of its own (distinct) filename.
+        let tab0_col = painted_col_of(&cells, "日");
+        let tab1_col = painted_col_of(&cells, "second");
         assert!(tab1_col > tab0_col);
 
         let resolve = |abs_col: u16| {
@@ -2399,8 +2401,8 @@ mod tests {
     fn left_click_after_wide_named_tab_activates_the_painted_tab() {
         let mut e = engine_with_wide_named_tab();
         let cells = render_tui_row_cells(&e, 80, 24, 0);
-        let tab1_col = painted_col_of(&cells, "2:");
-        let tab0_col = painted_col_of(&cells, "1:");
+        let tab1_col = painted_col_of(&cells, "second");
+        let tab0_col = painted_col_of(&cells, "日");
 
         assert_eq!(e.active_group().active_tab, 0);
         dispatch_tab_bar_left_click(&mut e, tab1_col);
@@ -2414,14 +2416,26 @@ mod tests {
     }
 
     /// Pure-ASCII tab names must be completely unaffected by #654.
+    ///
+    /// #700 removed the ordinal prefix that used to distinguish otherwise-
+    /// identical `[No Name]` tabs by column, so each tab here is given a
+    /// distinct file name instead — a closer match for real usage anyway.
     #[test]
     fn ascii_tab_names_still_hit_test_at_their_painted_columns() {
         let mut e = test_engine("content\n");
+        let set_path = |e: &mut Engine, p: &str| {
+            let wid = e.active_window_id();
+            let bid = e.windows.get(&wid).unwrap().buffer_id;
+            e.buffer_manager.get_mut(bid).unwrap().file_path = Some(std::path::PathBuf::from(p));
+        };
+        set_path(&mut e, "/tmp/one.rs");
         e.new_tab(None);
+        set_path(&mut e, "/tmp/two.rs");
         e.new_tab(None);
+        set_path(&mut e, "/tmp/three.rs");
         e.goto_tab(0);
         let cells = render_tui_row_cells(&e, 80, 24, 0);
-        let cols: Vec<u16> = ["1:", "2:", "3:"]
+        let cols: Vec<u16> = ["one.rs", "two.rs", "three.rs"]
             .iter()
             .map(|n| painted_col_of(&cells, n))
             .collect();
