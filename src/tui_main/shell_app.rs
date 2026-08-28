@@ -5667,10 +5667,32 @@ mod tests {
     // this file's `handle` method) only ever holds the `RefMut` for the
     // duration of that one statement — it is a temporary, not bound to a
     // name, so it drops before `dispatch_menu_action` runs, and
-    // `probe_694_hamburger_click_then_key*` below exercise precisely that
-    // borrow (the first real key after the click, which is what actually
-    // opens the `MenuSystem` dispatch — the hamburger click itself never
-    // reaches it, per the `ShellAdapter` early-return above).
+    // `driver_hamburger_click_then_key{,_with_sidebar_open}_does_not_panic`
+    // below exercise precisely that borrow (the first real key after the
+    // click, which is what actually opens the `MenuSystem` dispatch — the
+    // hamburger click itself never reaches it, per the `ShellAdapter`
+    // early-return above).
+    //
+    // Every test below that clicks the hamburger as its *first* interaction
+    // primes the driver with a benign `WindowFocused` + `render()` first,
+    // and then asserts on painted output that the menu bar actually opened.
+    // Both halves are mandatory, for the reason spelled out in
+    // `driver_hamburger_click_sidebar_closed_does_not_panic`'s doc comment:
+    // an unprimed first hamburger click deterministically takes
+    // `handle_activity_click`'s `SidebarHidden` branch, and without an
+    // assertion nothing notices that the test is exercising the wrong one.
+    //
+    // The other "still open" candidate — `take_requested_panel` failing to
+    // converge because the runner's `AppShell::show_panel` no-ops on an
+    // unregistered id — is exercised by
+    // `driver_hamburger_click_with_ext_panel_active_does_not_panic`, which
+    // registers the extension panel so the id *does* resolve and the
+    // reconciliation converges. Note what that means for the bug hunt: the
+    // non-convergence case needs an `engine.ext_panel_active` naming a panel
+    // that is **not** in the runner's panel list, which on this path
+    // `sync_ext_activity_panels` keeps reconciled on every dispatch. No
+    // driver-reachable sequence found in this session produces that
+    // divergence, so the candidate is neither confirmed nor ruled out.
     //
     // This does **not** close #694: `TuiDriver` renders to `TestBackend`
     // and never parses real ANSI (see this file's module doc, "raw-mode,
@@ -5849,24 +5871,72 @@ mod tests {
     /// at all after the click proves the sequence converges rather than
     /// looping forever inside a single `handle`/`tick` call.
     ///
-    /// Primed first (see `driver_hamburger_click_sidebar_closed_does_not_
-    /// panic`'s doc comment) for the same reason: a bare first click on a
-    /// freshly-built driver reads as `SidebarHidden`, not `PanelChanged`,
-    /// regardless of the ext-panel setup above, so without priming this
-    /// test would never actually reach the `take_requested_panel`
-    /// convergence path it claims to exercise.
+    /// Three setup details are load-bearing, and the first was missing from
+    /// the earlier versions of this test (review, iterations 1 and 2):
+    ///
+    /// 1. The panel is **registered** in `engine.ext_panels`
+    ///    (`app_with_ext_panel`) *and* the driver is built from
+    ///    [`TuiShellApp::live_shell_config`], so `"ext:git-insights"` is a
+    ///    real `PanelDefinition` on the **runner**'s `AppShell`. Setting
+    ///    `engine.ext_panel_active` alone is not enough:
+    ///    `Engine::ext_activity_panels` reads `ext_panels`, so with an empty
+    ///    registry it returns nothing, [`Self::sync_ext_activity_panels`]
+    ///    short-circuits on `unchanged`, the runner never learns the id, and
+    ///    `AppShell::show_panel` — which silently no-ops on an unknown id —
+    ///    leaves the runner parked on `AppShell::new`'s hard-coded
+    ///    `active_panel = Some(0)` (the hamburger) with `sidebar_visible`
+    ///    still `true`.
+    /// 2. The shadow `engine.app_shell`'s sidebar is opened, because
+    ///    [`Self::take_requested_panel`] returns `None` outright while the
+    ///    shadow sidebar is hidden — the ext arm below it would never run.
+    /// 3. The priming `WindowFocused` + `render()` then drives one
+    ///    `take_requested_panel` → `show_panel` cycle which, now that the id
+    ///    resolves, actually moves the runner off the hamburger. Without it
+    ///    the click below lands on the still-active hamburger and reports
+    ///    `SidebarHidden`, whose [`Self::on_shell_event`] arm *clears*
+    ///    `ext_panel_active` / `sidebar.ext_panel_name` — so the ext-panel
+    ///    sequence this test is named for would be wiped out by the very
+    ///    click that is supposed to exercise it.
+    ///
+    /// Both assertions pin that down on rendered output rather than state:
+    /// `"File"` means the click reached `PanelChanged { hamburger }` and set
+    /// `menu_bar_visible` (so the `press` below reaches the `menu_system`
+    /// `RefCell` borrow), and the panel title still painting in the sidebar
+    /// body means the extension panel survived the click, i.e. the ext arm
+    /// of `take_requested_panel` is what keeps running — and converging — on
+    /// every subsequent dispatch. Drop any of the three setup steps and both
+    /// go red instead of silently exercising the `SidebarHidden` branch.
     #[test]
     fn driver_hamburger_click_with_ext_panel_active_does_not_panic() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = app_with_ext_panel();
         app.engine.ext_panel_active = Some("git-insights".to_string());
         app.sidebar.ext_panel_name = Some("git-insights".to_string());
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
         let _ = driver.click(1.0, 0.0); // hamburger
+                                        // Pump the title-bar reservation sync (see
+                                        // `driver_hamburger_click_sidebar_closed_does_not_panic`) before
+                                        // asserting on the painted menu bar.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "hamburger click should have reached PanelChanged and opened \
+             the menu bar; screen:\n{screen}"
+        );
+        assert!(
+            screen.to_uppercase().contains("GIT INSIGHTS"),
+            "the extension panel must survive the hamburger click — if the \
+             click took the SidebarHidden branch instead, on_shell_event \
+             would have cleared ext_panel_active and this test would no \
+             longer exercise take_requested_panel's ext arm; screen:\n{screen}"
+        );
         let _ = driver.press(quadraui::Key::Char('j'));
         let _ = driver.screen();
     }
