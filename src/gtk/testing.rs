@@ -1335,6 +1335,24 @@ mod sidebar_panel_clicks {
             "this test aims at the first row expecting it to be category 0"
         );
         let before = h.engine.borrow().settings_collapsed[0];
+        // #677 audit: label of the first setting row under category 0 --
+        // `settings_collapsed[cat_idx]` gates whether `settings_flat_list`
+        // includes any `CoreSetting` rows for that category
+        // (`Engine::settings_flat_list`), so this row's label is painted iff
+        // the category is expanded. Used below to prove the click changes
+        // what's on screen, not just the `settings_collapsed` flag.
+        let first_setting_label = match h.engine.borrow().settings_flat_list().get(1) {
+            Some(crate::core::engine::SettingsRow::CoreSetting(idx)) => {
+                crate::core::settings::SETTING_DEFS[*idx].label
+            }
+            other => panic!("expected category 0's first setting row, got {other:?}"),
+        };
+        assert_eq!(
+            h.driver.screen_contains(first_setting_label),
+            !before,
+            "sanity: the first setting's label must be painted iff its category \
+             starts expanded"
+        );
 
         h.driver.click(sb.x + 20.0, sb.y + 4.0);
 
@@ -1347,6 +1365,20 @@ mod sidebar_panel_clicks {
             h.engine.borrow().settings_selected,
             0,
             "the clicked row must also become the selection"
+        );
+        // #677 audit: the two asserts above were the whole test before this
+        // audit -- pure `settings_collapsed`/`settings_selected` state
+        // checks with no confirmation the panel actually repainted.
+        // Verified vacuous by mutation: hardcoding `settings_flat_list`'s
+        // `collapsed` local to `false` (so painting always shows every row
+        // regardless of `settings_collapsed`) left both asserts above green
+        // and only this one red.
+        assert_eq!(
+            h.driver.screen_contains(first_setting_label),
+            before,
+            "clicking the category must actually repaint the row list -- the \
+             first setting's label must now be painted iff the category is \
+             still expanded (i.e. the opposite of the pre-click state)"
         );
     }
 
@@ -2486,26 +2518,97 @@ mod command_center {
             PickerSource::CommandCenter,
             "the search box must open the picker with the CommandCenter source"
         );
+        // #677 audit: `picker_popup_rect` is written only inside
+        // `render_content`'s picker draw branch, so this proves the popup
+        // actually painted -- not merely that engine state flipped (mirrors
+        // `status_bar_segment_click_opens_go_to_line_picker` /
+        // `breadcrumb_segment_click_opens_the_dropdown_and_selection_dispatches`,
+        // #555). The `picker_open`/`picker_source` asserts above were the
+        // whole test before this audit; verified vacuous by mutation:
+        // replacing `render_content`'s
+        // `picker_popup_rect.set(Some((...)))` write with `set(None)`
+        // (leaving the palette paint and `picker_open` untouched) left the
+        // two asserts above green and only this one red.
+        let (_, _, pw, ph) = h
+            .picker_popup()
+            .expect("the Command Center picker must actually paint, not just flip engine state");
+        assert!(
+            pw > 0.0 && ph > 0.0,
+            "the painted picker popup must have a non-degenerate rect, got {pw}x{ph}"
+        );
     }
 
     /// #676 design note: GTK forces `menu_bar_visible = true` at startup
     /// (`App::setup`), unlike TUI where it's optional, so in practice the
     /// Command Center is always visible on GTK. This guards the other half
-    /// of that contract anyway (mirroring TUI's identical gate): when the
-    /// flag is off, the layout cache must clear rather than keep serving a
-    /// stale hit-region for clicks to resolve against geometry that no
-    /// longer paints.
+    /// of that contract anyway (mirroring TUI's identical gate,
+    /// `render_content_does_not_paint_menu_bar_when_hidden_via_shell_app`):
+    /// when the flag is off, clicking where the Command Center used to be
+    /// must no longer trigger Command Center behaviour (stale hit-region),
+    /// not just clear the layout-cache field in isolation.
+    ///
+    /// #677 audit: the original version of this test asserted only
+    /// `command_center_layout.borrow().is_none()` — a state check with no
+    /// observable-behaviour probe, exactly the #553/#592 shape (a flag
+    /// flips, nothing confirms the click path actually changed). A first
+    /// attempt at replacing it with a raw pixel-region probe (same
+    /// coordinates, `region_has_non_background_pixel` before/after) turned
+    /// out to be a false-positive risk rather than a strengthening: hiding
+    /// the menu bar reserves one fewer title-bar row, so `main_content`
+    /// reflows upward and the tab bar's own (non-background) pixels land on
+    /// the old Command Center coordinates — that probe went red against
+    /// *correct*, unmodified code, which would have made this a flaky/wrong
+    /// test rather than a fixed one. Click-behaviour is layout-shift-proof
+    /// and directly exercises the actual risk the doc above names (a stale
+    /// cached rect still accepting clicks): verified non-vacuous by
+    /// mutation — commenting out the `command_center_layout.replace(None)`
+    /// clear (`src/gtk/mod.rs`, the `else` arm right after the Command
+    /// Center paint block) makes `assert!(!h.engine.borrow().picker_open, ...)`
+    /// below fail, because `handle()`'s click dispatch still finds a
+    /// (stale) `Some(layout)` to hit-test against and opens the picker.
     #[test]
     fn command_center_layout_clears_when_menu_bar_is_hidden() {
         let mut h = harness(engine_with_tab_history(), 1400, 900);
         h.driver.render();
         assert!(
-            h.engine.borrow().command_center_layout.borrow().is_some(),
-            "must be painted while the menu bar is visible"
+            h.engine.borrow().tab_nav_can_go_back(),
+            "fixture must start with back-navigation available"
         );
+        let tab_before = h.engine.borrow().active_tab().id;
+        let layout = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("must be painted while the menu bar is visible");
+        let back = layout.back_bounds.expect("back arrow must be painted");
+        let search = layout.search_bounds.expect("search box must be painted");
 
         h.engine.borrow_mut().menu_bar_visible = false;
         h.driver.render();
+
+        // Click at the *old* back-arrow and search-box coordinates: with the
+        // menu bar hidden neither must still behave like Command Center
+        // controls, even though the layout has reflowed and something else
+        // (editor/tab bar) may now occupy those pixels.
+        h.driver
+            .click(back.x + back.width / 2.0, back.y + back.height / 2.0);
+        assert_eq!(
+            h.engine.borrow().active_tab().id,
+            tab_before,
+            "clicking the old back-arrow coordinates after hiding the menu bar \
+             must not navigate tab history"
+        );
+        h.driver.click(
+            search.x + search.width / 2.0,
+            search.y + search.height / 2.0,
+        );
+        assert!(
+            !h.engine.borrow().picker_open,
+            "clicking the old search-box coordinates after hiding the menu bar \
+             must not open the Command Center picker"
+        );
         assert!(
             h.engine.borrow().command_center_layout.borrow().is_none(),
             "hiding the menu bar must clear the cached Command Center layout"

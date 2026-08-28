@@ -1788,6 +1788,24 @@ mod sc_panel_tests {
         assert!(contains(&lines, "Switch Branch"), "{lines:#?}");
         assert!(contains(&lines, "main"), "{lines:#?}");
         assert!(contains(&lines, "feature/foo"), "{lines:#?}");
+        // #677 audit: the test's own name promises "marks_current", but until
+        // now nothing checked that `main` (`is_current: true`) is painted any
+        // differently from `feature/foo` -- both branch-name asserts above
+        // pass even if the current-branch marker is deleted. render.rs's
+        // `sc_branch_picker_to_palette` prefixes the current branch with
+        // U+25CF ("\u{25cf} name") and non-current branches with two spaces
+        // ("  name"), so assert on that distinction directly. Verified
+        // vacuous by mutation: forcing `is_current` to `false` unconditionally
+        // in `sc_branch_picker_to_palette`'s formatting closure left the two
+        // asserts above green and only these two red.
+        assert!(
+            contains(&lines, "\u{25cf} main"),
+            "the current branch must be marked with the current-branch glyph; {lines:#?}"
+        );
+        assert!(
+            !contains(&lines, "\u{25cf} feature/foo"),
+            "a non-current branch must not carry the current-branch glyph; {lines:#?}"
+        );
     }
 
     #[test]
