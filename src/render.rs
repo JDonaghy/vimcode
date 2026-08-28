@@ -13056,6 +13056,44 @@ pub fn status_action_from_id(id: &str) -> Option<StatusAction> {
     }
 }
 
+/// Hit-test an absolute pixel point against a painted status bar's rect and
+/// its segment zones, resolving to the `StatusAction` of whichever segment
+/// it landed on (`None` if the point misses the bar entirely, or lands in a
+/// gap between segments).
+///
+/// `zones` is `(start_x, end_x, action)` triples **local to `bar_rect`'s own
+/// origin** — the same shape GTK's `status_segment_map` stores per bar
+/// (populated from `Backend::status_bar_layout`'s hit regions at paint
+/// time). Shared here so a backend with more than one on-screen status bar
+/// (GTK's separated status line sits outside any window's own rect, so it
+/// can't reuse `window_zone_hit_test`'s window-relative contract) resolves
+/// clicks the same way the per-window bar does, instead of a bespoke
+/// second copy of this arithmetic. TUI has no equivalent call site: its own
+/// hit test (`tui_main/mouse.rs::status_segment_hit_test`) re-derives the
+/// bar layout fresh from row/col on every click rather than consulting a
+/// persistent pixel cache.
+pub fn status_bar_zone_hit_test(
+    bar_rect: quadraui::Rect,
+    zones: &[(f64, f64, StatusAction)],
+    x: f64,
+    y: f64,
+) -> Option<StatusAction> {
+    let (bx, by, bw, bh) = (
+        bar_rect.x as f64,
+        bar_rect.y as f64,
+        bar_rect.width as f64,
+        bar_rect.height as f64,
+    );
+    if x < bx || x >= bx + bw || y < by || y >= by + bh {
+        return None;
+    }
+    let local_x = x - bx;
+    zones
+        .iter()
+        .find(|(start, end, _)| local_x >= *start && local_x < *end)
+        .map(|(_, _, action)| action.clone())
+}
+
 /// Convert a `WindowStatusLine` (built by `build_window_status_line`) into a
 /// `quadraui::StatusBar` primitive. Engine-owned `StatusAction` enums are
 /// flattened to opaque `WidgetId` strings so the primitive is
@@ -15028,6 +15066,70 @@ mod tests {
         );
         assert_eq!(first_line.spell_errors[0].start_col, 4);
         assert_eq!(first_line.spell_errors[0].end_col, 8);
+    }
+
+    // ── status_bar_zone_hit_test (#672) ──────────────────────────────────────
+
+    #[test]
+    fn status_bar_zone_hit_test_resolves_the_segment_a_point_lands_in() {
+        let bar_rect = quadraui::Rect::new(100.0, 800.0, 400.0, 20.0);
+        let zones = vec![
+            (0.0, 50.0, StatusAction::SwitchBranch),
+            (50.0, 120.0, StatusAction::GoToLine),
+        ];
+        // Absolute x = 180 -> local_x = 180 - 100 = 80, inside the second
+        // zone's [50, 120) local range.
+        let hit = status_bar_zone_hit_test(bar_rect, &zones, 180.0, 810.0);
+        assert_eq!(
+            hit,
+            Some(StatusAction::GoToLine),
+            "a point inside the second zone's local_x range must resolve to it"
+        );
+        let hit_first = status_bar_zone_hit_test(bar_rect, &zones, 120.0, 810.0);
+        assert_eq!(
+            hit_first,
+            Some(StatusAction::SwitchBranch),
+            "a point inside the first zone's local_x range must resolve to it"
+        );
+    }
+
+    #[test]
+    fn status_bar_zone_hit_test_misses_outside_the_bar_rect() {
+        let bar_rect = quadraui::Rect::new(100.0, 800.0, 400.0, 20.0);
+        let zones = vec![(0.0, 400.0, StatusAction::GoToLine)];
+        // Same x/y span as the zone, but outside the bar's own rect on each axis.
+        assert_eq!(
+            status_bar_zone_hit_test(bar_rect, &zones, 50.0, 810.0),
+            None,
+            "a point left of the bar's x origin must miss, even if the local_x \
+             arithmetic alone would land inside a zone"
+        );
+        assert_eq!(
+            status_bar_zone_hit_test(bar_rect, &zones, 200.0, 700.0),
+            None,
+            "a point above the bar's y band must miss"
+        );
+        assert_eq!(
+            status_bar_zone_hit_test(bar_rect, &zones, 200.0, 900.0),
+            None,
+            "a point below the bar's y band must miss"
+        );
+    }
+
+    #[test]
+    fn status_bar_zone_hit_test_misses_a_gap_between_segments() {
+        let bar_rect = quadraui::Rect::new(0.0, 0.0, 400.0, 20.0);
+        let zones = vec![
+            (0.0, 50.0, StatusAction::SwitchBranch),
+            // Gap between 50 and 100 — no segment painted there (e.g. the
+            // bar's own inter-segment padding).
+            (100.0, 150.0, StatusAction::GoToLine),
+        ];
+        assert_eq!(
+            status_bar_zone_hit_test(bar_rect, &zones, 75.0, 10.0),
+            None,
+            "a point in the gap between two segments must not resolve to either"
+        );
     }
 
     // ── Per-window status line tests ─────────────────────────────────────────

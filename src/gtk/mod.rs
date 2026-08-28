@@ -635,6 +635,18 @@ struct App {
     action_btn_map: Rc<RefCell<ActionBtnMap>>,
     /// Cached per-window status bar segment hit zones from draw_window_status_bar.
     status_segment_map: Rc<RefCell<StatusSegmentMap>>,
+    /// Painted rect of the separated status line's status bar (#671/#672),
+    /// or `None` if the last frame drew no separated line
+    /// (`window_status_line` off, `status_line_above_terminal` on, or no
+    /// bottom panel open — see `compute_editor_layout`'s `has_separated`).
+    /// Exists purely so the `status_segment_map` entry keyed by
+    /// `active_window_id` (inserted right alongside this) can be located by
+    /// pixel — the live click path itself needs no such cache, since
+    /// `status_segment_map`'s `local_x` is already bar-relative and
+    /// `window_zone_hit_test`/`screen_zone_hit_test` resolve the y-band
+    /// independently. Mirrors the existing `picker_popup_rect` /
+    /// `tab_switcher_popup_rect` "painted rect for click+test" pattern.
+    separated_status_bar_rect: Rc<Cell<Option<quadraui::Rect>>>,
     /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
     /// read this instead of recomputing geometry from engine state (#344).
     cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
@@ -1607,6 +1619,7 @@ impl App {
             split_btn_map: Rc::new(RefCell::new(HashMap::new())),
             action_btn_map: Rc::new(RefCell::new(HashMap::new())),
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
+            separated_status_bar_rect: Rc::new(Cell::new(None)),
             cached_screen_layout: Rc::new(RefCell::new(None)),
             cached_frame_hit_map: Rc::new(RefCell::new(None)),
             sidebar_pointer_captured: Cell::new(false),
@@ -1848,6 +1861,7 @@ impl App {
                             &self.split_btn_map.borrow(),
                             &self.action_btn_map.borrow(),
                             &self.status_segment_map.borrow(),
+                            self.separated_status_bar_rect.get(),
                             self.cached_frame_hit_map.borrow().as_ref(),
                             &self.cached_tab_bar_zones.borrow(),
                             true, // real click: focus/tab/gutter side effects are intended
@@ -1920,6 +1934,7 @@ impl App {
                                 &self.split_btn_map.borrow(),
                                 &self.action_btn_map.borrow(),
                                 &self.status_segment_map.borrow(),
+                                self.separated_status_bar_rect.get(),
                                 self.cached_frame_hit_map.borrow().as_ref(),
                                 &self.cached_tab_bar_zones.borrow(),
                             );
@@ -4717,6 +4732,7 @@ impl App {
                                 &self.split_btn_map.borrow(),
                                 &self.action_btn_map.borrow(),
                                 &self.status_segment_map.borrow(),
+                                self.separated_status_bar_rect.get(),
                                 self.cached_frame_hit_map.borrow().as_ref(),
                                 &self.cached_tab_bar_zones.borrow(),
                             )
@@ -5048,6 +5064,7 @@ impl App {
                     &self.split_btn_map.borrow(),
                     &self.action_btn_map.borrow(),
                     &self.status_segment_map.borrow(),
+                    self.separated_status_bar_rect.get(),
                     self.cached_frame_hit_map.borrow().as_ref(),
                     &self.cached_tab_bar_zones.borrow(),
                     true, // resolving the original tab-bar mouse-down; switching tabs is intended
@@ -5188,6 +5205,7 @@ impl App {
                         &self.split_btn_map.borrow(),
                         &self.action_btn_map.borrow(),
                         &self.status_segment_map.borrow(),
+                        self.separated_status_bar_rect.get(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                     );
@@ -9065,6 +9083,9 @@ impl quadraui::ShellApp for App {
             self.status_segment_map
                 .borrow_mut()
                 .insert(screen.active_window_id.0, zones);
+            self.separated_status_bar_rect.set(Some(sb_rect));
+        } else {
+            self.separated_status_bar_rect.set(None);
         }
 
         // ── Draw global status bar / wildmenu ─────────────────────────────────
