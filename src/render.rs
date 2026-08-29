@@ -5043,8 +5043,13 @@ impl Theme {
             // (0.9, 0.9, 0.9)
             command_fg: Color::from_hex("#e5e5e5"),
 
-            // (0.7, 0.7, 0.7)
-            line_number_fg: Color::from_hex("#b2b2b2"),
+            // VS Code's `editorLineNumber.foreground` (#699 Tier 2a / #701).
+            // Was #b2b2b2 (0.7, 0.7, 0.7), which read brighter than the
+            // editor's own body text (`default_fg` #abb2bf) and pulled the
+            // eye into the gutter. The cursor's line is brightened
+            // separately via `line_number_active_fg` below, so dimming the
+            // inactive token *increases* the active/inactive contrast.
+            line_number_fg: Color::from_hex("#858585"),
             // (0.9, 0.9, 0.5)
             line_number_active_fg: Color::from_hex("#e5e57f"),
 
@@ -5124,7 +5129,13 @@ impl Theme {
             semantic_macro: Color::from_hex("#56b6c2"),     // cyan
 
             breadcrumb_bg: Color::from_hex("#21252b"),
-            breadcrumb_fg: Color::from_hex("#7f848e"),
+            // #699 Tier 2a / #701: the non-trailing crumbs recede. Was
+            // #7f848e, a straight 15% dim of which is #6c7079 — same hue,
+            // now clearly below the editor's body text (`default_fg`
+            // #abb2bf) so the path reads as chrome rather than competing
+            // with the code. The trailing/current crumb keeps
+            // `breadcrumb_active_fg` at full body-text brightness.
+            breadcrumb_fg: Color::from_hex("#6c7079"),
             breadcrumb_active_fg: Color::from_hex("#abb2bf"),
 
             indent_guide_fg: Color::from_hex("#404040"),
