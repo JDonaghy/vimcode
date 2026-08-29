@@ -1254,6 +1254,86 @@ mod tests {
         );
     }
 
+    /// #700 item 6: indent guides must actually *paint* by default, not just
+    /// leave `settings.indent_guides` set to `true` — the exact gap #587/#592
+    /// (`ScreenLayout.picker`) burned ~5 sessions on: a state field flipped on
+    /// for months with nothing painting it, and a test asserting the field
+    /// alone would have stayed green throughout. `settings.rs`'s
+    /// `test_settings_default` already pins the field; this pins the pixels.
+    ///
+    /// Renders the same indented buffer twice — once at the real default
+    /// (`Engine::new()`, untouched), once with `indent_guides` forced off —
+    /// and requires the two frames to differ somewhere in the indented
+    /// region. `quadraui::gtk::editor`'s indent-guide rasteriser (pinned rev,
+    /// `src/gtk/editor.rs:290-306`) strokes a 1px vertical line at each guide
+    /// column, so any real diff here can only be that stroke.
+    ///
+    /// RED-first: forcing `indent_guides: false` on *both* harnesses (i.e.
+    /// simulating the pre-#700 off-by-default state) collapses `differing`
+    /// to 0 and this test fails — confirmed by hand before restoring the
+    /// real default.
+    #[test]
+    fn indent_guides_paint_by_default() {
+        // Two levels of leading-space indent (tabstop defaults to 4), so a
+        // guide is expected at column 0 and column 4 on the third line.
+        let indented_text = "fn main() {\n    if true {\n        let x = 1;\n    }\n}\n";
+
+        let mut engine_on = Engine::new();
+        engine_on.buffer_mut().insert(0, indented_text);
+        assert!(
+            engine_on.settings.indent_guides,
+            "test setup sanity: Engine::new()'s real default must be on, or \
+             this test isn't exercising the default at all"
+        );
+        let mut h_on = harness(engine_on, 1400, 900);
+        let win_on = h_on.engine.borrow().active_window_id();
+        h_on.window_center(win_on)
+            .expect("editor pane must paint with the default settings");
+        let rect_on = {
+            let layout = h_on.screen_layout.borrow();
+            layout
+                .as_ref()
+                .unwrap()
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_on)
+                .unwrap()
+                .rect
+        };
+        let lh = h_on
+            .painted_line_height()
+            .expect("frame must publish the line height it painted with");
+
+        let mut engine_off = Engine::new();
+        engine_off.buffer_mut().insert(0, indented_text);
+        engine_off.settings.indent_guides = false;
+        let mut h_off = harness(engine_off, 1400, 900);
+        let win_off = h_off.engine.borrow().active_window_id();
+        h_off
+            .window_center(win_off)
+            .expect("editor pane must paint with guides disabled");
+
+        // Row 2 (0-indexed) is "        let x = 1;" — 8 columns of leading
+        // whitespace, so both the col-0 and col-4 guides should be live.
+        let y = (rect_on.y + lh * 2.5) as i32;
+        let x0 = rect_on.x as i32;
+        let x1 = (rect_on.x + 100.0) as i32;
+
+        let mut differing = 0;
+        for x in x0..x1 {
+            if h_on.driver.pixel(x, y) != h_off.driver.pixel(x, y) {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing > 0,
+            "indent guides must paint visibly different pixels on an \
+             indented line by default (#700 item 6); sampled x in \
+             {x0}..{x1} at y={y}, 0/{} differed",
+            x1 - x0
+        );
+    }
+
     /// Two editor groups whose buffers have breadcrumb paths of *different*
     /// depths: the active group (A) shows `a.rs` (1 segment), the other group
     /// (B) shows `src/core/deep.rs` (3 segments). Returns `(engine, group_b)`.

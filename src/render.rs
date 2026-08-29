@@ -386,9 +386,22 @@ pub struct SelectionRange {
 /// Display information for a single tab-bar entry.
 #[derive(Debug, Clone)]
 pub struct TabInfo {
-    /// Display label, e.g. `"main.rs"` (#700: no ordinal prefix, matching
-    /// VS Code — `quadraui::TabItem`'s own padding/close-glyph geometry
-    /// supplies the surrounding space).
+    /// Display label, e.g. `"main.rs "` (#700: no ordinal prefix, matching
+    /// VS Code — but see the single trailing space). Checked against the
+    /// pinned quadraui rev's `tui::tab_bar::draw_tab_bar` (#700 review
+    /// nit): the TUI rasteriser paints the close glyph immediately after
+    /// the label's own measured width, with its reserved `TAB_CLOSE_COLS`
+    /// separator cell trailing the glyph, not leading it — so any
+    /// breathing room before `×` has to come from the label text itself.
+    /// Before #700 item 4 that space existed incidentally, baked into the
+    /// old `" {i+1}: {name} "` ordinal prefix's own trailing space; the
+    /// sole `TabInfo` builder for the editor tab bar
+    /// (`build_tab_bar_for_group_by_id`) now adds it back deliberately.
+    /// It has to live there rather than downstream at the
+    /// `quadraui::TabItem` conversion, because [`tab_hit_width`] measures
+    /// `t.name` directly — padding added only at the `TabItem` step would
+    /// paint one column wider than the hit-test math expects, the exact
+    /// measure/paint mismatch class #654 documents at length.
     pub name: String,
     /// Whether this is the currently active tab.
     pub active: bool,
@@ -3283,6 +3296,9 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
             // still underlines regardless); that fallback is the real gap
             // and needs a quadraui-side fix (an Alt-held gate, or "no `&`
             // means no underline") before this is genuinely conditional.
+            // A quadraui issue for this gap must be filed — do not treat
+            // #700's acceptance bullet "no underline when Alt is not held"
+            // as satisfied until it lands.
             label: name.to_string(),
             disabled: false,
             items: items
@@ -10072,15 +10088,19 @@ fn build_tab_bar_for_group_by_id(engine: &Engine, group_id: GroupId) -> Vec<TabI
             let window_id = tab.active_window;
             let (name, dirty, preview) = if let Some(window) = engine.windows.get(&window_id) {
                 if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                    (state.display_name().to_string(), state.dirty, state.preview)
+                    (state.display_name(), state.dirty, state.preview)
                 } else {
                     ("[No Name]".to_string(), false, false)
                 }
             } else {
                 ("[No Name]".to_string(), false, false)
             };
+            // #700 review nit: a single trailing space so the close glyph
+            // doesn't paint flush against the label — see `TabInfo::name`'s
+            // doc for why this has to be added here, at the source, rather
+            // than downstream where `TabInfo` becomes `quadraui::TabItem`.
             TabInfo {
-                name,
+                name: name + " ",
                 active,
                 dirty,
                 preview,
@@ -14043,7 +14063,11 @@ pub const TAB_ROW_HEIGHT_PX: f64 = 35.0;
 /// `Backend::draw_status_bar`, which has no per-call font override in the
 /// pinned quadraui rev (unlike `draw_dialog`/`draw_rich_text_popup`, which
 /// already take a `ui_font` description) — so breadcrumb text size still
-/// tracks `settings.font_size` until that quadraui gap is closed.
+/// tracks `settings.font_size` until that quadraui gap is closed. A
+/// quadraui issue for a `draw_status_bar` font override must be filed —
+/// do not treat #700's "breadcrumb text size independent of font_size"
+/// acceptance bullet as satisfied until it lands; only the row height half
+/// is fixed here.
 pub const BREADCRUMB_ROW_HEIGHT_PX: f64 = 22.0;
 
 /// Compute the tab bar row height in pixels (the row containing tab labels).
