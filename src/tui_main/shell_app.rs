@@ -1460,7 +1460,7 @@ impl ShellApp for TuiShellApp {
                     width: target.rect.width as u16,
                     height: 1,
                 };
-                let vis = render_tab_bar(backend, g_tab, target.bar, &theme);
+                let vis = render_tab_bar(backend, g_tab, target.bar, target.icons, &theme);
                 counts.push((target.group_id, vis));
             }
         }
@@ -7554,5 +7554,179 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── #703: per-tab language icons (quadraui `draw_tab_bar_icons`) ────────
+
+    /// Render the tab row for two open files with Nerd Fonts either on or
+    /// off, returning `(row, dir)` — the painted row-0 string plus the temp
+    /// dir to clean up.
+    ///
+    /// Nerd Fonts is a thread-local (see `crate::icons`' module docs), and
+    /// `TuiShellApp::new` sets it from `Settings`, so the flag has to be
+    /// flipped *after* construction — exactly as `app_with_ext_panel` does.
+    fn tab_row_with_nerd_fonts(on: bool) -> (String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_tab_icons_703_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let alpha = dir.join("alpha703.rs");
+        let beta = dir.join("beta703.rs");
+        std::fs::write(&alpha, "fn main() {}\n").unwrap();
+        std::fs::write(&beta, "fn other() {}\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = on;
+        crate::icons::set_nerd_fonts(on);
+        app.engine
+            .open_file_with_mode(&alpha, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.new_tab(Some(&beta));
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let row = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        (row, dir)
+    }
+
+    /// #703 acceptance (TUI): every tab slot shifts right by exactly
+    /// `TabIcon::cols()` once icons are on, the language glyph paints in the
+    /// column that reservation opened up, and the close × keeps its own
+    /// column immediately after the label.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before this change both backends called `Backend::draw_tab_bar`,
+    /// which paints no icons at all: the `alpha703.rs` label started at the
+    /// bar's column 0 with nothing before it, so `icon_shift` below would be
+    /// `0`, not `TabIcon::cols()`, and no Rust glyph would be on the row.
+    ///
+    /// It is also the guard for the *measure* half. `render_tab_bar` hands
+    /// the same sidecar to `draw_tab_bar_icons` that
+    /// `compute_tab_bar_hit_regions` measured with; painting with icons
+    /// while measuring with `&[]` would leave the second tab's label painted
+    /// at a column the hit regions never cover.
+    #[test]
+    fn tab_bar_paints_language_icons_and_shifts_slots_via_shell_app() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        let (row_on, dir_on) = tab_row_with_nerd_fonts(true);
+        let (row_off, dir_off) = tab_row_with_nerd_fonts(false);
+        crate::icons::set_nerd_fonts(prev_nf);
+        let _ = std::fs::remove_dir_all(&dir_on);
+        let _ = std::fs::remove_dir_all(&dir_off);
+
+        // The Rust glyph reserves its own display width plus a 1-column gap.
+        let rust_icon = quadraui::TabIcon {
+            glyph: crate::icons::FILE_RUST.nerd.to_string(),
+            color: quadraui::Color::rgb(0, 0, 0),
+        };
+        let icon_cols = rust_icon.cols() as usize;
+        assert!(icon_cols >= 2, "a glyph plus its gap is at least 2 columns");
+
+        let on_alpha = tab_col(&row_on, "alpha703.rs");
+        let off_alpha = tab_col(&row_off, "alpha703.rs");
+        let on_beta = tab_col(&row_on, "beta703.rs");
+        let off_beta = tab_col(&row_off, "beta703.rs");
+
+        // Origin-free: the distance between two adjacent tab labels is that
+        // tab's whole slot, so it does not depend on where the bar starts
+        // (the sidebar shifts it right).  Without icons a slot is exactly
+        // label + `TabInfo`'s trailing space + `TAB_CLOSE_COLS`.
+        let bare_slot = "alpha703.rs".chars().count() + 1 + crate::render::TAB_CLOSE_COLS as usize;
+        assert_eq!(
+            off_beta - off_alpha,
+            bare_slot,
+            "with icons off, tab 0's slot must be label + trailing space + \
+             close cols and nothing more; row:\n{row_off}"
+        );
+        assert_eq!(
+            on_beta - on_alpha,
+            bare_slot + icon_cols,
+            "with icons on, tab 0's slot must widen by exactly the icon \
+             reservation ({icon_cols} cols); row:\n{row_on}"
+        );
+
+        // The glyph itself paints in the column the reservation opened, i.e.
+        // at the head of tab 0's slot, `icon_cols` left of the label.
+        let glyph = crate::icons::FILE_RUST.nerd.chars().next().unwrap();
+        assert_eq!(
+            row_on.chars().position(|c| c == glyph),
+            Some(on_alpha - icon_cols),
+            "the Rust glyph must paint at the head of tab 0's slot; row:\n{row_on}"
+        );
+        assert!(
+            !row_off.contains(crate::icons::FILE_RUST.nerd),
+            "no Nerd Font glyph may paint with Nerd Fonts off; row:\n{row_off}"
+        );
+
+        // The close × keeps its own column right after the label + the
+        // deliberate trailing space `TabInfo::name` carries, in both renders:
+        // the icon widens the slot on the *left*, it does not push the glyph
+        // off its column relative to the label it belongs to.
+        for (row, label_at) in [(&row_on, on_alpha), (&row_off, off_alpha)] {
+            let close_col = label_at + "alpha703.rs".chars().count() + 1;
+            assert_eq!(
+                row.chars().nth(close_col),
+                Some('\u{00d7}'),
+                "the close glyph must stay on its own column at {close_col}; row:\n{row}"
+            );
+        }
+    }
+
+    /// Column (not byte offset) at which `label` paints in a rendered row.
+    /// Nerd Font glyphs are multi-byte, so `str::find` is not a column.
+    fn tab_col(row: &str, label: &str) -> usize {
+        let byte = row
+            .find(label)
+            .unwrap_or_else(|| panic!("tab bar must paint {label}; row:\n{row}"));
+        row[..byte].chars().count()
+    }
+
+    /// #703: with Nerd Fonts off, `build_tab_bar_icons` returns `&[]` rather
+    /// than ASCII fallbacks (a bare `R` before every label is noise, not
+    /// parity) — and `&[]` makes `draw_tab_bar_icons` byte-identical to
+    /// `draw_tab_bar`. So the tab bar must paint exactly what it painted
+    /// before this feature existed: nothing between the bar's left edge and
+    /// the first label, and no fallback letter either.
+    #[test]
+    fn nerd_fonts_off_keeps_tab_bar_geometry_byte_identical_via_shell_app() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        let (row, dir) = tab_row_with_nerd_fonts(false);
+        crate::icons::set_nerd_fonts(prev_nf);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // No reservation: the two labels sit exactly one bare slot apart.
+        let bare_slot = "alpha703.rs".chars().count() + 1 + crate::render::TAB_CLOSE_COLS as usize;
+        assert_eq!(
+            tab_col(&row, "beta703.rs") - tab_col(&row, "alpha703.rs"),
+            bare_slot,
+            "with Nerd Fonts off no column may be reserved for an icon; row:\n{row}"
+        );
+        // …and specifically not an ASCII fallback: `file_icon("rs")` would
+        // return "R" with the flag off, which is what `&[]` exists to avoid.
+        let before_alpha = row
+            .chars()
+            .nth(tab_col(&row, "alpha703.rs").saturating_sub(1));
+        assert_ne!(
+            before_alpha,
+            Some('R'),
+            "the ASCII fallback must not be painted as a tab badge; row:\n{row}"
+        );
+        for icon in [
+            crate::icons::FILE_RUST.nerd,
+            crate::icons::FILE_GENERIC.nerd,
+        ] {
+            assert!(
+                !row.contains(icon),
+                "no Nerd Font glyph may paint with Nerd Fonts off; row:\n{row}"
+            );
+        }
     }
 }

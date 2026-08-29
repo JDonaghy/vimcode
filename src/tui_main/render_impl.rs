@@ -553,7 +553,7 @@ pub(super) fn draw_frame(
             width: target.rect.width as u16,
             height: 1,
         };
-        let vis = render_tab_bar(backend, g_tab, target.bar, theme);
+        let vis = render_tab_bar(backend, g_tab, target.bar, target.icons, theme);
         tab_visible_counts_out.push((target.group_id, vis));
     }
     // Draw breadcrumb bars (below each group's tab bar). Hidden while the
@@ -1554,6 +1554,7 @@ pub(super) fn render_tab_bar(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
     bar: &quadraui::TabBar,
+    icons: &[Option<quadraui::TabIcon>],
     theme: &Theme,
 ) -> usize {
     let q_rect = quadraui::Rect::new(
@@ -1563,7 +1564,10 @@ pub(super) fn render_tab_bar(
         area.height as f32,
     );
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    let hits = backend.draw_tab_bar(q_rect, bar, None);
+    // #703: `draw_tab_bar_icons` with an empty sidecar is byte-identical to
+    // `draw_tab_bar` (quadraui's `draw_tab_bar` literally forwards to it with
+    // `&[]`), so the Nerd-Fonts-off path keeps today's geometry exactly.
+    let hits = backend.draw_tab_bar_icons(q_rect, bar, icons, None);
     hits.available_cols
 }
 
