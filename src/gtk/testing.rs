@@ -974,6 +974,225 @@ mod tests {
         );
     }
 
+    // ── #703: per-tab language icons (quadraui `draw_tab_bar_icons`) ────────
+
+    /// Three tabs in one group, each backed by a distinguishable real file
+    /// path so the tabs paint different labels *and* different language
+    /// badges (`.rs` orange, `.py` blue, `.md` blue).
+    fn engine_with_three_named_tabs() -> Engine {
+        let mut engine = Engine::new();
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        let names = ["alpha703.rs", "beta703.py", "gamma703.md"];
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+        engine
+    }
+
+    /// Display names of a group's tabs, in slot order — read from the engine
+    /// so the assertion says *which* tab survived, not just how many did.
+    fn tab_names(h: &Harness<impl AppLogic>) -> Vec<String> {
+        let engine = h.engine.borrow();
+        let group = &engine.editor_groups[&engine.active_group];
+        group
+            .tabs
+            .iter()
+            .map(|tab| {
+                engine
+                    .windows
+                    .get(&tab.active_window)
+                    .and_then(|w| engine.buffer_manager.get(w.buffer_id))
+                    .map(|s| s.display_name())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// True for a pixel painted in the Rust badge's identity colour,
+    /// [`crate::icons::ICON_ORANGE`].
+    ///
+    /// A small tolerance rather than exact equality because Cairo antialiases
+    /// the glyph against the tab background — but a *small* one (±25 per
+    /// channel), because the glyph's core does land on the nominal value and
+    /// a loose "reddish" predicate matches warm antialiasing fringes from the
+    /// label text itself.
+    fn is_icon_orange((r, g, b): (u8, u8, u8)) -> bool {
+        let (want_r, want_g, want_b) = crate::icons::ICON_ORANGE;
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 25;
+        near(r, want_r) && near(g, want_g) && near(b, want_b)
+    }
+
+    /// Two tabs whose labels are the same length and the same language, so
+    /// their painted slots are (to within a pixel of Pango kerning) equal
+    /// width — which is what lets [`tab_zero_left_half`] recover tab 0's left
+    /// edge from the two tab centres alone.
+    fn engine_with_two_rust_tabs() -> Engine {
+        let mut engine = Engine::new();
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        for (i, name) in ["aaa703.rs", "bbb703.rs"].iter().enumerate() {
+            if i > 0 {
+                engine.new_tab(None);
+            }
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join(name));
+            }
+        }
+        engine
+    }
+
+    /// Every pixel in the **left half of tab 0's painted slot** — the strip
+    /// that holds the tab's leading padding, its icon, and the start of its
+    /// label — plus tab 0's centre x.
+    ///
+    /// The slot is recovered from the two tab centres rather than from
+    /// `find_bounds`: `GtkDriver::find_bounds` returns the *first* painted
+    /// label matching a needle, and the breadcrumb bar and the explorer tree
+    /// both paint the same filename, so a needle-anchored probe silently
+    /// measures the wrong widget (it did — the label "moved" from x=490 to
+    /// x=490 because both readings were the breadcrumb's). `tab_center`
+    /// resolves against the `TabBarLayout` the rasteriser actually cached
+    /// while painting this bar, which is unambiguous.
+    fn tab_zero_left_half(h: &mut Harness<impl AppLogic>) -> (Vec<(u8, u8, u8)>, f32) {
+        let bar = editor_tab_bar_id();
+        let c0 = h
+            .driver
+            .tab_center(&bar, 0)
+            .expect("tab 0 must have painted");
+        let c1 = h
+            .driver
+            .tab_center(&bar, 1)
+            .expect("tab 1 must have painted");
+        // Equal-width slots ⇒ the centre-to-centre distance is one slot, so
+        // tab 0's left edge is half a slot left of its own centre.
+        let left = c0.0 - (c1.0 - c0.0) / 2.0;
+        let mut px = Vec::new();
+        for x in (left.max(0.0) as i32)..(c0.0 as i32) {
+            for y in (c0.1 as i32 - 6)..(c0.1 as i32 + 6) {
+                px.push(h.driver.pixel(x, y));
+            }
+        }
+        (px, c0.0)
+    }
+
+    /// #703 acceptance (GTK): a `.rs` tab paints its language badge — in the
+    /// badge's own identity colour — inside its own slot, and that badge
+    /// occupies real space: the tab is wider than the identical tab rendered
+    /// with `&[]`.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// `develop` paints through `Surface::TabBar` → `Backend::draw_tab_bar`,
+    /// which has no icon sidecar at all: tab 0's slot is bare background plus
+    /// a grey label, so `is_icon_orange` matches nothing, and tab 0's centre
+    /// is identical with Nerd Fonts on and off.
+    #[test]
+    fn tab_paints_its_language_icon_and_widens_the_tab() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+
+        // The flag has to be set *after* `Engine::new` (which applies the
+        // developer's own settings and would otherwise clobber it) and before
+        // the harness paints its first frame.
+        let render_with_nerd_fonts = |on: bool| {
+            let mut engine = engine_with_two_rust_tabs();
+            engine.settings.use_nerd_fonts = on;
+            crate::icons::set_nerd_fonts(on);
+            let mut h = harness(engine, 1400, 900);
+            tab_zero_left_half(&mut h)
+        };
+
+        let (on_px, on_center_x) = render_with_nerd_fonts(true);
+        let (off_px, off_center_x) = render_with_nerd_fonts(false);
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let reddest = |px: &[(u8, u8, u8)]| {
+            px.iter()
+                .max_by_key(|(r, _, b)| *r as i32 - *b as i32)
+                .copied()
+        };
+        assert!(
+            on_px.iter().copied().any(is_icon_orange),
+            "a .rs tab must paint its orange Rust badge inside its own slot; \
+             sampled {} px, reddest was {:?}",
+            on_px.len(),
+            reddest(&on_px)
+        );
+        assert!(
+            !off_px.iter().copied().any(is_icon_orange),
+            "with Nerd Fonts off nothing may be painted there — `&[]`, not \
+             an ASCII fallback; reddest was {:?}",
+            reddest(&off_px)
+        );
+        assert!(
+            on_center_x > off_center_x,
+            "the icon reservation must widen the tab, pushing its centre \
+             right: with icons {on_center_x}, without {off_center_x}"
+        );
+    }
+
+    /// #703, **the regression that matters**: with icons painted, a click on
+    /// the painted × must still close the tab it sits on.
+    ///
+    /// # Why this fails if `tab_bar_layout` is reinstated at `gtk/mod.rs`
+    ///
+    /// GTK caches click geometry from a *second*, no-paint measurement pass
+    /// (`App::cached_tab_pixel_hits`). quadraui's own doc is explicit that a
+    /// caller which paints with icons must measure with
+    /// `tab_bar_layout_icons`: the icon reservation widens every decorated
+    /// tab, so the icon-less twin reports every slot and close-button bound
+    /// shifted left of the painted glyphs, by a cumulative one icon width per
+    /// preceding tab.
+    ///
+    /// Verified by doing exactly that — swapping the `render_content` call
+    /// back to `backend.tab_bar_layout(tb_rect, target.bar)` — and re-running:
+    /// **no tab closes at all**. The × zone is narrow (`tighten_close_bounds`
+    /// trims it to the glyph box), so a drift of one icon width moves it clean
+    /// off every cached hit zone and `resolve_pixel_tab_click` matches
+    /// nothing, exactly the dead-close-button symptom #659/quadraui#615
+    /// produced. `single_group_tab_close_button_closes_that_tab` above goes
+    /// red under the same swap; this test adds the *which* tab (tab 1 of 3,
+    /// where the cumulative drift is larger than tab 0's).
+    #[test]
+    fn tab_close_button_closes_the_tab_under_the_cursor_with_icons_painted() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        // After `Engine::new` (which applies the developer's own settings),
+        // before the harness paints — see `tab_paints_its_language_icon…`.
+        let mut engine = engine_with_three_named_tabs();
+        engine.settings.use_nerd_fonts = true;
+        crate::icons::set_nerd_fonts(true);
+        let mut h = harness(engine, 1400, 900);
+
+        assert_eq!(
+            tab_names(&h),
+            vec!["alpha703.rs", "beta703.py", "gamma703.md"],
+            "fixture must open three distinguishable tabs in one group"
+        );
+
+        let (x, y) = h
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 1)
+            .expect("tab 1 must have painted a close button");
+        h.driver.click(x, y);
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        assert_eq!(
+            tab_names(&h),
+            vec!["alpha703.rs", "gamma703.md"],
+            "clicking tab 1's painted × must close tab 1 — measuring with \
+             the icon-less `tab_bar_layout` while painting with icons closes \
+             the tab to its left"
+        );
+    }
+
     /// An engine whose active buffer has a real (multi-component) file path
     /// under `cwd`, so `build_breadcrumbs_for_group` produces one clickable
     /// segment per path component.

@@ -443,6 +443,11 @@ pub struct GroupTabBar {
     )>,
     /// Pre-built quadraui `TabBar` primitive — backends draw this directly.
     pub bar: quadraui::TabBar,
+    /// Per-tab icon sidecar parallel to `bar.tabs` (#703), from
+    /// [`build_tab_bar_icons`]. Empty when Nerd Fonts are off. Backends must
+    /// pass this to **both** `Backend::draw_tab_bar_icons` and
+    /// `Backend::tab_bar_layout_icons`.
+    pub icons: Vec<Option<quadraui::TabIcon>>,
 }
 
 // ── Tab bar hit region constants (char-cell units) ──────────────────────────
@@ -490,8 +495,69 @@ const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
 /// `tui_main::render_impl::tests::
 /// tab_hit_regions_match_painted_columns_for_wide_names`, which reads the
 /// expected columns out of the rendered buffer.
-fn tab_hit_width(t: &TabInfo) -> usize {
-    quadraui::tui::display_width(&t.name) + TAB_CLOSE_COLS as usize
+///
+/// `icon_cols` is the per-tab icon reservation from
+/// [`quadraui::tab_icon_cols`] (#703) — glyph width + a 1-column gap, or `0`
+/// for an undecorated tab. It has to be folded in here for the same reason
+/// the trailing space on [`TabInfo::name`] does: `TuiBackend::draw_tab_bar_icons`
+/// adds `tab_icon_cols` to its own per-tab width budget, so a hit box measured
+/// without it sits one glyph left of the painted tab — the #654 desync again,
+/// this time surfacing as "the close × closes the tab to its right".
+fn tab_hit_width(t: &TabInfo, icon_cols: u16) -> usize {
+    quadraui::tui::display_width(&t.name) + TAB_CLOSE_COLS as usize + icon_cols as usize
+}
+
+/// Build the per-tab icon sidecar that decorates a tab bar with VS Code's
+/// coloured language badge (#703).
+///
+/// The result is a slice **parallel to `tabs`** (and therefore to the
+/// `quadraui::TabBar::tabs` that [`build_tab_bar_primitive`] derives from the
+/// same slice): entry `i` decorates tab `i`. Pass it to
+/// `Backend::draw_tab_bar_icons` *and* `Backend::tab_bar_layout_icons` — a
+/// caller that paints with icons but measures without them reports slot and
+/// close-button bounds shifted left of the painted glyphs.
+///
+/// Returns an **empty** vec when Nerd Fonts are off. `&[]` is quadraui's
+/// "no icons at all" argument and makes `draw_tab_bar_icons` byte-identical to
+/// `draw_tab_bar`, so the no-Nerd-Font geometry is exactly what it was before
+/// this feature existed. Deliberately *not* the ASCII fallbacks
+/// [`icons::file_icon`] would otherwise return: a bare `R`/`P`/`#` before every
+/// tab label is noise, not parity.
+pub fn build_tab_bar_icons(tabs: &[TabInfo]) -> Vec<Option<quadraui::TabIcon>> {
+    if !icons::nerd_fonts_enabled() {
+        return Vec::new();
+    }
+    tabs.iter()
+        .map(|t| {
+            // `TabInfo::name` carries a deliberate trailing space (see its
+            // doc); the extension has to be read from the trimmed name.
+            let ext = tab_name_extension(&t.name);
+            Some(quadraui::TabIcon {
+                glyph: icons::file_icon(&ext).to_string(),
+                color: to_quadraui_color(tab_icon_color(&ext)),
+            })
+        })
+        .collect()
+}
+
+/// Extract the lowercase file extension from a [`TabInfo::name`] label.
+/// Scratch/special buffers (`"[Keymaps]"`, `"[No Name]"`) yield `""`, which
+/// [`icons::file_icon`] maps to the generic file glyph — matching VS Code,
+/// which badges untitled editors with a plain file icon rather than nothing.
+fn tab_name_extension(name: &str) -> String {
+    std::path::Path::new(name.trim())
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// The language identity colour for a tab icon. Thin adapter over
+/// [`icons::file_icon_color`] so no rendering call site names an RGB literal
+/// (see that function's design note for why this is not a `Theme` token).
+fn tab_icon_color(ext: &str) -> Color {
+    let (r, g, b) = icons::file_icon_color(ext);
+    Color::from_rgb(r, g, b)
 }
 
 /// Compute hit regions for a group's tab bar.
@@ -508,8 +574,16 @@ fn tab_hit_width(t: &TabInfo) -> usize {
 /// Win-GUI migrate to consume `TabBarLayout` directly, this shim
 /// is the bridge — but the layout math itself has only one
 /// source of truth now.
+///
+/// `icons_sidecar` is the sidecar from [`build_tab_bar_icons`] — the *same*
+/// slice the backend paints with. It must be threaded through here because an
+/// icon widens its tab by `tab_icon_cols`; measuring with `&[]` while painting
+/// with icons is the measure/paint desync #654 exists to prevent. (Named with
+/// the suffix because bare `icons` would shadow the [`crate::icons`] module
+/// this file uses throughout.)
 pub fn compute_tab_bar_hit_regions(
     tabs: &[TabInfo],
+    icons_sidecar: &[Option<quadraui::TabIcon>],
     tab_scroll_offset: usize,
     bar_width: u16,
     has_diff_toolbar: bool,
@@ -554,7 +628,11 @@ pub fn compute_tab_bar_hit_regions(
     // measured now that #654 routed every TUI hit-test through these regions.
     // Close hit region is the trailing 2 cells (matches legacy behaviour:
     // clicks on × or the trailing separator count as close).
-    let tab_widths: Vec<usize> = tabs.iter().map(tab_hit_width).collect();
+    let tab_widths: Vec<usize> = tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| tab_hit_width(t, quadraui::tab_icon_cols(icons_sidecar, i)))
+        .collect();
 
     let layout = primitive.layout(
         bar_width as f32,
@@ -854,6 +932,10 @@ pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
 pub struct TabBarDrawTarget<'a> {
     pub rect: quadraui::Rect,
     pub bar: &'a quadraui::TabBar,
+    /// Per-tab icon sidecar parallel to `bar.tabs` (#703). Pass to **both**
+    /// `Backend::draw_tab_bar_icons` and `Backend::tab_bar_layout_icons` —
+    /// see [`build_tab_bar_icons`].
+    pub icons: &'a [Option<quadraui::TabIcon>],
     /// Group this tab bar belongs to — the active (and only) group in
     /// single-group mode.
     pub group_id: GroupId,
@@ -915,6 +997,7 @@ pub fn tab_bar_draw_targets<'a>(
                 tab_row_h as f32,
             ),
             bar: &gtb.bar,
+            icons: &gtb.icons,
             group_id: gtb.group_id,
         })
         .collect()
@@ -6863,8 +6946,13 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 .unwrap_or(0);
             let is_active = gid == engine.active_group;
             let has_split = is_active || engine.is_in_diff_view();
+            // #703: built once and reused for measurement *and* paint — the
+            // sidecar the backend hands to `tab_bar_layout_icons` is the same
+            // one it hands to `draw_tab_bar_icons`.
+            let tab_icons = build_tab_bar_icons(&tabs);
             let hit_regions = compute_tab_bar_hit_regions(
                 &tabs,
+                &tab_icons,
                 tab_scroll_offset,
                 bar_width,
                 has_diff_toolbar,
@@ -6891,6 +6979,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 tab_scroll_offset,
                 hit_regions,
                 bar,
+                icons: tab_icons,
             }
         })
         .collect();
@@ -7026,6 +7115,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             .unwrap_or(0);
         compute_tab_bar_hit_regions(
             &tab_bar,
+            &build_tab_bar_icons(&tab_bar),
             tab_scroll_offset_single,
             bar_width_cells,
             diff_toolbar.is_some(),

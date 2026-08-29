@@ -193,6 +193,75 @@ pub fn file_icon(ext: &str) -> &'static str {
     }
 }
 
+// ─── File Icon Colours ───────────────────────────────────────────────────────
+//
+// #703 design note — why these live here, next to `file_icon`, rather than as
+// `Theme` fields:
+//
+// The repo rule is "no hardcoded colours in rendering", and `tab_active_accent`
+// is the precedent for a theme-owned tab token. That rule is about *chrome*:
+// backgrounds, accents and text that must track the active colour scheme. A
+// language badge is not chrome — it is part of the icon's **identity**, the
+// same way the glyph is. VS Code's Seti icon theme keeps `.rs` orange and
+// `.ts` blue in every one of its built-in themes precisely because users
+// recognise files by that colour; making it theme-settable would let a theme
+// turn every badge the same shade and destroy the signal the badge exists for.
+//
+// So the colour is stored beside the glyph it belongs to, in one table, and no
+// rendering call site ever names a hex value: `render.rs` asks for
+// `icons::file_icon_color(ext)` exactly as it already asks for
+// `icons::file_icon(ext)`, and the two can never drift apart. If a future issue
+// wants per-theme overrides, the right shape is a `Theme` map that *overrides*
+// this table, not a replacement for it.
+//
+// Palette below is Seti-UI's, which is tuned for dark editor chrome (it is what
+// VS Code ships).
+
+/// Seti-UI blue — TypeScript, Python, C/C++, CSS, Lua, Markdown.
+pub const ICON_BLUE: (u8, u8, u8) = (0x51, 0x9a, 0xba);
+/// Seti-UI green — shell scripts.
+pub const ICON_GREEN: (u8, u8, u8) = (0x8d, 0xc1, 0x49);
+/// Seti-UI orange — Rust, TOML, HTML.
+pub const ICON_ORANGE: (u8, u8, u8) = (0xe3, 0x79, 0x33);
+/// Seti-UI purple — C/C++ headers, YAML.
+pub const ICON_PURPLE: (u8, u8, u8) = (0xa0, 0x74, 0xc4);
+/// Seti-UI yellow — JavaScript, JSON.
+pub const ICON_YELLOW: (u8, u8, u8) = (0xcb, 0xcb, 0x41);
+/// Seti-UI cyan — Go.
+pub const ICON_CYAN: (u8, u8, u8) = (0x51, 0xc9, 0xd4);
+/// Seti-UI off-white — plain text and unknown extensions.
+pub const ICON_NEUTRAL: (u8, u8, u8) = (0xd4, 0xd7, 0xd6);
+
+/// Return the identity colour (24-bit RGB) for a given file extension's icon.
+///
+/// Pairs 1:1 with [`file_icon`] — every arm there has an arm here, so a tab's
+/// glyph and its colour are always looked up from the same extension string.
+/// Unknown extensions get [`ICON_NEUTRAL`], matching [`FILE_GENERIC`].
+///
+/// Returned as a plain RGB triple rather than `render::Color` so this module
+/// stays free of any rendering dependency; `render::tab_icon_color` converts.
+pub fn file_icon_color(ext: &str) -> (u8, u8, u8) {
+    match ext.to_lowercase().as_str() {
+        "rs" => ICON_ORANGE,
+        "py" => ICON_BLUE,
+        "js" | "jsx" | "mjs" | "cjs" => ICON_YELLOW,
+        "ts" | "tsx" => ICON_BLUE,
+        "go" => ICON_CYAN,
+        "cpp" | "cc" | "cxx" | "c" => ICON_BLUE,
+        "h" | "hpp" => ICON_PURPLE,
+        "md" | "markdown" => ICON_BLUE,
+        "json" => ICON_YELLOW,
+        "toml" => ICON_ORANGE,
+        "yaml" | "yml" => ICON_PURPLE,
+        "html" | "htm" => ICON_ORANGE,
+        "css" => ICON_BLUE,
+        "sh" | "bash" | "zsh" => ICON_GREEN,
+        "lua" => ICON_BLUE,
+        "txt" => ICON_NEUTRAL,
+        _ => ICON_NEUTRAL,
+    }
+}
+
 /// Check whether a Nerd Font is installed on Windows by scanning the user and
 /// system font directories for font files with "Nerd" in the name.
 /// Returns `false` on non-Windows platforms.

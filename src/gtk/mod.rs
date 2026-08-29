@@ -8609,13 +8609,17 @@ impl quadraui::ShellApp for App {
             let hover = self
                 .tab_close_hover
                 .and_then(|(gid, i)| (gid == target.group_id.0).then_some(i));
-            let mut frame = QSL::new();
-            frame.push(Surface::TabBar {
-                rect: tb_rect,
-                bar: target.bar,
-                hovered_close: hover,
-            });
-            frame.draw(backend);
+            // #703: painted via `Backend::draw_tab_bar_icons` directly rather
+            // than a `Surface::TabBar` push, because quadraui's `Surface` enum
+            // carries no icon sidecar (adding a field to it would be the same
+            // hard break on downstream consumers that kept the icons off
+            // `TabItem` in the first place). With an empty sidecar the two are
+            // byte-identical — quadraui's `draw_tab_bar` forwards to
+            // `draw_tab_bar_icons` with `&[]` — so this is a pure superset of
+            // the old call. `hit_frame` below still gets a `Surface::TabBar`:
+            // it is only ever consumed via `hit_map()` (never drawn) and its
+            // zones are whole-bar rects, which icons do not move.
+            backend.draw_tab_bar_icons(tb_rect, target.bar, target.icons, hover);
             // `target.bar` borrows from `screen` (function-scoped), so this
             // can push directly into `hit_frame` without hoisting (#449).
             hit_frame.push(Surface::TabBar {
@@ -8626,7 +8630,14 @@ impl quadraui::ShellApp for App {
             tab_bar_zones.insert(next_surface_idx, (target.group_id, tb_rect));
             // Recover the exact pixel geometry the rasteriser just drew and
             // cache it (relative to the bar's left edge) for hit-testing.
-            let hits = backend.tab_bar_layout(tb_rect, target.bar);
+            //
+            // #703: must be the `_icons` twin, with the *same* sidecar the
+            // paint above used. The icon reservation widens every decorated
+            // tab, so the icon-less `tab_bar_layout` reports slot and close
+            // bounds shifted left of the painted glyphs — i.e. the close × of
+            // tab N lands inside tab N+1's painted slot, and clicking it
+            // closes the wrong tab. Exactly the measure/paint desync of #654.
+            let hits = backend.tab_bar_layout_icons(tb_rect, target.bar, target.icons);
             let ph = tab_hits_to_pixel_hits(&hits, target.bar, tb_rect.x as f64);
             let bar_top = tb_rect.y as f64;
             close_abs.insert(
