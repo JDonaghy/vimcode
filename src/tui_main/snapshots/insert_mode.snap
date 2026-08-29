@@ -2,7 +2,7 @@
 source: src/tui_main/render_impl.rs
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜  [No Name] ×                                     󰤲    ⋯
+ 󰍜   [No Name] ×                                   󰤲    ⋯
 ▎
     hello world
  
