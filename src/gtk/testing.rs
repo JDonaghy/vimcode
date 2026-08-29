@@ -85,6 +85,11 @@ pub(super) struct Harness<A: AppLogic> {
     pub picker_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
     /// Line height the last frame actually painted with (#555).
     pub painted_line_height: Rc<std::cell::Cell<Option<f64>>>,
+    /// Character-cell advance (pixels) the shell last reported to `App`.
+    /// The horizontal twin of [`Self::painted_line_height`] — needed to turn
+    /// `RenderedWindow::gutter_char_width` (char cells) into the pixel band
+    /// the line-number gutter occupies (#701).
+    pub painted_char_width: Rc<Cell<f64>>,
     /// Completion popup layout the last frame painted, or `None` if that
     /// frame drew no completion popup — the completion twin of
     /// [`Self::picker_popup_rect`] (#669).
@@ -271,6 +276,13 @@ impl<A: AppLogic> Harness<A> {
         self.painted_line_height.get()
     }
 
+    /// Character-cell advance (pixels) the shell last reported. Multiply by
+    /// [`crate::render::RenderedWindow::gutter_char_width`] to get the pixel
+    /// width of the line-number gutter (#701).
+    pub fn painted_char_width(&self) -> f64 {
+        self.painted_char_width.get()
+    }
+
     /// Geometry of the painted picker's result list: `(popup_x, list_w,
     /// rows_top, line_height)`. `None` before the picker has painted.
     ///
@@ -330,6 +342,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let screen_layout = Rc::clone(&app.cached_screen_layout);
     let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
     let painted_line_height = Rc::clone(&app.painted_line_height);
+    let painted_char_width = Rc::clone(&app.char_width_cell);
     let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
     let completion_layout = Rc::clone(&app.completion_layout);
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
@@ -344,6 +357,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         screen_layout,
         picker_popup_rect,
         painted_line_height,
+        painted_char_width,
         painted_sidebar_bounds,
         completion_layout,
         editor_hover_popup_rect,
@@ -3031,6 +3045,310 @@ mod command_center {
         assert!(
             h.engine.borrow().command_center_layout.borrow().is_none(),
             "hiding the menu bar must clear the cached Command Center layout"
+        );
+    }
+}
+
+/// #699 Tier 2a (#701): the default theme's line-number and breadcrumb
+/// foregrounds must actually *paint* dimmed, and the cursor line's number
+/// must stay bright.
+///
+/// Both are colour-token changes on `Theme::onedark()` — `line_number_fg`
+/// `#b2b2b2` → `#858585` (VS Code's `editorLineNumber.foreground`) and
+/// `breadcrumb_fg` `#7f848e` → `#6c7079`. The wiring already existed, so a
+/// test that asserted "the theme field holds X" would be asserting the
+/// constant against itself and would stay green if the paint path stopped
+/// consulting it. These probe the rendered surface instead, exactly as this
+/// file's header prescribes: locate the target through the layout the frame
+/// published, then read pixels.
+///
+/// RED-first (run, not assumed): with both values reverted on this same
+/// tree, `inactive_line_numbers_dim_while_the_cursor_line_stays_bright`
+/// fails its inactive-gutter assertion — the probe reads `(177, 176, 176)`
+/// instead of `#858585` — and
+/// `breadcrumb_path_paints_dimmer_than_editor_body_text` fails its
+/// segment-colour assertion, reading `(126, 130, 137)` instead of `#6c7079`
+/// (a 0.566 body-text luminance ratio, also over the 0.55 ceiling the
+/// second assertion enforces).
+#[cfg(test)]
+mod vscode_dimming {
+    use super::*;
+    use crate::core::settings::LineNumberMode;
+
+    /// Rec. 709 relative luminance of a painted pixel.
+    fn luma((r, g, b): (u8, u8, u8)) -> f64 {
+        0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64
+    }
+
+    /// Brightest pixel in the half-open box `[x0, x1) × [y0, y1)`.
+    ///
+    /// Glyph text is antialiased *from* the background *towards* the
+    /// foreground, so a fully-covered stem pixel carries the unblended
+    /// foreground and every other text pixel is darker. Taking the maximum
+    /// therefore recovers the fg colour the renderer was handed, and — the
+    /// property this module leans on — a blend can never overshoot it: no
+    /// amount of antialiasing over `background` `#1a1a1a` can produce
+    /// `#b2b2b2` out of an `#858585` pen.
+    fn brightest(
+        h: &mut Harness<impl AppLogic>,
+        x0: i32,
+        x1: i32,
+        y0: i32,
+        y1: i32,
+    ) -> (u8, u8, u8) {
+        let mut best = (0u8, 0u8, 0u8);
+        for x in x0..x1 {
+            for y in y0..y1 {
+                let p = h.driver.pixel(x, y);
+                if luma(p) > luma(best) {
+                    best = p;
+                }
+            }
+        }
+        best
+    }
+
+    /// Per-channel closeness, loose enough to absorb glyph-rasteriser
+    /// rounding (the observed worst case is 4/255) and far tighter than the
+    /// 45/255 gap between the old and new line-number values.
+    fn near(a: (u8, u8, u8), b: (u8, u8, u8)) -> bool {
+        const TOL: i32 = 10;
+        (a.0 as i32 - b.0 as i32).abs() <= TOL
+            && (a.1 as i32 - b.1 as i32).abs() <= TOL
+            && (a.2 as i32 - b.2 as i32).abs() <= TOL
+    }
+
+    /// `(window rect, gutter width in px, line height)` for the active pane
+    /// as the last frame painted it.
+    fn pane_geometry(h: &Harness<impl AppLogic>) -> (crate::core::WindowRect, f64, f64) {
+        let win = h.engine.borrow().active_window_id();
+        let (rect, gutter_cells) = {
+            let layout = h.screen_layout.borrow();
+            let w = layout
+                .as_ref()
+                .expect("a frame must have painted")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active pane must be in the painted layout");
+            (w.rect, w.gutter_char_width)
+        };
+        assert!(
+            gutter_cells > 1,
+            "test setup sanity: line numbers must be on, or there is no \
+             gutter to probe (got {gutter_cells} cells)"
+        );
+        let lh = h
+            .painted_line_height()
+            .expect("frame must publish the line height it painted with");
+        (rect, gutter_cells as f64 * h.painted_char_width(), lh)
+    }
+
+    /// Brightest pixel inside row `row`'s slice of the line-number gutter.
+    fn gutter_probe(h: &mut Harness<impl AppLogic>, row: usize) -> (u8, u8, u8) {
+        let (rect, gutter_px, lh) = pane_geometry(h);
+        brightest(
+            h,
+            rect.x as i32,
+            (rect.x + gutter_px) as i32,
+            (rect.y + lh * row as f64).ceil() as i32,
+            (rect.y + lh * (row as f64 + 1.0)).floor() as i32,
+        )
+    }
+
+    /// Inactive line numbers must render at VS Code's
+    /// `editorLineNumber.foreground` **and** the cursor's own line number
+    /// must not — one frame, two probes.
+    ///
+    /// The second probe is the point: a test that only checked the dim value
+    /// on some row would pass with `line_number_active_fg` broken (every row
+    /// would read `#858585` and the assertion would be satisfied by whichever
+    /// row it happened to sample).
+    #[test]
+    fn inactive_line_numbers_dim_while_the_cursor_line_stays_bright() {
+        // VS Code's `editorLineNumber.foreground` — the value #701 adopts.
+        const VSCODE_LINE_NUMBER_FG: (u8, u8, u8) = (0x85, 0x85, 0x85);
+
+        let mut engine = Engine::new();
+        // Line numbers default to `LineNumberMode::None`, so there is no
+        // gutter to probe unless the test turns them on — this is the
+        // `:set number` configuration the tokens exist for.
+        engine.settings.line_numbers = LineNumberMode::Absolute;
+        engine
+            .buffer_mut()
+            .insert(0, "aaa\nbbb\nccc\nddd\neee\nfff\n");
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().cursor().line,
+            0,
+            "test setup sanity: the cursor must sit on row 0 so row 0 is the \
+             active gutter row and row 3 is an inactive one"
+        );
+
+        let inactive = gutter_probe(&mut h, 3);
+        assert!(
+            near(inactive, VSCODE_LINE_NUMBER_FG),
+            "an inactive line number must paint at VS Code's \
+             editorLineNumber.foreground {VSCODE_LINE_NUMBER_FG:?} (#701); \
+             the gutter's brightest pixel on row 3 was {inactive:?} — the \
+             pre-#701 default #b2b2b2 reads (177, 176, 176) here"
+        );
+
+        let active = gutter_probe(&mut h, 0);
+        assert!(
+            !near(active, VSCODE_LINE_NUMBER_FG),
+            "the cursor line's number must NOT paint at the dimmed inactive \
+             colour — got {active:?}, which is indistinguishable from \
+             {VSCODE_LINE_NUMBER_FG:?}. Dimming line_number_fg is only a win \
+             if line_number_active_fg still lifts the cursor row out of it"
+        );
+        let active_token =
+            crate::render::to_quadraui_color(crate::render::Theme::onedark().line_number_active_fg);
+        assert!(
+            near(active, (active_token.r, active_token.g, active_token.b)),
+            "the cursor line's number must paint at line_number_active_fg \
+             ({active_token:?}); got {active:?}"
+        );
+        assert!(
+            luma(active) > luma(inactive) + 40.0,
+            "the active line number must be visibly brighter than an \
+             inactive one: active {active:?} (luma {:.0}) vs inactive \
+             {inactive:?} (luma {:.0})",
+            luma(active),
+            luma(inactive)
+        );
+    }
+
+    /// A non-trailing breadcrumb segment must paint measurably dimmer than
+    /// the editor's body text **in the same frame**, so the path recedes
+    /// instead of competing with the code (#701).
+    #[test]
+    fn breadcrumb_path_paints_dimmer_than_editor_body_text() {
+        // The dimmed `breadcrumb_fg` #701 adopts (a 15% dim of #7f848e).
+        const BREADCRUMB_FG: (u8, u8, u8) = (0x6c, 0x70, 0x79);
+        // Ratio ceiling: the crumb must sit at most a little over half of
+        // body-text luminance. Measured 0.483 with #6c7079; the pre-#701
+        // #7f848e measures 0.566 and fails this too.
+        const MAX_RATIO: f64 = 0.55;
+
+        let mut engine = Engine::new_for_test();
+        // A real multi-component path under `cwd` is what makes
+        // `build_breadcrumbs_for_group` emit more than one segment, so
+        // `bc:0` is a *non-trailing* crumb and therefore uses
+        // `breadcrumb_fg` rather than `breadcrumb_active_fg`.
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        let buf = engine.active_buffer_id();
+        if let Some(state) = engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(cwd.join("src").join("main.rs"));
+        }
+        engine
+            .buffer_mut()
+            .insert(0, "fn main() {}\nlet alpha = beta;\nlet gamma = delta;\n");
+
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.engine.borrow().settings.breadcrumbs,
+            "fixture assumes breadcrumbs are on by default"
+        );
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        let group = h.engine.borrow().active_group;
+
+        // Locate the crumb through the layout the frame published (never
+        // hardcode coordinates) and probe the rect it reported.
+        let seg = {
+            let layout = h.screen_layout.borrow();
+            let bc = layout
+                .as_ref()
+                .unwrap()
+                .breadcrumbs
+                .iter()
+                .find(|b| b.group_id == group)
+                .expect("the breadcrumb bar must have painted for this group");
+            let guard = bc.draw_layout.borrow();
+            let sbl = guard
+                .as_ref()
+                .expect("the breadcrumb bar must have cached a painted layout");
+            let want = quadraui::WidgetId::new("bc:0");
+            let r = sbl
+                .hit_regions
+                .iter()
+                .find_map(|(r, hit)| match hit {
+                    quadraui::StatusBarHit::Segment(id) if *id == want => Some(*r),
+                    _ => None,
+                })
+                .expect("segment 0 must have a painted hit region");
+            quadraui::Rect::new(
+                bc.bounds.x as f32 + r.x,
+                bc.bounds.y as f32 + r.y,
+                r.width,
+                r.height,
+            )
+        };
+        assert!(
+            seg.width > 1.0 && seg.height > 1.0,
+            "segment 0 must have painted a non-degenerate rect, got {seg:?}"
+        );
+
+        let crumb = brightest(
+            &mut h,
+            seg.x as i32,
+            (seg.x + seg.width) as i32,
+            seg.y as i32,
+            (seg.y + seg.height) as i32,
+        );
+        assert!(
+            near(crumb, BREADCRUMB_FG),
+            "a non-trailing breadcrumb segment must paint at the dimmed \
+             breadcrumb_fg {BREADCRUMB_FG:?} (#701); brightest pixel in the \
+             painted segment rect was {crumb:?} — the pre-#701 #7f848e reads \
+             (126, 130, 137) here"
+        );
+
+        // Body text from the *same* frame: row 2 of the pane, past the
+        // gutter. Row 0 is skipped deliberately — the block cursor sits
+        // there and its inverted cell is not body text.
+        let (rect, gutter_px, lh) = {
+            let win_id = h.engine.borrow().active_window_id();
+            let (rect, gutter_cells) = {
+                let layout = h.screen_layout.borrow();
+                let w = layout
+                    .as_ref()
+                    .unwrap()
+                    .windows
+                    .iter()
+                    .find(|w| w.window_id == win_id)
+                    .unwrap();
+                (w.rect, w.gutter_char_width)
+            };
+            let lh = h.painted_line_height().unwrap();
+            (rect, gutter_cells as f64 * h.painted_char_width(), lh)
+        };
+        let body = brightest(
+            &mut h,
+            (rect.x + gutter_px) as i32,
+            (rect.x + gutter_px + 200.0) as i32,
+            (rect.y + lh * 2.0) as i32,
+            (rect.y + lh * 3.0) as i32,
+        );
+        assert!(
+            luma(body) > 150.0,
+            "test setup sanity: row 2 must actually have painted body text \
+             to compare against, got {body:?}"
+        );
+
+        let ratio = luma(crumb) / luma(body);
+        assert!(
+            ratio <= MAX_RATIO,
+            "breadcrumb text must recede from the editor's body text in the \
+             same frame: crumb {crumb:?} (luma {:.0}) vs body {body:?} (luma \
+             {:.0}) is a ratio of {ratio:.3}, above the {MAX_RATIO} ceiling \
+             (#701)",
+            luma(crumb),
+            luma(body)
         );
     }
 }
