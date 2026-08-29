@@ -492,10 +492,27 @@ struct App {
     /// state or extension registrations change.
     activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
 
-    /// Row height actually used by the most recent explorer draw call.
-    /// The draw callback writes this each frame from the same Pango
-    /// context it renders with, so click and scroll handlers hit-test with
-    /// byte-exact row math.
+    /// ⚠️ DEAD ON THE LIVE PAINT PATH (#700 review, iteration 1) — do not
+    /// read this as "the explorer's on-screen row height." The explorer
+    /// tree is actually painted by quadraui's `TreeController` via
+    /// `Backend::line_height()`, which never reads this cell; it is set
+    /// once at construction (see the `Rc::new(Cell::new(...))` call below)
+    /// and then only ever *read*, never written, so the doc that used to
+    /// live here ("the draw callback writes this each frame") was stale.
+    /// The sole readers are `explorer_row_at`, reached only from
+    /// `Msg::ExplorerClick`/`Msg::ExplorerRightClick` — and nothing in this
+    /// codebase constructs either variant (`git grep "Msg::ExplorerClick {"`
+    /// matches only the enum definition and its `match` arm). Changing the
+    /// value here changes nothing a user can see.
+    ///
+    /// A real fix for the explorer's *painted* row pitch (VS Code parity,
+    /// #700 item 1) needs a quadraui-side row-height override for
+    /// `draw_tree`, matching what `draw_tab_bar`/`draw_status_bar` already
+    /// get via an explicit rect height — that is quadraui infrastructure
+    /// work, out of scope for vimcode alone per the Platform-Neutrality
+    /// Rule. **A quadraui issue for this gap must be filed before #700 is
+    /// treated as closing the explorer-row-pitch acceptance bullet** — do
+    /// not let this field's value read as "done."
     explorer_row_height_cell: Rc<Cell<f64>>,
     /// Explorer DA's UI-font line_height + char_width in pixels — cached
     /// for the engine-drawn ctx menu (#426). The right-click handler
