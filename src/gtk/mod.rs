@@ -492,42 +492,12 @@ struct App {
     /// state or extension registrations change.
     activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
 
-    /// ⚠️ DEAD ON THE LIVE PAINT PATH (#700 review, iteration 1) — do not
-    /// read this as "the explorer's on-screen row height." The explorer
-    /// tree is actually painted by quadraui's `TreeController` via
-    /// `Backend::line_height()`, which never reads this cell; it is set
-    /// once at construction (see the `Rc::new(Cell::new(...))` call below)
-    /// and then only ever *read*, never written, so the doc that used to
-    /// live here ("the draw callback writes this each frame") was stale.
-    /// The sole readers are `explorer_row_at`, reached only from
-    /// `Msg::ExplorerClick`/`Msg::ExplorerRightClick` — and nothing in this
-    /// codebase constructs either variant (`git grep "Msg::ExplorerClick {"`
-    /// matches only the enum definition and its `match` arm). Changing the
-    /// value here changes nothing a user can see.
-    ///
-    /// A real fix for the explorer's *painted* row pitch (VS Code parity,
-    /// #700 item 1) needs a quadraui-side row-height override for
-    /// `draw_tree`, matching what `draw_tab_bar`/`draw_status_bar` already
-    /// get via an explicit rect height — that is quadraui infrastructure
-    /// work, out of scope for vimcode alone per the Platform-Neutrality
-    /// Rule. **A quadraui issue for this gap must be filed before #700 is
-    /// treated as closing the explorer-row-pitch acceptance bullet** — do
-    /// not let this field's value read as "done."
-    explorer_row_height_cell: Rc<Cell<f64>>,
-    /// Explorer DA's UI-font line_height + char_width in pixels — cached
-    /// for the engine-drawn ctx menu (#426). The right-click handler
-    /// converts pixel coords to engine cells using these, and the
-    /// explorer-DA-side ctx menu render multiplies them back out for the
-    /// anchor pixel.
-    explorer_line_height_cell: Rc<Cell<f64>>,
-    explorer_char_width_cell: Rc<Cell<f64>>,
     /// Cached ContextMenuLayout from the last explorer-ctx-menu paint
     /// on the window-overlay DA (#426). Capture-phase click + motion
     /// handlers hit-test against this.
     explorer_ctx_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
     /// Window-level overlay DA dedicated to the explorer ctx menu (#426)
-    /// — kept here so `Msg::ExplorerRightClick` / `Esc` / item-confirm
-    /// can `queue_draw()` it.
+    /// — kept here so `Esc` / item-confirm can `queue_draw()` it.
     ctx_menu_overlay_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Fractional dy accumulator for the explorer scroll wheel. Small
     /// trackpad deltas are summed here until they exceed one row, so no
@@ -1125,18 +1095,6 @@ enum Msg {
         unicode: Option<char>,
         ctrl: bool,
     },
-    /// Left-click at (x, y) on the explorer DrawingArea. `n_press` is 1 for
-    /// single-click (preview), 2+ for double-click (open permanent / toggle dir).
-    ExplorerClick {
-        x: f64,
-        y: f64,
-        n_press: i32,
-    },
-    /// Right-click at (x, y) on the explorer DrawingArea — opens the context menu.
-    ExplorerRightClick {
-        x: f64,
-        y: f64,
-    },
     /// #426: click on the ctx-menu overlay DA (window coords). Routed
     /// through the overlay's gesture so the menu can extend past the
     /// explorer's right edge into the editor area.
@@ -1581,10 +1539,6 @@ impl App {
             pending_file_dialog: Cell::new(None),
             explorer_sidebar_da_ref: Rc::new(RefCell::new(None)),
             activity_bar_da_ref: Rc::new(RefCell::new(None)),
-            // #700: matches VS Code's `list.rowHeight` (was 28.0).
-            explorer_row_height_cell: Rc::new(Cell::new(22.0)),
-            explorer_line_height_cell: Rc::new(Cell::new(20.0)),
-            explorer_char_width_cell: Rc::new(Cell::new(8.0)),
             explorer_ctx_menu_layout: Rc::new(RefCell::new(None)),
             ctx_menu_overlay_da: Rc::new(RefCell::new(None)),
             explorer_scroll_accum: Rc::new(Cell::new(0.0)),
@@ -2377,8 +2331,6 @@ impl App {
                 self.handle_settings_msg(msg);
             }
             Msg::ExplorerKey { .. }
-            | Msg::ExplorerClick { .. }
-            | Msg::ExplorerRightClick { .. }
             | Msg::ExplorerScroll(_)
             | Msg::ExplorerUiEvent(_)
             | Msg::ExplorerCtxMenuClick(..)
@@ -6929,12 +6881,6 @@ impl App {
                 self.queue_explorer_draw();
                 self.draw_needed.set(true);
             }
-            Msg::ExplorerClick { x, y, n_press } => {
-                self.handle_explorer_da_click(x, y, n_press);
-            }
-            Msg::ExplorerRightClick { x, y } => {
-                self.handle_explorer_da_right_click(x, y);
-            }
             Msg::ExplorerScroll(dy) => {
                 let scaled = dy * 3.0;
                 let accum = self.explorer_scroll_accum.get() + scaled;
@@ -7416,21 +7362,6 @@ impl App {
         true
     }
 
-    fn explorer_row_at(&self, y: f64) -> Option<usize> {
-        let engine = self.engine.borrow();
-        let total = engine.explorer_rows.len();
-        let scroll_top = engine.explorer_tree.borrow().scroll_offset();
-        drop(engine);
-        let item_h = self.explorer_row_height_cell.get().max(1.0);
-        let local = (y / item_h).floor().max(0.0) as usize;
-        let idx = scroll_top + local;
-        if idx < total {
-            Some(idx)
-        } else {
-            None
-        }
-    }
-
     fn handle_explorer_da_key(&mut self, key_name: String, unicode: Option<char>, ctrl: bool) {
         // #426: when an explorer ctx menu is open, dispatch j/k/Esc/Enter
         // to the engine ctx menu handler. On Enter, forward the returned
@@ -7607,39 +7538,6 @@ impl App {
             da.queue_draw();
         }
         // Suppress the default engine key handler — key is consumed.
-    }
-
-    fn handle_explorer_da_click(&mut self, _x: f64, y: f64, n_press: i32) {
-        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-            da.grab_focus();
-        }
-        self.engine.borrow_mut().explorer_has_focus = true;
-
-        let Some(idx) = self.explorer_row_at(y) else {
-            return;
-        };
-        let (path, is_dir) = {
-            let eng = self.engine.borrow();
-            if idx >= eng.explorer_rows.len() {
-                return;
-            }
-            let row = &eng.explorer_rows[idx];
-            (row.path.clone(), row.is_dir)
-        };
-        self.engine
-            .borrow()
-            .explorer_tree
-            .borrow_mut()
-            .set_selected_path(Some(vec![idx as u16]));
-        self.queue_explorer_draw();
-        if is_dir {
-            self.engine.borrow_mut().explorer_toggle_dir(idx);
-            self.queue_explorer_draw();
-        } else if n_press >= 2 {
-            self.dispatch(Msg::OpenFileFromSidebar(path));
-        } else {
-            self.dispatch(Msg::PreviewFileFromSidebar(path));
-        }
     }
 
     /// #426: Intercept j/k/Enter/Esc on the explorer DA when an
@@ -7821,55 +7719,6 @@ impl App {
                 self.dispatch(Msg::ToggleFocusSearch);
             }
             _ => {} // engine-handled actions (copy_path, reveal, etc.)
-        }
-    }
-
-    fn handle_explorer_da_right_click(&mut self, x: f64, y: f64) {
-        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-            da.grab_focus();
-        }
-        self.engine.borrow_mut().explorer_has_focus = true;
-        let (target, is_dir) = if let Some(idx) = self.explorer_row_at(y) {
-            let eng = self.engine.borrow();
-            if idx < eng.explorer_rows.len() {
-                eng.explorer_tree
-                    .borrow_mut()
-                    .set_selected_path(Some(vec![idx as u16]));
-                let row = &eng.explorer_rows[idx];
-                (row.path.clone(), row.is_dir)
-            } else {
-                (self.engine.borrow().cwd.clone(), true)
-            }
-        } else {
-            (self.engine.borrow().cwd.clone(), true)
-        };
-        // #426: engine-driven ctx menu. The menu renders on a window-
-        // level overlay DA so it can extend past the narrow explorer DA
-        // into the editor area. Translate explorer-DA-local (x, y) to
-        // window coords via `compute_point`, then divide by UI-font
-        // metrics for the engine cell storage.
-        let (win_x, win_y) = if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-            if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
-                da.compute_point(overlay, &gtk4::graphene::Point::new(x as f32, y as f32))
-                    .map(|p| (p.x() as f64, p.y() as f64))
-                    .unwrap_or((x, y))
-            } else {
-                (x, y)
-            }
-        } else {
-            (x, y)
-        };
-        let cw = self.explorer_char_width_cell.get().max(1.0);
-        let lh = self.explorer_line_height_cell.get().max(1.0);
-        let cx = (win_x / cw) as u16;
-        let cy = (win_y / lh) as u16;
-        self.engine
-            .borrow_mut()
-            .open_explorer_context_menu(target, is_dir, cx, cy);
-        self.queue_explorer_draw();
-        if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
-            overlay.set_can_target(true);
-            overlay.queue_draw();
         }
     }
 
@@ -8250,6 +8099,24 @@ impl quadraui::ShellApp for App {
         // read the process-global atomic this writes, so before this port it
         // silently stayed pinned at the default size forever.
         sync_ui_font_size(&engine.settings);
+        // #705 item 3 / quadraui#624: push the same UI_FONT() family+size
+        // onto the *paint* backend's `ui_font`, which `draw_status_bar`
+        // (breadcrumbs, per-window/global status lines), `draw_tree`
+        // (explorer), `draw_tab_bar_icons`, and `draw_menu_bar` now all
+        // honour for both paint and their no-paint measurement twins
+        // (quadraui#624). Before this call `ui_font` on the paint backend
+        // (a *separate* `GtkBackend` instance from `self.backend`, which
+        // `Msg::CacheFontMetrics` above already keeps synced for click-time
+        // hit-testing — see that match arm's doc) was never touched, so it
+        // sat at quadraui's own "Sans 11" default forever: chrome text
+        // didn't track `settings.ui_font_size`, and — per #700's item 3 —
+        // status-bar-painted breadcrumb text had no font of its own to
+        // decouple it from whatever font a prior draw call in the frame
+        // left on the shared Pango layout. Re-set every frame (not just
+        // once from `setup()`) so a runtime `:set ui_font_size=N` takes
+        // effect immediately, matching `sync_ui_font_size`/`sync_nerd_fonts`
+        // just above.
+        backend.set_ui_font(&UI_FONT());
 
         // #672: scroll surfaces are re-registered from scratch every frame
         // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)

@@ -3365,23 +3365,23 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
         .iter()
         .map(|(name, _alt, items)| quadraui::MenuDef {
             id: quadraui::WidgetId::new(*name),
-            // #700 item 5: VS Code only reveals menu-bar mnemonic underlines
-            // while Alt is held; quadraui's GTK menu bar
-            // (`quadraui/src/gtk/menu_bar.rs`) underlines unconditionally
-            // with no Alt-held gate in the `Backend`/`MenuDef` API, and this
-            // call site has no reach into GTK's Alt-key state (`MenuDef` is
-            // built once per frame from static `MENU_STRUCTURE`, independent
-            // of key-event handling). Per the issue's documented fallback,
-            // drop the `&` rather than add per-backend Alt-tracking code
-            // here — this does NOT fully fix the underline (quadraui's
-            // `alt_char_byte_range` falls back to underlining char 0 when a
-            // label has no `&` at all, so the first letter of every menu
-            // still underlines regardless); that fallback is the real gap
-            // and needs a quadraui-side fix (an Alt-held gate, or "no `&`
-            // means no underline") before this is genuinely conditional.
-            // A quadraui issue for this gap must be filed — do not treat
-            // #700's acceptance bullet "no underline when Alt is not held"
-            // as satisfied until it lands.
+            // #700/#705 item 5: VS Code only reveals menu-bar mnemonic
+            // underlines while Alt is held. quadraui's GTK menu bar used to
+            // underline unconditionally — `alt_char_byte_range` fell back to
+            // underlining char 0 whenever a label had no `&` at all, so
+            // dropping the `&` here (#700) didn't stop the first letter of
+            // every menu from underlining regardless. quadraui#625 part (1)
+            // fixed that fallback: `alt_char_byte_range`/`alt_char_index` now
+            // return `None` (no underline) when the label carries no `&`, so
+            // dropping the `&` here is now sufficient — no menu item
+            // underlines unconditionally.
+            //
+            // quadraui#625 part (2) — a `MenuBar::show_mnemonics` flag so a
+            // host can gate underlines on Alt-held state, for menus that DO
+            // want a mnemonic — is a separate, not-yet-landed follow-up
+            // (breaking pub-struct-field addition, deferred per that issue's
+            // commit message). Nothing here needs Alt-state wiring until
+            // that ships, since every label in `MENU_STRUCTURE` is `&`-free.
             label: name.to_string(),
             disabled: false,
             items: items
