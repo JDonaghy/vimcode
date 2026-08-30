@@ -61,7 +61,34 @@ type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 /// paints directly, e.g. the menu-bar font and the breadcrumb-heading
 /// font), so they moved rather than being deleted with the rest of
 /// the file.
-const UI_FONT_FAMILY: &str = "Segoe UI, Ubuntu, Droid Sans, Sans";
+///
+/// #704 item 1: the old list (`"Segoe UI, Ubuntu, Droid Sans, Sans"`)
+/// led with two names that never resolve on Linux — Segoe UI is
+/// Windows-only, Droid Sans was retired from Android a decade ago —
+/// and never listed Cantarell, the default UI font on GNOME (the most
+/// common Linux desktop and the one this project targets). On a
+/// GNOME box without the `Ubuntu` font package installed, fontconfig
+/// fell through the whole list to the trailing generic `Sans`, which
+/// resolves to DejaVu Sans: wider, with a taller x-height, than what
+/// VS Code lands on at the same nominal point size (VS Code's own
+/// `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Ubuntu,
+/// "Droid Sans", sans-serif` stack has the identical problem, but
+/// Electron's Chromium has extra fallback logic Pango/fontconfig does
+/// not). Reordered so the two real Linux desktop UI fonts — Cantarell
+/// (GNOME) and Ubuntu (Ubuntu/Unity) — are tried first, ahead of the
+/// Windows/legacy names kept only for a hypothetical native-Windows
+/// GTK build; `Sans` remains the final catch-all so a system with none
+/// of the above still gets *a* font rather than a Pango parse failure.
+/// This was blocked on quadraui#624 landing `Backend::set_ui_font`
+/// reaching non-dialog chrome (tab bar, status bar, tree, menu bar) —
+/// before that, changing this constant only affected `draw_dialog`/
+/// `draw_rich_text_popup` and nothing else (see the issue's "Negative
+/// example" reference to #700 item 1's no-op shape). `ui_font_size`
+/// (`core::settings::default_ui_font_size`, 10pt ≈ 13.3px at 96dpi) is
+/// left as-is: VS Code's 13px default is a ~2% difference, dwarfed by
+/// the metric change from fixing the family, so nudging both at once
+/// would make it impossible to tell which change did what.
+const UI_FONT_FAMILY: &str = "Cantarell, Ubuntu, Segoe UI, Droid Sans, Sans";
 
 /// Process-global UI font size (points). Synced from
 /// `settings.ui_font_size` at the start of each frame by

@@ -1572,6 +1572,60 @@ mod tests {
         );
     }
 
+    /// #704 item 1 / quadraui#624: tab labels must also honour
+    /// `Backend::set_ui_font` — the other non-dialog surface #704's
+    /// acceptance criterion names ("a tab label or status-bar segment";
+    /// the sibling test just above already covers the status-bar/breadcrumb
+    /// half). `draw_tab_bar_icons`'s paint call and its no-paint measurement
+    /// twin both switched to `ui_font` under quadraui#624 — before that
+    /// landed, every chrome surface except `draw_dialog`/
+    /// `draw_rich_text_popup` painted with the shared *editor* Pango layout,
+    /// so `set_ui_font` was silently a no-op here too (#704's "Do not start
+    /// this before quadraui#624 lands" blocker, now cleared).
+    ///
+    /// #704's actual code change is widening `UI_FONT_FAMILY` (this module,
+    /// `gtk/mod.rs`) to try real Linux desktop UI fonts (Cantarell, Ubuntu)
+    /// ahead of the generic `Sans` fallback it used to collapse to. There is
+    /// no user-facing `ui_font_family` setting to vary directly the way
+    /// `ui_font_size` can be (see the sibling test), and family+size travel
+    /// to the paint backend as ONE Pango font-description string
+    /// (`UI_FONT()`, `App::render_content`'s `backend.set_ui_font(&UI_FONT())`
+    /// call) with no separate code path for either half. So proving the
+    /// *size* half reaches the tab bar — mirroring quadraui#624's own GTK
+    /// positive control, `gtk_backend_menu_bar_layout_ui_font_size_is_not_inert`
+    /// — is proof the *family* half reaches it too: this is the practical
+    /// form of "chrome glyph extents change when `UI_FONT_FAMILY` changes,
+    /// on a surface that is not a dialog" that a hardcoded `const` (rather
+    /// than a runtime setting) admits.
+    #[test]
+    fn tab_label_width_tracks_ui_font_size_not_editor_font_size() {
+        let mut engine_small = engine_with_three_named_tabs();
+        engine_small.settings.ui_font_size = 8;
+        let h_small = harness(engine_small, 1400, 900);
+        let small = h_small
+            .driver
+            .find_bounds("alpha703")
+            .expect("the tab label must paint");
+
+        let mut engine_big = engine_with_three_named_tabs();
+        engine_big.settings.ui_font_size = 28;
+        let h_big = harness(engine_big, 1400, 900);
+        let big = h_big
+            .driver
+            .find_bounds("alpha703")
+            .expect("the tab label must paint");
+
+        assert!(
+            big.width > small.width * 1.5,
+            "tab label glyph width must track settings.ui_font_size (8 vs \
+             28 pt): got small={:?} big={:?} — if these are close, \
+             `Backend::set_ui_font` isn't reaching the tab bar and labels \
+             are stuck at quadraui's hardcoded chrome-font default",
+            small,
+            big
+        );
+    }
+
     /// #705 item 5 / quadraui#625: menu-bar mnemonic underlines must not
     /// paint unconditionally. Before quadraui#625, `alt_char_byte_range`
     /// fell back to underlining char 0 whenever a label carried no `&` at
