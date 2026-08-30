@@ -1487,6 +1487,223 @@ mod tests {
         );
     }
 
+    /// #705 item 3 / quadraui#624: breadcrumb text must track
+    /// `settings.ui_font_size` — the app's dedicated "chrome font size"
+    /// knob (#217, `UI_FONT_FAMILY`/`UI_FONT_SIZE` in `gtk/mod.rs`) — not
+    /// float at whatever font a previous draw call in the frame happened to
+    /// leave on the shared Pango layout. Before `App::render_content` was
+    /// wired to call `Backend::set_ui_font(&UI_FONT())` on the *paint*
+    /// backend every frame (quadraui#624's mechanism), `ui_font` sat at
+    /// quadraui's own hardcoded `"Sans 11"` default forever — two very
+    /// different `ui_font_size` values would have painted breadcrumb text
+    /// at the identical size. That is the RED case this test's first
+    /// assertion catches: comment out the `backend.set_ui_font(&UI_FONT())`
+    /// call and `big.width > small.width` goes false.
+    ///
+    /// Measures *width*, not height: `find_bounds`' recorded rect reports a
+    /// fixed row-slot height for status-bar segments (matching
+    /// `BREADCRUMB_ROW_HEIGHT_PX`) regardless of the font actually painted,
+    /// but glyph width scales with point size same as it does — this
+    /// mirrors quadraui#624's own GTK positive control
+    /// (`gtk_backend_menu_bar_layout_ui_font_size_is_not_inert`: "changing
+    /// `ui_font` alone must visibly widen the measured menu item").
+    ///
+    /// This does not (and, per the sibling
+    /// `breadcrumb_row_adds_a_fixed_22px_not_a_whole_line_height` test's
+    /// doc comment just above, cannot within this harness) vary
+    /// `settings.font_size` — vimcode's GTK runner paints the editor at a
+    /// hardcoded font regardless of that setting, so there is no live paint
+    /// path from it to anything this test could observe change. The second
+    /// assertion below still pins the *intended* independence contract as a
+    /// regression guard: if `font_size` is ever wired into the editor paint
+    /// path in a way that also (incorrectly) reaches chrome text, this
+    /// starts failing.
+    #[test]
+    fn breadcrumb_text_width_tracks_ui_font_size_not_editor_font_size() {
+        let mut engine_small = engine_with_breadcrumb_path();
+        engine_small.settings.ui_font_size = 8;
+        let h_small = harness(engine_small, 1400, 900);
+        let small = h_small
+            .driver
+            .find_bounds("src")
+            .expect("the breadcrumb's \"src\" path segment must paint");
+
+        let mut engine_big = engine_with_breadcrumb_path();
+        engine_big.settings.ui_font_size = 28;
+        let h_big = harness(engine_big, 1400, 900);
+        let big = h_big
+            .driver
+            .find_bounds("src")
+            .expect("the breadcrumb's \"src\" path segment must paint");
+
+        assert!(
+            big.width > small.width * 1.5,
+            "breadcrumb glyph width must track settings.ui_font_size (8 vs \
+             28 pt): got small={:?} big={:?} — if these are close, \
+             `Backend::set_ui_font` isn't reaching the paint backend and \
+             breadcrumb text is stuck at quadraui's hardcoded chrome-font \
+             default",
+            small,
+            big
+        );
+
+        // Regression guard (see doc comment above): the editor's own font
+        // knob must not leak into chrome text, however that ever gets wired.
+        let mut engine_a = engine_with_breadcrumb_path();
+        engine_a.settings.font_size = 10;
+        let h_a = harness(engine_a, 1400, 900);
+        let a = h_a
+            .driver
+            .find_bounds("src")
+            .expect("the breadcrumb's \"src\" path segment must paint");
+
+        let mut engine_b = engine_with_breadcrumb_path();
+        engine_b.settings.font_size = 60;
+        let h_b = harness(engine_b, 1400, 900);
+        let b = h_b
+            .driver
+            .find_bounds("src")
+            .expect("the breadcrumb's \"src\" path segment must paint");
+
+        assert!(
+            (a.width - b.width).abs() < 0.5,
+            "breadcrumb glyph width must NOT track settings.font_size (10 \
+             vs 60): got a={a:?} b={b:?}"
+        );
+    }
+
+    /// #705 item 5 / quadraui#625: menu-bar mnemonic underlines must not
+    /// paint unconditionally. Before quadraui#625, `alt_char_byte_range`
+    /// fell back to underlining char 0 whenever a label carried no `&` at
+    /// all — #700 stripped the `&` from every `MenuDef` label
+    /// (`render::build_menu_defs`) hoping that would silence the underline,
+    /// but the fallback ignored the missing marker and underlined "File"'s
+    /// 'F' regardless (see that function's doc comment, now updated).
+    /// quadraui#625 part (1) fixed the fallback to return `None` (no
+    /// underline) instead of defaulting to char 0.
+    ///
+    /// Pixel-probing the underline stroke's own absolute color/position is
+    /// deliberately avoided — quadraui's own test suite documents why
+    /// (`alt_char_byte_range_indexes_display_text_not_label`'s doc comment:
+    /// "the underline's own pixels are Pango-font-metric dependent and not
+    /// stable across CI hosts"). Instead this paints the SAME "File" label
+    /// twice, on the SAME host, in the SAME process — once through the
+    /// real, `&`-free `build_menu_defs()` output, once with a synthetic
+    /// `&File` substituted for just that one entry — and diffs the
+    /// identical glyph region between the two frames. `display_text` strips
+    /// the `&` before layout, so both frames paint literally "File" at the
+    /// same position/size (asserted below); the ONLY possible pixel
+    /// difference left between the two captures is the underline
+    /// decoration itself.
+    ///
+    /// RED-first: if the char-0 fallback bug were reinstated, BOTH frames
+    /// would underline 'F' (the fallback doesn't care whether `&` is
+    /// present), the two captures would be pixel-identical, and `differs`
+    /// would come back `false`. A test asserting only that the real,
+    /// `&`-free render has *some* property (e.g. "no underline color at a
+    /// hardcoded offset") could pass by coincidence against a wrong offset
+    /// guess; this diffs against a positive control instead.
+    #[test]
+    fn menu_bar_underline_absent_without_ampersand_present_with_it() {
+        // Both harnesses re-apply `set_menus` once, post-construction,
+        // through the *identical* code path — differing only in the "File"
+        // label's text — so neither picks up any stray hover/active-index
+        // state difference between "however `setup()`'s one-time
+        // `set_menus` call left things" and "a second `set_menus` call
+        // plus an extra `render()`". An earlier version of this test
+        // called `set_menus` only on the marked side and saw the whole
+        // menu-item cell's background differ between the two captures
+        // (an `is_active` highlight artifact of that asymmetry) — a false
+        // signal that had nothing to do with the underline.
+        let mut h_plain = harness(Engine::new_for_test(), 1200, 800);
+        {
+            let defs = crate::render::build_menu_defs(false);
+            h_plain
+                .engine
+                .borrow()
+                .menu_system
+                .borrow_mut()
+                .set_menus(defs);
+        }
+        h_plain.driver.render();
+        let bounds_plain = h_plain
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        assert!(
+            bounds_plain.y < 40.0,
+            "sanity: \"File\" should resolve to the menu-bar header near the \
+             top of the window, not some other painted text; got {bounds_plain:?}"
+        );
+
+        let mut h_marked = harness(Engine::new_for_test(), 1200, 800);
+        {
+            let mut defs = crate::render::build_menu_defs(false);
+            let file_def = defs
+                .iter_mut()
+                .find(|d| d.label == "File")
+                .expect("MENU_STRUCTURE must carry a File entry");
+            file_def.label = "&File".to_string();
+            h_marked
+                .engine
+                .borrow()
+                .menu_system
+                .borrow_mut()
+                .set_menus(defs);
+        }
+        h_marked.driver.render();
+        let bounds_marked = h_marked
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must still paint with the marker");
+
+        assert_eq!(
+            (
+                bounds_plain.x,
+                bounds_plain.y,
+                bounds_plain.width,
+                bounds_plain.height
+            ),
+            (
+                bounds_marked.x,
+                bounds_marked.y,
+                bounds_marked.width,
+                bounds_marked.height
+            ),
+            "the `&` must be stripped before layout — both frames should \
+             paint literally \"File\" at the identical position/size, \
+             isolating the underline decoration as the only possible pixel \
+             difference"
+        );
+
+        let x0 = bounds_plain.x.floor() as i32;
+        let x1 = (bounds_plain.x + bounds_plain.width).ceil() as i32;
+        let y0 = bounds_plain.y.floor() as i32;
+        // A few px of slack below the ink rect — underlines paint just
+        // under the baseline, which may sit slightly outside the recorded
+        // ink extents.
+        let y1 = (bounds_plain.y + bounds_plain.height).ceil() as i32 + 3;
+
+        let mut differs = false;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if h_plain.driver.pixel(x, y) != h_marked.driver.pixel(x, y) {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "expected the synthetic \"&File\" render to paint an underline \
+             stroke somewhere under 'F' that the real, `&`-free \"File\" \
+             render does not — got pixel-identical regions in \
+             x=[{x0},{x1}) y=[{y0},{y1}), meaning either underlines never \
+             paint at all (masking a real regression elsewhere) or the \
+             char-0 fallback bug is back and both labels underline \
+             regardless of `&`"
+        );
+    }
+
     /// #700 item 6: indent guides must actually *paint* by default, not just
     /// leave `settings.indent_guides` set to `true` — the exact gap #587/#592
     /// (`ScreenLayout.picker`) burned ~5 sessions on: a state field flipped on
