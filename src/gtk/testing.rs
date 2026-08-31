@@ -3156,6 +3156,139 @@ mod command_center {
         );
     }
 
+    /// #710 item 1 / quadraui#637: the open Edit-menu dropdown ("Undo /
+    /// Redo / Cut / Copy / Paste / Find / Replace" + accelerators) must
+    /// paint in `settings.ui_font_size` — the menu bar's own font — not the
+    /// editor font. Before quadraui#637 landed,
+    /// `GtkBackend::draw_context_menu` handed the frame's shared Pango
+    /// layout straight to the rasteriser without swapping in `ui_font`
+    /// first (unlike `draw_menu_bar`, already fixed by quadraui#624/#705),
+    /// so the bar above the dropdown tracked `ui_font_size` while the
+    /// dropdown itself stayed pinned to whatever font a previous paint call
+    /// left on the layout. Mirrors the established pattern in
+    /// `breadcrumb_text_width_tracks_ui_font_size_not_editor_font_size` and
+    /// `tab_label_width_tracks_ui_font_size_not_editor_font_size` just
+    /// above: vary `ui_font_size` as the positive control (glyph extents
+    /// must move), then vary `settings.font_size` alone as a regression
+    /// guard (glyph extents must NOT move — vimcode's GTK runner paints the
+    /// editor at a hardcoded font regardless of that setting, so there is
+    /// no live paint path from it to chrome text; see that same doc
+    /// comment for the full rationale). Verified this fails (both "Undo"
+    /// bounds identical across `ui_font_size` 11 vs 28) with the pin rolled
+    /// back to the pre-#637 rev.
+    #[test]
+    fn edit_menu_dropdown_item_glyphs_track_ui_font_size_not_editor_font_size() {
+        fn open_edit_menu_and_find_undo(
+            mut engine: Engine,
+            ui_font_size: u8,
+            font_size: i32,
+        ) -> quadraui::Rect {
+            engine.settings.ui_font_size = ui_font_size;
+            engine.settings.font_size = font_size;
+            let mut h = harness(engine, 1400, 900);
+            h.driver.render();
+            let edit = h
+                .driver
+                .find_bounds("Edit")
+                .expect("the \"Edit\" top-level menu label must paint");
+            h.driver
+                .click(edit.x + edit.width / 2.0, edit.y + edit.height / 2.0);
+            h.driver.render();
+            h.driver
+                .find_bounds("Undo")
+                .expect("clicking \"Edit\" must open its dropdown with \"Undo\" painted")
+        }
+
+        let small = open_edit_menu_and_find_undo(engine_with_tab_history(), 8, 14);
+        let big = open_edit_menu_and_find_undo(engine_with_tab_history(), 28, 14);
+        assert!(
+            big.width > small.width * 1.5 && big.height > small.height * 1.5,
+            "dropdown item glyph extents must track settings.ui_font_size (8 \
+             vs 28 pt): got small={small:?} big={big:?} -- if these are \
+             close, draw_context_menu isn't honouring ui_font and the \
+             dropdown is stuck at the editor font"
+        );
+
+        let a = open_edit_menu_and_find_undo(engine_with_tab_history(), 11, 10);
+        let b = open_edit_menu_and_find_undo(engine_with_tab_history(), 11, 60);
+        assert!(
+            (a.width - b.width).abs() < 0.5 && (a.height - b.height).abs() < 0.5,
+            "dropdown item glyph extents must NOT track settings.font_size \
+             (10 vs 60) with ui_font_size held fixed: got a={a:?} b={b:?}"
+        );
+    }
+
+    /// #710 item 2: the title-bar/menu-row band and the Command Center
+    /// search-box pill inside it must be closer to VS Code's 35px title
+    /// bar / ~26px pill than the pre-#710 `with_title_bar(1.0)` (~18px
+    /// band / ~14px pill in this same headless harness -- one editor text
+    /// line, visibly squat). `build_shell_config`'s `with_title_bar`
+    /// multiplier is the only knob (quadraui's `AppShell` has no fixed-px
+    /// band reservation API yet -- see the #710 comment on that call site),
+    /// so the band is still an `lh` multiple; per this issue's acceptance
+    /// criteria that means the useful assertion is "the pill height matches
+    /// the intended target at the default size", pinned with a tolerance
+    /// band around the ~27px this measures in the headless harness at the
+    /// chosen 1.7 multiplier. The second assertion pins the residual this
+    /// doc note calls out: because the GTK runner paints the editor at a
+    /// hardcoded font regardless of `settings.font_size` (see the sibling
+    /// dropdown-font test's doc comment), the row height a single
+    /// `font_size` value produces here is already stable across
+    /// `font_size` even with the bug reinstated at 1.0 -- so it does NOT
+    /// alone distinguish fixed from unfixed and is kept only as the
+    /// "stable across two font_size values" half of the acceptance
+    /// criteria, not as the regression guard (that's the first assertion).
+    #[test]
+    fn title_bar_band_and_command_center_pill_hit_vs_code_parity_target() {
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.driver.render();
+        let band = h.title_bar_rect.get().height;
+        let layout = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("command center must have painted");
+        let pill = layout
+            .search_bounds
+            .expect("search box must have painted bounds")
+            .height
+            - 4.0;
+
+        assert!(
+            (25.0..=35.0).contains(&band),
+            "title-bar band height should land near VS Code's 35px title \
+             bar (pre-#710 with_title_bar(1.0) measured ~18px here, one \
+             editor text line): got {band}px"
+        );
+        assert!(
+            (22.0..=31.0).contains(&pill),
+            "command-centre pill height should land near VS Code's ~26px \
+             pill (pre-#710 measured ~14px here): got {pill}px"
+        );
+
+        // Stable across `settings.font_size` (see doc comment above for why
+        // this doesn't distinguish fixed from unfixed on its own).
+        let mut engine_small = engine_with_tab_history();
+        engine_small.settings.font_size = 10;
+        let mut h_small = harness(engine_small, 1400, 900);
+        h_small.driver.render();
+        let band_small = h_small.title_bar_rect.get().height;
+
+        let mut engine_big = engine_with_tab_history();
+        engine_big.settings.font_size = 40;
+        let mut h_big = harness(engine_big, 1400, 900);
+        h_big.driver.render();
+        let band_big = h_big.title_bar_rect.get().height;
+
+        assert!(
+            (band_small - band_big).abs() < 0.5,
+            "title-bar band height must be stable across settings.font_size \
+             (10 vs 40): got small={band_small} big={band_big}"
+        );
+    }
+
     #[test]
     fn command_center_click_routes_nav_and_opens_picker() {
         let mut h = harness(engine_with_tab_history(), 1400, 900);

@@ -10421,9 +10421,22 @@ fn build_shell_config(app: &App) -> quadraui::ShellConfig {
     // it since `run_with_shell` creates an undecorated-chrome-free window.
     // Always on: GTK's menu bar acts as its titlebar (matches pre-#540
     // behaviour), unlike TUI where it's optional.
+    //
+    // #710 item 2: `height_lh` is a line-height *multiple* of the editor's
+    // `current_line_height` (`AppShell::compute_layout`, quadraui
+    // `compose/app_shell.rs`) — there is no fixed-px reservation API yet, so
+    // this band is unavoidably coupled to editor font metrics until one
+    // exists (see the doc comment on `quadraui::ShellConfig::with_title_bar`
+    // and file a quadraui px-based-reservation issue if this residual needs
+    // closing — #710's PR should note whether that filing happened). 1.0
+    // measured ~18px in the headless GTK test harness — one editor text
+    // line, visibly squat next to VS Code's 35px title bar / ~26px command
+    // centre pill (`quadraui::gtk::command_center::draw_command_center`
+    // paints the pill at `band_height - 4`). 1.7 measures ~31px band / 27px
+    // pill here — much closer to parity without needing the fixed-px API.
     quadraui::ShellConfig::new("VimCode", top_panels)
         .with_bottom_items(bottom_items)
-        .with_title_bar(1.0)
+        .with_title_bar(1.7)
 }
 
 #[cfg(test)]
