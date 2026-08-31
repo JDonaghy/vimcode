@@ -406,6 +406,16 @@ pub(super) fn draw_frame(
     let editor_area = editor_col;
 
     // ── Render menu bar strip (if visible) ───────────────────────────────────
+    // #712: only *measure* the bar here (`menu_bar_layout`, no paint) and
+    // defer the command centre's own `draw_command_center` call until after
+    // the "Menu dropdown" block further down, which unconditionally
+    // repaints `draw_menu_bar` across the entire `bar_rect` band (so an
+    // open dropdown paints on top of everything) whether or not a dropdown
+    // is actually open — painting the command centre here, before that
+    // block runs, got it silently erased every frame. Mirrors the fix in
+    // the live `TuiShellApp::render_content` path (`shell_app.rs`'s
+    // `pending_command_center`) and GTK's identical #676 ordering fix.
+    let mut pending_command_center: Option<(quadraui::Rect, quadraui::CommandCenter)> = None;
     if screen.menu_bar_visible {
         let bar = engine.menu_system.borrow().menu_bar();
         let bar_rect = quadraui::Rect::new(
@@ -414,12 +424,14 @@ pub(super) fn draw_frame(
             menu_bar_area.width as f32,
             menu_bar_area.height as f32,
         );
-        let mb_layout = backend.draw_menu_bar(bar_rect, &bar);
+        let mb_layout = backend.menu_bar_layout(bar_rect, &bar);
 
+        // `vi.bounds.x` is already absolute — do not add `menu_bar_area.x`
+        // again (quadraui#494; harmless today only because it's always 0).
         let menu_end: u16 = mb_layout
             .visible_items
             .last()
-            .map(|vi| menu_bar_area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
+            .map(|vi| (vi.bounds.x + vi.bounds.width).round() as u16)
             .unwrap_or(menu_bar_area.x);
 
         let title = engine
@@ -447,11 +459,8 @@ pub(super) fn draw_frame(
             cc_area.width as f32,
             cc_area.height as f32,
         );
-        let cc_layout = backend.draw_command_center(cc_q_rect, &cc);
-        engine.command_center_layout.replace(Some(cc_layout));
+        pending_command_center = Some((cc_q_rect, cc));
         // Note: dropdown is rendered LAST (after all content) so it draws on top.
-    } else {
-        engine.command_center_layout.replace(None);
     }
 
     // ── Render activity bar ───────────────────────────────────────────────────
@@ -990,6 +999,14 @@ pub(super) fn draw_frame(
         );
         engine.menu_system.borrow().render(backend, bar_rect);
     }
+
+    // ── Command centre (#712) — painted after the dropdown block above, ───────
+    // which repaints `draw_menu_bar` across the entire `bar_rect` band and
+    // would erase anything drawn here first. See `pending_command_center`'s
+    // doc comment above for the full story.
+    engine.command_center_layout.replace(
+        pending_command_center.map(|(cc_rect, cc)| backend.draw_command_center(cc_rect, &cc)),
+    );
 
     // Toast overlay (#450) — drawn LAST so it sits on top of every other
     // surface. Bottom-right corner; transient (auto-dismissed after
