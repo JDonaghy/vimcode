@@ -551,6 +551,9 @@ pub(super) fn draw_frame(
         );
     }
     render_all_windows(backend, Some(frame), &screen.windows, theme);
+    // #35: minimap strip on the active window's right edge — one call, the
+    // braille rasteriser is quadraui's.
+    render::draw_minimap_strip(backend, screen);
     // Draw each group's tab bar. The tab bar sits `tui_tbh` rows above the
     // group's window content (`bounds.y - tui_tbh`, applied inside
     // `tab_bar_draw_targets`); with one group that resolves to row 0 of
@@ -3063,6 +3066,54 @@ mod tests {
         e.open_editor_group(crate::core::window::SplitDirection::Vertical);
         let lines = render_tui(&e, 80, 16);
         snap_settings().bind(|| insta::assert_snapshot!("split_panes", lines.join("\n")));
+    }
+
+    /// #35: the TUI minimap paints braille (`U+2800` block) dot cells — 2 dots
+    /// wide × 4 buffer lines tall per terminal cell. The fixture's
+    /// indentation shape is deliberately lopsided (a deeply-indented middle
+    /// band between flush top and bottom bands) so the snapshot pins the dot
+    /// grid's *orientation*: a transposed grid would paint the indent step at
+    /// the wrong end of the strip and this golden file would change.
+    #[test]
+    fn snapshot_minimap_braille() {
+        let text: String = (0..120)
+            .map(|i| {
+                let depth = if (40..80).contains(&i) { 3 } else { 0 };
+                format!("{}line {i}\n", "    ".repeat(depth))
+            })
+            .collect();
+        let e = test_engine(&text);
+        assert!(
+            e.settings.minimap,
+            "fixture must exercise the default-on minimap"
+        );
+        let lines = render_tui(&e, 100, 16);
+        assert!(
+            lines.iter().any(|l| l.chars().any(|c| ('\u{2800}'
+                ..='\u{28FF}')
+                .contains(&c)
+                && c != '\u{2800}')),
+            "the minimap must paint non-blank braille glyphs; got:\n{}",
+            lines.join("\n")
+        );
+        snap_settings().bind(|| insta::assert_snapshot!("minimap_braille", lines.join("\n")));
+    }
+
+    /// The `:set nominimap` half of the same picture — no braille anywhere,
+    /// and the editor text reaches further right.
+    #[test]
+    fn nominimap_paints_no_braille() {
+        let text: String = (0..120).map(|i| format!("line {i}\n")).collect();
+        let mut e = test_engine(&text);
+        e.settings.minimap = false;
+        let lines = render_tui(&e, 100, 16);
+        assert!(
+            !lines.iter().any(|l| l
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))),
+            "`:set nominimap` must paint no braille at all; got:\n{}",
+            lines.join("\n")
+        );
     }
 
     #[test]

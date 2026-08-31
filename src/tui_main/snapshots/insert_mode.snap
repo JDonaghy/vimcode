@@ -4,7 +4,7 @@ expression: "lines.join(\"\\n\")"
 ---
  󰍜   [No Name] ×                                   󰤲    ⋯
 ▎
-    hello world
+    hello world                                ⠉⠉⠉⠉⠉⠁⠈⠉⠉⠉⠉⠉
  
  
  
@@ -12,5 +12,5 @@ expression: "lines.join(\"\\n\")"
 
 
 
-     INSERT  [No Name]    󰘖 utf-8 LF Spaces: 4  Ln 1, Col 1
+     INSERT  [No Name]   Spaces: 4  Ln 1, Col 1
  

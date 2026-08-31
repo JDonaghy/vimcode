@@ -1469,6 +1469,9 @@ impl ShellApp for TuiShellApp {
         // longer needs the raw `Frame` that `frame: None` used to skip it
         // for).
         render_all_windows(backend, None, &screen.windows, &theme);
+        // #35: minimap strip on the active window's right edge — one call, the
+        // braille rasteriser is quadraui's.
+        render::draw_minimap_strip(backend, &screen);
 
         let tui_tbh: f64 = if self.engine.settings.breadcrumbs && !self.engine.terminal_maximized {
             2.0
@@ -7975,5 +7978,109 @@ mod tests {
                 "no Nerd Font glyph may paint with Nerd Fonts off; row:\n{row}"
             );
         }
+    }
+
+    // ── Minimap (#35) ───────────────────────────────────────────────────
+
+    /// Buffer with a lopsided indentation shape, long enough that the
+    /// minimap has to down-sample.
+    fn app_with_shaped_buffer() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        let text: String = (0..240)
+            .map(|i| {
+                let depth = if (80..160).contains(&i) { 3 } else { 0 };
+                format!("{}line {i}\n", "    ".repeat(depth))
+            })
+            .collect();
+        app.engine.buffer_mut().insert(0, &text);
+        app
+    }
+
+    /// Column of the leftmost braille cell on `row`, or `None` if that row
+    /// paints no braille. Locating the strip this way (rather than
+    /// hardcoding a column) keeps the "locate targets, never hardcode
+    /// coords" rule intact.
+    fn braille_col(screen: &str, row: usize) -> Option<usize> {
+        screen
+            .lines()
+            .nth(row)?
+            .chars()
+            .position(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+    }
+
+    /// #35: `render_content` must paint the minimap through the shell path,
+    /// as braille — not just populate `ScreenLayout.minimap`.
+    #[test]
+    fn render_content_paints_minimap_braille_via_shell_app() {
+        let driver = driver_with_shell(app_with_shaped_buffer(), config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            screen
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c)),
+            "the minimap must paint non-blank braille via the shell path; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// …and `:set nominimap` must take effect on the very next paint, with
+    /// no restart: no braille anywhere.
+    #[test]
+    fn render_content_paints_no_minimap_when_the_setting_is_off() {
+        let mut app = app_with_shaped_buffer();
+        app.engine.settings.minimap = false;
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            !screen
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "`minimap: false` must paint no braille at all; screen:\n{screen}"
+        );
+    }
+
+    /// Acceptance (#35): a click at the vertical middle of the strip scrolls
+    /// the editor to ~50% of the file — the TUI half of the cross-backend
+    /// claim, asserted on the painted line numbers rather than engine state.
+    #[test]
+    fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
+        let mut driver = driver_with_shell(app_with_shaped_buffer(), config(), 100, 24);
+
+        /// Lowest `line N` number visible on screen — the file's scroll
+        /// position, read back out of the paint.
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        let before = driver.screen();
+        assert_eq!(
+            top_line(&before),
+            Some(0),
+            "fixture must start at the top of the file; screen:\n{before}"
+        );
+
+        // Find the strip on a row it actually paints, then click its middle.
+        let mid_row = 12u16;
+        let x = braille_col(&before, mid_row as usize).unwrap_or_else(|| {
+            panic!("the minimap must paint braille on row {mid_row}; screen:\n{before}")
+        });
+        driver.click(x as f32 + 1.0, mid_row as f32);
+        driver.render();
+
+        let after = driver.screen();
+        let top = top_line(&after)
+            .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
+        let frac = top as f64 / 240.0;
+        assert!(
+            (0.3..0.7).contains(&frac),
+            "clicking the middle of the minimap must scroll to ~50% of the \
+             240-line file, landed on line {top} ({frac:.3}); screen:\n{after}"
+        );
     }
 }

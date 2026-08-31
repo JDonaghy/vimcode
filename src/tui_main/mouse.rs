@@ -2601,6 +2601,21 @@ pub(super) fn handle_mouse(
         return sidebar_width; // separator column
     }
 
+    // ── Minimap click / drag (#35) ──────────────────────────────────────────
+    // Pure rect plumbing: hand the click's cell coordinates to the shared
+    // resolver, which owns the hit-test and the scroll. Drag keeps seeking
+    // while the button is held, matching the GTK side.
+    if matches!(
+        ev.kind,
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+    ) {
+        if let Some(layout) = last_layout {
+            if render::apply_minimap_click(engine, layout, col as f64, row as f64).is_some() {
+                return sidebar_width;
+            }
+        }
+    }
+
     // The menu bar (if visible) occupies absolute row 0, pushing the tab bar
     // and editor content down by `menu_rows` (computed once, near the top of
     // this function).

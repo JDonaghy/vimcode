@@ -4336,6 +4336,289 @@ pub struct ScreenLayout {
     /// active tabs. Independent of `editor_group_split` — window splits exist
     /// regardless of how many editor groups are open (#582).
     pub window_dividers: Vec<WindowDivider>,
+    /// Code-overview minimap for the active editor window, or `None` when the
+    /// `minimap` setting is off / the window is too narrow to spare the strip
+    /// (#35). Backends paint it with a single `draw_minimap` call and route
+    /// clicks through `MinimapLayout::hit_test`; every piece of sampling,
+    /// scale arithmetic, colour aggregation and dot packing lives in quadraui.
+    pub minimap: Option<RenderedMinimap>,
+}
+
+// ─── Minimap (#35) ────────────────────────────────────────────────────────────
+
+/// Character-cell columns the minimap strip reserves on the right edge of the
+/// active editor window. In GTK this is multiplied by `char_width` to get
+/// pixels; in TUI `char_width` is `1.0`, so it *is* the cell count.
+pub const MINIMAP_COLS: usize = 12;
+
+/// Text columns that must survive after reserving the strip. Below this the
+/// minimap suppresses itself rather than squeezing the editor into a sliver.
+const MINIMAP_MIN_TEXT_COLS: f64 = 30.0;
+
+/// Buffer lines sampled per *display* row of minimap height.
+///
+/// This is quadraui's TUI braille factor — the denser of the two backends —
+/// and it is deliberately used for both. Per quadraui's own `minimap_app`
+/// example, the app "samples generously at the denser factor" and lets each
+/// rasteriser group/tile the result via `Minimap::layout`, so vimcode never
+/// has to know which backend is about to paint. For GTK (which paints one
+/// buffer line per row) it also lands the row pitch at `line_height / 4`,
+/// i.e. the ~2–6 px band #35 asks for.
+const MINIMAP_LINES_PER_ROW: usize = 4;
+
+/// Buffer columns folded into one aggregated colour cell — quadraui's TUI
+/// braille cell width, used for both backends for the same reason as
+/// [`MINIMAP_LINES_PER_ROW`].
+const MINIMAP_COLS_PER_CELL: usize = 2;
+
+/// Column ceiling for colour aggregation. Syntax past this column does not
+/// influence any painted cell, so aggregating it would be wasted work.
+const MINIMAP_SPAN_COLS: usize = 200;
+
+/// The active window's minimap: a quadraui `Minimap` primitive plus the strip
+/// it occupies. Both backends consume this verbatim — `rect` goes straight to
+/// `draw_minimap`, and the returned `MinimapLayout` answers clicks.
+#[derive(Debug, Clone)]
+pub struct RenderedMinimap {
+    /// The editor window this strip belongs to.
+    pub window_id: WindowId,
+    /// The strip, in the caller's units (pixels for GTK, cells for TUI).
+    pub rect: WindowRect,
+    /// The quadraui descriptor. Already sampled and colour-aggregated.
+    pub minimap: quadraui::Minimap,
+}
+
+/// Width the minimap reserves alongside the editor, in the caller's units.
+///
+/// Delegates the on/off decision to `quadraui::reserved_width` so both
+/// backends (and `build_screen_layout`, which shrinks the window rect by
+/// exactly this much) reclaim identical geometry when `:set nominimap`
+/// turns the strip off.
+pub fn minimap_reserved_width(engine: &Engine, rect_width: f64, char_width: f64) -> f64 {
+    let cw = if char_width > 0.0 { char_width } else { 1.0 };
+    let want = MINIMAP_COLS as f64 * cw;
+    let has = engine.settings.minimap && rect_width >= want + MINIMAP_MIN_TEXT_COLS * cw;
+    quadraui::reserved_width(want as f32, has) as f64
+}
+
+/// Build the quadraui `Minimap` for `window_id` over the strip `rect`.
+///
+/// Returns `None` when the setting is off (the caller passes a zero-width
+/// strip in that case), when the strip cannot hold a single row, or when the
+/// window/buffer has gone away. All sampling (`sample_lines`) and colour
+/// reduction (`aggregate_spans`) is quadraui's — this function only maps
+/// vimcode's tree-sitter byte-offset highlights into quadraui's
+/// `SyntaxSpan` input type.
+pub fn build_minimap_data(
+    engine: &Engine,
+    theme: &Theme,
+    window_id: WindowId,
+    rect: WindowRect,
+    line_height: f64,
+) -> Option<RenderedMinimap> {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+    let lh = if line_height > 0.0 { line_height } else { 1.0 };
+    let display_rows = (rect.height / lh).floor() as usize;
+    if display_rows == 0 {
+        return None;
+    }
+    let target_lines = display_rows.saturating_mul(MINIMAP_LINES_PER_ROW).max(1);
+
+    let window = engine.windows.get(&window_id)?;
+    let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
+    let rope = &buffer_state.buffer.content;
+    let total_buffer_lines = rope.len_lines();
+    if total_buffer_lines == 0 {
+        return None;
+    }
+
+    // Whole-file text, trimmed of line endings — `sample_lines` picks the
+    // stride, we only supply the candidates.
+    let owned: Vec<String> = (0..total_buffer_lines)
+        .map(|i| {
+            rope.line(i)
+                .as_str()
+                .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
+                .unwrap_or_else(|| {
+                    rope.line(i)
+                        .to_string()
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string()
+                })
+        })
+        .collect();
+    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let lines = quadraui::sample_lines(&borrowed, target_lines);
+    if lines.is_empty() {
+        return None;
+    }
+
+    // Map tree-sitter highlights (whole-buffer byte offsets) onto the sampled
+    // rows. `SyntaxSpan::line_idx` is an index into `lines`, not a buffer line
+    // number, so build a buffer-line → sampled-index lookup first.
+    let mut sampled_at: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        sampled_at.entry(l.line_idx).or_insert(i);
+    }
+    let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
+    for (start, end, scope) in &buffer_state.highlights {
+        if end <= start || *start >= rope.len_bytes() {
+            continue;
+        }
+        let buf_line = rope.byte_to_line(*start);
+        let Some(&idx) = sampled_at.get(&buf_line) else {
+            continue;
+        };
+        let line_start = rope.line_to_byte(buf_line);
+        let line_str = &owned[buf_line];
+        // quadraui's rasterisers treat span columns as *character* columns
+        // (GTK converts them back to byte offsets for Pango attributes), so
+        // convert here rather than handing over raw byte deltas.
+        let to_col = |b: usize| -> usize {
+            let b = b.min(line_str.len());
+            line_str.get(..b).map(|p| p.chars().count()).unwrap_or(b)
+        };
+        let start_col = to_col(start.saturating_sub(line_start));
+        let end_col = to_col(end.saturating_sub(line_start));
+        if end_col <= start_col {
+            continue;
+        }
+        let c = theme.scope_color(scope);
+        raw_spans.push(quadraui::SyntaxSpan {
+            line_idx: idx,
+            start_col,
+            end_col,
+            color: quadraui::Color::rgb(c.r, c.g, c.b),
+        });
+    }
+
+    let grid = quadraui::MinimapGrid {
+        rows: lines.len().div_ceil(MINIMAP_LINES_PER_ROW).max(1),
+        cols: MINIMAP_SPAN_COLS,
+        lines_per_row: MINIMAP_LINES_PER_ROW,
+        cols_per_cell: MINIMAP_COLS_PER_CELL,
+    };
+    let syntax_spans = quadraui::aggregate_spans(&raw_spans, grid);
+
+    // Where the editor's viewport lands inside `lines`.
+    let scroll_top = window.view.scroll_top.min(total_buffer_lines);
+    let viewport_end = scroll_top.saturating_add(display_rows.max(1));
+    let visible_row_start = lines
+        .iter()
+        .position(|l| l.line_idx >= scroll_top)
+        .unwrap_or(lines.len().saturating_sub(1));
+    let visible_row_end = lines
+        .iter()
+        .position(|l| l.line_idx >= viewport_end)
+        .unwrap_or(lines.len());
+
+    Some(RenderedMinimap {
+        window_id,
+        rect,
+        minimap: quadraui::Minimap {
+            id: quadraui::WidgetId::new(format!("minimap:{}", window_id.0)),
+            lines,
+            syntax_spans,
+            visible_row_start,
+            visible_row_count: visible_row_end
+                .saturating_sub(visible_row_start)
+                .max(1),
+            total_buffer_lines,
+        },
+    })
+}
+
+/// Paint `screen.minimap` (if any) through the backend's own rasteriser and
+/// return the resolved layout for click routing.
+///
+/// This is the *entire* backend-side contract for the minimap: GTK's font
+/// scaling and TUI's braille packing are quadraui's implementations of
+/// `Backend::draw_minimap`, so each backend's wiring is a single call to this
+/// function. Nothing about sampling, scaling, dot packing or colour
+/// aggregation exists on either side of it in vimcode.
+pub fn draw_minimap_strip(
+    backend: &mut dyn quadraui::Backend,
+    screen: &ScreenLayout,
+) -> Option<quadraui::MinimapLayout> {
+    let mm = screen.minimap.as_ref()?;
+    Some(
+        backend
+            .draw_minimap(minimap_strip_rect(mm), &mm.minimap)
+            .layout,
+    )
+}
+
+/// The strip a `RenderedMinimap` occupies, in quadraui coordinates.
+/// Shared by the paint path and the click path so the two cannot drift.
+pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
+    quadraui::Rect::new(
+        mm.rect.x as f32,
+        mm.rect.y as f32,
+        mm.rect.width as f32,
+        mm.rect.height as f32,
+    )
+}
+
+/// Resolve a click/drag at `(x, y)` (backend units, same space as
+/// [`minimap_strip_rect`]) against the minimap track, returning the buffer
+/// line to scroll to. `None` when there is no minimap or the point misses it.
+///
+/// Needs no backend instance: `MinimapLayout::hit_test` resolves purely from
+/// `bounds`, which is the same strip rect both rasterisers were handed —
+/// `lines_per_row` only shapes the *painted* rows, never the hit fraction. So
+/// "click the vertical middle → ~50% of the file" is one behaviour computed
+/// once, not two implementations that can drift.
+pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<usize> {
+    let mm = screen.minimap.as_ref()?;
+    let layout = mm
+        .minimap
+        .layout(minimap_strip_rect(mm), MINIMAP_LINES_PER_ROW);
+    match layout.hit_test(x as f32, y as f32) {
+        quadraui::MinimapHit::Seek { fraction } => Some(minimap_fraction_to_line(
+            fraction,
+            mm.minimap.total_buffer_lines,
+        )),
+        quadraui::MinimapHit::None => None,
+    }
+}
+
+/// Apply a minimap click/drag: scroll the strip's window to the clicked
+/// fraction of the file and carry the cursor with it, so the next
+/// `ensure_cursor_visible` doesn't snap the view straight back.
+///
+/// Returns the buffer line scrolled to, or `None` when the point missed the
+/// strip (in which case the caller must fall through to its normal editor
+/// click handling).
+pub fn apply_minimap_click(
+    engine: &mut Engine,
+    screen: &ScreenLayout,
+    x: f64,
+    y: f64,
+) -> Option<usize> {
+    let line = minimap_click_line(screen, x, y)?;
+    let window_id = screen.minimap.as_ref()?.window_id;
+    engine.set_scroll_top_for_window(window_id, line);
+    if let Some(w) = engine.windows.get_mut(&window_id) {
+        w.view.cursor.line = line;
+        w.view.cursor.col = 0;
+    }
+    Some(line)
+}
+
+/// Buffer line a minimap click at `fraction` of the track should scroll to.
+///
+/// `fraction` comes from `quadraui::MinimapLayout::hit_test`; both backends
+/// funnel through here so a click at the vertical middle of the strip lands on
+/// the same line in GTK and TUI.
+pub fn minimap_fraction_to_line(fraction: f32, total_buffer_lines: usize) -> usize {
+    if total_buffer_lines == 0 {
+        return 0;
+    }
+    let f = fraction.clamp(0.0, 1.0) as f64;
+    ((f * total_buffer_lines as f64) as usize).min(total_buffer_lines - 1)
 }
 
 /// Context menu data for TUI rendering.
@@ -6481,6 +6764,15 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // check below, since `:split`/`:vsplit` panes exist within a single group.
     let window_dividers = engine.calculate_window_dividers(window_rects);
 
+    // Minimap strip (#35). Reserved off the *active* window's right edge, and
+    // subtracted from that window's rect before the text is laid out so the
+    // editor reclaims the exact same width when `:set nominimap` turns it off.
+    let minimap_w = window_rects
+        .iter()
+        .find(|(id, _)| *id == active_window_id)
+        .map(|(_, r)| minimap_reserved_width(engine, r.width, char_width))
+        .unwrap_or(0.0);
+
     let windows = window_rects
         .iter()
         .map(|(window_id, rect)| {
@@ -6489,6 +6781,17 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 visible_lines -= 1; // reserve bottom row for per-window status bar
             }
             let is_active = *window_id == active_window_id;
+            let narrowed = WindowRect::new(
+                rect.x,
+                rect.y,
+                if is_active {
+                    (rect.width - minimap_w).max(0.0)
+                } else {
+                    rect.width
+                },
+                rect.height,
+            );
+            let rect = &narrowed;
             let mut rw = build_rendered_window(
                 engine,
                 theme,
@@ -6512,6 +6815,35 @@ pub fn build_screen_layout_with_breadcrumb_row(
             rw
         })
         .collect();
+
+    // The strip itself: the sliver just reclaimed above, minus the per-window
+    // status row when one is painted inside the window.
+    let minimap = if minimap_w > 0.0 {
+        window_rects
+            .iter()
+            .find(|(id, _)| *id == active_window_id)
+            .and_then(|(id, r)| {
+                let status_h = if per_window_status && !separate_status && r.height > line_height {
+                    line_height
+                } else {
+                    0.0
+                };
+                build_minimap_data(
+                    engine,
+                    theme,
+                    *id,
+                    WindowRect::new(
+                        r.x + r.width - minimap_w,
+                        r.y,
+                        minimap_w,
+                        (r.height - status_h).max(0.0),
+                    ),
+                    line_height,
+                )
+            })
+    } else {
+        None
+    };
 
     let separated_status_line = if separate_status {
         Some(build_window_status_line(
@@ -7198,6 +7530,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
         group_tab_bars,
         group_dividers,
         window_dividers,
+        minimap,
         ext_sidebar,
         ai_panel,
         ext_panel: build_ext_panel_data(engine),
@@ -13440,6 +13773,10 @@ pub enum ClickTarget {
     StatusBarAction(StatusAction),
     /// Click was on the editor action menu button.
     ActionMenuButton(GroupId),
+    /// Click was on the code-overview minimap — the window has *already* been
+    /// scrolled to the clicked fraction of the file (#35), like `Gutter`'s
+    /// "fold already toggled". Carries the buffer line seeked to.
+    Minimap(WindowId, usize),
     /// Click was outside any actionable area.
     None,
 }
@@ -15947,6 +16284,169 @@ mod tests {
             e.buffer_mut().insert(0, text);
         }
         e
+    }
+
+    // ─── Minimap (#35) ───────────────────────────────────────────────────
+
+    /// A file with a distinctive indentation shape — deep on the inside,
+    /// flush at the edges — so a transposed dot grid would be obvious.
+    fn minimap_engine() -> Engine {
+        let mut text = String::new();
+        for i in 0..200 {
+            let depth = if (40..160).contains(&i) { 3 } else { 0 };
+            text.push_str(&"    ".repeat(depth));
+            text.push_str(&format!("line {i} content\n"));
+        }
+        test_engine(&text)
+    }
+
+    /// Acceptance: `:set nominimap` must widen the editor text area by
+    /// *exactly* the reserved width, and `:set minimap` must give it back.
+    /// Asserted on the rendered `text_viewport_cols`, not on the setting.
+    #[test]
+    fn nominimap_widens_the_editor_by_exactly_the_reserved_width() {
+        let mut e = minimap_engine();
+
+        e.settings.minimap = true;
+        let with = render_engine(&e, 120.0, 30.0);
+        let cols_with = with.windows[0].text_viewport_cols;
+        assert!(
+            with.minimap.is_some(),
+            "the minimap must be present when the setting is on"
+        );
+
+        e.settings.minimap = false;
+        let without = render_engine(&e, 120.0, 30.0);
+        let cols_without = without.windows[0].text_viewport_cols;
+        assert!(
+            without.minimap.is_none(),
+            "`:set nominimap` must remove the minimap from the layout"
+        );
+
+        assert_eq!(
+            cols_without - cols_with,
+            MINIMAP_COLS,
+            "turning the minimap off must hand the editor back exactly \
+             MINIMAP_COLS columns (with={cols_with}, without={cols_without})"
+        );
+    }
+
+    /// `reserved_width` is the single source of truth for that reclaim —
+    /// both backends and `build_screen_layout` route through it.
+    #[test]
+    fn minimap_reserved_width_is_zero_when_the_setting_is_off() {
+        let mut e = minimap_engine();
+        e.settings.minimap = true;
+        assert_eq!(minimap_reserved_width(&e, 120.0, 1.0), MINIMAP_COLS as f64);
+        // GTK units: the same call in pixels.
+        assert_eq!(
+            minimap_reserved_width(&e, 1200.0, 8.0),
+            MINIMAP_COLS as f64 * 8.0
+        );
+        e.settings.minimap = false;
+        assert_eq!(minimap_reserved_width(&e, 120.0, 1.0), 0.0);
+        assert_eq!(minimap_reserved_width(&e, 1200.0, 8.0), 0.0);
+    }
+
+    /// A window too narrow to spare the strip suppresses the minimap rather
+    /// than squeezing the text into a sliver.
+    #[test]
+    fn minimap_suppresses_itself_in_a_narrow_window() {
+        let e = minimap_engine();
+        assert_eq!(
+            minimap_reserved_width(&e, 20.0, 1.0),
+            0.0,
+            "a 20-column window cannot spare a 12-column strip"
+        );
+    }
+
+    /// Acceptance: clicking the vertical middle of the strip seeks to ~50%
+    /// of the file. Backend-independent — both backends call exactly this.
+    #[test]
+    fn minimap_click_at_the_middle_seeks_to_half_the_file() {
+        let mut e = minimap_engine();
+        let screen = render_engine(&e, 120.0, 30.0);
+        let mm = screen.minimap.as_ref().expect("minimap present");
+        let total = mm.minimap.total_buffer_lines as f64;
+
+        let mid_x = mm.rect.x + mm.rect.width / 2.0;
+        let mid_y = mm.rect.y + mm.rect.height / 2.0;
+        let line = minimap_click_line(&screen, mid_x, mid_y).expect("middle of the strip must hit");
+        let frac = line as f64 / total;
+        assert!(
+            (frac - 0.5).abs() < 0.1,
+            "a click at the vertical middle must land near 50% of the file, got \
+             line {line} of {total} ({frac:.3})"
+        );
+
+        // …and it actually scrolls the window there.
+        let scrolled =
+            apply_minimap_click(&mut e, &screen, mid_x, mid_y).expect("click must be handled");
+        assert_eq!(scrolled, line);
+        assert_eq!(e.scroll_top(), line, "the window must be scrolled to it");
+    }
+
+    /// Top and bottom of the track bracket the file; a point outside the
+    /// strip must miss so the caller falls through to normal editor clicks.
+    #[test]
+    fn minimap_click_top_bottom_and_miss() {
+        let e = minimap_engine();
+        let screen = render_engine(&e, 120.0, 30.0);
+        let mm = screen.minimap.as_ref().expect("minimap present");
+        let total = mm.minimap.total_buffer_lines;
+        let x = mm.rect.x + 1.0;
+
+        assert_eq!(minimap_click_line(&screen, x, mm.rect.y), Some(0));
+        let bottom = minimap_click_line(&screen, x, mm.rect.y + mm.rect.height - 0.5)
+            .expect("bottom of the track must hit");
+        assert!(
+            bottom >= total - total / 10,
+            "the bottom of the track must land in the last tenth of the file, \
+             got {bottom} of {total}"
+        );
+
+        // One cell to the left of the strip is editor text, not the minimap.
+        assert_eq!(
+            minimap_click_line(&screen, mm.rect.x - 1.0, mm.rect.y + 5.0),
+            None,
+            "a point outside the strip must not be treated as a minimap click"
+        );
+    }
+
+    /// With the setting off there is nothing to click — the editor keeps the
+    /// full width and clicks in that column resolve as normal text clicks.
+    #[test]
+    fn minimap_click_is_a_no_op_when_the_setting_is_off() {
+        let mut e = minimap_engine();
+        e.settings.minimap = false;
+        let screen = render_engine(&e, 120.0, 30.0);
+        assert_eq!(minimap_click_line(&screen, 115.0, 15.0), None);
+        assert_eq!(apply_minimap_click(&mut e, &screen, 115.0, 15.0), None);
+    }
+
+    /// The sampled lines and aggregated spans are quadraui's output, keyed
+    /// back to real buffer lines — a transposed or empty sample would show up
+    /// here before it reaches a snapshot.
+    #[test]
+    fn minimap_samples_the_whole_buffer_in_order() {
+        let e = minimap_engine();
+        let screen = render_engine(&e, 120.0, 30.0);
+        let mm = &screen.minimap.as_ref().expect("minimap present").minimap;
+        assert_eq!(mm.total_buffer_lines, 201, "200 lines plus the trailing one");
+        assert!(!mm.lines.is_empty());
+        assert!(
+            mm.lines.windows(2).all(|w| w[0].line_idx < w[1].line_idx),
+            "sampled buffer line indices must be strictly increasing"
+        );
+        assert_eq!(mm.lines[0].line_idx, 0, "sampling starts at the first line");
+        // The indented middle of the file must survive sampling as indented
+        // text — this is the shape the TUI braille snapshot pins.
+        assert!(
+            mm.lines
+                .iter()
+                .any(|l| l.line_idx >= 40 && l.line_idx < 160 && l.text.starts_with("            ")),
+            "the deeply-indented middle band must appear in the sample"
+        );
     }
 
     #[test]
