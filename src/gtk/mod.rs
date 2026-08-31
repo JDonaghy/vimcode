@@ -8458,6 +8458,10 @@ impl quadraui::ShellApp for App {
             frame.draw(backend);
         }
 
+        // #35: minimap strip on the active window's right edge — one call, the
+        // font-scaling rasteriser is quadraui's.
+        render::draw_minimap_strip(backend, screen);
+
         // ── Recover a FrameHitMap for Editor/TabBar zone detection (#449) ──────
         // Pure `.push()` accumulation into a *separate* `ScreenLayout`, built
         // from the same `Editor` objects just painted above (`window_editors`,

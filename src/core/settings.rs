@@ -296,6 +296,10 @@ pub struct Settings {
     #[serde(default = "default_indent_guides")]
     pub indent_guides: bool,
 
+    /// Show the code-overview minimap on the right edge of each editor pane.
+    #[serde(default = "default_minimap")]
+    pub minimap: bool,
+
     /// Highlight matching brackets when cursor is on one.
     #[serde(default = "default_match_brackets")]
     pub match_brackets: bool,
@@ -337,6 +341,10 @@ fn default_syntax_max_lines() -> usize {
 }
 
 fn default_indent_guides() -> bool {
+    true
+}
+
+fn default_minimap() -> bool {
     true
 }
 
@@ -786,6 +794,7 @@ impl Default for Settings {
             hide_single_tab: false,
             autohide_panels: false,
             indent_guides: default_indent_guides(),
+            minimap: default_minimap(),
             match_brackets: default_match_brackets(),
             auto_pairs: default_auto_pairs(),
             hover_delay: default_hover_delay(),
@@ -1080,6 +1089,7 @@ impl Settings {
             "hidesingletab" | "hst" => self.hide_single_tab = enable,
             "autohidepanels" => self.autohide_panels = enable,
             "indentguides" => self.indent_guides = enable,
+            "minimap" => self.minimap = enable,
             "matchbrackets" => self.match_brackets = enable,
             "autopairs" => self.auto_pairs = enable,
             "nerdfonts" | "nf" => {
@@ -1344,6 +1354,11 @@ impl Settings {
             } else {
                 "noindentguides".to_string()
             }),
+            "minimap" => Ok(if self.minimap {
+                "minimap".to_string()
+            } else {
+                "nominimap".to_string()
+            }),
             "matchbrackets" => Ok(if self.match_brackets {
                 "matchbrackets".to_string()
             } else {
@@ -1473,6 +1488,7 @@ impl Settings {
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab.to_string(),
             "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
             "indent_guides" | "indentguides" => self.indent_guides.to_string(),
+            "minimap" => self.minimap.to_string(),
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
             "hover_delay" => self.hover_delay.to_string(),
@@ -1587,6 +1603,7 @@ impl Settings {
             "hide_single_tab" | "hidesingletab" | "hst" => self.hide_single_tab = value == "true",
             "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
             "indent_guides" | "indentguides" => self.indent_guides = value == "true",
+            "minimap" => self.minimap = value == "true",
             "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
             "auto_pairs" | "autopairs" => self.auto_pairs = value == "true",
             "hover_delay" => {
@@ -2042,6 +2059,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Bool,
     },
     SettingDef {
+        key: "minimap",
+        label: "Minimap",
+        description: "Show the code-overview minimap on the right edge of each editor pane",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "match_brackets",
         label: "Match Brackets",
         description: "Highlight matching bracket when cursor is on a bracket character",
@@ -2125,6 +2149,77 @@ mod tests {
         assert!(
             settings.indent_guides,
             "indent guides must default on, matching VS Code"
+        );
+    }
+
+    // ── `minimap` option (#35) ───────────────────────────────────────────
+    // The option is plumbed through eight separate sites; miss one and it
+    // works from `:set` but not the settings UI (or vice versa). One test
+    // per site so a regression names the site it broke.
+
+    #[test]
+    fn minimap_defaults_on() {
+        assert!(
+            Settings::default().minimap,
+            "minimap must default on, matching VS Code"
+        );
+    }
+
+    #[test]
+    fn set_minimap_and_nominimap_both_parse() {
+        let mut s = Settings::default();
+        s.parse_set_option("nominimap").expect("nominimap");
+        assert!(!s.minimap, "`:set nominimap` must turn the minimap off");
+        s.parse_set_option("minimap").expect("minimap");
+        assert!(s.minimap, "`:set minimap` must turn it back on");
+    }
+
+    #[test]
+    fn set_minimap_query_form_reports_both_states() {
+        let mut s = Settings::default();
+        assert_eq!(s.parse_set_option("minimap?").unwrap(), "minimap");
+        s.minimap = false;
+        assert_eq!(s.parse_set_option("minimap?").unwrap(), "nominimap");
+    }
+
+    #[test]
+    fn minimap_round_trips_through_get_set_by_key() {
+        // The settings UI reads/writes by key string, not by field.
+        let mut s = Settings::default();
+        assert_eq!(s.get_value_str("minimap"), "true");
+        s.set_value_str("minimap", "false").expect("set");
+        assert!(!s.minimap);
+        assert_eq!(s.get_value_str("minimap"), "false");
+        s.set_value_str("minimap", "true").expect("set");
+        assert!(s.minimap);
+    }
+
+    #[test]
+    fn minimap_appears_in_the_settings_registry() {
+        let def = SETTING_DEFS
+            .iter()
+            .find(|d| d.key == "minimap")
+            .expect("`minimap` must appear in SETTING_DEFS so the settings UI lists it");
+        assert_eq!(def.category, "Editor");
+        assert!(matches!(def.setting_type, SettingType::Bool));
+        assert!(!def.label.is_empty());
+        assert!(!def.description.is_empty());
+    }
+
+    #[test]
+    fn minimap_round_trips_through_the_settings_file() {
+        let mut s = Settings::default();
+        s.minimap = false;
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert!(!back.minimap, "`minimap: false` must survive a save/load");
+
+        // …and an older settings file with no `minimap` key at all must come
+        // back with the default (on), not `false` from `bool::default()`.
+        let legacy: Settings = serde_json::from_str("{}").expect("deserialize legacy");
+        assert!(
+            legacy.minimap,
+            "a settings file predating #35 must default the minimap on"
         );
     }
 

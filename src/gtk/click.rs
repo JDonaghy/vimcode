@@ -91,6 +91,18 @@ pub(super) fn pixel_to_click_target(
         }
     }
 
+    // ── Minimap click / drag (#35) ──────────────────────────────────────────
+    // Pure rect plumbing: the shared resolver owns the hit-test and the scroll.
+    // Checked before the zone walk because the strip was carved out of the
+    // active window's rect, so a `ScreenZone::Window` hit would otherwise
+    // swallow it. Gated on `mutate_focus` so a hover query never scrolls.
+    if mutate_focus {
+        if let Some(line) = render_mod::apply_minimap_click(engine, cached_layout, x, y) {
+            let window_id = engine.active_window_id();
+            return ClickTarget::Minimap(window_id, line);
+        }
+    }
+
     let tab_bar_height = render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
     let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
 

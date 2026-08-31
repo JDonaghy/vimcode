@@ -3756,3 +3756,156 @@ mod vscode_dimming {
         );
     }
 }
+
+#[cfg(test)]
+mod minimap {
+    use super::*;
+
+    // ── Minimap (#35) ───────────────────────────────────────────────────
+
+    /// A buffer with a distinctive indentation shape and enough lines that
+    /// the minimap has something to down-sample.
+    fn engine_with_shaped_buffer() -> Engine {
+        let mut engine = Engine::new();
+        let text: String = (0..400)
+            .map(|i| {
+                let depth = if (100..300).contains(&i) { 3 } else { 0 };
+                format!("{}fn item_{i}() {{ let x = {i}; }}\n", "    ".repeat(depth))
+            })
+            .collect();
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    /// Acceptance (#35): the minimap column is painted, and the width it
+    /// takes is exactly what `quadraui::reserved_width` reserves — the
+    /// editor pane gives up precisely that many pixels and gets them all
+    /// back with `:set nominimap`.
+    ///
+    /// RED-first: reverting `build_screen_layout`'s rect narrowing makes the
+    /// `on_w + strip.width == off_w` assertion fail, and dropping the
+    /// `draw_minimap_strip` call in `render_content` collapses `painted` to
+    /// 0 — both confirmed by hand before restoring the fix.
+    #[test]
+    fn minimap_paints_a_strip_whose_width_matches_reserved_width() {
+        let mut h_on = harness(engine_with_shaped_buffer(), 1400, 900);
+        let win_on = h_on.engine.borrow().active_window_id();
+        assert!(
+            h_on.engine.borrow().settings.minimap,
+            "test setup sanity: the minimap must default on, or this test \
+             isn't exercising the default at all"
+        );
+        h_on.window_center(win_on)
+            .expect("editor pane must paint with the default settings");
+
+        let (strip, on_w, on_cols) = {
+            let layout = h_on.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let mm = l
+                .minimap
+                .as_ref()
+                .expect("the layout must carry a minimap when the setting is on");
+            let rw = l.windows.iter().find(|w| w.window_id == win_on).unwrap();
+            (mm.rect, rw.rect.width, rw.text_viewport_cols)
+        };
+
+        // The editor must get every one of those pixels back when it's off.
+        let mut engine_off = engine_with_shaped_buffer();
+        engine_off.settings.minimap = false;
+        let h_off = harness(engine_off, 1400, 900);
+        let win_off = h_off.engine.borrow().active_window_id();
+        h_off
+            .window_center(win_off)
+            .expect("editor pane must paint with the minimap disabled");
+        let (off_w, off_cols) = {
+            let layout = h_off.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            assert!(
+                l.minimap.is_none(),
+                "`minimap: false` must remove the minimap from the layout"
+            );
+            let rw = l.windows.iter().find(|w| w.window_id == win_off).unwrap();
+            (rw.rect.width, rw.text_viewport_cols)
+        };
+
+        // `reserved_width` is defined in character cells; assert the strip in
+        // that unit too, without this test having to re-derive GTK's
+        // char_width (which is not the same number the harness reports).
+        assert_eq!(
+            off_cols - on_cols,
+            crate::render::MINIMAP_COLS,
+            "the editor must regain exactly MINIMAP_COLS text columns when \
+             the minimap is off (on={on_cols}, off={off_cols})"
+        );
+        assert_eq!(
+            on_w + strip.width,
+            off_w,
+            "the editor must reclaim exactly the reserved width when the \
+             minimap is off (on={on_w} + strip={} vs off={off_w})",
+            strip.width
+        );
+
+        // …and something actually painted in that column band. Probe a grid
+        // of points inside the strip and require the frame not to be a
+        // uniform block of background there.
+        let lh = h_on
+            .painted_line_height()
+            .expect("frame must publish the line height it painted with");
+        let x0 = (strip.x + 2.0) as i32;
+        let x1 = (strip.x + strip.width - 2.0) as i32;
+        let y0 = (strip.y + lh) as i32;
+        let y1 = (strip.y + strip.height - lh) as i32;
+        let mut seen = std::collections::HashSet::new();
+        for y in (y0..y1).step_by(3) {
+            for x in x0..x1 {
+                seen.insert(h_on.driver.pixel(x, y));
+            }
+        }
+        assert!(
+            seen.len() > 1,
+            "the minimap column must paint content, not a uniform block: \
+             sampled x in {x0}..{x1}, y in {y0}..{y1} and found only \
+             {:?}",
+            seen
+        );
+    }
+
+    /// Acceptance (#35): a click at the vertical middle of the strip scrolls
+    /// the pane to ~50% of the file — the GTK half of the cross-backend
+    /// claim, driven through the real `pixel_to_click_target` path.
+    #[test]
+    fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
+        let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+
+        let (strip, total) = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .as_ref()
+                .expect("minimap must be present");
+            (mm.rect, mm.minimap.total_buffer_lines)
+        };
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        h.driver.click(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height / 2.0) as f32,
+        );
+
+        let scroll_top = h.engine.borrow().scroll_top();
+        let frac = scroll_top as f64 / total as f64;
+        assert!(
+            (frac - 0.5).abs() < 0.1,
+            "clicking the middle of the minimap must scroll to ~50% of the \
+             file, got scroll_top={scroll_top} of {total} ({frac:.3})"
+        );
+    }
+}
