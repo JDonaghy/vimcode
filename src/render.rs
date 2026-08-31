@@ -4523,9 +4523,7 @@ pub fn build_minimap_data(
             lines,
             syntax_spans,
             visible_row_start,
-            visible_row_count: visible_row_end
-                .saturating_sub(visible_row_start)
-                .max(1),
+            visible_row_count: visible_row_end.saturating_sub(visible_row_start).max(1),
             total_buffer_lines,
         },
     })
@@ -16432,7 +16430,10 @@ mod tests {
         let e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
         let mm = &screen.minimap.as_ref().expect("minimap present").minimap;
-        assert_eq!(mm.total_buffer_lines, 201, "200 lines plus the trailing one");
+        assert_eq!(
+            mm.total_buffer_lines, 201,
+            "200 lines plus the trailing one"
+        );
         assert!(!mm.lines.is_empty());
         assert!(
             mm.lines.windows(2).all(|w| w[0].line_idx < w[1].line_idx),
@@ -16442,9 +16443,9 @@ mod tests {
         // The indented middle of the file must survive sampling as indented
         // text — this is the shape the TUI braille snapshot pins.
         assert!(
-            mm.lines
-                .iter()
-                .any(|l| l.line_idx >= 40 && l.line_idx < 160 && l.text.starts_with("            ")),
+            mm.lines.iter().any(|l| l.line_idx >= 40
+                && l.line_idx < 160
+                && l.text.starts_with("            ")),
             "the deeply-indented middle band must appear in the sample"
         );
     }

@@ -3089,10 +3089,9 @@ mod tests {
         );
         let lines = render_tui(&e, 100, 16);
         assert!(
-            lines.iter().any(|l| l.chars().any(|c| ('\u{2800}'
-                ..='\u{28FF}')
-                .contains(&c)
-                && c != '\u{2800}')),
+            lines.iter().any(|l| l
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c) && c != '\u{2800}')),
             "the minimap must paint non-blank braille glyphs; got:\n{}",
             lines.join("\n")
         );
@@ -3108,9 +3107,9 @@ mod tests {
         e.settings.minimap = false;
         let lines = render_tui(&e, 100, 16);
         assert!(
-            !lines.iter().any(|l| l
-                .chars()
-                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))),
+            !lines
+                .iter()
+                .any(|l| l.chars().any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))),
             "`:set nominimap` must paint no braille at all; got:\n{}",
             lines.join("\n")
         );

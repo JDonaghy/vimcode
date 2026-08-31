@@ -723,6 +723,7 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `smartcase` / `nosmartcase` | `scs` | off | Override `ignorecase` when pattern has uppercase |
 | `scrolloff=N` | `so` | 0 | Lines to keep above/below cursor when scrolling |
 | `cursorline` / `nocursorline` | `cul` | on | Highlight the line the cursor is on |
+| `minimap` / `nominimap` | | on | Code-overview minimap on the right edge of the active editor pane (GTK: scaled glyphs; TUI: braille dots). Click/drag it to scroll. Off hands the width back to the text area |
 | `windowstatusline` / `nowindowstatusline` | `wsl` | on | Per-window status line instead of single global bar (includes layout toggle icons) |
 | `statuslineaboveterminal` / `nostatuslineaboveterminal` | `slat` | on | Show active window's status line above the terminal panel instead of inside each window |
 | `colorcolumn=N` | `cc` | "" | Comma-list of column guides to highlight |

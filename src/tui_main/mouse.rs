@@ -2601,21 +2601,6 @@ pub(super) fn handle_mouse(
         return sidebar_width; // separator column
     }
 
-    // ── Minimap click / drag (#35) ──────────────────────────────────────────
-    // Pure rect plumbing: hand the click's cell coordinates to the shared
-    // resolver, which owns the hit-test and the scroll. Drag keeps seeking
-    // while the button is held, matching the GTK side.
-    if matches!(
-        ev.kind,
-        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
-    ) {
-        if let Some(layout) = last_layout {
-            if render::apply_minimap_click(engine, layout, col as f64, row as f64).is_some() {
-                return sidebar_width;
-            }
-        }
-    }
-
     // The menu bar (if visible) occupies absolute row 0, pushing the tab bar
     // and editor content down by `menu_rows` (computed once, near the top of
     // this function).
@@ -2852,6 +2837,26 @@ pub(super) fn handle_mouse(
             let div = &layout.window_dividers[i];
             *dragging_window_divider = Some((div.group_id, div.split_index));
             return sidebar_width;
+        }
+    }
+
+    // ── Minimap click / drag (#35) ──────────────────────────────────────────
+    // Pure rect plumbing: hand the click's cell coordinates to the shared
+    // resolver, which owns the hit-test and the scroll. Drag keeps seeking
+    // while the button is held, matching the GTK side.
+    //
+    // Deliberately *after* both divider hit-tests: the strip is carved off
+    // the active window's right edge, so in a `:vsplit` it abuts (and would
+    // otherwise swallow) the divider's grab column — and a divider drag is
+    // the more destructive gesture to lose.
+    if matches!(
+        ev.kind,
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+    ) {
+        if let Some(layout) = last_layout {
+            if render::apply_minimap_click(engine, layout, col as f64, row as f64).is_some() {
+                return sidebar_width;
+            }
         }
     }
 
