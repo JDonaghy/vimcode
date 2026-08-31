@@ -1311,7 +1311,7 @@ impl ShellApp for TuiShellApp {
         // the rasterisers on the very next paint instead of never.
         render::sync_nerd_fonts(backend, &self.engine);
 
-        // ── Menu bar + command centre (#635, Stage 6b item A) ────────────
+        // ── Menu bar + command centre (#635 Stage 6b item A, #712) ───────
         // Mirrors `draw_frame`'s own `menu_bar_area` block
         // (`render_impl.rs`, the `screen.menu_bar_visible` block right
         // after `top_chunks`). `AppShell::set_title_bar_visible`
@@ -1322,10 +1322,30 @@ impl ShellApp for TuiShellApp {
         // the row, so there's nothing to paint. `draw_menu_bar` and
         // `draw_command_center` were already trait calls — the gap this
         // stage closes was purely the missing runtime-toggleable reserved
-        // row, not these calls themselves. The menu *dropdown* (the open
-        // popup, as opposed to this horizontal bar) paints separately,
-        // last, near the end of this function — see that block's comment
-        // for why.
+        // row, not these calls themselves.
+        //
+        // #712: this block used to *paint* the bar here via
+        // `backend.draw_menu_bar` and immediately follow it with
+        // `backend.draw_command_center` in the same block. That command
+        // centre paint was silently erased every frame: the menu
+        // *dropdown* block further down (`self.engine.menu_system.borrow()
+        // .render(...)`, needed so an open dropdown paints on top of
+        // everything) calls `MenuSystem::render`, which unconditionally
+        // repaints `draw_menu_bar` across the *entire* `bar_rect` band —
+        // including the command-centre's columns to the right of the
+        // last menu label — whether or not a dropdown is actually open.
+        // Painting the command centre *before* that meant it got wiped
+        // the instant the frame reached the dropdown block, leaving a
+        // populated-but-invisible `command_center_layout` (paint and
+        // hit-test disagreeing, exactly like the #695 menu-bar bug and
+        // the #676 GTK command-centre bug this mirrors — see
+        // `gtk/mod.rs`'s identical "#676: painted *after*
+        // `menu_system.render()`" comment). Fixed the same way GTK was:
+        // only *measure* the bar here (`menu_bar_layout`, no paint — the
+        // dropdown block's `render()` call is what actually paints the
+        // bar, once, for real) and defer the command centre's own paint
+        // until after that block runs. `pending_command_center` carries
+        // the computed rect + descriptor across that gap.
         //
         // #695: `layout.title_bar_bounds` is cached into
         // `engine.menu_bar_rect` unconditionally (mirrors GTK's
@@ -1338,59 +1358,67 @@ impl ShellApp for TuiShellApp {
         // alone, which is what let paint and hit-test disagree (#695).
         let menu_bar_rect = layout.title_bar_bounds.unwrap_or_default();
         self.engine.menu_bar_rect.set(menu_bar_rect);
-        if self.engine.menu_bar_visible {
-            if menu_bar_rect.width >= 1.0 && menu_bar_rect.height >= 1.0 {
-                let tb_area = Rect {
-                    x: menu_bar_rect.x.round() as u16,
-                    y: menu_bar_rect.y.round() as u16,
-                    width: menu_bar_rect.width.round() as u16,
-                    height: menu_bar_rect.height.round() as u16,
-                };
-                backend.set_theme(super::quadraui_tui::q_theme(&theme));
-                let bar = self.engine.menu_system.borrow().menu_bar();
-                let bar_rect = quadraui::Rect::new(
-                    tb_area.x as f32,
-                    tb_area.y as f32,
-                    tb_area.width as f32,
-                    tb_area.height as f32,
-                );
-                let mb_layout = backend.draw_menu_bar(bar_rect, &bar);
+        let mut pending_command_center: Option<(quadraui::Rect, quadraui::CommandCenter)> = None;
+        if self.engine.menu_bar_visible && menu_bar_rect.width >= 1.0 && menu_bar_rect.height >= 1.0
+        {
+            let tb_area = Rect {
+                x: menu_bar_rect.x.round() as u16,
+                y: menu_bar_rect.y.round() as u16,
+                width: menu_bar_rect.width.round() as u16,
+                height: menu_bar_rect.height.round() as u16,
+            };
+            backend.set_theme(super::quadraui_tui::q_theme(&theme));
+            let bar = self.engine.menu_system.borrow().menu_bar();
+            let bar_rect = quadraui::Rect::new(
+                tb_area.x as f32,
+                tb_area.y as f32,
+                tb_area.width as f32,
+                tb_area.height as f32,
+            );
+            // Layout only — no paint. The dropdown block below paints the
+            // real bar (see this block's own comment for why painting it
+            // here too would just be redundant work the dropdown block
+            // immediately overwrites).
+            let mb_layout = backend.menu_bar_layout(bar_rect, &bar);
 
-                let menu_end: u16 = mb_layout
-                    .visible_items
-                    .last()
-                    .map(|vi| tb_area.x + (vi.bounds.x + vi.bounds.width).round() as u16)
-                    .unwrap_or(tb_area.x);
+            // `vi.bounds.x` is already absolute (`MenuBar::layout` starts
+            // its cursor at `bar_rect.x`, passed in above) — adding
+            // `tb_area.x` again double-counts it. Harmless today only
+            // because `AppShell::layout` always sets `title_bar_bounds.x`
+            // (hence `tb_area.x`) to `0`; quadraui hit and fixed the
+            // identical double-count internally (quadraui#494). Mirrors
+            // GTK's `mod.rs` comment on its own `menu_end` computation.
+            let menu_end: u16 = mb_layout
+                .visible_items
+                .last()
+                .map(|vi| (vi.bounds.x + vi.bounds.width).round() as u16)
+                .unwrap_or(tb_area.x);
 
-                let title = self
-                    .engine
-                    .cwd
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "VimCode".to_string());
-                let cc = render::build_command_center_view(
-                    self.engine.tab_nav_can_go_back(),
-                    self.engine.tab_nav_can_go_forward(),
-                    &title,
-                );
-                let cc_area = Rect {
-                    x: menu_end,
-                    y: tb_area.y,
-                    width: tb_area.width.saturating_sub(menu_end - tb_area.x),
-                    height: tb_area.height,
-                };
-                let cc_q_rect = quadraui::Rect::new(
-                    cc_area.x as f32,
-                    cc_area.y as f32,
-                    cc_area.width as f32,
-                    cc_area.height as f32,
-                );
-                let cc_layout = backend.draw_command_center(cc_q_rect, &cc);
-                self.engine.command_center_layout.replace(Some(cc_layout));
-            }
-        } else {
-            self.engine.command_center_layout.replace(None);
+            let title = self
+                .engine
+                .cwd
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "VimCode".to_string());
+            let cc = render::build_command_center_view(
+                self.engine.tab_nav_can_go_back(),
+                self.engine.tab_nav_can_go_forward(),
+                &title,
+            );
+            let cc_area = Rect {
+                x: menu_end,
+                y: tb_area.y,
+                width: tb_area.width.saturating_sub(menu_end - tb_area.x),
+                height: tb_area.height,
+            };
+            let cc_q_rect = quadraui::Rect::new(
+                cc_area.x as f32,
+                cc_area.y as f32,
+                cc_area.width as f32,
+                cc_area.height as f32,
+            );
+            pending_command_center = Some((cc_q_rect, cc));
         }
 
         // ── Sidebar panel content (#607) ─────────────────────────────────
@@ -1917,6 +1945,22 @@ impl ShellApp for TuiShellApp {
                 self.engine.menu_system.borrow().render(backend, bar_rect);
             }
         }
+
+        // ── Command centre (#635 Stage 6b item A, #712) ───────────────────
+        // Painted *after* `menu_system.render()` above, which repaints
+        // `draw_menu_bar` across the entire `bar_rect` band and would erase
+        // anything drawn here first — see `pending_command_center`'s own
+        // comment (menu-bar block, top of this function) for the full
+        // story and the matching GTK ordering (`gtk/mod.rs`'s "#676:
+        // painted *after* `menu_system.render()`"). `None` both when the
+        // bar is hidden and when this frame's reserved row was degenerate
+        // (zero width/height) — either way `command_center_layout` must
+        // agree with what actually got painted, not linger with last
+        // frame's stale layout (mouse.rs's hit test reads this cache
+        // directly).
+        self.engine.command_center_layout.replace(
+            pending_command_center.map(|(cc_rect, cc)| backend.draw_command_center(cc_rect, &cc)),
+        );
 
         // ── Toast overlay (#450) — last, so it sits on top of everything ─
         if let Some(stack) = render::build_toast_stack(&self.engine) {
@@ -5384,6 +5428,209 @@ mod tests {
         assert!(
             screen.contains("File"),
             "menu bar should paint via TuiShellApp::render_content when menu_bar_visible; screen:\n{screen}"
+        );
+    }
+
+    /// Engine with a real `cwd` (so the search box's title isn't empty) and
+    /// two tabs wired into `tab_nav_history` at index 1, so `tab_nav_back`
+    /// has somewhere to go and `tab_nav_can_go_back()` reads `true` the
+    /// moment the frame paints. Mirrors GTK's `engine_with_tab_history`
+    /// (`src/gtk/testing.rs`'s `command_center` test module, #676) with one
+    /// difference: tab1 opens this repo's own `Cargo.toml` (always
+    /// present, always the same first line) rather than staying blank —
+    /// GTK asserts tab-nav via `active_tab().id`, which TUI's driver has no
+    /// accessor for (module doc: no way back to the concrete
+    /// `TuiShellApp`), so the click-routing test below needs the two tabs
+    /// to paint *visibly* differently (blank editor vs. `[package]`) to
+    /// prove a click actually switched the active tab.
+    fn app_with_menu_bar_and_tab_history() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.menu_bar_visible = true;
+        app.engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let group = app.engine.active_group;
+        let tab0 = app.engine.active_tab().id;
+        let cargo_toml = app.engine.cwd.join("Cargo.toml");
+        app.engine.new_tab(Some(&cargo_toml));
+        let tab1 = app.engine.active_tab().id;
+        assert_ne!(tab0, tab1, "fixture needs two distinct tabs");
+        app.engine.tab_nav_history = vec![(group, tab0), (group, tab1)];
+        app.engine.tab_nav_index = 1;
+        app
+    }
+
+    /// #712: the omnibar (quadraui `CommandCenter`) never painted on TUI —
+    /// `render_content` computed and cached a fully populated
+    /// `command_center_layout` (so it was hit-testable), but the paint
+    /// itself, done *before* the menu-dropdown block further down, got
+    /// silently erased: that later block calls `MenuSystem::render`, which
+    /// unconditionally repaints `draw_menu_bar` across the *entire* bar
+    /// row — including the command centre's columns — whether or not a
+    /// dropdown is actually open. Fixed by deferring the command centre's
+    /// paint until after that block (see `pending_command_center`'s doc
+    /// comment in `render_content`), mirroring GTK's identical #676 fix
+    /// and its `command_center_paints_between_menu_labels_and_window_controls`
+    /// test. Verified this fails (screen has no ◀/▶/🔍 past "Help") against
+    /// the pre-fix ordering.
+    #[test]
+    fn render_content_paints_command_center_after_menu_labels_via_shell_app() {
+        let app = app_with_menu_bar_and_tab_history();
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let screen = driver.screen();
+
+        let file = driver
+            .find_bounds("File")
+            .expect("the \"File\" menu label must paint");
+        let back = driver
+            .find_bounds("◀")
+            .expect("the back arrow must paint on the menu-bar row");
+        let fwd = driver
+            .find_bounds("▶")
+            .expect("the forward arrow must paint on the menu-bar row");
+        let search = driver
+            .find_bounds("🔍")
+            .expect("the search-box icon must paint on the menu-bar row");
+
+        assert_eq!(
+            back.y, file.y,
+            "the command centre must paint on the same row as the menu labels; screen:\n{screen}"
+        );
+        assert!(
+            back.x > file.x && back.x < fwd.x && fwd.x < search.x,
+            "back arrow, forward arrow, and search box must lay out left-to-right \
+             to the right of the menu labels: file={file:?} back={back:?} \
+             forward={fwd:?} search={search:?}"
+        );
+    }
+
+    /// #712 companion: paint and hit-test must agree at the *same*
+    /// coordinates — clicking the painted arrows/search box must actually
+    /// drive tab-nav and open the picker, not just have a populated
+    /// `command_center_layout` sitting unused (which is exactly what the
+    /// pre-fix code had: `mouse.rs`'s hit test already worked against the
+    /// cached layout, only the paint was missing). Mirrors GTK's
+    /// `command_center_click_routes_nav_and_opens_picker`.
+    #[test]
+    fn command_center_click_routes_nav_and_opens_picker_via_shell_app() {
+        let app = app_with_menu_bar_and_tab_history();
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+
+        let back = driver.find_bounds("◀").expect("back arrow must paint");
+        let fwd = driver.find_bounds("▶").expect("forward arrow must paint");
+        let search = driver
+            .find_bounds("🔍")
+            .expect("search-box icon must paint");
+
+        assert!(
+            !driver.screen().contains("Search"),
+            "no picker popup should be open before the search box is clicked; screen:\n{}",
+            driver.screen()
+        );
+
+        // Search box -> opens the unified Command Center picker (mirrors
+        // GTK #676; `PickerSource::CommandCenter`'s title is "Search",
+        // `core/engine/picker.rs`).
+        driver.click(
+            search.x + search.width / 2.0,
+            search.y + search.height / 2.0,
+        );
+        assert!(
+            driver.screen().contains("Search"),
+            "clicking the search box must open the Command Center picker \
+             (its \"Search\" title must paint); screen:\n{}",
+            driver.screen()
+        );
+
+        // Dismiss the picker before exercising the nav arrows below —
+        // otherwise a click at the (now-covered) arrow coordinates would
+        // hit the picker overlay instead of the command centre.
+        driver.press_named(quadraui::NamedKey::Escape);
+        assert!(
+            !driver.screen().contains("Search"),
+            "Escape must close the picker before the nav-arrow assertions below; screen:\n{}",
+            driver.screen()
+        );
+
+        // Back arrow -> tab-nav history moves backward, from tab1
+        // (`Cargo.toml`, active per the fixture's `tab_nav_index == 1`) to
+        // tab0 (a blank buffer). `Cargo.toml`'s `[package]` first line is
+        // the observable, engine-external proof the click actually reached
+        // tab-nav and switched the *active* tab (as opposed to a hit-test
+        // no-op) — `driver`'s only feedback channel is the painted screen
+        // (module doc: no accessor back to the concrete `TuiShellApp`), and
+        // the tab bar shows both tab labels regardless of which is active,
+        // so only the editor content pane distinguishes them.
+        assert!(
+            driver.screen().contains("[package]"),
+            "fixture must start on the Cargo.toml tab; screen:\n{}",
+            driver.screen()
+        );
+        driver.click(back.x + back.width / 2.0, back.y + back.height / 2.0);
+        assert!(
+            !driver.screen().contains("[package]"),
+            "clicking the back arrow must navigate away from the Cargo.toml \
+             tab to the blank one; screen:\n{}",
+            driver.screen()
+        );
+
+        // Forward arrow -> undoes the back navigation.
+        driver.click(fwd.x + fwd.width / 2.0, fwd.y + fwd.height / 2.0);
+        assert!(
+            driver.screen().contains("[package]"),
+            "clicking the forward arrow must undo the back navigation, \
+             returning to the Cargo.toml tab; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #712 companion: the reserved-row degenerate case (menu bar
+    /// technically visible but this frame's `title_bar_bounds` collapsed
+    /// to zero width/height) must clear `command_center_layout`, not leave
+    /// last frame's stale layout live for `mouse.rs`'s hit test to keep
+    /// routing clicks against — the "mechanism 2" this issue named
+    /// alongside the paint-order bug the tests above cover. Exercised via
+    /// the ordinary hidden-menu-bar path (the only reachable degenerate
+    /// case from a black-box test — `menu_bar_visible=false` reserves no
+    /// row at all, same effect on `command_center_layout` as a collapsed
+    /// one) and asserted the same way GTK's sibling test is:
+    /// click-behaviour-after-hide, not a bare `is_none()` state check
+    /// (#553/#592 shape).
+    #[test]
+    fn command_center_layout_clears_when_menu_bar_hidden_via_shell_app() {
+        // Measure the search box's coordinates on a *visible*-menu-bar frame
+        // first, from a throwaway driver — `driver_with_shell` consumes its
+        // app by value and paints immediately, so this needs its own
+        // fixture instance before building the real (hidden) one below.
+        let (search_x, search_y) = {
+            let probe_driver = driver_with_shell(
+                app_with_menu_bar_and_tab_history(),
+                TuiShellApp::shell_config(true),
+                80,
+                24,
+            );
+            let sb = probe_driver
+                .find_bounds("🔍")
+                .expect("search-box icon must paint while the menu bar is visible");
+            (sb.x + sb.width / 2.0, sb.y + sb.height / 2.0)
+        };
+
+        let mut app = app_with_menu_bar_and_tab_history();
+
+        app.engine.menu_bar_visible = false;
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        assert!(
+            driver.find_bounds("🔍").is_none(),
+            "the search-box icon must not paint once the menu bar is hidden"
+        );
+
+        // Click at the coordinates the search box used to occupy: with the
+        // menu bar hidden, that must no longer open the picker (a stale
+        // cached layout would still hit-test and route the click).
+        driver.click(search_x, search_y);
+        assert!(
+            !driver.screen().contains("Search"),
+            "a click at the old command-centre coordinates must not open the \
+             picker once the menu bar is hidden (stale hit-region); screen:\n{}",
+            driver.screen()
         );
     }
 
