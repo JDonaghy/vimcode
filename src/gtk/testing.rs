@@ -3873,8 +3873,147 @@ mod minimap {
     /// Acceptance (#35): a click at the vertical middle of the strip scrolls
     /// the pane to ~50% of the file — the GTK half of the cross-backend
     /// claim, driven through the real `pixel_to_click_target` path.
+    ///
+    /// Deliberately does **not** trust `scroll_top()` alone (CLAUDE.md:
+    /// "Assert on rendered output — never on state being populated" — a
+    /// click that mutates `scroll_top` but never actually repaints the new
+    /// position is exactly the #587/#592 bug shape). The fixture's
+    /// indentation shape (12-space indent for lines 100..300 of 400) makes
+    /// the *paint* observable even though this harness can't record
+    /// editor/gutter text (`Harness::window_center`'s doc comment): the
+    /// column band the indent occupies holds no syntax-colored glyph ink
+    /// when a row is indented, and does when it isn't, so counting
+    /// non-grayscale ("colorful") pixels in that band before/after
+    /// distinguishes "repainted the new scroll position" from "only the
+    /// state moved".
+    ///
+    /// RED-first: hardcoding `build_rendered_window`'s `scroll_top` local to
+    /// `0` (so engine state moves but the paint stays pinned to the top of
+    /// the file) makes the final assertion fail with the indented row still
+    /// showing ~294 colorful pixels instead of 0 — confirmed by hand, along
+    /// with an initial brightness-based version of this probe that turned
+    /// out to be theme-dependent noise (see the color-vs-brightness note
+    /// above) and had to be replaced with this colorfulness count — before
+    /// restoring the fix.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
+        let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+
+        let (strip, total, rect, gutter_px, char_w, lh) = {
+            let layout = h.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let mm = l.minimap.as_ref().expect("minimap must be present");
+            let rw = l
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active pane must be in the painted layout");
+            (
+                mm.rect,
+                mm.minimap.total_buffer_lines,
+                rw.rect,
+                rw.gutter_char_width as f64 * h.painted_char_width(),
+                h.painted_char_width(),
+                h.painted_line_height()
+                    .expect("frame must publish the line height it painted with"),
+            )
+        };
+        assert_eq!(
+            h.engine.borrow().scroll_top(),
+            0,
+            "fixture must start at the top of the file"
+        );
+
+        // The 12-column band right after the gutter, on the top visible
+        // row: unindented content ("fn item_0() ...") paints syntax-colored
+        // glyph ink *somewhere* in this band before the click, while a row
+        // from the indented band (100..300) paints nothing there but blank
+        // indentation (background plus, at most, an indent-guide line —
+        // grayscale, `r == g == b`). Counting *colorful* pixels (channels
+        // that disagree, i.e. not grayscale) rather than comparing raw
+        // brightness or the full color set keeps this theme-agnostic and
+        // immune to the indent guide: a light theme makes background the
+        // *brightest* color in the band rather than the ink, and indent
+        // guides paint real (if faint) grayscale pixels in the same band
+        // even on a correctly-repainted frame.
+        let band_x0 = (rect.x + gutter_px) as i32;
+        let band_x1 = (rect.x + gutter_px + 12.0 * char_w) as i32;
+        let row_y0 = (rect.y).ceil() as i32;
+        let row_y1 = (rect.y + lh).floor() as i32;
+        let is_colorful = |(r, g, b): (u8, u8, u8)| {
+            let (r, g, b) = (r as i32, g as i32, b as i32);
+            const TOL: i32 = 12; // AA-rounding tolerance, matching `near()` above
+            (r - g).abs() > TOL || (g - b).abs() > TOL || (r - b).abs() > TOL
+        };
+        let colorful_pixel_count = |h: &mut Harness<_>| -> usize {
+            let mut n = 0;
+            for y in row_y0..row_y1 {
+                for x in band_x0..band_x1 {
+                    if is_colorful(h.driver.pixel(x, y)) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let before = colorful_pixel_count(&mut h);
+        assert!(
+            before > 0,
+            "test setup sanity: the unindented top row must paint some \
+             syntax-colored glyph ink in the probed band, not a blank/gray \
+             block"
+        );
+
+        h.driver.click(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height / 2.0) as f32,
+        );
+        h.driver.render();
+
+        let scroll_top = h.engine.borrow().scroll_top();
+        let frac = scroll_top as f64 / total as f64;
+        assert!(
+            (frac - 0.5).abs() < 0.1,
+            "clicking the middle of the minimap must scroll to ~50% of the \
+             file, got scroll_top={scroll_top} of {total} ({frac:.3})"
+        );
+        assert!(
+            (100..300).contains(&scroll_top),
+            "the ~50% scroll must land inside the fixture's indented band \
+             (lines 100..300) for the paint probe below to be meaningful; \
+             got scroll_top={scroll_top}"
+        );
+
+        // The band that used to hold "fn item_N(...)" ink must now show no
+        // colorful (syntax-highlighted) pixels at all — proof the view
+        // actually repainted the indented band, not just moved `scroll_top`
+        // in engine state while the paint stayed on the old lines.
+        let after = colorful_pixel_count(&mut h);
+        assert_eq!(
+            after, 0,
+            "the band right after the gutter must show no syntax-colored \
+             glyph ink once the view scrolls into the indented band — found \
+             {after} colorful pixels; scroll_top moved to {scroll_top} but \
+             the paint didn't follow it"
+        );
+    }
+
+    /// Acceptance (#35): pressing and holding on the minimap and dragging
+    /// keeps seeking — not just the pixel under the initial mouse-down.
+    ///
+    /// RED-first regression: before this fix, `pixel_to_click_target`'s
+    /// minimap hit-test only ran when `mutate_focus` was true, and
+    /// `handle_mouse_drag` (the drag-continuation path) always called it
+    /// with `mutate_focus: false` — so a `mouse_down` + `mouse_move`
+    /// gesture (this test, run through the real
+    /// `handle_mouse_drag_msg` -> `handle_mouse_drag` dispatch) only ever
+    /// saw the mouse-down's own seek; the follow-up drag never reached the
+    /// minimap resolver at all and the assertion below failed. Confirmed by
+    /// hand against the pre-fix `click.rs` before restoring the fix.
+    #[test]
+    fn minimap_drag_keeps_seeking_while_the_button_is_held() {
         let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win).expect("editor pane must paint");
@@ -3895,17 +4034,41 @@ mod minimap {
             "fixture must start at the top of the file"
         );
 
-        h.driver.click(
+        // Press down near the top of the strip — mouse-down alone already
+        // seeks there (covered by the click test above).
+        h.driver.mouse_down(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height * 0.1) as f32,
+        );
+        let after_down = h.engine.borrow().scroll_top();
+
+        // Continue the SAME held-button gesture down to the vertical
+        // middle of the strip, without releasing the button — this
+        // exercises `handle_mouse_drag`, not a fresh mouse-down.
+        h.driver.mouse_move(
+            (strip.x + strip.width / 2.0) as f32,
+            (strip.y + strip.height / 2.0) as f32,
+        );
+        h.driver.mouse_up(
             (strip.x + strip.width / 2.0) as f32,
             (strip.y + strip.height / 2.0) as f32,
         );
 
-        let scroll_top = h.engine.borrow().scroll_top();
-        let frac = scroll_top as f64 / total as f64;
+        let after_drag = h.engine.borrow().scroll_top();
+        let frac = after_drag as f64 / total as f64;
         assert!(
             (frac - 0.5).abs() < 0.1,
-            "clicking the middle of the minimap must scroll to ~50% of the \
-             file, got scroll_top={scroll_top} of {total} ({frac:.3})"
+            "dragging while the button is held must keep seeking the \
+             minimap: after mouse-down scroll_top={after_down}, after \
+             continuing the drag to the strip's vertical middle it must \
+             land at ~50% of {total} lines but got \
+             scroll_top={after_drag} ({frac:.3})"
+        );
+        assert_ne!(
+            after_down, after_drag,
+            "the drag must move the scroll position further than the \
+             initial mouse-down alone — both landed on {after_down}, so \
+             the drag continuation never reached the minimap"
         );
     }
 }

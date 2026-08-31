@@ -3074,6 +3074,10 @@ mod tests {
     /// band between flush top and bottom bands) so the snapshot pins the dot
     /// grid's *orientation*: a transposed grid would paint the indent step at
     /// the wrong end of the strip and this golden file would change.
+    ///
+    /// RED-first: commenting out `render_content`'s `draw_minimap_strip`
+    /// call makes the non-blank-braille assertion below fail — confirmed by
+    /// hand before restoring the fix.
     #[test]
     fn snapshot_minimap_braille() {
         let text: String = (0..120)
@@ -3100,6 +3104,11 @@ mod tests {
 
     /// The `:set nominimap` half of the same picture — no braille anywhere,
     /// and the editor text reaches further right.
+    ///
+    /// RED-first: forcing `minimap_reserved_width`'s `has` to ignore
+    /// `engine.settings.minimap` (always reserve the strip) makes braille
+    /// paint even with the setting off, failing the assertion below —
+    /// confirmed by hand before restoring the fix.
     #[test]
     fn nominimap_paints_no_braille() {
         let text: String = (0..120).map(|i| format!("line {i}\n")).collect();

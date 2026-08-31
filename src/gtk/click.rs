@@ -674,14 +674,26 @@ pub(super) fn handle_mouse_double_click(
     }
 }
 
-/// Handle mouse drag — extend visual selection.
+/// Handle mouse drag — extend visual selection, or keep seeking the
+/// minimap while a minimap drag is held.
 ///
 /// #568: this only ever fires while a mouse button is held (drag
-/// continuation), so it resolves the hit as a pure query (`mutate_focus:
-/// false`) — the mouse sweeping over a different split's tab bar/gutter
-/// while the drag is held must not steal focus or fire actions there.
-/// `Engine::mouse_drag`'s origin-window lock then keeps the selection itself
-/// pinned to the split the drag started in.
+/// continuation), so text-selection resolution goes through
+/// `pixel_to_click_target` as a pure query (`mutate_focus: false`) — the
+/// mouse sweeping over a different split's tab bar/gutter while the drag is
+/// held must not steal focus or fire actions there. `Engine::mouse_drag`'s
+/// origin-window lock then keeps the selection itself pinned to the split
+/// the drag started in.
+///
+/// The minimap check (#35) is deliberately *not* routed through that
+/// `mutate_focus`-gated call: it isn't a text-selection drag at all (a
+/// mouse-down that lands on the minimap resolves to `ClickTarget::Minimap`,
+/// never `BufferPos`, so no selection-drag ever originates there), and the
+/// gate exists solely to stop a text-selection drag stealing focus/actions
+/// elsewhere — a concern that doesn't apply to continuing to scroll the
+/// strip the drag started on. Checked first and unconditionally, mirroring
+/// `src/tui_main/mouse.rs`, which resolves `Down` and `Drag` through
+/// `apply_minimap_click` identically.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_drag(
     engine: &mut Engine,
@@ -701,6 +713,16 @@ pub(super) fn handle_mouse_drag(
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
+    // ── Minimap drag-to-scroll (#35) ────────────────────────────────────────
+    // Checked first, before the mutate_focus-gated resolver below: see the
+    // doc comment on this function for why this is not the "focus-stealing
+    // text-selection drag" case that gate exists to stop. If the pointer is
+    // over the strip, keep seeking and skip buffer-selection resolution
+    // entirely for this event.
+    if render_mod::apply_minimap_click(engine, cached_layout, x, y).is_some() {
+        return;
+    }
+
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
         backend,
