@@ -8010,6 +8010,13 @@ mod tests {
 
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
+    ///
+    /// RED-first: commenting out this `render_content`'s own
+    /// `render::draw_minimap_strip(backend, &screen)` call (the ShellApp
+    /// path has a separate call site from the legacy `render_impl.rs`
+    /// `draw_frame` path — see the module doc's gap list) makes the
+    /// non-blank-braille assertion fail — confirmed by hand before
+    /// restoring the fix.
     #[test]
     fn render_content_paints_minimap_braille_via_shell_app() {
         let driver = driver_with_shell(app_with_shaped_buffer(), config(), 100, 24);
@@ -8025,6 +8032,11 @@ mod tests {
 
     /// …and `:set nominimap` must take effect on the very next paint, with
     /// no restart: no braille anywhere.
+    ///
+    /// RED-first: forcing `minimap_reserved_width`'s `has` to ignore
+    /// `engine.settings.minimap` (always reserve the strip) makes braille
+    /// paint even with the setting off, failing the assertion below —
+    /// confirmed by hand before restoring the fix.
     #[test]
     fn render_content_paints_no_minimap_when_the_setting_is_off() {
         let mut app = app_with_shaped_buffer();
@@ -8042,6 +8054,11 @@ mod tests {
     /// Acceptance (#35): a click at the vertical middle of the strip scrolls
     /// the editor to ~50% of the file — the TUI half of the cross-backend
     /// claim, asserted on the painted line numbers rather than engine state.
+    ///
+    /// RED-first: with the shell path's `draw_minimap_strip` call commented
+    /// out (see `render_content_paints_minimap_braille_via_shell_app`), the
+    /// `braille_col` lookup below panics — nothing paints on `mid_row` to
+    /// click — confirmed by hand before restoring the fix.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
         let mut driver = driver_with_shell(app_with_shaped_buffer(), config(), 100, 24);
