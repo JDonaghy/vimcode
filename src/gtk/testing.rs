@@ -4128,6 +4128,22 @@ mod app_icon {
     /// the distinct-colour assertion fails (1 colour, not >= 8).
     #[test]
     fn app_icon_paints_left_of_the_file_menu() {
+        // #720 review: without a gdk-pixbuf SVG loader on this host
+        // (`librsvg2-common` is only a `Recommends` of `libgtk-4-1` on
+        // Ubuntu, so a `--no-install-recommends` install can legitimately
+        // lack it), `draw_image` cannot decode the app icon and paints
+        // nothing -- an environment gap, not a regression in this code. CI
+        // installs the loader explicitly (see `.github/workflows/ci.yml`),
+        // so skip the pixel assertions rather than hard-failing when it's
+        // genuinely absent.
+        if crate::gtk::util::cached_app_icon_png().is_none() {
+            eprintln!(
+                "skipping app_icon_paints_left_of_the_file_menu: no gdk-pixbuf \
+                 SVG loader on this host"
+            );
+            return;
+        }
+
         let mut h = harness(Engine::new_for_test(), 1200, 800);
         h.driver.render();
 

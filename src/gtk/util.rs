@@ -130,18 +130,26 @@ const APP_ICON_RASTER_PX: u32 = 64;
 /// design — see [`crate::render::app_icon_image`]), which is the same visible
 /// outcome as skipping the call, but keeps the "why" in one place.
 pub(super) fn app_icon_image() -> quadraui::Image {
-    use std::sync::OnceLock;
-    static PNG: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-
-    match PNG.get_or_init(rasterise_app_icon_png) {
+    match cached_app_icon_png() {
         Some(png) => quadraui::Image {
-            source: quadraui::ImageSource::Bytes(png.clone()),
+            source: quadraui::ImageSource::Bytes(png),
             intrinsic_size: Some((APP_ICON_RASTER_PX, APP_ICON_RASTER_PX)),
             // id / fit / fallback_text stay owned by the shared builder.
             ..crate::render::app_icon_image()
         },
         None => crate::render::app_icon_image(),
     }
+}
+
+/// The one-time rasterisation result, memoised. `None` means this host's
+/// `gdk-pixbuf` has no SVG loader (see [`rasterise_app_icon_png`]) — exposed
+/// (not just inlined into [`app_icon_image`]) so tests can distinguish "no
+/// loader on this host" from "the rasterisation code is broken" and skip
+/// the pixel assertions gracefully instead of hard-failing (#720 review).
+pub(super) fn cached_app_icon_png() -> Option<Vec<u8>> {
+    use std::sync::OnceLock;
+    static PNG: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    PNG.get_or_init(rasterise_app_icon_png).clone()
 }
 
 /// Decode [`crate::render::APP_ICON_SVG`] and re-encode it as an
@@ -345,6 +353,22 @@ mod tests {
     /// identical but quietly cap the UI's frame rate.
     #[test]
     fn painted_app_icon_is_the_rasterised_png_not_the_raw_svg() {
+        // #720 review: this host may have no gdk-pixbuf SVG loader
+        // (`librsvg2-common` is only a `Recommends` of `libgtk-4-1` on
+        // Ubuntu, so a `--no-install-recommends` install can legitimately
+        // lack it). That is an environment gap, not a regression in this
+        // code, so skip the rasterisation assertions rather than
+        // hard-failing — CI installs the loader explicitly (see
+        // `.github/workflows/ci.yml`) so this only fires on a stripped-down
+        // host.
+        if cached_app_icon_png().is_none() {
+            eprintln!(
+                "skipping painted_app_icon_is_the_rasterised_png_not_the_raw_svg: \
+                 no gdk-pixbuf SVG loader on this host"
+            );
+            return;
+        }
+
         let img = app_icon_image();
         let quadraui::ImageSource::Bytes(bytes) = &img.source else {
             panic!(

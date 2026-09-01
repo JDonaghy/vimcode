@@ -79,7 +79,14 @@ jobs:
     - name: Install GTK4 dev libraries
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends libgtk-4-dev
+        # #720: librsvg2-common ships the gdk-pixbuf SVG loader. It's only a
+        # `Recommends` of libgtk-4-1 on Ubuntu, not a hard `Depends`, so
+        # --no-install-recommends (below) does NOT pull it in on its own --
+        # it must be listed explicitly. Without it, `Pixbuf::from_read` on
+        # the app-icon SVG (src/gtk/util.rs) fails, and the two #720 icon
+        # tests (src/gtk/testing.rs, src/gtk/util.rs) hard-fail rather than
+        # exercising real rasterised pixels.
+        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
