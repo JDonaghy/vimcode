@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** September 1, 2026 — **audit session.** Verified the platform-neutrality effort against the code rather than against issue-closure state. #592's four children (#669–#672) all landed and `src/gtk/draw.rs` is deleted, but **`screen.ai_panel` is still unpainted on GTK** (`src/gtk/mod.rs:9364`), so #592 stays open. Found a second orphan pocket the epic could not have seen: **22 Relm4-era widget handles on `App` are initialised `None` and assigned nowhere**, guarding ~103 unreachable arms — which is why #723's GTK half (`e02a824`) cannot run. #593 re-scoped (unblocked by #672; #646's `GtkDriver` replaces its stale "needs live smoke" plan). Three issue bodies drafted: the orphan sweep, the `Msg`-bus retirement, and mouse-router convergence.
+**Last updated:** September 1, 2026 — **audit session, and everything it found is now queued.** Closed the platform-neutrality audit by filing the five pockets nobody had issue-shaped, re-scoping three stale issues (#593, #657, #47), moving #146 out of #7, and putting the whole thing on the drive queue as **16 entries in two parallel chains**. `vimcode#727` and `quadraui#596` are running. Milestone #7 is 10 open / 29 closed, and every one of the ten is queued.
 
 ## Active milestone: #7 Platform-Neutral
 
@@ -24,21 +24,54 @@ there is no feature logic left in the existing backends to re-implement.
 - **Dedup sweep landed:** #621 (`fuzzy_score` → `quadraui::text_util`), #659 (driver tab
   geometry + `SidebarSystem::reveal`), #660 (four duplicates retired, incl. `SplitTree`),
   #536 (activity-bar keyboard nav → `AppShell` cursor).
-- Milestone #7 stands at **29 closed / 4 open**; quadraui milestone #9 ("vimcode
+- Milestone #7 stands at **29 closed / 10 open** (4 at the time of the audit, plus the
+  six issues the audit filed); quadraui milestone #9 ("vimcode
   Platform-Neutral blockers") is closed out.
 
-### Open, and what actually gates each
+### The queue — everything known, in two parallel chains
 
-| Issue | State |
-|---|---|
-| **#592** (epic) | 13 of 14 fields done. **`ai_panel` still unpainted on GTK** — #670 deferred it to a follow-up that was never filed (`src/gtk/mod.rs:9364-9369`, click holdout at `:7325`). Closes when that lands. |
-| **#593** Ctrl+V on GTK | **Unblocked** — the #672 hold is lifted, and #646's `GtkDriver` supersedes the "no GTK harness, needs live smoke" plan in its body. Re-scoped 2026-09-01. |
-| **#658** preview tier | The only genuinely supply-blocked item: quadraui#596 + #597 both OPEN. Two live copies of vimcode's own preview policy until it lands. |
-| **#146** Lua → quadraui | Weakest fit of the original #7 seeding. Re-triage or drop. |
+```
+quadraui#666 ✅ ─┬─ vimcode#727 ▶ → #728 → #730 → #593 → #731 → #732 → #733
+                 │                → #734 → #735 → #657 → #47
+                 └─ quadraui#596 ▶ → #597 → vimcode#658
+```
 
-### Untracked residual — the actual remaining mass
+Strict chains: every vimcode entry declares `src/gtk/mod.rs`, so they cannot run
+concurrently and `coord`'s #2247 overlap predictor enforces the order. The two chains are
+in different repos, so they run in parallel and never stale each other's Test verdicts —
+which also means the ">2 issues per repo" drive-queue caution does not apply here: at most
+one vimcode entry is ever tested-but-unmerged, so there is no `coord merge --revalidate`
+drain to do.
 
-Production lines (`#[cfg(test)]` blocks excluded):
+| Order | Issue | Scope |
+|---|---|---|
+| 1 | **#730** | `#592-E` — paint `screen.ai_panel` on GTK. The 14th and last field from #592's table; #670 deferred it to a follow-up nobody filed (`mod.rs:9364-9369`, click holdout `:7325`). **Closes #592.** |
+| 2 | **#593** | `Ctrl+V` on GTK. Unblocked by #672; #646's `GtkDriver` supersedes its stale "needs live smoke" plan. Smallest user-visible fix in the chain. Given a `## Files` block so the overlap predictor can order it. |
+| 3 | **#731** | 22 Relm4-era widget handles permanently `None`, guarding ~103 unreachable arms. **Also re-derives #723**, whose landed fix (`e02a824`) targets a `gtk4::Scrollbar` that is never constructed. |
+| 4 | **#732** | Retire the GTK `Msg` bus — 124 variants, 301 sites, 684-line `dispatch`, 16 `handle_*_msg` methods. |
+| 5 | **#733** | Converge the two mouse routers — ~4,800 lines, one precedence ladder written twice. |
+| 6 | **#734** | Converge keyboard dispatch — ~2,000 lines. The TUI half carries 19 `mirrors mod.rs:NNNN` comments and **every one of those line refs is stale**. |
+| 7 | **#735** | Converge frame composition — ~4,500 lines. The hard one: units differ (px vs cells), `draw_frame` has raw-`Buffer` residue `render_content` structurally cannot reach, and painter models differ intrinsically. |
+| 8 | **#657** | The oracle loop. Last, deliberately — Stage 1 rewrites every `crate::` path in the three modules the chain is about to shrink by ~9,000 lines. |
+| 9 | **#47** | Native macOS GUI, **re-scoped**: a thin wrapper over `quadraui::macos::shell_runner::run_with_shell`, not Core Graphics. |
+| ∥ | **quadraui#596 → #597 → #658** | The preview tier. #596/#597 were open, unassigned and **in nobody's queue** while #658 sat blocked on them — the supply-side trap `GOALS.md` exists to catch. Queued 2026-09-01. |
+
+### The five pockets — all now issue-shaped
+
+The previous revision of this file listed four pockets as untracked. All are filed, plus a
+fifth it missed:
+
+| Pocket | Size | Issue |
+|---|---|---|
+| Mouse/click routing | ~4,800 lines | #733 |
+| GTK `Msg` bus | 124 variants / 301 sites | #732 |
+| Frame composition | ~4,500 lines | #735 |
+| Orphaned Relm4 widget handles | 22 fields / ~103 arms | #731 |
+| **Keyboard dispatch** | ~2,000 lines | **#734** — missed by the previous revision entirely |
+
+### What draining the chain will and will not achieve
+
+Production lines, `#[cfg(test)]` excluded:
 
 | | 2026-05-01 | 2026-07-01 | 2026-09-01 |
 |---|---|---|---|
@@ -46,38 +79,55 @@ Production lines (`#[cfg(test)]` blocks excluded):
 | `src/tui_main/` | 14,657 | 10,305 | **11,135** |
 | `src/render.rs` (shared) | 10,547 | 12,690 | **15,110** |
 
-The May→July drop was real. **Since July 1 the two backends are flat** — 23,693 → 23,723
-combined; `draw.rs`'s −2,327 was cancelled by new growth. Shared code grew +2,420 over
-the same window, so *new* features are going shared (the Platform-Neutrality Rule is
-working) while the *existing* per-backend mass has stopped coming down.
+The May→July drop was real; **since July 1 the backends have been flat** (23,693 →
+23,723) while `render.rs` grew +2,420. New work goes shared — the Platform-Neutrality Rule
+is holding — but the existing mass stopped coming down, and `draw.rs`'s −2,327 was
+cancelled by ordinary feature growth.
 
-Where it sits, none of it issue-shaped before 2026-09-01:
+Draining the chain should remove **~8,700–9,500 production lines** from the backends
+(#731 ~1,000, #732 ~1,100, #733 ~3,000–3,500, #734 ~1,200, #735 ~2,500), landing near
+**14,000–15,000**, with perhaps +4,000–5,000 added to `render.rs`.
 
-- **Mouse/click routing, ~4,800 lines.** GTK `handle_mouse_click_msg` (`mod.rs:3785`,
-  1,071) + `handle_mouse_drag_msg` (356) + `try_route_sidebar_mouse_event` (176) ↔ TUI
-  `handle_mouse` (`mouse.rs:157`, **3,027 lines in one function**) + `handle_mouse_event`
-  (364). Same precedence ladder, written twice, with rungs each backend has and the other
-  doesn't.
-- **The GTK `Msg` bus.** 124 variants (`mod.rs:1096-1413`), 301 `Msg::` sites, 684-line
-  `fn dispatch` (`:1799`), 16 `handle_*_msg` methods. `ShellApp::handle` re-encodes a
-  `UiEvent` it already holds into one of 17 `Msg` variants so `dispatch` can decode it
-  again. TUI has no equivalent.
-- **Frame composition, ~4,500 lines.** GTK `render_content` (1,533) ↔ TUI
-  `render_content` (708) + `draw_frame` (749) + `panels.rs` (1,555).
-- **22 orphaned Relm4-era widget handles** on `App` — initialised `None`, assigned
-  nowhere in the crate, guarding ~103 arms that never execute. Same class as `draw.rs`,
-  but invisible to #672's "no file-level `allow(dead_code)`" criterion because they are
-  *read*, just never *written*. Live cost: #723's GTK half (`e02a824`) targets a
-  `gtk4::Scrollbar` that is never constructed, so that fix cannot run.
+**That is a 38% cut and it is not "thin event-to-engine wiring."** What it buys is that
+every *decision* — which surface was hit, which handler owns a key, what order a frame is
+composed in — is stated once. What remains has **not been enumerated**: rasteriser
+adapters, `src/gtk/css.rs` (508 lines), window/CSD wiring, clipboard provider setup, font
+metrics. Some of that is legitimately platform-specific and should stay. **Re-run the
+sizing audit when #735 lands** rather than assuming the chain finishes the job.
 
-### Trust gate
+### Trust gate — accepted as a deliberate trade
 
-**#657** (promote `gtk`/`render`/`tui_main` into `vimcode_core`, seal a
-`tests/acceptance/` suite) remains the gate under all of the above — today's tests are
-written by the same worker that writes the fix. #553 is the in-repo proof: it shipped
-`GtkDriver` tests that stayed green with the bug reinstated. Note the false blocker in
-#657's body — "vimcode needs a GTK acceptance driver first" is **wrong** (#646 shipped
-one) and chasing it costs a large piece of work that isn't needed.
+**#657** is queued *after* the whole chain, so every fix ahead of it is verified by tests
+its own author wrote — precisely the failure mode #657 exists to close, with #553 as the
+in-repo proof (it shipped `GtkDriver` tests that stayed green with the bug reinstated).
+
+This is a trade, not an oversight: promoting `gtk`/`render`/`tui_main` into the lib first
+means rewriting every `crate::` path across code that #731–#735 then delete, and
+re-resolving those conflicts on every subsequent PR. **Reversible with one `drive-queue`
+re-chain** if the risk is judged too high.
+
+Note also that #657's body opens by declaring a 2026-08-10 freeze on vimcode bug-fix
+dispatch until the oracle lands. That has not been honoured — 20+ bug-fix/feature issues
+merged 08-26 → 09-01. It is retired, or #657 moves to the front. Recorded on the issue as
+an operator decision.
+
+### Milestone hygiene
+
+**#146** (Lua plugin API → quadraui primitives) moved **out** of #7 to Editor Features: it
+is an *addition*, and every other #7 issue is a deletion or a convergence, so leaving it
+in made the burndown mean two things. **#47** was put in #5 Cross-Platform UI Crate for
+the same reason (`GOALS.md` defines #5 as covering "the macOS/Windows backends").
+
+Result: **#7 is 10 open / 29 closed, and all ten are queued.**
+
+### Supply side: the macOS gate is cleared
+
+**quadraui#465** — the `ShellApp` + `run_with_shell` composition support this file and
+`GOALS.md` both named as "the actual gate on 'the macOS port is a thin wrapper'" — closed
+**2026-08-31** (`bd92d6f` + `434e1d6`). It is present at vimcode's currently pinned rev
+`69fd9cdd` (`quadraui/src/macos/shell_runner.rs:24`), so **no pin bump is needed** to
+start #47. Nothing on the quadraui side now blocks a macOS backend; the remaining gate is
+vimcode-side and it is the chain above.
 
 ---
 
@@ -200,11 +250,14 @@ the mouse-routing and event-dispatch duplication listed under
 
 > Sessions 389 and earlier in **SESSION_HISTORY.md**.
 
-**2026-09-01 — platform-neutrality audit (docs only).** Measured the effort against the
-code. Findings and their disposition are in "Active milestone" above; the three drafted
-issue bodies (orphan-handle sweep, `Msg`-bus retirement, mouse-router convergence) plus
-the missing `ai_panel` child are the queue that comes out of it. #592 given an audit
-comment and deliberately **left open**; #593 re-scoped.
+**2026-09-01 — platform-neutrality audit, and everything it found is now queued.**
+Filed #730 (`ai_panel`), #731 (orphan handles), #732 (`Msg` bus), #733 (mouse routers),
+#734 (keyboard), #735 (frame composition). Re-scoped #593 (unblocked, `GtkDriver`
+supersedes its smoke plan), #657 (audit run and recorded, fixture list corrected, freeze
+contradiction flagged) and #47 (macOS: thin wrapper, not Core Graphics). Moved #146 out
+of #7. Queued all of it plus quadraui#596/#597 — 16 entries, two parallel chains. #592
+given an audit comment and deliberately **left open** on `ai_panel`. Docs: PRs #729
+(PROJECT_STATE + PLAN) and #736 (GOALS).
 
 **2026-08-26 → 09-01 — the #592 epic and the dedup sweep cleared.** #669/#670/#671/#672
 (GTK live-path paint + `draw.rs` deletion), #676 (Command Center), #673/#674/#677 (tab
