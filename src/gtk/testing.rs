@@ -129,6 +129,12 @@ pub(super) struct Harness<A: AppLogic> {
     /// (nav arrows + search box) must never paint past this rect's left
     /// edge — see `command_center_does_not_overlap_window_controls`.
     pub title_bar_rect: Rc<Cell<quadraui::Rect>>,
+    /// The full menu-bar row band the last frame laid out (`layout
+    /// .title_bar_bounds`), or a default (zero) rect before the first frame
+    /// (#720). Aim app-icon pixel probes at
+    /// `render::split_menu_row_for_app_icon(this).0` rather than at guessed
+    /// chrome offsets — see `app_icon_paints_left_of_the_file_menu`.
+    pub menu_row_rect: Rc<Cell<quadraui::Rect>>,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -351,6 +357,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let status_segment_map = Rc::clone(&app.status_segment_map);
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
+    let menu_row_rect = Rc::clone(&app.menu_row_rect);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -366,6 +373,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         status_segment_map,
         separated_status_bar_rect,
         title_bar_rect,
+        menu_row_rect,
     }
 }
 
@@ -4069,6 +4077,158 @@ mod minimap {
             "the drag must move the scroll position further than the \
              initial mouse-down alone — both landed on {after_down}, so \
              the drag continuation never reached the minimap"
+        );
+    }
+}
+
+/// Black-box coverage for the VimCode app icon painted left of the `File`
+/// menu, VS Code style (#720, part 2 of #716).
+///
+/// #716 landed the app-*identity* half and explicitly deferred this one:
+/// quadraui had no raster paint path at all, so a GTK-side workaround would
+/// have been the per-backend hack the Platform-Neutrality Rule forbids. The
+/// upstream `Image` primitive + `Backend::draw_image` (quadraui#662) closed
+/// that gap; this module covers vimcode's adoption of it.
+///
+/// The paint is the easy half. A leading element shifts the menu bar's
+/// x-origin, so every item's hit-test offset moves with it — see
+/// `clicking_file_after_the_app_icon_still_opens_the_file_menu`.
+#[cfg(test)]
+mod app_icon {
+    use super::*;
+
+    // ── App icon left of the File menu (#720) ────────────────────────────
+
+    /// The reserved app-icon slot for the frame the harness last painted,
+    /// taken from the *renderer's own* menu row rect through the *same*
+    /// `split_menu_row_for_app_icon` the paint uses — never a hardcoded
+    /// chrome offset (CLAUDE.md "locate targets, never hardcode
+    /// coordinates").
+    fn painted_app_icon_rect<A: AppLogic>(h: &Harness<A>) -> quadraui::Rect {
+        let row = h.menu_row_rect.get();
+        assert!(
+            row.width > 0.0 && row.height > 0.0,
+            "the menu row must have been laid out by the last frame; got {row:?}"
+        );
+        crate::render::split_menu_row_for_app_icon(row).0
+    }
+
+    /// #720 acceptance 1: the VimCode icon renders left of `File`, at
+    /// menu-bar row height.
+    ///
+    /// Asserts on **pixels**, not on the icon rect being computed: an
+    /// unpainted slot is a flat fill (`draw_menu_bar`'s single `tab_bar_bg`
+    /// rectangle), so "the slot contains more than one distinct colour" is
+    /// exactly the difference between painted artwork and no artwork. The
+    /// asset is a blue→cyan gradient on a rounded rect, so a real paint has
+    /// many colours; the flat filler has one.
+    ///
+    /// RED-verified: with the `backend.draw_image(...)` call in
+    /// `render_content` removed, the slot stays uniformly `tab_bar_bg` and
+    /// the distinct-colour assertion fails (1 colour, not >= 8).
+    #[test]
+    fn app_icon_paints_left_of_the_file_menu() {
+        let mut h = harness(Engine::new_for_test(), 1200, 800);
+        h.driver.render();
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        let icon = painted_app_icon_rect(&h);
+        let row = h.menu_row_rect.get();
+
+        // (a) The icon slot really is to the *left* of `File`, and `File`
+        //     really did shift out of the row's leading edge.
+        assert!(
+            icon.x + icon.width <= file.x,
+            "the app icon must sit entirely left of the File label; \
+             icon={icon:?} File={file:?}"
+        );
+        assert!(
+            file.x >= row.x + crate::render::menu_bar_app_icon_slot_width_px(row.height),
+            "the File label must start after the reserved icon slot \
+             (row={row:?} slot={}); got File={file:?}",
+            crate::render::menu_bar_app_icon_slot_width_px(row.height)
+        );
+
+        // (b) The icon is sized from the *row height*, not the editor font —
+        //     it is square and fits inside the row with vertical breathing
+        //     room (#720: "size it to the menu-bar row height").
+        assert_eq!(
+            icon.width, icon.height,
+            "the app icon slot must be square; got {icon:?}"
+        );
+        assert!(
+            icon.y > row.y && icon.y + icon.height < row.y + row.height,
+            "the icon must be inset inside the menu row, not flush against \
+             its edges; icon={icon:?} row={row:?}"
+        );
+
+        // (c) Real pixels landed there.
+        let mut colours = std::collections::HashSet::new();
+        let x0 = icon.x.ceil() as i32;
+        let x1 = (icon.x + icon.width).floor() as i32;
+        let y0 = icon.y.ceil() as i32;
+        let y1 = (icon.y + icon.height).floor() as i32;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                colours.insert(h.driver.pixel(x, y));
+            }
+        }
+        assert!(
+            colours.len() >= 8,
+            "the app icon slot ({icon:?}) should hold rasterised artwork — a \
+             blue→cyan gradient on a rounded rect — but only {} distinct \
+             colour(s) were painted there ({colours:?}). One colour means the \
+             slot was reserved and background-filled but `draw_image` never \
+             put pixels in it (or gdk-pixbuf has no SVG loader on this host).",
+            colours.len()
+        );
+    }
+
+    /// #720 acceptance 2: clicking `File` still opens `File`.
+    ///
+    /// The leading icon shifts every menu item's x-origin. If the shift
+    /// reaches the paint but not `MenuSystem::handle`'s `bar_rect` (the
+    /// #552 `TabBar` bug class quadraui's `MenuBar::layout_with_leading`
+    /// doc calls out), a click aimed at the *painted* `File` label lands
+    /// one slot further right in the unshifted hit-test — i.e. on `Edit`.
+    ///
+    /// RED-verified: reverting `handle()`'s `bar_rect` to
+    /// `self.menu_row_rect` (the pre-#720 full band) makes this open the
+    /// *Edit* menu — "Undo" paints instead of "New Tab" — and the test
+    /// fails on the `New Tab` assertion.
+    #[test]
+    fn clicking_file_after_the_app_icon_still_opens_the_file_menu() {
+        let mut h = harness(Engine::new_for_test(), 1200, 800);
+        h.driver.render();
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "sanity: the File dropdown must be closed before the click"
+        );
+
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("New Tab"),
+            "clicking the painted File label must open the *File* dropdown \
+             (its first entry is \"New Tab\"); painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("Undo"),
+            "the click must not have opened the *Edit* menu — that is the \
+             symptom of hit-testing against the unshifted menu row while \
+             painting the shifted one; painted texts were {:?}",
+            h.driver.painted_texts()
         );
     }
 }

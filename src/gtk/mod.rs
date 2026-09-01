@@ -771,7 +771,26 @@ struct App {
     /// `render_content` each frame. Reused by `handle()` so `MenuSystem`'s
     /// click/key routing tests against the exact rect the bar was drawn
     /// into. (#552)
-    menu_row_rect: Cell<quadraui::Rect>,
+    ///
+    /// `Rc`-wrapped (like [`Self::title_bar_rect`]) so the headless test
+    /// harness can clone a handle and *aim* pixel probes at the row the
+    /// renderer actually used, instead of hardcoding chrome coordinates (#720).
+    menu_row_rect: Rc<Cell<quadraui::Rect>>,
+    /// The sub-rect of [`Self::menu_row_rect`] the menu *items* were actually
+    /// drawn into — `menu_row_rect` minus the app-icon slot at its leading
+    /// edge (#720). Equal to `menu_row_rect` when the icon slot is empty
+    /// (menu bar hidden / zero-height row).
+    ///
+    /// `handle()` routes `MenuSystem` clicks against **this**, not
+    /// `menu_row_rect`: the icon shifts every item's x-origin right, so a
+    /// hit-test run against the unshifted band would resolve a click on
+    /// `File` to whatever item now sits one slot to its left. Written once
+    /// per frame by `render_content` from the same
+    /// `render::split_menu_row_for_app_icon` call that positions the paint,
+    /// so paint and hit-test cannot disagree (the #552 `TabBar` bug class,
+    /// which quadraui's `MenuBar::layout_with_leading` doc calls out for
+    /// exactly this feature).
+    menu_items_rect: Cell<quadraui::Rect>,
     /// Rect of the drawn inline window-control buttons (minimize/maximize/
     /// close), to the right of the menu items within `menu_row_rect`. (#552)
     /// `Rc`-wrapped (like `picker_popup_rect` etc.) so the headless test
@@ -1636,7 +1655,8 @@ impl App {
             tab_drag_drop_zone: core::window::DropZone::None,
             window: None,
             cached_editor_bounds: Cell::new(None),
-            menu_row_rect: Cell::new(quadraui::Rect::default()),
+            menu_row_rect: Rc::new(Cell::new(quadraui::Rect::default())),
+            menu_items_rect: Cell::new(quadraui::Rect::default()),
             title_bar_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             title_bar_interaction: RefCell::new(quadraui::StatusBarInteraction::new()),
             last_sc_refresh: std::time::Instant::now(),
@@ -8200,6 +8220,23 @@ impl quadraui::ShellApp for App {
         // `engine.menu_system` / `Backend::draw_menu_bar`.
         let menu_row_rect = layout.title_bar_bounds.unwrap_or_default();
         self.menu_row_rect.set(menu_row_rect);
+        // #720: reserve a square, row-height slot at the leading edge of the
+        // band for the VimCode app icon (VS Code puts its logo left of
+        // `File`), and lay the menu items out in what's left. This is the
+        // *only* place the split is computed: `menu_items_rect` is what the
+        // measurement below, `menu_system.render()` and — via
+        // `self.menu_items_rect` — `handle()`'s click routing all use, so the
+        // icon's x-shift can never be applied to the paint but not the
+        // hit-test (quadraui's `MenuBar::layout_with_leading` doc names this
+        // exact hazard; vimcode goes through `MenuSystem`, which owns its own
+        // `MenuBar::layout` call and takes no leading width, so the narrowed
+        // rect is how vimcode expresses the same thing).
+        let (app_icon_rect, menu_items_rect) = if engine.menu_bar_visible {
+            render::split_menu_row_for_app_icon(menu_row_rect)
+        } else {
+            (quadraui::Rect::default(), menu_row_rect)
+        };
+        self.menu_items_rect.set(menu_items_rect);
         // Compute where the menu labels end so the inline window controls can
         // sit to their right. This is layout-only (`menu_bar_layout`, no draw):
         // the menu bar itself — and the whole `menu_row_rect` band — is painted
@@ -8211,7 +8248,7 @@ impl quadraui::ShellApp for App {
         let (controls_rect, command_center_rect) =
             if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
                 let bar = engine.menu_system.borrow().menu_bar();
-                let mb_layout = backend.menu_bar_layout(menu_row_rect, &bar);
+                let mb_layout = backend.menu_bar_layout(menu_items_rect, &bar);
                 // `vi.bounds.x` is already absolute (quadraui's `MenuBar::layout`
                 // starts its cursor at `bounds.x`, the rect passed above) — do not
                 // add `menu_row_rect.x` again.
@@ -8219,7 +8256,10 @@ impl quadraui::ShellApp for App {
                     .visible_items
                     .last()
                     .map(|vi| vi.bounds.x + vi.bounds.width)
-                    .unwrap_or(menu_row_rect.x);
+                    // #720: an item-less bar still starts *after* the app-icon
+                    // slot, so the Command Center / window controls must not
+                    // be handed the icon's real estate back.
+                    .unwrap_or(menu_items_rect.x);
                 let full_rect = quadraui::Rect::new(
                     menu_end,
                     menu_row_rect.y,
@@ -9369,7 +9409,43 @@ impl quadraui::ShellApp for App {
         // Rendered last so it paints on top of everything else, matching TUI
         // (render_impl.rs: "dropdown is rendered LAST ... so it draws on top").
         if engine.menu_bar_visible {
-            engine.menu_system.borrow().render(backend, menu_row_rect);
+            // `menu_items_rect`, not `menu_row_rect` — the app icon owns the
+            // leading slot (#720). `MenuSystem::render` positions the open
+            // dropdown from this same rect, so passing the narrowed one is
+            // what keeps a dropdown under the label that opened it.
+            engine.menu_system.borrow().render(backend, menu_items_rect);
+
+            // ── App icon, left of `File` (#720) ──────────────────────────
+            // `draw_menu_bar` above only filled `menu_items_rect`, so the
+            // reserved slot still shows the frame-clear colour
+            // (`theme.background`) rather than the bar's own `tab_bar_bg`.
+            // Painting an *item-less* `MenuBar` across the slot fills it
+            // through the very same rasteriser as the strip beside it, so
+            // the two backgrounds cannot drift apart the way a hand-picked
+            // theme colour would.
+            if app_icon_rect.width > 0.0 && app_icon_rect.height > 0.0 {
+                let filler = quadraui::MenuBar {
+                    id: quadraui::WidgetId::new("app_icon_slot"),
+                    items: Vec::new(),
+                    open_item: None,
+                    focused_item: None,
+                };
+                let _ = backend.draw_menu_bar(
+                    quadraui::Rect::new(
+                        menu_row_rect.x,
+                        menu_row_rect.y,
+                        (menu_items_rect.x - menu_row_rect.x).max(0.0),
+                        menu_row_rect.height,
+                    ),
+                    &filler,
+                );
+                // `util::app_icon_image`, not `render::app_icon_image`: the
+                // former hands over a once-rasterised small PNG instead of the
+                // 1024x1024 SVG, which `Backend::draw_image` would otherwise
+                // re-render through librsvg on *every* frame (+16.5ms per
+                // repaint — see that function's doc comment).
+                let _ = backend.draw_image(app_icon_rect, &util::app_icon_image());
+            }
         }
 
         // ── Command Center: nav arrows + search box (#676) ────────────────────
@@ -9600,7 +9676,14 @@ impl quadraui::ShellApp for App {
             (eng.menu_bar_visible, eng.menu_system.clone())
         };
         if menu_bar_visible || menu_system.borrow().is_open() {
-            let bar_rect = self.menu_row_rect.get();
+            // `menu_items_rect`, not `menu_row_rect` (#720): the app icon
+            // occupies a leading slot, so the items the last frame *painted*
+            // start one slot right of the band's left edge. Hit-testing
+            // against the full band would resolve a click on `File` to
+            // whatever label now sits a slot to its left. `render_content`
+            // writes this from the same `split_menu_row_for_app_icon` call
+            // that positions the paint.
+            let bar_rect = self.menu_items_rect.get();
             let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
             match menu_event {
                 quadraui::MenuEvent::Activated(id) => {

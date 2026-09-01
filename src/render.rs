@@ -14573,6 +14573,112 @@ pub fn separated_status_height_px(line_height: f64, has_separated: bool) -> f64 
     }
 }
 
+// ─── Menu-bar app icon (#720) ───────────────────────────────────────────────
+
+/// The VimCode app icon's encoded bytes.
+///
+/// The **single** embedded copy in the tree: `gtk::util::install_icon_and_desktop`
+/// writes these same bytes into the icon theme, and the GTK menu row paints
+/// them via [`app_icon_image`]. #716 consolidated three competing app
+/// identities onto `data/icons/io.github.jdonaghy.VimCode.svg`; #720 hangs a
+/// second consumer off it and must not fork a second `include_bytes!` of the
+/// same file (see that issue's "do not add a third copy of the SVG").
+pub const APP_ICON_SVG: &[u8] = include_bytes!("../data/icons/io.github.jdonaghy.VimCode.svg");
+
+/// Intrinsic size declared by [`APP_ICON_SVG`]'s `viewBox` (`0 0 1024 1024`).
+///
+/// Handed to `quadraui::Image::intrinsic_size` so `Image::layout` can preserve
+/// the aspect ratio *without* decoding. It happens to be square, so
+/// [`ImageFit::Contain`](quadraui::ImageFit::Contain) never letterboxes inside
+/// the square slot [`split_menu_row_for_app_icon`] hands it — but the field is
+/// still populated rather than left `None`, because `None` silently degrades
+/// to `Fill` (stretch) if the asset is ever replaced with a non-square one.
+const APP_ICON_INTRINSIC_SIZE: (u32, u32) = (1024, 1024);
+
+/// Fraction of the menu row's height left as breathing room above and below
+/// the app icon, so the glyph doesn't touch the window edge or the tab bar.
+const APP_ICON_INSET_FRACTION: f32 = 0.18;
+
+/// Width reserved at the leading edge of the GTK menu row for the app icon.
+///
+/// Deliberately derived from the **menu row's own height**, not from
+/// `settings.font_size` / the editor line height — the icon is window chrome
+/// and must not grow when the user bumps the editor font, the same lesson
+/// #719 applied to the activity bar's width. A square slot (`width == row
+/// height`) is what VS Code uses for the logo left of `File`.
+pub fn menu_bar_app_icon_slot_width_px(menu_row_height: f32) -> f32 {
+    if menu_row_height <= 0.0 {
+        0.0
+    } else {
+        menu_row_height
+    }
+}
+
+/// Split the full menu row band into `(icon_rect, items_rect)`.
+///
+/// `items_rect` is the rect the menu *items* live in — it is what must be
+/// handed to `MenuSystem::render` **and** `MenuSystem::handle`, and to any
+/// `Backend::menu_bar_layout` measurement, so paint geometry and hit-test
+/// geometry cannot drift. That drift is the actual regression risk of adding a
+/// leading element (quadraui's `MenuBar::layout_with_leading` doc calls out the
+/// same #552 `TabBar` bug class); vimcode goes through `MenuSystem`, which owns
+/// its own `MenuBar::layout` call and exposes no leading-width parameter, so
+/// this function is vimcode's equivalent single source of the offset.
+///
+/// `icon_rect` is a square inset vertically inside the slot by
+/// [`APP_ICON_INSET_FRACTION`], horizontally centred in the reserved slot.
+///
+/// A zero/negative-height row (menu bar hidden) yields an empty icon rect and
+/// an unchanged items rect, so callers can split unconditionally.
+pub fn split_menu_row_for_app_icon(
+    menu_row_rect: quadraui::Rect,
+) -> (quadraui::Rect, quadraui::Rect) {
+    let slot = menu_bar_app_icon_slot_width_px(menu_row_rect.height).min(menu_row_rect.width);
+    if slot <= 0.0 {
+        return (
+            quadraui::Rect::new(menu_row_rect.x, menu_row_rect.y, 0.0, 0.0),
+            menu_row_rect,
+        );
+    }
+    let inset = menu_row_rect.height * APP_ICON_INSET_FRACTION;
+    let side = (menu_row_rect.height - 2.0 * inset).max(1.0);
+    let icon = quadraui::Rect::new(
+        menu_row_rect.x + ((slot - side) / 2.0).max(0.0),
+        menu_row_rect.y + inset,
+        side,
+        side,
+    );
+    let items = quadraui::Rect::new(
+        menu_row_rect.x + slot,
+        menu_row_rect.y,
+        (menu_row_rect.width - slot).max(0.0),
+        menu_row_rect.height,
+    );
+    (icon, items)
+}
+
+/// The app icon as a `quadraui::Image`, backed by the raw SVG.
+///
+/// `fallback_text` is empty on purpose: the icon is purely decorative chrome,
+/// so a backend that cannot rasterise (TUI) or a decode failure (no SVG
+/// gdk-pixbuf loader installed) should leave the slot blank rather than paint
+/// a placeholder string where a logo belongs.
+///
+/// **Painting code wants `gtk::util::app_icon_image()`, not this.** quadraui's
+/// `Image` carries no cache, so `Backend::draw_image` re-decodes `source` every
+/// frame — and a 1024×1024 SVG through librsvg costs ~16.5 ms of that. This
+/// function owns the icon's *identity* (which asset, which fit, which id); the
+/// GTK wrapper reuses all of it and swaps in a once-rasterised small PNG.
+pub fn app_icon_image() -> quadraui::Image {
+    quadraui::Image {
+        id: quadraui::WidgetId::new("app-icon"),
+        source: quadraui::ImageSource::Bytes(APP_ICON_SVG.to_vec()),
+        intrinsic_size: Some(APP_ICON_INTRINSIC_SIZE),
+        fit: quadraui::ImageFit::Contain,
+        fallback_text: String::new(),
+    }
+}
+
 // ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
 
 pub struct TabDropGroup {
@@ -18465,5 +18571,91 @@ mod tests {
             split.ratio
         );
         assert_eq!(rect, quadraui::Rect::new(300.0, 40.0, 600.0, 500.0));
+    }
+
+    // ── Menu-bar app icon geometry (#720) ────────────────────────────────
+
+    #[test]
+    fn app_icon_slot_shifts_menu_items_by_exactly_its_width() {
+        let row = quadraui::Rect::new(10.0, 5.0, 800.0, 30.0);
+        let (icon, items) = split_menu_row_for_app_icon(row);
+        let slot = menu_bar_app_icon_slot_width_px(row.height);
+
+        assert_eq!(slot, 30.0, "the slot is the row height, making it square");
+        assert_eq!(items.x, row.x + slot);
+        assert_eq!(items.width, row.width - slot);
+        assert_eq!(items.y, row.y);
+        assert_eq!(items.height, row.height);
+        assert!(
+            icon.x + icon.width <= items.x,
+            "the icon must not overlap the items strip; icon={icon:?} items={items:?}"
+        );
+    }
+
+    /// The icon is chrome: its size must track the *menu row height* and
+    /// nothing else, so bumping `settings.font_size` (which changes the
+    /// editor line height, not this row) cannot grow it. Same lesson #719
+    /// applied to the activity bar's width.
+    #[test]
+    fn app_icon_size_tracks_row_height_only() {
+        let short = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0)).0;
+        let tall = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 800.0, 48.0)).0;
+        assert!(tall.height > short.height);
+        // Square, and strictly inside the row on both edges.
+        for (icon, h) in [(short, 24.0_f32), (tall, 48.0_f32)] {
+            assert_eq!(icon.width, icon.height, "icon must be square: {icon:?}");
+            assert!(
+                icon.height < h,
+                "icon must be inset inside the row: {icon:?}"
+            );
+            assert!(
+                icon.y > 0.0,
+                "icon must be inset from the row top: {icon:?}"
+            );
+        }
+        // Widening the row (a wider window) must not change the icon at all.
+        let wide = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 4000.0, 24.0)).0;
+        assert_eq!(wide, short);
+    }
+
+    /// A hidden / zero-height menu row must reserve nothing, so callers can
+    /// split unconditionally without the items strip silently losing width.
+    #[test]
+    fn zero_height_menu_row_reserves_no_icon_slot() {
+        let row = quadraui::Rect::new(0.0, 0.0, 800.0, 0.0);
+        let (icon, items) = split_menu_row_for_app_icon(row);
+        assert_eq!(menu_bar_app_icon_slot_width_px(row.height), 0.0);
+        assert_eq!(icon.width, 0.0);
+        assert_eq!(icon.height, 0.0);
+        assert_eq!(items, row, "the items strip must be the untouched row");
+    }
+
+    /// A window narrower than the slot must not produce a negative-width
+    /// items rect (which would wrap or panic downstream in `MenuBar::layout`).
+    #[test]
+    fn menu_row_narrower_than_the_icon_slot_clamps_to_zero_width_items() {
+        let row = quadraui::Rect::new(0.0, 0.0, 8.0, 30.0);
+        let (_, items) = split_menu_row_for_app_icon(row);
+        assert!(items.width >= 0.0, "got {items:?}");
+        assert_eq!(items.width, 0.0);
+    }
+
+    /// The icon painted in the menu row and the icon installed into the
+    /// desktop icon theme are the same artwork, by construction (#716/#720
+    /// "do not add a third copy of the SVG").
+    #[test]
+    fn app_icon_image_carries_the_shipped_svg_and_its_viewbox_size() {
+        let img = app_icon_image();
+        assert_eq!(
+            img.source,
+            quadraui::ImageSource::Bytes(APP_ICON_SVG.to_vec())
+        );
+        assert_eq!(img.intrinsic_size, Some(APP_ICON_INTRINSIC_SIZE));
+        assert_eq!(img.fit, quadraui::ImageFit::Contain);
+        let svg = std::str::from_utf8(APP_ICON_SVG).expect("the icon asset is text SVG");
+        assert!(
+            svg.contains("viewBox=\"0 0 1024 1024\""),
+            "APP_ICON_INTRINSIC_SIZE must match the asset's own viewBox"
+        );
     }
 }
