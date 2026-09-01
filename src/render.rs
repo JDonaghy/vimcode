@@ -14641,7 +14641,13 @@ pub fn split_menu_row_for_app_icon(
         );
     }
     let inset = menu_row_rect.height * APP_ICON_INSET_FRACTION;
-    let side = (menu_row_rect.height - 2.0 * inset).max(1.0);
+    // Clamp to `slot`: `slot = height.min(width)`, so in the pathological
+    // case of a row narrower than it is tall, an unclamped `side` (derived
+    // from height alone) could extend past `items`' left edge. Not
+    // reachable with any real window -- row height is always far smaller
+    // than window width -- but keeping the icon inside its own reserved
+    // slot is a one-line invariant worth holding regardless (#720 review).
+    let side = (menu_row_rect.height - 2.0 * inset).max(1.0).min(slot);
     let icon = quadraui::Rect::new(
         menu_row_rect.x + ((slot - side) / 2.0).max(0.0),
         menu_row_rect.y + inset,
@@ -18638,6 +18644,28 @@ mod tests {
         let (_, items) = split_menu_row_for_app_icon(row);
         assert!(items.width >= 0.0, "got {items:?}");
         assert_eq!(items.width, 0.0);
+    }
+
+    /// #720 review: a row narrower than it is tall must not let the
+    /// height-derived `side` spill past the reserved `slot` (`slot =
+    /// height.min(width)`) into, or past, `items`' left edge. Not reachable
+    /// with any real window (row height is always far smaller than window
+    /// width), but the invariant -- the icon rect never extends beyond its
+    /// own slot -- should hold unconditionally.
+    #[test]
+    fn menu_row_narrower_than_the_icon_slot_keeps_the_icon_inside_the_slot() {
+        let row = quadraui::Rect::new(0.0, 0.0, 8.0, 30.0);
+        let (icon, items) = split_menu_row_for_app_icon(row);
+        let slot = menu_bar_app_icon_slot_width_px(row.height).min(row.width);
+        assert!(
+            icon.x + icon.width <= row.x + slot,
+            "icon must stay within its reserved slot; icon={icon:?} slot_end={}",
+            row.x + slot
+        );
+        assert!(
+            icon.x + icon.width <= items.x,
+            "icon must not extend into the items rect; icon={icon:?} items={items:?}"
+        );
     }
 
     /// The icon painted in the menu row and the icon installed into the
