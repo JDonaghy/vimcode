@@ -10441,6 +10441,49 @@ fn build_shell_config(app: &App) -> quadraui::ShellConfig {
     quadraui::ShellConfig::new("VimCode", top_panels)
         .with_bottom_items(bottom_items)
         .with_title_bar(1.7)
+        // #719: quadraui#656 builders — route the WM app id / icon name
+        // through the single `APP_ID` constant #716 introduced, rather than
+        // a fresh string literal, so there's exactly one identity string.
+        .with_app_id(util::APP_ID)
+        .with_icon_name(util::APP_ID)
+        // #719: quadraui#657 fixed-px form. The activity bar's row height is
+        // already the fixed `ACTIVITY_ROW_PX = 48.0` (VS Code parity), so
+        // sizing the bar's *width* from the editor font (the old default)
+        // made it oblong; pin the width to the same 48px instead of using
+        // the font-relative unit form.
+        .with_activity_bar_width_px(48.0)
+}
+
+#[cfg(test)]
+mod shell_config_identity_tests {
+    //! #719: quadraui#656/#657 landed `ShellConfig::with_app_id()` /
+    //! `with_icon_name()` / `with_activity_bar_width_px()`, but a pin bump
+    //! alone doesn't prove `build_shell_config` actually calls them — a
+    //! headless build can't assert the WM taskbar/alt-tab icon (that's the
+    //! SMOKE_TESTS item), but it *can* assert the values reach the
+    //! `ShellConfig` GTK's toplevel is built from, which is the only part
+    //! of this fix source-level tests can reach.
+    use super::{build_shell_config, util, App};
+    use crate::core::Engine;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn app_id_and_icon_name_reach_shell_config() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(engine);
+        let config = build_shell_config(&app);
+        assert_eq!(config.app_id, util::APP_ID);
+        assert_eq!(config.icon_name.as_deref(), Some(util::APP_ID));
+    }
+
+    #[test]
+    fn activity_bar_pinned_to_48px_matching_its_own_row_height() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(engine);
+        let config = build_shell_config(&app);
+        assert_eq!(config.activity_bar_width_px, Some(48.0));
+    }
 }
 
 #[cfg(test)]
