@@ -1427,7 +1427,7 @@ fn sync_scrollbar_positions(
     da_width: f64,
     da_height: f64,
     line_height: f64,
-    _char_width: f64,
+    char_width: f64,
     engine: &core::Engine,
     scrollbars: &HashMap<core::WindowId, WindowScrollbars>,
 ) {
@@ -1444,21 +1444,40 @@ fn sync_scrollbar_positions(
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
+    // #723: a window with an active minimap strip uses that strip as its
+    // scroll affordance instead (`draw_minimap_strip` paints a thumb over
+    // it, VS Code's "minimap is the scrollbar track" model) — the native
+    // widget stays pinned to the pane's right edge regardless, which is
+    // exactly where the strip now lives, so leaving both up doubles the
+    // affordance in the same column. `minimap_reserved_width` is the same
+    // per-window call `build_screen_layout_with_breadcrumb_row` uses to
+    // reserve/paint the strip, so "has a strip" can't drift from what
+    // actually painted this frame.
+    let has_minimap: std::collections::HashSet<core::WindowId> = window_rects
+        .iter()
+        .filter(|(_, r)| render::minimap_reserved_width(engine, r.width, char_width) > 0.0)
+        .map(|(wid, _)| *wid)
+        .collect();
+
     // Hide scrollbars for windows not in the current visible set
-    // (e.g. windows in non-active tabs), or when a modal popup is
-    // open. Native gtk4::Scrollbar widgets render above the
-    // DrawingArea, so they would otherwise poke through the
-    // palette / picker / tab-switcher overlays.
+    // (e.g. windows in non-active tabs), for windows whose minimap now
+    // owns the scroll affordance (#723), or when a modal popup is open.
+    // Native gtk4::Scrollbar widgets render above the DrawingArea, so
+    // they would otherwise poke through the palette / picker /
+    // tab-switcher overlays.
     let visible_ids: std::collections::HashSet<core::WindowId> =
         window_rects.iter().map(|(wid, _)| *wid).collect();
     let modal_open = engine.is_blocking_modal_open();
     for (wid, ws) in scrollbars.iter() {
-        let show = visible_ids.contains(wid) && !modal_open;
+        let show = visible_ids.contains(wid) && !modal_open && !has_minimap.contains(wid);
         ws.vertical.set_visible(show);
         ws.cursor_indicator.set_visible(show);
     }
 
     for (window_id, rect) in &window_rects {
+        if has_minimap.contains(window_id) {
+            continue; // scroll affordance is the minimap thumb, not this widget (#723)
+        }
         let ws = match scrollbars.get(window_id) {
             Some(ws) => ws,
             None => continue,
@@ -2681,11 +2700,27 @@ impl App {
             }
         }
 
+        // #723: a window with an active minimap strip uses that strip as its
+        // scroll affordance instead (`draw_minimap_strip` paints a thumb over
+        // it, VS Code's "minimap is the scrollbar track" model) — leaving the
+        // native widget up too would double the affordance in the same
+        // column it now occupies. `minimap_reserved_width` is the same
+        // per-window call `build_screen_layout_with_breadcrumb_row` uses to
+        // reserve/paint the strip, so "has a strip" can't drift from what
+        // actually painted this frame.
+        let char_width = self.cached_char_width;
+        let has_minimap: std::collections::HashSet<core::WindowId> = window_rects
+            .iter()
+            .filter(|(_, r)| render::minimap_reserved_width(&engine, r.width, char_width) > 0.0)
+            .map(|(wid, _)| *wid)
+            .collect();
+
         // Hide scrollbars for windows that exist but aren't visible
-        // (e.g. windows in non-active tabs), or when a modal popup is
-        // open. Native gtk4::Scrollbar widgets render above the
-        // DrawingArea, so they would otherwise poke through the
-        // palette / picker / tab-switcher overlays.
+        // (e.g. windows in non-active tabs), whose minimap now owns the
+        // scroll affordance (#723), or when a modal popup is open. Native
+        // gtk4::Scrollbar widgets render above the DrawingArea, so they
+        // would otherwise poke through the palette / picker /
+        // tab-switcher overlays.
         let visible_ids: std::collections::HashSet<core::WindowId> =
             window_rects.iter().map(|(wid, _)| *wid).collect();
         // Native gtk4::Scrollbar widgets render above the DrawingArea
@@ -2695,13 +2730,16 @@ impl App {
         // in `Engine::is_blocking_modal_open()`.
         let modal_open = engine.is_blocking_modal_open();
         for (wid, ws) in scrollbars.iter() {
-            let show = visible_ids.contains(wid) && !modal_open;
+            let show = visible_ids.contains(wid) && !modal_open && !has_minimap.contains(wid);
             ws.vertical.set_visible(show);
             ws.cursor_indicator.set_visible(show);
         }
 
         // Create/update scrollbars for each window
         for (window_id, rect) in &window_rects {
+            if has_minimap.contains(window_id) {
+                continue; // scroll affordance is the minimap thumb, not this widget (#723)
+            }
             let window = match engine.windows.get(window_id) {
                 Some(w) => w,
                 None => continue,
