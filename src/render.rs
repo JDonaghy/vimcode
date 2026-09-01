@@ -4659,9 +4659,16 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
 /// once, not two implementations that can drift.
 pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(WindowId, usize)> {
     for mm in &screen.minimap {
-        let layout = mm
-            .minimap
-            .layout(minimap_strip_rect(mm), MINIMAP_LINES_PER_ROW);
+        // quadraui#667 deprecated the 2-arg `Minimap::layout` shim in favor
+        // of `layout_with_sizing` with an explicit `MinimapSizing` — `Fill`
+        // here is byte-for-byte the old shim's (and this function's
+        // pre-#667) behaviour, so this is a warning fix, not a behaviour
+        // change.
+        let layout = mm.minimap.layout_with_sizing(
+            minimap_strip_rect(mm),
+            MINIMAP_LINES_PER_ROW,
+            quadraui::MinimapSizing::Fill,
+        );
         if let quadraui::MinimapHit::Seek { fraction } = layout.hit_test(x as f32, y as f32) {
             return Some((
                 mm.window_id,
@@ -4867,8 +4874,13 @@ pub fn build_command_center_view(
 pub struct DialogPanel {
     pub title: String,
     pub body: Vec<String>,
-    /// Each button is `(formatted_label, is_selected)`.
-    pub buttons: Vec<(String, bool)>,
+    /// Each button is `(formatted_label, is_selected, is_cancel)`. `is_cancel`
+    /// is derived from the engine-side `DialogButton::action == "cancel"`
+    /// (#727) — it has no other visual effect in-canvas, but flows through
+    /// [`dialog_panel_to_quadraui_dialog`] into `quadraui::DialogButton::is_cancel`
+    /// so a native GTK `AlertDialog` knows which button Escape/close-box
+    /// should activate.
+    pub buttons: Vec<(String, bool, bool)>,
     /// Optional text input field (e.g. for SSH passphrase).
     pub input: Option<DialogInputPanel>,
     /// When true, buttons are rendered as a vertical list instead of a horizontal row.
@@ -4889,13 +4901,15 @@ pub fn dialog_panel_to_quadraui_dialog(panel: &DialogPanel) -> quadraui::Dialog 
         .buttons
         .iter()
         .enumerate()
-        .map(|(i, (label, is_selected))| quadraui::DialogButton {
-            id: quadraui::WidgetId::new(format!("dialog:btn:{i}")),
-            label: label.clone(),
-            is_default: *is_selected,
-            is_cancel: false,
-            tint: None,
-        })
+        .map(
+            |(i, (label, is_selected, is_cancel))| quadraui::DialogButton {
+                id: quadraui::WidgetId::new(format!("dialog:btn:{i}")),
+                label: label.clone(),
+                is_default: *is_selected,
+                is_cancel: *is_cancel,
+                tint: None,
+            },
+        )
         .collect();
     quadraui::Dialog {
         id: quadraui::WidgetId::new("dialog"),
@@ -4960,7 +4974,7 @@ pub fn dialog_generic_layout(
     let btn_max_label = panel
         .buttons
         .iter()
-        .map(|(lbl, _)| lbl.chars().count() + 4)
+        .map(|(lbl, _, _)| lbl.chars().count() + 4)
         .max()
         .unwrap_or(0);
     let btn_row_len: usize = if panel.vertical_buttons {
@@ -4969,7 +4983,7 @@ pub fn dialog_generic_layout(
         panel
             .buttons
             .iter()
-            .map(|(lbl, _)| lbl.chars().count() + 4)
+            .map(|(lbl, _, _)| lbl.chars().count() + 4)
             .sum::<usize>()
             + 2
     };
@@ -7664,7 +7678,13 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 .buttons
                 .iter()
                 .enumerate()
-                .map(|(i, btn)| (format_button_label(&btn.label, btn.hotkey), i == d.selected))
+                .map(|(i, btn)| {
+                    (
+                        format_button_label(&btn.label, btn.hotkey),
+                        i == d.selected,
+                        btn.action == "cancel",
+                    )
+                })
                 .collect(),
             input: d.input.as_ref().map(|inp| DialogInputPanel {
                 display: if inp.is_password {

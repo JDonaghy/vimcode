@@ -131,6 +131,26 @@ impl Engine {
         self.process_dialog_result(&tag, &action, input_value.as_deref())
     }
 
+    /// Cancel the currently-open dialog — the same outcome as pressing
+    /// Escape on the in-canvas dialog (`handle_dialog_key`'s `"Escape"`
+    /// arm): looks up the dialog's tag, clears it, and runs
+    /// `process_dialog_result(tag, "cancel", ..)`, the single function that
+    /// owns what "cancel" means for a given dialog tag.
+    ///
+    /// Used by the GTK native-message-dialog path (#727) when
+    /// `PlatformServices::show_message_dialog` returns `None` — the native
+    /// alert was dismissed (Escape, close box) without a button choice, the
+    /// same event the in-canvas dialog's Escape key produces. Returns
+    /// `EngineAction::None` if no dialog is open.
+    pub fn dialog_cancel(&mut self) -> EngineAction {
+        let (tag, input_value) = match self.dialog.as_ref() {
+            Some(d) => (d.tag.clone(), d.input.as_ref().map(|i| i.value.clone())),
+            None => return EngineAction::None,
+        };
+        self.dialog = None;
+        self.process_dialog_result(&tag, "cancel", input_value.as_deref())
+    }
+
     /// Handle a key press when a dialog is open.
     /// Returns `Some((tag, action))` when the dialog is dismissed, `None` to keep it open.
     pub(crate) fn handle_dialog_key(

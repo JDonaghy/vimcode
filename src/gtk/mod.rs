@@ -598,6 +598,29 @@ struct App {
     /// hit-testing both read `DialogLayout::hit_test` off this instead of a
     /// hand-rolled per-backend rect cache.
     dialog_layout: Rc<RefCell<Option<quadraui::DialogLayout>>>,
+    /// Edge-trigger flag for #727's native message-dialog path: `true`
+    /// once a native present has been queued (or already shown) for the
+    /// `engine.dialog` currently open. A native `AlertDialog` cannot be
+    /// re-presented every frame the way the in-canvas `Dialog` primitive
+    /// is repainted, so `render_content` only queues one when this is
+    /// `false`, then sets it `true`. Reset to `false` by `render_content`
+    /// when `engine.dialog` goes back to `None` (dialog closed), arming
+    /// the trigger for the next open.
+    ///
+    /// `Rc`-wrapped (like `dialog_layout` above) so `testing::harness` can
+    /// keep a handle after `App` is moved into the driver — the #727 test
+    /// asserts the present-exactly-once behaviour by repainting several
+    /// frames and checking this never re-queues.
+    native_dialog_shown: Rc<Cell<bool>>,
+    /// A native message dialog queued by `render_content`'s edge-trigger
+    /// check, drained by `tick()`. Mirrors `PendingFileDialog` (#572):
+    /// `PlatformServices::show_message_dialog` blocks via quadraui's
+    /// nested-mainloop pump, which must not run from inside the paint
+    /// callback `render_content` runs under, so the request is stashed
+    /// here and the actual call happens in `tick()` instead.
+    ///
+    /// `Rc`-wrapped for the same testing reason as `native_dialog_shown`.
+    pending_native_dialog: Rc<Cell<Option<quadraui::MessageDialogOptions>>>,
     /// Shared with the drawing-area resize callback so scrollbars can be
     /// repositioned synchronously (before each frame) without going through
     /// Relm4's async message queue.
@@ -1089,6 +1112,18 @@ struct WindowScrollbars {
 enum PendingFileDialog {
     OpenFile,
     SaveWorkspaceAs,
+}
+
+/// Parse the button index out of a `"dialog:btn:N"` id — the synthesized
+/// id convention `render::dialog_panel_to_quadraui_dialog` uses (backends
+/// dispatch clicks by index via `Engine::dialog_click_button(idx)`, since
+/// `DialogPanel.buttons` carries no engine-side id). Shared (#727) by the
+/// in-canvas `DialogHit::Button(id)` hit-test path and the native
+/// message-dialog response mapping so both parse the id the same way.
+fn dialog_btn_index(id: &quadraui::WidgetId) -> Option<usize> {
+    id.as_str()
+        .strip_prefix("dialog:btn:")
+        .and_then(|s| s.parse::<usize>().ok())
 }
 
 #[derive(Debug)]
@@ -1649,6 +1684,8 @@ impl App {
             last_editor_pointer: Rc::new(Cell::new(None)),
             cached_ui_line_height: 20.0,
             dialog_layout: Rc::new(RefCell::new(None)),
+            native_dialog_shown: Rc::new(Cell::new(false)),
+            pending_native_dialog: Rc::new(Cell::new(None)),
             line_height_cell: Rc::new(Cell::new(24.0)),
             char_width_cell: Rc::new(Cell::new(9.0)),
             mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
@@ -1794,6 +1831,54 @@ impl App {
             }
         }
         self.draw_needed.set(true);
+    }
+
+    /// Present the native message dialog queued by `render_content`'s
+    /// edge-trigger check (#727), using the runner-owned `backend`'s
+    /// `PlatformServices` — `show_message_dialog` blocks (via quadraui's
+    /// nested-mainloop pump, #666, the same adapter #427's file dialogs
+    /// use) until the user picks a button or dismisses it. Mirrors
+    /// `run_pending_file_dialog` above.
+    ///
+    /// Maps the response back through the same `"dialog:btn:N"` id
+    /// convention and `Engine::dialog_click_button` / `Engine::dialog_cancel`
+    /// the in-canvas `DialogHit::Button(id)` mouse path
+    /// (`handle_mouse_click_msg`) already uses — `None` (dismissed with no
+    /// button chosen: Escape, close box) maps to `dialog_cancel()`, the
+    /// same outcome the in-canvas dialog's Escape key produces — so both
+    /// paths funnel through the identical `EngineAction` outcomes.
+    fn run_pending_native_dialog(
+        &mut self,
+        opts: quadraui::MessageDialogOptions,
+        backend: &mut dyn quadraui::Backend,
+    ) {
+        let choice = backend.services().show_message_dialog(opts);
+        let action = match choice.as_ref().and_then(dialog_btn_index) {
+            Some(idx) => self.engine.borrow_mut().dialog_click_button(idx),
+            None => self.engine.borrow_mut().dialog_cancel(),
+        };
+        self.apply_dialog_action(action);
+        self.draw_needed.set(true);
+    }
+
+    /// Apply the `EngineAction` produced by dismissing a dialog — clears
+    /// `explorer_needs_refresh` (some dialog outcomes, e.g. "Discard &
+    /// Close", can trigger a sidebar refresh) and handles quit/save-quit.
+    /// Shared by the in-canvas mouse-click path
+    /// (`handle_mouse_click_msg`'s dialog-button block) and the native
+    /// message-dialog path (`run_pending_native_dialog`, #727) so both
+    /// produce exactly the same outcome for a given `EngineAction`.
+    fn apply_dialog_action(&mut self, action: EngineAction) {
+        if self.engine.borrow().explorer_needs_refresh {
+            self.engine.borrow_mut().explorer_needs_refresh = false;
+            self.dispatch(Msg::RefreshFileTree);
+        }
+        match action {
+            EngineAction::Quit | EngineAction::SaveQuit => {
+                self.save_session_and_exit();
+            }
+            _ => {}
+        }
     }
 
     fn dispatch(&mut self, msg: Msg) {
@@ -4396,10 +4481,7 @@ impl App {
                 dialog_layout
                     .as_ref()
                     .and_then(|dl| match dl.hit_test(x as f32, y as f32) {
-                        quadraui::DialogHit::Button(id) => id
-                            .as_str()
-                            .strip_prefix("dialog:btn:")
-                            .and_then(|s| s.parse::<usize>().ok()),
+                        quadraui::DialogHit::Button(id) => dialog_btn_index(&id),
                         _ => None,
                     });
 
@@ -4446,16 +4528,7 @@ impl App {
 
             if let Some(idx) = clicked_btn {
                 let action = self.engine.borrow_mut().dialog_click_button(idx);
-                if self.engine.borrow().explorer_needs_refresh {
-                    self.engine.borrow_mut().explorer_needs_refresh = false;
-                    self.dispatch(Msg::RefreshFileTree);
-                }
-                match action {
-                    EngineAction::Quit | EngineAction::SaveQuit => {
-                        self.save_session_and_exit();
-                    }
-                    _ => {}
-                }
+                self.apply_dialog_action(action);
                 // dialog_click_button may have closed the dialog; sync
                 // the stack so the next frame doesn't see a stale entry.
                 if self.engine.borrow().dialog.is_none() {
@@ -9639,17 +9712,53 @@ impl quadraui::ShellApp for App {
             }
         }
 
-        if let Some(ref panel) = screen.dialog {
-            let (dialog, dlayout) = render::dialog_generic_layout(panel, popup_viewport, cw, lh);
-            let mut frame = QSL::new();
-            frame.push(Surface::Dialog {
-                dialog: &dialog,
-                layout: &dlayout,
-            });
-            frame.draw(backend);
-            *self.dialog_layout.borrow_mut() = Some(dlayout);
-        } else {
-            *self.dialog_layout.borrow_mut() = None;
+        // #727: a natively-expressible `screen.dialog` (no `DialogTable`,
+        // no text input — `quadraui::native_dialog_options` is the single
+        // source of truth for that split, no hand-maintained tag list here)
+        // goes through a real OS `AlertDialog` instead of this in-canvas
+        // primitive. Unlike this primitive, which is happily repainted every
+        // frame, a native dialog must be presented exactly once per open —
+        // `native_dialog_shown` is the edge-trigger: the first
+        // `render_content` call to see a given open queues the present (via
+        // `pending_native_dialog`, drained by `tick()` since the blocking
+        // `PlatformServices` call can't run from inside this paint callback,
+        // mirroring `PendingFileDialog` #572) and flips the flag; every
+        // subsequent call before the dialog closes just suppresses the
+        // in-canvas draw without re-queuing.
+        match screen
+            .dialog
+            .as_ref()
+            .map(render::dialog_panel_to_quadraui_dialog)
+        {
+            Some(dialog) => match quadraui::native_dialog_options(&dialog) {
+                Some(opts) => {
+                    if !self.native_dialog_shown.get() {
+                        self.native_dialog_shown.set(true);
+                        self.pending_native_dialog.set(Some(opts));
+                    }
+                    *self.dialog_layout.borrow_mut() = None;
+                }
+                None => {
+                    // Carries a `DialogTable` or text input (e.g. the
+                    // SSH-passphrase prompt) — no native alert facility
+                    // hosts either, so this stays in-canvas exactly as
+                    // before.
+                    let panel = screen.dialog.as_ref().expect("just matched Some above");
+                    let (dialog, dlayout) =
+                        render::dialog_generic_layout(panel, popup_viewport, cw, lh);
+                    let mut frame = QSL::new();
+                    frame.push(Surface::Dialog {
+                        dialog: &dialog,
+                        layout: &dlayout,
+                    });
+                    frame.draw(backend);
+                    *self.dialog_layout.borrow_mut() = Some(dlayout);
+                }
+            },
+            None => {
+                self.native_dialog_shown.set(false);
+                *self.dialog_layout.borrow_mut() = None;
+            }
         }
 
         if let Some(ref panel) = screen.context_menu {
@@ -10144,6 +10253,14 @@ impl quadraui::ShellApp for App {
         // `PendingFileDialog` for why this can't happen in `dispatch()`.
         if let Some(req) = self.pending_file_dialog.take() {
             self.run_pending_file_dialog(req, backend);
+        }
+
+        // Run a native message dialog queued by `render_content`'s
+        // edge-trigger check (#727) — same reason as the file dialog above:
+        // needs the runner-owned `backend` for `PlatformServices`, which
+        // `render_content`'s paint callback must not block inside.
+        if let Some(opts) = self.pending_native_dialog.take() {
+            self.run_pending_native_dialog(opts, backend);
         }
 
         // Periodic background work: LSP, DAP, git, search, etc.

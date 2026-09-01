@@ -14972,6 +14972,52 @@ fn test_dialog_show_and_escape() {
     assert!(e.dialog.is_none());
 }
 
+/// #727: `Engine::dialog_cancel()` is what the GTK native-dialog path calls
+/// when `PlatformServices::show_message_dialog` comes back with no button
+/// chosen (Escape, close box on the real OS alert) — it must produce the
+/// exact same outcome as the in-canvas dialog's own Escape key, since both
+/// represent the same user action ("dismiss without choosing").
+#[test]
+fn test_dialog_cancel_mirrors_escape_dismiss() {
+    fn open_test_dialog(e: &mut Engine) {
+        e.show_dialog(
+            "test",
+            "Test Dialog",
+            vec!["Body line".into()],
+            vec![DialogButton {
+                label: "OK".into(),
+                hotkey: 'o',
+                action: "ok".into(),
+            }],
+        );
+    }
+
+    let mut escaped = Engine::new();
+    open_test_dialog(&mut escaped);
+    let escape_action = escaped.handle_key("Escape", None, false);
+    assert!(escaped.dialog.is_none());
+
+    let mut cancelled = Engine::new();
+    open_test_dialog(&mut cancelled);
+    let cancel_action = cancelled.dialog_cancel();
+    assert!(cancelled.dialog.is_none());
+
+    assert_eq!(
+        escape_action, cancel_action,
+        "dialog_cancel() must produce the same EngineAction as pressing Escape"
+    );
+}
+
+/// `dialog_cancel()` is a no-op (`EngineAction::None`) when no dialog is
+/// open — the native-dialog path could race a dialog being dismissed some
+/// other way before quadraui's blocking call returns.
+#[test]
+fn test_dialog_cancel_with_no_dialog_open_is_noop() {
+    let mut e = Engine::new();
+    assert!(e.dialog.is_none());
+    assert_eq!(e.dialog_cancel(), EngineAction::None);
+}
+
 #[test]
 fn test_dialog_hotkey() {
     let mut e = Engine::new();
