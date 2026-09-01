@@ -8314,11 +8314,9 @@ mod tests {
     }
 
     /// Buffer short enough to fit entirely within the viewport — the other
-    /// half of #723's acceptance: `Minimap::scroll_thumb` returns `None`
-    /// when the whole file already fits, so no thumb (and, for the same
-    /// reason, no editor-internal scrollbar either) should paint anywhere.
-    /// Sidebar forced off for the same reason as
-    /// `app_with_shaped_buffer_no_sidebar`.
+    /// half of #723's acceptance: nothing overflows, so no scrollbar (and no
+    /// minimap thumb) should paint anywhere. Sidebar forced off for the same
+    /// reason as `app_with_shaped_buffer_no_sidebar`.
     fn app_with_short_buffer() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
         app.engine.settings.autohide_panels = false;
@@ -8329,25 +8327,29 @@ mod tests {
         app
     }
 
-    /// #723 part A acceptance: with the minimap on and a file longer than
-    /// the viewport, `Minimap::layout`'s `MinimapLayout.scrollbar` resolves
-    /// `Some` — but `draw_minimap_strip` used to compute it via
-    /// `Backend::draw_minimap` and throw the result straight away (the
-    /// `MinimapLayout.scrollbar` field was never read anywhere in
-    /// `render.rs`/`src/tui_main/`/`src/gtk/`). This drives the real shell
-    /// paint path and confirms quadraui's own TUI scrollbar glyphs
-    /// (`'█'` thumb / `'░'` track, `tui::draw_scrollbar`) now paint in the
-    /// minimap strip's own leftmost column — immediately to the right of
-    /// the editor's own pre-existing vertical scrollbar column (same
-    /// glyphs, painted inside `draw_editor`), i.e. two adjacent columns,
-    /// never the same one.
+    /// #723 acceptance (TUI half): with the minimap on and a file longer
+    /// than the viewport, the pane shows **exactly one** vertical scroll
+    /// affordance, and it sits *beside* the strip rather than on top of it —
+    /// one column of `'█'`/`'░'` (quadraui's `tui::draw_editor` scrollbar),
+    /// with the minimap's braille starting in the very next column.
     ///
-    /// RED against `draw_minimap_strip` without its new `draw_scrollbar`
-    /// call: the column right of the editor's own scrollbar still shows
-    /// ordinary minimap braille, not a scrollbar glyph — confirmed by hand
-    /// by commenting out that call before restoring this fix.
+    /// This is the invariant the first attempt at #723 broke: painting
+    /// `MinimapLayout.scrollbar` over the strip via `Backend::draw_scrollbar`
+    /// put a second solid bar in the strip's leftmost column, directly
+    /// against the editor's own — two bars jammed together, which is exactly
+    /// the operator-visible defect
+    /// `render_impl::tests::test_tui_two_groups_single_boundary_scrollbar_481`
+    /// exists to prevent (it went from 2 scrollbar columns to 4). The strip's
+    /// own scroll feedback is quadraui's `viewport_highlight` band — a
+    /// *background* accent across the visible rows, painted by both
+    /// rasterisers — not a second foreground bar.
+    ///
+    /// RED against the reverted state: with `draw_minimap_strip` calling
+    /// `draw_scrollbar`, the column right of the editor's scrollbar is a
+    /// second `'░'`/`'█'` instead of braille, and the "exactly one" count is
+    /// 2. Verified by hand by restoring that call.
     #[test]
-    fn minimap_paints_a_scroll_thumb_when_the_file_overflows_via_shell_app() {
+    fn minimap_strip_does_not_double_the_scrollbar_via_shell_app() {
         let mut driver = driver_with_shell(app_with_shaped_buffer_no_sidebar(), config(), 100, 24);
         // Warm-up dispatch: the runner's own `AppShell` only picks up the
         // engine's pinned sidebar/autohide state at the tail of a
@@ -8359,36 +8361,45 @@ mod tests {
         fn is_scrollbar_glyph(c: char) -> bool {
             c == '█' || c == '░'
         }
+        // Braille block: what `tui::draw_minimap` packs its dot cells from.
+        fn is_braille(c: char) -> bool {
+            ('\u{2800}'..='\u{28FF}').contains(&c)
+        }
 
         let row = 15usize;
-        let line = screen
+        let line: Vec<char> = screen
             .lines()
             .nth(row)
-            .unwrap_or_else(|| panic!("row {row} must exist; screen:\n{screen}"));
-        let editor_sb_col = line
+            .unwrap_or_else(|| panic!("row {row} must exist; screen:\n{screen}"))
             .chars()
-            .position(is_scrollbar_glyph)
-            .unwrap_or_else(|| {
-                panic!(
-                    "the editor's own vertical scrollbar (240 lines overflowing \
-                 the viewport) must paint a '█'/'░' glyph on row {row}; \
-                 screen:\n{screen}"
-                )
-            });
+            .collect();
 
-        let next = line.chars().nth(editor_sb_col + 1);
+        let sb_cols: Vec<usize> = line
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| is_scrollbar_glyph(**c))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            sb_cols.len(),
+            1,
+            "a pane with the minimap on must show exactly one vertical \
+             scrollbar column on row {row}, got {sb_cols:?}; screen:\n{screen}"
+        );
+
+        let next = line.get(sb_cols[0] + 1).copied();
         assert!(
-            next.is_some_and(is_scrollbar_glyph),
-            "the minimap's own scroll thumb must paint a '█'/'░' glyph \
-             immediately right of the editor's own scrollbar column \
-             ({editor_sb_col}), got {next:?}; screen:\n{screen}"
+            next.is_some_and(is_braille),
+            "the minimap strip must begin in the column immediately right of \
+             the scrollbar ({}), painting braille rather than a second bar; \
+             got {next:?}; screen:\n{screen}",
+            sb_cols[0]
         );
     }
 
-    /// #723 part A acceptance, the other half: a file that fits entirely
-    /// within the viewport must paint no scroll affordance anywhere —
-    /// neither the minimap's thumb nor the editor's own scrollbar, both
-    /// gated on the same "does it overflow" condition.
+    /// #723 acceptance, the other half: a file that fits entirely within the
+    /// viewport must paint no scroll affordance anywhere — neither the
+    /// editor's own scrollbar nor a thumb over the minimap strip.
     #[test]
     fn minimap_paints_no_scroll_thumb_when_the_file_fits_via_shell_app() {
         let mut driver = driver_with_shell(app_with_short_buffer(), config(), 100, 24);
