@@ -4605,12 +4605,19 @@ pub fn build_minimap_data(
 /// function. Nothing about sampling, scaling, dot packing or colour
 /// aggregation exists on either side of it in vimcode.
 ///
-/// #723: also paints the pane's scroll thumb over the strip — VS Code's
-/// "minimap is the scrollbar track" model — whenever `MinimapLayout.scrollbar`
-/// says one exists (`None` when the whole file already fits). Painted after
-/// `draw_minimap` so the thumb sits on top of the strip's own content, via
-/// `Backend::draw_scrollbar`, the same trait method TUI's own editor
-/// scrollbar already goes through — no backend-specific painting code.
+/// #723: the strip carries its own scroll affordance — `Minimap::layout`
+/// resolves a `viewport_highlight` band that *both* quadraui rasterisers
+/// already paint (a background accent across the visible rows on TUI, a
+/// translucent slider on GTK). `MinimapLayout.scrollbar` is deliberately
+/// **not** painted on top of it: TUI's `draw_editor` already paints a solid
+/// one-column vertical scrollbar in the column immediately left of the
+/// strip, so an extra solid bar in the strip's own first column reads as
+/// two bars jammed together — the exact regression
+/// `test_tui_two_groups_single_boundary_scrollbar_481` guards. The pane's
+/// scrollbar instead stays *beside* the strip on both backends; GTK's
+/// native widget is inset past the strip by `native_scrollbar_margin_start`
+/// in `src/gtk/mod.rs`, which reads the strip width from
+/// [`minimap_reserved_width`] — the same call that reserved it here.
 pub fn draw_minimap_strip(
     backend: &mut dyn quadraui::Backend,
     screen: &ScreenLayout,
@@ -4619,57 +4626,11 @@ pub fn draw_minimap_strip(
         .minimap
         .iter()
         .map(|mm| {
-            let result = backend.draw_minimap(minimap_strip_rect(mm), &mm.minimap);
-            if result.layout.scrollbar.is_some() {
-                let sb = minimap_scrollbar(mm);
-                backend.draw_scrollbar(minimap_strip_rect(mm), &sb);
-            }
-            result.layout
+            backend
+                .draw_minimap(minimap_strip_rect(mm), &mm.minimap)
+                .layout
         })
         .collect()
-}
-
-/// Real on-screen geometry for `mm`'s scroll thumb (#723).
-///
-/// `Minimap::layout` already decides *whether* a thumb exists —
-/// `MinimapLayout.scrollbar` is `None` when the whole file fits — but the
-/// `Scrollbar` it carries in the `Some` case has a zero-sized `track`
-/// (`Minimap::scroll_thumb` is private and builds it before real pixel
-/// bounds exist), so its `thumb_start`/`thumb_len` collapse to `(0.0, 0.0)`
-/// via `fit_thumb`'s own `track_len <= 0.0` bail-out — unusable for
-/// painting. `scroll_thumb`'s own doc says as much: "callers that want
-/// on-screen thumb pixels recompute `track` from their own bounds". This
-/// does exactly that recompute — the same start/end buffer-line derivation
-/// `scroll_thumb` uses internally (`MinimapLine::line_idx` at
-/// `visible_row_start`/`visible_row_count`), just handed the strip's real
-/// bounds instead of a zero rect — nothing here re-derives *whether* a
-/// thumb should show; only `draw_minimap_strip`'s `scrollbar.is_some()`
-/// gate (quadraui's decision) does that.
-fn minimap_scrollbar(mm: &RenderedMinimap) -> quadraui::Scrollbar {
-    let m = &mm.minimap;
-    let start_buffer_line = m
-        .lines
-        .get(m.visible_row_start)
-        .map(|l| l.line_idx)
-        .unwrap_or(0);
-    let end_idx = (m.visible_row_start + m.visible_row_count).min(m.lines.len());
-    let end_buffer_line = if end_idx == 0 {
-        start_buffer_line
-    } else {
-        m.lines
-            .get(end_idx - 1)
-            .map(|l| l.line_idx + 1)
-            .unwrap_or(m.total_buffer_lines)
-    };
-    let visible = end_buffer_line.saturating_sub(start_buffer_line).max(1) as f32;
-    quadraui::Scrollbar::vertical(
-        format!("{}-scrollbar", m.id.0),
-        minimap_strip_rect(mm),
-        start_buffer_line as f32,
-        m.total_buffer_lines as f32,
-        visible,
-        1.0,
-    )
 }
 
 /// The strip a `RenderedMinimap` occupies, in quadraui coordinates.
@@ -16920,67 +16881,6 @@ mod tests {
                 && l.line_idx < 160
                 && l.text.starts_with("            ")),
             "the deeply-indented middle band must appear in the sample"
-        );
-    }
-
-    /// #723 part A: `minimap_scrollbar`'s track must be the strip's own
-    /// real on-screen bounds — not the zero-sized placeholder
-    /// `Minimap::scroll_thumb` builds internally before real pixel bounds
-    /// exist (`MinimapLayout.scrollbar.track` stays `Rect::new(0,0,0,0)`,
-    /// which collapses `thumb_start`/`thumb_len` to `(0.0, 0.0)` via
-    /// `fit_thumb`'s own `track_len <= 0.0` bail-out — unusable for
-    /// painting, see that function's own doc). This is the geometry
-    /// `draw_minimap_strip` actually hands `Backend::draw_scrollbar`.
-    #[test]
-    fn minimap_scrollbar_thumb_tracks_the_real_strip_bounds() {
-        let e = minimap_engine();
-        let screen = render_engine(&e, 120.0, 30.0);
-        let mm = screen.minimap.first().expect("minimap present");
-        let layout = mm
-            .minimap
-            .layout(minimap_strip_rect(mm), MINIMAP_LINES_PER_ROW);
-        assert!(
-            layout.scrollbar.is_some(),
-            "a 201-line file over a 30-row viewport must have a scroll thumb"
-        );
-
-        let sb = minimap_scrollbar(mm);
-        assert_eq!(
-            sb.track,
-            minimap_strip_rect(mm),
-            "the thumb's track must be the strip's real on-screen bounds"
-        );
-        assert!(sb.thumb_len > 0.0, "the thumb must have non-zero length");
-        assert!(
-            sb.thumb_len < sb.track.height,
-            "the thumb must be shorter than the full track — some of the \
-             file is scrolled out of view"
-        );
-        assert_eq!(
-            sb.thumb_start, 0.0,
-            "scrolled to the top of the file, the thumb must start at the \
-             track's own top"
-        );
-    }
-
-    /// #723 part A, the other half: a file that fits entirely within the
-    /// viewport has nothing to scroll — `MinimapLayout.scrollbar` is
-    /// `None`, matching `Minimap::scroll_thumb`'s documented contract, and
-    /// `draw_minimap_strip` never calls `minimap_scrollbar` at all in that
-    /// case (see its `scrollbar.is_some()` gate).
-    #[test]
-    fn minimap_layout_has_no_scrollbar_when_the_file_fits() {
-        let mut e = test_engine("");
-        e.buffer_mut().insert(0, &"short\n".repeat(5));
-        let screen = render_engine(&e, 120.0, 30.0);
-        let mm = screen.minimap.first().expect("minimap present");
-        let layout = mm
-            .minimap
-            .layout(minimap_strip_rect(mm), MINIMAP_LINES_PER_ROW);
-        assert!(
-            layout.scrollbar.is_none(),
-            "a 5-line file fitting entirely within a 30-row viewport must \
-             have no scroll thumb"
         );
     }
 

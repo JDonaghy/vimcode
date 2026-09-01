@@ -1412,6 +1412,39 @@ enum Msg {
     },
 }
 
+/// Left edge (drawing-area px, as a GTK `margin-start`) of a window's native
+/// vertical `gtk4::Scrollbar`.
+///
+/// #723: `minimap_reserved_width` carves the minimap strip out of the pane's
+/// **right** edge, but native `gtk4::Scrollbar` widgets live in the `Overlay`
+/// *above* the `DrawingArea` — so a scrollbar pinned to `rect`'s outer edge
+/// lands on top of the strip, where it is both indistinguishable from the
+/// minimap and (being an opaque widget) hides the strip content underneath.
+/// That is the "no scrollbar when the minimap is on" the issue reports.
+///
+/// Insetting by `minimap_width` puts the scrollbar immediately to the *left*
+/// of the strip — exactly where TUI's editor-internal scrollbar column
+/// already sits (quadraui's `tui::draw_editor` paints it at the editor
+/// viewport's right edge, and that viewport is already narrowed by the same
+/// reserved width). Both backends therefore land on one scroll affordance in
+/// the same relative place, which is why `draw_minimap_strip` deliberately
+/// does not paint a second one over the strip.
+///
+/// The trailing 2px keeps the bar off the group divider / adjacent group,
+/// preserved from the pre-#723 positioning. `minimap_width` is `0.0` when the
+/// strip is off (`:set nominimap`, or a pane too narrow to afford one), which
+/// reduces this to exactly that original expression. Clamped to `rect_x` so a
+/// pathologically narrow pane can never push the widget left of its own pane.
+fn native_scrollbar_margin_start(
+    rect_x: f64,
+    rect_width: f64,
+    scrollbar_width: f64,
+    minimap_width: f64,
+) -> i32 {
+    let x = rect_x + rect_width - minimap_width - scrollbar_width - 2.0;
+    x.max(rect_x).round() as i32
+}
+
 /// Reposition existing scrollbar widgets for the given drawing-area size.
 ///
 /// This is a free function so it can be called both from `sync_scrollbar` (via
@@ -1444,40 +1477,21 @@ fn sync_scrollbar_positions(
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
 
-    // #723: a window with an active minimap strip uses that strip as its
-    // scroll affordance instead (`draw_minimap_strip` paints a thumb over
-    // it, VS Code's "minimap is the scrollbar track" model) — the native
-    // widget stays pinned to the pane's right edge regardless, which is
-    // exactly where the strip now lives, so leaving both up doubles the
-    // affordance in the same column. `minimap_reserved_width` is the same
-    // per-window call `build_screen_layout_with_breadcrumb_row` uses to
-    // reserve/paint the strip, so "has a strip" can't drift from what
-    // actually painted this frame.
-    let has_minimap: std::collections::HashSet<core::WindowId> = window_rects
-        .iter()
-        .filter(|(_, r)| render::minimap_reserved_width(engine, r.width, char_width) > 0.0)
-        .map(|(wid, _)| *wid)
-        .collect();
-
     // Hide scrollbars for windows not in the current visible set
-    // (e.g. windows in non-active tabs), for windows whose minimap now
-    // owns the scroll affordance (#723), or when a modal popup is open.
-    // Native gtk4::Scrollbar widgets render above the DrawingArea, so
-    // they would otherwise poke through the palette / picker /
-    // tab-switcher overlays.
+    // (e.g. windows in non-active tabs), or when a modal popup is
+    // open. Native gtk4::Scrollbar widgets render above the
+    // DrawingArea, so they would otherwise poke through the
+    // palette / picker / tab-switcher overlays.
     let visible_ids: std::collections::HashSet<core::WindowId> =
         window_rects.iter().map(|(wid, _)| *wid).collect();
     let modal_open = engine.is_blocking_modal_open();
     for (wid, ws) in scrollbars.iter() {
-        let show = visible_ids.contains(wid) && !modal_open && !has_minimap.contains(wid);
+        let show = visible_ids.contains(wid) && !modal_open;
         ws.vertical.set_visible(show);
         ws.cursor_indicator.set_visible(show);
     }
 
     for (window_id, rect) in &window_rects {
-        if has_minimap.contains(window_id) {
-            continue; // scroll affordance is the minimap thumb, not this widget (#723)
-        }
         let ws = match scrollbars.get(window_id) {
             Some(ws) => ws,
             None => continue,
@@ -1493,13 +1507,16 @@ fn sync_scrollbar_positions(
         // — Vertical scrollbar —
         // Query the actual allocated width so we position correctly even if
         // GTK's theme enforces a minimum wider than our CSS min-width.
-        // Inset 2px from the right edge so the scrollbar doesn't visually
-        // overlap the group divider or the adjacent group's space.
         let sb_actual_w = ws.vertical.width().max(4) as f64;
+        let minimap_w = render::minimap_reserved_width(engine, rect.width, char_width);
         ws.vertical.set_halign(gtk4::Align::Start);
         ws.vertical.set_valign(gtk4::Align::Start);
-        ws.vertical
-            .set_margin_start(rect.x as i32 + (rect.width - sb_actual_w) as i32 - 2);
+        ws.vertical.set_margin_start(native_scrollbar_margin_start(
+            rect.x,
+            rect.width,
+            sb_actual_w,
+            minimap_w,
+        ));
         ws.vertical.set_margin_top(rect.y as i32);
         ws.vertical
             .set_height_request((rect.height as i32 - 4).max(0));
@@ -2700,27 +2717,18 @@ impl App {
             }
         }
 
-        // #723: a window with an active minimap strip uses that strip as its
-        // scroll affordance instead (`draw_minimap_strip` paints a thumb over
-        // it, VS Code's "minimap is the scrollbar track" model) — leaving the
-        // native widget up too would double the affordance in the same
-        // column it now occupies. `minimap_reserved_width` is the same
-        // per-window call `build_screen_layout_with_breadcrumb_row` uses to
-        // reserve/paint the strip, so "has a strip" can't drift from what
-        // actually painted this frame.
+        // #723: the minimap strip is reserved out of each pane's right edge,
+        // so the native scrollbar has to be inset past it — see
+        // `native_scrollbar_margin_start`. Same per-window call
+        // `build_screen_layout_with_breadcrumb_row` reserves/paints the strip
+        // with, so the inset can't drift from what actually painted.
         let char_width = self.cached_char_width;
-        let has_minimap: std::collections::HashSet<core::WindowId> = window_rects
-            .iter()
-            .filter(|(_, r)| render::minimap_reserved_width(&engine, r.width, char_width) > 0.0)
-            .map(|(wid, _)| *wid)
-            .collect();
 
         // Hide scrollbars for windows that exist but aren't visible
-        // (e.g. windows in non-active tabs), whose minimap now owns the
-        // scroll affordance (#723), or when a modal popup is open. Native
-        // gtk4::Scrollbar widgets render above the DrawingArea, so they
-        // would otherwise poke through the palette / picker /
-        // tab-switcher overlays.
+        // (e.g. windows in non-active tabs), or when a modal popup is
+        // open. Native gtk4::Scrollbar widgets render above the
+        // DrawingArea, so they would otherwise poke through the
+        // palette / picker / tab-switcher overlays.
         let visible_ids: std::collections::HashSet<core::WindowId> =
             window_rects.iter().map(|(wid, _)| *wid).collect();
         // Native gtk4::Scrollbar widgets render above the DrawingArea
@@ -2730,16 +2738,13 @@ impl App {
         // in `Engine::is_blocking_modal_open()`.
         let modal_open = engine.is_blocking_modal_open();
         for (wid, ws) in scrollbars.iter() {
-            let show = visible_ids.contains(wid) && !modal_open && !has_minimap.contains(wid);
+            let show = visible_ids.contains(wid) && !modal_open;
             ws.vertical.set_visible(show);
             ws.cursor_indicator.set_visible(show);
         }
 
         // Create/update scrollbars for each window
         for (window_id, rect) in &window_rects {
-            if has_minimap.contains(window_id) {
-                continue; // scroll affordance is the minimap thumb, not this widget (#723)
-            }
             let window = match engine.windows.get(window_id) {
                 Some(w) => w,
                 None => continue,
@@ -2767,7 +2772,10 @@ impl App {
             ws.vertical.set_halign(gtk4::Align::Start);
             ws.vertical.set_valign(gtk4::Align::Start);
 
-            let scrollbar_x = rect.x as i32 + (rect.width - 10.0) as i32;
+            // Inset past the minimap strip (#723) — see
+            // `native_scrollbar_margin_start`.
+            let minimap_w = render::minimap_reserved_width(&engine, rect.width, char_width);
+            let scrollbar_x = native_scrollbar_margin_start(rect.x, rect.width, 10.0, minimap_w);
             ws.vertical.set_margin_start(scrollbar_x);
             ws.vertical.set_margin_top(rect.y as i32);
             ws.vertical
@@ -2795,7 +2803,10 @@ impl App {
                 let indicator_y = rect.y + (ratio * scrollbar_height);
 
                 let sb_w = ws.vertical.width().max(4) as f64;
-                let indicator_x = rect.x as i32 + (rect.width - sb_w) as i32;
+                // Track the scrollbar's own inset so the cursor tick stays
+                // on the bar rather than under the minimap strip (#723).
+                let indicator_x =
+                    native_scrollbar_margin_start(rect.x, rect.width, sb_w, minimap_w);
                 ws.cursor_indicator.set_margin_start(indicator_x);
                 ws.cursor_indicator.set_margin_top(indicator_y as i32);
 
@@ -10574,6 +10585,61 @@ fn build_shell_config(app: &App) -> quadraui::ShellConfig {
         // made it oblong; pin the width to the same 48px instead of using
         // the font-relative unit form.
         .with_activity_bar_width_px(48.0)
+}
+
+#[cfg(test)]
+mod native_scrollbar_placement_tests {
+    //! #723: GTK's native `gtk4::Scrollbar` widgets live in the `Overlay`
+    //! *above* the `DrawingArea`, so a scrollbar pinned to the pane's outer
+    //! edge lands on top of the minimap strip that
+    //! `render::minimap_reserved_width` reserves out of that same edge —
+    //! the "no scrollbar when the minimap is on" symptom.
+    //!
+    //! Widget visibility/geometry itself is out of reach headlessly
+    //! (`App::new_headless` never constructs a real `gtk4::Scrollbar`, and
+    //! `GtkDriver` only sees Cairo paint, not overlay widgets), so the
+    //! geometry decision is factored into the pure
+    //! `native_scrollbar_margin_start` and pinned here. The on-screen
+    //! result is a SMOKE_TESTS item.
+    use super::native_scrollbar_margin_start;
+
+    /// Strip off (`:set nominimap`, or a pane too narrow to afford one):
+    /// unchanged from the pre-#723 expression — right edge, less the
+    /// scrollbar's own width, less the 2px divider gap.
+    #[test]
+    fn no_minimap_keeps_the_scrollbar_on_the_panes_right_edge() {
+        assert_eq!(native_scrollbar_margin_start(0.0, 800.0, 12.0, 0.0), 786);
+        assert_eq!(native_scrollbar_margin_start(400.0, 400.0, 12.0, 0.0), 786);
+    }
+
+    /// RED against `develop`: the pre-fix expression ignored the strip and
+    /// returned 786 here too — 48px *inside* the strip, i.e. the scrollbar
+    /// painted over the minimap instead of beside it.
+    #[test]
+    fn minimap_pushes_the_scrollbar_left_of_the_strip() {
+        let x = native_scrollbar_margin_start(0.0, 800.0, 12.0, 48.0);
+        assert_eq!(x, 738, "must be inset by the strip's full 48px width");
+        assert!(
+            x + 12 <= 800 - 48,
+            "the scrollbar's right edge ({}) must not reach into the strip, \
+             which starts at 752",
+            x + 12
+        );
+    }
+
+    /// Second pane of a `:vsplit` — the inset is relative to that pane's own
+    /// origin, not the drawing area's.
+    #[test]
+    fn split_pane_inset_is_relative_to_the_panes_own_origin() {
+        assert_eq!(native_scrollbar_margin_start(400.0, 400.0, 12.0, 48.0), 738);
+    }
+
+    /// A pane narrower than strip + scrollbar can't push the widget out of
+    /// its own pane.
+    #[test]
+    fn degenerate_pane_clamps_to_the_pane_origin() {
+        assert_eq!(native_scrollbar_margin_start(100.0, 30.0, 12.0, 48.0), 100);
+    }
 }
 
 #[cfg(test)]
