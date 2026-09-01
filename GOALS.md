@@ -140,7 +140,7 @@ not the whole remainder.
 
 | Issue | What | Status |
 |---|---|---|
-| **quadraui#465** | macOS backend: `ShellApp` + `run_with_shell` composition support. All macOS chrome *primitives* already exist — this is purely the composition/runner wiring, the macOS analogue of what #595 did for TUI. **This is the actual gate on "the macOS port is a thin wrapper."** | 📋 OPEN, supply-side (#5), **not queued** |
+| **quadraui#465** | macOS backend: `ShellApp` + `run_with_shell` composition support — the macOS analogue of what #595 did for TUI, and the stated gate on "the macOS port is a thin wrapper." | ✅ **CLOSED 2026-08-31** (`bd92d6f` + `434e1d6`). The gate is cleared. |
 | **#657** | Put vimcode on the oracle loop | 🔨 Queued after #735 |
 | **#146** | Lua plugin API → quadraui primitives | ⚠️ Weakest fit of the original #7 seeding; **not de-dup work**. Recommend moving out of #7 to a feature milestone. |
 
@@ -170,7 +170,14 @@ about to be deleted, then re-resolving on every subsequent PR), **not an oversig
   class as `draw.rs` but invisible to #672's `allow(dead_code)` criterion because they
   are *read*, never *written*. It has already cost a landed fix (#723).
 - ⚠️ **Two operator decisions open** (above): the freeze, and worker-authored verification.
-- 📋 **quadraui#465 remains unqueued** — the real gate on the macOS port.
+- ✅ **quadraui#465 landed 2026-08-31** — the supply-side gate on a thin macOS wrapper is
+  **cleared**. Nothing on the quadraui side now blocks starting a macOS backend; what
+  remains is vimcode-side, and it is the same chain above (a "thin wrapper" is only thin
+  once there is no feature logic left in GTK/TUI to re-implement).
+- 📋 **No vimcode issue exists for the macOS backend itself.** #47 ("Native macOS GUI")
+  predates quadraui and needs re-scoping against `run_with_shell` before it means
+  anything. Not queued — deliberately, until the chain above has shrunk what a wrapper
+  would have to wrap.
 
 ## How to use this doc
 
