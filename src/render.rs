@@ -4336,20 +4336,41 @@ pub struct ScreenLayout {
     /// active tabs. Independent of `editor_group_split` — window splits exist
     /// regardless of how many editor groups are open (#582).
     pub window_dividers: Vec<WindowDivider>,
-    /// Code-overview minimap for the active editor window, or `None` when the
-    /// `minimap` setting is off / the window is too narrow to spare the strip
-    /// (#35). Backends paint it with a single `draw_minimap` call and route
-    /// clicks through `MinimapLayout::hit_test`; every piece of sampling,
-    /// scale arithmetic, colour aggregation and dot packing lives in quadraui.
-    pub minimap: Option<RenderedMinimap>,
+    /// Code-overview minimap for *every* editor window (#35, #722) — one
+    /// entry per `WindowId` that has the `minimap` setting on and enough
+    /// width to spare the strip, empty when none do. A `:vsplit` therefore
+    /// carries two entries, one per pane, instead of a single strip pinned
+    /// to whichever pane happens to be active. Backends paint each with a
+    /// `draw_minimap` call (see `draw_minimap_strip`, which loops over this
+    /// vec) and route clicks through `MinimapLayout::hit_test`; every piece
+    /// of sampling, scale arithmetic, colour aggregation and dot packing
+    /// lives in quadraui.
+    pub minimap: Vec<RenderedMinimap>,
 }
 
 // ─── Minimap (#35) ────────────────────────────────────────────────────────────
 
-/// Character-cell columns the minimap strip reserves on the right edge of the
-/// active editor window. In GTK this is multiplied by `char_width` to get
-/// pixels; in TUI `char_width` is `1.0`, so it *is* the cell count.
-pub const MINIMAP_COLS: usize = 12;
+/// Fraction of a pane's own width the minimap strip reserves (#722).
+///
+/// VS Code keeps its minimap at a roughly constant fraction of the editor
+/// regardless of window width or editor font size — e.g. its ~120px strip
+/// over a ~800px editor pane at default settings is ~15%. This is the
+/// primary driver of `minimap_reserved_width`'s `want`; `MINIMAP_MIN_COLS`/
+/// `MINIMAP_MAX_COLS` below only bound the extremes, so widening a pane
+/// grows the strip and resizing the editor font does not (both pinned by
+/// `render.rs`'s minimap test module).
+pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
+
+/// Floor on the reserved width, in the caller's own local columns — cells
+/// directly for TUI, multiplied by `char_width` into pixels for GTK (same
+/// convention as `MINIMAP_MIN_TEXT_COLS` below). Stops the strip shrinking
+/// to an unreadable sliver in a merely-narrow pane, before
+/// `MINIMAP_MIN_TEXT_COLS` suppresses it outright in a very narrow one.
+const MINIMAP_MIN_COLS: f64 = 6.0;
+
+/// Ceiling on the reserved width, same units as `MINIMAP_MIN_COLS`. Stops
+/// the strip from eating an ever-growing share of a very wide pane.
+const MINIMAP_MAX_COLS: f64 = 30.0;
 
 /// Text columns that must survive after reserving the strip. Below this the
 /// minimap suppresses itself rather than squeezing the editor into a sliver.
@@ -4390,13 +4411,22 @@ pub struct RenderedMinimap {
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
 ///
+/// `want` is `rect_width * MINIMAP_WIDTH_FRACTION`, clamped to
+/// `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]` (in local columns, i.e. multiplied
+/// by `char_width` for GTK) — a proportion of *this pane's* width, not a
+/// fixed column count multiplied by the editor's font metrics (#722). That
+/// makes the strip grow with the pane and hold steady across a font-size
+/// change, matching VS Code.
+///
 /// Delegates the on/off decision to `quadraui::reserved_width` so both
-/// backends (and `build_screen_layout`, which shrinks the window rect by
+/// backends (and `build_screen_layout`, which shrinks each window rect by
 /// exactly this much) reclaim identical geometry when `:set nominimap`
 /// turns the strip off.
 pub fn minimap_reserved_width(engine: &Engine, rect_width: f64, char_width: f64) -> f64 {
     let cw = if char_width > 0.0 { char_width } else { 1.0 };
-    let want = MINIMAP_COLS as f64 * cw;
+    let min_w = MINIMAP_MIN_COLS * cw;
+    let max_w = MINIMAP_MAX_COLS * cw;
+    let want = (rect_width * MINIMAP_WIDTH_FRACTION).clamp(min_w, max_w);
     let has = engine.settings.minimap && rect_width >= want + MINIMAP_MIN_TEXT_COLS * cw;
     quadraui::reserved_width(want as f32, has) as f64
 }
@@ -4529,8 +4559,9 @@ pub fn build_minimap_data(
     })
 }
 
-/// Paint `screen.minimap` (if any) through the backend's own rasteriser and
-/// return the resolved layout for click routing.
+/// Paint every entry in `screen.minimap` (#722 — one per editor pane, not
+/// just the active one) through the backend's own rasteriser and return the
+/// resolved layouts for click routing, in the same order.
 ///
 /// This is the *entire* backend-side contract for the minimap: GTK's font
 /// scaling and TUI's braille packing are quadraui's implementations of
@@ -4540,13 +4571,16 @@ pub fn build_minimap_data(
 pub fn draw_minimap_strip(
     backend: &mut dyn quadraui::Backend,
     screen: &ScreenLayout,
-) -> Option<quadraui::MinimapLayout> {
-    let mm = screen.minimap.as_ref()?;
-    Some(
-        backend
-            .draw_minimap(minimap_strip_rect(mm), &mm.minimap)
-            .layout,
-    )
+) -> Vec<quadraui::MinimapLayout> {
+    screen
+        .minimap
+        .iter()
+        .map(|mm| {
+            backend
+                .draw_minimap(minimap_strip_rect(mm), &mm.minimap)
+                .layout
+        })
+        .collect()
 }
 
 /// The strip a `RenderedMinimap` occupies, in quadraui coordinates.
@@ -4561,49 +4595,55 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
 }
 
 /// Resolve a click/drag at `(x, y)` (backend units, same space as
-/// [`minimap_strip_rect`]) against the minimap track, returning the buffer
-/// line to scroll to. `None` when there is no minimap or the point misses it.
+/// [`minimap_strip_rect`]) against every pane's minimap track (#722),
+/// returning the window it hit plus the buffer line to scroll that window
+/// to. `None` when no pane has a minimap or the point misses all of them.
+///
+/// Panes never overlap, so at most one strip can claim a given point — the
+/// loop stops at the first hit rather than needing to pick a "closest" one.
 ///
 /// Needs no backend instance: `MinimapLayout::hit_test` resolves purely from
 /// `bounds`, which is the same strip rect both rasterisers were handed —
 /// `lines_per_row` only shapes the *painted* rows, never the hit fraction. So
 /// "click the vertical middle → ~50% of the file" is one behaviour computed
 /// once, not two implementations that can drift.
-pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<usize> {
-    let mm = screen.minimap.as_ref()?;
-    let layout = mm
-        .minimap
-        .layout(minimap_strip_rect(mm), MINIMAP_LINES_PER_ROW);
-    match layout.hit_test(x as f32, y as f32) {
-        quadraui::MinimapHit::Seek { fraction } => Some(minimap_fraction_to_line(
-            fraction,
-            mm.minimap.total_buffer_lines,
-        )),
-        quadraui::MinimapHit::None => None,
+pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(WindowId, usize)> {
+    for mm in &screen.minimap {
+        let layout = mm
+            .minimap
+            .layout(minimap_strip_rect(mm), MINIMAP_LINES_PER_ROW);
+        if let quadraui::MinimapHit::Seek { fraction } = layout.hit_test(x as f32, y as f32) {
+            return Some((
+                mm.window_id,
+                minimap_fraction_to_line(fraction, mm.minimap.total_buffer_lines),
+            ));
+        }
     }
+    None
 }
 
-/// Apply a minimap click/drag: scroll the strip's window to the clicked
+/// Apply a minimap click/drag: scroll the *hit* pane's window to the clicked
 /// fraction of the file and carry the cursor with it, so the next
-/// `ensure_cursor_visible` doesn't snap the view straight back.
+/// `ensure_cursor_visible` doesn't snap the view straight back. Works
+/// against whichever pane's strip the point landed on (#722), not just the
+/// active window.
 ///
-/// Returns the buffer line scrolled to, or `None` when the point missed the
-/// strip (in which case the caller must fall through to its normal editor
-/// click handling).
+/// Returns the window scrolled and the buffer line scrolled to, or `None`
+/// when the point missed every strip (in which case the caller must fall
+/// through to its normal editor click handling).
 pub fn apply_minimap_click(
     engine: &mut Engine,
     screen: &ScreenLayout,
     x: f64,
     y: f64,
-) -> Option<usize> {
-    let line = minimap_click_line(screen, x, y)?;
-    let window_id = screen.minimap.as_ref()?.window_id;
+) -> Option<(WindowId, usize)> {
+    let (window_id, line) = minimap_click_line(screen, x, y)?;
     engine.set_scroll_top_for_window(window_id, line);
     if let Some(w) = engine.windows.get_mut(&window_id) {
         w.view.cursor.line = line;
         w.view.cursor.col = 0;
     }
-    Some(line)
+    Some((window_id, line))
 }
 
 /// Buffer line a minimap click at `fraction` of the track should scroll to.
@@ -6762,14 +6802,17 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // check below, since `:split`/`:vsplit` panes exist within a single group.
     let window_dividers = engine.calculate_window_dividers(window_rects);
 
-    // Minimap strip (#35). Reserved off the *active* window's right edge, and
-    // subtracted from that window's rect before the text is laid out so the
-    // editor reclaims the exact same width when `:set nominimap` turns it off.
-    let minimap_w = window_rects
+    // Minimap strip (#35, #722). Reserved off *every* window's right edge —
+    // not just the active one — and subtracted from that same window's rect
+    // before its text is laid out, so each pane reclaims exactly its own
+    // strip's width when `:set nominimap` turns the strip off. Keyed per
+    // window (rather than a single scalar) because `minimap_reserved_width`
+    // is a function of that window's own rect width, so unevenly split
+    // panes legitimately get differently-sized strips.
+    let minimap_widths: std::collections::HashMap<WindowId, f64> = window_rects
         .iter()
-        .find(|(id, _)| *id == active_window_id)
-        .map(|(_, r)| minimap_reserved_width(engine, r.width, char_width))
-        .unwrap_or(0.0);
+        .map(|(id, r)| (*id, minimap_reserved_width(engine, r.width, char_width)))
+        .collect();
 
     let windows = window_rects
         .iter()
@@ -6779,14 +6822,11 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 visible_lines -= 1; // reserve bottom row for per-window status bar
             }
             let is_active = *window_id == active_window_id;
+            let minimap_w = minimap_widths.get(window_id).copied().unwrap_or(0.0);
             let narrowed = WindowRect::new(
                 rect.x,
                 rect.y,
-                if is_active {
-                    (rect.width - minimap_w).max(0.0)
-                } else {
-                    rect.width
-                },
+                (rect.width - minimap_w).max(0.0),
                 rect.height,
             );
             let rect = &narrowed;
@@ -6814,34 +6854,37 @@ pub fn build_screen_layout_with_breadcrumb_row(
         })
         .collect();
 
-    // The strip itself: the sliver just reclaimed above, minus the per-window
-    // status row when one is painted inside the window.
-    let minimap = if minimap_w > 0.0 {
-        window_rects
-            .iter()
-            .find(|(id, _)| *id == active_window_id)
-            .and_then(|(id, r)| {
-                let status_h = if per_window_status && !separate_status && r.height > line_height {
-                    line_height
-                } else {
-                    0.0
-                };
-                build_minimap_data(
-                    engine,
-                    theme,
-                    *id,
-                    WindowRect::new(
-                        r.x + r.width - minimap_w,
-                        r.y,
-                        minimap_w,
-                        (r.height - status_h).max(0.0),
-                    ),
-                    line_height,
-                )
-            })
-    } else {
-        None
-    };
+    // The strips themselves: the sliver just reclaimed off each window above,
+    // minus the per-window status row when one is painted inside that window.
+    // One `RenderedMinimap` per window that has a strip, in `window_rects`
+    // order — a `:vsplit` therefore carries two independent strips, each
+    // over its own pane's buffer, instead of one that migrates with focus.
+    let minimap: Vec<RenderedMinimap> = window_rects
+        .iter()
+        .filter_map(|(id, r)| {
+            let minimap_w = minimap_widths.get(id).copied().unwrap_or(0.0);
+            if minimap_w <= 0.0 {
+                return None;
+            }
+            let status_h = if per_window_status && !separate_status && r.height > line_height {
+                line_height
+            } else {
+                0.0
+            };
+            build_minimap_data(
+                engine,
+                theme,
+                *id,
+                WindowRect::new(
+                    r.x + r.width - minimap_w,
+                    r.y,
+                    minimap_w,
+                    (r.height - status_h).max(0.0),
+                ),
+                line_height,
+            )
+        })
+        .collect();
 
     let separated_status_line = if separate_status {
         Some(build_window_status_line(
@@ -16396,7 +16439,7 @@ mod tests {
         e
     }
 
-    // ─── Minimap (#35) ───────────────────────────────────────────────────
+    // ─── Minimap (#35, #722) ────────────────────────────────────────────
 
     /// A file with a distinctive indentation shape — deep on the inside,
     /// flush at the edges — so a transposed dot grid would be obvious.
@@ -16413,6 +16456,10 @@ mod tests {
     /// Acceptance: `:set nominimap` must widen the editor text area by
     /// *exactly* the reserved width, and `:set minimap` must give it back.
     /// Asserted on the rendered `text_viewport_cols`, not on the setting.
+    /// The expected delta is computed through `minimap_reserved_width`
+    /// itself (the single source of truth `build_screen_layout` also
+    /// reads) rather than a hardcoded column count, since #722 made that
+    /// width a function of pane width instead of a fixed constant.
     #[test]
     fn nominimap_widens_the_editor_by_exactly_the_reserved_width() {
         let mut e = minimap_engine();
@@ -16420,25 +16467,79 @@ mod tests {
         e.settings.minimap = true;
         let with = render_engine(&e, 120.0, 30.0);
         let cols_with = with.windows[0].text_viewport_cols;
-        assert!(
-            with.minimap.is_some(),
+        assert_eq!(
+            with.minimap.len(),
+            1,
             "the minimap must be present when the setting is on"
         );
+        let expected_cols = minimap_reserved_width(&e, 120.0, 1.0) as usize;
 
         e.settings.minimap = false;
         let without = render_engine(&e, 120.0, 30.0);
         let cols_without = without.windows[0].text_viewport_cols;
         assert!(
-            without.minimap.is_none(),
+            without.minimap.is_empty(),
             "`:set nominimap` must remove the minimap from the layout"
         );
 
         assert_eq!(
             cols_without - cols_with,
-            MINIMAP_COLS,
-            "turning the minimap off must hand the editor back exactly \
-             MINIMAP_COLS columns (with={cols_with}, without={cols_without})"
+            expected_cols,
+            "turning the minimap off must hand the editor back exactly the \
+             reserved width (with={cols_with}, without={cols_without}, \
+             expected={expected_cols})"
         );
+    }
+
+    /// #722 acceptance: `:set nominimap` reclaims exactly the reserved width
+    /// in *every* pane of a split, not just a single active one — extending
+    /// the test above to `:vsplit`.
+    #[test]
+    fn nominimap_widens_every_pane_in_a_split_by_exactly_its_reserved_width() {
+        let mut e = minimap_engine();
+        e.split_window(SplitDirection::Vertical, None);
+
+        e.settings.minimap = true;
+        let with = render_engine(&e, 160.0, 30.0);
+        assert_eq!(with.windows.len(), 2, "vsplit must produce two windows");
+        assert_eq!(
+            with.minimap.len(),
+            2,
+            "both panes must carry their own minimap when the setting is on"
+        );
+
+        e.settings.minimap = false;
+        let without = render_engine(&e, 160.0, 30.0);
+        assert!(
+            without.minimap.is_empty(),
+            "`:set nominimap` must remove every pane's minimap"
+        );
+        // `minimap_reserved_width` reads `engine.settings.minimap` itself —
+        // put it back on before using `e` to recompute what each pane
+        // *would* reserve, or every expectation below collapses to 0.
+        e.settings.minimap = true;
+
+        for w_with in &with.windows {
+            let w_without = without
+                .windows
+                .iter()
+                .find(|w| w.window_id == w_with.window_id)
+                .expect("window set must be identical with/without the minimap");
+            // `w_with.rect.width` is already narrowed by its own strip;
+            // `w_without.rect.width` is the same pane's un-narrowed width
+            // (minimap off ⇒ no narrowing), which is what
+            // `minimap_reserved_width` expects to be fed back in.
+            let expected_cols = minimap_reserved_width(&e, w_without.rect.width, 1.0) as usize;
+            assert_eq!(
+                w_without.text_viewport_cols - w_with.text_viewport_cols,
+                expected_cols,
+                "pane {:?} must regain exactly its own reserved width \
+                 (with={}, without={}, expected={expected_cols})",
+                w_with.window_id,
+                w_with.text_viewport_cols,
+                w_without.text_viewport_cols
+            );
+        }
     }
 
     /// `reserved_width` is the single source of truth for that reclaim —
@@ -16447,12 +16548,8 @@ mod tests {
     fn minimap_reserved_width_is_zero_when_the_setting_is_off() {
         let mut e = minimap_engine();
         e.settings.minimap = true;
-        assert_eq!(minimap_reserved_width(&e, 120.0, 1.0), MINIMAP_COLS as f64);
-        // GTK units: the same call in pixels.
-        assert_eq!(
-            minimap_reserved_width(&e, 1200.0, 8.0),
-            MINIMAP_COLS as f64 * 8.0
-        );
+        assert!(minimap_reserved_width(&e, 120.0, 1.0) > 0.0);
+        assert!(minimap_reserved_width(&e, 1200.0, 8.0) > 0.0);
         e.settings.minimap = false;
         assert_eq!(minimap_reserved_width(&e, 120.0, 1.0), 0.0);
         assert_eq!(minimap_reserved_width(&e, 1200.0, 8.0), 0.0);
@@ -16466,8 +16563,54 @@ mod tests {
         assert_eq!(
             minimap_reserved_width(&e, 20.0, 1.0),
             0.0,
-            "a 20-column window cannot spare a 12-column strip"
+            "a 20-column window cannot spare the minimap's floor width plus \
+             MINIMAP_MIN_TEXT_COLS of surviving text"
         );
+    }
+
+    /// #722 acceptance: the reserved width is a proportion of the *pane's*
+    /// width, so widening the pane must widen the strip too — unlike the
+    /// old fixed `MINIMAP_COLS` constant, which stayed put as the window
+    /// grew. Both widths chosen well inside `[MINIMAP_MIN_COLS,
+    /// MINIMAP_MAX_COLS]` so the clamp never masks the scaling.
+    #[test]
+    fn minimap_reserved_width_scales_with_pane_width() {
+        let e = minimap_engine();
+        // Both widths land `want = width * MINIMAP_WIDTH_FRACTION` strictly
+        // inside `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]` (9 and 18, against a
+        // 6..30 band) so the clamp can't be masking the scaling either test
+        // exercises.
+        let narrow = minimap_reserved_width(&e, 60.0, 1.0);
+        let wide = minimap_reserved_width(&e, 120.0, 1.0);
+        assert_eq!(narrow, 60.0 * MINIMAP_WIDTH_FRACTION);
+        assert_eq!(wide, 120.0 * MINIMAP_WIDTH_FRACTION);
+        assert!(
+            wide > narrow * 1.5,
+            "doubling the pane width must substantially widen the strip: \
+             narrow(60)={narrow}, wide(120)={wide}"
+        );
+    }
+
+    /// #722 acceptance: bumping the editor font (`char_width`) must NOT
+    /// change the reserved width at a fixed pane width — the old formula
+    /// multiplied `MINIMAP_COLS` by `char_width` directly, so a larger font
+    /// made the strip wider, which is backwards (VS Code's minimap width is
+    /// independent of the editor font). Pane width chosen so the
+    /// fraction-derived want sits inside the clamp band for every
+    /// `char_width` tested, so the clamp itself can't be the reason the
+    /// widths happen to match.
+    #[test]
+    fn minimap_reserved_width_is_unchanged_by_font_size() {
+        let e = minimap_engine();
+        let pane_width = 1200.0;
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0);
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0);
+        assert_eq!(
+            small_font, large_font,
+            "reserved width must not depend on char_width: \
+             8px/char={small_font}, 16px/char={large_font}"
+        );
+        assert_eq!(small_font, pane_width * MINIMAP_WIDTH_FRACTION);
     }
 
     /// Acceptance: clicking the vertical middle of the strip seeks to ~50%
@@ -16476,12 +16619,18 @@ mod tests {
     fn minimap_click_at_the_middle_seeks_to_half_the_file() {
         let mut e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
-        let mm = screen.minimap.as_ref().expect("minimap present");
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
         let total = mm.minimap.total_buffer_lines as f64;
 
         let mid_x = mm.rect.x + mm.rect.width / 2.0;
         let mid_y = mm.rect.y + mm.rect.height / 2.0;
-        let line = minimap_click_line(&screen, mid_x, mid_y).expect("middle of the strip must hit");
+        let (hit_win, line) =
+            minimap_click_line(&screen, mid_x, mid_y).expect("middle of the strip must hit");
+        assert_eq!(
+            hit_win, win_id,
+            "the hit must resolve to the pane it was clicked in"
+        );
         let frac = line as f64 / total;
         assert!(
             (frac - 0.5).abs() < 0.1,
@@ -16490,8 +16639,9 @@ mod tests {
         );
 
         // …and it actually scrolls the window there.
-        let scrolled =
+        let (scrolled_win, scrolled) =
             apply_minimap_click(&mut e, &screen, mid_x, mid_y).expect("click must be handled");
+        assert_eq!(scrolled_win, win_id);
         assert_eq!(scrolled, line);
         assert_eq!(e.scroll_top(), line, "the window must be scrolled to it");
     }
@@ -16502,12 +16652,13 @@ mod tests {
     fn minimap_click_top_bottom_and_miss() {
         let e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
-        let mm = screen.minimap.as_ref().expect("minimap present");
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
         let total = mm.minimap.total_buffer_lines;
         let x = mm.rect.x + 1.0;
 
-        assert_eq!(minimap_click_line(&screen, x, mm.rect.y), Some(0));
-        let bottom = minimap_click_line(&screen, x, mm.rect.y + mm.rect.height - 0.5)
+        assert_eq!(minimap_click_line(&screen, x, mm.rect.y), Some((win_id, 0)));
+        let (_, bottom) = minimap_click_line(&screen, x, mm.rect.y + mm.rect.height - 0.5)
             .expect("bottom of the track must hit");
         assert!(
             bottom >= total - total / 10,
@@ -16541,7 +16692,7 @@ mod tests {
     fn minimap_samples_the_whole_buffer_in_order() {
         let e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
-        let mm = &screen.minimap.as_ref().expect("minimap present").minimap;
+        let mm = &screen.minimap.first().expect("minimap present").minimap;
         assert_eq!(
             mm.total_buffer_lines, 201,
             "200 lines plus the trailing one"
@@ -16560,6 +16711,107 @@ mod tests {
                 && l.text.starts_with("            ")),
             "the deeply-indented middle band must appear in the sample"
         );
+    }
+
+    /// #722 acceptance: in a `:vsplit`, both panes show their own minimap
+    /// over their own buffer — not a single strip pinned to the active
+    /// pane. Each buffer gets distinct content so a transposed or
+    /// cross-wired sample (pane A showing pane B's file) would show up as a
+    /// mismatched `total_buffer_lines`.
+    #[test]
+    fn split_gives_every_pane_its_own_minimap_over_its_own_buffer() {
+        let mut e = test_engine("");
+        e.buffer_mut().insert(0, &"left\n".repeat(50));
+        e.split_window(SplitDirection::Vertical, None);
+        // The split's new window starts on the same buffer; give it its own
+        // so the two minimaps are provably over different files.
+        let new_buf = e.buffer_manager.create();
+        e.buffer_manager
+            .get_mut(new_buf)
+            .unwrap()
+            .buffer
+            .insert(0, &"right\n".repeat(120));
+        e.active_window_mut().buffer_id = new_buf;
+
+        let screen = render_engine(&e, 160.0, 30.0);
+        assert_eq!(screen.windows.len(), 2, "vsplit must produce two windows");
+        assert_eq!(
+            screen.minimap.len(),
+            2,
+            "both panes must carry a minimap, not just the active one"
+        );
+
+        let totals: Vec<usize> = screen
+            .windows
+            .iter()
+            .map(|w| {
+                screen
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == w.window_id)
+                    .unwrap_or_else(|| panic!("pane {:?} must have its own minimap", w.window_id))
+                    .minimap
+                    .total_buffer_lines
+            })
+            .collect();
+        assert_ne!(
+            totals[0], totals[1],
+            "the two panes' minimaps must reflect their own distinct buffers, \
+             got matching totals {totals:?}"
+        );
+    }
+
+    /// #722 acceptance: switching focus between panes must not change
+    /// either pane's text width. Before the fix, the width reclaim was
+    /// gated on `is_active`, so *both* panes reflowed every time focus
+    /// moved — assert the window rects (hence `text_viewport_cols`) are
+    /// bit-identical across a focus change with the minimap on.
+    #[test]
+    fn focus_change_does_not_move_either_panes_text_width() {
+        let mut e = minimap_engine();
+        e.split_window(SplitDirection::Vertical, None);
+        e.settings.minimap = true;
+
+        let before = render_engine(&e, 160.0, 30.0);
+        assert_eq!(before.minimap.len(), 2, "both panes must have a minimap");
+        let widths_before: std::collections::HashMap<WindowId, f64> = before
+            .windows
+            .iter()
+            .map(|w| (w.window_id, w.rect.width))
+            .collect();
+        let cols_before: std::collections::HashMap<WindowId, usize> = before
+            .windows
+            .iter()
+            .map(|w| (w.window_id, w.text_viewport_cols))
+            .collect();
+
+        let focus_before = e.active_window_id();
+        e.focus_next_window();
+        assert_ne!(
+            e.active_window_id(),
+            focus_before,
+            "test setup sanity: focus must actually have moved"
+        );
+
+        let after = render_engine(&e, 160.0, 30.0);
+        assert_eq!(
+            after.minimap.len(),
+            2,
+            "both panes must still have a minimap"
+        );
+        for w in &after.windows {
+            assert_eq!(
+                w.rect.width, widths_before[&w.window_id],
+                "pane {:?}'s width must not change when focus moves elsewhere",
+                w.window_id
+            );
+            assert_eq!(
+                w.text_viewport_cols, cols_before[&w.window_id],
+                "pane {:?}'s text_viewport_cols must not change when focus \
+                 moves elsewhere",
+                w.window_id
+            );
+        }
     }
 
     #[test]
@@ -16690,6 +16942,11 @@ mod tests {
     #[test]
     fn test_screen_layout_split_windows() {
         let mut e = test_engine("file one\n");
+        // This test is about general split geometry, not the minimap — turn
+        // it off so its per-pane width reservation (#722: every pane reserves
+        // its own strip now, not just the active one) doesn't confound the
+        // "windows divide the available width" assertion below.
+        e.settings.minimap = false;
         // Open a vertical split
         e.open_editor_group(SplitDirection::Vertical);
 

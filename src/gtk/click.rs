@@ -91,14 +91,18 @@ pub(super) fn pixel_to_click_target(
         }
     }
 
-    // ── Minimap click / drag (#35) ──────────────────────────────────────────
-    // Pure rect plumbing: the shared resolver owns the hit-test and the scroll.
-    // Checked before the zone walk because the strip was carved out of the
-    // active window's rect, so a `ScreenZone::Window` hit would otherwise
-    // swallow it. Gated on `mutate_focus` so a hover query never scrolls.
+    // ── Minimap click / drag (#35, #722) ────────────────────────────────────
+    // Pure rect plumbing: the shared resolver owns the hit-test and the
+    // scroll. Checked before the zone walk because every window's strip is
+    // carved out of that window's own rect, so a `ScreenZone::Window` hit
+    // would otherwise swallow it. Gated on `mutate_focus` so a hover query
+    // never scrolls. `apply_minimap_click` resolves against *every* pane's
+    // strip and reports which one it hit — never assumed to be the active
+    // window, since a split can have a strip on an inactive pane too.
     if mutate_focus {
-        if let Some(line) = render_mod::apply_minimap_click(engine, cached_layout, x, y) {
-            let window_id = engine.active_window_id();
+        if let Some((window_id, line)) =
+            render_mod::apply_minimap_click(engine, cached_layout, x, y)
+        {
             return ClickTarget::Minimap(window_id, line);
         }
     }

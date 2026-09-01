@@ -4,7 +4,7 @@ expression: "lines.join(\"\\n\")"
 ---
  󰍜   [No Name] ×                                   󰤲    ⋯
 ▎
-    buffer content                             ⠉⠉⠉⠉⠉⠁⠉⠉⠉⠉⠉⠉
+    buffer content                                 ⠉⠉⠉⠁⠉⠉⠉⠉
  
  
  
@@ -12,5 +12,5 @@ expression: "lines.join(\"\\n\")"
 
 
 
-     COMMAND  [No Name]  Spaces: 4  Ln 1, Col 1
+     COMMAND  [No Name]  LF Spaces: 4  Ln 1, Col 1
    :set
