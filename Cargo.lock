@@ -2219,7 +2219,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=bde2f4481009fa156b20a76debd16c23468a5537#bde2f4481009fa156b20a76debd16c23468a5537"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=69fd9cdd2107be401306bf64d1fd9553127d7226#69fd9cdd2107be401306bf64d1fd9553127d7226"
 dependencies = [
  "arboard",
  "gtk4",
@@ -3382,7 +3382,7 @@ dependencies = [
 [[package]]
 name = "vt100"
 version = "0.16.2"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=bde2f4481009fa156b20a76debd16c23468a5537#bde2f4481009fa156b20a76debd16c23468a5537"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=69fd9cdd2107be401306bf64d1fd9553127d7226#69fd9cdd2107be401306bf64d1fd9553127d7226"
 dependencies = [
  "itoa",
  "unicode-width",

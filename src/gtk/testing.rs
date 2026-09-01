@@ -3811,8 +3811,9 @@ mod minimap {
             let l = layout.as_ref().unwrap();
             let mm = l
                 .minimap
-                .as_ref()
-                .expect("the layout must carry a minimap when the setting is on");
+                .iter()
+                .find(|m| m.window_id == win_on)
+                .expect("the layout must carry a minimap for the pane when the setting is on");
             let rw = l.windows.iter().find(|w| w.window_id == win_on).unwrap();
             (mm.rect, rw.rect.width, rw.text_viewport_cols)
         };
@@ -3829,21 +3830,23 @@ mod minimap {
             let layout = h_off.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
             assert!(
-                l.minimap.is_none(),
+                l.minimap.is_empty(),
                 "`minimap: false` must remove the minimap from the layout"
             );
             let rw = l.windows.iter().find(|w| w.window_id == win_off).unwrap();
             (rw.rect.width, rw.text_viewport_cols)
         };
 
-        // `reserved_width` is defined in character cells; assert the strip in
-        // that unit too, without this test having to re-derive GTK's
-        // char_width (which is not the same number the harness reports).
-        assert_eq!(
-            off_cols - on_cols,
-            crate::render::MINIMAP_COLS,
-            "the editor must regain exactly MINIMAP_COLS text columns when \
-             the minimap is off (on={on_cols}, off={off_cols})"
+        // #722: the reserved width is now a proportion of the pane's own
+        // width rather than a fixed `MINIMAP_COLS` count, so the column
+        // delta isn't a pinned constant any more. The pixel-exact assertion
+        // right below is the real acceptance check (`build_screen_layout`
+        // narrows/widens the rect by exactly `strip.width`); this is just a
+        // column-domain sanity check that *some* text columns came back.
+        assert!(
+            off_cols > on_cols,
+            "the editor must regain text columns when the minimap is off \
+             (on={on_cols}, off={off_cols})"
         );
         assert_eq!(
             on_w + strip.width,
@@ -3912,7 +3915,11 @@ mod minimap {
         let (strip, total, rect, gutter_px, char_w, lh) = {
             let layout = h.screen_layout.borrow();
             let l = layout.as_ref().unwrap();
-            let mm = l.minimap.as_ref().expect("minimap must be present");
+            let mm = l
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
             let rw = l
                 .windows
                 .iter()
@@ -4032,8 +4039,9 @@ mod minimap {
                 .as_ref()
                 .unwrap()
                 .minimap
-                .as_ref()
-                .expect("minimap must be present");
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
             (mm.rect, mm.minimap.total_buffer_lines)
         };
         assert_eq!(
