@@ -1,27 +1,89 @@
 # VimCode Project State
 
-**Last updated:** May 19, 2026 (Session 389 — **Coordinator-driven 3-agent sprint.** 13 issues closed, 10 PRs merged. vimcode: #447 GTK AppShell intermediate (PR #495), #475 TUI key dedup (PR #492), #467 completion popup filtering (PR #498), #483/#485 TUI ext panel fixes (PR #501), #465 breadcrumb symbol picker (PR #502). quadraui: #206 unicode-width (PR #220), #209 rounded chrome (PR #228), #227 drop overlay (PR #229), #230 rich text link advance (PR #231), #222 TextInput primitive (PR #232). Rolled back PR #496 (platform-neutrality violation) → fixed properly via quadraui #230. Filed 7 quadraui pipeline issues (#221–#227), 2 already-implemented, 3 shipped. Unblocked vimcode #479/#480/#481/#488. Next: Server #479 (Settings FormController), Desktop A #488 (hover links — zero-code retest after quadraui pull), Quadraui #223 (ButtonBar). 1994+ lib tests passing.)
+**Last updated:** September 1, 2026 — **audit session.** Verified the platform-neutrality effort against the code rather than against issue-closure state. #592's four children (#669–#672) all landed and `src/gtk/draw.rs` is deleted, but **`screen.ai_panel` is still unpainted on GTK** (`src/gtk/mod.rs:9364`), so #592 stays open. Found a second orphan pocket the epic could not have seen: **22 Relm4-era widget handles on `App` are initialised `None` and assigned nowhere**, guarding ~103 unreachable arms — which is why #723's GTK half (`e02a824`) cannot run. #593 re-scoped (unblocked by #672; #646's `GtkDriver` replaces its stale "needs live smoke" plan). Three issue bodies drafted: the orphan sweep, the `Msg`-bus retirement, and mouse-router convergence.
 
-## Active milestone: Cross-Platform UI Crate
+## Active milestone: #7 Platform-Neutral
 
-**This is the current top priority.** All quadraui primitive migrations must complete before moving to other milestones. The goal is zero bespoke per-backend code — every UI surface paints, scrolls, and handles clicks through quadraui's shared API. A native Windows backend will be re-added as a thin wrapper when the quadraui Win backend ships (quadraui#19–#31).
+**The north star is [`GOALS.md`](GOALS.md): eliminate all platform-specific code from
+vimcode and lift it into quadraui.** Milestone **#7 Platform-Neutral** is the consume
+side (vimcode adopts a shipped quadraui API and *deletes* its bespoke per-backend code);
+milestone **#5 Cross-Platform UI Crate** is the supply side (building quadraui itself).
+Don't conflate them. A native Windows/macOS backend gets re-added as a thin wrapper once
+there is no feature logic left in the existing backends to re-implement.
 
-**All bespoke paint surfaces are now eliminated.** Every UI surface in both TUI and GTK paints through quadraui primitives. **Scroll dispatch consolidation (#307) is complete** — all scrollable surfaces route through `dispatch_scroll`/`dispatch_click`.
+### Done
 
-**Vimcode-side dedup work added to milestone** (#429, #428, #395, #274, #225, #233) **+ TUI convergence backlog** from Session 388 audit (#477, #478, #479, #480, #481 — #475 closed Session 389). **Session 389 unblocked:** #479 (Settings FormController — Form cursor already exists in quadraui), #480 (partially — TextInput primitive shipped as quadraui#222), #481 (scrollbar + drop overlay — both primitives exist). Remaining quadraui pipeline: #223 (ButtonBar), #224 (Palette dual-mode), #225 (Dialog table). **GTK convergence chain:** #447 intermediate step landed (PR #495) → full `run_with_shell()` migration filed as #493 (blocked on quadraui stages 3+4) → #448 (event dispatch → UiEvent) → #449 (click dispatch → FrameHitMap).
+- **Both structural migrations closed 2026-08-26.** #448 (GTK → `ShellApp::handle`) and
+  #595 (TUI → `ShellApp` + `run_with_shell`). `fn event_loop` no longer exists in `src/`.
+  `impl ShellApp for App` at `src/gtk/mod.rs:8123`; `TuiShellApp` at
+  `src/tui_main/shell_app.rs:1251`.
+- **The orphaned GTK paint path is gone.** #669/#670/#671/#672 painted 13 of the 14
+  dropped `ScreenLayout` fields on GTK's live path and deleted `src/gtk/draw.rs`
+  (−2,327 production lines). #676 recovered the Command Center, the one sibling the
+  epic's `draw.rs`-shaped method could not have found.
+- **Dedup sweep landed:** #621 (`fuzzy_score` → `quadraui::text_util`), #659 (driver tab
+  geometry + `SidebarSystem::reveal`), #660 (four duplicates retired, incl. `SplitTree`),
+  #536 (activity-bar keyboard nav → `AppShell` cursor).
+- Milestone #7 stands at **29 closed / 4 open**; quadraui milestone #9 ("vimcode
+  Platform-Neutral blockers") is closed out.
 
-**#505 landed (ff-merge `ee502f9`):** SC action-button row migrated to `quadraui::Toolbar` (unblocked by quadraui#257/#259). Both hand-painters (TUI `set_cell` + GTK Cairo/Pango) and the bespoke `sc_button_hit_test` deleted; shared `render::sc_button_toolbar` + `draw_sc_button_toolbar` builder, cached `ToolbarLayout` for click/hover hit-test. Commit button now dims + no-ops when the message is empty. Carved out of #480's four chunks. Follow-ups filed: #509 (adopt `SidebarPanel` to consolidate the SC button-row + sections Y-geometry, recomputed across 4 files) and #510 (debug toolbar → `Toolbar`, replacing the faked `StatusBar`).
+### Open, and what actually gates each
+
+| Issue | State |
+|---|---|
+| **#592** (epic) | 13 of 14 fields done. **`ai_panel` still unpainted on GTK** — #670 deferred it to a follow-up that was never filed (`src/gtk/mod.rs:9364-9369`, click holdout at `:7325`). Closes when that lands. |
+| **#593** Ctrl+V on GTK | **Unblocked** — the #672 hold is lifted, and #646's `GtkDriver` supersedes the "no GTK harness, needs live smoke" plan in its body. Re-scoped 2026-09-01. |
+| **#658** preview tier | The only genuinely supply-blocked item: quadraui#596 + #597 both OPEN. Two live copies of vimcode's own preview policy until it lands. |
+| **#146** Lua → quadraui | Weakest fit of the original #7 seeding. Re-triage or drop. |
+
+### Untracked residual — the actual remaining mass
+
+Production lines (`#[cfg(test)]` blocks excluded):
+
+| | 2026-05-01 | 2026-07-01 | 2026-09-01 |
+|---|---|---|---|
+| `src/gtk/` | 18,979 | 13,388 | **12,588** |
+| `src/tui_main/` | 14,657 | 10,305 | **11,135** |
+| `src/render.rs` (shared) | 10,547 | 12,690 | **15,110** |
+
+The May→July drop was real. **Since July 1 the two backends are flat** — 23,693 → 23,723
+combined; `draw.rs`'s −2,327 was cancelled by new growth. Shared code grew +2,420 over
+the same window, so *new* features are going shared (the Platform-Neutrality Rule is
+working) while the *existing* per-backend mass has stopped coming down.
+
+Where it sits, none of it issue-shaped before 2026-09-01:
+
+- **Mouse/click routing, ~4,800 lines.** GTK `handle_mouse_click_msg` (`mod.rs:3785`,
+  1,071) + `handle_mouse_drag_msg` (356) + `try_route_sidebar_mouse_event` (176) ↔ TUI
+  `handle_mouse` (`mouse.rs:157`, **3,027 lines in one function**) + `handle_mouse_event`
+  (364). Same precedence ladder, written twice, with rungs each backend has and the other
+  doesn't.
+- **The GTK `Msg` bus.** 124 variants (`mod.rs:1096-1413`), 301 `Msg::` sites, 684-line
+  `fn dispatch` (`:1799`), 16 `handle_*_msg` methods. `ShellApp::handle` re-encodes a
+  `UiEvent` it already holds into one of 17 `Msg` variants so `dispatch` can decode it
+  again. TUI has no equivalent.
+- **Frame composition, ~4,500 lines.** GTK `render_content` (1,533) ↔ TUI
+  `render_content` (708) + `draw_frame` (749) + `panels.rs` (1,555).
+- **22 orphaned Relm4-era widget handles** on `App` — initialised `None`, assigned
+  nowhere in the crate, guarding ~103 arms that never execute. Same class as `draw.rs`,
+  but invisible to #672's "no file-level `allow(dead_code)`" criterion because they are
+  *read*, just never *written*. Live cost: #723's GTK half (`e02a824`) targets a
+  `gtk4::Scrollbar` that is never constructed, so that fix cannot run.
+
+### Trust gate
+
+**#657** (promote `gtk`/`render`/`tui_main` into `vimcode_core`, seal a
+`tests/acceptance/` suite) remains the gate under all of the above — today's tests are
+written by the same worker that writes the fix. #553 is the in-repo proof: it shipped
+`GtkDriver` tests that stayed green with the bug reinstated. Note the false blocker in
+#657's body — "vimcode needs a GTK acceptance driver first" is **wrong** (#646 shipped
+one) and chasing it costs a large piece of work that isn't needed.
 
 ---
 
-Vimcode at 1994+ lib tests passing.
-
-> Sessions 388 and earlier in **SESSION_HISTORY.md**.
-
-> Feature documentation lives in **README.md**.
-> **Active multi-stage wave:** `quadraui` cross-platform UI crate extraction — see **PLAN.md** for pickup-on-another-machine instructions.
-
-
+> Feature documentation lives in **README.md**. Sessions 389 and earlier in
+> **SESSION_HISTORY.md**. No multi-stage wave is in flight — **PLAN.md** is history until
+> the next one opens.
 
 ---
 
@@ -49,14 +111,19 @@ TUI was the reference implementation through Phase C; GTK caught
 up. Numbers update with each Path-A landing — read this to find
 the next slice.
 
-**Status (post #296, 2026-05-02):** **TUI/GTK paint duplication is
-done.** Every entry in the cross-backend coverage table below is ✅
-on both backends. Debug sidebar migrated to `MultiSectionView`
-(#296) — both paint and click consume one cached layout per frame.
-**No bespoke section-walk paint code remains.** Residual convergence
-work (#210/#211/#288-style hit-test/click items) plus
-intrinsic-to-surface divergences (Cairo painter order vs ratatui
-cell coalescence) remain but are tracked separately.
+**Status (2026-09-01):** **Paint duplication is done for every
+surface in the table below** — all ✅ on both backends. The
+GTK-side regression that #540 introduced (surfaces painted only
+by the since-deleted `draw.rs`) was swept by #669–#672; the one
+holdout is `ai_panel`, which has no row here because it was never
+migrated to a primitive on GTK at all.
+
+No bespoke section-walk paint code remains (debug sidebar moved to
+`MultiSectionView` in #296 — both paint and click consume one cached
+layout per frame). What remains cross-backend is **not paint**: it is
+the mouse-routing and event-dispatch duplication listed under
+"Untracked residual" above, plus intrinsic-to-surface divergences
+(Cairo painter order vs ratatui cell coalescence).
 
 | Surface | Primitive | TUI | GTK | Notes |
 |---|---|---|---|---|
@@ -132,3 +199,20 @@ cell coalescence) remain but are tracked separately.
 ## Recent Work
 
 > Sessions 389 and earlier in **SESSION_HISTORY.md**.
+
+**2026-09-01 — platform-neutrality audit (docs only).** Measured the effort against the
+code. Findings and their disposition are in "Active milestone" above; the three drafted
+issue bodies (orphan-handle sweep, `Msg`-bus retirement, mouse-router convergence) plus
+the missing `ai_panel` child are the queue that comes out of it. #592 given an audit
+comment and deliberately **left open**; #593 re-scoped.
+
+**2026-08-26 → 09-01 — the #592 epic and the dedup sweep cleared.** #669/#670/#671/#672
+(GTK live-path paint + `draw.rs` deletion), #676 (Command Center), #673/#674/#677 (tab
+MRU, jump-list pane identity, vacuous-test rewrites), #621/#659/#660/#536 (dedup),
+#691 (quadraui pinned as a git rev instead of a sibling path dep), #693/#694/#695
+(menu-bar paint + hamburger), #699–#705 (VS Code chrome-metrics parity), #35 (minimap
+primitive, both backends), #710/#712 (omnibar + dropdown fonts), #715/#716/#719/#720
+(WM identity, titlebar glyphs, app icon), #722/#723 (per-pane minimap, scroll thumb).
+
+**2026-08-26 — both `ShellApp` migrations closed.** #448 (GTK) and #595 (TUI).
+`fn event_loop` deleted from `src/` (#634).
