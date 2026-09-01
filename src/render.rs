@@ -16817,66 +16817,104 @@ mod tests {
         test_engine(&text)
     }
 
-    /// #728 performance acceptance: wheel-scrolling a 10,000-line file must
-    /// not cost O(buffer) per frame. `build_minimap_data` used to allocate a
-    /// `String` for *every* line in the buffer on every call regardless of
-    /// how many it actually samples (`quadraui::sample_lines` only keeps
-    /// ~`target_lines`, but the old code built the whole buffer as
-    /// candidates first) — this simulates sustained wheel scroll (one call
-    /// per frame, `scroll_top` advancing each time so the sampled window
-    /// keeps moving, the same as a real scroll) and pins a cost ceiling a
-    /// buffer-wide allocation blows through.
-    ///
-    /// Measured on this machine (debug `cargo test --no-default-features
-    /// --bin vcd`), 300 simulated scroll frames over a 10,000-line file:
-    ///   - before (whole-buffer `owned: Vec<String>` every frame): **24.23s
-    ///     total, ~80.8ms/frame** — unusable under sustained wheel scroll,
-    ///     matching the issue's report.
-    ///   - after (index-first sampling, only ~`target_lines` lines fetched
-    ///     from the rope per frame): **0.40s total, ~1.34ms/frame** — a
-    ///     ~60x improvement, and no longer scales with buffer size at all
-    ///     (cost tracks `target_lines`, i.e. the strip's own display rows).
-    ///
-    /// The ceiling below (500ms) is intentionally generous — an order of
-    /// magnitude above the fixed measurement — so the test is a regression
-    /// guard against reintroducing O(buffer) behavior, not a tight perf pin
-    /// that flakes on a loaded CI box.
-    #[test]
-    fn minimap_scroll_does_not_scale_with_buffer_size() {
-        let n_lines = 10_000;
-        let mut e = large_minimap_engine(n_lines);
-        e.settings.minimap = true;
+    /// Time `frames` simulated wheel-scroll frames of `build_minimap_data`
+    /// over `e`, advancing `scroll_top` each frame so the sampled window
+    /// keeps moving — exactly what sustained wheel scroll does. Returns the
+    /// accumulated time spent *inside* `build_minimap_data` only (engine
+    /// setup and the `scroll_top` write are outside the timed region).
+    fn time_minimap_frames(e: &mut Engine, n_lines: usize, frames: usize) -> std::time::Duration {
         let wid = e.active_window_id();
         let theme = Theme::onedark();
         let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
-
-        let frames = 300;
-        let start = std::time::Instant::now();
+        let mut total = std::time::Duration::ZERO;
         for i in 0..frames {
             if let Some(w) = e.windows.get_mut(&wid) {
                 w.view.scroll_top = i % n_lines;
             }
-            let mm = build_minimap_data(&e, &theme, wid, rect, 1.0);
+            let t0 = std::time::Instant::now();
+            let mm = build_minimap_data(e, &theme, wid, rect, 1.0);
+            total += t0.elapsed();
             assert!(mm.is_some(), "minimap must build for every simulated frame");
         }
-        let elapsed = start.elapsed();
+        total
+    }
+
+    /// #728 performance acceptance: wheel-scrolling a big file must not cost
+    /// O(buffer) per frame. `build_minimap_data` used to allocate a `String`
+    /// for *every* line in the buffer on every call regardless of how many
+    /// it actually samples (`quadraui::sample_lines` only keeps
+    /// ~`target_lines`, but the old code built the whole buffer as
+    /// candidates first).
+    ///
+    /// **This asserts on a *ratio*, not a wall-clock ceiling.** The same
+    /// scroll workload is run over a 1,000-line buffer and a 10,000-line
+    /// one — 10x the buffer, identical strip geometry, so identical
+    /// `target_lines` — and the per-frame costs are compared. The two
+    /// measurements are *interleaved* frame-by-frame so a burst of CPU
+    /// contention (the full suite runs these tests in parallel with ~2,300
+    /// others) inflates both sides equally and cancels out of the ratio.
+    ///
+    /// The earlier version of this test pinned a 500ms absolute budget for
+    /// 300 frames; the fixed cost on an idle box is ~405ms, so the margin
+    /// was ~20% and it flaked at 517–586ms under full-suite contention
+    /// while passing in isolation. Absolute timings cannot be made
+    /// contention-proof; the ratio can, and it is what the test name
+    /// actually claims.
+    ///
+    /// Measured on this machine (debug `cargo test --no-default-features
+    /// --bin vcd`), per-frame cost over a 10,000-line file:
+    ///   - before (whole-buffer `owned: Vec<String>` every frame):
+    ///     **~80.8ms/frame** — unusable under sustained wheel scroll,
+    ///     matching the issue's report, and ~10x the 1,000-line cost
+    ///     because the work is linear in buffer size.
+    ///   - after (index-first sampling, only ~`target_lines` lines fetched
+    ///     from the rope per frame): **~1.34ms/frame**, i.e. ~1x the
+    ///     1,000-line cost — the cost tracks `target_lines` (the strip's
+    ///     own display rows), not the buffer.
+    ///
+    /// So the discriminator is ~1x (fixed) vs ~10x (linear); the 4x
+    /// threshold below sits between them with generous room on both sides.
+    #[test]
+    fn minimap_scroll_does_not_scale_with_buffer_size() {
+        const SMALL_LINES: usize = 1_000;
+        const LARGE_LINES: usize = 10_000;
+        const FRAMES: usize = 150;
+
+        let mut small = large_minimap_engine(SMALL_LINES);
+        small.settings.minimap = true;
+        let mut large = large_minimap_engine(LARGE_LINES);
+        large.settings.minimap = true;
+
+        // Warm both sides (first-touch page faults, allocator growth) so the
+        // ratio measures steady-state work rather than one-time setup.
+        time_minimap_frames(&mut small, SMALL_LINES, 5);
+        time_minimap_frames(&mut large, LARGE_LINES, 5);
+
+        // Interleaved: alternate one small frame and one large frame so both
+        // series see the same scheduling weather.
+        let mut small_total = std::time::Duration::ZERO;
+        let mut large_total = std::time::Duration::ZERO;
+        for _ in 0..FRAMES {
+            small_total += time_minimap_frames(&mut small, SMALL_LINES, 1);
+            large_total += time_minimap_frames(&mut large, LARGE_LINES, 1);
+        }
+
+        let small_ms = small_total.as_secs_f64() * 1000.0 / FRAMES as f64;
+        let large_ms = large_total.as_secs_f64() * 1000.0 / FRAMES as f64;
+        let ratio = large_ms / small_ms.max(f64::MIN_POSITIVE);
         eprintln!(
-            "minimap_scroll_does_not_scale_with_buffer_size: {frames} frames / \
-             {n_lines} lines in {elapsed:?} ({:.4}ms/frame)",
-            elapsed.as_secs_f64() * 1000.0 / frames as f64
+            "minimap_scroll_does_not_scale_with_buffer_size: {FRAMES} frames \
+             each — {SMALL_LINES} lines {small_ms:.4}ms/frame, {LARGE_LINES} \
+             lines {large_ms:.4}ms/frame, ratio {ratio:.2}x"
         );
 
-        // A per-frame whole-buffer materialisation (10,000 lines * 300
-        // frames = 3,000,000 allocated/trimmed Strings) is the regression
-        // this guards against; a per-frame ~display-rows sampling is not.
-        // 500ms for 300 frames (1.6ms/frame) is generous headroom above the
-        // fixed cost on this machine, chosen to catch "still O(buffer)"
-        // without flaking on a slower/loaded box.
         assert!(
-            elapsed.as_millis() < 500,
-            "300 simulated scroll frames over a {n_lines}-line buffer took \
-             {elapsed:?} — expected well under 500ms; this smells like an \
-             O(buffer)-per-frame regression"
+            ratio < 4.0,
+            "a 10x bigger buffer cost {ratio:.2}x more per minimap frame \
+             ({SMALL_LINES} lines: {small_ms:.4}ms/frame, {LARGE_LINES} \
+             lines: {large_ms:.4}ms/frame) — the per-frame cost must track \
+             the strip's display rows, not the buffer; this smells like a \
+             return of the whole-buffer materialisation"
         );
     }
 
