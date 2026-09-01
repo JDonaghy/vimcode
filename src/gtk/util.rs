@@ -92,6 +92,18 @@ pub(super) fn install_bundled_icon_font() {
     }
 }
 
+/// The single VimCode application identity: app id, `Icon=`/`StartupWMClass=`
+/// value, and the stem of the installed icon files. Must match the shipped
+/// `data/io.github.jdonaghy.VimCode.desktop` / `data/icons/io.github.jdonaghy.VimCode.svg`
+/// and the flatpak manifest (`flatpak/io.github.jdonaghy.VimCode.yml`) exactly.
+///
+/// #716: this file used to write a *second*, different identity
+/// (`com.vimcode.VimCode` / icon name `vimcode`) to `~/.local/share/`,
+/// competing with the shipped one — whichever the desktop shell indexed
+/// first determined whether the WM taskbar/alt-tab icon resolved at all.
+/// `APP_ID` is now the only identity string this module writes anywhere.
+pub(super) const APP_ID: &str = "io.github.jdonaghy.VimCode";
+
 pub(super) fn install_icon_and_desktop() {
     use std::fs;
     use std::path::PathBuf;
@@ -102,13 +114,19 @@ pub(super) fn install_icon_and_desktop() {
     let data_dir = home.join(".local/share");
     let hicolor = data_dir.join("icons/hicolor");
 
-    // SVG icon for scalable size (GTK/GNOME renders SVGs natively).
+    // SVG icon for scalable size (GTK/GNOME renders SVGs natively). Same
+    // bytes as the shipped `data/icons/io.github.jdonaghy.VimCode.svg` —
+    // deduplicated under #716, this used to be a separate `vim-code.svg`
+    // copy at the repo root that could silently drift from the shipped one.
     let svg_dir = hicolor.join("scalable/apps");
-    let svg_path = svg_dir.join("vimcode.svg");
-    let svg_bytes: &[u8] = include_bytes!("../../vim-code.svg");
+    let svg_path = svg_dir.join(format!("{APP_ID}.svg"));
+    let svg_bytes: &[u8] = include_bytes!("../../data/icons/io.github.jdonaghy.VimCode.svg");
     if fs::create_dir_all(&svg_dir).is_ok() {
         let _ = fs::write(&svg_path, svg_bytes);
     }
+    // #716: remove the stale pre-fix icon file installed under the old,
+    // wrong name so it can't shadow the correctly-named one above.
+    let _ = fs::remove_file(svg_dir.join("vimcode.svg"));
 
     // Render the SVG to PNG at multiple sizes so compositors and window
     // managers that don't support SVG lookup (or only read _NET_WM_ICON
@@ -116,17 +134,18 @@ pub(super) fn install_icon_and_desktop() {
     if svg_path.exists() {
         for size in [48, 64, 128, 256, 512] {
             let png_dir = hicolor.join(format!("{size}x{size}/apps"));
-            let png_path = png_dir.join("vimcode.png");
+            let png_path = png_dir.join(format!("{APP_ID}.png"));
             if png_path.exists() {
-                continue; // already rendered
-            }
-            if fs::create_dir_all(&png_dir).is_ok() {
+                // already rendered
+            } else if fs::create_dir_all(&png_dir).is_ok() {
                 if let Ok(pixbuf) =
                     gtk4::gdk_pixbuf::Pixbuf::from_file_at_size(&svg_path, size, size)
                 {
                     let _ = pixbuf.savev(&png_path, "png", &[]);
                 }
             }
+            // #716: same cleanup as the SVG above, at every rendered size.
+            let _ = fs::remove_file(png_dir.join("vimcode.png"));
         }
     }
 
@@ -137,26 +156,39 @@ pub(super) fn install_icon_and_desktop() {
         .arg(&hicolor)
         .output();
 
-    // .desktop file
+    // .desktop file — same identity as the shipped
+    // `data/io.github.jdonaghy.VimCode.desktop`, so a non-flatpak build
+    // launched from this runtime-written entry resolves to the same WM
+    // identity as a flatpak install.
     let app_dir = data_dir.join("applications");
-    let desktop_path = app_dir.join("com.vimcode.VimCode.desktop");
+    let desktop_path = app_dir.join(format!("{APP_ID}.desktop"));
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "vimcode".to_string());
-    let desktop = format!(
-        "[Desktop Entry]\n\
-         Name=VimCode\n\
-         Comment=Vim-like code editor\n\
-         Exec={exe}\n\
-         Icon=vimcode\n\
-         Terminal=false\n\
-         Type=Application\n\
-         Categories=Development;TextEditor;\n\
-         StartupWMClass=com.vimcode.VimCode\n"
-    );
     if fs::create_dir_all(&app_dir).is_ok() {
-        let _ = fs::write(&desktop_path, desktop);
+        let _ = fs::write(&desktop_path, desktop_entry_contents(&exe));
     }
+    // #716: a stale desktop entry under the old, wrong identity left behind
+    // by a pre-fix install would otherwise keep shadowing the correct one
+    // in some desktop-shell indexes across an upgrade.
+    let _ = fs::remove_file(app_dir.join("com.vimcode.VimCode.desktop"));
+}
+
+/// Contents of the runtime-installed `.desktop` file. Factored out from
+/// [`install_icon_and_desktop`] so the identity fields are unit-testable
+/// without touching the filesystem (#716).
+pub(super) fn desktop_entry_contents(exe: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=VimCode\n\
+         Comment=Vim-like code editor with GTK4 and tree-sitter\n\
+         Exec={exe}\n\
+         Icon={APP_ID}\n\
+         Terminal=false\n\
+         Categories=Development;TextEditor;Utility;\n\
+         StartupWMClass={APP_ID}\n"
+    )
 }
 
 /// Global GLib structured-log writer that drops a couple of benign GTK4
@@ -205,4 +237,45 @@ pub(super) unsafe extern "C" fn gtk_log_writer(
         return gtk4::glib::ffi::G_LOG_WRITER_HANDLED;
     }
     unsafe { gtk4::glib::ffi::g_log_writer_default(log_level, fields, n_fields, user_data) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #716: this is the one identity string vimcode should ever write —
+    /// pin it so a future edit can't silently reintroduce a second one.
+    #[test]
+    fn app_id_matches_shipped_packaging() {
+        assert_eq!(APP_ID, "io.github.jdonaghy.VimCode");
+    }
+
+    /// #716 regression test: the runtime-installed `.desktop` file used to
+    /// claim `Icon=vimcode` / `StartupWMClass=com.vimcode.VimCode`, a
+    /// different identity than the shipped `data/io.github.jdonaghy.VimCode.desktop`.
+    /// Whichever one the desktop shell indexed first determined whether the
+    /// WM taskbar/alt-tab icon resolved. Assert there is exactly one
+    /// identity in the generated contents, and it's the canonical one.
+    #[test]
+    fn desktop_entry_uses_canonical_app_id_everywhere() {
+        let contents = desktop_entry_contents("/usr/bin/vimcode");
+        assert!(
+            contents.contains(&format!("Icon={APP_ID}\n")),
+            "missing Icon={APP_ID} in:\n{contents}"
+        );
+        assert!(
+            contents.contains(&format!("StartupWMClass={APP_ID}\n")),
+            "missing StartupWMClass={APP_ID} in:\n{contents}"
+        );
+        assert!(
+            !contents.contains("com.vimcode") && !contents.contains("Icon=vimcode\n"),
+            "found the old, wrong identity in:\n{contents}"
+        );
+    }
+
+    #[test]
+    fn desktop_entry_embeds_the_given_exe_path() {
+        let contents = desktop_entry_contents("/opt/vimcode/bin/vimcode");
+        assert!(contents.contains("Exec=/opt/vimcode/bin/vimcode\n"));
+    }
 }
