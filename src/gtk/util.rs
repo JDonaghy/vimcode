@@ -104,6 +104,57 @@ pub(super) fn install_bundled_icon_font() {
 /// `APP_ID` is now the only identity string this module writes anywhere.
 pub(super) const APP_ID: &str = "io.github.jdonaghy.VimCode";
 
+/// Edge length, in pixels, of the one-time PNG rasterisation of
+/// [`crate::render::APP_ICON_SVG`] the menu row paints (#720).
+///
+/// Comfortably larger than any menu-bar row height (and so still crisp when a
+/// HiDPI scale factor multiplies the device pixels behind that row), but small
+/// enough that re-decoding it per frame is free.
+const APP_ICON_RASTER_PX: u32 = 64;
+
+/// The app icon as a `quadraui::Image`, pre-rasterised **once** to a small PNG.
+///
+/// quadraui's `Image` deliberately ships no caching layer ("callers own the
+/// bytes/path they hand in; the backend decodes once per paint call") — so
+/// handing `Backend::draw_image` the raw 1024×1024 SVG means librsvg renders a
+/// megapixel canvas on *every* repaint, only to downscale it into a ~20px slot.
+/// Measured on the headless GTK harness that is **+16.5 ms per frame** (4.4 ms →
+/// 20.9 ms for a full `render_content`), i.e. every keystroke's repaint, which
+/// is not a cost window chrome gets to impose. Rasterising to
+/// [`APP_ICON_RASTER_PX`] once and re-handing those bytes puts it back in the
+/// noise.
+///
+/// If this host has no SVG `gdk-pixbuf` loader the rasterisation fails and the
+/// raw SVG is handed through unchanged: `draw_image` then reports
+/// `Unsupported` and paints nothing (the icon's `fallback_text` is empty by
+/// design — see [`crate::render::app_icon_image`]), which is the same visible
+/// outcome as skipping the call, but keeps the "why" in one place.
+pub(super) fn app_icon_image() -> quadraui::Image {
+    use std::sync::OnceLock;
+    static PNG: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+
+    match PNG.get_or_init(rasterise_app_icon_png) {
+        Some(png) => quadraui::Image {
+            source: quadraui::ImageSource::Bytes(png.clone()),
+            intrinsic_size: Some((APP_ICON_RASTER_PX, APP_ICON_RASTER_PX)),
+            // id / fit / fallback_text stay owned by the shared builder.
+            ..crate::render::app_icon_image()
+        },
+        None => crate::render::app_icon_image(),
+    }
+}
+
+/// Decode [`crate::render::APP_ICON_SVG`] and re-encode it as an
+/// [`APP_ICON_RASTER_PX`]-square PNG. `None` if `gdk-pixbuf` cannot read the
+/// SVG (no librsvg loader) or cannot write a PNG.
+fn rasterise_app_icon_png() -> Option<Vec<u8>> {
+    use gtk4::gdk_pixbuf::{InterpType, Pixbuf};
+    let px = APP_ICON_RASTER_PX as i32;
+    let svg = Pixbuf::from_read(std::io::Cursor::new(crate::render::APP_ICON_SVG)).ok()?;
+    let scaled = svg.scale_simple(px, px, InterpType::Bilinear)?;
+    scaled.save_to_bufferv("png", &[]).ok()
+}
+
 pub(super) fn install_icon_and_desktop() {
     use std::fs;
     use std::path::PathBuf;
@@ -120,7 +171,10 @@ pub(super) fn install_icon_and_desktop() {
     // copy at the repo root that could silently drift from the shipped one.
     let svg_dir = hicolor.join("scalable/apps");
     let svg_path = svg_dir.join(format!("{APP_ID}.svg"));
-    let svg_bytes: &[u8] = include_bytes!("../../data/icons/io.github.jdonaghy.VimCode.svg");
+    // #720: the bytes now live in exactly one place (`render::APP_ICON_SVG`),
+    // shared with the menu-row app icon, so the installed theme icon and the
+    // one painted left of `File` can never be different artwork.
+    let svg_bytes: &[u8] = crate::render::APP_ICON_SVG;
     if fs::create_dir_all(&svg_dir).is_ok() {
         let _ = fs::write(&svg_path, svg_bytes);
     }
@@ -277,5 +331,48 @@ mod tests {
     fn desktop_entry_embeds_the_given_exe_path() {
         let contents = desktop_entry_contents("/opt/vimcode/bin/vimcode");
         assert!(contents.contains("Exec=/opt/vimcode/bin/vimcode\n"));
+    }
+
+    /// #720 perf guard: the icon handed to `Backend::draw_image` must be the
+    /// once-rasterised **PNG**, never the raw SVG.
+    ///
+    /// quadraui's `Image` carries no cache by design, so whatever bytes go in
+    /// here get re-decoded on every single repaint. With the 1024x1024 SVG
+    /// that measured +16.5 ms per `render_content` (4.4 ms -> 20.9 ms on the
+    /// headless harness); with the cached 64px PNG it is +0.35 ms. This test
+    /// is the tripwire against a well-meaning "simplify" back to
+    /// `render::app_icon_image()` at the paint site, which would look and test
+    /// identical but quietly cap the UI's frame rate.
+    #[test]
+    fn painted_app_icon_is_the_rasterised_png_not_the_raw_svg() {
+        let img = app_icon_image();
+        let quadraui::ImageSource::Bytes(bytes) = &img.source else {
+            panic!(
+                "the app icon must be carried as bytes, got {:?}",
+                img.source
+            );
+        };
+        assert_ne!(
+            bytes.as_slice(),
+            crate::render::APP_ICON_SVG,
+            "the raw SVG must not reach draw_image -- it would be re-rendered \
+             through librsvg every frame"
+        );
+        assert_eq!(
+            &bytes[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "expected a PNG signature from the one-time rasterisation"
+        );
+        assert_eq!(
+            img.intrinsic_size,
+            Some((APP_ICON_RASTER_PX, APP_ICON_RASTER_PX)),
+            "intrinsic_size must describe the rasterised bytes, not the SVG viewBox"
+        );
+        // Identity (which artwork / how it fits) still comes from the one
+        // shared builder, so the two can't diverge.
+        let shared = crate::render::app_icon_image();
+        assert_eq!(img.id, shared.id);
+        assert_eq!(img.fit, shared.fit);
+        assert_eq!(img.fallback_text, shared.fallback_text);
     }
 }
