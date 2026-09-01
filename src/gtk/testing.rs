@@ -4087,6 +4087,155 @@ mod minimap {
              the drag continuation never reached the minimap"
         );
     }
+
+    /// `engine_with_shaped_buffer` split into two panes (`:vsplit`) — the
+    /// fixture the split-minimap black-box tests below share.
+    fn engine_with_split_shaped_buffer() -> Engine {
+        use crate::core::window::SplitDirection;
+        let mut engine = engine_with_shaped_buffer();
+        engine.split_window(SplitDirection::Vertical, None);
+        engine
+    }
+
+    /// #722 acceptance, painted-output tier: a `:vsplit` must paint **two**
+    /// independent minimap strips, one over each pane's own buffer — not a
+    /// single strip pinned to whichever pane happens to be active.
+    ///
+    /// GTK twin of TUI's
+    /// `split_paints_two_independent_minimap_strips_via_shell_app`
+    /// (`tui_main/shell_app.rs`) — same acceptance criterion, driven
+    /// through the real headless `GtkDriver` paint path. Every #722 GTK
+    /// test before this one (including
+    /// `minimap_paints_a_strip_whose_width_matches_reserved_width` above)
+    /// only ever painted a single, unsplit window; the review that
+    /// reopened #722 flagged the missing split/pixel coverage by name.
+    ///
+    /// RED against the pre-#722 code (single `Option<RenderedMinimap>`
+    /// gated on `active_window_id`): `screen.minimap` would carry no entry
+    /// for the inactive pane at all, so its strip band would sample as a
+    /// uniform block (plain editor background) instead of the varied
+    /// braille/syntax-colour content asserted below — confirmed by hand by
+    /// reverting `build_screen_layout`'s minimap map to
+    /// `.find(|(id, _)| *id == active_window_id)` before restoring the fix.
+    #[test]
+    fn split_paints_two_independent_minimap_strips() {
+        let mut h = harness(engine_with_split_shaped_buffer(), 1400, 900);
+
+        let win_ids: Vec<_> = h.engine.borrow().windows.keys().copied().collect();
+        assert_eq!(win_ids.len(), 2, "`:vsplit` must produce two windows");
+
+        // Paint a first frame — also primes `screen_layout`/`painted_line_height`.
+        for id in &win_ids {
+            h.window_center(*id)
+                .unwrap_or_else(|| panic!("pane {id:?} must paint"));
+        }
+        let lh = h
+            .painted_line_height()
+            .expect("frame must publish the line height it painted with");
+
+        for id in &win_ids {
+            let strip = {
+                let layout = h.screen_layout.borrow();
+                layout
+                    .as_ref()
+                    .unwrap()
+                    .minimap
+                    .iter()
+                    .find(|m| m.window_id == *id)
+                    .unwrap_or_else(|| panic!("pane {id:?} must carry its own minimap"))
+                    .rect
+            };
+            let x0 = (strip.x + 2.0) as i32;
+            let x1 = (strip.x + strip.width - 2.0) as i32;
+            let y0 = (strip.y + lh) as i32;
+            let y1 = (strip.y + strip.height - lh) as i32;
+            let mut seen = std::collections::HashSet::new();
+            for y in (y0..y1).step_by(3) {
+                for x in x0..x1 {
+                    seen.insert(h.driver.pixel(x, y));
+                }
+            }
+            assert!(
+                seen.len() > 1,
+                "pane {id:?}'s minimap strip must paint content, not a \
+                 uniform block: sampled x in {x0}..{x1}, y in {y0}..{y1}, \
+                 found only {:?}",
+                seen
+            );
+        }
+    }
+
+    /// #722 acceptance, painted-output tier: switching focus between panes
+    /// of a `:vsplit` must not move either pane's text — GTK twin of TUI's
+    /// `focus_change_does_not_move_either_panes_text_via_shell_app`.
+    /// Coverage for the "migrates on focus change, reflowing both panes"
+    /// symptom the issue called out as *worse* than the missing strip (the
+    /// width reclaim was gated on the same `is_active` flag as the strip
+    /// itself, so both panes reflowed on every focus change).
+    ///
+    /// Mutates focus directly through `Engine::focus_next_window` on the
+    /// harness's shared `engine: Rc<RefCell<Engine>>` — the same "assert on
+    /// engine state after an event" escape hatch the harness's own doc
+    /// comment describes, used here only to *drive* the focus change
+    /// (GTK's own Ctrl-W accelerator wiring is out of scope for this test)
+    /// — then forces a real repaint (`h.driver.render()`, the same pattern
+    /// `menu_bar_visible`'s test elsewhere in this file uses) and diffs the
+    /// two *painted* window rects, which is the acceptance claim under
+    /// test.
+    ///
+    /// RED against the pre-#722 code: focusing the right pane would widen
+    /// it (reclaiming the now-inactive left pane's minimap width) and
+    /// narrow the left pane by the same amount, moving both panes' painted
+    /// rects — confirmed by hand by reverting the `minimap_w` reclaim to
+    /// the old `is_active`-gated single value before restoring this fix.
+    #[test]
+    fn focus_change_does_not_move_either_panes_text() {
+        let mut h = harness(engine_with_split_shaped_buffer(), 1400, 900);
+
+        let win_ids: Vec<_> = h.engine.borrow().windows.keys().copied().collect();
+        assert_eq!(win_ids.len(), 2, "`:vsplit` must produce two windows");
+        for id in &win_ids {
+            h.window_center(*id)
+                .unwrap_or_else(|| panic!("pane {id:?} must paint"));
+        }
+
+        fn painted_rects(
+            h: &Harness<impl AppLogic>,
+            win_ids: &[crate::core::WindowId],
+        ) -> Vec<(f64, f64, f64, f64)> {
+            let layout = h.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            win_ids
+                .iter()
+                .map(|id| {
+                    let r = l.windows.iter().find(|w| w.window_id == *id).unwrap().rect;
+                    (r.x, r.y, r.width, r.height)
+                })
+                .collect()
+        }
+
+        let before = painted_rects(&h, &win_ids);
+
+        let active_before = h.engine.borrow().active_window_id();
+        h.engine.borrow_mut().focus_next_window();
+        let active_after = h.engine.borrow().active_window_id();
+        assert_ne!(
+            active_before, active_after,
+            "test setup sanity: focus_next_window must actually move focus \
+             to the other pane, or this test isn't exercising a focus \
+             change at all"
+        );
+        h.driver.render();
+
+        let after = painted_rects(&h, &win_ids);
+
+        assert_eq!(
+            before, after,
+            "cycling focus between panes of a `:vsplit` must not move \
+             either pane's painted rect (i.e. must not reflow either \
+             pane's text width); before={before:?}, after={after:?}"
+        );
+    }
 }
 
 /// Black-box coverage for the VimCode app icon painted left of the `File`

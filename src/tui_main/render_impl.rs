@@ -551,8 +551,9 @@ pub(super) fn draw_frame(
         );
     }
     render_all_windows(backend, Some(frame), &screen.windows, theme);
-    // #35: minimap strip on the active window's right edge — one call, the
-    // braille rasteriser is quadraui's.
+    // #35/#722: minimap strips on every window's right edge (one entry per
+    // `WindowId` in `screen.minimap`, not just the active window's) — one
+    // call, the braille rasteriser is quadraui's.
     render::draw_minimap_strip(backend, screen);
     // Draw each group's tab bar. The tab bar sits `tui_tbh` rows above the
     // group's window content (`bounds.y - tui_tbh`, applied inside
