@@ -135,6 +135,21 @@ pub(super) struct Harness<A: AppLogic> {
     /// `render::split_menu_row_for_app_icon(this).0` rather than at guessed
     /// chrome offsets — see `app_icon_paints_left_of_the_file_menu`.
     pub menu_row_rect: Rc<Cell<quadraui::Rect>>,
+    /// Cached in-canvas `DialogLayout` from the last `render_content` paint,
+    /// or `None` if that frame drew no in-canvas dialog — either no dialog
+    /// was open, or an open one went the #727 native-dialog route instead
+    /// (see [`Self::native_dialog_shown`] / [`Self::pending_native_dialog`]).
+    pub dialog_layout: Rc<RefCell<Option<quadraui::DialogLayout>>>,
+    /// #727: `true` once a native message-dialog present has been queued
+    /// (or already shown) for the `engine.dialog` currently open.
+    pub native_dialog_shown: Rc<Cell<bool>>,
+    /// #727: a native message dialog queued by `render_content`'s
+    /// edge-trigger check, awaiting `tick()` to drain it. Tests read this
+    /// with `Cell::take` directly (never calling `tick()`, which would
+    /// actually try to pop a real `gtk4::AlertDialog` and block forever
+    /// with no display / no user to click it) to observe *that* a present
+    /// was queued without running the blocking call itself.
+    pub pending_native_dialog: Rc<Cell<Option<quadraui::MessageDialogOptions>>>,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -358,6 +373,9 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
     let menu_row_rect = Rc::clone(&app.menu_row_rect);
+    let dialog_layout = Rc::clone(&app.dialog_layout);
+    let native_dialog_shown = Rc::clone(&app.native_dialog_shown);
+    let pending_native_dialog = Rc::clone(&app.pending_native_dialog);
     Harness {
         driver: driver_with_shell(app, config, width, height),
         engine,
@@ -374,6 +392,9 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         separated_status_bar_rect,
         title_bar_rect,
         menu_row_rect,
+        dialog_layout,
+        native_dialog_shown,
+        pending_native_dialog,
     }
 }
 
@@ -1985,6 +2006,100 @@ mod tests {
              {}/{} sampled pixels differed",
             differing,
             with.len()
+        );
+    }
+
+    /// #727: a natively-expressible dialog (no `DialogTable`, no text
+    /// input — `quit_unsaved`, the "Unsaved Changes" confirm, is exactly
+    /// this shape) must be presented via a real `PlatformServices::
+    /// show_message_dialog` call *exactly once* per open, unlike the
+    /// in-canvas `Dialog` primitive, which is happily repainted every
+    /// frame.
+    ///
+    /// `GtkDriver` paints into an in-memory Cairo surface and never opens a
+    /// live GTK window — quadraui's own #666 doc says as much:
+    /// "`GtkDriver` paints Cairo — it never sees a native `AlertDialog`
+    /// window at all" — so an automated test structurally cannot observe
+    /// the real alert appearing (that gap is exactly what `SMOKE_TESTS`
+    /// covers). This module's own doc adds the other half: "`tick()` is
+    /// never pumped by the driver", so `render_content`'s queued
+    /// `pending_native_dialog` is never drained by a real blocking
+    /// `show_message_dialog` call here — safe to assert on without risking
+    /// a test that hangs forever with no display and no user to click it.
+    ///
+    /// What *is* fully in reach headlessly: `render_content`'s edge-trigger
+    /// decision itself — repaint several frames with the same dialog still
+    /// open and confirm the native present was queued exactly once, with
+    /// the in-canvas draw suppressed on every one of those frames. Fails
+    /// against unfixed code (#553's rule): drop the
+    /// `!self.native_dialog_shown.get()` guard in `render_content` (always
+    /// queue whenever `native_dialog_options` is `Some`) and
+    /// `pending_native_dialog.take()` returns `Some` on every repaint below
+    /// instead of only the first.
+    #[test]
+    fn native_dialog_presented_exactly_once_across_repeated_frames() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "unsaved change");
+        engine.show_quit_confirm();
+        let mut h = harness(engine, 1400, 900);
+
+        // `harness()` already painted one frame (inside `GtkDriver::new`)
+        // with the dialog open — that first paint must have suppressed the
+        // in-canvas draw and queued exactly one native present.
+        assert!(
+            h.dialog_layout.borrow().is_none(),
+            "a natively-expressible dialog must not paint in-canvas"
+        );
+        assert!(
+            h.native_dialog_shown.get(),
+            "the edge-trigger flag must flip on the first paint of a \
+             natively-expressible dialog"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "the first paint of a natively-expressible dialog must queue \
+             exactly one native present"
+        );
+
+        // Several more frames with the *same* dialog still open: must
+        // never re-queue a second present, and must keep suppressing the
+        // in-canvas draw.
+        for i in 0..5 {
+            h.driver.render();
+            assert!(
+                h.dialog_layout.borrow().is_none(),
+                "frame {i}: in-canvas draw must stay suppressed while the \
+                 native dialog is in flight"
+            );
+            assert!(
+                h.pending_native_dialog.take().is_none(),
+                "frame {i}: must not re-queue a native present while the \
+                 same dialog stays open"
+            );
+        }
+    }
+
+    /// #727's native path only covers dialogs `quadraui::native_dialog_options`
+    /// reports as natively expressible — a dialog carrying a text input
+    /// (e.g. the move-file destination prompt) is not, and must keep
+    /// rendering exactly as it did before this issue: in-canvas, with no
+    /// native present ever queued.
+    #[test]
+    fn text_input_dialog_stays_in_canvas_not_native() {
+        let mut engine = Engine::new();
+        engine.start_move_file_dialog(
+            std::path::Path::new("/tmp/project/foo.rs"),
+            std::path::Path::new("/tmp/project"),
+        );
+        let h = harness(engine, 1400, 900);
+
+        assert!(
+            h.dialog_layout.borrow().is_some(),
+            "a dialog carrying a text input must still paint in-canvas"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_none(),
+            "a text-input dialog must never be queued for a native present"
         );
     }
 }
