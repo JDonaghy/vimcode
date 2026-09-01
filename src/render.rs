@@ -4879,7 +4879,14 @@ pub struct DialogPanel {
     /// (#727) — it has no other visual effect in-canvas, but flows through
     /// [`dialog_panel_to_quadraui_dialog`] into `quadraui::DialogButton::is_cancel`
     /// so a native GTK `AlertDialog` knows which button Escape/close-box
-    /// should activate.
+    /// should activate. Accepted: dialogs with no `action == "cancel"`
+    /// button at all (e.g. the file-changed-on-disk "Yes"/"No" prompt in
+    /// `src/core/engine/buffers.rs`) get `is_cancel: false` on every
+    /// button, so `GtkAlertDialog::set_cancel_button` is never called for
+    /// them — GTK's own dismiss-without-choosing path still falls back to
+    /// `None` → `Engine::dialog_cancel()`, matching in-canvas Escape, but
+    /// these dialogs lose the native "Escape activates a specific labeled
+    /// button" affordance that dialogs with an explicit Cancel button get.
     pub buttons: Vec<(String, bool, bool)>,
     /// Optional text input field (e.g. for SSH passphrase).
     pub input: Option<DialogInputPanel>,

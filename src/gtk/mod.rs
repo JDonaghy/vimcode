@@ -1853,6 +1853,18 @@ impl App {
         backend: &mut dyn quadraui::Backend,
     ) {
         let choice = backend.services().show_message_dialog(opts);
+        // Reset the edge-trigger flag *here*, before running the engine
+        // callback below, rather than only lazily on the next
+        // `render_content` call that observes `screen.dialog == None`. If
+        // `dialog_click_button`/`dialog_cancel` ever opens a second dialog
+        // synchronously (e.g. a chained "save failed, retry?" prompt), that
+        // new dialog needs `native_dialog_shown == false` to be seen as a
+        // fresh no-dialog-to-dialog edge and get queued for its own native
+        // present — a stale `true` left over from the dialog that just
+        // closed would otherwise suppress it silently. No such chain exists
+        // in `process_dialog_result` today, but resetting eagerly here
+        // costs nothing and removes the latent trap either way.
+        self.native_dialog_shown.set(false);
         let action = match choice.as_ref().and_then(dialog_btn_index) {
             Some(idx) => self.engine.borrow_mut().dialog_click_button(idx),
             None => self.engine.borrow_mut().dialog_cancel(),

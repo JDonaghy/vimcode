@@ -2030,12 +2030,24 @@ mod tests {
     /// What *is* fully in reach headlessly: `render_content`'s edge-trigger
     /// decision itself — repaint several frames with the same dialog still
     /// open and confirm the native present was queued exactly once, with
-    /// the in-canvas draw suppressed on every one of those frames. Fails
-    /// against unfixed code (#553's rule): drop the
-    /// `!self.native_dialog_shown.get()` guard in `render_content` (always
-    /// queue whenever `native_dialog_options` is `Some`) and
-    /// `pending_native_dialog.take()` returns `Some` on every repaint below
-    /// instead of only the first.
+    /// the in-canvas draw suppressed on every one of those frames.
+    ///
+    /// The bookkeeping assertions (`dialog_layout.borrow().is_none()`,
+    /// `native_dialog_shown`, `pending_native_dialog`) alone would stay
+    /// green even if `render_content`'s native branch *also* kept calling
+    /// `frame.draw(backend)` underneath — the #587/#592 "cache says one
+    /// thing, paint does another" shape — so every state check below is
+    /// paired with a `screen_contains` read of the *painted* surface: the
+    /// in-canvas dialog's own title ("Unsaved Changes") and its
+    /// "Save All & Quit" button label must be absent from the Cairo surface
+    /// on every frame the native path is taken.
+    ///
+    /// RED-verified: with the `!self.native_dialog_shown.get()` guard
+    /// dropped from `render_content` (so it always re-queues whenever
+    /// `native_dialog_options` is `Some`), `pending_native_dialog.take()`
+    /// returns `Some` on every repaint below instead of only the first —
+    /// this test fails at the "must not re-queue" assertion in the loop.
+    /// Restored before committing.
     #[test]
     fn native_dialog_presented_exactly_once_across_repeated_frames() {
         let mut engine = Engine::new();
@@ -2051,6 +2063,17 @@ mod tests {
             "a natively-expressible dialog must not paint in-canvas"
         );
         assert!(
+            !h.driver.screen_contains("Unsaved Changes"),
+            "the in-canvas dialog title must not be painted on the surface \
+             while the native alert is in flight — a cleared \
+             `dialog_layout` alone doesn't prove nothing was drawn"
+        );
+        assert!(
+            !h.driver.screen_contains("Save All & Quit"),
+            "the in-canvas dialog's button labels must not be painted on \
+             the surface while the native alert is in flight"
+        );
+        assert!(
             h.native_dialog_shown.get(),
             "the edge-trigger flag must flip on the first paint of a \
              natively-expressible dialog"
@@ -2063,13 +2086,18 @@ mod tests {
 
         // Several more frames with the *same* dialog still open: must
         // never re-queue a second present, and must keep suppressing the
-        // in-canvas draw.
+        // in-canvas draw — both the cache and the actual painted surface.
         for i in 0..5 {
             h.driver.render();
             assert!(
                 h.dialog_layout.borrow().is_none(),
                 "frame {i}: in-canvas draw must stay suppressed while the \
                  native dialog is in flight"
+            );
+            assert!(
+                !h.driver.screen_contains("Unsaved Changes"),
+                "frame {i}: the in-canvas dialog title must stay off the \
+                 painted surface while the native alert is in flight"
             );
             assert!(
                 h.pending_native_dialog.take().is_none(),
@@ -2084,6 +2112,22 @@ mod tests {
     /// (e.g. the move-file destination prompt) is not, and must keep
     /// rendering exactly as it did before this issue: in-canvas, with no
     /// native present ever queued.
+    ///
+    /// As with the sibling test above, the `dialog_layout.borrow().is_some()`
+    /// bookkeeping check alone would stay green even if nothing had actually
+    /// reached the Cairo surface, so this also reads the painted content
+    /// directly: the dialog's title and its body prompt must both be
+    /// on-screen. (The text-input *field* itself paints only the live value
+    /// plus a cursor glyph — `DialogInputPanel::display`, `render.rs` — with
+    /// no separate "Destination:" label text to assert on, so the body
+    /// line `start_move_file_dialog` sets — "Enter destination path:" — is
+    /// the stand-in proof that the input dialog reached the surface.)
+    ///
+    /// RED-verified: forcing this dialog down the native branch (making
+    /// `native_dialog_options` return `Some` unconditionally, ignoring the
+    /// text input) makes `dialog_layout.borrow().is_some()` false and both
+    /// `screen_contains` calls below false — this test fails at the layout
+    /// assertion first. Restored before committing.
     #[test]
     fn text_input_dialog_stays_in_canvas_not_native() {
         let mut engine = Engine::new();
@@ -2096,6 +2140,16 @@ mod tests {
         assert!(
             h.dialog_layout.borrow().is_some(),
             "a dialog carrying a text input must still paint in-canvas"
+        );
+        assert!(
+            h.driver.screen_contains("Move 'foo.rs'"),
+            "the in-canvas dialog's title must actually be painted on the \
+             surface, not just recorded in the layout cache"
+        );
+        assert!(
+            h.driver.screen_contains("Enter destination path:"),
+            "the in-canvas dialog's body prompt must actually be painted \
+             on the surface"
         );
         assert!(
             h.pending_native_dialog.take().is_none(),
