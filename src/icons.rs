@@ -154,7 +154,13 @@ pub const FIND_CLOSE: Icon = Icon::new("\u{ea76}", "\u{00d7}"); // × nf-cod-clo
 // draw at the very top of the window before any font capability probing is
 // meaningful, and the shapes read fine as monospace fallback text too.
 
-pub const WINDOW_MINIMIZE: Icon = Icon::new("\u{2500}", "\u{2500}"); // ─
+// #715: U+2500 BOX DRAWINGS LIGHT HORIZONTAL is a hairline rule, not a
+// window-control glyph — at titlebar size it renders as a ~1px line, or
+// nothing at all if the resolved UI font has no box-drawing coverage (it
+// didn't, which is why minimize alone was invisible while □/✕ painted
+// fine). U+2014 EM DASH has the same broad coverage as any other symbol
+// glyph in a UI font, and its optical weight actually matches □/✕ beside it.
+pub const WINDOW_MINIMIZE: Icon = Icon::new("\u{2014}", "\u{2014}"); // —
 pub const WINDOW_MAXIMIZE: Icon = Icon::new("\u{25a1}", "\u{25a1}"); // □
 pub const WINDOW_RESTORE: Icon = Icon::new("\u{29c9}", "\u{29c9}"); // ⧉
 pub const WINDOW_CLOSE: Icon = Icon::new("\u{2715}", "\u{00d7}"); // ✕ / ×

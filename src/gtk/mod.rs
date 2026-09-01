@@ -10473,19 +10473,33 @@ mod chrome_paint_tests {
 
     /// Paint `render::window_controls_status_bar(theme, false)` into a fresh
     /// headless surface and return the max luminance delta, against the
-    /// bar's own background fill, found anywhere in the painted row.
+    /// bar's own background fill, found **within each button's own
+    /// hit-region x-range** — keyed by the button's `action_id`.
+    ///
+    /// #715: the original version of this helper measured the max delta
+    /// found *anywhere in the whole row*. Three buttons share one row, so
+    /// two glyphs painting fine was enough to clear the floor even though
+    /// the third (minimize, `U+2500` — a hairline box-drawing rule with no
+    /// coverage in the resolved UI font) contributed zero pixels. Per-segment
+    /// measurement is the only version of this check that can fail on a
+    /// single invisible button rather than needing all three to break at
+    /// once. Segment x-ranges come from the `StatusBarLayout` `draw_status_bar`
+    /// returns — the same hit-region data the real click handler resolves
+    /// against (`render::window_controls_status_bar`'s doc comment) — rather
+    /// than hardcoded pixel columns, so a future layout change can't
+    /// silently desync the test from what's actually painted.
     ///
     /// A glyph that paints but has near-zero contrast against its own
     /// background (e.g. white-on-near-white) is exactly as invisible to a
     /// user as a glyph that paints nothing at all — a plain "differs from
     /// background" check would pass in both cases, so this measures the
     /// actual perceptual gap instead.
-    fn max_contrast_delta(theme: &Theme) -> f64 {
+    fn per_segment_contrast_deltas(theme: &Theme) -> Vec<(String, f64)> {
         let bar = render::window_controls_status_bar(theme, false);
 
         let mut surface =
             ImageSurface::create(Format::ARgb32, W, ROW_H).expect("create ImageSurface");
-        {
+        let layout = {
             let cr = Context::new(&surface).expect("Context::new");
             // Fill with a color that can't be confused with any themed fg/bg.
             cr.set_source_rgb(1.0, 0.0, 1.0);
@@ -10503,27 +10517,48 @@ mod chrome_paint_tests {
                 &render::to_quadraui_theme(theme),
                 None,
                 None,
-            );
-        }
+            )
+        };
         surface.flush();
         let stride = surface.stride() as usize;
         let data = surface.data().expect("surface data");
-        let mid_y = ROW_H / 2;
 
         let bg = {
             let c = render::to_quadraui_color(theme.tab_bar_bg);
             (c.r, c.g, c.b)
         };
         let bg_lum = luminance(bg);
-        let mut max_delta = 0.0f64;
-        for x in 0..W {
-            let px = pixel(&data, stride, x, mid_y);
-            if px == (255, 0, 255) {
-                continue; // untouched sentinel fill — not part of the bar.
-            }
-            max_delta = max_delta.max((luminance(px) - bg_lum).abs());
-        }
-        max_delta
+
+        layout
+            .hit_regions
+            .iter()
+            .filter_map(|(rect, hit)| match hit {
+                quadraui::StatusBarHit::Segment(id) => Some((rect, id)),
+                quadraui::StatusBarHit::Empty => None,
+            })
+            .map(|(rect, id)| {
+                let x0 = rect.x.round() as i32;
+                let x1 = (rect.x + rect.width).round() as i32;
+                let mut max_delta = 0.0f64;
+                // Scan every row of the painted surface, not just one
+                // mid-line scanline (#715): a thin glyph like an em dash
+                // sits at a specific baseline offset that a single sampled
+                // row can miss even though the glyph paints fine — that
+                // would be a false "invisible" failure caused by the test's
+                // own sampling, not a real bug. Scanning the full height
+                // means only a genuinely unpainted segment reports zero.
+                for y in 0..ROW_H {
+                    for x in x0.max(0)..x1.min(W) {
+                        let px = pixel(&data, stride, x, y);
+                        if px == (255, 0, 255) {
+                            continue; // untouched sentinel fill — not part of the bar.
+                        }
+                        max_delta = max_delta.max((luminance(px) - bg_lum).abs());
+                    }
+                }
+                (id.as_str().to_string(), max_delta)
+            })
+            .collect()
     }
 
     /// #552 round-2 smoke test: the minimize/maximize/close glyphs rendered
@@ -10537,18 +10572,49 @@ mod chrome_paint_tests {
     /// built-in theme (not just the default) so a future contrast
     /// regression on any one theme fails loudly instead of only surfacing
     /// in a manual smoke test against a theme nobody happened to try.
+    ///
+    /// #715: checked **per button**, not row-max. On the reporter's real GTK
+    /// desktop the old minimize glyph (`U+2500`, a box-drawing hairline)
+    /// painted zero visible pixels while `□`/`✕` painted fine — a row-max
+    /// check only needs *one* of the three buttons visible to pass, so it
+    /// shipped anyway. (This headless Cairo/Pango environment happens to
+    /// have box-drawing coverage in its fallback font, so it can't reproduce
+    /// that exact zero-pixel case — verified instead by temporarily blanking
+    /// a segment's glyph entirely, which *is* reproducible headlessly and
+    /// exercises the identical "one button visible, one isn't" failure
+    /// shape.) Asserting on each of the three `action_id`s independently is
+    /// the only version of this check that can catch a single dead button.
     #[test]
     fn window_control_buttons_are_visible_against_their_background_in_every_theme() {
+        let expected_actions = [
+            render::WINDOW_MINIMIZE_ACTION,
+            render::WINDOW_MAXIMIZE_ACTION,
+            render::WINDOW_CLOSE_ACTION,
+        ];
         for name in Theme::available_names() {
             let theme = Theme::from_name(&name);
-            let delta = max_contrast_delta(&theme);
-            // WCAG-ish floor: anything much below this reads as "same color"
-            // at a glance, which is exactly the bug this test guards against.
-            assert!(
-                delta > 40.0,
-                "theme {name:?}: window-control glyphs have only {delta:.1} \
-                 luminance contrast against tab_bar_bg — effectively invisible"
-            );
+            let deltas = per_segment_contrast_deltas(&theme);
+            for action in expected_actions {
+                let delta = deltas
+                    .iter()
+                    .find(|(id, _)| id == action)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "theme {name:?}: no hit-region painted for window-control \
+                             action {action:?} — button missing from the row entirely"
+                        )
+                    })
+                    .1;
+                // WCAG-ish floor: anything much below this reads as "same
+                // color" at a glance, which is exactly the bug this test
+                // guards against.
+                assert!(
+                    delta > 40.0,
+                    "theme {name:?}: window-control button {action:?} has only \
+                     {delta:.1} luminance contrast against tab_bar_bg — \
+                     effectively invisible"
+                );
+            }
         }
     }
 }
