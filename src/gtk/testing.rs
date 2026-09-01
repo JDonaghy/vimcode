@@ -4050,6 +4050,89 @@ mod minimap {
         );
     }
 
+    /// #728 acceptance: on an ordinary wide pane the minimap strip settles
+    /// at VS Code's own ~120px width instead of scaling up with the pane —
+    /// the pre-fix `rect_width * MINIMAP_WIDTH_FRACTION` formula reached
+    /// ~240px on a pane this wide, roughly twice VS Code's. Driven through
+    /// the real paint path (`ScreenLayout` from an actual `window_center`
+    /// call), not just `minimap_reserved_width` in isolation.
+    #[test]
+    fn minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane() {
+        let h = harness(engine_with_shaped_buffer(), 1600, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win)
+            .expect("editor pane must paint with the default settings");
+
+        let (strip_width, pane_width) = {
+            let layout = h.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let mm = l
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("the layout must carry a minimap for the pane");
+            let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
+            (mm.rect.width, rw.rect.width + mm.rect.width)
+        };
+        let char_width = h.painted_char_width();
+        let expected =
+            crate::render::minimap_reserved_width(&h.engine.borrow(), pane_width, char_width);
+
+        assert_eq!(
+            strip_width, expected,
+            "the real paint path must reserve exactly what \
+             minimap_reserved_width computes"
+        );
+        assert!(
+            strip_width < 150.0,
+            "a 1600px pane must not blow past VS Code's ~120px minimap \
+             width (got {strip_width}px — the pre-#728 formula would have \
+             hit ~240px here)"
+        );
+    }
+
+    /// #728 acceptance: the minimap strip must never extend into the
+    /// per-window status row painted at the bottom of the same window.
+    /// `build_screen_layout` reserves `status_h` off the bottom of the
+    /// strip's own rect via `render::window_status_row_reserved` — the same
+    /// predicate GTK's h-scrollbar geometry now shares (previously it used
+    /// a diverging predicate; see `gtk::h_scrollbar_status_offset_tests`).
+    #[test]
+    fn minimap_strip_never_overlaps_the_per_window_status_row() {
+        let mut engine = engine_with_shaped_buffer();
+        engine.settings.window_status_line = true;
+        let h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win)
+            .expect("editor pane must paint with the status line on");
+
+        let lh = h
+            .painted_line_height()
+            .expect("frame must publish the line height it painted with");
+        let layout = h.screen_layout.borrow();
+        let l = layout.as_ref().unwrap();
+        let mm = l
+            .minimap
+            .iter()
+            .find(|m| m.window_id == win)
+            .expect("the layout must carry a minimap for the pane");
+        let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
+        assert!(
+            rw.status_line.is_some(),
+            "test setup sanity: the per-window status line must actually \
+             be painted, or this test isn't exercising the overlap risk \
+             at all"
+        );
+
+        let status_row_top = rw.rect.y + rw.rect.height - lh;
+        let strip_bottom = mm.rect.y + mm.rect.height;
+        assert!(
+            strip_bottom <= status_row_top + 0.01,
+            "the minimap strip (bottom={strip_bottom}) must not extend \
+             into the per-window status row (top={status_row_top})"
+        );
+    }
+
     /// Acceptance (#35): a click at the vertical middle of the strip scrolls
     /// the pane to ~50% of the file — the GTK half of the cross-backend
     /// claim, driven through the real `pixel_to_click_target` path.

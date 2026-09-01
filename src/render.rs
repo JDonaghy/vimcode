@@ -4350,16 +4350,31 @@ pub struct ScreenLayout {
 
 // ─── Minimap (#35) ────────────────────────────────────────────────────────────
 
-/// Fraction of a pane's own width the minimap strip reserves (#722).
+/// Fraction of a pane's own width the minimap strip may reserve, as an
+/// *upper bound* only (#728).
 ///
-/// VS Code keeps its minimap at a roughly constant fraction of the editor
-/// regardless of window width or editor font size — e.g. its ~120px strip
-/// over a ~800px editor pane at default settings is ~15%. This is the
-/// primary driver of `minimap_reserved_width`'s `want`; `MINIMAP_MIN_COLS`/
-/// `MINIMAP_MAX_COLS` below only bound the extremes, so widening a pane
-/// grows the strip and resizing the editor font does not (both pinned by
-/// `render.rs`'s minimap test module).
+/// #722 made this fraction the primary driver of `minimap_reserved_width`'s
+/// `want`, which is what let the strip grow to ~240px (`MINIMAP_MAX_PX`) in
+/// an ordinary wide pane — roughly twice VS Code's own strip. VS Code does
+/// not scale its minimap with window width at all: it derives a *fixed*
+/// width from `minimap.maxColumn` (120, one pixel per assumed column — see
+/// `MINIMAP_TARGET_COLS`). #728 makes that fixed target the primary driver
+/// instead, and demotes this fraction to a cap that only matters for a pane
+/// too narrow to afford the full 120px/cols (so the strip still shrinks
+/// smoothly with the pane rather than snapping straight from 120 to
+/// suppressed at `MINIMAP_MIN_TEXT_COLS`).
 pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
+
+/// Target minimap width, in the caller's own unit (px for GTK, columns for
+/// TUI) — VS Code's `minimap.maxColumn` default (#728). VS Code renders its
+/// minimap at one pixel per assumed source column, so at 120px this is
+/// "precisely 1px per column", matching quadraui's own colour-bar heuristic
+/// (`aggregate_spans`'s `MINIMAP_SPAN_COLS` window), and TUI's column-native
+/// units make the same constant trivially the column count directly.
+/// `minimap_reserved_width` takes `min(MINIMAP_TARGET_COLS, pane-fraction
+/// cap)`, so this is a ceiling a wide pane settles at, not something a wider
+/// pane keeps growing past (unlike the old fraction-only formula).
+const MINIMAP_TARGET_COLS: f64 = 120.0;
 
 /// Floor on the reserved width for TUI, in cell columns directly. TUI is
 /// cell-native and always passes `char_width == 1.0` into
@@ -4394,6 +4409,13 @@ const MINIMAP_MIN_PX: f64 = 48.0;
 
 /// Ceiling on the reserved width for GTK, same units/rationale as
 /// `MINIMAP_MIN_PX` (30 cols * 8px at the same representative font).
+///
+/// #728: since `MINIMAP_TARGET_COLS` (120) is now `want`'s primary driver
+/// and is itself below this ceiling, `want` no longer reaches 240px in
+/// practice — this remains only as a defensive bound (e.g. if
+/// `MINIMAP_TARGET_COLS` is ever raised above it) rather than the everyday
+/// cap it used to be. The strip's everyday ceiling is `MINIMAP_TARGET_COLS`
+/// itself.
 const MINIMAP_MAX_PX: f64 = 240.0;
 
 /// Text columns that must survive after reserving the strip. Below this the
@@ -4420,6 +4442,40 @@ const MINIMAP_COLS_PER_CELL: usize = 2;
 /// influence any painted cell, so aggregating it would be wasted work.
 const MINIMAP_SPAN_COLS: usize = 200;
 
+/// Character-count ceiling for `build_minimap_data`'s `to_col` closure
+/// (#728). `aggregate_spans` never looks past `MINIMAP_SPAN_COLS` cells of
+/// `MINIMAP_COLS_PER_CELL` raw columns each, so a byte offset past that many
+/// characters always maps to a column `aggregate_spans` discards anyway —
+/// scanning further just to report an exact (and irrelevant) larger number
+/// is wasted, unbounded work on a long line. The `+ 1` keeps the boundary
+/// value itself exact rather than off-by-one short.
+const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_SPAN_COLS * MINIMAP_COLS_PER_CELL + 1;
+
+/// Buffer line numbers `build_minimap_data` will actually sample, computed
+/// **before** any line text is fetched (#728).
+///
+/// Mirrors `quadraui::sample_lines`'s own stride formula exactly (never
+/// upscales — keep every line when `total_lines <= target_lines` — otherwise
+/// stride every `total_lines / target_lines` lines), so handing exactly
+/// these `total_lines.min(target_lines)`-many candidates back into
+/// `sample_lines` with `target_rows` set to that same count always takes its
+/// cheap "keep every candidate, in order" path. That lets the caller fetch
+/// only these lines' text from the rope instead of materialising a `String`
+/// for every line in the buffer, while still going through `sample_lines`
+/// for the actual `MinimapLine` construction.
+fn minimap_sample_indices(total_lines: usize, target_lines: usize) -> Vec<usize> {
+    if total_lines == 0 || target_lines == 0 {
+        return Vec::new();
+    }
+    if total_lines <= target_lines {
+        return (0..total_lines).collect();
+    }
+    let stride = total_lines as f64 / target_lines as f64;
+    (0..target_lines)
+        .map(|r| ((r as f64 * stride) as usize).min(total_lines - 1))
+        .collect()
+}
+
 /// The active window's minimap: a quadraui `Minimap` primitive plus the strip
 /// it occupies. Both backends consume this verbatim — `rect` goes straight to
 /// `draw_minimap`, and the returned `MinimapLayout` answers clicks.
@@ -4435,11 +4491,16 @@ pub struct RenderedMinimap {
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
 ///
-/// `want` is `rect_width * MINIMAP_WIDTH_FRACTION`, clamped to a floor/
-/// ceiling — a proportion of *this pane's* width, not a fixed column count
-/// multiplied by the editor's font metrics (#722). That makes the strip
-/// grow with the pane and hold steady across a font-size change, matching
-/// VS Code.
+/// #728: `want` is `min(MINIMAP_TARGET_COLS, rect_width *
+/// MINIMAP_WIDTH_FRACTION)`, clamped to a floor/ceiling. The fixed target is
+/// VS Code parity — its minimap does not grow with the window — and the
+/// fraction only caps `want` down for a pane too narrow to afford the full
+/// target, still as a proportion of *this pane's* width rather than a fixed
+/// column count multiplied by the editor's font metrics (#722). That keeps
+/// the strip narrowing smoothly in a narrow/split pane while holding steady
+/// at the VS Code-sized target in an ordinary or wide one, and — since
+/// neither term depends on `char_width` — still holds steady across a
+/// font-size change.
 ///
 /// The clamp bounds themselves must be font-invariant too, or the *clamped*
 /// result reintroduces #722's defect B in exactly the narrow-pane regime a
@@ -4462,7 +4523,9 @@ pub fn minimap_reserved_width(engine: &Engine, rect_width: f64, char_width: f64)
     } else {
         (MINIMAP_MIN_COLS * cw, MINIMAP_MAX_COLS * cw)
     };
-    let want = (rect_width * MINIMAP_WIDTH_FRACTION).clamp(min_w, max_w);
+    let want = MINIMAP_TARGET_COLS
+        .min(rect_width * MINIMAP_WIDTH_FRACTION)
+        .clamp(min_w, max_w);
     let has = engine.settings.minimap && rect_width >= want + MINIMAP_MIN_TEXT_COLS * cw;
     quadraui::reserved_width(want as f32, has) as f64
 }
@@ -4500,10 +4563,22 @@ pub fn build_minimap_data(
         return None;
     }
 
-    // Whole-file text, trimmed of line endings — `sample_lines` picks the
-    // stride, we only supply the candidates.
-    let owned: Vec<String> = (0..total_buffer_lines)
-        .map(|i| {
+    // #728: pick *which* buffer lines to sample before fetching any line
+    // text — mirrors `quadraui::sample_lines`'s own stride formula (never
+    // upscales; otherwise strides every `total / target` lines) so only the
+    // ~`target_lines` candidates that will actually survive get fetched
+    // from the rope, instead of materialising a `String` for every line in
+    // the buffer on every frame (the fix this pins in
+    // `minimap_scroll_does_not_scale_with_buffer_size`). `sample_lines` is
+    // still the function that turns text into `MinimapLine`s below — this
+    // only decides which lines are worth reading in the first place.
+    let sample_indices = minimap_sample_indices(total_buffer_lines, target_lines);
+    if sample_indices.is_empty() {
+        return None;
+    }
+    let owned: Vec<String> = sample_indices
+        .iter()
+        .map(|&i| {
             rope.line(i)
                 .as_str()
                 .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
@@ -4516,7 +4591,17 @@ pub fn build_minimap_data(
         })
         .collect();
     let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let lines = quadraui::sample_lines(&borrowed, target_lines);
+    // `sample_indices.len()` candidates against a `target_rows` of exactly
+    // that count always takes `sample_lines`'s "never upscales, keep every
+    // candidate" branch, so `line_idx` below is just each candidate's
+    // position in `borrowed`/`owned` — remapped to the real buffer line
+    // number via `sample_indices` right after, since `sample_lines` only
+    // knows positions within the slice it was given, not buffer line
+    // numbers.
+    let mut lines = quadraui::sample_lines(&borrowed, borrowed.len());
+    for (line, &real_idx) in lines.iter_mut().zip(sample_indices.iter()) {
+        line.line_idx = real_idx;
+    }
     if lines.is_empty() {
         return None;
     }
@@ -4539,13 +4624,30 @@ pub fn build_minimap_data(
             continue;
         };
         let line_start = rope.line_to_byte(buf_line);
-        let line_str = &owned[buf_line];
+        // `owned`/`borrowed`/`lines` are all indexed by *sampled* position
+        // (`idx`), not by real buffer line number (`buf_line`) — `owned` no
+        // longer has one entry per buffer line since #728 stopped
+        // materialising the whole buffer, so `sampled_at`'s value (the
+        // sampled index) is what indexes it now.
+        let line_str = &owned[idx];
         // quadraui's rasterisers treat span columns as *character* columns
         // (GTK converts them back to byte offsets for Pango attributes), so
-        // convert here rather than handing over raw byte deltas.
+        // convert here rather than handing over raw byte deltas. Capped at
+        // `MINIMAP_COL_SCAN_LIMIT` chars: columns past
+        // `MINIMAP_SPAN_COLS` * `MINIMAP_COLS_PER_CELL` never affect
+        // `aggregate_spans`'s output (it drops any cell at/past
+        // `grid.cols`), so counting further into a long — e.g. minified —
+        // line is wasted, and unbounded: a span's byte offset can land
+        // arbitrarily far into it. Without the cap this was an O(line
+        // length) rescan run up to twice per highlight span on that line
+        // (#728).
         let to_col = |b: usize| -> usize {
             let b = b.min(line_str.len());
-            line_str.get(..b).map(|p| p.chars().count()).unwrap_or(b)
+            line_str
+                .char_indices()
+                .take(MINIMAP_COL_SCAN_LIMIT)
+                .take_while(|&(byte_idx, _)| byte_idx < b)
+                .count()
         };
         let start_col = to_col(start.saturating_sub(line_start));
         let end_col = to_col(end.saturating_sub(line_start));
@@ -6804,6 +6906,41 @@ impl Theme {
     }
 }
 
+/// Whether a per-window status line is reserved (and painted) at the bottom
+/// of each editor window's own rect, given the engine's current state.
+///
+/// Single source of truth for "does this window reserve its bottom row for
+/// its own status line" (#728). Before this, the question was answered
+/// independently — and inconsistently — in two places:
+///   - `build_screen_layout_with_breadcrumb_row` used `per_window_status &&
+///     !separate_status`, correctly handling `status_line_above_terminal`
+///     being OFF with the bottom panel open (which pulls the active
+///     window's status into a *separated* bar above the terminal instead,
+///     freeing that window's own bottom row) but never checking
+///     `terminal_maximized`.
+///   - GTK's `h_scrollbar_geometry` used `window_status_line &&
+///     !terminal_maximized` (to avoid offsetting the horizontal scrollbar
+///     for a status row that isn't painted while the terminal panel covers
+///     the editor windows entirely), but never checked `separate_status`.
+///
+/// Each covered an axis the other didn't, so either one alone could
+/// disagree with what actually gets painted. Both call sites now go through
+/// this one function instead.
+pub fn window_status_row_reserved(engine: &Engine) -> bool {
+    // While the terminal panel is maximized, editor windows are not the
+    // visible surface at all (`breadcrumb_draw_targets` suppresses every
+    // breadcrumb the same way), so nothing paints a per-window status row
+    // regardless of the setting.
+    if engine.terminal_maximized {
+        return false;
+    }
+    let per_window_status = engine.settings.window_status_line;
+    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
+    let separate_status =
+        per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
+    per_window_status && !separate_status
+}
+
 // ─── build_screen_layout ──────────────────────────────────────────────────────
 
 /// Build a complete `ScreenLayout` from current engine state.
@@ -6875,6 +7012,9 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // window — they're naturally above the terminal by being part of the editor area.
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
+    // Single source of truth for "does this window paint its own bottom-row
+    // status line" (#728) — also consulted by GTK's `h_scrollbar_geometry`.
+    let own_status_row = window_status_row_reserved(engine);
 
     // Window-split dividers (#582) — independent of the `n >= 2` editor-group
     // check below, since `:split`/`:vsplit` panes exist within a single group.
@@ -6896,7 +7036,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
         .iter()
         .map(|(window_id, rect)| {
             let mut visible_lines = (rect.height / line_height).floor() as usize;
-            if per_window_status && !separate_status && visible_lines > 1 {
+            if own_status_row && visible_lines > 1 {
                 visible_lines -= 1; // reserve bottom row for per-window status bar
             }
             let is_active = *window_id == active_window_id;
@@ -6919,7 +7059,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 multi_window,
                 color_headings,
             );
-            if per_window_status && !separate_status {
+            if own_status_row {
                 rw.status_line = Some(build_window_status_line(
                     engine, theme, *window_id, is_active,
                 ));
@@ -6944,7 +7084,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             if minimap_w <= 0.0 {
                 return None;
             }
-            let status_h = if per_window_status && !separate_status && r.height > line_height {
+            let status_h = if own_status_row && r.height > line_height {
                 line_height
             } else {
                 0.0
@@ -16065,6 +16205,134 @@ mod tests {
         assert!(layout.global_status_bar.is_some());
     }
 
+    // ─── #728: single-predicate status-row reservation ──────────────────
+
+    /// `window_status_row_reserved` is now the only place either
+    /// `build_screen_layout` or GTK's `h_scrollbar_geometry` decide whether
+    /// a window paints its own bottom-row status line. Pin every axis it
+    /// depends on: the base setting, `terminal_maximized` (GTK's old
+    /// predicate accounted for this; `build_screen_layout`'s old one
+    /// didn't), and the `status_line_above_terminal`/bottom-panel
+    /// combination that produces a *separated* status bar instead
+    /// (`build_screen_layout`'s old predicate accounted for this; GTK's old
+    /// one didn't).
+    #[test]
+    fn window_status_row_reserved_covers_every_axis() {
+        use crate::core::engine::Engine;
+
+        let base = || {
+            let mut e = Engine::new_for_test();
+            e.settings.window_status_line = true;
+            e
+        };
+
+        // Setting off → never reserved, regardless of anything else.
+        let mut e = base();
+        e.settings.window_status_line = false;
+        assert!(!window_status_row_reserved(&e), "setting off");
+
+        // Setting on, nothing else in play → reserved.
+        let e = base();
+        assert!(
+            window_status_row_reserved(&e),
+            "plain per-window status must reserve its own row"
+        );
+
+        // Terminal maximized → editor windows aren't the visible surface;
+        // GTK's old predicate caught this, `build_screen_layout`'s didn't.
+        let mut e = base();
+        e.terminal_maximized = true;
+        assert!(
+            !window_status_row_reserved(&e),
+            "a maximized terminal panel must suppress the per-window row"
+        );
+
+        // status_line_above_terminal ON (default) with the bottom panel
+        // open: per-window status bars stay inside each window (still
+        // "naturally above" the terminal), so the row is still reserved.
+        let mut e = base();
+        e.settings.status_line_above_terminal = true;
+        e.terminal_open = true;
+        assert!(
+            window_status_row_reserved(&e),
+            "status_line_above_terminal keeps the status row inside the window"
+        );
+
+        // status_line_above_terminal OFF with the bottom panel open: the
+        // active window's status is pulled into a *separated* bar above the
+        // terminal instead, freeing this row. GTK's old predicate
+        // (`window_status_line && !terminal_maximized`) missed this axis
+        // entirely and would have reported "reserved" here.
+        let mut e = base();
+        e.settings.status_line_above_terminal = false;
+        e.terminal_open = true;
+        assert!(
+            !window_status_row_reserved(&e),
+            "separated status must free the window's own bottom row"
+        );
+
+        // Same, but via the non-terminal bottom panel (debug output etc.)
+        // rather than the terminal specifically.
+        let mut e = base();
+        e.settings.status_line_above_terminal = false;
+        e.bottom_panel_open = true;
+        assert!(
+            !window_status_row_reserved(&e),
+            "any open bottom panel — not just the terminal — must separate the status"
+        );
+
+        // status_line_above_terminal OFF but nothing open at the bottom:
+        // `separate_status` requires `bottom_panel_open`, so the row stays
+        // reserved in-window.
+        let e = {
+            let mut e = base();
+            e.settings.status_line_above_terminal = false;
+            e
+        };
+        assert!(
+            window_status_row_reserved(&e),
+            "no bottom panel open → nothing to separate the status from"
+        );
+    }
+
+    /// #728 acceptance: across every combination of the four settings
+    /// `window_status_row_reserved` depends on, GTK's h-scrollbar geometry
+    /// (via the same shared predicate) must never disagree with
+    /// `build_screen_layout` about whether a window's bottom row is free.
+    /// Exercised here through the shared predicate directly (both call
+    /// sites now route through it), rather than duplicating GTK's own
+    /// geometry math into a render.rs test.
+    #[test]
+    fn window_status_row_reserved_is_deterministic_across_all_combinations() {
+        use crate::core::engine::Engine;
+
+        for window_status_line in [false, true] {
+            for status_line_above_terminal in [false, true] {
+                for bottom_panel_open in [false, true] {
+                    for terminal_maximized in [false, true] {
+                        let mut e = Engine::new_for_test();
+                        e.settings.window_status_line = window_status_line;
+                        e.settings.status_line_above_terminal = status_line_above_terminal;
+                        e.bottom_panel_open = bottom_panel_open;
+                        e.terminal_maximized = terminal_maximized;
+
+                        let expected = window_status_line
+                            && !terminal_maximized
+                            && !(!status_line_above_terminal && bottom_panel_open);
+                        assert_eq!(
+                            window_status_row_reserved(&e),
+                            expected,
+                            "window_status_line={window_status_line} \
+                             status_line_above_terminal={status_line_above_terminal} \
+                             bottom_panel_open={bottom_panel_open} \
+                             terminal_maximized={terminal_maximized}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_status_segments_have_actions() {
         use crate::core::engine::Engine;
@@ -16537,6 +16805,81 @@ mod tests {
         test_engine(&text)
     }
 
+    /// A synthetic file large enough to make an O(buffer) per-frame cost
+    /// visible: 10,000 lines, none of them trivially short (so a full
+    /// buffer-wide `String` materialisation actually does real allocation
+    /// work, not just touch 10,000 empty strings).
+    fn large_minimap_engine(n_lines: usize) -> Engine {
+        let mut text = String::with_capacity(n_lines * 24);
+        for i in 0..n_lines {
+            text.push_str(&format!("fn line_{i}() {{ do_something({i}); }}\n"));
+        }
+        test_engine(&text)
+    }
+
+    /// #728 performance acceptance: wheel-scrolling a 10,000-line file must
+    /// not cost O(buffer) per frame. `build_minimap_data` used to allocate a
+    /// `String` for *every* line in the buffer on every call regardless of
+    /// how many it actually samples (`quadraui::sample_lines` only keeps
+    /// ~`target_lines`, but the old code built the whole buffer as
+    /// candidates first) — this simulates sustained wheel scroll (one call
+    /// per frame, `scroll_top` advancing each time so the sampled window
+    /// keeps moving, the same as a real scroll) and pins a cost ceiling a
+    /// buffer-wide allocation blows through.
+    ///
+    /// Measured on this machine (debug `cargo test --no-default-features
+    /// --bin vcd`), 300 simulated scroll frames over a 10,000-line file:
+    ///   - before (whole-buffer `owned: Vec<String>` every frame): **24.23s
+    ///     total, ~80.8ms/frame** — unusable under sustained wheel scroll,
+    ///     matching the issue's report.
+    ///   - after (index-first sampling, only ~`target_lines` lines fetched
+    ///     from the rope per frame): **0.40s total, ~1.34ms/frame** — a
+    ///     ~60x improvement, and no longer scales with buffer size at all
+    ///     (cost tracks `target_lines`, i.e. the strip's own display rows).
+    ///
+    /// The ceiling below (500ms) is intentionally generous — an order of
+    /// magnitude above the fixed measurement — so the test is a regression
+    /// guard against reintroducing O(buffer) behavior, not a tight perf pin
+    /// that flakes on a loaded CI box.
+    #[test]
+    fn minimap_scroll_does_not_scale_with_buffer_size() {
+        let n_lines = 10_000;
+        let mut e = large_minimap_engine(n_lines);
+        e.settings.minimap = true;
+        let wid = e.active_window_id();
+        let theme = Theme::onedark();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+
+        let frames = 300;
+        let start = std::time::Instant::now();
+        for i in 0..frames {
+            if let Some(w) = e.windows.get_mut(&wid) {
+                w.view.scroll_top = i % n_lines;
+            }
+            let mm = build_minimap_data(&e, &theme, wid, rect, 1.0);
+            assert!(mm.is_some(), "minimap must build for every simulated frame");
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "minimap_scroll_does_not_scale_with_buffer_size: {frames} frames / \
+             {n_lines} lines in {elapsed:?} ({:.4}ms/frame)",
+            elapsed.as_secs_f64() * 1000.0 / frames as f64
+        );
+
+        // A per-frame whole-buffer materialisation (10,000 lines * 300
+        // frames = 3,000,000 allocated/trimmed Strings) is the regression
+        // this guards against; a per-frame ~display-rows sampling is not.
+        // 500ms for 300 frames (1.6ms/frame) is generous headroom above the
+        // fixed cost on this machine, chosen to catch "still O(buffer)"
+        // without flaking on a slower/loaded box.
+        assert!(
+            elapsed.as_millis() < 500,
+            "300 simulated scroll frames over a {n_lines}-line buffer took \
+             {elapsed:?} — expected well under 500ms; this smells like an \
+             O(buffer)-per-frame regression"
+        );
+    }
+
     /// Acceptance: `:set nominimap` must widen the editor text area by
     /// *exactly* the reserved width, and `:set minimap` must give it back.
     /// Asserted on the rendered `text_viewport_cols`, not on the setting.
@@ -16725,10 +17068,10 @@ mod tests {
     /// change the reserved width at a fixed pane width — the old formula
     /// multiplied `MINIMAP_COLS` by `char_width` directly, so a larger font
     /// made the strip wider, which is backwards (VS Code's minimap width is
-    /// independent of the editor font). Pane width chosen so the
-    /// fraction-derived want sits inside the clamp band for every
-    /// `char_width` tested, so the clamp itself can't be the reason the
-    /// widths happen to match.
+    /// independent of the editor font). Pane wide enough that `want` is
+    /// driven by `MINIMAP_TARGET_COLS` (#728) rather than the fraction, for
+    /// every `char_width` tested, so the clamp/fraction can't be the reason
+    /// the widths happen to match.
     #[test]
     fn minimap_reserved_width_is_unchanged_by_font_size() {
         let e = minimap_engine();
@@ -16740,7 +17083,7 @@ mod tests {
             "reserved width must not depend on char_width: \
              8px/char={small_font}, 16px/char={large_font}"
         );
-        assert_eq!(small_font, pane_width * MINIMAP_WIDTH_FRACTION);
+        assert_eq!(small_font, MINIMAP_TARGET_COLS);
     }
 
     /// #722 review regression: `minimap_reserved_width_is_unchanged_by_font_size`
@@ -16791,12 +17134,14 @@ mod tests {
     /// font's `MINIMAP_MAX_COLS * char_width` ceiling can exceed a
     /// merely-wide pane's `want`, so the clamp never engages) — precisely
     /// backwards, since VS Code's minimap cap does not grow with the
-    /// editor font. Pane wide enough that `want` exceeds the fixed 240px
-    /// ceiling at every font size tested.
+    /// editor font. Pane wide enough that the pane-fraction cap alone would
+    /// exceed `MINIMAP_TARGET_COLS` at every font size tested, so `want`
+    /// settles at the fixed target rather than either the fraction or
+    /// `MINIMAP_MAX_PX`.
     #[test]
     fn minimap_reserved_width_clamp_ceiling_is_font_invariant() {
         let e = minimap_engine();
-        let pane_width = 2000.0; // want = 2000 * 0.15 = 300px, above the 240px ceiling
+        let pane_width = 2000.0; // fraction = 2000 * 0.15 = 300px, above the 120px target
         let small_font = minimap_reserved_width(&e, pane_width, 8.0);
         let large_font = minimap_reserved_width(&e, pane_width, 16.0);
         assert_eq!(
@@ -16805,9 +17150,27 @@ mod tests {
              on char_width: 8px/char={small_font}, 16px/char={large_font}"
         );
         assert_eq!(
-            small_font, MINIMAP_MAX_PX,
-            "a pane this wide must clamp to the fixed pixel ceiling, not a \
-             char_width-scaled one"
+            small_font, MINIMAP_TARGET_COLS,
+            "a pane this wide must settle at the fixed VS Code-parity \
+             target, not a char_width-scaled one"
+        );
+    }
+
+    /// #728 acceptance: the old formula (`want = rect_width *
+    /// MINIMAP_WIDTH_FRACTION`, clamped only at 240px) let an ordinary wide
+    /// GTK pane reach ~240px — roughly twice VS Code's own ~120px minimap,
+    /// which does not grow with window width at all. A representative
+    /// 1600px pane at an 8px font is exactly the case #728 reported: RED
+    /// against the pre-fix formula (`1600 * 0.15 = 240`, hitting
+    /// `MINIMAP_MAX_PX` — double the VS Code-parity width asserted here).
+    #[test]
+    fn minimap_reserved_width_matches_vs_code_parity_on_a_wide_pane() {
+        let e = minimap_engine();
+        let want = minimap_reserved_width(&e, 1600.0, 8.0);
+        assert_eq!(
+            want, MINIMAP_TARGET_COLS,
+            "an ordinary wide GTK pane must settle at VS Code's ~120px \
+             minimap width, not scale up with the pane: got {want}"
         );
     }
 

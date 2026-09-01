@@ -10439,8 +10439,15 @@ fn h_scrollbar_geometry(
     // line_height` and paints after the scrollbars, so anchor the
     // h-scrollbar above it when the status line is on. Otherwise the
     // status bar overdraws the entire scrollbar (it's `line_height`
-    // tall vs the scrollbar's ~5px).
-    let status_offset = if engine.settings.window_status_line && !engine.terminal_maximized {
+    // tall vs the scrollbar's ~5px). `render::window_status_row_reserved`
+    // is the single source of truth for whether that row is actually
+    // painted (#728) — this used to check `window_status_line &&
+    // !terminal_maximized` directly, which (unlike the shared helper)
+    // never accounted for `status_line_above_terminal`/bottom-panel state
+    // pulling the status line out into a separated bar instead, and so
+    // could disagree with `build_screen_layout` about whether this row is
+    // free.
+    let status_offset = if render::window_status_row_reserved(engine) {
         line_height
     } else {
         0.0
@@ -10768,6 +10775,116 @@ mod native_scrollbar_placement_tests {
     #[test]
     fn degenerate_pane_clamps_to_the_pane_origin() {
         assert_eq!(native_scrollbar_margin_start(100.0, 30.0, 12.0, 48.0), 100);
+    }
+}
+
+#[cfg(test)]
+mod h_scrollbar_status_offset_tests {
+    //! #728: `h_scrollbar_geometry`'s status-row offset used to check
+    //! `window_status_line && !terminal_maximized` directly, while
+    //! `render::build_screen_layout`'s reservation of that same row used
+    //! `per_window_status && !separate_status` — two independent answers to
+    //! "is a per-window status row painted here", each covering an axis the
+    //! other didn't (`terminal_maximized` vs. `separate_status`). Both now
+    //! go through `render::window_status_row_reserved`; these pin that the
+    //! scrollbar's track actually moves in lockstep with it rather than
+    //! re-diverging.
+    use super::h_scrollbar_geometry;
+    use crate::core::{Engine, WindowRect};
+
+    /// A window whose longest line overflows a narrow viewport, so
+    /// `h_scrollbar_geometry` returns `Some` rather than `None` ("content
+    /// fits" — nothing to offset).
+    fn engine_needing_h_scrollbar() -> Engine {
+        let mut e = Engine::new_for_test();
+        e.buffer_mut().insert(0, &"x".repeat(500));
+        // `max_col` (what `h_scrollbar_geometry` reads) is a cache
+        // refreshed by `update_syntax`, not by a raw `Buffer::insert` —
+        // force it so the 500-char line above is actually reflected.
+        let wid = e.active_window_id();
+        let buffer_id = e.windows.get(&wid).unwrap().buffer_id;
+        e.buffer_manager.get_mut(buffer_id).unwrap().update_syntax();
+        e
+    }
+
+    #[test]
+    fn track_moves_up_by_exactly_one_row_when_the_status_row_is_reserved() {
+        let mut e = engine_needing_h_scrollbar();
+        e.settings.window_status_line = true;
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let line_height = 20.0;
+
+        let (_, track_y_with, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
+            .expect("an overflowing line needs an h-scrollbar");
+
+        e.settings.window_status_line = false;
+        let (_, track_y_without, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
+            .expect("still overflowing with the status line off");
+
+        assert_eq!(
+            track_y_without - track_y_with,
+            line_height,
+            "the status row must shift the h-scrollbar up by exactly one line_height"
+        );
+    }
+
+    /// #728 regression: with `status_line_above_terminal` OFF and the
+    /// bottom panel open, the active window's status is pulled into a
+    /// *separated* bar above the terminal instead of painting inside this
+    /// window — `render::window_status_row_reserved` reports the row as
+    /// free, and the h-scrollbar must agree. The old
+    /// `window_status_line && !terminal_maximized` predicate never checked
+    /// this axis and would have offset for a row nothing paints here.
+    /// RED against that predicate (verified while writing this fix): 13.0
+    /// vs. 33.0 — the old code offset the track by a full `line_height` for
+    /// a status row that was actually painted as a separated bar elsewhere.
+    #[test]
+    fn track_does_not_move_when_status_is_separated_above_the_terminal() {
+        let mut e = engine_needing_h_scrollbar();
+        e.settings.window_status_line = true;
+        e.settings.status_line_above_terminal = false;
+        e.terminal_open = true;
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let line_height = 20.0;
+
+        let (_, track_y_separated, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
+            .expect("an overflowing line needs an h-scrollbar");
+
+        e.settings.window_status_line = false;
+        let (_, track_y_no_status, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
+            .expect("still overflowing with the status line off");
+
+        assert_eq!(
+            track_y_separated, track_y_no_status,
+            "a separated status bar must not offset the h-scrollbar — this \
+             window's own bottom row is free"
+        );
+    }
+
+    /// #728 regression: while the terminal panel is maximized, editor
+    /// windows are not the visible surface, so nothing paints a per-window
+    /// status row even with the setting on — the h-scrollbar must not
+    /// offset for one. This is the axis `build_screen_layout`'s old
+    /// predicate never checked (only GTK's did).
+    #[test]
+    fn track_does_not_move_when_the_terminal_is_maximized() {
+        let mut e = engine_needing_h_scrollbar();
+        e.settings.window_status_line = true;
+        e.terminal_maximized = true;
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let line_height = 20.0;
+
+        let (_, track_y_maximized, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
+            .expect("an overflowing line needs an h-scrollbar");
+
+        e.settings.window_status_line = false;
+        let (_, track_y_no_status, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
+            .expect("still overflowing with the status line off");
+
+        assert_eq!(track_y_maximized, track_y_no_status);
     }
 }
 
