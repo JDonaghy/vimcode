@@ -4361,16 +4361,40 @@ pub struct ScreenLayout {
 /// `render.rs`'s minimap test module).
 pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
 
-/// Floor on the reserved width, in the caller's own local columns — cells
-/// directly for TUI, multiplied by `char_width` into pixels for GTK (same
-/// convention as `MINIMAP_MIN_TEXT_COLS` below). Stops the strip shrinking
-/// to an unreadable sliver in a merely-narrow pane, before
-/// `MINIMAP_MIN_TEXT_COLS` suppresses it outright in a very narrow one.
+/// Floor on the reserved width for TUI, in cell columns directly. TUI is
+/// cell-native and always passes `char_width == 1.0` into
+/// [`minimap_reserved_width`], so multiplying by it is a no-op and this
+/// constant is trivially font-invariant (TUI has no font size to vary).
+/// Stops the strip shrinking to an unreadable sliver in a merely-narrow
+/// pane, before `MINIMAP_MIN_TEXT_COLS` suppresses it outright in a very
+/// narrow one.
 const MINIMAP_MIN_COLS: f64 = 6.0;
 
-/// Ceiling on the reserved width, same units as `MINIMAP_MIN_COLS`. Stops
-/// the strip from eating an ever-growing share of a very wide pane.
+/// Ceiling on the reserved width for TUI, same units/caveats as
+/// `MINIMAP_MIN_COLS`. Stops the strip from eating an ever-growing share of
+/// a very wide pane.
 const MINIMAP_MAX_COLS: f64 = 30.0;
+
+/// Floor on the reserved width for GTK, in **raw pixels** — deliberately
+/// *not* `MINIMAP_MIN_COLS * char_width`. #722 made the un-clamped `want`
+/// term font-invariant (a fraction of the pane's own pixel width), but an
+/// earlier version of this fix left the clamp bounds multiplied by
+/// `char_width`, which reintroduces font-dependence exactly where a
+/// `:vsplit` pushes panes into: once a pane is narrow enough that `want`
+/// falls below the floor, the *clamped* result is `MINIMAP_MIN_COLS *
+/// char_width` again — doubling the editor font doubles the minimap width
+/// in that regime (a ~300px pane went 48px→96px), which is precisely the
+/// backwards behaviour #722 exists to prevent. Chosen to match the old
+/// per-column floor at a representative 8px/char default font (6 cols *
+/// 8px), but as a fixed pixel amount rather than something derived from
+/// `char_width` at call time — see
+/// `minimap_reserved_width_clamp_floor_is_font_invariant` below, which pins
+/// this in the regime the un-clamped scaling test deliberately avoids.
+const MINIMAP_MIN_PX: f64 = 48.0;
+
+/// Ceiling on the reserved width for GTK, same units/rationale as
+/// `MINIMAP_MIN_PX` (30 cols * 8px at the same representative font).
+const MINIMAP_MAX_PX: f64 = 240.0;
 
 /// Text columns that must survive after reserving the strip. Below this the
 /// minimap suppresses itself rather than squeezing the editor into a sliver.
@@ -4411,12 +4435,21 @@ pub struct RenderedMinimap {
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
 ///
-/// `want` is `rect_width * MINIMAP_WIDTH_FRACTION`, clamped to
-/// `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]` (in local columns, i.e. multiplied
-/// by `char_width` for GTK) — a proportion of *this pane's* width, not a
-/// fixed column count multiplied by the editor's font metrics (#722). That
-/// makes the strip grow with the pane and hold steady across a font-size
-/// change, matching VS Code.
+/// `want` is `rect_width * MINIMAP_WIDTH_FRACTION`, clamped to a floor/
+/// ceiling — a proportion of *this pane's* width, not a fixed column count
+/// multiplied by the editor's font metrics (#722). That makes the strip
+/// grow with the pane and hold steady across a font-size change, matching
+/// VS Code.
+///
+/// The clamp bounds themselves must be font-invariant too, or the *clamped*
+/// result reintroduces #722's defect B in exactly the narrow-pane regime a
+/// split pushes panes into (see `MINIMAP_MIN_PX`'s doc comment). TUI is
+/// cell-native (`char_width == 1.0` always) so `MINIMAP_MIN_COLS` /
+/// `MINIMAP_MAX_COLS` are already font-invariant there; GTK gets separate
+/// raw-pixel bounds (`MINIMAP_MIN_PX` / `MINIMAP_MAX_PX`) that do not scale
+/// with `char_width` at all. `char_width > 1.0` is this file's existing
+/// convention for "this call is GTK, not TUI" (see the `#515` comment on
+/// the `bar_width` hit-region conversion above).
 ///
 /// Delegates the on/off decision to `quadraui::reserved_width` so both
 /// backends (and `build_screen_layout`, which shrinks each window rect by
@@ -4424,8 +4457,11 @@ pub struct RenderedMinimap {
 /// turns the strip off.
 pub fn minimap_reserved_width(engine: &Engine, rect_width: f64, char_width: f64) -> f64 {
     let cw = if char_width > 0.0 { char_width } else { 1.0 };
-    let min_w = MINIMAP_MIN_COLS * cw;
-    let max_w = MINIMAP_MAX_COLS * cw;
+    let (min_w, max_w) = if char_width > 1.0 {
+        (MINIMAP_MIN_PX, MINIMAP_MAX_PX)
+    } else {
+        (MINIMAP_MIN_COLS * cw, MINIMAP_MAX_COLS * cw)
+    };
     let want = (rect_width * MINIMAP_WIDTH_FRACTION).clamp(min_w, max_w);
     let has = engine.settings.minimap && rect_width >= want + MINIMAP_MIN_TEXT_COLS * cw;
     quadraui::reserved_width(want as f32, has) as f64
@@ -4622,11 +4658,20 @@ pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(Wind
     None
 }
 
-/// Apply a minimap click/drag: scroll the *hit* pane's window to the clicked
-/// fraction of the file and carry the cursor with it, so the next
+/// Apply a minimap click/drag: focus the *hit* pane, scroll it to the
+/// clicked fraction of the file, and carry the cursor with it, so the next
 /// `ensure_cursor_visible` doesn't snap the view straight back. Works
 /// against whichever pane's strip the point landed on (#722), not just the
 /// active window.
+///
+/// The focus switch (`focus_group_for_window` + `set_cursor_for_window`,
+/// the same pair `Engine::mouse_click` uses for a plain buffer click) is a
+/// #722 follow-up: before every pane had its own minimap, only the active
+/// pane's strip was ever clickable, so "click a strip without focusing its
+/// pane" could never arise. Now that a background pane's strip is
+/// reachable too, scrolling it without also bringing it to the front would
+/// read as broken — a click that visibly moves a pane's view but leaves
+/// focus (and keyboard input) somewhere else.
 ///
 /// Returns the window scrolled and the buffer line scrolled to, or `None`
 /// when the point missed every strip (in which case the caller must fall
@@ -4638,11 +4683,9 @@ pub fn apply_minimap_click(
     y: f64,
 ) -> Option<(WindowId, usize)> {
     let (window_id, line) = minimap_click_line(screen, x, y)?;
+    engine.focus_group_for_window(window_id);
     engine.set_scroll_top_for_window(window_id, line);
-    if let Some(w) = engine.windows.get_mut(&window_id) {
-        w.view.cursor.line = line;
-        w.view.cursor.col = 0;
-    }
+    engine.set_cursor_for_window(window_id, line, 0);
     Some((window_id, line))
 }
 
@@ -16542,6 +16585,52 @@ mod tests {
         }
     }
 
+    /// #722 review follow-up (non-blocking finding): clicking a
+    /// **background** pane's minimap must focus that pane, not just
+    /// scroll/reposition its cursor while leaving focus (and keyboard
+    /// input) on whichever pane was already active. Before #722 this could
+    /// never come up — only the active pane had a minimap at all — so
+    /// there was no "click a strip that isn't the focused pane's" case to
+    /// get wrong until every pane got its own strip.
+    #[test]
+    fn minimap_click_on_a_background_pane_focuses_that_pane() {
+        let mut e = minimap_engine();
+        e.split_window(SplitDirection::Vertical, None);
+        let screen = render_engine(&e, 160.0, 30.0);
+        assert_eq!(
+            screen.minimap.len(),
+            2,
+            "vsplit must give each pane a minimap"
+        );
+
+        let active_before = e.active_window_id();
+        let background_mm = screen
+            .minimap
+            .iter()
+            .find(|m| m.window_id != active_before)
+            .expect("the split must have a non-active pane with its own minimap");
+        let mid_x = background_mm.rect.x + background_mm.rect.width / 2.0;
+        let mid_y = background_mm.rect.y + background_mm.rect.height / 2.0;
+
+        let (hit_win, _line) =
+            apply_minimap_click(&mut e, &screen, mid_x, mid_y).expect("click must be handled");
+        assert_eq!(
+            hit_win, background_mm.window_id,
+            "test setup sanity: the click must resolve to the background pane"
+        );
+        assert_ne!(
+            hit_win, active_before,
+            "test setup sanity: the clicked pane must actually have been \
+             the non-active one"
+        );
+        assert_eq!(
+            e.active_window_id(),
+            background_mm.window_id,
+            "clicking a background pane's minimap must focus that pane, \
+             not just scroll it while leaving focus on {active_before:?}"
+        );
+    }
+
     /// `reserved_width` is the single source of truth for that reclaim —
     /// both backends and `build_screen_layout` route through it.
     #[test]
@@ -16611,6 +16700,74 @@ mod tests {
              8px/char={small_font}, 16px/char={large_font}"
         );
         assert_eq!(small_font, pane_width * MINIMAP_WIDTH_FRACTION);
+    }
+
+    /// #722 review regression: `minimap_reserved_width_is_unchanged_by_font_size`
+    /// above deliberately keeps `want` inside the clamp band, so it cannot
+    /// catch font-dependence in the clamp *bounds* themselves. A first pass
+    /// of #722 made the un-clamped `want` term font-invariant but left the
+    /// floor/ceiling as `MINIMAP_MIN_COLS * char_width` /
+    /// `MINIMAP_MAX_COLS * char_width` — so once a pane is narrow enough to
+    /// actually hit the floor (exactly the regime a `:vsplit` produces),
+    /// the *clamped* result was font-dependent again. This pins the fixed
+    /// scenario from the review finding: a ~300px pane, at two GTK font
+    /// sizes close enough together that neither hits
+    /// `MINIMAP_MIN_TEXT_COLS`'s separate (and correct — #722 keeps it)
+    /// suppression floor, so any difference in the result can only be the
+    /// clamp bound moving with the font.
+    ///
+    /// RED against the pre-fix formula: at `rect_width = 300.0`,
+    /// `char_width = 6.0` gives `min_w = 36.0` (want=45 not clamped → 45),
+    /// while `char_width = 8.0` gives `min_w = 48.0` (want=45 clamped →
+    /// 48) — two different widths for the same pane at two font sizes.
+    #[test]
+    fn minimap_reserved_width_clamp_floor_is_font_invariant() {
+        let e = minimap_engine();
+        let pane_width = 300.0; // want = 300 * 0.15 = 45px, below the 48px floor
+        let small_font = minimap_reserved_width(&e, pane_width, 6.0);
+        let large_font = minimap_reserved_width(&e, pane_width, 8.0);
+        assert!(
+            small_font > 0.0 && large_font > 0.0,
+            "test setup sanity: neither font size may trip \
+             MINIMAP_MIN_TEXT_COLS's suppression floor, or this isn't \
+             exercising the clamp bound at all: small={small_font}, \
+             large={large_font}"
+        );
+        assert_eq!(
+            small_font, large_font,
+            "the clamped (floor-hitting) reserved width must not depend on \
+             char_width either: 6px/char={small_font}, 8px/char={large_font}"
+        );
+        assert_eq!(
+            small_font, MINIMAP_MIN_PX,
+            "a pane this narrow must clamp to the fixed pixel floor, not a \
+             char_width-scaled one"
+        );
+    }
+
+    /// Same regression, at the ceiling: an old formula whose `max_w` scaled
+    /// with `char_width` let a large font effectively lift the cap (a giant
+    /// font's `MINIMAP_MAX_COLS * char_width` ceiling can exceed a
+    /// merely-wide pane's `want`, so the clamp never engages) — precisely
+    /// backwards, since VS Code's minimap cap does not grow with the
+    /// editor font. Pane wide enough that `want` exceeds the fixed 240px
+    /// ceiling at every font size tested.
+    #[test]
+    fn minimap_reserved_width_clamp_ceiling_is_font_invariant() {
+        let e = minimap_engine();
+        let pane_width = 2000.0; // want = 2000 * 0.15 = 300px, above the 240px ceiling
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0);
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0);
+        assert_eq!(
+            small_font, large_font,
+            "the clamped (ceiling-hitting) reserved width must not depend \
+             on char_width: 8px/char={small_font}, 16px/char={large_font}"
+        );
+        assert_eq!(
+            small_font, MINIMAP_MAX_PX,
+            "a pane this wide must clamp to the fixed pixel ceiling, not a \
+             char_width-scaled one"
+        );
     }
 
     /// Acceptance: clicking the vertical middle of the strip seeks to ~50%

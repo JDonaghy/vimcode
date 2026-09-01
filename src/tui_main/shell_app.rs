@@ -1469,8 +1469,9 @@ impl ShellApp for TuiShellApp {
         // longer needs the raw `Frame` that `frame: None` used to skip it
         // for).
         render_all_windows(backend, None, &screen.windows, &theme);
-        // #35: minimap strip on the active window's right edge — one call, the
-        // braille rasteriser is quadraui's.
+        // #35/#722: minimap strips on every window's right edge (one entry
+        // per `WindowId` in `screen.minimap`, not just the active window's)
+        // — one call, the braille rasteriser is quadraui's.
         render::draw_minimap_strip(backend, &screen);
 
         let tui_tbh: f64 = if self.engine.settings.breadcrumbs && !self.engine.terminal_maximized {
@@ -8006,6 +8007,201 @@ mod tests {
             .nth(row)?
             .chars()
             .position(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+    }
+
+    /// Whether `s` contains a *non-blank* braille glyph
+    /// (`\u{2801}'..='\u{28FF}`, excluding the all-empty `\u{2800}` cell) —
+    /// the minimap's own paint signature.
+    fn has_braille(s: &str) -> bool {
+        s.chars().any(|c| ('\u{2801}'..='\u{28FF}').contains(&c))
+    }
+
+    /// `app_with_shaped_buffer` split into two panes (`:vsplit`) — the
+    /// fixture the split-minimap black-box tests below share.
+    ///
+    /// Sidebar/autohide state pinned explicitly rather than left ambient:
+    /// `TuiShellApp::new`'s sidebar visibility reads the developer's real
+    /// `~/.config/vimcode` off disk (`app_with_sidebar_open`'s doc comment
+    /// above explains the split-state shape this produces), and per
+    /// `on_shell_event`'s own doc comment the runner's *painted* `AppShell`
+    /// only picks up the engine's (the "shadow"'s) sidebar/autohide state
+    /// at the tail of a dispatch — never on the very first frame
+    /// `driver_with_shell` paints before any `handle()` call. Pinning both
+    /// here keeps `focus_change_does_not_move_either_panes_text_via_shell_app`
+    /// from spuriously seeing the sidebar appear/disappear mid-test, which
+    /// would otherwise be indistinguishable from a real minimap regression.
+    fn app_with_split_shaped_buffer() -> TuiShellApp {
+        let mut app = app_with_shaped_buffer();
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine.split_window(SplitDirection::Vertical, None);
+        app
+    }
+
+    /// #722 acceptance, painted-output tier: a `:vsplit` must paint **two**
+    /// independent minimap strips, one over each pane's own buffer — not a
+    /// single strip pinned to whichever pane happens to be active.
+    ///
+    /// The review that reopened #722 flagged that every prior test for this
+    /// (`split_gives_every_pane_its_own_minimap_over_its_own_buffer` et al.
+    /// in `render.rs`) only asserted on `ScreenLayout.minimap.len()` — a
+    /// struct field populated by the pure layout function, never proven to
+    /// reach a real frame. This drives the same fixture through the real
+    /// `driver_with_shell` → `render_content` → `draw_minimap_strip` path
+    /// and reads the painted braille back.
+    ///
+    /// RED against the pre-#722 code (single `Option<RenderedMinimap>`
+    /// gated on `active_window_id`): only one half of the screen would ever
+    /// paint braille — confirmed by hand by reverting `build_screen_layout`
+    /// to `.find(|(id, _)| *id == active_window_id)` before restoring this
+    /// fix.
+    #[test]
+    fn split_paints_two_independent_minimap_strips_via_shell_app() {
+        let driver = driver_with_shell(app_with_split_shaped_buffer(), config(), 160, 30);
+        let screen = driver.screen();
+
+        // Both panes share the same fixture buffer, so a row that paints
+        // buffer text paints the literal `"line "` prefix twice — once per
+        // pane. Splitting the row at the second occurrence's start column
+        // (rather than at a hardcoded fraction of the screen width) locates
+        // each pane's own column span regardless of sidebar width, gutter
+        // width or where exactly the window divider/scrollbar glyphs land.
+        let mut left_hit = false;
+        let mut right_hit = false;
+        for row in 0..30usize {
+            let Some(line) = screen.lines().nth(row) else {
+                continue;
+            };
+            let starts: Vec<usize> = line.match_indices("line ").map(|(i, _)| i).collect();
+            let Some(&second) = starts.get(1) else {
+                continue; // row doesn't paint both panes' buffer text
+            };
+            let (left, right) = line.split_at(second);
+            left_hit |= has_braille(left);
+            right_hit |= has_braille(right);
+        }
+        assert!(
+            left_hit && right_hit,
+            "a `:vsplit` must paint minimap braille in both the left pane \
+             and the right pane, not just one; screen:\n{screen}"
+        );
+    }
+
+    /// #722 acceptance, painted-output tier: switching focus between panes
+    /// of a `:vsplit` must not move either pane's text — coverage for the
+    /// "migrates on focus change, reflowing both panes" symptom the issue
+    /// called out as *worse* than the missing strip (the width reclaim was
+    /// gated on the same `is_active` flag as the strip itself, so both
+    /// panes reflowed on every focus change).
+    ///
+    /// Drives a live `<C-w>w` — the standard two-keystroke vim window-cycle
+    /// chord (`Engine::handle_key`'s `pending_key = Some('\x17')` arm,
+    /// consumed by the plain `w` that follows) — through the real
+    /// `driver_with_shell` key path, and diffs two real painted frames: the
+    /// right pane's own `"line "` text column (both panes share the fixture
+    /// buffer, so this is exactly the column its own gutter/minimap layout
+    /// puts it at) must land in the same place whichever pane is focused.
+    ///
+    /// A test that dispatches `<C-w>w` but never confirms it actually moved
+    /// focus would pass vacuously if the chord silently no-ops (identical
+    /// before/after frames trivially satisfy "column unchanged"), so this
+    /// first pins that focus really moved by locating the block cursor's
+    /// own painted cell — quadraui's TUI editor rasteriser paints
+    /// `CursorShape::Block` (Normal mode's shape, the fixture's default) as
+    /// a cell background recolour (`theme.cursor`), not ratatui's real
+    /// terminal cursor, and only in the *active* window
+    /// (`build_screen_layout`'s `is_active`-gated `cursor` field — see
+    /// `render.rs`) — so that cell must relocate to the other pane.
+    ///
+    /// RED against the pre-#722 code: focusing the right pane would widen
+    /// it (reclaiming the now-inactive left pane's minimap width) and
+    /// narrow the left pane by the same amount, moving the right pane's
+    /// `"line "` column — confirmed by hand by reverting the `minimap_w`
+    /// reclaim to the old `is_active`-gated single value before restoring
+    /// this fix.
+    #[test]
+    fn focus_change_does_not_move_either_panes_text_via_shell_app() {
+        const WIDTH: u16 = 160;
+        const HEIGHT: u16 = 30;
+
+        /// Column of the *second* `"line "` occurrence on the first row
+        /// that paints both panes' buffer text — i.e. where the right
+        /// pane's own text starts.
+        fn right_pane_text_col(screen: &str) -> usize {
+            screen
+                .lines()
+                .find_map(|line| {
+                    let mut hits = line.match_indices("line ");
+                    hits.next()?;
+                    hits.next().map(|(i, _)| i)
+                })
+                .expect(
+                    "a `:vsplit` of the shared fixture must paint a row with \
+                     both panes' \"line N\" text",
+                )
+        }
+
+        let app = app_with_split_shaped_buffer();
+        // Read the fixture's own resolved theme before `app` moves into the
+        // driver, so the cursor-cell scan below matches whatever colour
+        // this fixture actually paints with, ambient colorscheme setting
+        // included, rather than a hardcoded theme that could silently
+        // drift from it.
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        // Warm-up dispatch: the runner's own `AppShell` only picks up the
+        // engine's pinned sidebar/autohide state (see
+        // `app_with_split_shaped_buffer`'s doc comment) at the tail of a
+        // `handle()` call, never on the construction-time first frame. An
+        // inert `Escape` forces that sync to happen *before* `before` is
+        // captured, so the real `<C-w>w` dispatch below isn't the one that
+        // (spuriously) changes the sidebar's painted state.
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        fn cursor_cell(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<(u16, u16)> {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let cell_before = cursor_cell(&driver, cursor_bg)
+            .expect("the active pane must paint a block cursor cell");
+        let before = driver.screen();
+        let col_before = right_pane_text_col(&before);
+
+        driver.ctrl_char('w');
+        driver.type_char('w');
+        driver.render();
+
+        let cell_after = cursor_cell(&driver, cursor_bg)
+            .expect("the newly-active pane must paint a block cursor cell");
+        assert_ne!(
+            cell_before, cell_after,
+            "test setup sanity: `<C-w>w` must actually move focus (and so \
+             the painted block-cursor cell) to the other pane, or this \
+             test isn't exercising a focus change at all"
+        );
+
+        let after = driver.screen();
+        let col_after = right_pane_text_col(&after);
+
+        assert_eq!(
+            col_before, col_after,
+            "cycling focus between panes of a `:vsplit` must not move \
+             either pane's text (i.e. must not reflow either pane's text \
+             width); before:\n{before}\nafter:\n{after}"
+        );
     }
 
     /// #35: `render_content` must paint the minimap through the shell path,

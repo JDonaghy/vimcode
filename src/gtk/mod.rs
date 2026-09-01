@@ -8498,8 +8498,9 @@ impl quadraui::ShellApp for App {
             frame.draw(backend);
         }
 
-        // #35: minimap strip on the active window's right edge — one call, the
-        // font-scaling rasteriser is quadraui's.
+        // #35/#722: minimap strips on every window's right edge (one entry
+        // per `WindowId` in `screen.minimap`, not just the active window's)
+        // — one call, the font-scaling rasteriser is quadraui's.
         render::draw_minimap_strip(backend, screen);
 
         // ── Recover a FrameHitMap for Editor/TabBar zone detection (#449) ──────
