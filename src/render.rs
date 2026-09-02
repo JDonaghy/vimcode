@@ -3277,6 +3277,235 @@ pub const GTK_DIVIDER_METRICS: DividerMetrics = DividerMetrics {
     quantize: false,
 };
 
+// ─── Editor hover popup rung (#755 slice 5) ──────────────────────────────────
+//
+// Four consecutive rungs used to be transcribed into *both* backends —
+// "click a link", "click the scrollbar", "focus or start a selection", and
+// "click outside → dismiss". They had drifted apart in six separate ways, and
+// the drift is the whole open-bug cluster this slice closes:
+//
+//  * **Order.** TUI tested the *link* rects first and the scrollbar second;
+//    GTK tested the scrollbar first. The scrollbar is painted on top of the
+//    content, so scrollbar-first (GTK's order) is the one that matches what
+//    the user sees, and it is what this router does (#229).
+//  * **Where the rung sits in the ladder.** TUI ran it *above* the
+//    scroll-surface dispatch; GTK ran it *below*, so on GTK a click aimed at
+//    the popup's scrollbar was eaten by whatever scroll surface sat behind it
+//    (#486). Both backends now call this router before their scroll surfaces.
+//  * **Thumb grab offset.** TUI preserved the cursor's offset within the
+//    thumb; GTK hardcoded `0.0`, so grabbing a thumb anywhere but its top
+//    teleported it under the cursor.
+//  * **Track click.** TUI armed a drag and let the shared drag-apply seek;
+//    GTK computed a *second*, ratio-based offset of its own first. One seek,
+//    computed once, now.
+//  * **Link hit-test.** TUI ignored the rect's height and required an exact
+//    row match; GTK used `<=` on the right and bottom edges, so adjacent link
+//    rects overlapped by a pixel and `find()` could only ever return the
+//    first one (#504). This router uses the half-open `[x, x+w) × [y, y+h)`
+//    convention every other hit test in this file uses.
+//  * **`command:` links.** TUI ran `execute_hover_goto` and left the popup
+//    up, covering the definition it had just jumped to; GTK dismissed. Both
+//    dismiss now (#272, #491).
+//
+// Only two steps are genuinely per-backend and stay outside the router: what
+// "open a plain URL" means (clipboard on TUI, browser on GTK), and the drag
+// registration, which each backend owns a different handle to.
+
+/// The content-box metrics of the painted hover popup: how far the text is
+/// inset from the popup's own top-left, and the cell size it is laid out on.
+///
+/// TUI measures in whole cells (`col_width`/`line_height` of 1.0, a 2×1
+/// inset); GTK in pixels. Expressing both as an inset plus a cell size is
+/// what lets one `content_line`/`content_col` inverse serve both.
+#[derive(Debug, Clone, Copy)]
+pub struct PopupContentMetrics {
+    pub pad_x: f32,
+    pub pad_y: f32,
+    pub col_width: f32,
+    pub line_height: f32,
+}
+
+/// Everything a backend cached at paint time for the editor hover popup.
+///
+/// All rects are in the backend's own coordinate space — the router never
+/// converts, it only compares, so cells and pixels both work unchanged.
+pub struct EditorHoverPopupState<'a> {
+    /// Popup bounds as painted, `None` when nothing was painted this frame.
+    pub popup: Option<quadraui::Rect>,
+    /// Painted link rects and their URIs, in paint order.
+    pub links: &'a [(quadraui::Rect, String)],
+    /// Painted scrollbar track/thumb, `None` when the content fits.
+    pub scrollbar: Option<PopupScrollbarHit>,
+    /// `Engine::editor_hover_has_focus`.
+    pub has_focus: bool,
+    /// Where the popup's text starts, and the cell size it uses.
+    pub content: PopupContentMetrics,
+}
+
+/// What a left-press on (or near) the editor hover popup means.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EditorHoverPopupRoute {
+    /// A `command:` URI link — navigate, then dismiss.
+    Command(String),
+    /// A plain URL link — the backend opens or copies it, then dismisses.
+    Link(String),
+    /// The popup's scrollbar was grabbed. Begin this drag, then apply it.
+    Scrollbar(Box<quadraui::DragTarget>),
+    /// An unfocused popup's body was clicked — give it focus.
+    Focus,
+    /// A focused popup's body was clicked — start a text selection there.
+    StartSelection {
+        content_line: usize,
+        content_col: usize,
+    },
+    /// The click missed a visible popup: dismiss it, but let the press fall
+    /// through so the cursor still lands where the user aimed (rather than
+    /// costing them a second click).
+    DismissAndFallThrough,
+    /// No popup is visible — nothing to arbitrate.
+    None,
+}
+
+/// Half-open hit test, `[x, x+w) × [y, y+h)` — the convention every other
+/// rect test in this file uses, and the one that makes abutting link rects
+/// tile without overlapping.
+fn rect_contains(r: quadraui::Rect, x: f32, y: f32) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// Arbitrate a left-press against the painted editor hover popup.
+///
+/// Called by TUI's `handle_mouse` and GTK's `handle_mouse_click_msg` /
+/// `handle_mouse_double_click_msg` **before** either backend's scroll
+/// surfaces, so the popup — which paints on top of the editor — also wins the
+/// click that lands on it (#229, #486).
+///
+/// Reads only `visible` (`Engine::editor_hover.is_some()`) and the caller's
+/// painted geometry, so it is directly unit-testable without an `Engine`.
+pub fn route_editor_hover_popup_click(
+    visible: bool,
+    state: &EditorHoverPopupState<'_>,
+    x: f64,
+    y: f64,
+) -> EditorHoverPopupRoute {
+    if !visible {
+        return EditorHoverPopupRoute::None;
+    }
+    let (cx, cy) = (x as f32, y as f32);
+    let Some(popup) = state.popup.filter(|p| rect_contains(*p, cx, cy)) else {
+        return EditorHoverPopupRoute::DismissAndFallThrough;
+    };
+
+    // 1. Scrollbar — painted on top of the content, so it is tested first.
+    if let Some(sb) = state.scrollbar {
+        let on_thumb = rect_contains(sb.thumb, cx, cy);
+        let on_track = !on_thumb && rect_contains(sb.track, cx, cy);
+        if on_thumb || on_track {
+            return EditorHoverPopupRoute::Scrollbar(Box::new(
+                quadraui::DragTarget::ScrollbarY {
+                    widget: quadraui::WidgetId::new("editor_hover"),
+                    track_start: sb.track.y,
+                    track_length: sb.track.height,
+                    thumb_length: sb.thumb.height,
+                    max_scroll: sb.total.saturating_sub(sb.visible_rows),
+                    // Grabbing the thumb keeps the cursor where it landed on
+                    // it; clicking the empty track seeks the thumb's *top* to
+                    // the cursor, which is what a single shared apply-pass
+                    // produces without a second bespoke ratio calculation.
+                    grab_offset: if on_thumb { cy - sb.thumb.y } else { 0.0 },
+                    inverted: false,
+                },
+            ));
+        }
+    }
+
+    // 2. Links — first painted rect that contains the point wins.
+    for (rect, uri) in state.links {
+        if rect_contains(*rect, cx, cy) {
+            return if uri.starts_with("command:") {
+                EditorHoverPopupRoute::Command(uri.clone())
+            } else {
+                EditorHoverPopupRoute::Link(uri.clone())
+            };
+        }
+    }
+
+    // 3. Body — focus it, or (once focused) start a selection in it.
+    if !state.has_focus {
+        return EditorHoverPopupRoute::Focus;
+    }
+    let m = state.content;
+    let rel_x = (cx - popup.x - m.pad_x).max(0.0);
+    let rel_y = (cy - popup.y - m.pad_y).max(0.0);
+    EditorHoverPopupRoute::StartSelection {
+        content_line: (rel_y / m.line_height.max(1.0)) as usize,
+        content_col: (rel_x / m.col_width.max(1.0)) as usize,
+    }
+}
+
+/// What the caller still has to do after [`apply_editor_hover_popup_route`]
+/// has mutated the engine.
+#[derive(Debug, Default)]
+pub struct EditorHoverPopupEffect {
+    /// `true` when the press belongs to the popup and must not fall through.
+    pub consumed: bool,
+    /// A drag to register on this backend's own `DragState` handle, then
+    /// apply once at the press position.
+    pub begin_drag: Option<quadraui::DragTarget>,
+    /// A plain URL to open (GTK) or copy (TUI) — the one genuinely
+    /// per-backend step in the whole rung.
+    pub open_url: Option<String>,
+    /// `true` when a popup text selection was started, so the backend can arm
+    /// its drag follow-through.
+    pub selecting: bool,
+}
+
+/// Apply an [`EditorHoverPopupRoute`] to the engine.
+///
+/// `scroll_top` is added to the router's viewport-relative `content_line`
+/// here rather than in the router so the router stays engine-free.
+pub fn apply_editor_hover_popup_route(
+    engine: &mut Engine,
+    route: EditorHoverPopupRoute,
+) -> EditorHoverPopupEffect {
+    let mut effect = EditorHoverPopupEffect {
+        consumed: true,
+        ..Default::default()
+    };
+    match route {
+        EditorHoverPopupRoute::None => effect.consumed = false,
+        EditorHoverPopupRoute::DismissAndFallThrough => {
+            engine.dismiss_editor_hover();
+            effect.consumed = false;
+        }
+        EditorHoverPopupRoute::Command(uri) => {
+            engine.execute_hover_goto(&uri);
+            // Leaving the popup up would cover the definition just jumped to
+            // (#272/#491) — TUI's old copy did exactly that.
+            engine.dismiss_editor_hover();
+        }
+        EditorHoverPopupRoute::Link(url) => {
+            effect.open_url = Some(url);
+            engine.dismiss_editor_hover();
+        }
+        EditorHoverPopupRoute::Scrollbar(target) => effect.begin_drag = Some(*target),
+        EditorHoverPopupRoute::Focus => engine.editor_hover_focus(),
+        EditorHoverPopupRoute::StartSelection {
+            content_line,
+            content_col,
+        } => {
+            let scroll = engine
+                .editor_hover
+                .as_ref()
+                .map(|h| h.scroll_top)
+                .unwrap_or(0);
+            engine.editor_hover_start_selection(content_line + scroll, content_col);
+            effect.selecting = true;
+        }
+    }
+    effect
+}
+
 /// The painted divider geometry for one frame, plus the caller's grab metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct DividerState<'a> {
