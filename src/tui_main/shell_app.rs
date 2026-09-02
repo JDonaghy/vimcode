@@ -9810,4 +9810,158 @@ mod tests {
             driver.screen()
         );
     }
+
+    // ── #757 slice 2: the shared focus-owner keyboard rung ─────────────
+    //
+    // `render::route_focus_key` now states the activity-bar → sidebar-panel
+    // ladder once for both backends. Its GTK twins live in
+    // `src/gtk/testing.rs` (`palette_outranks_a_focused_explorer_on_gtk`,
+    // `focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk`).
+
+    /// An explorer sidebar showing one real file, revealed and focused, with
+    /// a temp `cwd` the caller must clean up. Returns the app plus the temp
+    /// dir so the test can remove it.
+    fn app_with_focused_explorer(tag: &str) -> (TuiShellApp, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_757_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("zqxw757.txt");
+        std::fs::write(&marker, "marker").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&marker);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        app.engine.session.explorer_visible = true;
+        app.engine.explorer_has_focus = true;
+        app.sidebar.has_focus = true;
+        (app, dir)
+    }
+
+    /// #757: Ctrl-L while the activity bar holds the keyboard must **not**
+    /// activate the selected item.
+    ///
+    /// `render::activity_bar_key_action` states the toolbar's key table once
+    /// and, following GTK, suppresses activate/focus-out under Ctrl. TUI's
+    /// own copy matched a bare `KeyCode::Char('l')` with no modifier guard,
+    /// so Ctrl-L in the toolbar switched panels on TUI and did nothing on
+    /// GTK — one table, two behaviours.
+    ///
+    /// Asserts on the painted sidebar (does the Settings panel's `SETTINGS`
+    /// header reach the screen?), never on `activity_bar_focused`, and pairs
+    /// the negative with a positive: a bare `l` immediately afterwards
+    /// *must* activate, so a fixture that simply cannot activate could not
+    /// pass this test by accident.
+    ///
+    /// **Verified RED against unfixed `develop`:** the pre-#757 activity-bar
+    /// tier reaches `activity_bar_activate()` for Ctrl-L, so `SETTINGS`
+    /// paints after the first keypress and the first assertion fires.
+    #[test]
+    fn activity_bar_ctrl_l_does_not_activate_via_shell_app() {
+        use crate::core::engine::sidebar::TOOLBAR_IDX_SETTINGS;
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.activity_bar_focus_in_at(TOOLBAR_IDX_SETTINGS);
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+
+        let before = driver.screen();
+        assert!(
+            !before.contains("SETTINGS"),
+            "precondition: the Settings panel must not already be open; \
+             screen:\n{before}"
+        );
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('l'),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+
+        let after_ctrl = driver.screen();
+        assert!(
+            !after_ctrl.contains("SETTINGS"),
+            "Ctrl-L in the activity bar must not activate the selected item \
+             (`render::activity_bar_key_action` guards Activate on !ctrl); \
+             screen:\n{after_ctrl}"
+        );
+
+        // ...but a bare `l` must, so this fixture demonstrably *can* activate.
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('l'),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+
+        let after_plain = driver.screen();
+        assert!(
+            after_plain.contains("SETTINGS"),
+            "a bare `l` on the Settings slot must still activate it; \
+             screen:\n{after_plain}"
+        );
+    }
+
+    /// #757: Backspace must reach the explorer's inline edit.
+    ///
+    /// The explorer arm's key table was one of seven hand-rolled
+    /// `KeyCode` → engine-key-name copies in the sidebar tier. Its copy
+    /// listed Esc/Enter/arrows/Home/End/PageUp/PageDown and *not*
+    /// Backspace or Delete, so those two arrived at
+    /// `dispatch_explorer_key` as the empty string and were dropped —
+    /// even though `dispatch_explorer_edit_key` handles both, and GTK
+    /// (which routes through the single `map_gtk_key_name` table) had
+    /// them. Renaming a file from the TUI explorer could not delete a
+    /// character.
+    ///
+    /// #757 replaced that copy with the module's existing
+    /// `tui_key_to_engine_name`, which is where the two names come from.
+    ///
+    /// **Verified RED against unfixed `develop`:** reinstating the old
+    /// explorer-local table leaves the painted edit text at
+    /// `ZQXWEDIT757` after the Backspace, failing the final assertion.
+    #[test]
+    fn explorer_inline_edit_backspace_reaches_the_engine_via_shell_app() {
+        let (app, dir) = app_with_focused_explorer("edit_backspace");
+        app.engine.explorer_tree.borrow_mut().start_editing(
+            vec![0u16],
+            "ZQXWEDIT757".to_string(),
+            "ZQXWEDIT757".len(),
+            None,
+            None,
+        );
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+
+        let before = driver.screen();
+        assert!(
+            before.contains("ZQXWEDIT757"),
+            "precondition: the explorer's inline edit text must paint before \
+             the keypress; screen:\n{before}"
+        );
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Backspace),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+
+        let after = driver.screen();
+        assert!(
+            !after.contains("ZQXWEDIT757"),
+            "Backspace must reach the explorer's inline edit and delete the \
+             last character; screen:\n{after}"
+        );
+        assert!(
+            after.contains("ZQXWEDIT75"),
+            "Backspace must delete exactly one character; screen:\n{after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
