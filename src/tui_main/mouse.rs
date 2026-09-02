@@ -1838,20 +1838,12 @@ pub(super) fn handle_mouse(
             .borrow()
             .as_ref()
             .map(|l| l.hit_test(col as f32, row as f32 + 0.5));
-        match cc_hit {
-            Some(quadraui::CommandCenterHit::Back) => {
-                engine.tab_nav_back();
+        // Shared with GTK's identical match arm as `render::apply_command_center_hit`
+        // (#752).
+        if let Some(hit) = cc_hit {
+            if crate::render::apply_command_center_hit(engine, hit) {
                 return sidebar_width;
             }
-            Some(quadraui::CommandCenterHit::Forward) => {
-                engine.tab_nav_forward();
-                return sidebar_width;
-            }
-            Some(quadraui::CommandCenterHit::SearchBox) => {
-                engine.open_command_center();
-                return sidebar_width;
-            }
-            _ => {}
         }
         // Click on menu bar area outside command center / menu items is
         // handled by MenuSystem (it closes the dropdown if open).

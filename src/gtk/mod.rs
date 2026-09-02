@@ -3903,24 +3903,6 @@ impl App {
     /// Kept as a named no-op so its two call sites stay self-documenting.
     fn sync_menu_overlay(&self) {}
 
-    /// Navigate back in MRU tab history (command-center back arrow).
-    fn mru_nav_back(&mut self) {
-        self.engine.borrow_mut().tab_nav_back();
-        self.draw_needed.set(true);
-    }
-
-    /// Open the Command Center picker (command-center search box).
-    fn open_command_center_picker(&mut self) {
-        self.engine.borrow_mut().open_command_center();
-        self.draw_needed.set(true);
-    }
-
-    /// Navigate forward in MRU tab history (command-center forward arrow).
-    fn mru_nav_forward(&mut self) {
-        self.engine.borrow_mut().tab_nav_forward();
-        self.draw_needed.set(true);
-    }
-
     /// Dispatch a menu action by command string, as produced by
     /// `quadraui::MenuEvent::Activated`.
     fn handle_menu_action(&mut self, action: String) {
@@ -6858,12 +6840,14 @@ impl quadraui::ShellApp for App {
         // drag-to-move check would otherwise claim) routes to tab-nav / the
         // picker instead of starting a window drag. Mirrors TUI's
         // `mouse.rs` "Menu bar row click — command center only" precedence.
-        // `mru_nav_back` / `mru_nav_forward` / `open_command_center_picker`
-        // were the pre-#540 Relm4 `Msg::MruNavBack` / `MruNavForward` /
-        // `OpenCommandCenter` variants for this exact action — already wired
-        // end-to-end but never dispatched from anywhere since the cutover.
-        // This block was their first live caller (#676); #732 turned them into
-        // the plain methods called below.
+        // The nav-arrow / search-box actions are the shared
+        // `render::apply_command_center_hit` (#752) — the pre-#540 Relm4
+        // `Msg::MruNavBack` / `MruNavForward` / `OpenCommandCenter` variants
+        // for this exact action, already wired end-to-end but never
+        // dispatched from anywhere since the cutover. This block was their
+        // first live caller (#676); #732 turned them into plain methods,
+        // and #752 converged those methods with TUI's identical match arm
+        // into the one function in `render.rs`.
         if let UiEvent::MouseDown {
             button: MouseButton::Left,
             position,
@@ -6877,24 +6861,14 @@ impl quadraui::ShellApp for App {
                 .borrow()
                 .as_ref()
                 .map(|l| l.hit_test(position.x, position.y));
-            match cc_hit {
-                Some(quadraui::CommandCenterHit::Back) => {
-                    self.mru_nav_back();
+            // `Bar` (command-center background, not an interactive segment)
+            // and `Outside`/`None` fall through so the drag-to-move fallback
+            // below still works for genuine empty-band clicks.
+            if let Some(hit) = cc_hit {
+                if crate::render::apply_command_center_hit(&mut self.engine.borrow_mut(), hit) {
+                    self.draw_needed.set(true);
                     return quadraui::Reaction::Redraw;
                 }
-                Some(quadraui::CommandCenterHit::Forward) => {
-                    self.mru_nav_forward();
-                    return quadraui::Reaction::Redraw;
-                }
-                Some(quadraui::CommandCenterHit::SearchBox) => {
-                    self.open_command_center_picker();
-                    return quadraui::Reaction::Redraw;
-                }
-                // `Bar` (command-center background, not an interactive
-                // segment) and `Outside`/`None` fall through so the
-                // drag-to-move fallback below still works for genuine
-                // empty-band clicks.
-                _ => {}
             }
         }
 
