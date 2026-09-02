@@ -181,37 +181,22 @@ The adversarial reviewer reads this file and **rejects** behaviour-changing PRs 
 If the change touches a surface both backends render, the multi-backend rule above applies to
 the tests too: cover both.
 
-- **Full test suite:** `cargo test` (default features, GUI on) — the `vimcode_core` lib (which since #657 owns `core`, `render`, `tui_main` **and** `gtk`) plus all integration tests
+- **Full test suite:** `cargo test` (default features, GUI on) — lib + integration tests + the `vimcode` bin's GTK/render unit tests
 - **Fast dev iteration:** `cargo test --no-default-features --lib` — lib tests only
 
-### Test lanes: which command covers which backend (#645, #657)
+### Test lanes: which command covers which backend (#645)
 
 | Command | Compiles | Covers |
 |---------|----------|--------|
-| `cargo test` (default = `gui` on) | everything: the whole `vimcode_core` lib *including* `src/gtk/`, both bins, all integration tests | **both backends** — strict superset of the TUI lane |
-| `cargo test --no-default-features` | the lib without `src/gtk/`, `vcd`, integration tests — `src/gtk/` is **never compiled**, and the `vimcode` bin (`required-features = ["gui"]`) is skipped | TUI/core only |
+| `cargo test` (default = `gui` on) | everything: lib, `vcd`, all integration tests, **plus** the `vimcode` bin (`src/gtk/`, bin-side `render`) | **both backends** — strict superset of the TUI lane |
+| `cargo test --no-default-features` | lib, `vcd`, integration tests only — `src/gtk/` is **never compiled** | TUI/core only |
 
-- #657 promoted `render`, `tui_main` and `gtk` out of the `vimcode` binary and
-  into `vimcode_core`, so the GTK/TUI/render unit tests now live in the **lib**
-  test target rather than the bin's. `src/main.rs` and `src/tui_bin.rs` are thin
-  shims with no tests of their own. One consequence worth knowing: those two
-  bins used to re-declare `mod core; mod render; mod tui_main;` privately, so a
-  plain `cargo test` compiled and ran the core tests three times over. It no
-  longer does — a lower total test count than you remember is that dedup, not a
-  dropped target.
-- The one `cfg(feature = "gui")` outside a bin is `pub mod gtk` in `src/lib.rs`
-  — nothing else in the lib is feature-gated, so the GUI lane is still a strict
-  superset of the TUI lane's test coverage. The TUI lane's
+- The two lanes compile *identical* code for every shared target — no
+  `cfg(feature = "gui")` exists outside the `vimcode` bin target — so the GUI
+  lane is a strict superset of the TUI lane's test coverage. The TUI lane's
   only unique value is compile-hygiene: proving vimcode still builds on a
   machine without GTK dev libs (CI keeps a `--no-default-features` job for
   exactly that).
-- **Sealed acceptance suite (#657).** `tests/acceptance.rs` is the oracle-loop
-  entrypoint; slices live under `tests/acceptance/ms-NN/` and are authored
-  independently by the `test-author` agent (a worker may *run* them, never read
-  or edit them). It is skipped by both lanes above — run it with
-  `cargo test --test acceptance --features test-support`. The `test-support`
-  feature is what makes `gtk::testing::{Harness, harness}` and
-  `tui_main::testing::TuiShellApp` reachable from an external test crate.
 - **A green `--no-default-features` run says NOTHING about GTK code.** Reading
   it as cross-backend coverage is the misread #645 exists to prevent: the Test
   stage reported `passed` on GTK bug fixes whose GTK code it never compiled.
