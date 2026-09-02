@@ -5767,12 +5767,16 @@ mod chrome_rung {
     }
 
     /// #752 companion: a click on the global status bar that is *not* on the
-    /// branch must be consumed by the bar, not fall through to the editor.
+    /// branch must be consumed by the bar — no cursor move, no picker.
     ///
-    /// The bar is chrome; before the shared rung GTK let every non-branch
-    /// pixel of it drop through to `handle_mouse_click`, which resolved it as
-    /// an editor position and moved the cursor. TUI swallowed the whole row.
-    /// The router now makes both consume it.
+    /// **Not RED against unfixed `develop`**, and deliberately kept anyway:
+    /// it is the negative half of the pair above. The bar is now routed by
+    /// `render::route_chrome_click`, whose `ChromeRoute::StatusBar` arm
+    /// consumes every pixel of a status band. Without it, widening the
+    /// branch segment's zone — or feeding the band a rect that is too tall —
+    /// would make the test above pass while quietly stealing clicks from
+    /// whatever the bar overlaps. That failure mode is invisible to a test
+    /// that only ever checks the positive case.
     #[test]
     fn global_status_bar_consumes_non_branch_clicks_via_gtk_driver() {
         let mut engine = engine_with_decorated_global_status_bar();
