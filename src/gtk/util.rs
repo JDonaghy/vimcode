@@ -35,29 +35,6 @@ pub(super) fn is_modifier_only_key(key_name: &str) -> bool {
     )
 }
 
-/// Validate a filename for the explorer file / folder creation flow.
-pub(super) fn validate_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Name cannot be empty".to_string());
-    }
-    if name.contains('/') || name.contains('\\') {
-        return Err("Name cannot contain slashes".to_string());
-    }
-    if name.contains('\0') {
-        return Err("Name cannot contain null characters".to_string());
-    }
-    #[cfg(windows)]
-    {
-        if name.contains(['<', '>', ':', '"', '|', '?', '*']) {
-            return Err("Name contains invalid characters".to_string());
-        }
-    }
-    if name == "." || name == ".." {
-        return Err("Invalid name".to_string());
-    }
-    Ok(())
-}
-
 /// Install the bundled Nerd Font icon subset to `~/.local/share/fonts/` so
 /// GTK/Pango can resolve the Nerd Font glyphs without a user-installed Nerd Font.
 /// The font file is embedded in the binary via `include_bytes!` and only written
