@@ -842,6 +842,18 @@ struct App {
     /// Line height the last frame actually painted with, published by
     /// `render_content` — see [`App::painted_line_height`] (#555).
     painted_line_height: Rc<Cell<Option<f64>>>,
+    /// Character-cell advance the last frame actually painted with — the
+    /// horizontal twin of [`Self::painted_line_height`], and published for
+    /// exactly the same reason (#751).
+    ///
+    /// `render_content` paints at `cached_char_width.max(backend.char_width())`,
+    /// but click-time hit-tests read the plain `cached_char_width`, which is
+    /// seeded once in `setup()` from the runner's *default* metrics. With a
+    /// real font those differ (8.0 vs. ~9.14 in the headless harness), so a
+    /// cell-unit overlay hit-tested against the smaller value drifted further
+    /// right the further into the panel the pointer went — the find/replace
+    /// toggles resolved to the *input field* four cells to their left.
+    painted_char_width: Rc<Cell<Option<f64>>>,
     /// The sidebar content area the last frame painted a panel into
     /// (`ShellContext::layout.sidebar_content_bounds`), or `None` when the
     /// sidebar was hidden. Published purely so the headless harness can aim a
@@ -1250,6 +1262,7 @@ impl App {
             picker_popup_rect: Rc::new(Cell::new(None)),
             painted_sidebar_bounds: Rc::new(Cell::new(None)),
             painted_line_height: Rc::new(Cell::new(None)),
+            painted_char_width: Rc::new(Cell::new(None)),
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
             css_provider,
@@ -2341,120 +2354,39 @@ impl App {
     /// through to `TreeController`'s row hit-test underneath instead of
     /// firing the menu action or dismissing it).
     fn dispatch_context_menu_click(&mut self, x: f64, y: f64) -> bool {
-        if self.engine.borrow().context_menu.is_some() {
-            let cm_id = quadraui::WidgetId::new("context_menu");
-
-            let menu_layout = self.context_menu_layout.borrow().clone();
-
-            let Some(menu_layout) = menu_layout else {
-                // Empty items list — close defensively.
-                self.engine.borrow_mut().close_context_menu();
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&cm_id);
-                self.draw_needed.set(true);
-                return true;
-            };
-
-            // Push the menu's resolved bounds to the modal stack so
-            // any other modal that might be open (picker, dialog) is
-            // arbitrated against the menu by `dispatch_mouse_down`.
+        let cm_id = quadraui::WidgetId::new("context_menu");
+        if self.engine.borrow().context_menu.is_none() {
+            // Defensive cleanup: the menu may have closed via Esc/Enter while
+            // no click was seen by us. Pop any stale entry.
             self.backend
                 .borrow()
                 .modal_stack_handle()
                 .borrow_mut()
-                .push(cm_id.clone(), menu_layout.bounds);
-
-            let stack_events = {
-                let stack_rc = self.backend.borrow().modal_stack_handle();
-                let stack = stack_rc.borrow();
-                quadraui::dispatch_mouse_down(
-                    &stack,
-                    quadraui::Point {
-                        x: x as f32,
-                        y: y as f32,
-                    },
-                    quadraui::MouseButton::Left,
-                    quadraui::Modifiers::default(),
-                )
-            };
-            let dismissed = stack_events.iter().any(|ev| {
-                matches!(
-                    ev,
-                    quadraui::UiEvent::Palette(id, _) if *id == cm_id
-                )
-            });
-
-            if dismissed {
-                self.engine.borrow_mut().close_context_menu();
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&cm_id);
-            } else {
-                // Inner hit. `hit_test` returns Item(id) for clickable
-                // rows, Inert for separators / disabled rows, Empty
-                // for outside (unreachable here since the dispatcher
-                // already routed that case to `dismissed`).
-                match menu_layout.hit_test(x as f32, y as f32) {
-                    quadraui::ContextMenuHit::Item(id) => {
-                        // Item ids are synthesised as `"context:N"`
-                        // where N is the engine-side item index. Parse
-                        // back to the engine index so
-                        // `context_menu_confirm` fires the right action.
-                        let engine_idx = id
-                            .as_str()
-                            .strip_prefix("context:")
-                            .and_then(|s| s.parse::<usize>().ok());
-                        if let Some(idx) = engine_idx {
-                            let mut engine = self.engine.borrow_mut();
-                            if let Some(ref mut cm) = engine.context_menu {
-                                cm.selected = idx;
-                            }
-                            let _act = engine.context_menu_confirm();
-                            let needs_tree_refresh = engine.explorer_needs_refresh;
-                            if needs_tree_refresh {
-                                engine.explorer_needs_refresh = false;
-                            }
-                            drop(engine);
-                            self.backend
-                                .borrow()
-                                .modal_stack_handle()
-                                .borrow_mut()
-                                .pop(&cm_id);
-                            if needs_tree_refresh {
-                                self.refresh_file_tree();
-                            }
-                        }
-                    }
-                    quadraui::ContextMenuHit::Inert => {
-                        // Separator or disabled item — keep menu open.
-                    }
-                    quadraui::ContextMenuHit::Empty => {
-                        // Defensive: dispatcher should have caught this.
-                        self.engine.borrow_mut().close_context_menu();
-                        self.backend
-                            .borrow()
-                            .modal_stack_handle()
-                            .borrow_mut()
-                            .pop(&cm_id);
-                    }
-                }
-            }
-            self.draw_needed.set(true);
-            return true;
+                .pop(&cm_id);
+            return false;
         }
-        // Defensive cleanup: context menu may have closed via Esc/Enter
-        // while no click was seen by us. Pop any stale entry.
-        self.backend
-            .borrow()
-            .modal_stack_handle()
-            .borrow_mut()
-            .pop(&quadraui::WidgetId::new("context_menu"));
-        false
+
+        // Keep the menu's painted bounds on the modal stack so any other modal
+        // that might be open (picker, dialog) is arbitrated against it by the
+        // *drag* guard, which still consults the stack.
+        if let Some(bounds) = self.context_menu_layout.borrow().as_ref().map(|l| l.bounds) {
+            self.backend
+                .borrow()
+                .modal_stack_handle()
+                .borrow_mut()
+                .push(cm_id, bounds);
+        }
+
+        match self.route_modal_overlay(x, y, render::ModalMouseAction::LeftPress) {
+            render::ModalOverlayRoute::ContextMenu(route) => {
+                self.apply_context_menu_route(route);
+            }
+            // A dialog or a toast outranks the menu; the shared router already
+            // said so, and re-deciding that here is what let the two backends
+            // drift in the first place.
+            _ => self.draw_needed.set(true),
+        }
+        true
     }
 
     /// Editor content bounds + tab-bar height **as last painted**, in the
@@ -2492,35 +2424,180 @@ impl App {
         y: f64,
         action: render::ModalMouseAction,
     ) -> render::ModalOverlayRoute {
-        let (toast, dialog_open, tab_switcher_open, completion_open) = {
-            let engine = self.engine.borrow();
-            let toast = engine.toast_layout.borrow().clone();
-            (
-                toast,
-                engine.dialog.is_some(),
-                engine.tab_switcher_open,
-                engine.completion_idx.is_some(),
-            )
-        };
+        let engine_ref = self.engine.borrow();
+        let toast = engine_ref.toast_layout.borrow().clone();
         let dialog = self.dialog_layout.borrow().clone();
         let completion = self.completion_layout.borrow().clone();
+        let context_menu = self.context_menu_layout.borrow().clone();
         let tab_switcher_bounds = self.tab_switcher_popup_rect.get().map(|(px, py, pw, ph)| {
             quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
         });
+        let lh = self.painted_line_height() as f32;
+        // Both geometries come from what the last frame PAINTED — the picker's
+        // own published rect, and the `FindReplacePanel` the frame was built
+        // from — never a re-derivation off the drawing-area size (#555/#582).
+        let picker = self.picker_popup_rect.get().map(|(px, py, pw, ph)| {
+            render::PickerHitGeometry::new(
+                quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32),
+                lh,
+                engine_ref.picker_preview.is_some(),
+                &render::gtk_picker_rows(lh),
+                &engine_ref,
+            )
+        });
+        let screen_ref = self.cached_screen_layout.borrow();
+        let find_replace = screen_ref
+            .as_ref()
+            .and_then(|s| s.find_replace.as_ref())
+            .map(|panel| {
+                render::FindReplaceHitGeometry::from_panel(
+                    panel,
+                    (self.painted_char_width() as f32, lh),
+                    &render::GTK_FIND_REPLACE_ANCHOR,
+                )
+            });
+
         render::route_modal_overlay_click(
             &render::ModalOverlayState {
                 toast: toast.as_ref(),
-                dialog_open,
+                dialog_open: engine_ref.dialog.is_some(),
                 dialog: dialog.as_ref(),
-                tab_switcher_open,
+                context_menu_open: engine_ref.context_menu.is_some(),
+                context_menu: context_menu.as_ref(),
+                // The GTK rasteriser strokes the menu's border *inside*
+                // `ContextMenuLayout::bounds`, so there is no frame outside it.
+                context_menu_border: 0.0,
+                tab_switcher_open: engine_ref.tab_switcher_open,
                 tab_switcher_bounds,
-                completion_open,
+                completion_open: engine_ref.completion_idx.is_some(),
                 completion: completion.as_ref(),
+                picker_open: engine_ref.picker_open,
+                picker,
+                find_replace_open: engine_ref.find_replace_open,
+                find_replace,
             },
             x as f32,
             y as f32,
             action,
         )
+    }
+
+    /// Apply a unified-picker verdict from
+    /// [`render::route_modal_overlay_click`].
+    ///
+    /// The verdict itself — which result row, thumb vs. track, inside vs.
+    /// outside — is `render::PickerHitGeometry`'s, shared with TUI's
+    /// `handle_mouse`. Before #751 each backend resolved it from its own
+    /// re-derivation of the popup geometry, and the two had already drifted:
+    /// GTK jumped the offset proportionally on a track click and grabbed the
+    /// thumb at zero, TUI paged the track and grabbed with an offset, and
+    /// clicking an already-selected row confirmed it on TUI but did nothing on
+    /// GTK.
+    fn apply_picker_route(&mut self, route: render::PickerRoute) {
+        let picker_id = quadraui::WidgetId::new("picker");
+        let Some((px, py, pw, ph)) = self.picker_popup_rect.get() else {
+            return;
+        };
+        let lh = self.painted_line_height() as f32;
+        let geo = {
+            let engine = self.engine.borrow();
+            render::PickerHitGeometry::new(
+                quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32),
+                lh,
+                engine.picker_preview.is_some(),
+                &render::gtk_picker_rows(lh),
+                &engine,
+            )
+        };
+        // Keep the stack in step: the drag guard in `handle_mouse_drag_msg`
+        // consults it to stop a gesture leaking to the editor behind the modal
+        // (#192).
+        self.backend
+            .borrow()
+            .modal_stack_handle()
+            .borrow_mut()
+            .push(picker_id.clone(), geo.bounds);
+
+        match route {
+            render::PickerRoute::Row(idx) => {
+                render::apply_picker_row_click(&mut self.engine.borrow_mut(), idx);
+            }
+            render::PickerRoute::ScrollbarThumb { grab_offset } => {
+                self.backend
+                    .borrow()
+                    .drag_state_handle()
+                    .borrow_mut()
+                    .begin(geo.drag_target(picker_id, grab_offset));
+            }
+            render::PickerRoute::ScrollbarTrack { toward_end } => {
+                render::apply_picker_scroll_offset(
+                    &mut self.engine.borrow_mut(),
+                    geo.paged_offset(toward_end),
+                    geo.visible_rows,
+                );
+            }
+            render::PickerRoute::Consume => {}
+            render::PickerRoute::Dismiss => {
+                self.engine.borrow_mut().close_picker();
+                self.backend
+                    .borrow()
+                    .modal_stack_handle()
+                    .borrow_mut()
+                    .pop(&picker_id);
+            }
+        }
+    }
+
+    /// Apply a context-menu verdict from [`render::route_modal_overlay_click`].
+    ///
+    /// Returns `true` when the event was consumed. The route itself — which
+    /// item, hover vs. click, dismiss vs. keep-open — is decided once in
+    /// `render.rs` and shared with TUI's `handle_mouse`; what stays here is
+    /// GTK's own plumbing (modal-stack bookkeeping, file-tree refresh).
+    fn apply_context_menu_route(&mut self, route: render::ContextMenuRoute) -> bool {
+        let cm_id = quadraui::WidgetId::new("context_menu");
+        let pop_stack = |app: &Self| {
+            app.backend
+                .borrow()
+                .modal_stack_handle()
+                .borrow_mut()
+                .pop(&cm_id);
+        };
+        match route {
+            render::ContextMenuRoute::Item(idx) => {
+                let mut engine = self.engine.borrow_mut();
+                if let Some(ref mut cm) = engine.context_menu {
+                    cm.selected = idx;
+                }
+                let _act = engine.context_menu_confirm();
+                let needs_tree_refresh = engine.explorer_needs_refresh;
+                if needs_tree_refresh {
+                    engine.explorer_needs_refresh = false;
+                }
+                drop(engine);
+                pop_stack(self);
+                if needs_tree_refresh {
+                    self.refresh_file_tree();
+                }
+            }
+            render::ContextMenuRoute::Hover(idx) => {
+                let mut engine = self.engine.borrow_mut();
+                if let Some(ref mut cm) = engine.context_menu {
+                    if cm.selected == idx {
+                        return true;
+                    }
+                    cm.selected = idx;
+                }
+            }
+            render::ContextMenuRoute::Consume => {}
+            render::ContextMenuRoute::Dismiss => {
+                self.engine.borrow_mut().close_context_menu();
+                pop_stack(self);
+            }
+            render::ContextMenuRoute::Fallthrough => return false,
+        }
+        self.draw_needed.set(true);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2561,6 +2638,11 @@ impl App {
                 self.draw_needed.set(true);
                 return;
             }
+            render::ModalOverlayRoute::ContextMenu(route) => {
+                if self.apply_context_menu_route(route) {
+                    return;
+                }
+            }
             render::ModalOverlayRoute::TabSwitcher { inside } => {
                 // Click anywhere dismisses; inside also consumes so the
                 // editor underneath doesn't take a cursor move through it.
@@ -2576,6 +2658,21 @@ impl App {
                 if consumed {
                     return;
                 }
+            }
+            render::ModalOverlayRoute::UnifiedPicker(hit) => {
+                self.apply_picker_route(hit);
+                self.draw_needed.set(true);
+                return;
+            }
+            render::ModalOverlayRoute::FindReplace(hit) => {
+                if let render::FindReplaceRoute::Target { target, is_input } = hit {
+                    if is_input {
+                        self.fr_input_dragging = true;
+                    }
+                    self.engine.borrow_mut().handle_find_replace_click(target);
+                }
+                self.draw_needed.set(true);
+                return;
             }
             render::ModalOverlayRoute::Swallow => return,
             render::ModalOverlayRoute::None => {}
@@ -2630,298 +2727,13 @@ impl App {
             }
         }
 
-        // ── Context menu click handling (engine-drawn) ──
-        //
-        // Extracted into `dispatch_context_menu_click` (#546 FAILED-2) so
-        // `try_route_sidebar_mouse_event` can give an open menu first right
-        // of refusal on sidebar-bound clicks too — an explorer-sourced menu
-        // typically renders inside the sidebar's own content bounds, and
-        // without this it fell straight through to `TreeController`'s row
-        // hit-test underneath instead of firing the menu action.
-        if self.dispatch_context_menu_click(x, y) {
-            return;
-        }
-
-        // ── Find/replace overlay click handling (using shared hit regions) ──
-        //
-        // #196: must use the SAME cell-unit layout as the renderer in
-        // `draw.rs::draw_find_replace_popup`. Pixel → cell conversion
-        // uses `char_width` + `line_height`; the popup origin is
-        // derived the same way the renderer computes it from the
-        // active editor group's bounds.
-        if self.engine.borrow().find_replace_open {
-            let cw = self.cached_char_width.max(1.0);
-            let lh = self.cached_line_height.max(1.0);
-
-            let (hit_regions, on_panel, rel_col, rel_row) = {
-                let engine = self.engine.borrow();
-
-                // Build match_info (same logic as build_screen_layout).
-                let match_info = if engine.search_matches.is_empty() {
-                    if engine.find_replace_query.is_empty() {
-                        String::new()
-                    } else {
-                        "No results".to_string()
-                    }
-                } else {
-                    match engine.search_index {
-                        Some(idx) => {
-                            format!("{} of {}", idx + 1, engine.search_matches.len())
-                        }
-                        None => format!("{} matches", engine.search_matches.len()),
-                    }
-                };
-
-                let panel_w_cells = render::FR_PANEL_WIDTH;
-                let (hit_regions, _) = render::compute_find_replace_hit_regions(
-                    panel_w_cells,
-                    engine.find_replace_show_replace,
-                    &match_info,
-                );
-
-                // Popup bounds — mirror exactly what `draw_find_replace_popup`
-                // computes. panel_w is in cells; scale via `cw`.
-                // +2 rows in height for top/bottom border.
-                let popup_w = panel_w_cells as f64 * cw;
-                let row_count_f = if engine.find_replace_show_replace {
-                    2.0
-                } else {
-                    1.0
-                };
-                let popup_h = (row_count_f + 2.0) * lh;
-                // Renderer uses the active group's bounds to compute
-                // popup_x; we don't have that here, so approximate from
-                // the DA width the same way the renderer does in the
-                // typical single-group case.
-                let popup_x = (width - popup_w - 10.0).max(0.0);
-                let popup_y = lh * 2.5 + 2.0;
-
-                let on_panel =
-                    x >= popup_x && x < popup_x + popup_w && y >= popup_y && y < popup_y + popup_h;
-
-                // Content origin — 1 cell inside the borders, same as
-                // `draw_find_replace_popup`. Pixel → cell.
-                let content_x = popup_x + cw;
-                let content_y = popup_y + lh;
-                let rel_col = if x >= content_x {
-                    ((x - content_x) / cw) as u16
-                } else {
-                    u16::MAX
-                };
-                let rel_row = if y >= content_y {
-                    ((y - content_y) / lh) as u16
-                } else {
-                    u16::MAX
-                };
-
-                (hit_regions, on_panel, rel_col, rel_row)
-            };
-
-            if on_panel {
-                let mut matched_target = None;
-                for (region, target) in &hit_regions {
-                    if region.row == rel_row
-                        && rel_col >= region.col
-                        && rel_col < region.col + region.width
-                    {
-                        matched_target = Some((*target, region.col));
-                        break;
-                    }
-                }
-
-                if let Some((target, region_col)) = matched_target {
-                    use core::engine::FindReplaceClickTarget::*;
-
-                    let target = match target {
-                        FindInput(_) => FindInput(rel_col.saturating_sub(region_col) as usize),
-                        ReplaceInput(_) => {
-                            ReplaceInput(rel_col.saturating_sub(region_col) as usize)
-                        }
-                        other => other,
-                    };
-
-                    if matches!(target, FindInput(_) | ReplaceInput(_)) {
-                        self.fr_input_dragging = true;
-                    }
-
-                    self.engine.borrow_mut().handle_find_replace_click(target);
-                }
-
-                self.draw_needed.set(true);
-                return;
-            }
-        }
-
-        // Picker popup: route the click through quadraui's modal-stack
-        // dispatcher (Phase B.4 pilot). Before this refactor, the click
-        // was gated by an inline popup-bounds check; the *drag* gesture
-        // on the same DrawingArea had no equivalent check and leaked
-        // through to the editor behind the modal (#192). The drag guard
-        // now lives in `handle_mouse_drag_msg` and consults the same
-        // modal stack this branch pushes to.
-        //
-        // Inner hit refinement (which result row) still lives here
-        // because the palette primitive's result-row hit math hasn't
-        // been lifted into quadraui yet — that's a separate follow-up
-        // once we generalise beyond the pilot.
-        {
-            let engine = self.engine.borrow();
-            if engine.picker_open {
-                drop(engine);
-                // Keep the modal stack in sync with engine state. Safe
-                // to call repeatedly — push() dedupes on id.
-                let (popup_x, popup_y, popup_w, popup_h) =
-                    self.compute_picker_popup_bounds(width, height);
-                let picker_id = quadraui::WidgetId::new("picker");
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .push(
-                        picker_id.clone(),
-                        quadraui::Rect {
-                            x: popup_x as f32,
-                            y: popup_y as f32,
-                            width: popup_w as f32,
-                            height: popup_h as f32,
-                        },
-                    );
-
-                let stack_rc = self.backend.borrow().modal_stack_handle();
-                let stack = stack_rc.borrow();
-                let events = quadraui::dispatch_mouse_down(
-                    &stack,
-                    quadraui::Point {
-                        x: x as f32,
-                        y: y as f32,
-                    },
-                    quadraui::MouseButton::Left,
-                    quadraui::Modifiers::default(),
-                );
-                drop(stack);
-
-                // Inspect the dispatcher's verdict.
-                let mut hit_modal = false;
-                let mut dismiss_modal = false;
-                for ev in &events {
-                    match ev {
-                        quadraui::UiEvent::MouseDown {
-                            widget: Some(id), ..
-                        } if *id == picker_id => {
-                            hit_modal = true;
-                        }
-                        quadraui::UiEvent::Palette(_, _) => {
-                            dismiss_modal = true;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if hit_modal {
-                    let lh = self.painted_line_height();
-                    let has_preview = self.engine.borrow().picker_preview.is_some();
-                    let list_w = if has_preview {
-                        (popup_w * 0.4_f64).round()
-                    } else {
-                        popup_w
-                    };
-                    let results_top = popup_y + lh * 2.0 + 1.0;
-                    let results_bottom = popup_y + popup_h;
-                    const BOTTOM_INSET: f64 = 4.0;
-                    let rows_h_raw = (results_bottom - results_top - BOTTOM_INSET).max(0.0);
-                    let visible_rows = (rows_h_raw / lh) as usize;
-                    let rows_h = visible_rows as f64 * lh;
-                    let (total, scroll_top, selected) = {
-                        let engine = self.engine.borrow();
-                        (
-                            engine.picker_items.len(),
-                            engine.picker_scroll_top,
-                            engine.picker_selected,
-                        )
-                    };
-                    let has_scrollbar = total > visible_rows;
-
-                    let max_offset = total.saturating_sub(visible_rows);
-                    let effective_offset = if visible_rows == 0 {
-                        0
-                    } else if selected < scroll_top {
-                        selected
-                    } else if selected >= scroll_top + visible_rows {
-                        selected + 1 - visible_rows
-                    } else {
-                        scroll_top
-                    }
-                    .min(max_offset);
-
-                    const SB_W: f64 = 6.0;
-                    let sb_x = popup_x + list_w - SB_W;
-                    let on_scrollbar = has_scrollbar
-                        && visible_rows > 0
-                        && x >= sb_x
-                        && x < popup_x + list_w
-                        && y >= results_top
-                        && y < results_top + rows_h;
-
-                    if on_scrollbar {
-                        let rel = ((y - results_top) / rows_h).clamp(0.0, 1.0);
-                        let max_scroll = total.saturating_sub(visible_rows);
-                        let new_offset = (rel * max_scroll as f64).round() as usize;
-                        {
-                            let mut engine = self.engine.borrow_mut();
-                            engine.picker_scroll_top = new_offset;
-                            if engine.picker_selected < new_offset {
-                                engine.picker_selected = new_offset;
-                            } else if engine.picker_selected >= new_offset + visible_rows {
-                                engine.picker_selected = new_offset + visible_rows - 1;
-                            }
-                            engine.picker_load_preview();
-                        }
-                        self.backend
-                            .borrow()
-                            .drag_state_handle()
-                            .borrow_mut()
-                            .begin(quadraui::DragTarget::ScrollbarY {
-                                widget: picker_id.clone(),
-                                track_start: results_top as f32,
-                                track_length: rows_h as f32,
-                                thumb_length: (rows_h as f32 * visible_rows as f32
-                                    / total.max(1) as f32)
-                                    .max(1.0),
-                                max_scroll: total.saturating_sub(visible_rows),
-                                grab_offset: 0.0,
-                                inverted: false,
-                            });
-                    } else if y >= results_top && y < results_bottom {
-                        let mut engine = self.engine.borrow_mut();
-                        let clicked_idx = effective_offset + ((y - results_top) / lh) as usize;
-                        if clicked_idx < engine.picker_items.len() {
-                            engine.picker_selected = clicked_idx;
-                            engine.picker_load_preview();
-                        }
-                    }
-                }
-                if dismiss_modal {
-                    self.engine.borrow_mut().close_picker();
-                    self.backend
-                        .borrow()
-                        .modal_stack_handle()
-                        .borrow_mut()
-                        .pop(&picker_id);
-                }
-                // Consume click — don't fall through to editor.
-                return;
-            } else {
-                // Picker isn't open but the stack might hold a stale
-                // entry (engine closed it via Esc or Enter while the
-                // stack still has the id). Keep them consistent.
-                let picker_id = quadraui::WidgetId::new("picker");
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&picker_id);
-            }
-        }
+        // #751: the context-menu, find/replace and unified-picker rungs that
+        // used to be transcribed here — ~370 lines — are now decided by
+        // `render::route_modal_overlay_click` at the top of this handler and
+        // applied by `apply_context_menu_route` / `apply_picker_route`. The
+        // shared router also fixed their order: this backend arbitrated the
+        // context menu *below* find/replace and the picker, while
+        // `render::OVERLAY_Z_ORDER` paints it above both.
 
         // Breadcrumb click: shared resolution via cached StatusBarLayout.
         {
@@ -3454,6 +3266,16 @@ impl App {
         self.painted_line_height
             .get()
             .unwrap_or(self.cached_line_height)
+            .max(1.0)
+    }
+
+    /// Character-cell advance the last frame actually painted with — the
+    /// horizontal twin of [`Self::painted_line_height`]. See the field's doc
+    /// for why `cached_char_width` is the wrong number at click time (#751).
+    fn painted_char_width(&self) -> f64 {
+        self.painted_char_width
+            .get()
+            .unwrap_or(self.cached_char_width)
             .max(1.0)
     }
 
@@ -5337,6 +5159,7 @@ impl quadraui::ShellApp for App {
         // wrong place (the picker resolved clicks two rows off) and clipped
         // the bottom of every single-row band, breadcrumbs included.
         self.painted_line_height.set(Some(lh));
+        self.painted_char_width.set(Some(cw));
 
         let main = layout.main_content_bounds;
         let (x, y, w, h) = (
@@ -7266,6 +7089,22 @@ impl quadraui::ShellApp for App {
             UiEvent::MouseMoved { position, buttons } => {
                 self.mouse_pos_cell
                     .set((position.x as f64, position.y as f64));
+                // ── Modal-overlay hover rung (#751) ─────────────────────
+                // An open context menu tracks the pointer, exactly as TUI's
+                // `handle_mouse` has always done. This backend had no hover
+                // arm at all, so whichever item was selected when the menu
+                // opened stayed highlighted wherever the pointer went (#373)
+                // — and a keyboard Down after a mouse hover then moved from
+                // the wrong row.
+                if !buttons.left {
+                    if let render::ModalOverlayRoute::ContextMenu(route) = self.route_modal_overlay(
+                        position.x as f64,
+                        position.y as f64,
+                        render::ModalMouseAction::Move,
+                    ) {
+                        self.apply_context_menu_route(route);
+                    }
+                }
                 if buttons.left {
                     let main = ctx.layout.main_content_bounds;
                     self.handle_mouse_drag_msg(

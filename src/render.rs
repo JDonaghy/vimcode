@@ -2034,7 +2034,7 @@ impl TabSwitcherGeometry {
     }
 }
 
-// ─── Modal-overlay mouse router (#733 slice 1) ────────────────────────────
+// ─── Modal-overlay mouse router (#733 slice 1, finished in #751) ──────────
 //
 // The top rung of the mouse precedence ladder, implemented once. Both
 // backends used to hand-roll it, in *different* orders: TUI ran
@@ -2046,25 +2046,79 @@ impl TabSwitcherGeometry {
 // `dispatch_mouse_down` round-trip that `DialogHit::Outside` already
 // answers directly.
 //
+// #733 slice 1 shared four rungs — toast, dialog, tab switcher,
+// completion. #751 folded in the last three, whose per-backend copies had
+// drifted in the same two ways:
+//
+//  1. **Precedence.** TUI arbitrated the unified picker and the
+//     find/replace overlay ~1,100 lines *before* the context menu, and GTK
+//     arbitrated the context menu *after* find/replace and the picker —
+//     while [`OVERLAY_Z_ORDER`] paints the menu above both. Input and
+//     paint disagreeing is the #587/#592 failure shape.
+//     [`MOUSE_ARBITRATION_ORDER`] is now the router's own declared order,
+//     asserted against `OVERLAY_Z_ORDER` reversed.
+//  2. **Missing rungs.** GTK had no context-menu *hover* arm at all — its
+//     `MouseMoved` handler did nothing unless the left button was held —
+//     so a menu's highlight never followed the pointer (#373). GTK also
+//     hit-tested find/replace against the drawing-area width rather than
+//     the active group's, so with a sidebar open the clickable panel sat
+//     a couple of hundred pixels left of the painted one; and it neither
+//     confirmed a click on the already-selected picker row nor paged its
+//     scrollbar track the way TUI did.
+//
 // Deliberately *not* pushed into quadraui: `FrameHitMap` (quadraui
 // `frame.rs`) resolves "which registered rect is topmost", but the order
 // below is gated on vimcode engine state (`dialog.is_some()`,
-// `tab_switcher_open`, `completion_idx`), which is app knowledge. The
-// per-surface `hit_test()` calls this function sequences *are*
-// quadraui's, and are used as-is.
+// `tab_switcher_open`, `completion_idx`, `picker_open`), which is app
+// knowledge. The per-surface `hit_test()` calls this function sequences
+// *are* quadraui's, and are used as-is.
 //
 // Note every layout below is the one the last frame actually PAINTED
 // (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
-// `Engine::toast_layout`), never a freshly recomputed one — #582 / #646.
+// `context_menu_layout`, `picker_popup_rect`, `Engine::toast_layout`),
+// never a freshly recomputed one — #582 / #646.
+//
+// **Not a rung, deliberately:** the TUI folder/workspace picker. GTK opens
+// a *native* GTK file chooser deferred through `PendingFileDialog` and run
+// from `tick()`, so there is no GTK canvas surface to arbitrate against —
+// the same verdict [`OVERLAY_Z_ORDER`] records for the paint side. See the
+// comment on `tui_main::mouse`'s folder-picker arm.
 
 /// The subset of mouse actions this rung distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalMouseAction {
-    /// Left button pressed (or, on terminals that swallow `Down`, the
-    /// matching `Up` — see `#456`).
+    /// Left button pressed.
     LeftPress,
-    /// Anything else: motion, drag, right-click, scroll.
+    /// Left button *released*. Kept distinct from [`Self::LeftPress`]
+    /// because the two rungs disagree about it on purpose:
+    ///
+    /// * The context menu accepts either (#456 — alacritty via SGR mouse
+    ///   mode + tmux, and gnome-terminal in some configurations, drop
+    ///   `Down(Left)` and only emit `Up(Left)`; without accepting the
+    ///   release the menu item never fires).
+    /// * Every other rung accepts `LeftPress` alone, so a terminal that
+    ///   sends *both* can't double-fire a dialog button.
+    LeftRelease,
+    /// Pointer motion with no button held — the hover rung.
+    Move,
+    /// Anything else: drag, right-click, scroll.
     Other,
+}
+
+impl ModalMouseAction {
+    /// Does this action open/confirm a surface? `LeftPress` only — see
+    /// [`Self::LeftRelease`] for why the release is deliberately excluded.
+    fn is_press(self) -> bool {
+        self == ModalMouseAction::LeftPress
+    }
+
+    /// Does this action count as "the user clicked the context menu"?
+    fn is_menu_click(self) -> bool {
+        matches!(
+            self,
+            ModalMouseAction::LeftPress | ModalMouseAction::LeftRelease
+        )
+    }
 }
 
 /// The painted modal overlays, in the order they are arbitrated.
@@ -2079,10 +2133,389 @@ pub struct ModalOverlayState<'a> {
     pub toast: Option<&'a quadraui::ToastStackLayout>,
     pub dialog_open: bool,
     pub dialog: Option<&'a quadraui::DialogLayout>,
+    /// `Engine::context_menu.is_some()`.
+    pub context_menu_open: bool,
+    pub context_menu: Option<&'a quadraui::ContextMenuLayout>,
+    /// Slack, in the caller's own units, around
+    /// [`quadraui::ContextMenuLayout::bounds`] that still counts as "on the
+    /// menu". The TUI rasteriser draws the menu's box-drawing border *outside*
+    /// `bounds` (1 cell), so a click on the frame must consume rather than
+    /// dismiss; GTK paints its border inside `bounds` and passes `0.0`.
+    pub context_menu_border: f32,
     pub tab_switcher_open: bool,
     pub tab_switcher_bounds: Option<quadraui::Rect>,
     pub completion_open: bool,
     pub completion: Option<&'a quadraui::CompletionsLayout>,
+    /// `Engine::picker_open`.
+    pub picker_open: bool,
+    pub picker: Option<PickerHitGeometry>,
+    /// `Engine::find_replace_open`.
+    pub find_replace_open: bool,
+    pub find_replace: Option<FindReplaceHitGeometry<'a>>,
+}
+
+/// What the context-menu rung decided about one event.
+///
+/// Split out of [`ModalOverlayRoute`] so the *engine index* — the one piece
+/// both backends previously re-derived from `"context:N"` themselves — is
+/// resolved here, once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuRoute {
+    /// Fire the action for item `idx`: set `selected`, then
+    /// `Engine::context_menu_confirm`.
+    Item(usize),
+    /// Pointer moved onto item `idx` — set `selected` and consume. Both
+    /// backends must do this for keyboard/mouse selection to agree; before
+    /// #751 only TUI did, so on GTK whichever item was selected when the menu
+    /// opened stayed highlighted no matter where the pointer went (#373).
+    Hover(usize),
+    /// On the menu but not on an actionable item (separator, disabled row,
+    /// border) — consume, change nothing.
+    Consume,
+    /// Click landed outside the menu — close it and consume.
+    Dismiss,
+    /// The menu is open but does not arbitrate this event (right-click,
+    /// scroll, drag) — the caller continues down its own ladder.
+    Fallthrough,
+}
+
+/// What the find/replace rung decided about one event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FindReplaceRoute {
+    /// The click resolved to `target`; input targets already carry their
+    /// character offset.
+    Target {
+        target: quadraui::FindReplaceClickTarget,
+        /// `target` is a text input, so the caller arms its input-drag flag.
+        is_input: bool,
+    },
+    /// On the panel but not on any hit region (border, padding) — consume.
+    Consume,
+}
+
+/// What the unified-picker rung decided about one event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PickerRoute {
+    /// Result row `idx`, already offset by the effective scroll offset.
+    Row(usize),
+    /// The scrollbar thumb was grabbed — begin a `ScrollbarY` drag with this
+    /// grab offset (distance from the thumb's top edge to the pointer).
+    ScrollbarThumb { grab_offset: f32 },
+    /// The scrollbar *track* was clicked; page one screen in that direction.
+    ScrollbarTrack { toward_end: bool },
+    /// Inside the popup but on neither a row nor the scrollbar — consume.
+    Consume,
+    /// Outside the popup — dismiss the picker.
+    Dismiss,
+}
+
+/// The find/replace overlay's painted geometry, in whatever unit the caller's
+/// mouse events arrive in.
+///
+/// TUI passes cells and a `(1.0, 1.0)` cell size; GTK passes device pixels and
+/// its painted `(char_width, line_height)`. The *hit-region walk* underneath —
+/// the part that was transcribed twice and could drift — is unit-free once the
+/// caller has stated its own scale here.
+#[derive(Debug, Clone, Copy)]
+pub struct FindReplaceHitGeometry<'a> {
+    /// Outer panel bounds including borders.
+    pub bounds: quadraui::Rect,
+    /// Top-left of the first content row, one cell inside the border.
+    pub content_origin: (f32, f32),
+    /// One cell, in the caller's units.
+    pub cell: (f32, f32),
+    /// The regions `compute_find_replace_hit_regions` produced for the frame
+    /// that was actually painted.
+    pub hit_regions: &'a [(quadraui::FrHitRegion, quadraui::FindReplaceClickTarget)],
+}
+
+/// Where a backend's rasteriser anchors the find/replace panel inside the
+/// active editor group.
+///
+/// The panel's *shape* is identical on both backends (a `panel_width`-cell box
+/// with a one-cell border and one or two content rows); only the gap it leaves
+/// and the units it measures in differ, and both of those are data. Stating
+/// them as constants — the same shape [`PickerSizing`] / [`TUI_PICKER_SIZING`]
+/// already uses in this file — lets one hit-test function serve both backends
+/// instead of each transcribing its rasteriser's arithmetic by hand.
+///
+/// That transcription is exactly what had rotted on GTK: the rasteriser
+/// (`quadraui::gtk::find_replace`) anchors the panel to
+/// `group_bounds.x + group_bounds.width`, but `handle_mouse_click_msg`
+/// hit-tested against the *drawing area* width and a `line_height * 2.5 + 2`
+/// top edge, so with a sidebar open, a vertical split, or any window whose
+/// editor area was narrower than the DA, the clickable panel sat somewhere the
+/// painted panel wasn't.
+#[derive(Debug, Clone, Copy)]
+pub struct FindReplaceAnchor {
+    /// Gap between the panel's right edge and the group's right edge.
+    pub right_gap: f32,
+    /// Offset of the panel's top edge below the group's top edge.
+    pub top_offset: f32,
+    /// Lower clamp on the panel's top edge.
+    pub min_y: f32,
+    /// Round the resolved origin down to whole cells (TUI's integer grid).
+    pub snap_to_cells: bool,
+}
+
+/// TUI: one cell of gap, panel top clamped below the menu-bar row.
+pub const TUI_FIND_REPLACE_ANCHOR: FindReplaceAnchor = FindReplaceAnchor {
+    right_gap: 1.0,
+    top_offset: 0.0,
+    min_y: 1.0,
+    snap_to_cells: true,
+};
+
+/// GTK: a 10-pixel gap and a 2-pixel drop, matching
+/// `quadraui::gtk::find_replace::draw`.
+pub const GTK_FIND_REPLACE_ANCHOR: FindReplaceAnchor = FindReplaceAnchor {
+    right_gap: 10.0,
+    top_offset: 2.0,
+    min_y: 0.0,
+    snap_to_cells: false,
+};
+
+impl<'a> FindReplaceHitGeometry<'a> {
+    /// Resolve the panel's painted geometry from the panel primitive the frame
+    /// was built with, in `cell`-sized units.
+    ///
+    /// Mirrors `quadraui::{tui,gtk}::find_replace::draw` — the *paint* math —
+    /// so the hit rect and the pixels can no longer disagree.
+    pub fn from_panel(
+        panel: &'a quadraui::FindReplacePanel,
+        cell: (f32, f32),
+        anchor: &FindReplaceAnchor,
+    ) -> Self {
+        let (cw, ch) = (cell.0.max(f32::EPSILON), cell.1.max(f32::EPSILON));
+        let panel_w = panel.panel_width as f32 * cw;
+        let row_count = if panel.show_replace { 2.0 } else { 1.0 };
+        let panel_h = (row_count + 2.0) * ch;
+
+        let gb = panel.group_bounds;
+        let mut x = (gb.x + gb.width - panel_w - anchor.right_gap).max(gb.x);
+        let mut y = (gb.y + anchor.top_offset).max(anchor.min_y);
+        if anchor.snap_to_cells {
+            x = x.floor();
+            y = y.floor();
+        }
+
+        FindReplaceHitGeometry {
+            bounds: quadraui::Rect::new(x, y, panel_w, panel_h),
+            content_origin: (x + cw, y + ch),
+            cell: (cw, ch),
+            hit_regions: &panel.hit_regions,
+        }
+    }
+}
+
+/// How a backend's palette rasteriser lays result rows out inside the popup.
+///
+/// Companion to [`PickerSizing`] (which sizes the popup): this sizes the
+/// *results band* inside it, and is the second half of the geometry both
+/// backends' click handlers used to re-derive by hand.
+#[derive(Debug, Clone, Copy)]
+pub struct PickerRowMetrics {
+    /// Height of the header band (prompt + query) above the first result row.
+    pub header_h: f32,
+    /// Space reserved below the last result row.
+    pub bottom_inset: f32,
+    /// Share of the popup width given to the results list when a preview pane
+    /// is shown.
+    pub list_ratio: f32,
+    /// Width of the scrollbar gutter, inset from the list pane's right edge.
+    pub scrollbar_w: f32,
+}
+
+/// TUI: a three-row header, a one-row bottom border, a one-cell scrollbar.
+pub const TUI_PICKER_ROWS: PickerRowMetrics = PickerRowMetrics {
+    header_h: 3.0,
+    bottom_inset: 1.0,
+    list_ratio: 0.4,
+    scrollbar_w: 1.0,
+};
+
+/// GTK: header and rows scale with the painted line height; the scrollbar is a
+/// fixed 6-pixel gutter.
+pub fn gtk_picker_rows(line_height: f32) -> PickerRowMetrics {
+    PickerRowMetrics {
+        header_h: line_height * 2.0 + 1.0,
+        bottom_inset: 4.0,
+        list_ratio: 0.4,
+        scrollbar_w: 6.0,
+    }
+}
+
+/// The unified picker's painted geometry, in the caller's own units.
+///
+/// Every field below is a *paint* result, never a fresh recomputation (#582 /
+/// #646). The derived quantities — effective scroll offset, thumb length,
+/// thumb top — used to be hand-rolled on both backends from these same inputs,
+/// and had already drifted: TUI paged the track and grabbed the thumb with an
+/// offset, GTK jumped proportionally and grabbed at zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PickerHitGeometry {
+    /// Popup bounds.
+    pub bounds: quadraui::Rect,
+    /// Width of the results list pane, measured from `bounds.x`. Equals
+    /// `bounds.width` when no preview pane is shown.
+    pub list_width: f32,
+    /// Top edge of the first result row.
+    pub rows_top: f32,
+    /// Height of one result row (`1.0` on TUI, the painted line height on GTK).
+    pub row_height: f32,
+    /// Width of the scrollbar gutter, measured back from the list pane's right
+    /// edge.
+    pub scrollbar_width: f32,
+    pub visible_rows: usize,
+    pub total_items: usize,
+    pub scroll_top: usize,
+    pub selected: usize,
+}
+
+impl PickerHitGeometry {
+    /// Resolve the results band from the popup rect the frame actually
+    /// painted plus the backend's row metrics.
+    pub fn new(
+        bounds: quadraui::Rect,
+        row_height: f32,
+        has_preview: bool,
+        metrics: &PickerRowMetrics,
+        engine: &Engine,
+    ) -> Self {
+        let row_height = row_height.max(f32::EPSILON);
+        let rows_top = bounds.y + metrics.header_h;
+        let rows_bottom = bounds.y + bounds.height - metrics.bottom_inset;
+        let visible_rows = ((rows_bottom - rows_top).max(0.0) / row_height) as usize;
+        let list_width = if has_preview {
+            (bounds.width * metrics.list_ratio).round()
+        } else {
+            bounds.width
+        };
+        PickerHitGeometry {
+            bounds,
+            list_width,
+            rows_top,
+            row_height,
+            scrollbar_width: metrics.scrollbar_w,
+            visible_rows,
+            total_items: engine.picker_items.len(),
+            scroll_top: engine.picker_scroll_top,
+            selected: engine.picker_selected,
+        }
+    }
+
+    /// The scroll offset the picker was actually *drawn* at.
+    ///
+    /// `draw_palette` clamps its offset to keep `selected` on screen, so the
+    /// raw `scroll_top` is not what the user is looking at. Both backends
+    /// carried a verbatim copy of this eight-line clamp.
+    pub fn effective_offset(&self) -> usize {
+        let max_offset = self.total_items.saturating_sub(self.visible_rows);
+        if self.visible_rows == 0 {
+            0
+        } else if self.selected < self.scroll_top {
+            self.selected
+        } else if self.selected >= self.scroll_top + self.visible_rows {
+            self.selected + 1 - self.visible_rows
+        } else {
+            self.scroll_top
+        }
+        .min(max_offset)
+    }
+
+    /// Height of the results viewport (== the scrollbar track length).
+    pub fn track_length(&self) -> f32 {
+        self.visible_rows as f32 * self.row_height
+    }
+
+    /// Is there anything to scroll?
+    pub fn has_scrollbar(&self) -> bool {
+        self.total_items > self.visible_rows && self.visible_rows > 0
+    }
+
+    /// Length of the scrollbar thumb.
+    pub fn thumb_length(&self) -> f32 {
+        (self.track_length() * self.visible_rows as f32 / self.total_items.max(1) as f32)
+            .max(self.row_height.max(1.0))
+    }
+
+    /// Top edge of the scrollbar thumb, for the offset actually painted.
+    pub fn thumb_top(&self) -> f32 {
+        let max_scroll = self.total_items.saturating_sub(self.visible_rows);
+        let effective_track = (self.track_length() - self.thumb_length()).max(1.0);
+        let ratio = if max_scroll == 0 {
+            0.0
+        } else {
+            (self.effective_offset() as f32 / max_scroll as f32).clamp(0.0, 1.0)
+        };
+        self.rows_top + ratio * effective_track
+    }
+
+    /// The offset a [`PickerRoute::ScrollbarTrack`] click pages to.
+    pub fn paged_offset(&self, toward_end: bool) -> usize {
+        let max_scroll = self.total_items.saturating_sub(self.visible_rows);
+        let page = self.visible_rows.max(1);
+        let current = self.effective_offset();
+        if toward_end {
+            (current + page).min(max_scroll)
+        } else {
+            current.saturating_sub(page)
+        }
+    }
+
+    /// The drag quadraui should run for a [`PickerRoute::ScrollbarThumb`] grab.
+    pub fn drag_target(
+        &self,
+        widget: quadraui::WidgetId,
+        grab_offset: f32,
+    ) -> quadraui::DragTarget {
+        quadraui::DragTarget::ScrollbarY {
+            widget,
+            track_start: self.rows_top,
+            track_length: self.track_length(),
+            thumb_length: self.thumb_length(),
+            max_scroll: self.total_items.saturating_sub(self.visible_rows),
+            grab_offset,
+            inverted: false,
+        }
+    }
+
+    /// Resolve a point against the painted popup.
+    pub fn resolve(&self, x: f32, y: f32) -> PickerRoute {
+        let b = self.bounds;
+        let inside = x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
+        if !inside {
+            return PickerRoute::Dismiss;
+        }
+
+        let rows_bottom = self.rows_top + self.track_length();
+        let on_rows_band = y >= self.rows_top && y < rows_bottom;
+
+        if self.has_scrollbar() && on_rows_band {
+            let sb_right = b.x + self.list_width;
+            let sb_left = sb_right - self.scrollbar_width;
+            if x >= sb_left && x < sb_right {
+                let thumb_top = self.thumb_top();
+                let dy = y - thumb_top;
+                if dy >= 0.0 && dy < self.thumb_length() {
+                    return PickerRoute::ScrollbarThumb { grab_offset: dy };
+                }
+                return PickerRoute::ScrollbarTrack {
+                    toward_end: y >= thumb_top,
+                };
+            }
+        }
+
+        if on_rows_band {
+            let row = ((y - self.rows_top) / self.row_height.max(f32::EPSILON)) as usize;
+            let idx = self.effective_offset() + row;
+            if idx < self.total_items {
+                return PickerRoute::Row(idx);
+            }
+        }
+
+        PickerRoute::Consume
+    }
 }
 
 /// Which modal overlay owns a mouse event, plus its resolved hit.
@@ -2095,16 +2528,41 @@ pub struct ModalOverlayState<'a> {
 pub enum ModalOverlayRoute {
     Toast(quadraui::ToastHit),
     Dialog(quadraui::DialogHit),
+    ContextMenu(ContextMenuRoute),
     TabSwitcher {
         inside: bool,
     },
     Completion(quadraui::CompletionsHit),
+    UnifiedPicker(PickerRoute),
+    FindReplace(FindReplaceRoute),
     /// An overlay is up and must eat this event without acting on it
     /// (e.g. mouse motion while a modal dialog is open).
     Swallow,
     /// Nothing claimed it.
     None,
 }
+
+/// The overlay rungs [`route_modal_overlay_click`] arbitrates, **highest z
+/// first** — the exact inverse of [`OVERLAY_Z_ORDER`], restricted to the rungs
+/// that take mouse input.
+///
+/// Input precedence and paint order are the same fact stated twice, and #587 /
+/// #592 are what happens when the two disagree: whatever is painted on top is
+/// what the user is aiming at. Keeping this as a `const` rather than a comment
+/// lets `mouse_arbitration_matches_paint_z_order` assert the relationship
+/// instead of asking reviewers to eyeball it.
+///
+/// The completion popup is deliberately absent: it is editor-anchored, painted
+/// outside the shared overlay band (see [`OVERLAY_Z_ORDER`]'s doc), so it has
+/// no paint rung to agree with.
+pub const MOUSE_ARBITRATION_ORDER: [OverlayOp; 6] = [
+    OverlayOp::ToastStack,
+    OverlayOp::Dialog,
+    OverlayOp::ContextMenu,
+    OverlayOp::TabSwitcher,
+    OverlayOp::UnifiedPicker,
+    OverlayOp::FindReplace,
+];
 
 /// Resolve the top rung of the mouse ladder against the painted overlays.
 pub fn route_modal_overlay_click(
@@ -2113,7 +2571,7 @@ pub fn route_modal_overlay_click(
     y: f32,
     action: ModalMouseAction,
 ) -> ModalOverlayRoute {
-    let press = action == ModalMouseAction::LeftPress;
+    let press = action.is_press();
 
     // ── Toast (× dismiss / action) ────────────────────────────────────
     // Painted above every other overlay, so it is arbitrated first —
@@ -2145,6 +2603,55 @@ pub fn route_modal_overlay_click(
         return ModalOverlayRoute::Dialog(hit);
     }
 
+    // ── Context menu ──────────────────────────────────────────────────
+    // Modal for clicks *and* hovers, which is why it sits above the tab
+    // switcher / picker / find-replace rather than ~1,100 lines below
+    // them as it did on TUI. Painted directly under the dialog
+    // (`OVERLAY_Z_ORDER`), so it is arbitrated directly after it.
+    if state.context_menu_open {
+        if action.is_menu_click() {
+            let Some(cl) = state.context_menu else {
+                // Menu state with nothing painted (empty item list, or
+                // opened after the last frame). Close defensively rather
+                // than leaving an invisible modal eating clicks — both
+                // backends already did exactly this.
+                return ModalOverlayRoute::ContextMenu(ContextMenuRoute::Dismiss);
+            };
+            let route = match cl.hit_test(x, y) {
+                quadraui::ContextMenuHit::Item(id) => {
+                    match crate::core::engine::context_menu_hit_to_idx(
+                        &quadraui::ContextMenuHit::Item(id),
+                    ) {
+                        Some(idx) => ContextMenuRoute::Item(idx),
+                        None => ContextMenuRoute::Consume,
+                    }
+                }
+                quadraui::ContextMenuHit::Inert => ContextMenuRoute::Consume,
+                quadraui::ContextMenuHit::Empty => {
+                    if point_in_menu_frame(cl, state.context_menu_border, x, y) {
+                        ContextMenuRoute::Consume
+                    } else {
+                        ContextMenuRoute::Dismiss
+                    }
+                }
+            };
+            return ModalOverlayRoute::ContextMenu(route);
+        }
+        if action == ModalMouseAction::Move {
+            let route = state
+                .context_menu
+                .map(|cl| cl.hit_test(x, y))
+                .and_then(|hit| crate::core::engine::context_menu_hit_to_idx(&hit))
+                .map(ContextMenuRoute::Hover)
+                .unwrap_or(ContextMenuRoute::Consume);
+            return ModalOverlayRoute::ContextMenu(route);
+        }
+        // Right-click / scroll / drag: the caller keeps going (a
+        // right-click closes this menu and opens the one under the
+        // pointer).
+        return ModalOverlayRoute::ContextMenu(ContextMenuRoute::Fallthrough);
+    }
+
     // ── Tab switcher (Ctrl+Tab MRU popup) ─────────────────────────────
     if state.tab_switcher_open && press {
         let inside = state
@@ -2162,7 +2669,127 @@ pub fn route_modal_overlay_click(
         return ModalOverlayRoute::Completion(hit);
     }
 
+    // ── Unified picker / command palette ──────────────────────────────
+    if state.picker_open && press {
+        if let Some(geo) = state.picker {
+            return ModalOverlayRoute::UnifiedPicker(geo.resolve(x, y));
+        }
+        // Open but not painted yet — swallow rather than let the click
+        // reach the editor behind a modal the user has already summoned.
+        return ModalOverlayRoute::UnifiedPicker(PickerRoute::Consume);
+    }
+
+    // ── Find/replace overlay ──────────────────────────────────────────
+    // Bottom of the arbitration ladder, matching its bottom-of-band paint
+    // position. A click that misses the panel falls through to whatever
+    // is underneath — unlike the picker, this overlay is not modal.
+    if state.find_replace_open && press {
+        if let Some(geo) = state.find_replace {
+            if let Some(route) = geo.resolve(x, y) {
+                return ModalOverlayRoute::FindReplace(route);
+            }
+        }
+    }
+
     ModalOverlayRoute::None
+}
+
+/// Is `(x, y)` on the context menu, counting `border` units of frame drawn
+/// outside [`quadraui::ContextMenuLayout::bounds`]?
+fn point_in_menu_frame(cl: &quadraui::ContextMenuLayout, border: f32, x: f32, y: f32) -> bool {
+    let b = &cl.bounds;
+    x >= b.x - border
+        && x < b.x + b.width + border
+        && y >= b.y - border
+        && y < b.y + b.height + border
+}
+
+impl FindReplaceHitGeometry<'_> {
+    /// Resolve a point against the painted panel.
+    ///
+    /// `None` means the point missed the panel entirely and the caller should
+    /// keep going down its own ladder.
+    pub fn resolve(&self, x: f32, y: f32) -> Option<FindReplaceRoute> {
+        let b = self.bounds;
+        if x < b.x || x >= b.x + b.width || y < b.y || y >= b.y + b.height {
+            return None;
+        }
+
+        let (cw, ch) = (self.cell.0.max(f32::EPSILON), self.cell.1.max(f32::EPSILON));
+        let (ox, oy) = self.content_origin;
+        // `u16::MAX` for "above/left of the content box" matches no region,
+        // which is what both backends' own out-of-range sentinel did.
+        let rel_col = if x >= ox {
+            ((x - ox) / cw) as u16
+        } else {
+            u16::MAX
+        };
+        let rel_row = if y >= oy {
+            ((y - oy) / ch) as u16
+        } else {
+            u16::MAX
+        };
+
+        let matched = self.hit_regions.iter().find(|(region, _)| {
+            region.row == rel_row && rel_col >= region.col && rel_col < region.col + region.width
+        });
+
+        let Some((region, target)) = matched else {
+            return Some(FindReplaceRoute::Consume);
+        };
+
+        use quadraui::FindReplaceClickTarget::*;
+        let char_pos = rel_col.saturating_sub(region.col) as usize;
+        let target = match target {
+            FindInput(_) => FindInput(char_pos),
+            ReplaceInput(_) => ReplaceInput(char_pos),
+            other => *other,
+        };
+        Some(FindReplaceRoute::Target {
+            target,
+            is_input: matches!(target, FindInput(_) | ReplaceInput(_)),
+        })
+    }
+}
+
+/// Apply a scroll offset the unified-picker rung produced, keeping the
+/// selection inside the new viewport and reloading the preview.
+///
+/// Extracted because both backends carried this identical five-line
+/// clamp-then-reload in **three** places each (scrollbar drag, track page,
+/// thumb click).
+pub fn apply_picker_scroll_offset(engine: &mut Engine, new_offset: usize, visible_rows: usize) {
+    engine.picker_scroll_top = new_offset;
+    if engine.picker_selected < new_offset {
+        engine.picker_selected = new_offset;
+    } else if visible_rows > 0 && engine.picker_selected >= new_offset + visible_rows {
+        engine.picker_selected = new_offset + visible_rows - 1;
+    }
+    engine.picker_load_preview();
+}
+
+/// Apply a click on unified-picker result row `idx`.
+///
+/// Clicking the already-selected row confirms it — or, in the command
+/// centre's `@` tree mode, expands/collapses it. Clicking a different row
+/// selects it. Before #751 only TUI did the confirm/expand half, so a GTK user
+/// had to click a row and then press Enter.
+pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
+    if idx >= engine.picker_items.len() {
+        return;
+    }
+    if engine.picker_selected == idx {
+        let in_tree_mode = engine.picker_source == crate::core::engine::PickerSource::CommandCenter
+            && engine.picker_query == "@";
+        if in_tree_mode && engine.picker_toggle_expand() {
+            engine.picker_load_preview();
+        } else {
+            engine.picker_confirm();
+        }
+    } else {
+        engine.picker_selected = idx;
+        engine.picker_load_preview();
+    }
 }
 
 // ─── Modal keyboard routing (#734 slice 1) ────────────────────────────────────
@@ -16218,6 +16845,50 @@ mod tests {
             "toasts sit on top of everything, and are the first rung \
              `route_modal_overlay_click` arbitrates"
         );
+    }
+
+    /// #751 acceptance: the order the *mouse* router arbitrates in must be the
+    /// exact inverse of the order the *paint* band composes in.
+    ///
+    /// They are the same fact stated twice — whatever paints on top is what the
+    /// user is aiming at — and #587/#592 are what happens when the two
+    /// disagree. Before #751 the two halves genuinely did: `OVERLAY_Z_ORDER`
+    /// put the context menu above the picker and find/replace, while TUI's
+    /// `handle_mouse` arbitrated the picker and find/replace ~1,100 lines
+    /// *before* it. Nothing could catch that because the mouse ladder was
+    /// straight-line control flow, not a value; `MOUSE_ARBITRATION_ORDER`
+    /// makes it one.
+    #[test]
+    fn mouse_arbitration_is_the_inverse_of_the_paint_z_order() {
+        let expected: Vec<OverlayOp> = OVERLAY_Z_ORDER
+            .iter()
+            .rev()
+            .copied()
+            .filter(|op| MOUSE_ARBITRATION_ORDER.contains(op))
+            .collect();
+        assert_eq!(
+            MOUSE_ARBITRATION_ORDER.to_vec(),
+            expected,
+            "`route_modal_overlay_click` arbitrates in a different order than \
+             `OVERLAY_Z_ORDER` paints in — an overlay would be painted on top \
+             of the one that actually owns the click underneath it"
+        );
+
+        // The rungs that carry *mouse* input must all be arbitrated: a painted
+        // rung missing from the router falls through to the editor beneath it,
+        // which is the tab-switcher bug #733 found. `MenuDropdown` /
+        // `CommandCenter` are the deliberate exceptions — `MenuSystem::handle`
+        // owns the title-bar band's own events before this router runs.
+        for op in OVERLAY_Z_ORDER {
+            let arbitrated = MOUSE_ARBITRATION_ORDER.contains(&op);
+            let title_bar_chrome = matches!(op, OverlayOp::MenuDropdown | OverlayOp::CommandCenter);
+            assert_eq!(
+                arbitrated, !title_bar_chrome,
+                "{op:?} is painted but not arbitrated (or vice versa) — add it \
+                 to `MOUSE_ARBITRATION_ORDER` and to \
+                 `route_modal_overlay_click`, or state why it is chrome"
+            );
+        }
     }
 
     #[test]

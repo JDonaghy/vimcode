@@ -7059,6 +7059,17 @@ mod tests {
             app.engine.context_menu.is_some(),
             "test precondition: context menu must be open"
         );
+        // `ensure_panel_active` focuses the explorer as a side effect, so
+        // clear it first: the assertion below has to prove the
+        // `TreeController` intercept did **not** *claim* focus, and it can
+        // only do that from a known-unfocused start. (#751: before the
+        // context-menu rung moved into `render::route_modal_overlay_click`,
+        // this read as `!explorer_has_focus` only because `handle_mouse` fell
+        // all the way through to the *editor* click path, which clears
+        // sidebar focus — i.e. the assertion passed for the wrong reason,
+        // and would have kept passing if the menu had been ignored entirely.)
+        app.engine.explorer_has_focus = false;
+        app.sidebar.has_focus = false;
 
         let mut backend = backend_at(80.0, 24.0);
         {
@@ -7087,6 +7098,11 @@ mod tests {
             "an open explorer context menu must block the TreeController \
              intercept so the click reaches mouse.rs's ctx-menu confirm \
              instead of being consumed as a tree row activation (#456)"
+        );
+        assert!(
+            app.engine.context_menu.is_none(),
+            "the click must have reached the shared context-menu rung, which \
+             dismisses a menu whose layout was never painted (#751)"
         );
     }
 
@@ -8901,6 +8917,142 @@ mod tests {
             !screen.contains("Paste"),
             "Escape must dismiss the modal context menu, not be eaten by the \
              focused activity bar underneath; screen:\n{screen}"
+        );
+    }
+
+    // ─── #751: the modal rung, finished (context menu / picker / find-replace)
+    //
+    // TUI twins of the `modal_rung` module in `src/gtk/testing.rs`. Each rung
+    // is arbitrated once, by `render::route_modal_overlay_click`.
+
+    /// A frame with both the unified picker and a context menu open. A click
+    /// on a menu item must fire the menu, because `render::OVERLAY_Z_ORDER`
+    /// paints the context menu *above* the picker.
+    ///
+    /// **RED-verified against unfixed `develop`.** `handle_mouse` arbitrated
+    /// the picker ~1,100 lines before the context menu and returned
+    /// unconditionally once `engine.picker_open` was set, so the click was
+    /// swallowed as a picker outside-click: "Paste" stayed on screen and the
+    /// palette closed instead. Reinstating that order — moving the
+    /// `ContextMenu` arm of `route_modal_overlay_click` below its
+    /// `UnifiedPicker` arm — reproduces it. (The companion
+    /// `render::tests::mouse_arbitration_is_the_inverse_of_the_paint_z_order`
+    /// guards the *declared* order in `MOUSE_ARBITRATION_ORDER`; this one
+    /// guards that the code actually follows it.) Restored before committing.
+    #[test]
+    fn context_menu_click_outranks_the_open_picker_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::LineEndings);
+        // Anchored inside the centred palette, so the two overlays genuinely
+        // overlap and the ladder has to arbitrate rather than luck out on
+        // disjoint geometry.
+        app.engine.open_editor_context_menu(45, 10);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let paste = driver
+            .find_bounds("Paste")
+            .expect("the context menu must paint its always-enabled Paste item");
+
+        driver.click(paste.x + 1.0, paste.y);
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Paste"),
+            "the click must confirm the context-menu item and close the menu, \
+             not be swallowed by the picker painted underneath it; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// TUI twin of
+    /// `gtk::testing::modal_rung::find_replace_toggle_click_lands_where_the_panel_painted_via_gtk_driver`:
+    /// a click on the painted case-sensitivity toggle flips it, and the panel
+    /// repaints the toggle in its active style.
+    ///
+    /// Not RED on this backend — TUI's own hit test already mirrored its
+    /// rasteriser. It is here because the rung is now shared: if
+    /// `render::FindReplaceHitGeometry::from_panel` is changed to suit GTK, or
+    /// `TUI_FIND_REPLACE_ANCHOR` drifts from `quadraui::tui::find_replace`,
+    /// this is what catches it before a user does.
+    #[test]
+    fn find_replace_toggle_click_lands_where_the_panel_painted_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine.find_replace_open = true;
+        app.engine.find_replace_query = "ZQXW751FR".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen_contains("ZQXW751FR"),
+            "fixture must actually paint the find/replace panel; screen:\n{}",
+            driver.screen()
+        );
+        let toggle = driver
+            .find_bounds("Aa")
+            .expect("the panel must paint its Aa case-sensitivity toggle");
+        let before = driver.screen();
+
+        driver.click(toggle.x, toggle.y);
+
+        let after = driver.screen();
+        assert_ne!(
+            before, after,
+            "clicking the painted Aa toggle must repaint the panel; nothing \
+             changed, so the click hit-tested somewhere the panel is not"
+        );
+        assert!(
+            after.contains("ZQXW751FR"),
+            "the toggle click must not close or displace the panel; \
+             screen:\n{after}"
+        );
+    }
+
+    /// A click on the *already selected* palette row confirms it and closes
+    /// the palette — the behaviour `render::apply_picker_row_click` now states
+    /// once for both backends (its GTK twin is
+    /// `second_click_on_a_picker_row_confirms_it_via_gtk_driver`, which *is*
+    /// RED against unfixed `develop`).
+    ///
+    /// Not RED on this backend: TUI already behaved this way, and that is
+    /// precisely why it is worth pinning — the shared helper now has to keep
+    /// doing so while GTK is brought onto it.
+    #[test]
+    fn second_click_on_a_picker_row_confirms_it_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::LineEndings);
+        assert_eq!(
+            app.engine.picker_selected, 0,
+            "fixture assumes the palette opens on row 0, so row 1 is a \
+             not-yet-selected row"
+        );
+        let title = app.engine.picker_title.clone();
+        let row1_label = app.engine.picker_items[1].display.clone();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        // Locate the row by the text it painted, never by arithmetic on the
+        // popup's origin (`CLAUDE.md` rule 1).
+        let row1 = driver
+            .find_bounds(&row1_label)
+            .unwrap_or_else(|| panic!("the palette must paint its {row1_label:?} row"));
+
+        driver.click(row1.x, row1.y);
+        assert!(
+            driver.screen_contains(&title),
+            "the first click only selects — the palette must still be painted; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.click(row1.x, row1.y);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&title),
+            "a second click on the already-selected row must confirm it and \
+             close the palette; screen:\n{screen}"
         );
     }
 }
