@@ -1738,128 +1738,30 @@ pub(super) fn handle_mouse(
     //
     // Breadcrumbs → status bands → global status bar, sequenced ONCE in
     // `render::route_chrome_click` and shared verbatim with GTK's
-    // `handle_mouse_click_msg`. Three arms used to be transcribed here and
-    // scattered down the ladder: the breadcrumb arm ~700 lines below, the
-    // separated status line, and the per-window status line another ~250 lines
-    // below *that*, buried inside the window walk. The global status bar row
-    // was swallowed outright with a `// no interactive segments` comment that
-    // had stopped being true.
+    // `handle_mouse_click_msg`. Four arms used to be transcribed here and
+    // scattered down the ladder — see `route_and_apply_chrome_click` below for
+    // where each one lived and what it had drifted into.
     //
     // Placed here — above the command line, below the modal band — because
     // every band it arbitrates is spatially disjoint from the rungs it now
     // jumps ahead of (scroll surfaces, the activity bar, the sidebar panel,
     // the editor area), so the move is a re-ordering of checks that cannot
-    // both match.
-    {
-        let mut bands: Vec<render::StatusBand<'_>> = Vec::new();
-        let mut zone_store: Vec<(quadraui::Rect, render::StatusZones)> = Vec::new();
-        if let Some(layout) = last_layout {
-            let bar_width = terminal_size.map(|s| s.width).unwrap_or(80) as usize;
-            // Separated status line first, for the same reason GTK lists it
-            // first: it sits in its own band outside every window's rect.
-            if let Some(status) = &layout.separated_status_line {
-                let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-                let strip_rows: u16 = if engine.terminal_open {
-                    super::effective_terminal_panel_rows_tui(engine, term_height) + 1
-                } else {
-                    0
-                };
-                let term_strip_top =
-                    term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
-                let sep_row = term_strip_top.saturating_sub(sep_status_rows);
-                zone_store.push((
-                    quadraui::Rect::new(
-                        editor_left as f32,
-                        sep_row as f32,
-                        bar_width.saturating_sub(editor_left as usize) as f32,
-                        1.0,
-                    ),
-                    render::window_status_line_zones(status, bar_width),
-                ));
-            }
-            for rw in &layout.windows {
-                let (Some(status), true) = (&rw.status_line, rw.rect.height > 1.0) else {
-                    continue;
-                };
-                let ww = rw.rect.width as usize;
-                zone_store.push((
-                    quadraui::Rect::new(
-                        rw.rect.x as f32,
-                        (rw.rect.y + rw.rect.height - 1.0) as f32,
-                        rw.rect.width as f32,
-                        1.0,
-                    ),
-                    render::window_status_line_zones(status, ww),
-                ));
-            }
-            // The global bar last, spatially and in arbitration: it is the
-            // shell's own bottom band, below every window. Its rect is the one
-            // `render_impl.rs` published at paint time (#752) — this arm used
-            // to re-derive the row as `row + 2 == term_height` and then
-            // swallow it whole.
-            let global_rect = engine.global_status_rect.get();
-            if let (Some(bar), true) = (
-                layout.global_status_bar.as_ref(),
-                global_rect.width > 0.0 && global_rect.height > 0.0,
-            ) {
-                zone_store.push((
-                    global_rect,
-                    render::status_bar_zones_in_cells(bar, global_rect.width as usize),
-                ));
-            }
-        }
-        for (rect, zones) in &zone_store {
-            bands.push(render::StatusBand { rect: *rect, zones });
-        }
-
-        let empty_breadcrumbs: [render::BreadcrumbBar; 0] = [];
-        let action = if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-            render::ChromeMouseAction::LeftPress
-        } else {
-            render::ChromeMouseAction::Other
-        };
-        let route = render::route_chrome_click(
-            &render::ChromeState {
-                breadcrumbs_enabled: engine.settings.breadcrumbs,
-                breadcrumbs: last_layout
-                    .map(|l| l.breadcrumbs.as_slice())
-                    .unwrap_or(&empty_breadcrumbs),
-                line_height: 1.0,
-                status_bands: &bands,
-                on_window_divider: last_layout.is_some_and(|l| {
-                    // The same shared hit test, with the same tolerances, the
-                    // window-divider rung further down this function runs —
-                    // see `ChromeState::on_window_divider` (#582/#752).
-                    render::divider_hit_test(
-                        &l.window_dividers,
-                        col as f64,
-                        row as f64,
-                        (1.0, 1.0),
-                        (1.0, 1.0),
-                        true,
-                    )
-                    .is_some()
-                }),
-            },
-            action,
-            col as f64,
-            row as f64,
-        );
-        match route {
-            render::ChromeRoute::Breadcrumb { group_id, idx } => {
-                engine.handle_breadcrumb_click(group_id, idx);
-                return sidebar_width;
-            }
-            render::ChromeRoute::StatusAction(action) => {
-                let cols = terminal_size.as_ref().map(|s| s.width).unwrap_or(80);
-                render::apply_status_action(engine, &action, cols);
-                return sidebar_width;
-            }
-            render::ChromeRoute::BreadcrumbBar | render::ChromeRoute::StatusBar => {
-                return sidebar_width;
-            }
-            render::ChromeRoute::None => {}
-        }
+    // both match. The one place two bands genuinely overlap — a `:split`
+    // divider's grab row and the status line that marks it (#582) — is
+    // arbitrated inside the shared router, not by this ordering.
+    if route_and_apply_chrome_click(
+        ev,
+        engine,
+        last_layout,
+        terminal_size,
+        ChromeGeometry {
+            editor_left,
+            term_height,
+            bottom_chrome,
+            sep_status_rows,
+        },
+    ) {
+        return sidebar_width;
     }
 
     // ── Command line click — start text selection ──────────────────────────────
@@ -3033,6 +2935,154 @@ pub(super) fn handle_mouse(
     }
 
     sidebar_width
+}
+
+/// The bits of `handle_mouse`'s own layout arithmetic the chrome rung needs to
+/// place the separated status line, which is the one band with no cached rect
+/// of its own.
+struct ChromeGeometry {
+    editor_left: u16,
+    term_height: u16,
+    bottom_chrome: u16,
+    sep_status_rows: u16,
+}
+
+/// Assemble this backend's [`render::ChromeState`] in character cells, run the
+/// shared chrome rung over it, and apply whatever it decides. Returns `true`
+/// when the event was consumed.
+///
+/// The TUI twin of `gtk::App::route_and_apply_chrome_click`. #752 folded four
+/// arms into this one call:
+///
+///  * the **breadcrumb** arm, ~700 lines down `handle_mouse`;
+///  * the **separated status line**, with its own copy of the
+///    `handle_status_action` → `OpenTerminal` follow-up;
+///  * the **per-window status line**, a third copy of that follow-up, buried
+///    another ~250 lines below inside the window walk;
+///  * the **global status bar** row, which was not routed at all — swallowed
+///    by `if row + 2 == term_height { return }` under a
+///    `// no interactive segments` comment that had stopped being true.
+///
+/// Unlike GTK, which caches zones at paint time, TUI re-derives each bar's
+/// layout here on every click — exactly as `render_window_status_line` derives
+/// it on every paint, and exactly as the deleted `status_segment_hit_test`
+/// did. Same measure function, same `min_gap`, so hit and paint agree.
+fn route_and_apply_chrome_click(
+    ev: MouseEvent,
+    engine: &mut Engine,
+    last_layout: Option<&render::ScreenLayout>,
+    terminal_size: &Option<Size>,
+    geom: ChromeGeometry,
+) -> bool {
+    let (col, row) = (ev.column, ev.row);
+    let mut zone_store: Vec<(quadraui::Rect, render::StatusZones)> = Vec::new();
+    if let Some(layout) = last_layout {
+        let bar_width = terminal_size.map(|s| s.width).unwrap_or(80) as usize;
+        // The separated status line first, for the same reason GTK lists it
+        // first: it paints in its own full-width band *outside* every window's
+        // rect, so a click there must not fall through to what sits under it.
+        if let Some(status) = &layout.separated_status_line {
+            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+            let strip_rows: u16 = if engine.terminal_open {
+                super::effective_terminal_panel_rows_tui(engine, geom.term_height) + 1
+            } else {
+                0
+            };
+            let term_strip_top = geom
+                .term_height
+                .saturating_sub(geom.bottom_chrome + qf_rows + strip_rows);
+            let sep_row = term_strip_top.saturating_sub(geom.sep_status_rows);
+            zone_store.push((
+                quadraui::Rect::new(
+                    geom.editor_left as f32,
+                    sep_row as f32,
+                    bar_width.saturating_sub(geom.editor_left as usize) as f32,
+                    1.0,
+                ),
+                render::window_status_line_zones(status, bar_width),
+            ));
+        }
+        // Each window's own status line occupies its bottom row — the same row
+        // `render_window` subtracts before computing viewport geometry.
+        for rw in &layout.windows {
+            let (Some(status), true) = (&rw.status_line, rw.rect.height > 1.0) else {
+                continue;
+            };
+            zone_store.push((
+                quadraui::Rect::new(
+                    rw.rect.x as f32,
+                    (rw.rect.y + rw.rect.height - 1.0) as f32,
+                    rw.rect.width as f32,
+                    1.0,
+                ),
+                render::window_status_line_zones(status, rw.rect.width as usize),
+            ));
+        }
+        // The global bar last, spatially and in arbitration: it is the shell's
+        // own bottom band, below every window. Its rect is the one the paint
+        // path published (#752), not a re-derived `term_height - 2`.
+        let global_rect = engine.global_status_rect.get();
+        if let (Some(bar), true) = (
+            layout.global_status_bar.as_ref(),
+            global_rect.width > 0.0 && global_rect.height > 0.0,
+        ) {
+            zone_store.push((
+                global_rect,
+                render::status_bar_zones_in_cells(bar, global_rect.width as usize),
+            ));
+        }
+    }
+    let bands: Vec<render::StatusBand<'_>> = zone_store
+        .iter()
+        .map(|(rect, zones)| render::StatusBand { rect: *rect, zones })
+        .collect();
+
+    let empty_breadcrumbs: [render::BreadcrumbBar; 0] = [];
+    let route = render::route_chrome_click(
+        &render::ChromeState {
+            breadcrumbs_enabled: engine.settings.breadcrumbs,
+            breadcrumbs: last_layout
+                .map(|l| l.breadcrumbs.as_slice())
+                .unwrap_or(&empty_breadcrumbs),
+            // TUI measures in whole cells, so one row *is* the unit.
+            line_height: 1.0,
+            status_bands: &bands,
+            // The same shared hit test, with the same tolerances, the
+            // window-divider rung in `handle_mouse` runs — see
+            // `render::ChromeState::on_window_divider` (#582/#752).
+            on_window_divider: last_layout.is_some_and(|l| {
+                render::divider_hit_test(
+                    &l.window_dividers,
+                    col as f64,
+                    row as f64,
+                    (1.0, 1.0),
+                    (1.0, 1.0),
+                    true,
+                )
+                .is_some()
+            }),
+        },
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            render::ChromeMouseAction::LeftPress
+        } else {
+            render::ChromeMouseAction::Other
+        },
+        col as f64,
+        row as f64,
+    );
+    match route {
+        render::ChromeRoute::None => false,
+        render::ChromeRoute::Breadcrumb { group_id, idx } => {
+            engine.handle_breadcrumb_click(group_id, idx);
+            true
+        }
+        render::ChromeRoute::StatusAction(action) => {
+            let cols = terminal_size.as_ref().map(|s| s.width).unwrap_or(80);
+            render::apply_status_action(engine, &action, cols);
+            true
+        }
+        render::ChromeRoute::BreadcrumbBar | render::ChromeRoute::StatusBar => true,
+    }
 }
 
 // #752: `status_segment_hit_test` lived here — it built the `StatusBar`
