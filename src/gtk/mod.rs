@@ -4,7 +4,7 @@
 
 use gio::prelude::{FileExt, FileMonitorExt};
 use gtk4::gdk;
-use gtk4::pango::{self, FontDescription};
+use gtk4::pango;
 use gtk4::prelude::*;
 use pangocairo::functions as pangocairo;
 use std::cell::{Cell, RefCell};
@@ -511,37 +511,10 @@ struct App {
     /// call (which has the `backend` handle `PlatformServices` needs).
     /// See [`PendingFileDialog`] (#572).
     pending_file_dialog: Cell<Option<PendingFileDialog>>,
-    /// DrawingArea for the file explorer sidebar (Phase A.2b-2: native
-    /// `gtk4::TreeView` replaced by a single DrawingArea rendering via
-    /// `draw_explorer_panel`).
-    explorer_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    /// A.6f: activity bar DA handle; used to queue redraws when panel
-    /// state or extension registrations change.
-    activity_bar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-
-    /// Cached ContextMenuLayout from the last explorer-ctx-menu paint
-    /// on the window-overlay DA (#426). Capture-phase click + motion
-    /// handlers hit-test against this.
-    explorer_ctx_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
-    /// Window-level overlay DA dedicated to the explorer ctx menu (#426)
-    /// — kept here so `Esc` / item-confirm can `queue_draw()` it.
-    ctx_menu_overlay_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Fractional dy accumulator for the explorer scroll wheel. Small
     /// trackpad deltas are summed here until they exceed one row, so no
     /// scroll event is silently dropped.
     explorer_scroll_accum: Rc<Cell<f64>>,
-    /// The editor `DrawingArea` (Relm4-era handle).
-    ///
-    /// **Always `None` under the ShellApp runner** — quadraui's
-    /// `gtk::run` owns the single DrawingArea (#217) and never hands it back,
-    /// and nothing in this file assigns this field. Every `if let Some(da) =
-    /// self.drawing_area…` arm is therefore dead code inherited from the Relm4
-    /// build. Treat a read of this as "never taken" until the per-DA rewiring
-    /// lands; do not gate live behaviour on it (that is how the wheel's
-    /// hovered-window lookup silently died — see #646 and
-    /// [`Self::last_editor_pointer`]).
-    drawing_area: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    debug_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Line height the debug-sidebar draw closure last computed via
     /// `pangocairo::create_context(cr).metrics(...)`. Click / scroll /
     /// key handlers read this cell so their row math agrees with what
@@ -549,30 +522,6 @@ struct App {
     /// different scale than the cairo-derived context (HiDPI). #281
     /// smoke surfaced a 4:3 drift between the two paths.
     debug_sidebar_lh: Rc<Cell<f64>>,
-    git_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    ext_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    /// DrawingArea for extension-provided panels (e.g. git-insights GIT LOG).
-    ext_dyn_panel_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    /// Outer Box for the extension-provided panel sidebar.
-    ext_dyn_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    ai_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    sidebar_inner_sw: Rc<RefCell<Option<gtk4::ScrolledWindow>>>,
-    /// Direct ref to the sidebar Revealer for programmatic open/close.
-    sidebar_revealer: Rc<RefCell<Option<gtk4::Revealer>>>,
-    /// Direct refs to each panel's outer Box for programmatic show/hide.
-    explorer_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    search_sidebar_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    debug_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    git_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    ext_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    settings_panel_box: Rc<RefCell<Option<gtk4::Box>>>,
-    /// DrawingArea inside the Settings panel (Phase A.3c-2: native widget
-    /// tree replaced by a single DrawingArea that calls `draw_settings_panel`).
-    settings_da_ref: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    ai_panel_box_ref: Rc<RefCell<Option<gtk4::Box>>>,
-    // Per-window scrollbars and indicators
-    window_scrollbars: Rc<RefCell<HashMap<core::WindowId, WindowScrollbars>>>,
-    overlay: Rc<RefCell<Option<gtk4::Overlay>>>,
     cached_line_height: f64,
     cached_char_width: f64,
     /// Position of the wheel event currently being handled, in **absolute**
@@ -628,10 +577,6 @@ struct App {
     char_width_cell: Rc<Cell<f64>>,
     /// Current mouse position, updated directly from the motion callback (no Relm4 message).
     mouse_pos_cell: Rc<Cell<(f64, f64)>>,
-    /// Shared with draw closure: hovered state for Cairo h scrollbars.
-    h_sb_hovered_cell: Rc<Cell<bool>>,
-    /// Shared with draw closure: which tab close button (×) is hovered: (group_id.0, tab_idx).
-    tab_close_hover_cell: Rc<Cell<Option<(usize, usize)>>>,
     /// Shared with draw closure: which window (if any) has an active h scrollbar drag.
     h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
     /// True while user is drag-selecting text inside a find/replace input field.
@@ -642,8 +587,6 @@ struct App {
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
     last_clipboard_content: Option<String>,
-    /// True while the mouse cursor is over any horizontal scrollbar track.
-    h_sb_hovered: bool,
     /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
     tab_close_hover: Option<(usize, usize)>,
     /// Cached tab slot widths per group, populated during draw_tab_bar for click hit-testing.
@@ -834,13 +777,6 @@ struct App {
     title_bar_interaction: RefCell<quadraui::StatusBarInteraction>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     last_sc_refresh: std::time::Instant,
-    /// Last time explorer tree indicators (modified/diagnostics) were refreshed.
-    last_tree_indicator_update: std::time::Instant,
-    /// Full-window overlay DrawingArea that draws the menu dropdown.
-    /// Can-target toggles true/false with menu open/close.
-    menu_dropdown_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
-    /// Full-window overlay DrawingArea for panel hover popups.
-    panel_hover_da: Rc<RefCell<Option<gtk4::DrawingArea>>>,
     /// Link hit rects populated during hover popup draw: (x, y, w, h, url, is_native).
     #[allow(clippy::type_complexity)]
     panel_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String, bool)>>>,
@@ -1084,15 +1020,6 @@ fn setup_gtk_clipboard(engine: &mut Engine) {
     }));
 }
 
-/// Scrollbars and indicators for a single window.
-/// The horizontal scrollbar is drawn in Cairo (draw_editor) so it can be
-/// pixel-exact in height — GTK's Scrollbar widget enforces theme minimum
-/// heights that can't be overridden with CSS.
-struct WindowScrollbars {
-    vertical: gtk4::Scrollbar,
-    cursor_indicator: gtk4::DrawingArea,
-}
-
 /// A native file dialog requested by `Msg::OpenFileDialog` /
 /// `Msg::SaveWorkspaceAsDialog`, deferred to the next `tick()` (#572).
 ///
@@ -1182,13 +1109,6 @@ enum Msg {
         unicode: Option<char>,
         ctrl: bool,
     },
-    /// #426: click on the ctx-menu overlay DA (window coords). Routed
-    /// through the overlay's gesture so the menu can extend past the
-    /// explorer's right edge into the editor area.
-    ExplorerCtxMenuClick(f64, f64),
-    /// #426: mouse motion on the ctx-menu overlay DA (window coords).
-    /// Updates the engine's `context_menu.selected` from the cached layout.
-    ExplorerCtxMenuMotion(f64, f64),
     /// Mouse-wheel on the explorer DrawingArea. Positive dy scrolls down.
     ExplorerScroll(f64),
     /// UiEvent (scroll, mouse) on the explorer DrawingArea — routed
@@ -1449,119 +1369,6 @@ enum Msg {
     },
 }
 
-/// Left edge (drawing-area px, as a GTK `margin-start`) of a window's native
-/// vertical `gtk4::Scrollbar`.
-///
-/// #723: `minimap_reserved_width` carves the minimap strip out of the pane's
-/// **right** edge, but native `gtk4::Scrollbar` widgets live in the `Overlay`
-/// *above* the `DrawingArea` — so a scrollbar pinned to `rect`'s outer edge
-/// lands on top of the strip, where it is both indistinguishable from the
-/// minimap and (being an opaque widget) hides the strip content underneath.
-/// That is the "no scrollbar when the minimap is on" the issue reports.
-///
-/// Insetting by `minimap_width` puts the scrollbar immediately to the *left*
-/// of the strip — exactly where TUI's editor-internal scrollbar column
-/// already sits (quadraui's `tui::draw_editor` paints it at the editor
-/// viewport's right edge, and that viewport is already narrowed by the same
-/// reserved width). Both backends therefore land on one scroll affordance in
-/// the same relative place, which is why `draw_minimap_strip` deliberately
-/// does not paint a second one over the strip.
-///
-/// The trailing 2px keeps the bar off the group divider / adjacent group,
-/// preserved from the pre-#723 positioning. `minimap_width` is `0.0` when the
-/// strip is off (`:set nominimap`, or a pane too narrow to afford one), which
-/// reduces this to exactly that original expression. Clamped to `rect_x` so a
-/// pathologically narrow pane can never push the widget left of its own pane.
-fn native_scrollbar_margin_start(
-    rect_x: f64,
-    rect_width: f64,
-    scrollbar_width: f64,
-    minimap_width: f64,
-) -> i32 {
-    let x = rect_x + rect_width - minimap_width - scrollbar_width - 2.0;
-    x.max(rect_x).round() as i32
-}
-
-/// Reposition existing scrollbar widgets for the given drawing-area size.
-///
-/// This is a free function so it can be called both from `sync_scrollbar` (via
-/// Relm4's message queue) AND from a `connect_resize` callback that runs
-/// synchronously during GTK's layout pass — before each frame is rendered.
-/// Calling it synchronously eliminates the 1-frame lag where the editor draws
-/// at the new size while scrollbars are still at the old position.
-///
-/// It only updates widget geometry; it does NOT create/remove scrollbars or
-/// update adjustment values (that is `sync_scrollbar`'s job).
-#[allow(clippy::too_many_arguments)]
-fn sync_scrollbar_positions(
-    da_width: f64,
-    da_height: f64,
-    line_height: f64,
-    char_width: f64,
-    engine: &core::Engine,
-    scrollbars: &HashMap<core::WindowId, WindowScrollbars>,
-) {
-    if da_width < 20.0 || da_height < 20.0 || line_height < 1.0 {
-        return;
-    }
-    let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-    let editor_bounds = core::WindowRect::new(
-        0.0,
-        0.0,
-        da_width,
-        gtk_editor_bottom(engine, da_width, da_height, line_height),
-    );
-    let (window_rects, _dividers) =
-        engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-
-    // Hide scrollbars for windows not in the current visible set
-    // (e.g. windows in non-active tabs), or when a modal popup is
-    // open. Native gtk4::Scrollbar widgets render above the
-    // DrawingArea, so they would otherwise poke through the
-    // palette / picker / tab-switcher overlays.
-    let visible_ids: std::collections::HashSet<core::WindowId> =
-        window_rects.iter().map(|(wid, _)| *wid).collect();
-    let modal_open = engine.is_blocking_modal_open();
-    for (wid, ws) in scrollbars.iter() {
-        let show = visible_ids.contains(wid) && !modal_open;
-        ws.vertical.set_visible(show);
-        ws.cursor_indicator.set_visible(show);
-    }
-
-    for (window_id, rect) in &window_rects {
-        let ws = match scrollbars.get(window_id) {
-            Some(ws) => ws,
-            None => continue,
-        };
-        let window = match engine.windows.get(window_id) {
-            Some(w) => w,
-            None => continue,
-        };
-        if engine.buffer_manager.get(window.buffer_id).is_none() {
-            continue;
-        }
-
-        // — Vertical scrollbar —
-        // Query the actual allocated width so we position correctly even if
-        // GTK's theme enforces a minimum wider than our CSS min-width.
-        let sb_actual_w = ws.vertical.width().max(4) as f64;
-        let minimap_w = render::minimap_reserved_width(engine, rect.width, char_width);
-        ws.vertical.set_halign(gtk4::Align::Start);
-        ws.vertical.set_valign(gtk4::Align::Start);
-        ws.vertical.set_margin_start(native_scrollbar_margin_start(
-            rect.x,
-            rect.width,
-            sb_actual_w,
-            minimap_w,
-        ));
-        ws.vertical.set_margin_top(rect.y as i32);
-        ws.vertical
-            .set_height_request((rect.height as i32 - 4).max(0));
-
-        // Horizontal scrollbar is drawn in Cairo by draw_editor — nothing to do here.
-    }
-}
-
 /// Create a new `App` instance.
 ///
 /// All widget-dependent setup (window handle, CSS) is deferred to
@@ -1656,31 +1463,8 @@ impl App {
             engine,
             draw_needed: Rc::new(Cell::new(false)),
             pending_file_dialog: Cell::new(None),
-            explorer_sidebar_da_ref: Rc::new(RefCell::new(None)),
-            activity_bar_da_ref: Rc::new(RefCell::new(None)),
-            explorer_ctx_menu_layout: Rc::new(RefCell::new(None)),
-            ctx_menu_overlay_da: Rc::new(RefCell::new(None)),
             explorer_scroll_accum: Rc::new(Cell::new(0.0)),
-            drawing_area: Rc::new(RefCell::new(None)),
-            debug_sidebar_da_ref: Rc::new(RefCell::new(None)),
             debug_sidebar_lh: Rc::new(Cell::new(20.0)),
-            git_sidebar_da_ref: Rc::new(RefCell::new(None)),
-            ext_sidebar_da_ref: Rc::new(RefCell::new(None)),
-            ext_dyn_panel_da_ref: Rc::new(RefCell::new(None)),
-            ext_dyn_panel_box: Rc::new(RefCell::new(None)),
-            ai_sidebar_da_ref: Rc::new(RefCell::new(None)),
-            sidebar_inner_sw: Rc::new(RefCell::new(None)),
-            sidebar_revealer: Rc::new(RefCell::new(None)),
-            explorer_panel_box: Rc::new(RefCell::new(None)),
-            search_sidebar_da_ref: Rc::new(RefCell::new(None)),
-            debug_panel_box: Rc::new(RefCell::new(None)),
-            git_panel_box: Rc::new(RefCell::new(None)),
-            ext_panel_box: Rc::new(RefCell::new(None)),
-            settings_panel_box: Rc::new(RefCell::new(None)),
-            settings_da_ref: Rc::new(RefCell::new(None)),
-            ai_panel_box_ref: Rc::new(RefCell::new(None)),
-            window_scrollbars: Rc::new(RefCell::new(HashMap::new())),
-            overlay: Rc::new(RefCell::new(None)),
             cached_line_height: 24.0,
             cached_char_width: 9.0,
             last_editor_pointer: Rc::new(Cell::new(None)),
@@ -1691,14 +1475,11 @@ impl App {
             line_height_cell: Rc::new(Cell::new(24.0)),
             char_width_cell: Rc::new(Cell::new(9.0)),
             mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
-            h_sb_hovered_cell: Rc::new(Cell::new(false)),
-            tab_close_hover_cell: Rc::new(Cell::new(None)),
             h_sb_drag_cell: Rc::new(Cell::new(None)),
             fr_input_dragging: false,
             settings_monitor,
             sender,
             last_clipboard_content: None,
-            h_sb_hovered: false,
             tab_close_hover: None,
             tab_slot_positions: Rc::new(RefCell::new(HashMap::new())),
             cached_tab_close_abs: Rc::new(RefCell::new(HashMap::new())),
@@ -1736,9 +1517,6 @@ impl App {
             title_bar_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             title_bar_interaction: RefCell::new(quadraui::StatusBarInteraction::new()),
             last_sc_refresh: std::time::Instant::now(),
-            last_tree_indicator_update: std::time::Instant::now(),
-            menu_dropdown_da: Rc::new(RefCell::new(None)),
-            panel_hover_da: Rc::new(RefCell::new(None)),
             panel_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             panel_hover_popup_rect: Rc::new(Cell::new(None)),
             editor_hover_popup_rect: Rc::new(Cell::new(None)),
@@ -1897,12 +1675,6 @@ impl App {
     }
 
     fn dispatch(&mut self, msg: Msg) {
-        // Track if this is a scrollbar change to avoid syncing feedback loop
-        let is_scrollbar_msg = matches!(
-            &msg,
-            Msg::VerticalScrollbarChanged { .. } | Msg::HorizontalScrollbarChanged { .. }
-        );
-
         match msg {
             Msg::KeyPress {
                 key_name,
@@ -1958,25 +1730,15 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::Resize => {
-                // Update backend viewport for MenuSystem::handle() calls.
-                if let Some(ref overlay) = *self.overlay.borrow() {
-                    use quadraui::Backend;
-                    self.backend
-                        .borrow_mut()
-                        .begin_frame(quadraui::Viewport::new(
-                            overlay.width().max(1) as f32,
-                            overlay.height().max(1) as f32,
-                            1.0,
-                        ));
-                }
-                // Propagate window resize to open terminal panes.
-                if !self.engine.borrow().terminal_panes.is_empty() {
-                    if let Some(da) = self.drawing_area.borrow().as_ref() {
-                        let cols = ((da.width() as f64 / self.cached_char_width) as u16).max(40);
-                        let rows = self.engine.borrow().session.terminal_panel_rows;
-                        self.engine.borrow_mut().terminal_resize(cols, rows);
-                    }
-                }
+                // #731: both branches here were gated on `self.overlay` /
+                // `self.drawing_area`, permanently `None` under the
+                // ShellApp runner (nothing assigns either field) — so
+                // this was already a no-op: the backend viewport is
+                // re-derived every frame by the runner itself, and
+                // terminal-pane resize-on-window-resize has not fired
+                // since the #540 cutover. Re-deriving live terminal
+                // pane sizing needs a way to read the live DA's pixel
+                // size without a widget handle — see `terminal_cols`.
                 self.draw_needed.set(true);
             }
             Msg::MouseClick {
@@ -2191,9 +1953,7 @@ impl App {
                                 "debug_output" => {
                                     engine.handle_debug_output_scroll(delta.y);
                                     drop(engine);
-                                    if let Some(da) = self.drawing_area.borrow().as_ref() {
-                                        da.queue_draw();
-                                    }
+                                    self.draw_needed.set(true);
                                     return;
                                 }
                                 "terminal_scrollback" => {
@@ -2264,7 +2024,6 @@ impl App {
                 self.draw_needed.set(true);
             }
             Msg::CacheFontMetrics(line_height, char_width) => {
-                let old_char_width = self.cached_char_width;
                 self.cached_line_height = line_height;
                 self.cached_char_width = char_width;
                 // #270 lift: keep the lifted `GtkBackend`'s settings-driven
@@ -2282,53 +2041,25 @@ impl App {
                         e.settings.ui_font_size.max(1)
                     ));
                 }
-                // Compute UI font line height for sidebar click handlers.
-                if let Some(ref da) = *self.drawing_area.borrow() {
-                    let font_desc = FontDescription::from_string(&UI_FONT());
-                    let pango_ctx = da.pango_context();
-                    let fm = pango_ctx.metrics(Some(&font_desc), None);
-                    self.cached_ui_line_height =
-                        (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64;
-                    let lh = self.cached_ui_line_height as f32;
-                    let metrics = quadraui::MsvLayoutMetrics {
-                        header_size: (lh * 1.2).round(),
-                        divider_size: 0.0,
-                        scrollbar_size: 8.0,
-                        cell_quantum: 0.0,
-                    };
-                    self.engine
-                        .borrow()
-                        .ext_sidebar_system
-                        .borrow_mut()
-                        .set_backend_info(lh, metrics);
-                    self.engine
-                        .borrow()
-                        .sc_sidebar_system
-                        .borrow_mut()
-                        .set_backend_info(lh, metrics);
-                    self.engine
-                        .borrow()
-                        .search_sidebar_system
-                        .borrow_mut()
-                        .set_backend_info(lh, metrics);
-                }
+                // #731: computing UI font line height + `set_backend_info`
+                // for the ext/sc/search sidebar systems was gated on
+                // `self.drawing_area`, permanently `None` under the
+                // ShellApp runner — dead since #540. `cached_ui_line_height`
+                // still gets a one-time seed from `cached_line_height` in
+                // `setup()`, so this only means it doesn't track a runtime
+                // `:set guifont`/font-size change; those three sidebar
+                // systems' `MsvLayoutMetrics` never receive real values,
+                // which needs a live font-metrics source under ShellApp to
+                // fix (same root cause as `terminal_cols`, above).
                 // Keep shared cells in sync so the resize callback can use accurate values.
                 self.line_height_cell.set(line_height);
                 self.char_width_cell.set(char_width);
                 // Keep menu dropdown overlay in sync with current line height.
                 self.menu_dd_line_height.set(line_height);
-                // If cached_char_width changed significantly (e.g. on first draw after startup
-                // when the initial default of 9.0 differed from the actual font metric),
-                // resize any open terminal panes so their PTY col count matches the display.
-                if (old_char_width - char_width).abs() > 0.5
-                    && !self.engine.borrow().terminal_panes.is_empty()
-                {
-                    if let Some(da) = self.drawing_area.borrow().as_ref() {
-                        let cols = ((da.width() as f64 / char_width) as u16).max(40);
-                        let rows = self.engine.borrow().session.terminal_panel_rows;
-                        self.engine.borrow_mut().terminal_resize(cols, rows);
-                    }
-                }
+                // #731: the on-first-draw terminal-pane resize (comparing
+                // char-width delta) was gated on `self.drawing_area`,
+                // permanently `None` under the ShellApp runner — dead
+                // since #540. See `terminal_cols`.
                 // Sync per-window viewport_cols from paint-time geometry
                 // so ensure_cursor_visible (run during key handling) uses
                 // exact column counts, not the resize handler's estimate.
@@ -2359,9 +2090,6 @@ impl App {
             }
             Msg::SettingsFileChanged => {
                 if self.engine.borrow_mut().check_settings_reload() {
-                    if let Some(drawing_area) = self.drawing_area.borrow().as_ref() {
-                        drawing_area.queue_draw();
-                    }
                     self.dispatch(Msg::RefreshFileTree);
                     self.draw_needed.set(true);
                 }
@@ -2449,9 +2177,6 @@ impl App {
             Msg::SearchSidebarEvent(ev) => {
                 self.engine.borrow_mut().handle_search_sidebar_ui_event(ev);
                 self.draw_needed.set(true);
-                if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
             }
             Msg::RenameFile(_, _)
             | Msg::MoveFile(_, _)
@@ -2512,11 +2237,7 @@ impl App {
             Msg::SettingsKey(_, _, _) | Msg::SettingsClick(_, _, _) | Msg::SettingsScroll(_) => {
                 self.handle_settings_msg(msg);
             }
-            Msg::ExplorerKey { .. }
-            | Msg::ExplorerScroll(_)
-            | Msg::ExplorerUiEvent(_)
-            | Msg::ExplorerCtxMenuClick(..)
-            | Msg::ExplorerCtxMenuMotion(..) => {
+            Msg::ExplorerKey { .. } | Msg::ExplorerScroll(_) | Msg::ExplorerUiEvent(_) => {
                 self.handle_explorer_msg(msg);
             }
             Msg::ExtPanelKey(_, _)
@@ -2546,10 +2267,12 @@ impl App {
             }
         }
 
-        // Sync scrollbar position to match engine state (except when scrollbar itself changed)
-        if !is_scrollbar_msg {
-            self.sync_scrollbar();
-        }
+        // #731: `sync_scrollbar` (rebuilding/repositioning native
+        // `gtk4::Scrollbar` overlay widgets) used to run here on every
+        // non-scrollbar message. It was gated on `self.overlay` /
+        // `self.drawing_area`, both permanently `None` under the ShellApp
+        // runner, so it was already a no-op — see the function's removal
+        // for the full story, including the live #723 re-diagnosis.
 
         // #435: engine-drawn ctx menu keys (j/k/Enter/Esc) are dispatched on
         // the editor DA's key controller. If the trigger click landed on a
@@ -2560,24 +2283,6 @@ impl App {
         // #426: do NOT do this for explorer-targeted ctx menus — those render
         // on the explorer DA and have their own key handler. Stealing focus
         // back to the editor DA would break keyboard nav of the explorer menu.
-        {
-            use core::engine::ContextMenuTarget;
-            let on_explorer = matches!(
-                self.engine
-                    .borrow()
-                    .context_menu
-                    .as_ref()
-                    .map(|cm| &cm.target),
-                Some(
-                    ContextMenuTarget::ExplorerFile { .. } | ContextMenuTarget::ExplorerDir { .. }
-                )
-            );
-            if !on_explorer && self.engine.borrow().context_menu.is_some() {
-                if let Some(ref drawing) = *self.drawing_area.borrow() {
-                    drawing.grab_focus();
-                }
-            }
-        }
     }
 
     /// Reveal `target` in the explorer sidebar: expand all ancestors,
@@ -2650,16 +2355,8 @@ impl App {
             }
             EngineAction::OpenFile(path) => {
                 let mut engine = self.engine.borrow_mut();
-                match engine.open_file_with_mode(&path, OpenMode::Permanent) {
-                    Ok(()) => {
-                        drop(engine);
-                        if let Some(ref drawing) = *self.drawing_area.borrow() {
-                            drawing.grab_focus();
-                        }
-                    }
-                    Err(e) => {
-                        engine.message = e;
-                    }
+                if let Err(e) = engine.open_file_with_mode(&path, OpenMode::Permanent) {
+                    engine.message = e;
                 }
             }
             EngineAction::OpenTerminal => {
@@ -2716,14 +2413,17 @@ impl App {
         }
     }
 
-    /// Return focus to the main editor drawing area when a sidebar loses focus.
-    fn focus_editor_if_needed(&self, still_focused: bool) {
-        if !still_focused {
-            if let Some(ref drawing) = *self.drawing_area.borrow() {
-                drawing.grab_focus();
-            }
-        }
-    }
+    /// Return focus to the main editor drawing area when a sidebar loses
+    /// focus.
+    ///
+    /// #731: was `if let Some(ref drawing) = *self.drawing_area.borrow()`
+    /// — that field is permanently `None` under the ShellApp runner
+    /// (nothing assigns it), so this has been a no-op since #540. Kept as
+    /// a named function (rather than deleting every call site) so the
+    /// intent stays legible at each of its ~10 callers; a real fix needs a
+    /// live way to grab GTK keyboard focus on the editor DA from here,
+    /// which nothing in this file currently has under ShellApp.
+    fn focus_editor_if_needed(&self, _still_focused: bool) {}
 
     /// Sync the unnamed `"` register (and explicit `+` register) to the system clipboard
     /// whenever their content changes (clipboard=unnamedplus semantics).
@@ -2749,233 +2449,6 @@ impl App {
             }
             drop(engine);
             self.last_clipboard_content = new_content;
-        }
-    }
-
-    /// Rebuild and sync scrollbars for all windows
-    fn sync_scrollbar(&self) {
-        // Also run the fast positional sync so callers that go through the
-        // Relm4 message queue still converge to the right layout.
-        if let Some(da) = self.drawing_area.borrow().as_ref() {
-            let scrollbars = self.window_scrollbars.borrow();
-            let engine = self.engine.borrow();
-            sync_scrollbar_positions(
-                da.width() as f64,
-                da.height() as f64,
-                self.cached_line_height,
-                self.cached_char_width,
-                &engine,
-                &scrollbars,
-            );
-        }
-        let overlay = match self.overlay.borrow().as_ref() {
-            Some(o) => o.clone(),
-            None => return,
-        };
-
-        let drawing_area = match self.drawing_area.borrow().as_ref() {
-            Some(da) => da.clone(),
-            None => return,
-        };
-
-        let engine = self.engine.borrow();
-        let mut scrollbars = self.window_scrollbars.borrow_mut();
-
-        // Calculate window rects (same logic as draw_editor)
-        let da_width = drawing_area.width() as f64;
-        let da_height = drawing_area.height() as f64;
-
-        // Skip if the drawing area hasn't been laid out yet (startup / minimised)
-        if da_width < 20.0 || da_height < 20.0 {
-            return;
-        }
-
-        let line_height = self.cached_line_height;
-        let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-        let editor_bounds = WindowRect::new(
-            0.0,
-            0.0,
-            da_width,
-            gtk_editor_bottom(&engine, da_width, da_height, line_height),
-        );
-        let (window_rects, _dividers) =
-            engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-
-        // Remove scrollbars for windows that no longer exist.
-        // Must explicitly remove GTK widgets from the overlay before dropping them,
-        // otherwise the widgets remain visible even after the window is gone.
-        let dead_ids: Vec<core::WindowId> = scrollbars
-            .keys()
-            .filter(|wid| !engine.windows.contains_key(*wid))
-            .copied()
-            .collect();
-        for wid in dead_ids {
-            if let Some(ws) = scrollbars.remove(&wid) {
-                overlay.remove_overlay(&ws.vertical);
-                overlay.remove_overlay(&ws.cursor_indicator);
-            }
-        }
-
-        // #723: the minimap strip is reserved out of each pane's right edge,
-        // so the native scrollbar has to be inset past it — see
-        // `native_scrollbar_margin_start`. Same per-window call
-        // `build_screen_layout_with_breadcrumb_row` reserves/paints the strip
-        // with, so the inset can't drift from what actually painted.
-        let char_width = self.cached_char_width;
-
-        // Hide scrollbars for windows that exist but aren't visible
-        // (e.g. windows in non-active tabs), or when a modal popup is
-        // open. Native gtk4::Scrollbar widgets render above the
-        // DrawingArea, so they would otherwise poke through the
-        // palette / picker / tab-switcher overlays.
-        let visible_ids: std::collections::HashSet<core::WindowId> =
-            window_rects.iter().map(|(wid, _)| *wid).collect();
-        // Native gtk4::Scrollbar widgets render above the DrawingArea
-        // (they're real GTK widgets, not Cairo paint), so they'd
-        // otherwise poke through every modal popup. Hide them when
-        // any popup is up (#252). The single source of truth lives
-        // in `Engine::is_blocking_modal_open()`.
-        let modal_open = engine.is_blocking_modal_open();
-        for (wid, ws) in scrollbars.iter() {
-            let show = visible_ids.contains(wid) && !modal_open;
-            ws.vertical.set_visible(show);
-            ws.cursor_indicator.set_visible(show);
-        }
-
-        // Create/update scrollbars for each window
-        for (window_id, rect) in &window_rects {
-            let window = match engine.windows.get(window_id) {
-                Some(w) => w,
-                None => continue,
-            };
-
-            let buffer_state = match engine.buffer_manager.get(window.buffer_id) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            // Create new scrollbars if needed
-            if !scrollbars.contains_key(window_id) {
-                let ws = self.create_window_scrollbars(&overlay, *window_id, &self.sender);
-                scrollbars.insert(*window_id, ws);
-            }
-
-            // Get scrollbars for this window
-            let ws = match scrollbars.get(window_id) {
-                Some(ws) => ws,
-                None => continue,
-            };
-
-            // Position and sync vertical scrollbar
-            // Use absolute positioning with Start alignment
-            ws.vertical.set_halign(gtk4::Align::Start);
-            ws.vertical.set_valign(gtk4::Align::Start);
-
-            // Inset past the minimap strip (#723) — see
-            // `native_scrollbar_margin_start`.
-            let minimap_w = render::minimap_reserved_width(&engine, rect.width, char_width);
-            let scrollbar_x = native_scrollbar_margin_start(rect.x, rect.width, 10.0, minimap_w);
-            ws.vertical.set_margin_start(scrollbar_x);
-            ws.vertical.set_margin_top(rect.y as i32);
-            ws.vertical
-                .set_height_request(((rect.height - 10.0) as i32).max(0));
-
-            let total_lines = buffer_state.buffer.content.len_lines();
-            let v_adj = ws.vertical.adjustment();
-            v_adj.set_upper(total_lines as f64);
-            v_adj.set_page_size(window.view.viewport_lines as f64);
-            // Page-step (trough click) scrolls by one viewport instead
-            // of the constructor's hardcoded 10. Without this, clicking
-            // the trough always pages by 10 lines regardless of how
-            // tall the window is.
-            v_adj.set_page_increment(window.view.viewport_lines.max(1) as f64);
-            v_adj.set_value(window.view.scroll_top as f64);
-
-            // Position cursor indicator (fix: ensure height stays constant at 4px)
-            let cursor_line = window.view.cursor.line;
-            if total_lines > 0 {
-                let ratio = cursor_line as f64 / total_lines as f64;
-
-                // Calculate Y position within the scrollbar's visible area
-                // Use the vertical scrollbar's actual height
-                let scrollbar_height = ws.vertical.height() as f64;
-                let indicator_y = rect.y + (ratio * scrollbar_height);
-
-                let sb_w = ws.vertical.width().max(4) as f64;
-                // Track the scrollbar's own inset so the cursor tick stays
-                // on the bar rather than under the minimap strip (#723).
-                let indicator_x =
-                    native_scrollbar_margin_start(rect.x, rect.width, sb_w, minimap_w);
-                ws.cursor_indicator.set_margin_start(indicator_x);
-                ws.cursor_indicator.set_margin_top(indicator_y as i32);
-
-                // Ensure size stays fixed (defensive coding)
-                ws.cursor_indicator.set_width_request(sb_w as i32);
-                ws.cursor_indicator.set_height_request(4);
-            }
-        }
-        // Horizontal scrollbar is drawn in Cairo by draw_h_scrollbars() in draw_editor().
-
-        // Remove overlay widgets for deleted windows
-        // (GTK will automatically remove them when we drop the references)
-    }
-
-    /// Create scrollbars and indicator for a window
-    fn create_window_scrollbars(
-        &self,
-        overlay: &gtk4::Overlay,
-        window_id: core::WindowId,
-        sender: &MsgSender,
-    ) -> WindowScrollbars {
-        // Vertical scrollbar — interactive for click-to-jump and drag.
-        let v_adj = gtk4::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 20.0);
-        let vertical = gtk4::Scrollbar::new(gtk4::Orientation::Vertical, Some(&v_adj));
-        vertical.set_width_request(4);
-        vertical.set_hexpand(false);
-        vertical.set_vexpand(false);
-        vertical.set_overflow(gtk4::Overflow::Hidden);
-
-        // Cursor indicator
-        let cursor_indicator = gtk4::DrawingArea::new();
-        cursor_indicator.set_width_request(4);
-        cursor_indicator.set_height_request(4);
-        cursor_indicator.set_can_target(false);
-        cursor_indicator.set_halign(gtk4::Align::Start);
-        cursor_indicator.set_valign(gtk4::Align::Start);
-        cursor_indicator.set_hexpand(false);
-        cursor_indicator.set_vexpand(false);
-        let thumb_color = {
-            let engine = self.engine.borrow();
-            Theme::from_name(&engine.settings.colorscheme).scrollbar_thumb
-        };
-        cursor_indicator.set_draw_func(move |_, cr, w, h| {
-            let (r, g, b) = thumb_color.to_cairo();
-            cr.set_source_rgba(r, g, b, 0.8);
-            cr.rectangle(0.0, 0.0, w as f64, h as f64);
-            let _ = cr.fill();
-        });
-
-        // Add to overlay
-        overlay.add_overlay(&vertical);
-        overlay.add_overlay(&cursor_indicator);
-
-        vertical.show();
-        cursor_indicator.show();
-
-        // Connect vertical scrollbar signal
-        let sender_v = sender.clone();
-        v_adj.connect_value_changed(move |adj| {
-            sender_v
-                .send(Msg::VerticalScrollbarChanged {
-                    window_id,
-                    value: adj.value(),
-                })
-                .ok();
-        });
-
-        WindowScrollbars {
-            vertical,
-            cursor_indicator,
         }
     }
 
@@ -3041,9 +2514,6 @@ impl App {
 
         // Dismiss any panel hover popup on key press.
         self.engine.borrow_mut().dismiss_panel_hover_now();
-        if let Some(ref da) = *self.panel_hover_da.borrow() {
-            da.queue_draw();
-        }
 
         // Pre-load system clipboard into engine registers for paste keys
         // (p/P in normal/visual, Ctrl+V in VSCode mode). Detection and
@@ -3116,9 +2586,6 @@ impl App {
                 drop(engine);
                 // h/Left moves focus to the activity bar; other exits go to the editor.
                 self.focus_after_sidebar_key(still_focused && !has_dialog);
-                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.sync_plus_register_to_clipboard();
                 self.draw_needed.set(true);
                 return;
@@ -3134,9 +2601,6 @@ impl App {
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused && !has_dialog);
-                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
                 return;
             }
@@ -3151,9 +2615,6 @@ impl App {
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused && !has_dialog);
-                if let Some(ref da) = *self.settings_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
                 return;
             }
@@ -3172,9 +2633,6 @@ impl App {
                 let still_focused = engine.search_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.search_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
                 return;
             }
@@ -3188,9 +2646,6 @@ impl App {
                 let still_focused = engine.sc_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
                 return;
             }
@@ -3219,9 +2674,6 @@ impl App {
                 let still_focused = engine.dap_sidebar_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
                 return;
             }
@@ -3234,9 +2686,6 @@ impl App {
                 let still_focused = engine.ai_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
                 return;
             }
@@ -3339,143 +2788,23 @@ impl App {
             }
         }
 
-        // Check h scrollbar hover state from the shared mouse position cell.
-        // This replaces per-motion-event Relm4 messages with a 20 Hz poll.
-        {
-            let (mx, my) = self.mouse_pos_cell.get();
-            let lh = self.cached_line_height;
-            let cw = self.cached_char_width;
-            let da_size = self
-                .drawing_area
-                .borrow()
-                .as_ref()
-                .map(|da| (da.width() as f64, da.height() as f64));
-            if let Some((da_w, da_h)) = da_size {
-                let engine = self.engine.borrow();
-                let rects = compute_editor_window_rects(&engine, da_w, da_h, lh);
-                let now_hovered =
-                    mx >= 0.0 && h_scrollbar_hit_test(&engine, mx, my, &rects, cw, lh).is_some();
-                drop(engine);
-                if now_hovered != self.h_sb_hovered {
-                    self.h_sb_hovered = now_hovered;
-                    self.h_sb_hovered_cell.set(now_hovered);
-                    self.draw_needed.set(true);
-                }
-
-                // Tab close button hover detection + tab tooltip.
-                let engine = self.engine.borrow();
-                let close_abs_map = self.cached_tab_close_abs.borrow();
-                let tab_hover = if mx >= 0.0 && lh > 0.0 {
-                    tab_close_hit_test(&close_abs_map, mx, my)
-                } else {
-                    None
-                };
-                drop(close_abs_map);
-                let tooltip = if mx >= 0.0 && lh > 0.0 {
-                    tab_tooltip_hit_test(&engine, mx, my, da_w, da_h, lh, cw)
-                } else {
-                    None
-                };
-                drop(engine);
-                if tab_hover != self.tab_close_hover {
-                    self.tab_close_hover = tab_hover;
-                    self.tab_close_hover_cell.set(tab_hover);
-                    self.draw_needed.set(true);
-                }
-                {
-                    let mut engine = self.engine.borrow_mut();
-                    if tooltip != engine.tab_hover_tooltip {
-                        engine.tab_hover_tooltip = tooltip;
-                        self.draw_needed.set(true);
-                    }
-                }
-
-                // Debug toolbar hover detection (#510) — use cached ToolbarLayout
-                // on the engine rather than a model-local StatusBarLayout.
-                {
-                    let dbg_y = self.debug_toolbar_y_offset.get();
-                    let dbg_h = self.debug_toolbar_height.get();
-                    let new_hover = if dbg_h > 0.0 && my >= dbg_y && my < dbg_y + dbg_h {
-                        let engine = self.engine.borrow();
-                        engine.debug_button_hit(mx as f32, my as f32)
-                    } else {
-                        None
-                    };
-                    let old_hover = self.engine.borrow().debug_button_hovered;
-                    if new_hover != old_hover {
-                        self.engine.borrow_mut().debug_button_hovered = new_hover;
-                        self.draw_needed.set(true);
-                    }
-                }
-
-                // Editor hover: convert mouse pixel position to editor (line, col)
-                // and feed into dwell detection for auto-hover popups.
-                if mx >= 0.0 {
-                    let mut engine = self.engine.borrow_mut();
-                    // Phase B.5b Stage 6: gate the hover trigger when any
-                    // blocking modal is open. Without this, mousing over
-                    // an LSP-hoverable identifier under (e.g.) an open
-                    // palette would still fire the hover request and
-                    // pop the hover popup behind the palette (#247).
-                    // The single source of truth lives in
-                    // `Engine::is_blocking_modal_open()` — hover itself
-                    // is a passive popup that doesn't count.
-                    let blocking_modal_open = engine.is_blocking_modal_open();
-                    if engine.settings.hover_delay > 0
-                        && !engine.editor_hover_has_focus
-                        && !blocking_modal_open
-                        && (matches!(engine.mode, core::Mode::Normal | core::Mode::Visual)
-                            || engine.is_vscode_mode())
-                    {
-                        let active_wid = engine.active_window_id();
-                        if let Some((_wid, rect)) = rects.iter().find(|(w, _)| *w == active_wid) {
-                            if mx >= rect.x
-                                && mx < rect.x + rect.width
-                                && my >= rect.y
-                                && my < rect.y + rect.height
-                            {
-                                let total_lines = engine.buffer().len_lines();
-                                // Approximate gutter width — exact value doesn't need
-                                // to be pixel-perfect for hover dwell detection.
-                                let gutter = render::calculate_gutter_cols(
-                                    engine.settings.line_numbers,
-                                    total_lines,
-                                    cw,
-                                    true, // assume git column present
-                                    false,
-                                );
-                                let gutter_px = gutter as f64 * cw;
-                                let text_x = rect.x + gutter_px;
-                                let scroll_top = engine.view().scroll_top;
-                                let scroll_left = engine.view().scroll_left;
-                                if mx >= text_x {
-                                    // Check if mouse is over the editor hover popup
-                                    let mouse_on_popup = engine.editor_hover.is_some()
-                                        && self.editor_hover_popup_rect.get().is_some_and(
-                                            |(px, py, pw, ph)| {
-                                                mx >= px && mx < px + pw && my >= py && my < py + ph
-                                            },
-                                        );
-                                    if !mouse_on_popup {
-                                        let rel_y = my - rect.y;
-                                        let rel_x = mx - text_x;
-                                        let vis_line = (rel_y / lh).floor() as usize;
-                                        let line = scroll_top + vis_line;
-                                        let col = scroll_left + (rel_x / cw).floor() as usize;
-                                        engine.editor_hover_mouse_move(line, col, false);
-                                    }
-                                }
-                            } else if engine.editor_hover.is_some()
-                                && !engine.editor_hover_has_focus
-                            {
-                                // Mouse outside editor area — dismiss hover
-                                engine.dismiss_editor_hover();
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // #731: a ~135-line block used to live here polling
+        // `self.mouse_pos_cell` at 20Hz for four distinct hover features —
+        // h-scrollbar hover, tab-close (×) hover + tab tooltip, debug
+        // toolbar button hover, and LSP hover-on-dwell popups
+        // (`Engine::editor_hover_mouse_move`). All four were gated on a
+        // `da_size` derived from `self.drawing_area`, permanently `None`
+        // under the ShellApp runner (nothing assigns it) — so none of the
+        // four have worked since the #540 cutover, and nothing else in
+        // this file writes `h_sb_hovered`/`tab_close_hover`/
+        // `debug_button_hovered`/calls `editor_hover_mouse_move`. This is
+        // the single biggest confirmed-dead surface this issue found (see
+        // the PR description) — restoring it needs a live, correctly
+        // absolute-coordinate DA size (the removed code used a `(0, 0)`
+        // origin the neighboring comment already flagged as the #582/#646
+        // coordinate-frame bug, so it was not simply "wire the same code
+        // back up"), which is follow-up work, not a dead-code deletion.
+        //
         // Sync per-window viewport dimensions from the paint-time ScreenLayout
         // so ensure_cursor_visible uses exact geometry.  This block is outside
         // the `da_size` guard because `cached_screen_layout` is populated by
@@ -3517,14 +2846,7 @@ impl App {
                 .unwrap();
             self.dispatch(Msg::RunCommandInTerminal(cmd));
         }
-        // Explicitly redraw the debug sidebar if it's active so the
-        // Run/Stop button text and section data stay in sync.
         let active_panel = self.current_active_panel_id();
-        if active_panel == PANEL_DEBUG {
-            if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                da.queue_draw();
-            }
-        }
         // Explorer refresh after confirmed file move.
         if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
@@ -3539,12 +2861,6 @@ impl App {
             self.last_sc_refresh = std::time::Instant::now();
         }
         if self.engine.borrow_mut().poll_sc_refresh() {
-            if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                da.queue_draw();
-            }
-            if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                da.queue_draw();
-            }
             self.draw_needed.set(true);
         }
         // Check for panel reveal request from plugins.
@@ -3561,30 +2877,6 @@ impl App {
                 engine.ext_panel_active = Some(panel_name);
             }
             self.sync_sidebar_widgets();
-        }
-        // GTK-specific: queue redraws on individual sidebar DAs whose
-        // content may have changed from the polls above.
-        if active_panel == PANEL_EXPLORER {
-            if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                da.queue_draw();
-            }
-        }
-        // Panel hover overlay redraw.
-        {
-            if let Some(ref da) = *self.panel_hover_da.borrow() {
-                da.queue_draw();
-            }
-        }
-        // Explorer tree indicators (modified/diagnostics) are pulled by
-        // the draw callback via `populate_explorer_tree_controller`, so we
-        // trigger a redraw on a 1 Hz cadence to pick up background changes.
-        if self.last_tree_indicator_update.elapsed() >= std::time::Duration::from_secs(1) {
-            self.last_tree_indicator_update = std::time::Instant::now();
-            if active_panel == PANEL_EXPLORER {
-                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-            }
         }
         // Sync the OS window title with the active buffer name (taskbar/pager).
         let win_title = self
@@ -3605,60 +2897,15 @@ impl App {
     /// index grows because UI_FONT is proportional. Heading rows
     /// (font scale > 1.0) need the scale applied to the layout so
     /// `xy_to_index` returns the right position.
-    fn pixel_to_editor_hover_col(&self, rel_x: f64, content_line: usize) -> usize {
-        let da = match self.drawing_area.borrow().as_ref() {
-            Some(da) => da.clone(),
-            None => return rel_x.max(0.0) as usize,
-        };
-        let engine = self.engine.borrow();
-        let Some(eh) = engine.editor_hover.as_ref() else {
-            return 0;
-        };
-        let Some(line_text) = eh.rendered.lines.get(content_line).cloned() else {
-            return 0;
-        };
-        let heading_level = eh
-            .rendered
-            .spans
-            .get(content_line)
-            .and_then(|spans| {
-                spans.iter().find_map(|s| match s.style {
-                    core::markdown::MdStyle::Heading(n) => Some(n),
-                    _ => None,
-                })
-            })
-            .unwrap_or(0);
-        let scale = match heading_level {
-            1 => 1.4,
-            2 => 1.2,
-            3..=6 => 1.1,
-            _ => 1.0,
-        };
-        drop(engine);
-
-        let pango_ctx = da.pango_context();
-        let layout = pango::Layout::new(&pango_ctx);
-        let font_desc = FontDescription::from_string(&UI_FONT());
-        layout.set_font_description(Some(&font_desc));
-        layout.set_text(&line_text);
-        if (scale - 1.0_f64).abs() > 0.01 {
-            let attrs = pango::AttrList::new();
-            let mut a = pango::AttrFloat::new_scale(scale);
-            a.set_start_index(0);
-            a.set_end_index(line_text.len() as u32);
-            attrs.insert(a);
-            layout.set_attributes(Some(&attrs));
-        }
-
-        let x_pango = (rel_x.max(0.0) * pango::SCALE as f64) as i32;
-        // y=0 → first (and only) line of the layout. xy_to_index returns
-        // (inside, byte_index, trailing). When the click is past the
-        // line's last char `inside` is false but `byte_index + trailing`
-        // points at the trailing edge, which is what we want.
-        let (_inside, byte_index, trailing) = layout.xy_to_index(x_pango, 0);
-        let byte_pos = (byte_index as usize).saturating_add(trailing as usize);
-        let clamped = byte_pos.min(line_text.len());
-        line_text[..clamped].chars().count()
+    ///
+    /// #731: the Pango-measured path below was gated on
+    /// `self.drawing_area`, permanently `None` under the ShellApp runner
+    /// (nothing assigns it), so this has always taken the approximate
+    /// `rel_x / char-width`-style fallback in practice — see `terminal_cols`
+    /// for the same "no live font-metrics source without a widget handle"
+    /// root cause.
+    fn pixel_to_editor_hover_col(&self, rel_x: f64, _content_line: usize) -> usize {
+        rel_x.max(0.0) as usize
     }
 
     /// Push or pop the editor hover popup on the modal stack so
@@ -5374,11 +4621,10 @@ impl App {
                 let rows = engine.session.terminal_panel_rows;
                 drop(engine);
                 if left_cols > 0 {
-                    let da_w = if let Some(da) = self.drawing_area.borrow().as_ref() {
-                        da.width() as f64
-                    } else {
-                        800.0
-                    };
+                    // #731: was `if let Some(da) = self.drawing_area…`,
+                    // permanently `None` under the ShellApp runner — see
+                    // `terminal_cols`.
+                    let da_w = 800.0;
                     const SB_W: f64 = 6.0;
                     let total_cols = ((da_w - SB_W) / self.cached_char_width) as u16;
                     let right_cols = total_cols.saturating_sub(left_cols);
@@ -5391,16 +4637,9 @@ impl App {
         if self.terminal_resize_dragging {
             self.terminal_resize_dragging = false;
             let rows = self.engine.borrow().session.terminal_panel_rows;
-            let cols = if let Some(da) = self.drawing_area.borrow().as_ref() {
-                if self.cached_char_width > 0.0 {
-                    (da.width() as f64 / self.cached_char_width) as u16
-                } else {
-                    80
-                }
-            } else {
-                80
-            }
-            .max(40);
+            // #731: was `if let Some(da) = self.drawing_area…`, permanently
+            // `None` under the ShellApp runner — see `terminal_cols`.
+            let cols = self.terminal_cols();
             self.engine.borrow_mut().terminal_resize(cols, rows);
             let _ = self.engine.borrow().session.save();
         }
@@ -5490,16 +4729,17 @@ impl App {
             }
             Msg::TerminalToggleSplit => {
                 let (full_cols, rows) = {
-                    let da_w = if let Some(da) = self.drawing_area.borrow().as_ref() {
-                        da.width() as f64
-                    } else {
-                        0.0
-                    };
-                    let cols = if self.cached_char_width > 0.0 {
-                        (da_w / self.cached_char_width) as u16
-                    } else {
-                        80
-                    };
+                    // #731: `da_w` was gated on `self.drawing_area`,
+                    // permanently `None` under the ShellApp runner, so this
+                    // always took the `else` branch (`da_w = 0.0`) — and
+                    // since `cached_char_width` is never actually `0.0` in
+                    // practice, `cols` has always evaluated to `0`, not the
+                    // `80` fallback used elsewhere in this file (e.g.
+                    // `terminal_cols`). Preserved as-is rather than
+                    // "fixed" to `80` here, since that would be an
+                    // observable behavior change this cleanup is not
+                    // meant to make — see PR description.
+                    let cols: u16 = 0;
                     let rows = self.engine.borrow().session.terminal_panel_rows;
                     (cols, rows)
                 };
@@ -5588,13 +4828,13 @@ impl App {
         }
     }
 
-    fn sync_menu_overlay(&self) {
-        let is_open = self.engine.borrow().menu_system.borrow().is_open();
-        if let Some(ref da) = *self.menu_dropdown_da.borrow() {
-            da.set_can_target(is_open);
-            da.queue_draw();
-        }
-    }
+    /// #731: was `if let Some(ref da) = *self.menu_dropdown_da.borrow()`
+    /// — that field is permanently `None` under the ShellApp runner
+    /// (nothing assigns it), so this has been a no-op since #540. The menu
+    /// bar is repainted every frame by `render_content` from engine state
+    /// instead (see the `ActivityBarActivation::MenuToggled` comment).
+    /// Kept as a named no-op so its two call sites stay self-documenting.
+    fn sync_menu_overlay(&self) {}
 
     fn handle_menu_msg(&mut self, msg: Msg) {
         match msg {
@@ -5712,11 +4952,6 @@ impl App {
                     engine.dispatch_dap_sidebar_event(sidebar_event);
                 }
                 drop(engine);
-
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    da.grab_focus();
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::DebugSidebarKey(key_name, ctrl) => {
@@ -5751,9 +4986,6 @@ impl App {
                 let still_focused = engine.dap_sidebar_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::DebugSidebarScroll(dy) => {
@@ -5772,9 +5004,6 @@ impl App {
                     rect,
                 );
                 drop(engine);
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::DebugSidebarDrag(x, y) => {
@@ -5794,9 +5023,6 @@ impl App {
                     rect,
                 );
                 drop(engine);
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::DebugSidebarDragEnd(x, y) => {
@@ -5814,9 +5040,6 @@ impl App {
                     rect,
                 );
                 drop(engine);
-                if let Some(ref da) = *self.debug_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             _ => unreachable!(),
@@ -5831,9 +5054,6 @@ impl App {
                     return;
                 }
                 // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
-                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                    da.grab_focus();
-                }
                 {
                     let mut engine = self.engine.borrow_mut();
                     engine.sc_set_focus(true);
@@ -5886,9 +5106,6 @@ impl App {
                             _ => {}
                         }
                     }
-                }
-                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                    da.queue_draw();
                 }
                 self.draw_needed.set(true);
             }
@@ -6012,9 +5229,6 @@ impl App {
                         if let Some(fi) = hit_flat {
                             if engine.panel_hover_mouse_move("source_control", "", fi) {
                                 drop(engine);
-                                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                                    da.queue_draw();
-                                }
                                 return;
                             }
                         } else {
@@ -6031,9 +5245,6 @@ impl App {
 
                 if engine.sc_button_hovered != old {
                     drop(engine);
-                    if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                        da.queue_draw();
-                    }
                 }
             }
             Msg::ScKey(key_name, ctrl) => {
@@ -6052,17 +5263,11 @@ impl App {
                 let still_focused = engine.sc_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::ScSidebarEvent(ev) => {
                 let mut engine = self.engine.borrow_mut();
                 engine.handle_sc_sidebar_ui_event(ev);
-                if let Some(ref da) = *self.git_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             _ => unreachable!(),
@@ -6130,9 +5335,6 @@ impl App {
                     drop(engine);
                     self.focus_editor_if_needed(false);
                     self.draw_needed.set(true);
-                    if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                        da.queue_draw();
-                    }
                     return;
                 }
                 engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
@@ -6140,9 +5342,6 @@ impl App {
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused && !has_dialog);
-                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::ExtSidebarEvent(ev) => {
@@ -6181,9 +5380,6 @@ impl App {
                     self.focus_editor_if_needed(still_focused && !has_dialog);
                 }
                 self.draw_needed.set(true);
-                if let Some(ref da) = *self.ext_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
             }
             _ => unreachable!(),
         }
@@ -6209,9 +5405,6 @@ impl App {
                 let still_focused = engine.settings_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.settings_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::SettingsClick(x_click, y_click, n_press) => {
@@ -6221,26 +5414,24 @@ impl App {
                 let line_height = self.cached_ui_line_height.max(1.0);
                 let row_h = (line_height * 1.4_f64).round();
                 let body_top = line_height * 2.0; // header + search
-                let panel_w = self
-                    .settings_da_ref
-                    .borrow()
-                    .as_ref()
-                    .map(|da| da.width() as f64)
-                    .unwrap_or(0.0);
-                let panel_h = self
-                    .settings_da_ref
-                    .borrow()
-                    .as_ref()
-                    .map(|da| da.height() as f64)
-                    .unwrap_or(0.0);
+                                                  // #731: `panel_w`/`panel_h` were read from
+                                                  // `self.settings_da_ref`, permanently `None` under the
+                                                  // ShellApp runner (nothing assigns it) — both have always
+                                                  // evaluated to `0.0` here, which makes `body_h` (below)
+                                                  // always `0.0` too, and therefore `visible_rows == 0` and
+                                                  // `footer_top == body_top`. The consequence is real and
+                                                  // observable: every click at or below the search row falls
+                                                  // into the `y_click >= footer_top` "open settings.json"
+                                                  // branch, so the Settings sidebar's per-row click/edit
+                                                  // path (below) is unreachable on GTK today. Preserved
+                                                  // as-is — not fixed here — since a live panel size needs
+                                                  // the same fix as `terminal_cols`, and silently changing
+                                                  // this arm's behavior is exactly what this cleanup must
+                                                  // not do. See PR description.
+                let panel_w = 0.0_f64;
+                let panel_h = 0.0_f64;
                 let footer_top = (panel_h - line_height).max(body_top);
                 let body_h = (footer_top - body_top).max(0.0);
-
-                // Grab focus so subsequent keys reach this panel's controller
-                // (the activity-bar button keeps focus by default after click).
-                if let Some(ref da) = *self.settings_da_ref.borrow() {
-                    da.grab_focus();
-                }
 
                 let mut engine = self.engine.borrow_mut();
                 engine.settings_has_focus = true;
@@ -6280,9 +5471,6 @@ impl App {
                     }
                     drop(engine);
                     self.draw_needed.set(true);
-                    if let Some(ref da) = *self.settings_da_ref.borrow() {
-                        da.queue_draw();
-                    }
                     return;
                 }
 
@@ -6341,9 +5529,6 @@ impl App {
                 }
 
                 drop(engine);
-                if let Some(ref da) = *self.settings_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::SettingsScroll(dy) => {
@@ -6352,12 +5537,9 @@ impl App {
                 let line_height = self.cached_ui_line_height.max(1.0);
                 let row_h = (line_height * 1.4_f64).round();
                 let body_top = line_height * 2.0;
-                let panel_h = self
-                    .settings_da_ref
-                    .borrow()
-                    .as_ref()
-                    .map(|da| da.height() as f64)
-                    .unwrap_or(0.0);
+                // #731: see the `Msg::SettingsClick` arm above — `panel_h`
+                // was gated on `self.settings_da_ref`, permanently `None`.
+                let panel_h = 0.0_f64;
                 let body_h = (panel_h - body_top - line_height).max(0.0);
                 let visible_rows = (body_h / row_h).floor() as usize;
                 let max_scroll = total.saturating_sub(visible_rows);
@@ -6367,9 +5549,6 @@ impl App {
                     .clamp(0, max_scroll as isize) as usize;
                 engine.settings_scroll_top = new_scroll;
                 drop(engine);
-                if let Some(ref da) = *self.settings_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             _ => unreachable!(),
@@ -6397,9 +5576,6 @@ impl App {
                     self.focus_after_sidebar_key(still_focused);
                 }
                 self.sync_plus_register_to_clipboard();
-                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::ExtPanelClick(x_click, y_click, n_press) => {
@@ -6408,9 +5584,6 @@ impl App {
                     let had_hover = self.engine.borrow().panel_hover.is_some();
                     if had_hover {
                         self.engine.borrow_mut().dismiss_panel_hover_now();
-                        if let Some(ref da) = *self.panel_hover_da.borrow() {
-                            da.queue_draw();
-                        }
                     }
                 }
                 let mut engine = self.engine.borrow_mut();
@@ -6428,28 +5601,21 @@ impl App {
                         .unwrap_or(false);
                 let content_top = line_height * if has_input_row { 2.0 } else { 1.0 };
 
-                // Scrollbar click — proportional jump scroll
-                let da_w = if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                    da.width() as f64
-                } else {
-                    200.0
-                };
+                // Scrollbar click — proportional jump scroll.
+                // #731: `da_w`/`da_h` were gated on
+                // `self.ext_dyn_panel_da_ref`, permanently `None` under the
+                // ShellApp runner — always the fallback constants below.
+                // See `terminal_cols`.
+                let da_w = 200.0_f64;
                 let flat_len = engine.ext_panel_flat_len();
                 if x_click >= da_w - 8.0 && y_click >= content_top && flat_len > 0 {
-                    let da_h = if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                        da.height() as f64
-                    } else {
-                        400.0
-                    };
+                    let da_h = 400.0_f64;
                     let content_h = da_h - content_top;
                     if content_h > 0.0 {
                         let ratio = (y_click - content_top) / content_h;
                         let new_top = (ratio * flat_len as f64) as usize;
                         engine.ext_panel_scroll_top = new_top.min(flat_len.saturating_sub(1));
                         drop(engine);
-                        if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                            da.queue_draw();
-                        }
                         self.draw_needed.set(true);
                         return;
                     }
@@ -6479,9 +5645,6 @@ impl App {
                 } else {
                     drop(engine);
                 }
-                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::ExtPanelRightClick(x_click, y_click) => {
@@ -6499,9 +5662,6 @@ impl App {
                 }
                 engine.open_ext_panel_context_menu(x_click as u16, y_click as u16);
                 drop(engine);
-                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::ExtPanelMouseMove(x_move, y_move) => {
@@ -6515,9 +5675,6 @@ impl App {
                 // Header row occupies row 0; content rows start at line_height.
                 if y_move < line_height {
                     self.engine.borrow_mut().dismiss_panel_hover();
-                    if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                        da.queue_draw();
-                    }
                     return;
                 }
                 let scroll_top = self.engine.borrow().ext_panel_scroll_top;
@@ -6528,10 +5685,12 @@ impl App {
                     self.engine
                         .borrow_mut()
                         .panel_hover_mouse_move(&panel_name, "", flat_idx);
+                // #731: was `if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow()
+                // { da.queue_draw(); }` — permanently `None` under the ShellApp
+                // runner. `render_content` repaints from engine state every
+                // frame, so `draw_needed` is the live equivalent.
                 if changed {
-                    if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                        da.queue_draw();
-                    }
+                    self.draw_needed.set(true);
                 }
             }
             Msg::ExtPanelScroll(dy) => {
@@ -6546,9 +5705,6 @@ impl App {
                         engine.ext_panel_scroll_top.saturating_sub(scroll_amount);
                 }
                 drop(engine);
-                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                    da.queue_draw();
-                }
             }
             Msg::PanelHoverClick(click_x, click_y) => {
                 // Check if click hit a link rect in the hover popup.
@@ -6593,9 +5749,6 @@ impl App {
                 }
                 // Dismiss popup after click.
                 self.engine.borrow_mut().dismiss_panel_hover_now();
-                if let Some(ref da) = *self.panel_hover_da.borrow() {
-                    da.queue_draw();
-                }
             }
             _ => unreachable!(),
         }
@@ -6626,9 +5779,6 @@ impl App {
                     if !text.is_empty() {
                         self.engine.borrow_mut().ai_insert_text(&text);
                     }
-                    if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
-                        da.queue_draw();
-                    }
                     return;
                 }
                 let mut engine = self.engine.borrow_mut();
@@ -6636,9 +5786,6 @@ impl App {
                 let still_focused = engine.ai_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
-                if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             Msg::AiSidebarClick(x_click, y_click) => {
@@ -6654,9 +5801,6 @@ impl App {
                 engine.ai_has_focus = true;
                 let _ = x_click;
                 drop(engine);
-                if let Some(ref da) = *self.ai_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
                 self.draw_needed.set(true);
             }
             _ => unreachable!(),
@@ -6695,61 +5839,15 @@ impl App {
         self.sync_sidebar_widgets();
     }
 
-    /// Update GTK widget visibility (revealer + panel boxes), grab focus on
-    /// the active panel DA, and queue an activity bar redraw. Reads
-    /// effective state from `engine.app_shell` via the `current_*` helpers.
+    /// Queue a redraw after sidebar visibility/focus state changes.
+    ///
+    /// Used to update GTK widget visibility (revealer + panel boxes) and
+    /// grab focus on the active panel DA under the pre-#540 Relm4 widget
+    /// tree. Under the ShellApp runner there is no such widget tree to
+    /// sync — `render_content` repaints the whole sidebar from
+    /// `engine.app_shell` every frame — so this is now just the redraw
+    /// trigger (#731).
     fn sync_sidebar_widgets(&mut self) {
-        let show = self.current_sidebar_visible();
-        let id = self.current_active_panel_id();
-        let is_ext = is_ext_panel_id(&id);
-
-        if let Some(ref r) = *self.sidebar_revealer.borrow() {
-            r.set_reveal_child(show);
-        }
-        let panel_boxes: [(&str, &Rc<RefCell<Option<gtk4::Box>>>); 6] = [
-            (PANEL_EXPLORER, &self.explorer_panel_box),
-            (PANEL_DEBUG, &self.debug_panel_box),
-            (PANEL_GIT, &self.git_panel_box),
-            (PANEL_EXTENSIONS, &self.ext_panel_box),
-            (PANEL_SETTINGS, &self.settings_panel_box),
-            (PANEL_AI, &self.ai_panel_box_ref),
-        ];
-        for (panel_id, box_ref) in &panel_boxes {
-            if let Some(ref b) = *box_ref.borrow() {
-                b.set_visible(show && !is_ext && id.as_str() == *panel_id);
-            }
-        }
-        if let Some(ref b) = *self.ext_dyn_panel_box.borrow() {
-            b.set_visible(show && is_ext);
-        }
-        if show && self.engine.borrow().sidebar_has_focus() {
-            let da_refs: [(&str, &Rc<RefCell<Option<gtk4::DrawingArea>>>); 7] = [
-                (PANEL_EXPLORER, &self.explorer_sidebar_da_ref),
-                (PANEL_SEARCH, &self.search_sidebar_da_ref),
-                (PANEL_DEBUG, &self.debug_sidebar_da_ref),
-                (PANEL_GIT, &self.git_sidebar_da_ref),
-                (PANEL_EXTENSIONS, &self.ext_sidebar_da_ref),
-                (PANEL_SETTINGS, &self.settings_da_ref),
-                (PANEL_AI, &self.ai_sidebar_da_ref),
-            ];
-            let target = if is_ext { "ext:" } else { id.as_str() };
-            for (panel_id, da_ref) in &da_refs {
-                if *panel_id == target {
-                    if let Some(ref da) = *da_ref.borrow() {
-                        da.grab_focus();
-                    }
-                    break;
-                }
-            }
-            if is_ext {
-                if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                    da.grab_focus();
-                }
-            }
-        }
-        if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
-            da.queue_draw();
-        }
         self.draw_needed.set(true);
     }
 
@@ -6809,9 +5907,6 @@ impl App {
                     engine.open_file_in_tab(&path);
                     engine.explorer_has_focus = false;
                 }
-                if let Some(ref drawing) = *self.drawing_area.borrow() {
-                    drawing.grab_focus();
-                }
                 self.draw_needed.set(true);
             }
             Msg::OpenSide(path) => {
@@ -6820,9 +5915,6 @@ impl App {
                 // Replace the cloned buffer in the new group with the target file.
                 engine.execute_command(&format!("e {}", path.display()));
                 drop(engine);
-                if let Some(ref drawing) = *self.drawing_area.borrow() {
-                    drawing.grab_focus();
-                }
                 // tree_has_focus removed (A.2b-2); engine.explorer_has_focus is authoritative
                 self.draw_needed.set(true);
             }
@@ -6831,9 +5923,6 @@ impl App {
                 // Single-click: open as a preview tab (replaceable by next single-click).
                 engine.open_file_preview(&path);
                 drop(engine);
-                if let Some(ref drawing) = *self.drawing_area.borrow() {
-                    drawing.grab_focus();
-                }
                 self.draw_needed.set(true);
             }
             Msg::CreateFile(parent_dir, name) => {
@@ -6910,12 +5999,6 @@ impl App {
             }
             Msg::ExplorerActivateSelected => {
                 self.engine.borrow_mut().explorer_activate_selected();
-                let still_focused = self.engine.borrow().explorer_has_focus;
-                if !still_focused {
-                    if let Some(ref drawing) = *self.drawing_area.borrow() {
-                        drawing.grab_focus();
-                    }
-                }
                 self.queue_explorer_draw();
                 self.draw_needed.set(true);
             }
@@ -6952,36 +6035,17 @@ impl App {
                     engine.ext_panel_active = None;
                     engine.focus_sidebar_panel(PANEL_EXPLORER);
                 }
-                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                    da.grab_focus();
-                    // `draw_needed` only queues the editor DA / menu bar.
-                    // The explorer DA needs its own `queue_draw` to re-run
-                    // the draw callback so the selection highlight
-                    // appears now that `explorer_has_focus = true`.
-                    da.queue_draw();
-                }
                 self.sync_sidebar_widgets();
                 self.draw_needed.set(true);
             }
             Msg::ToggleFocusExplorer => {
                 if self.engine.borrow().explorer_has_focus {
                     self.engine.borrow_mut().explorer_has_focus = false;
-                    if let Some(ref drawing) = *self.drawing_area.borrow() {
-                        drawing.grab_focus();
-                    }
-                    if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                        da.queue_draw();
-                    }
                 } else {
-                    {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.ext_panel_active = None;
-                        engine.focus_sidebar_panel(PANEL_EXPLORER);
-                    }
-                    if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                        da.grab_focus();
-                        da.queue_draw();
-                    }
+                    let mut engine = self.engine.borrow_mut();
+                    engine.ext_panel_active = None;
+                    engine.focus_sidebar_panel(PANEL_EXPLORER);
+                    drop(engine);
                     self.sync_sidebar_widgets();
                 }
                 self.draw_needed.set(true);
@@ -6989,38 +6053,21 @@ impl App {
             Msg::ToggleFocusSearch => {
                 if self.current_active_panel_id() == PANEL_SEARCH && self.current_sidebar_visible()
                 {
-                    if let Some(ref drawing) = *self.drawing_area.borrow() {
-                        drawing.grab_focus();
-                    }
+                    // Just give the editor DA back keyboard focus.
                 } else {
-                    {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.ext_panel_active = None;
-                        engine.focus_sidebar_panel(PANEL_SEARCH);
-                    }
-                    if let Some(ref drawing) = *self.drawing_area.borrow() {
-                        drawing.grab_focus();
-                    }
+                    let mut engine = self.engine.borrow_mut();
+                    engine.ext_panel_active = None;
+                    engine.focus_sidebar_panel(PANEL_SEARCH);
+                    drop(engine);
                     self.sync_sidebar_widgets();
                 }
                 self.draw_needed.set(true);
             }
             Msg::FocusEditor => {
-                {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.explorer_has_focus = false;
-                    engine.dap_sidebar_has_focus = false;
-                }
-
-                // Grab focus on drawing area
-                if let Some(ref drawing) = *self.drawing_area.borrow() {
-                    drawing.grab_focus();
-                }
-                // Redraw explorer so its selection highlight fades.
-                if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-
+                let mut engine = self.engine.borrow_mut();
+                engine.explorer_has_focus = false;
+                engine.dap_sidebar_has_focus = false;
+                drop(engine);
                 self.draw_needed.set(true);
             }
             Msg::ExplorerKey {
@@ -7042,12 +6089,6 @@ impl App {
                 }
                 self.engine.borrow_mut().explorer_scroll(step);
                 self.queue_explorer_draw();
-            }
-            Msg::ExplorerCtxMenuClick(x, y) => {
-                self.handle_explorer_ctx_menu_overlay_click(x, y);
-            }
-            Msg::ExplorerCtxMenuMotion(x, y) => {
-                self.handle_explorer_ctx_menu_overlay_motion(x, y);
             }
             Msg::ExplorerUiEvent(ev) => {
                 let dominated = matches!(
@@ -7132,8 +6173,6 @@ impl App {
                             self.draw_needed.set(true);
                             return;
                         }
-                        let is_scrollbar =
-                            matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
                         if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
                             self.engine
                                 .borrow_mut()
@@ -7142,13 +6181,6 @@ impl App {
                             self.engine
                                 .borrow_mut()
                                 .handle_explorer_mouse_event(tree_event);
-                        }
-                        // Scrollbar interaction should not steal keyboard
-                        // focus from the editor.
-                        if is_scrollbar {
-                            if let Some(ref da) = *self.drawing_area.borrow() {
-                                da.grab_focus();
-                            }
                         }
                         self.queue_explorer_draw();
                         self.draw_needed.set(true);
@@ -7616,9 +6648,6 @@ impl App {
         match result {
             ExplorerKeyResult::Unfocused => {
                 self.engine.borrow_mut().explorer_has_focus = false;
-                if let Some(ref drawing) = *self.drawing_area.borrow() {
-                    drawing.grab_focus();
-                }
             }
             ExplorerKeyResult::FocusToolbar => {
                 // engine.activity_bar_focus_in_at(1) was already called inside
@@ -7628,12 +6657,6 @@ impl App {
                 // dispatches to handle_activity_bar_key. The activity bar DA
                 // has no EventControllerKey, so grab_focus on it drops keys.
                 self.engine.borrow_mut().explorer_has_focus = false;
-                if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
-                    da.queue_draw();
-                }
-                if let Some(ref da) = *self.drawing_area.borrow() {
-                    da.grab_focus();
-                }
             }
             _ => {}
         }
@@ -7641,11 +6664,13 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    fn queue_explorer_draw(&self) {
-        if let Some(ref da) = *self.explorer_sidebar_da_ref.borrow() {
-            da.queue_draw();
-        }
-    }
+    /// #731: was a redraw hint on `self.explorer_sidebar_da_ref`, permanently
+    /// `None` under the ShellApp runner. `render_content` repaints the whole
+    /// sidebar from engine state every frame, so callers only need
+    /// `self.draw_needed.set(true)` — kept as a named no-op (rather than
+    /// touching every call site) so the intent at each call site stays
+    /// legible.
+    fn queue_explorer_draw(&self) {}
 
     /// After a sidebar panel processes a key, queue a redraw of the activity
     /// bar if the engine just set `activity_bar_focused`, and in all cases
@@ -7664,11 +6689,9 @@ impl App {
     /// applies (i.e. the sidebar panel kept focus → don't steal it).
     fn focus_after_sidebar_key(&self, fallback_focused: bool) {
         if self.engine.borrow().activity_bar_focused {
-            // Activity bar has logical focus — redraw it for the keyboard-
-            // selection highlight. Key routing flows through the editor DA.
-            if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
-                da.queue_draw();
-            }
+            // Activity bar has logical focus — `render_content` repaints it
+            // every frame from engine state, so there's no separate redraw
+            // hint to give here. Key routing flows through the editor DA.
             self.focus_editor_if_needed(false);
         } else {
             self.focus_editor_if_needed(fallback_focused);
@@ -7701,19 +6724,12 @@ impl App {
                     }
                     ActivityBarActivation::ExtPanelFocused(_) => {
                         self.sync_sidebar_from_engine();
-                        if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow() {
-                            da.grab_focus();
-                        }
                     }
                     ActivityBarActivation::NoOp => {}
                 }
             }
             "h" | "Left" | "Escape" if !ctrl => {
                 self.engine.borrow_mut().activity_bar_focus_out();
-                // Return keyboard focus to the editor drawing area.
-                if let Some(ref da) = *self.drawing_area.borrow() {
-                    da.grab_focus();
-                }
             }
             "q" => {
                 let mut engine = self.engine.borrow_mut();
@@ -7722,16 +6738,8 @@ impl App {
                 engine.clear_sidebar_focus();
                 engine.session.explorer_visible = false;
                 let _ = engine.session.save();
-                drop(engine);
-                if let Some(ref da) = *self.drawing_area.borrow() {
-                    da.grab_focus();
-                }
             }
             _ => {}
-        }
-        // Always redraw the activity bar to update the selection highlight.
-        if let Some(ref da) = *self.activity_bar_da_ref.borrow() {
-            da.queue_draw();
         }
         // Suppress the default engine key handler — key is consumed.
     }
@@ -7752,7 +6760,6 @@ impl App {
         match key_name {
             "Escape" => {
                 self.engine.borrow_mut().close_context_menu();
-                self.dismiss_ctx_menu_overlay();
                 true
             }
             "Return" => {
@@ -7770,40 +6777,29 @@ impl App {
                 if let (Some(action), Some(target)) = (action, target_path) {
                     self.dispatch_explorer_ctx_action(&action, &target);
                 }
-                self.dismiss_ctx_menu_overlay();
                 true
             }
             "j" | "Down" => {
-                {
-                    let mut eng = self.engine.borrow_mut();
-                    if let Some(ref mut cm) = eng.context_menu {
-                        let len = cm.items.len();
-                        if len > 0 {
-                            cm.selected = (cm.selected + 1) % len;
-                        }
+                let mut eng = self.engine.borrow_mut();
+                if let Some(ref mut cm) = eng.context_menu {
+                    let len = cm.items.len();
+                    if len > 0 {
+                        cm.selected = (cm.selected + 1) % len;
                     }
-                }
-                if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
-                    overlay.queue_draw();
                 }
                 true
             }
             "k" | "Up" => {
-                {
-                    let mut eng = self.engine.borrow_mut();
-                    if let Some(ref mut cm) = eng.context_menu {
-                        let len = cm.items.len();
-                        if len > 0 {
-                            cm.selected = if cm.selected > 0 {
-                                cm.selected - 1
-                            } else {
-                                len - 1
-                            };
-                        }
+                let mut eng = self.engine.borrow_mut();
+                if let Some(ref mut cm) = eng.context_menu {
+                    let len = cm.items.len();
+                    if len > 0 {
+                        cm.selected = if cm.selected > 0 {
+                            cm.selected - 1
+                        } else {
+                            len - 1
+                        };
                     }
-                }
-                if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
-                    overlay.queue_draw();
                 }
                 true
             }
@@ -7811,83 +6807,9 @@ impl App {
                 // Any other key dismisses + falls through to normal explorer
                 // handling so the user can keep navigating.
                 self.engine.borrow_mut().close_context_menu();
-                self.dismiss_ctx_menu_overlay();
                 false
             }
         }
-    }
-
-    /// #426: Intercept UI events on the explorer DA when an engine-drawn
-    /// explorer ctx menu is open. Returns true if consumed.
-    /// #426: Mouse-move on the ctx-menu overlay DA — update hover idx
-    /// from the cached layout (window coords).
-    fn handle_explorer_ctx_menu_overlay_motion(&mut self, x: f64, y: f64) {
-        let layout = match self.explorer_ctx_menu_layout.borrow().clone() {
-            Some(l) => l,
-            None => return,
-        };
-        let hit = layout.hit_test(x as f32, y as f32);
-        if let Some(idx) = core::engine::context_menu_hit_to_idx(&hit) {
-            let mut eng = self.engine.borrow_mut();
-            if let Some(ref mut cm) = eng.context_menu {
-                cm.selected = idx;
-            }
-        }
-        if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
-            overlay.queue_draw();
-        }
-    }
-
-    /// #426: Click on the ctx-menu overlay DA — hit-test cached layout
-    /// and confirm or dismiss. On confirm, dispatch backend-only actions.
-    fn handle_explorer_ctx_menu_overlay_click(&mut self, x: f64, y: f64) {
-        use core::engine::ContextMenuTarget;
-        let layout = match self.explorer_ctx_menu_layout.borrow().clone() {
-            Some(l) => l,
-            None => {
-                self.engine.borrow_mut().close_context_menu();
-                self.dismiss_ctx_menu_overlay();
-                return;
-            }
-        };
-        let hit = layout.hit_test(x as f32, y as f32);
-        let idx = core::engine::context_menu_hit_to_idx(&hit);
-        if let Some(idx) = idx {
-            let target_path =
-                self.engine
-                    .borrow()
-                    .context_menu
-                    .as_ref()
-                    .and_then(|cm| match &cm.target {
-                        ContextMenuTarget::ExplorerFile { path }
-                        | ContextMenuTarget::ExplorerDir { path } => Some(path.clone()),
-                        _ => None,
-                    });
-            let action = {
-                let mut eng = self.engine.borrow_mut();
-                if let Some(ref mut cm) = eng.context_menu {
-                    cm.selected = idx;
-                }
-                eng.context_menu_confirm()
-            };
-            if let (Some(action), Some(target)) = (action, target_path) {
-                self.dispatch_explorer_ctx_action(&action, &target);
-            }
-        } else {
-            // Click outside any item → dismiss.
-            self.engine.borrow_mut().close_context_menu();
-        }
-        self.dismiss_ctx_menu_overlay();
-    }
-
-    /// #426: Stop intercepting events on the ctx-menu overlay DA and
-    /// queue a redraw so the menu paint clears.
-    fn dismiss_ctx_menu_overlay(&self) {
-        if let Some(ref overlay) = *self.ctx_menu_overlay_da.borrow() {
-            overlay.set_can_target(false);
-            overlay.queue_draw();
-        }
-        *self.explorer_ctx_menu_layout.borrow_mut() = None;
     }
 
     /// #426: Map the action string returned by `context_menu_confirm` for
@@ -7929,11 +6851,12 @@ impl App {
                 // Window geometry is saved on close instead
             }
             Msg::SidebarResized => {
-                if let Some(ref sb) = *self.sidebar_inner_sw.borrow() {
-                    let w = sb.width_request();
-                    self.engine.borrow_mut().session.sidebar_width = w;
-                    let _ = self.engine.borrow().session.save();
-                }
+                // #731: was `if let Some(ref sb) = *self.sidebar_inner_sw.borrow()`
+                // — that field is permanently `None` under the ShellApp
+                // runner (nothing assigns it), so this was already a no-op.
+                // Sidebar-width persistence needs a live handle on the
+                // sidebar's actual width, which nothing in this file
+                // currently has under ShellApp.
             }
             _ => unreachable!(),
         }
@@ -8002,10 +6925,9 @@ impl App {
                 engine.session.window.width = width;
                 engine.session.window.height = height;
                 engine.session.explorer_visible = engine.app_shell.sidebar_visible();
-                // Save sidebar width on close too
-                if let Some(ref sb) = *self.sidebar_inner_sw.borrow() {
-                    engine.session.sidebar_width = sb.width_request();
-                }
+                // #731: sidebar-width-on-close save was gated on
+                // `self.sidebar_inner_sw`, permanently `None` under the
+                // ShellApp runner — see the `Msg::SidebarResized` arm above.
 
                 // Save cursor/scroll position for the active file
                 let buffer_id = engine.active_buffer_id();
@@ -8189,28 +7111,24 @@ impl App {
         }
     }
 
+    /// #731: was `if let Some(da) = self.drawing_area…` — that field is
+    /// permanently `None` under the ShellApp runner (see its removal in
+    /// #731), so this always took the `else` branch. The real fix is a way
+    /// to read the live DA's pixel width without a widget handle (e.g. from
+    /// `backend: &mut dyn quadraui::Backend`, which none of this method's
+    /// callers currently have in scope) — until then this is pinned at the
+    /// fallback, same as it was silently pinned at runtime before the dead
+    /// field was deleted.
     #[allow(dead_code)]
     fn terminal_cols(&self) -> u16 {
-        if let Some(da) = self.drawing_area.borrow().as_ref() {
-            if self.cached_char_width > 0.0 {
-                (da.width() as f64 / self.cached_char_width) as u16
-            } else {
-                80
-            }
-        } else {
-            80
-        }
-        .max(40)
+        80
     }
 
+    /// #731: see `terminal_cols` — was `if let Some(da) =
+    /// self.drawing_area…`, permanently `None`, so this always took the
+    /// `else` branch.
     fn terminal_target_maximize_rows(&self) -> u16 {
-        let lh = self.cached_line_height.max(1.0);
-        if let Some(da) = self.drawing_area.borrow().as_ref() {
-            render::compute_editor_layout(&self.engine.borrow(), da.height() as f64, lh, false)
-                .terminal_max_target_rows
-        } else {
-            10
-        }
+        10
     }
 }
 
@@ -8555,6 +7473,37 @@ impl quadraui::ShellApp for App {
         // past the loop (#449) so the FrameHitMap built just below can
         // reference the SAME objects just painted, instead of constructing
         // a second copy that could drift from what's on screen.
+        //
+        // #731: no vertical (or horizontal) scrollbar is painted for the
+        // editor on GTK today. quadraui's `gtk::editor::draw_editor` (the
+        // rasteriser `Surface::Editor` below calls into) documents that it
+        // deliberately skips scrollbars on GTK and defers to "the host" —
+        // meaning the Relm4-era native `gtk4::Scrollbar` overlay path this
+        // issue deleted (`sync_scrollbar`/`create_window_scrollbars`, plus
+        // the pixel-inset math in the now-deleted
+        // `native_scrollbar_margin_start`: `rect.x + rect.width -
+        // minimap_width - scrollbar_width - 2.0`, clamped to `rect.x`).
+        // That path never ran under the ShellApp runner (nothing assigns
+        // `self.overlay`/`self.drawing_area`), so it was already dead
+        // before this cleanup — this was not a working feature this PR
+        // broke.
+        //
+        // TUI's equivalent rasteriser (`quadraui::tui::editor`) paints an
+        // inline vertical + horizontal scrollbar column as part of the
+        // `Editor` primitive itself, narrowing the text viewport to make
+        // room — see `super::draw_scrollbar` calls in that module. GTK has
+        // no equivalent; closing this gap means teaching
+        // `quadraui::gtk::editor::draw_editor` to do the same (Cairo-paint
+        // a scrollbar inside `editor.rect`, mirroring TUI), which also
+        // makes the minimap inset automatic (the viewport is already
+        // narrowed by `minimap_reserved_width` before the rect reaches the
+        // rasteriser) — no separate margin-inset formula would be needed
+        // there. That is quadraui-side work per `CLAUDE.md`'s
+        // Platform-Neutrality Rule (file a quadraui issue; do not
+        // reintroduce GTK-specific scrollbar widget plumbing here). #723's
+        // fix (`e02a824`) targeted the dead native-widget path and cannot
+        // have been visible on screen; it needs re-verifying once this
+        // lands there.
         let mut window_editors: Vec<quadraui::Editor> = Vec::with_capacity(screen.windows.len());
         for rw in &screen.windows {
             let editor = render::to_q_editor(rw);
@@ -10429,9 +9378,9 @@ fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_heigh
     render::compute_editor_layout(engine, da_height, line_height, false).editor_bottom
 }
 
-/// Compute editor window rects with the same formula used by draw_editor and
-/// sync_scrollbar, so event handlers can do hit-testing without duplicating the
-/// layout logic.
+/// Compute editor window rects with the same formula `render_content` uses
+/// (previously shared with the now-deleted `sync_scrollbar`, #731), so event
+/// handlers can do hit-testing without duplicating the layout logic.
 fn compute_editor_window_rects(
     engine: &Engine,
     da_width: f64,
@@ -10541,105 +9490,13 @@ fn h_scrollbar_hit_test(
     None
 }
 
-/// Hit-test tab close buttons. Returns `Some((group_id.0, tab_idx))` if the
-/// mouse is over a tab's × glyph.
-///
-/// Consults the **absolute** tight close-glyph rects captured during
-/// `render_content` ([`App::cached_tab_close_abs`]). Those rects already fold in
-/// the activity-bar/sidebar x-offset and the exact drawn Pango geometry, so this
-/// is a plain point-in-rect test — no group-rect re-derivation. The previous
-/// version rebuilt group rects from a `(0,0)` content origin, ignoring the
-/// left-hand chrome offset, so hover never fired once a sidebar was open and the
-/// × highlight silently disappeared (#515). Because the rects match the ×
-/// highlight the rasteriser draws, a hover shows exactly the box a click closes.
-fn tab_close_hit_test(close_abs_map: &TabCloseAbsMap, mx: f64, my: f64) -> Option<(usize, usize)> {
-    for (gid, (y_top, y_bot, xs)) in close_abs_map {
-        if my < *y_top || my >= *y_bot {
-            continue;
-        }
-        for (i, cb) in xs.iter().enumerate() {
-            if let Some((cx_start, cx_end)) = cb {
-                if mx >= *cx_start && mx < *cx_end {
-                    return Some((*gid, i));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Returns a shortened display path for the tab under the cursor, or `None` if
-/// the cursor is not over a tab or the tab has no file path.
-fn tab_tooltip_hit_test(
-    engine: &Engine,
-    mx: f64,
-    my: f64,
-    da_w: f64,
-    da_h: f64,
-    line_height: f64,
-    char_width: f64,
-) -> Option<String> {
-    let tab_row_height = render::tab_row_height_px(line_height);
-    let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-    let editor_bottom = gtk_editor_bottom(engine, da_w, da_h, line_height);
-    let content_bounds = core::WindowRect::new(0.0, 0.0, da_w, editor_bottom);
-    let mut group_rects = engine
-        .group_layout
-        .calculate_group_rects(content_bounds, tab_bar_height);
-    engine.adjust_group_rects_for_hidden_tabs(&mut group_rects, tab_bar_height);
-
-    let close_w = char_width;
-    let tab_pad = 14.0_f64;
-    let tab_inner_gap = 10.0_f64;
-    let tab_outer_gap = 1.0_f64;
-
-    for (gid, grect) in &group_rects {
-        if engine.is_tab_bar_hidden(*gid) {
-            continue;
-        }
-        let tab_y = grect.y - tab_bar_height;
-        if my < tab_y || my >= tab_y + tab_row_height || mx < grect.x || mx >= grect.x + grect.width
-        {
-            continue;
-        }
-        let local_x = mx - grect.x;
-        if let Some(group) = engine.editor_groups.get(gid) {
-            let mut tab_x = 0.0;
-            for tab in group.tabs.iter() {
-                let wid = tab.active_window;
-                let (name, file_path) = if let Some(window) = engine.windows.get(&wid) {
-                    if let Some(state) = engine.buffer_manager.get(window.buffer_id) {
-                        let dirty = if state.dirty { "*" } else { "" };
-                        (
-                            format!("{}{}", state.display_name(), dirty),
-                            state.file_path.clone(),
-                        )
-                    } else {
-                        ("[No Name]".to_string(), None)
-                    }
-                } else {
-                    ("[No Name]".to_string(), None)
-                };
-                let tab_w = name.chars().count() as f64 * char_width;
-                let slot_w = tab_pad + tab_w + tab_inner_gap + close_w + tab_pad + tab_outer_gap;
-                if local_x >= tab_x && local_x < tab_x + slot_w {
-                    return file_path.map(|p| shorten_path(&p));
-                }
-                tab_x += slot_w;
-            }
-        }
-    }
-    None
-}
-
-/// Shorten a path for display: replace the user's home directory with `~`.
-fn shorten_path(path: &std::path::Path) -> String {
-    let home = core::paths::home_dir();
-    if let Ok(rest) = path.strip_prefix(&home) {
-        return format!("~/{}", rest.display());
-    }
-    path.display().to_string()
-}
+// #731: `tab_close_hit_test`, `tab_tooltip_hit_test`, and `shorten_path`
+// used to live here. Their only caller was the ~135-line hover-polling
+// block removed from `App::tick` by this issue (see that removal's doc
+// comment) — dead since #540, so deleting them changes nothing on screen.
+// `App::cached_tab_close_abs` (mentioned in `tab_close_hit_test`'s old doc)
+// is still populated by `render_content` and read elsewhere (click
+// handling), so that mechanism itself is unaffected.
 
 /// Entry point for GTK mode.
 pub(crate) fn run(file_path: Option<PathBuf>) {
@@ -10764,60 +9621,16 @@ fn build_shell_config(app: &App) -> quadraui::ShellConfig {
         .with_activity_bar_width_px(48.0)
 }
 
-#[cfg(test)]
-mod native_scrollbar_placement_tests {
-    //! #723: GTK's native `gtk4::Scrollbar` widgets live in the `Overlay`
-    //! *above* the `DrawingArea`, so a scrollbar pinned to the pane's outer
-    //! edge lands on top of the minimap strip that
-    //! `render::minimap_reserved_width` reserves out of that same edge —
-    //! the "no scrollbar when the minimap is on" symptom.
-    //!
-    //! Widget visibility/geometry itself is out of reach headlessly
-    //! (`App::new_headless` never constructs a real `gtk4::Scrollbar`, and
-    //! `GtkDriver` only sees Cairo paint, not overlay widgets), so the
-    //! geometry decision is factored into the pure
-    //! `native_scrollbar_margin_start` and pinned here. The on-screen
-    //! result is a SMOKE_TESTS item.
-    use super::native_scrollbar_margin_start;
-
-    /// Strip off (`:set nominimap`, or a pane too narrow to afford one):
-    /// unchanged from the pre-#723 expression — right edge, less the
-    /// scrollbar's own width, less the 2px divider gap.
-    #[test]
-    fn no_minimap_keeps_the_scrollbar_on_the_panes_right_edge() {
-        assert_eq!(native_scrollbar_margin_start(0.0, 800.0, 12.0, 0.0), 786);
-        assert_eq!(native_scrollbar_margin_start(400.0, 400.0, 12.0, 0.0), 786);
-    }
-
-    /// RED against `develop`: the pre-fix expression ignored the strip and
-    /// returned 786 here too — 48px *inside* the strip, i.e. the scrollbar
-    /// painted over the minimap instead of beside it.
-    #[test]
-    fn minimap_pushes_the_scrollbar_left_of_the_strip() {
-        let x = native_scrollbar_margin_start(0.0, 800.0, 12.0, 48.0);
-        assert_eq!(x, 738, "must be inset by the strip's full 48px width");
-        assert!(
-            x + 12 <= 800 - 48,
-            "the scrollbar's right edge ({}) must not reach into the strip, \
-             which starts at 752",
-            x + 12
-        );
-    }
-
-    /// Second pane of a `:vsplit` — the inset is relative to that pane's own
-    /// origin, not the drawing area's.
-    #[test]
-    fn split_pane_inset_is_relative_to_the_panes_own_origin() {
-        assert_eq!(native_scrollbar_margin_start(400.0, 400.0, 12.0, 48.0), 738);
-    }
-
-    /// A pane narrower than strip + scrollbar can't push the widget out of
-    /// its own pane.
-    #[test]
-    fn degenerate_pane_clamps_to_the_pane_origin() {
-        assert_eq!(native_scrollbar_margin_start(100.0, 30.0, 12.0, 48.0), 100);
-    }
-}
+// #731: the `native_scrollbar_placement_tests` module that used to live
+// here (#723) tested `native_scrollbar_margin_start`'s pure inset
+// arithmetic — that function guarded the native `gtk4::Scrollbar` overlay
+// path deleted by this issue (`sync_scrollbar`/`create_window_scrollbars`),
+// which never ran under the ShellApp runner in the first place (nothing
+// assigns `self.overlay`/`self.drawing_area`), so #723's fix was never
+// live on screen. See the doc comment above the `Surface::Editor` push in
+// `render_content` for where the minimap-inset decision needs to move
+// (quadraui's `gtk::editor::draw_editor`, mirroring TUI's inline
+// scrollbar column) and the quadraui issue that needs filing first.
 
 #[cfg(test)]
 mod h_scrollbar_status_offset_tests {

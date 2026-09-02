@@ -595,6 +595,16 @@ impl Engine {
     /// behaviour on modal state — e.g. GTK suppresses the LSP hover
     /// trigger and hides native scrollbar widgets when this returns
     /// true.
+    ///
+    /// #731 (vimcode): both GTK call sites were inside dead code deleted
+    /// by that issue (`App::tick`'s hover-polling block and the
+    /// `sync_scrollbar`/`sync_scrollbar_positions` native-widget path) —
+    /// both were already gated on Relm4-era widget handles permanently
+    /// `None` under the ShellApp runner, so this had no live caller before
+    /// the deletion either. Kept `pub` (not deleted) because it is
+    /// documented, generically useful core API that the hover-polling
+    /// restoration work #731 flags as follow-up will need again.
+    #[allow(dead_code)]
     pub fn is_blocking_modal_open(&self) -> bool {
         self.picker_open
             || self.tab_switcher_open
