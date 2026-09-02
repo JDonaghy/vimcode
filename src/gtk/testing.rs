@@ -4722,3 +4722,50 @@ mod app_icon {
         );
     }
 }
+
+#[cfg(test)]
+mod clipboard_paste {
+    use super::*;
+    use quadraui::UiEvent;
+
+    /// #593: `Ctrl+V` did nothing on GTK. quadraui's runner reads the system
+    /// clipboard and delivers `UiEvent::ClipboardPaste` straight to
+    /// `ShellApp::handle`, unconditionally consuming the keypress — there is
+    /// no raw `KeyPressed` fallback for an app that ignores it. Before this
+    /// fix, `handle`'s catch-all `_` arm swallowed the event and the paste
+    /// vanished. Mirrors TUI's
+    /// `bracketed_paste_reaches_the_buffer_via_shell_app`
+    /// (`tui_main/shell_app.rs`), which covers the same `Engine::route_paste`
+    /// entry point from the other backend.
+    ///
+    /// Command line chosen as the black-box target (rather than the editor
+    /// buffer) because the GTK backend does not `record_painted_text` editor
+    /// text — see this module's doc comment — so a buffer paste has no
+    /// painted pixels this harness can assert against. The command line
+    /// paints through `Surface::CommandLine`, a quadraui primitive whose text
+    /// the paint-time recording sink *does* capture (confirmed by the
+    /// harness smoke test's `"EXPLORER"` assertion against the same sink).
+    /// `route_paste`'s other destinations (search/replace fields, explorer
+    /// rename, editor buffer) share this one dispatch arm and are covered at
+    /// the engine level instead: `search_input_paste` already has coverage,
+    /// and #593 adds `test_explorer_rename_route_paste`
+    /// (`core/engine/tests.rs`) for the tree inline-edit target this same
+    /// fix newly wires up.
+    #[test]
+    fn ctrl_v_paste_reaches_the_command_line_via_shell_app() {
+        let mut engine = Engine::new_for_test();
+        engine.mode = crate::core::Mode::Command;
+        let mut h = harness(engine, 1200, 800);
+
+        h.driver
+            .dispatch(UiEvent::ClipboardPaste("ZQXW_PASTE_MARKER".to_string()));
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains(":ZQXW_PASTE_MARKER"),
+            "UiEvent::ClipboardPaste must route through Engine::route_paste \
+             into the command line; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
+}
