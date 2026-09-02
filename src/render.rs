@@ -3401,21 +3401,19 @@ pub fn route_editor_hover_popup_click(
         let on_thumb = rect_contains(sb.thumb, cx, cy);
         let on_track = !on_thumb && rect_contains(sb.track, cx, cy);
         if on_thumb || on_track {
-            return EditorHoverPopupRoute::Scrollbar(Box::new(
-                quadraui::DragTarget::ScrollbarY {
-                    widget: quadraui::WidgetId::new("editor_hover"),
-                    track_start: sb.track.y,
-                    track_length: sb.track.height,
-                    thumb_length: sb.thumb.height,
-                    max_scroll: sb.total.saturating_sub(sb.visible_rows),
-                    // Grabbing the thumb keeps the cursor where it landed on
-                    // it; clicking the empty track seeks the thumb's *top* to
-                    // the cursor, which is what a single shared apply-pass
-                    // produces without a second bespoke ratio calculation.
-                    grab_offset: if on_thumb { cy - sb.thumb.y } else { 0.0 },
-                    inverted: false,
-                },
-            ));
+            return EditorHoverPopupRoute::Scrollbar(Box::new(quadraui::DragTarget::ScrollbarY {
+                widget: quadraui::WidgetId::new("editor_hover"),
+                track_start: sb.track.y,
+                track_length: sb.track.height,
+                thumb_length: sb.thumb.height,
+                max_scroll: sb.total.saturating_sub(sb.visible_rows),
+                // Grabbing the thumb keeps the cursor where it landed on
+                // it; clicking the empty track seeks the thumb's *top* to
+                // the cursor, which is what a single shared apply-pass
+                // produces without a second bespoke ratio calculation.
+                grab_offset: if on_thumb { cy - sb.thumb.y } else { 0.0 },
+                inverted: false,
+            }));
         }
     }
 
@@ -19956,6 +19954,154 @@ mod tests {
         let lh = 18.0;
         assert_eq!(separated_status_height_px(lh, true), lh);
         assert_eq!(separated_status_height_px(lh, false), 0.0);
+    }
+
+    // ── #755: the shared editor hover popup rung ────────────────────────
+    //
+    // The behaviours below are what the two backends' bespoke copies
+    // *disagreed* about. Black-box coverage lives in
+    // `src/tui_main/shell_app.rs` and `src/gtk/testing.rs`; these pin the
+    // arbitration itself, which neither driver can isolate.
+
+    fn hover_state<'a>(
+        links: &'a [(quadraui::Rect, String)],
+        scrollbar: Option<PopupScrollbarHit>,
+        has_focus: bool,
+    ) -> EditorHoverPopupState<'a> {
+        EditorHoverPopupState {
+            popup: Some(quadraui::Rect::new(10.0, 10.0, 100.0, 40.0)),
+            links,
+            scrollbar,
+            has_focus,
+            content: PopupContentMetrics {
+                pad_x: 2.0,
+                pad_y: 1.0,
+                col_width: 1.0,
+                line_height: 1.0,
+            },
+        }
+    }
+
+    /// #504: abutting link rects must each be individually reachable. GTK's
+    /// arm hit-tested with `<=` on the right and bottom edges, so rect *n*
+    /// and rect *n+1* overlapped by a pixel on their shared boundary and
+    /// `find()` could only ever return the earlier one. The shared router
+    /// uses the half-open `[x, x+w)` convention, so a click on the second
+    /// link's first column reaches the second link.
+    #[test]
+    fn hover_popup_abutting_link_rects_are_each_reachable() {
+        let links = vec![
+            (quadraui::Rect::new(12.0, 12.0, 8.0, 1.0), "http://a".into()),
+            (quadraui::Rect::new(20.0, 12.0, 8.0, 1.0), "http://b".into()),
+        ];
+        let st = hover_state(&links, None, false);
+        assert_eq!(
+            route_editor_hover_popup_click(true, &st, 12.0, 12.0),
+            EditorHoverPopupRoute::Link("http://a".into())
+        );
+        assert_eq!(
+            route_editor_hover_popup_click(true, &st, 20.0, 12.0),
+            EditorHoverPopupRoute::Link("http://b".into()),
+            "the second of two abutting link rects must be reachable (#504)"
+        );
+    }
+
+    /// A `command:` URI routes to `Command`, not `Link` — the apply pass
+    /// navigates and dismisses rather than handing the string to the
+    /// backend's clipboard/browser (#272, #491).
+    #[test]
+    fn hover_popup_command_uri_routes_to_command_not_link() {
+        let links = vec![(
+            quadraui::Rect::new(12.0, 12.0, 10.0, 1.0),
+            "command:definition".to_string(),
+        )];
+        let st = hover_state(&links, None, true);
+        assert_eq!(
+            route_editor_hover_popup_click(true, &st, 14.0, 12.0),
+            EditorHoverPopupRoute::Command("command:definition".into())
+        );
+    }
+
+    /// The scrollbar is painted on top of the content, so it wins a point
+    /// that a link rect also claims. TUI tested links first; GTK tested the
+    /// scrollbar first. GTK's order is the one that matches the paint.
+    #[test]
+    fn hover_popup_scrollbar_outranks_a_link_rect_underneath_it() {
+        let sb = PopupScrollbarHit {
+            track: quadraui::Rect::new(105.0, 11.0, 1.0, 20.0),
+            thumb: quadraui::Rect::new(105.0, 15.0, 1.0, 5.0),
+            visible_rows: 10,
+            total: 40,
+        };
+        let links = vec![(
+            quadraui::Rect::new(100.0, 15.0, 9.0, 1.0),
+            "http://under".to_string(),
+        )];
+        let st = hover_state(&links, Some(sb), true);
+        let route = route_editor_hover_popup_click(true, &st, 105.0, 15.0);
+        assert!(
+            matches!(route, EditorHoverPopupRoute::Scrollbar(_)),
+            "the painted scrollbar must outrank a link rect beneath it, got {route:?}"
+        );
+    }
+
+    /// Grabbing the thumb preserves the cursor's offset within it; clicking
+    /// the empty track seeks the thumb's top to the cursor. GTK hardcoded
+    /// `0.0` for both, so a thumb grab teleported.
+    #[test]
+    fn hover_popup_thumb_grab_preserves_the_offset_and_track_click_does_not() {
+        let sb = PopupScrollbarHit {
+            track: quadraui::Rect::new(105.0, 11.0, 1.0, 20.0),
+            thumb: quadraui::Rect::new(105.0, 15.0, 1.0, 5.0),
+            visible_rows: 10,
+            total: 40,
+        };
+        let st = hover_state(&[], Some(sb), true);
+        let grab = |y: f64| match route_editor_hover_popup_click(true, &st, 105.0, y) {
+            EditorHoverPopupRoute::Scrollbar(t) => match *t {
+                quadraui::DragTarget::ScrollbarY { grab_offset, .. } => grab_offset,
+                other => panic!("expected a ScrollbarY target, got {other:?}"),
+            },
+            other => panic!("expected the scrollbar arm, got {other:?}"),
+        };
+        assert_eq!(grab(19.0), 4.0, "thumb grab keeps the cursor on the thumb");
+        assert_eq!(grab(29.0), 0.0, "a track click seeks the thumb's top");
+    }
+
+    /// An unfocused popup takes focus; a focused one starts a selection at
+    /// the clicked content cell (the router works in viewport rows — the
+    /// apply pass adds `scroll_top`).
+    #[test]
+    fn hover_popup_body_click_focuses_then_selects() {
+        let unfocused = hover_state(&[], None, false);
+        assert_eq!(
+            route_editor_hover_popup_click(true, &unfocused, 20.0, 15.0),
+            EditorHoverPopupRoute::Focus
+        );
+        let focused = hover_state(&[], None, true);
+        assert_eq!(
+            route_editor_hover_popup_click(true, &focused, 20.0, 15.0),
+            EditorHoverPopupRoute::StartSelection {
+                content_line: 4,
+                content_col: 8,
+            }
+        );
+    }
+
+    /// A press outside a visible popup dismisses it but is *not* consumed,
+    /// so the cursor still lands where the user aimed; with no popup at all
+    /// the rung reports `None` and the ladder continues.
+    #[test]
+    fn hover_popup_outside_press_falls_through_and_invisible_is_a_no_op() {
+        let st = hover_state(&[], None, true);
+        assert_eq!(
+            route_editor_hover_popup_click(true, &st, 200.0, 200.0),
+            EditorHoverPopupRoute::DismissAndFallThrough
+        );
+        assert_eq!(
+            route_editor_hover_popup_click(false, &st, 20.0, 15.0),
+            EditorHoverPopupRoute::None
+        );
     }
 
     #[test]

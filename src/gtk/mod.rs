@@ -2328,12 +2328,9 @@ impl App {
         let route = render::route_editor_hover_popup_click(
             visible,
             &render::EditorHoverPopupState {
-                popup: self
-                    .editor_hover_popup_rect
-                    .get()
-                    .map(|(px, py, pw, ph)| {
-                        quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
-                    }),
+                popup: self.editor_hover_popup_rect.get().map(|(px, py, pw, ph)| {
+                    quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
+                }),
                 links: &links,
                 scrollbar: self.editor_hover_scrollbar.get(),
                 has_focus,
@@ -2349,8 +2346,7 @@ impl App {
             x,
             y,
         );
-        let effect =
-            render::apply_editor_hover_popup_route(&mut self.engine.borrow_mut(), route);
+        let effect = render::apply_editor_hover_popup_route(&mut self.engine.borrow_mut(), route);
         if let Some(url) = effect.open_url {
             open_url(&url);
         }
@@ -2379,24 +2375,6 @@ impl App {
         }
         self.draw_needed.set(true);
         effect.consumed
-    }
-
-    /// Seek to the minimap strip position under `(x, y)`, if any (#35, #723).
-    ///
-    /// Returns `true` when a strip was hit and the press must not fall
-    /// through. Stateless, exactly like TUI's rung: a drag frame re-runs the
-    /// same hit test, so holding the button keeps seeking without either
-    /// backend carrying a `minimap_dragging` flag.
-    fn route_and_apply_minimap_click(&self, x: f64, y: f64) -> bool {
-        let layout_ref = self.cached_screen_layout.borrow();
-        let Some(ref layout) = *layout_ref else {
-            return false;
-        };
-        if render::apply_minimap_click(&mut self.engine.borrow_mut(), layout, x, y).is_some() {
-            self.draw_needed.set(true);
-            return true;
-        }
-        false
     }
 
     /// Popup-content column under `rel_x` (pixels from the content origin).
@@ -3154,21 +3132,6 @@ impl App {
                     }
                 }
 
-                // ── Minimap click / drag (#35, #723) ─────────────────────────
-                // `render::apply_minimap_click` owns the hit test and the
-                // seek; both backends' only contribution is the point. Before
-                // #755 this rung existed on TUI alone — GTK *painted* every
-                // pane's strip (`render::draw_minimap_strip`) and then had no
-                // handler at all, so clicking one did nothing.
-                //
-                // Placed after both divider hit-tests for the same reason TUI
-                // places it there: the strip is carved off the active window's
-                // right edge, so in a `:vsplit` it abuts the divider's grab
-                // band, and losing a divider drag is the worse failure.
-                if self.route_and_apply_minimap_click(x, y) {
-                    return;
-                }
-
                 {
                     let mut engine = self.engine.borrow_mut();
 
@@ -3454,20 +3417,6 @@ impl App {
     }
 
     fn handle_mouse_drag_msg(&mut self, x: f64, y: f64, width: f64, height: f64) {
-        // #35/#723: minimap drag follow-through. Same stateless hit test the
-        // press ran (`render::apply_minimap_click`), so holding the button
-        // keeps seeking — exactly as TUI's rung does, and with no
-        // `minimap_dragging` flag on either side. Gated on "no other gesture
-        // already owns this drag" so a text selection or an armed scrollbar
-        // that happens to travel across a strip is never hijacked.
-        if self.divider_grab.is_none()
-            && !self.engine.borrow().mouse_drag_active
-            && !self.backend.borrow().drag_state_handle().borrow().is_active()
-            && self.route_and_apply_minimap_click(x, y)
-        {
-            return;
-        }
-
         // Phase B.4 drag dispatch: feed the move through quadraui's
         // dispatcher so an active drag (scrollbar, handle, etc.)
         // translates into primitive-specific events, then guard
