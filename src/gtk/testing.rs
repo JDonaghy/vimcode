@@ -6313,7 +6313,7 @@ mod editor_mouse_rungs {
         assert!(
             h.driver.screen_contains("line 30 content"),
             "clicking the vertical middle of the painted minimap strip must \
-             seek the pane to ~50% of the file (#35/#723); screen was {:?}",
+             seek the pane to ~50% of the file (#35); screen was {:?}",
             h.driver.painted_texts()
         );
     }
