@@ -8437,6 +8437,18 @@ mod tests {
     /// Two real file tabs so `open_tab_switcher` has more than one MRU
     /// entry (it no-ops with one) and the editor underneath has enough
     /// lines that a stray click would visibly move the cursor.
+    ///
+    /// Sidebar/autohide state is pinned explicitly for the reason
+    /// `app_with_sidebar_open`'s doc comment spells out (#634):
+    /// `TuiShellApp::new` reads the developer's real `~/.config/vimcode`
+    /// off disk, so an explorer that was ever opened on this machine makes
+    /// the sidebar boot *visible*. Both tests below hit-test against
+    /// painted geometry — the popup's centred rect and a column the
+    /// "outside" click must land on — and an ambient sidebar shifts the
+    /// editor pane right underneath both of them, turning the outside
+    /// click into an explorer click (which opens a file rather than moving
+    /// the cursor). Pinned, the geometry is the same on a bare CI runner
+    /// and a developer box.
     fn app_with_two_file_tabs_and_switcher_open() -> TuiShellApp {
         let dir = std::env::temp_dir().join(format!(
             "vimcode_test_733_tab_switcher_{:?}",
@@ -8451,6 +8463,9 @@ mod tests {
         std::fs::write(&file_b, &content).unwrap();
 
         let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
         app.engine
             .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
             .unwrap();
@@ -8576,8 +8591,17 @@ mod tests {
     /// `spell_suggestions` is set through `Engine`'s own tuple shape rather
     /// than `spell_suggest_under_cursor` so the fixture does not depend on a
     /// dictionary being installed on the test machine.
+    ///
+    /// Sidebar/autohide pinned for the #634 reason `app_with_sidebar_open`
+    /// documents: `TuiShellApp::new` reads the developer's real
+    /// `~/.config/vimcode`, so the sidebar boots visible on a box that has
+    /// ever opened the explorer and hidden on a bare CI runner. Neither
+    /// test here should depend on which.
     fn app_with_spell_suggestions_and_activity_bar_focus() -> TuiShellApp {
         let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
         app.engine.buffer_mut().insert(0, "teh end\n");
         app.engine.spell_suggestions =
             Some(("teh".to_string(), vec!["the".to_string()], String::new()));
@@ -8644,6 +8668,10 @@ mod tests {
     #[test]
     fn driver_context_menu_key_beats_a_focused_activity_bar() {
         let mut app = TuiShellApp::new(None);
+        // Sidebar pinned for the same #634 reason as the fixture above.
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
         app.engine.buffer_mut().insert(0, "fn main() {}\n");
         app.engine.open_editor_context_menu(20, 5);
         app.engine.activity_bar_focus_in_at(0);
