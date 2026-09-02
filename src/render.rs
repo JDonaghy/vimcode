@@ -2443,6 +2443,56 @@ pub fn check_overlay_band_order(painted: &[OverlayOp]) -> Result<(), String> {
     Ok(())
 }
 
+/// The expected band for the "context menu + in-canvas dialog open together"
+/// cross-backend fixture (`overlay_band_paints_dialog_above_context_menu_via_gtk_driver`
+/// / `..._via_shell_app`), computed from [`compose_overlay_band`] rather than
+/// hand-copied as a `Vec` literal into each test.
+///
+/// Both backend tests call this one function, so a rung added to
+/// [`OVERLAY_Z_ORDER`] or reordered there updates both expectations from a
+/// single edit — the compiler keeps them in sync instead of the "keep them in
+/// step" comment discipline this issue exists to remove from the *production*
+/// code (#735 review). `menu_dropdown`/`command_center` are hardcoded `true`
+/// here because both fixtures pin the title bar visible (GTK forces it via
+/// `App::setup`, TUI via `shell_config(true)`) — they are not derivable from
+/// `ScreenLayout` alone, see [`OverlayPresence::from_screen`]'s doc comment.
+#[cfg(test)]
+pub(crate) fn overlay_band_dialog_over_context_menu_fixture() -> Vec<OverlayOp> {
+    compose_overlay_band(&OverlayPresence {
+        menu_dropdown: true,
+        command_center: true,
+        find_replace: false,
+        unified_picker: false,
+        tab_switcher: false,
+        context_menu: true,
+        dialog: true,
+        toast_stack: false,
+    })
+}
+
+/// The expected band for the "no app-level overlay open, only title-bar
+/// chrome" cross-backend fixture (`overlay_band_holds_only_the_title_bar_when_no_overlay_is_open_via_gtk_driver`
+/// / `overlay_band_is_empty_when_no_overlay_is_open_via_shell_app`'s GTK twin).
+///
+/// GTK pins the title bar visible unconditionally (#552), so its "nothing
+/// open" band still has `MenuDropdown`/`CommandCenter` live; see
+/// [`overlay_band_dialog_over_context_menu_fixture`]'s doc comment for why
+/// this is a separate literal `OverlayPresence` rather than derived from
+/// `ScreenLayout`.
+#[cfg(test)]
+pub(crate) fn overlay_band_title_bar_only_fixture() -> Vec<OverlayOp> {
+    compose_overlay_band(&OverlayPresence {
+        menu_dropdown: true,
+        command_center: true,
+        find_replace: false,
+        unified_picker: false,
+        tab_switcher: false,
+        context_menu: false,
+        dialog: false,
+        toast_stack: false,
+    })
+}
+
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
 /// Data needed to render the quickfix bottom panel.
