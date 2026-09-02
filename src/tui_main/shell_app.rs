@@ -2353,26 +2353,43 @@ impl ShellApp for TuiShellApp {
                         },
                     )
                 }
-                // ── Bracketed paste (mirrors mod.rs:3032-:3035) ─────────
+                // ── Bracketed paste (#758 / #734 slice 3) ───────────────
                 // The runner maps crossterm's `Event::Paste` to
                 // `UiEvent::ClipboardPaste`; without this arm a paste into
-                // the TUI is silently dropped.
+                // the TUI is silently dropped. The rung itself is already
+                // shared: `Engine::route_paste` is the one focus-priority
+                // paste router both backends call (GTK's identical arm is in
+                // `gtk/mod.rs`'s `UiEvent::ClipboardPaste`), and its terminal
+                // branch now delegates the bracketed-paste decision to
+                // quadraui's `TerminalSession::paste` (quadraui#343/#415)
+                // instead of wrapping unconditionally. The extra
+                // `sync_tui_clipboard` is TUI-only by necessity: crossterm
+                // has no clipboard, so the `+` register is the backing store
+                // (GTK reads the real system clipboard).
                 UiEvent::ClipboardPaste(ref text) => {
                     self.engine.route_paste(text);
                     sync_tui_clipboard(&mut self.engine, &mut self.last_clipboard_content);
                     Reaction::Redraw
                 }
-                // ── Resize → PTY resize (mirrors mod.rs:3036-:3045) ─────
+                // ── Resize → PTY resize (#758 / #734 slice 3) ───────────
                 // The runner already debounces the crossterm resize burst
                 // (`RESIZE_SETTLE`) and re-reads the real terminal size for
                 // painting every frame, so only the embedded shell's own
                 // SIGWINCH needs forwarding here. The legacy loop's
                 // accompanying `terminal.clear()` has no shell-runner
                 // equivalent — see the Ctrl+L note in `handle_key_pressed`.
+                //
+                // `render::route_terminal_resize` rather than
+                // `Engine::terminal_resize`: the latter resizes *every* pane
+                // to the full panel width, which reflows a split's
+                // half-width panes off the area they are painted into (#471).
                 UiEvent::WindowResized { viewport } => {
                     let term_rows = self.engine.session.terminal_panel_rows;
-                    self.engine
-                        .terminal_resize(viewport.width as u16, term_rows);
+                    render::route_terminal_resize(
+                        &mut self.engine,
+                        viewport.width as u16,
+                        term_rows,
+                    );
                     Reaction::Redraw
                 }
                 // #602 (gap 2): dispatch through the legacy `mouse::handle_mouse`
@@ -3748,82 +3765,17 @@ fn handle_key_pressed(
         return Reaction::Redraw;
     }
 
-    // ── Terminal (PTY) key routing (#351, mirrors mod.rs:2439-:2513) ────
-    // The engine decides the action; the backend performs the clipboard I/O
-    // and the PTY writes.
-    if engine.terminal_has_focus {
-        use crate::core::engine::TerminalKeyAction;
-        let mut tui_fn_buf = String::new();
-        let (kn, uc) = match key_event.code {
-            KeyCode::Enter => ("Return", None),
-            KeyCode::Backspace => ("BackSpace", None),
-            KeyCode::Esc => ("Escape", None),
-            KeyCode::Tab => ("Tab", None),
-            KeyCode::BackTab => ("ISO_Left_Tab", None),
-            KeyCode::Up => ("Up", None),
-            KeyCode::Down => ("Down", None),
-            KeyCode::Left => ("Left", None),
-            KeyCode::Right => ("Right", None),
-            KeyCode::Home => ("Home", None),
-            KeyCode::End => ("End", None),
-            KeyCode::Delete => ("Delete", None),
-            KeyCode::Insert => ("Insert", None),
-            KeyCode::PageUp => ("Page_Up", None),
-            KeyCode::PageDown => ("Page_Down", None),
-            KeyCode::F(n) => {
-                tui_fn_buf = format!("F{n}");
-                (tui_fn_buf.as_str(), None)
-            }
-            KeyCode::Char(c) => ("", Some(c)),
-            _ => ("", None),
-        };
-        let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
-        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
-        match engine.handle_terminal_key(kn, uc, ctrl, shift, alt) {
-            TerminalKeyAction::CopySelection => {
-                let text = engine.active_terminal().and_then(|t| t.selected_text());
-                if let Some(ref text) = text {
-                    if let Some(ref cb) = engine.clipboard_write {
-                        let _ = cb(text);
-                    }
-                    engine.message = "Copied".to_string();
-                }
-            }
-            TerminalKeyAction::PasteClipboard => {
-                let paste_text = engine
-                    .clipboard_read
-                    .as_ref()
-                    .and_then(|cb| cb().ok())
-                    .filter(|t| !t.is_empty())
-                    .or_else(|| {
-                        engine
-                            .registers
-                            .get(&'+')
-                            .map(|(t, _)| t.clone())
-                            .filter(|t| !t.is_empty())
-                    })
-                    .or_else(|| {
-                        engine
-                            .registers
-                            .get(&'"')
-                            .map(|(t, _)| t.clone())
-                            .filter(|t| !t.is_empty())
-                    });
-                if let Some(text) = paste_text {
-                    engine.terminal_write(b"\x1b[200~");
-                    engine.terminal_write(text.as_bytes());
-                    engine.terminal_write(b"\x1b[201~");
-                    engine.poll_terminal();
-                } else {
-                    engine.message = "Nothing to paste".to_string();
-                }
-            }
-            TerminalKeyAction::SendToPty(data) => {
-                engine.terminal_write(&data);
-                engine.poll_terminal();
-            }
-            TerminalKeyAction::Handled | TerminalKeyAction::Ignore => {}
-        }
+    // ── Terminal (PTY) key routing (#758 / #734 slice 3, #351) ─────────
+    // One shared rung, `render::route_terminal_key`, replaces the ~75-line
+    // block that used to live here (and the GTK twin the #540 cutover had
+    // deleted outright). It also lets `translate_key`'s own `key_name` reach
+    // the PTY encoder: the old block bypassed it and re-derived names from
+    // the raw `KeyCode`, because `translate_key` spells shifted navigation
+    // keys `Shift_Up`/`Shift_Return` — `canonical_terminal_key_name` strips
+    // that prefix (shift is passed separately) so the bypass is unnecessary.
+    let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+    if render::route_terminal_key(engine, &key_name, unicode, ctrl, shift, alt) {
         return Reaction::Redraw;
     }
 
@@ -5742,6 +5694,138 @@ mod tests {
             screen.contains("Terminal"),
             "bottom panel terminal tab bar should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
+    }
+
+    // ── #758 / #734 slice 3: the shared terminal (PTY) keyboard rung ───────
+
+    /// TUI half of `terminal_ctrl_f_opens_the_painted_find_bar` (`gtk/
+    /// testing.rs`): with the terminal focused, Ctrl+F must open the
+    /// *terminal's* find bar, and subsequent characters must land in that
+    /// bar's query — all the way through `driver_with_shell` ->
+    /// `TuiShellApp::handle` -> `handle_key_pressed` ->
+    /// `render::route_terminal_key` -> `Engine::handle_terminal_key`.
+    ///
+    /// Asserts on rendered output (`CLAUDE.md` rule 1): the terminal
+    /// toolbar's painted `" FIND: …"` text
+    /// (`render::build_terminal_toolbar`), not `terminal_find_active`. A test
+    /// on the flag would pass against a backend that flipped it while the
+    /// tab strip still painted — the #587/#592 failure shape.
+    ///
+    /// **Verified RED against unfixed `develop`:** deleting the
+    /// `render::route_terminal_key` call from `handle_key_pressed` makes
+    /// Ctrl+F fall through to `Engine::handle_key`, which opens the
+    /// *editor*'s find/replace overlay instead; the `"FIND:"` assertion
+    /// fires. (This rung existed on TUI before the slice — it is GTK that
+    /// had none — so the removed-fix control is the router call itself.)
+    #[test]
+    fn terminal_ctrl_f_opens_the_painted_find_bar_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        // `terminal_new_tab` opens the panel and focuses it.
+        app.engine.terminal_new_tab(80, 10);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        assert!(
+            !driver.screen_contains("FIND:"),
+            "precondition: the terminal toolbar starts as a tab strip; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('f');
+        driver.render();
+        assert!(
+            driver.screen_contains("FIND:"),
+            "Ctrl+F with the terminal focused must open the terminal find bar, \
+             not the editor find/replace overlay; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('z');
+        driver.render();
+        assert!(
+            driver.screen_contains("FIND: z"),
+            "characters typed after Ctrl+F must reach the terminal find query \
+             through the shared router; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A focused terminal must swallow ordinary keys so they never reach the
+    /// editor buffer — the divergence that made GTK unusable (there, `x` ran
+    /// vim's delete-char on the file while the user thought they were typing
+    /// into a shell). Stated once here for TUI so the pair is symmetric, and
+    /// so the router's `false` return (the "no terminal focus" path) is
+    /// covered too.
+    ///
+    /// Asserts on the painted buffer text with a positive control: clearing
+    /// `terminal_has_focus` and repeating the *identical* key must delete the
+    /// character, so a fixture whose text simply could not change would fail
+    /// the second half.
+    #[test]
+    fn focused_terminal_swallows_editor_keys_via_shell_app() {
+        // Same fixture twice, differing only in `terminal_has_focus`.
+        let build = |focused: bool| {
+            let mut app = TuiShellApp::new(None);
+            app.engine.buffer_mut().insert(0, "ZQXWTERM758\n");
+            app.engine.terminal_new_tab(80, 6);
+            app.engine.terminal_has_focus = focused;
+            driver_with_shell(app, config(), 80, 24)
+        };
+
+        let mut driver = build(true);
+        driver.render();
+        assert!(
+            driver.screen_contains("ZQXWTERM758"),
+            "precondition: the buffer line must paint; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('x');
+        driver.render();
+        assert!(
+            driver.screen_contains("ZQXWTERM758"),
+            "`x` with the terminal focused must go to the PTY, not delete a \
+             character from the editor buffer; screen:\n{}",
+            driver.screen()
+        );
+
+        // Positive control: the same key on the same fixture, terminal
+        // unfocused, must edit — so a buffer that simply could not change
+        // would fail here.
+        let mut control = build(false);
+        control.render();
+        control.type_char('x');
+        control.render();
+        assert!(
+            control.screen_contains("QXWTERM758") && !control.screen_contains("ZQXWTERM758"),
+            "control: with the terminal unfocused `x` must delete the first \
+             character; screen:\n{}",
+            control.screen()
+        );
+    }
+
+    /// The `Shift_`-prefixed names `translate_key` hands the editor
+    /// (`Shift_Up`, `Shift_Return`, …) have no PTY encoding — which is why
+    /// the old TUI arm bypassed `translate_key` and re-derived names from the
+    /// raw crossterm `KeyCode`. `render::canonical_terminal_key_name` strips
+    /// the prefix (shift travels as its own argument) and reconciles the two
+    /// backends' spellings of the same physical keys, so the bypass is gone.
+    #[test]
+    fn canonical_terminal_key_name_reconciles_both_backends_spellings() {
+        use crate::render::canonical_terminal_key_name as canon;
+        // TUI's editor-facing shift prefix.
+        assert_eq!(canon("Shift_Up"), "Up");
+        assert_eq!(canon("Shift_Return"), "Return");
+        // GTK's `NamedKey` spellings vs TUI's / X11's.
+        assert_eq!(canon("PageUp"), "Page_Up");
+        assert_eq!(canon("PageDown"), "Page_Down");
+        assert_eq!(canon("BackTab"), "ISO_Left_Tab");
+        assert_eq!(canon("Enter"), "Return");
+        // Already-canonical names and bare characters pass through.
+        assert_eq!(canon("Page_Up"), "Page_Up");
+        assert_eq!(canon("ISO_Left_Tab"), "ISO_Left_Tab");
+        assert_eq!(canon("F5"), "F5");
+        assert_eq!(canon("a"), "a");
     }
 
     // ── #754 (mouse ladder slice 4: panels) ────────────────────────────────

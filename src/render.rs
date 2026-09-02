@@ -3056,6 +3056,191 @@ pub fn activity_bar_key_action(key: &str, ctrl: bool) -> ActivityBarKeyAction {
     }
 }
 
+// ─── Terminal (PTY) keyboard rung (#758 / #734 slice 3, #351, #471) ──────────
+//
+// The rung directly beneath [`route_focus_key`]: once no modal overlay and no
+// focus owner has claimed the key, a focused embedded terminal takes it before
+// the editor ever sees it.
+//
+// **Where the encoder lives.** quadraui's `TerminalSession` already owns the
+// *mouse* encoder (`encode_mouse` / `forward_mouse`) and, since quadraui#343,
+// bracketed paste (`paste` / `bracketed_paste_enabled`) — but quadraui#342
+// ("lift the keyboard → PTY encoder out of the example into the engine") has
+// **not** landed on the pinned rev, so there is no upstream
+// `TerminalSession::key_bytes`. The key encoder therefore stays where it
+// already is: [`crate::core::engine::terminal_ops::key_to_pty_bytes`], which is
+// platform-neutral `core` code and satisfies `CLAUDE.md`'s neutrality rule
+// exactly as well. When quadraui#342 lands, `key_to_pty_bytes` is the single
+// call site to swap; nothing in either backend changes.
+//
+// **What diverged.** TUI hand-rolled this rung inside `handle_key_pressed`
+// (~80 lines). GTK's twin was deleted outright by the #540 Relm4→ShellApp
+// cutover — the whole `if engine.borrow().terminal_has_focus { … }` block lived
+// in the per-window `EventControllerKey` closure that went with the Relm4
+// `view!`, and nothing replaced it. Since #540, GTK keys typed into a focused
+// terminal have fallen through to `Engine::handle_key` and edited the *buffer*
+// instead of reaching the PTY. Three concrete disagreements this router ends:
+//
+//  1. **GTK forwarded nothing at all.** Typing in the terminal ran vim normal
+//     mode commands on the editor buffer. This is the live half of **#471** —
+//     the other half was the old GTK arm's `sender.input(Msg::Resize)` after
+//     every terminal keypress, whose handler called
+//     `terminal_resize(full_panel_cols, …)` on *every* pane. In split mode that
+//     reflowed the half-width panes to the full panel width on each keystroke
+//     while they were still painted into their narrow rects, so freshly typed
+//     text in the right pane wrapped off the painted area and "disappeared".
+//     This router performs no resize, and [`route_terminal_resize`] is
+//     split-aware, so neither half can come back.
+//  2. **Key-name spelling.** TUI reached past `translate_key` and re-derived
+//     names from the raw crossterm `KeyCode` (`"Page_Up"`, `"ISO_Left_Tab"`)
+//     because `translate_key`'s editor-facing names (`"Shift_Up"`,
+//     `"Shift_Return"`) have no PTY encoding; GTK speaks `"PageUp"` /
+//     `"BackTab"`. [`canonical_terminal_key_name`] accepts both spellings, so
+//     PageUp scrolls the scrollback on GTK too (it previously did not exist,
+//     and would have fallen through to a raw `ESC[5~` write had it).
+//  3. **`SendToPty` follow-through.** TUI polled the PTY immediately after the
+//     write so the echo landed in the same frame; the old GTK arm did not, and
+//     relied on the next poll tick. The router always polls.
+//
+// Both backends now call [`route_terminal_key`] and do nothing else for this
+// rung.
+
+/// Canonicalise a backend key name into the spelling
+/// [`crate::core::engine::terminal_ops::key_to_pty_bytes`] and
+/// `Engine::handle_terminal_key` expect.
+///
+/// The two backends name the same physical keys differently, and TUI's
+/// `translate_key` additionally prefixes shifted navigation keys with `Shift_`
+/// for the *editor*'s benefit — a prefix the PTY encoder has no arm for, which
+/// is why TUI used to bypass `translate_key` entirely here. Shift is already
+/// carried as its own `shift` argument, so the prefix is pure noise on this
+/// rung and is stripped.
+pub fn canonical_terminal_key_name(key_name: &str) -> &str {
+    let base = key_name.strip_prefix("Shift_").unwrap_or(key_name);
+    match base {
+        // GTK's `NamedKey::Enter` mapping and the GDK keypad name.
+        "Enter" | "KP_Enter" => "Return",
+        // GTK says "PageUp"; X11/GDK says "Page_Up"/"Prior"; TUI says "Page_Up".
+        "PageUp" | "Prior" | "KP_Page_Up" => "Page_Up",
+        "PageDown" | "Next" | "KP_Page_Down" => "Page_Down",
+        // GTK's `NamedKey::BackTab`; TUI/X11 spell it "ISO_Left_Tab".
+        "BackTab" => "ISO_Left_Tab",
+        other => other,
+    }
+}
+
+/// The shared terminal (PTY) keyboard rung — one implementation, both backends
+/// (#758 / #734 slice 3).
+///
+/// Returns `true` when the focused terminal claimed the key, in which case the
+/// caller must stop dispatching and repaint. Returns `false` when no terminal
+/// has focus, leaving the key to the rungs below.
+///
+/// `key_name` may be spelled in either backend's dialect — see
+/// [`canonical_terminal_key_name`]. `unicode` is the resolved character (for
+/// Ctrl combos, the *unshifted* letter, matching both backends' translation
+/// layers).
+///
+/// The engine decides *what* the key means
+/// ([`Engine::handle_terminal_key`](crate::core::Engine::handle_terminal_key));
+/// this function performs the side effects that used to be duplicated in the
+/// backends — clipboard read/write through the engine's own callbacks, the PTY
+/// write, and the follow-up poll.
+pub fn route_terminal_key(
+    engine: &mut Engine,
+    key_name: &str,
+    unicode: Option<char>,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+) -> bool {
+    use crate::core::engine::TerminalKeyAction;
+
+    if !engine.terminal_has_focus {
+        return false;
+    }
+
+    let canon = canonical_terminal_key_name(key_name);
+    match engine.handle_terminal_key(canon, unicode, ctrl, shift, alt) {
+        TerminalKeyAction::CopySelection => {
+            let text = engine.active_terminal().and_then(|t| t.selected_text());
+            if let Some(ref text) = text {
+                if let Some(ref cb) = engine.clipboard_write {
+                    let _ = cb(text);
+                }
+                engine.message = "Copied".to_string();
+            }
+        }
+        TerminalKeyAction::PasteClipboard => {
+            // System clipboard first, then the `+` and unnamed registers —
+            // the fallback chain TUI had and GTK never did.
+            let paste_text = engine
+                .clipboard_read
+                .as_ref()
+                .and_then(|cb| cb().ok())
+                .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    engine
+                        .registers
+                        .get(&'+')
+                        .map(|(t, _)| t.clone())
+                        .filter(|t| !t.is_empty())
+                })
+                .or_else(|| {
+                    engine
+                        .registers
+                        .get(&'"')
+                        .map(|(t, _)| t.clone())
+                        .filter(|t| !t.is_empty())
+                });
+            if let Some(text) = paste_text {
+                engine.terminal_paste(&text);
+            } else {
+                engine.message = "Nothing to paste".to_string();
+            }
+        }
+        TerminalKeyAction::SendToPty(data) => {
+            engine.terminal_write(&data);
+            engine.poll_terminal();
+        }
+        TerminalKeyAction::Handled | TerminalKeyAction::Ignore => {}
+    }
+    true
+}
+
+/// The shared "window resized → resize the PTYs" rung (#758 / #734 slice 3).
+///
+/// `panel_cols` is the *whole* terminal panel's width in cells.
+///
+/// `Engine::terminal_resize` resizes **every** pane to `panel_cols`, which is
+/// right for tabs and wrong for a split: the two visible panes are painted at
+/// roughly half the panel width each, so resizing them to the full width
+/// reflows their contents off the painted area — the resize half of **#471**.
+/// This router keeps a split's per-pane widths, honouring an in-progress
+/// divider drag (`terminal_split_left_cols`) when one is set.
+pub fn route_terminal_resize(engine: &mut Engine, panel_cols: u16, rows: u16) {
+    let panel_cols = panel_cols.max(2);
+    if engine.terminal_split && engine.terminal_panes.len() >= 2 {
+        let left = if engine.terminal_split_left_cols > 0 {
+            engine
+                .terminal_split_left_cols
+                .clamp(1, panel_cols.saturating_sub(1))
+        } else {
+            panel_cols / 2
+        };
+        let right = panel_cols.saturating_sub(left).max(1);
+        engine.terminal_panes[0].session.resize(left, rows);
+        engine.terminal_panes[1].session.resize(right, rows);
+        // Panes 3+ are hidden tabs; they get the full panel width they will
+        // be painted at once the split closes.
+        for slot in engine.terminal_panes.iter_mut().skip(2) {
+            slot.session.resize(panel_cols, rows);
+        }
+    } else {
+        engine.terminal_resize(panel_cols, rows);
+    }
+}
+
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
 //
 // The rung directly beneath [`route_modal_overlay_click`]: once no modal
@@ -22390,6 +22575,59 @@ mod tests {
 
         e.terminal_toggle_split(80, 24);
         assert!(!e.terminal_split, "second toggle should disable split");
+    }
+
+    /// #758 / #471 (resize half): a window resize must not reflow a *split*
+    /// terminal's panes to the full panel width.
+    ///
+    /// `Engine::terminal_resize` — what `UiEvent::WindowResized` used to call
+    /// directly — resizes every pane to the panel width, so both halves of a
+    /// split silently became as wide as the whole panel while still being
+    /// painted into their narrow rects; anything typed past the painted
+    /// boundary wrapped out of view. `route_terminal_resize` splits the width
+    /// instead. Asserts on the PTY's own reported `cols()`, which is what the
+    /// painter reads back (`build_terminal_panel` -> `TerminalPanel::
+    /// content_cols`).
+    #[test]
+    fn route_terminal_resize_keeps_a_split_split() {
+        let mut e = test_engine("hello\n");
+        e.terminal_new_tab(80, 24);
+        e.terminal_toggle_split(80, 24);
+        assert!(e.terminal_split, "fixture must be in split mode");
+        assert_eq!(e.terminal_panes.len(), 2, "split must have two panes");
+
+        route_terminal_resize(&mut e, 100, 24);
+        assert_eq!(
+            (
+                e.terminal_panes[0].session.cols(),
+                e.terminal_panes[1].session.cols()
+            ),
+            (50, 50),
+            "a 100-column panel must be split between the two panes, not \
+             handed to each of them in full (#471)"
+        );
+
+        // An in-progress divider drag pins the left width; the right pane
+        // takes the remainder.
+        e.terminal_split_set_drag_cols(30);
+        route_terminal_resize(&mut e, 100, 24);
+        assert_eq!(
+            (
+                e.terminal_panes[0].session.cols(),
+                e.terminal_panes[1].session.cols()
+            ),
+            (30, 70),
+            "a dragged divider width must survive a resize"
+        );
+
+        // Not split: every pane gets the whole panel, as before.
+        e.terminal_split_set_drag_cols(0);
+        e.terminal_close_split(100, 24);
+        route_terminal_resize(&mut e, 90, 24);
+        assert!(
+            e.terminal_panes.iter().all(|s| s.session.cols() == 90),
+            "outside split mode every pane still takes the full panel width"
+        );
     }
 
     /// Tab drag and drop between groups creates a new split.
