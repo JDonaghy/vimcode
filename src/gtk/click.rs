@@ -399,7 +399,7 @@ fn resolve_charcell_tab_click(
 /// apply (selecting the tab, closing it, opening a split, ...).
 ///
 /// Right-clicks reach `ShellApp::handle` via a dedicated `MouseButton::Right`
-/// branch that historically only ever built `Msg::EditorRightClick` — there
+/// branch that historically only ever opened the *editor* context menu — there
 /// was no tab-bar-aware routing at all, so right-clicking a tab always opened
 /// the *editor's* context menu instead of a tab-specific one (#546 FAILED-1).
 /// This mirrors `pixel_to_click_target`'s zone resolution (read-only) so the

@@ -526,7 +526,7 @@ struct App {
     cached_char_width: f64,
     /// Position of the wheel event currently being handled, in **absolute**
     /// surface pixels (the same frame `render_content` paints in). Read by
-    /// `Msg::MouseScroll` to route the wheel to the registered scroll surface
+    /// `handle_mouse_scroll_msg` to route the wheel to the registered scroll surface
     /// or editor pane under the cursor (#240) — matches TUI behaviour.
     ///
     /// Written by `ShellApp::handle`'s `UiEvent::Scroll` arm from the event's
@@ -1072,15 +1072,6 @@ enum Msg {
     },
     /// Notify that a resize happened (triggers redraw).
     Resize,
-    /// Mouse click at (x, y) coordinates in drawing area.
-    MouseClick {
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-        /// True if the Alt modifier was held when the mouse button was pressed.
-        alt: bool,
-    },
     /// Toggle sidebar visibility.
     ToggleSidebar,
     /// Switch to a different sidebar panel.
@@ -1174,34 +1165,6 @@ enum Msg {
     ProjectReplaceAll,
     SearchPanelClick(f64, f64),
     SearchPanelKey(String, Option<char>),
-    /// Mouse scroll wheel on editor drawing area.
-    MouseScroll {
-        delta_x: f64,
-        delta_y: f64,
-    },
-    /// Ctrl+Click — plant a secondary cursor at the clicked buffer position.
-    CtrlMouseClick {
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-    },
-    /// Mouse double-click at (x, y) coordinates in drawing area.
-    MouseDoubleClick {
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-    },
-    /// Mouse drag to (x, y) coordinates in drawing area.
-    MouseDrag {
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-    },
-    /// Mouse button released in editor.
-    MouseUp,
     /// Rename a file: (old_path, new_name_without_dir)
     RenameFile(PathBuf, String),
     /// Move a file to a different directory: (src, dest_dir)
@@ -1264,16 +1227,8 @@ enum Msg {
     TerminalFindPrev,
     /// Toggle the VSCode-style menu bar on/off.
     ToggleMenuBar,
-    /// Dispatch a menu action by command string (from MenuSystem::Activated).
-    HandleMenuAction(String),
     /// MenuSystem state changed — sync overlay visibility and redraw.
     MenuRedraw,
-    /// Navigate back in MRU tab history.
-    MruNavBack,
-    /// Navigate forward in MRU tab history.
-    MruNavForward,
-    /// Open the Command Center picker (search box click).
-    OpenCommandCenter,
     /// Click in the debug sidebar DrawingArea (x, y coordinates in pixels).
     DebugSidebarClick(f64, f64),
     /// Drag motion in the debug sidebar (absolute x, y from GestureDrag).
@@ -1318,12 +1273,6 @@ enum Msg {
     AiSidebarKey(String, bool, Option<char>),
     /// Click in the AI sidebar DrawingArea (x, y).
     AiSidebarClick(f64, f64),
-    /// Minimize the application window.
-    WindowMinimize,
-    /// Maximize or restore the application window.
-    WindowMaximize,
-    /// Close the application window.
-    WindowClose,
     /// Show a native "Open File" dialog.
     OpenFileDialog,
     /// Show a native "Open Folder" dialog.
@@ -1334,8 +1283,6 @@ enum Msg {
     SaveWorkspaceAsDialog,
     /// Show a "Open Recent" picker.
     OpenRecentDialog,
-    /// User triggered quit from menu/close-button; check for unsaved changes.
-    ShowQuitConfirm,
     /// User confirmed quit (after saving or choosing to discard changes).
     QuitConfirmed,
     /// Clear the yank highlight after the flash duration has elapsed.
@@ -1355,18 +1302,6 @@ enum Msg {
     OpenBufferEditor(String),
     /// Alt key released — confirm tab switcher if open.
     TabSwitcherRelease,
-    /// Right-click on a tab in the tab bar: (group_id, tab_idx, pixel x, pixel y).
-    TabRightClick {
-        group_id: core::window::GroupId,
-        tab_idx: usize,
-        x: f64,
-        y: f64,
-    },
-    /// Right-click on the editor area (buffer text).
-    EditorRightClick {
-        x: f64,
-        y: f64,
-    },
 }
 
 /// Create a new `App` instance.
@@ -1674,6 +1609,298 @@ impl App {
         }
     }
 
+    /// Open the tab context menu for `tab_idx` in `group_id`, anchored at the
+    /// click's pixel position.
+    ///
+    /// #732 tranche 1: was `Msg::TabRightClick`, constructed by
+    /// `ShellApp::handle` from a `UiEvent::MouseDown` it already held and
+    /// immediately decoded again by `dispatch`.
+    fn handle_tab_right_click(
+        &mut self,
+        group_id: core::window::GroupId,
+        tab_idx: usize,
+        x: f64,
+        y: f64,
+    ) {
+        let cw = self.cached_char_width.max(1.0);
+        let lh = self.cached_line_height.max(1.0);
+        let cx = (x / cw) as u16;
+        let cy = (y / lh) as u16;
+        self.engine
+            .borrow_mut()
+            .open_tab_context_menu(group_id, tab_idx, cx, cy);
+        self.draw_needed.set(true);
+    }
+
+    /// Open the editor (buffer text) context menu at the click's pixel
+    /// position, unless a focused modal wants to swallow the click.
+    fn handle_editor_right_click(&mut self, x: f64, y: f64) {
+        // Swallow if the click landed on a focused modal that
+        // wants to consume it (#216 — editor hover popup).
+        self.reconcile_editor_hover_modal();
+        let stack_rc = self.backend.borrow().modal_stack_handle();
+        let in_modal = stack_rc
+            .borrow()
+            .hit_test(quadraui::Point {
+                x: x as f32,
+                y: y as f32,
+            })
+            .is_some();
+        if in_modal {
+            return;
+        }
+        let cw = self.cached_char_width.max(1.0);
+        let lh = self.cached_line_height.max(1.0);
+        let cx = (x / cw) as u16;
+        let cy = (y / lh) as u16;
+        self.engine.borrow_mut().open_editor_context_menu(cx, cy);
+        self.draw_needed.set(true);
+    }
+
+    /// Handle a window/viewport resize.
+    fn handle_resize(&mut self) {
+        // #731: both branches here were gated on `self.overlay` /
+        // `self.drawing_area`, permanently `None` under the
+        // ShellApp runner (nothing assigns either field) — so
+        // this was already a no-op: the backend viewport is
+        // re-derived every frame by the runner itself, and
+        // terminal-pane resize-on-window-resize has not fired
+        // since the #540 cutover. Re-deriving live terminal
+        // pane sizing needs a way to read the live DA's pixel
+        // size without a widget handle — see `terminal_cols`.
+        self.draw_needed.set(true);
+    }
+
+    /// Ctrl+Click — plant a secondary cursor at the clicked buffer position.
+    ///
+    /// The retired `Msg::CtrlMouseClick` also carried `width`/`height`, but
+    /// the arm bound both to `_`, so they are dropped from the signature
+    /// rather than threaded through unused.
+    fn handle_ctrl_mouse_click(&mut self, x: f64, y: f64) {
+        let layout_ref = self.cached_screen_layout.borrow();
+        if let Some(ref layout) = *layout_ref {
+            let mut engine = self.engine.borrow_mut();
+            if !engine.picker_open {
+                if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
+                    &mut engine,
+                    &self.backend,
+                    x,
+                    y,
+                    self.cached_line_height,
+                    self.cached_char_width,
+                    layout,
+                    &self.cached_tab_pixel_hits.borrow(),
+                    &self.tab_slot_positions.borrow(),
+                    &self.diff_btn_map.borrow(),
+                    &self.split_btn_map.borrow(),
+                    &self.action_btn_map.borrow(),
+                    &self.status_segment_map.borrow(),
+                    self.separated_status_bar_rect.get(),
+                    self.cached_frame_hit_map.borrow().as_ref(),
+                    &self.cached_tab_bar_zones.borrow(),
+                    true, // real click: focus/tab/gutter side effects are intended
+                ) {
+                    engine.add_cursor_at_pos(line, col);
+                }
+            }
+        }
+        self.draw_needed.set(true);
+    }
+
+    /// Double-click in the editor drawing area at the given pixel position.
+    ///
+    /// As with [`App::handle_ctrl_mouse_click`], the `width`/`height` the
+    /// retired `Msg::MouseDoubleClick` carried were bound to `_` and are
+    /// dropped from the signature.
+    fn handle_mouse_double_click_msg(&mut self, x: f64, y: f64) {
+        let mut engine = self.engine.borrow_mut();
+        if engine.picker_open {
+            let in_tree_mode = engine.picker_source
+                == crate::core::engine::PickerSource::CommandCenter
+                && engine.picker_query == "@";
+            if in_tree_mode && engine.picker_toggle_expand() {
+                engine.picker_load_preview();
+            } else {
+                let _action = engine.picker_confirm();
+            }
+            self.draw_needed.set(true);
+        } else {
+            // Breadcrumb double-click: same shared resolution as the
+            // single-click path above (#555). This used to re-derive
+            // the bar's geometry by hand — `y >= lh && y < lh * 2.0`
+            // plus a per-`char_width` walk over the *active* group's
+            // segments — which is pre-#540 Relm4 geometry: under the
+            // ShellApp runner the breadcrumb row sits below the title
+            // bar, the menu bar and a `1.6 * lh` tab row, so that band
+            // never contained it (double-click was dead) while still
+            // matching chrome rows that could fire the wrong segment.
+            let mut bc_handled = false;
+            if engine.settings.breadcrumbs {
+                let lh = self.painted_line_height();
+                let layout_ref = self.cached_screen_layout.borrow();
+                if let Some(ref layout) = *layout_ref {
+                    match render::resolve_breadcrumb_click(&layout.breadcrumbs, x, y, lh) {
+                        render::BreadcrumbClickResult::Hit(group_id, idx) => {
+                            drop(layout_ref);
+                            engine.handle_breadcrumb_double_click(group_id, idx);
+                            bc_handled = true;
+                        }
+                        render::BreadcrumbClickResult::OnBar => {
+                            bc_handled = true;
+                        }
+                        render::BreadcrumbClickResult::Miss => {}
+                    }
+                }
+            }
+            if !bc_handled {
+                let layout_ref = self.cached_screen_layout.borrow();
+                if let Some(ref layout) = *layout_ref {
+                    handle_mouse_double_click(
+                        &mut engine,
+                        &self.backend,
+                        x,
+                        y,
+                        self.cached_line_height,
+                        self.cached_char_width,
+                        layout,
+                        &self.cached_tab_pixel_hits.borrow(),
+                        &self.tab_slot_positions.borrow(),
+                        &self.diff_btn_map.borrow(),
+                        &self.split_btn_map.borrow(),
+                        &self.action_btn_map.borrow(),
+                        &self.status_segment_map.borrow(),
+                        self.separated_status_bar_rect.get(),
+                        self.cached_frame_hit_map.borrow().as_ref(),
+                        &self.cached_tab_bar_zones.borrow(),
+                    );
+                }
+            }
+        }
+        self.draw_needed.set(true);
+    }
+
+    /// Mouse wheel over the editor drawing area.
+    ///
+    /// `delta_y` arrives in **GTK's raw polarity** (positive = wheel down) —
+    /// see the negation comment at the `UiEvent::Scroll` call site in
+    /// `ShellApp::handle`.
+    fn handle_mouse_scroll_msg(&mut self, delta_x: f64, delta_y: f64) {
+        let mut engine = self.engine.borrow_mut();
+        // Picker open: scroll the picker results.
+        //
+        // #191: previously used `(delta_y * 3.0).round()`, which
+        // rounded small trackpad deltas (dy<0.17) down to 0 and
+        // made scrolling feel dead. `.ceil()` on the absolute
+        // value guarantees every non-zero event advances at
+        // least one row, and the `5.0` amplification is closer
+        // to native-app conventions for wheel notches.
+        if engine.picker_open && delta_y.abs() > 0.01 {
+            let step = (delta_y.abs() * 5.0).ceil() as isize;
+            let delta = if delta_y > 0.0 { step } else { -step };
+            engine.picker_scroll(delta, 20);
+            drop(engine);
+            self.draw_needed.set(true);
+            return;
+        }
+        // Route scroll through dispatch_scroll using cached scroll surfaces.
+        if let Some((px, py)) = self.last_editor_pointer.get() {
+            let surfaces = engine.scroll_surfaces.borrow();
+            let scroll_events = quadraui::dispatch_scroll(
+                &self.backend.borrow().modal_stack_handle().borrow(),
+                &surfaces,
+                quadraui::Point {
+                    x: px as f32,
+                    y: py as f32,
+                },
+                quadraui::ScrollDelta::new(delta_x as f32, delta_y as f32),
+            );
+            drop(surfaces);
+            for sev in &scroll_events {
+                if let quadraui::UiEvent::Scroll {
+                    widget: Some(id),
+                    delta,
+                    ..
+                } = sev
+                {
+                    match id.as_str() {
+                        "editor_hover" => {
+                            let step = (delta.y * 3.0).round() as i32;
+                            engine.editor_hover_scroll(step);
+                            drop(engine);
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                        "debug_output" => {
+                            engine.handle_debug_output_scroll(delta.y);
+                            drop(engine);
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                        "terminal_scrollback" => {
+                            // #533: single shared scroll entry point.
+                            // delta.y < 0 = up (into history); > 0 =
+                            // down (toward live).  Policy + forwarding
+                            // live in Engine::handle_terminal_scroll.
+                            engine.handle_terminal_scroll(delta.y);
+                            drop(engine);
+                            self.draw_needed.set(true);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // #240: route to the window under the pointer, falling back
+        // to the active window when the pointer is missing or over
+        // a non-window region. Hovering an unfocused group's pane
+        // scrolls *that* pane without changing focus or moving its
+        // cursor — matches TUI behaviour.
+        // #646: resolve the hovered pane against the bounds
+        // `render_content` actually painted with (`cached_editor_bounds`,
+        // absolute coords including the activity-bar/sidebar x-offset and
+        // the title-bar y-offset), not against a re-derived
+        // `(0, 0, da.width(), …)` rect. `self.drawing_area` is never
+        // assigned under the ShellApp runner — the runner owns the single
+        // DrawingArea — so the old `if let Some(da)` arm never ran and this
+        // was unconditionally `None`; and even had it run, a `(0, 0)`
+        // origin is the exact coordinate-frame mismatch #582 fixed for
+        // divider hit-testing.
+        let hovered_window_id = self
+            .last_editor_pointer
+            .get()
+            .zip(self.cached_editor_bounds.get())
+            .and_then(|((x, y), (editor_bounds, tab_bar_height))| {
+                let (rects, _) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
+                rects
+                    .iter()
+                    .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+                    .map(|(id, _)| *id)
+            });
+        if delta_y.abs() > 0.01 {
+            let scroll_count = (delta_y * 3.0).round().abs() as usize;
+            let active_id = engine.active_window_id();
+            let target = hovered_window_id.unwrap_or(active_id);
+            if target == active_id {
+                let dir = if delta_y > 0.0 { 1 } else { -1 };
+                engine.scroll_viewport_with_cursor(dir, scroll_count);
+            } else {
+                let dir = if delta_y > 0.0 { 1 } else { -1 };
+                engine.scroll_viewport_with_cursor_for_window(target, dir, scroll_count);
+            }
+            engine.sync_scroll_binds();
+        }
+        if delta_x.abs() > 0.01 {
+            let win_id = engine.active_window_id();
+            let current = engine.view().scroll_left;
+            let scroll_amount = (delta_x * 3.0).round() as isize;
+            let new_left = (current as isize + scroll_amount).max(0) as usize;
+            engine.set_scroll_left_for_window(win_id, new_left);
+        }
+        drop(engine);
+        self.draw_needed.set(true);
+    }
+
     fn dispatch(&mut self, msg: Msg) {
         match msg {
             Msg::KeyPress {
@@ -1688,184 +1915,12 @@ impl App {
                 self.engine.borrow_mut().clear_yank_highlight();
                 self.draw_needed.set(true);
             }
-            Msg::TabRightClick {
-                group_id,
-                tab_idx,
-                x,
-                y,
-            } => {
-                let cw = self.cached_char_width.max(1.0);
-                let lh = self.cached_line_height.max(1.0);
-                let cx = (x / cw) as u16;
-                let cy = (y / lh) as u16;
-                self.engine
-                    .borrow_mut()
-                    .open_tab_context_menu(group_id, tab_idx, cx, cy);
-                self.draw_needed.set(true);
-            }
             Msg::TabSwitcherRelease => {
                 // Handled directly by the root EventControllerKey release handler.
                 // Kept as a no-op for exhaustive match.
             }
-            Msg::EditorRightClick { x, y } => {
-                // Swallow if the click landed on a focused modal that
-                // wants to consume it (#216 — editor hover popup).
-                self.reconcile_editor_hover_modal();
-                let stack_rc = self.backend.borrow().modal_stack_handle();
-                let in_modal = stack_rc
-                    .borrow()
-                    .hit_test(quadraui::Point {
-                        x: x as f32,
-                        y: y as f32,
-                    })
-                    .is_some();
-                if in_modal {
-                    return;
-                }
-                let cw = self.cached_char_width.max(1.0);
-                let lh = self.cached_line_height.max(1.0);
-                let cx = (x / cw) as u16;
-                let cy = (y / lh) as u16;
-                self.engine.borrow_mut().open_editor_context_menu(cx, cy);
-                self.draw_needed.set(true);
-            }
             Msg::Resize => {
-                // #731: both branches here were gated on `self.overlay` /
-                // `self.drawing_area`, permanently `None` under the
-                // ShellApp runner (nothing assigns either field) — so
-                // this was already a no-op: the backend viewport is
-                // re-derived every frame by the runner itself, and
-                // terminal-pane resize-on-window-resize has not fired
-                // since the #540 cutover. Re-deriving live terminal
-                // pane sizing needs a way to read the live DA's pixel
-                // size without a widget handle — see `terminal_cols`.
-                self.draw_needed.set(true);
-            }
-            Msg::MouseClick {
-                x,
-                y,
-                width,
-                height,
-                alt,
-            } => {
-                self.handle_mouse_click_msg(x, y, width, height, alt);
-            }
-            Msg::CtrlMouseClick {
-                x,
-                y,
-                width: _,
-                height: _,
-            } => {
-                let layout_ref = self.cached_screen_layout.borrow();
-                if let Some(ref layout) = *layout_ref {
-                    let mut engine = self.engine.borrow_mut();
-                    if !engine.picker_open {
-                        if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
-                            &mut engine,
-                            &self.backend,
-                            x,
-                            y,
-                            self.cached_line_height,
-                            self.cached_char_width,
-                            layout,
-                            &self.cached_tab_pixel_hits.borrow(),
-                            &self.tab_slot_positions.borrow(),
-                            &self.diff_btn_map.borrow(),
-                            &self.split_btn_map.borrow(),
-                            &self.action_btn_map.borrow(),
-                            &self.status_segment_map.borrow(),
-                            self.separated_status_bar_rect.get(),
-                            self.cached_frame_hit_map.borrow().as_ref(),
-                            &self.cached_tab_bar_zones.borrow(),
-                            true, // real click: focus/tab/gutter side effects are intended
-                        ) {
-                            engine.add_cursor_at_pos(line, col);
-                        }
-                    }
-                }
-                self.draw_needed.set(true);
-            }
-            Msg::MouseDoubleClick {
-                x,
-                y,
-                width: _,
-                height: _,
-            } => {
-                let mut engine = self.engine.borrow_mut();
-                if engine.picker_open {
-                    let in_tree_mode = engine.picker_source
-                        == crate::core::engine::PickerSource::CommandCenter
-                        && engine.picker_query == "@";
-                    if in_tree_mode && engine.picker_toggle_expand() {
-                        engine.picker_load_preview();
-                    } else {
-                        let _action = engine.picker_confirm();
-                    }
-                    self.draw_needed.set(true);
-                } else {
-                    // Breadcrumb double-click: same shared resolution as the
-                    // single-click path above (#555). This used to re-derive
-                    // the bar's geometry by hand — `y >= lh && y < lh * 2.0`
-                    // plus a per-`char_width` walk over the *active* group's
-                    // segments — which is pre-#540 Relm4 geometry: under the
-                    // ShellApp runner the breadcrumb row sits below the title
-                    // bar, the menu bar and a `1.6 * lh` tab row, so that band
-                    // never contained it (double-click was dead) while still
-                    // matching chrome rows that could fire the wrong segment.
-                    let mut bc_handled = false;
-                    if engine.settings.breadcrumbs {
-                        let lh = self.painted_line_height();
-                        let layout_ref = self.cached_screen_layout.borrow();
-                        if let Some(ref layout) = *layout_ref {
-                            match render::resolve_breadcrumb_click(&layout.breadcrumbs, x, y, lh) {
-                                render::BreadcrumbClickResult::Hit(group_id, idx) => {
-                                    drop(layout_ref);
-                                    engine.handle_breadcrumb_double_click(group_id, idx);
-                                    bc_handled = true;
-                                }
-                                render::BreadcrumbClickResult::OnBar => {
-                                    bc_handled = true;
-                                }
-                                render::BreadcrumbClickResult::Miss => {}
-                            }
-                        }
-                    }
-                    if !bc_handled {
-                        let layout_ref = self.cached_screen_layout.borrow();
-                        if let Some(ref layout) = *layout_ref {
-                            handle_mouse_double_click(
-                                &mut engine,
-                                &self.backend,
-                                x,
-                                y,
-                                self.cached_line_height,
-                                self.cached_char_width,
-                                layout,
-                                &self.cached_tab_pixel_hits.borrow(),
-                                &self.tab_slot_positions.borrow(),
-                                &self.diff_btn_map.borrow(),
-                                &self.split_btn_map.borrow(),
-                                &self.action_btn_map.borrow(),
-                                &self.status_segment_map.borrow(),
-                                self.separated_status_bar_rect.get(),
-                                self.cached_frame_hit_map.borrow().as_ref(),
-                                &self.cached_tab_bar_zones.borrow(),
-                            );
-                        }
-                    }
-                }
-                self.draw_needed.set(true);
-            }
-            Msg::MouseDrag {
-                x,
-                y,
-                width,
-                height,
-            } => {
-                self.handle_mouse_drag_msg(x, y, width, height);
-            }
-            Msg::MouseUp => {
-                self.handle_mouse_up_msg();
+                self.handle_resize();
             }
             Msg::ToggleSidebar | Msg::SwitchPanel(_) => {
                 self.handle_sidebar_panel_msg(msg);
@@ -1901,125 +1956,6 @@ impl App {
             Msg::HorizontalScrollbarChanged { window_id, value } => {
                 let mut engine = self.engine.borrow_mut();
                 engine.set_scroll_left_for_window(window_id, value.round() as usize);
-                drop(engine);
-                self.draw_needed.set(true);
-            }
-            Msg::MouseScroll { delta_x, delta_y } => {
-                let mut engine = self.engine.borrow_mut();
-                // Picker open: scroll the picker results.
-                //
-                // #191: previously used `(delta_y * 3.0).round()`, which
-                // rounded small trackpad deltas (dy<0.17) down to 0 and
-                // made scrolling feel dead. `.ceil()` on the absolute
-                // value guarantees every non-zero event advances at
-                // least one row, and the `5.0` amplification is closer
-                // to native-app conventions for wheel notches.
-                if engine.picker_open && delta_y.abs() > 0.01 {
-                    let step = (delta_y.abs() * 5.0).ceil() as isize;
-                    let delta = if delta_y > 0.0 { step } else { -step };
-                    engine.picker_scroll(delta, 20);
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
-                }
-                // Route scroll through dispatch_scroll using cached scroll surfaces.
-                if let Some((px, py)) = self.last_editor_pointer.get() {
-                    let surfaces = engine.scroll_surfaces.borrow();
-                    let scroll_events = quadraui::dispatch_scroll(
-                        &self.backend.borrow().modal_stack_handle().borrow(),
-                        &surfaces,
-                        quadraui::Point {
-                            x: px as f32,
-                            y: py as f32,
-                        },
-                        quadraui::ScrollDelta::new(delta_x as f32, delta_y as f32),
-                    );
-                    drop(surfaces);
-                    for sev in &scroll_events {
-                        if let quadraui::UiEvent::Scroll {
-                            widget: Some(id),
-                            delta,
-                            ..
-                        } = sev
-                        {
-                            match id.as_str() {
-                                "editor_hover" => {
-                                    let step = (delta.y * 3.0).round() as i32;
-                                    engine.editor_hover_scroll(step);
-                                    drop(engine);
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                "debug_output" => {
-                                    engine.handle_debug_output_scroll(delta.y);
-                                    drop(engine);
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                "terminal_scrollback" => {
-                                    // #533: single shared scroll entry point.
-                                    // delta.y < 0 = up (into history); > 0 =
-                                    // down (toward live).  Policy + forwarding
-                                    // live in Engine::handle_terminal_scroll.
-                                    engine.handle_terminal_scroll(delta.y);
-                                    drop(engine);
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                // #240: route to the window under the pointer, falling back
-                // to the active window when the pointer is missing or over
-                // a non-window region. Hovering an unfocused group's pane
-                // scrolls *that* pane without changing focus or moving its
-                // cursor — matches TUI behaviour.
-                // #646: resolve the hovered pane against the bounds
-                // `render_content` actually painted with (`cached_editor_bounds`,
-                // absolute coords including the activity-bar/sidebar x-offset and
-                // the title-bar y-offset), not against a re-derived
-                // `(0, 0, da.width(), …)` rect. `self.drawing_area` is never
-                // assigned under the ShellApp runner — the runner owns the single
-                // DrawingArea — so the old `if let Some(da)` arm never ran and this
-                // was unconditionally `None`; and even had it run, a `(0, 0)`
-                // origin is the exact coordinate-frame mismatch #582 fixed for
-                // divider hit-testing.
-                let hovered_window_id = self
-                    .last_editor_pointer
-                    .get()
-                    .zip(self.cached_editor_bounds.get())
-                    .and_then(|((x, y), (editor_bounds, tab_bar_height))| {
-                        let (rects, _) =
-                            engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-                        rects
-                            .iter()
-                            .find(|(_, r)| {
-                                x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-                            })
-                            .map(|(id, _)| *id)
-                    });
-                if delta_y.abs() > 0.01 {
-                    let scroll_count = (delta_y * 3.0).round().abs() as usize;
-                    let active_id = engine.active_window_id();
-                    let target = hovered_window_id.unwrap_or(active_id);
-                    if target == active_id {
-                        let dir = if delta_y > 0.0 { 1 } else { -1 };
-                        engine.scroll_viewport_with_cursor(dir, scroll_count);
-                    } else {
-                        let dir = if delta_y > 0.0 { 1 } else { -1 };
-                        engine.scroll_viewport_with_cursor_for_window(target, dir, scroll_count);
-                    }
-                    engine.sync_scroll_binds();
-                }
-                if delta_x.abs() > 0.01 {
-                    let win_id = engine.active_window_id();
-                    let current = engine.view().scroll_left;
-                    let scroll_amount = (delta_x * 3.0).round() as isize;
-                    let new_left = (current as isize + scroll_amount).max(0) as usize;
-                    engine.set_scroll_left_for_window(win_id, new_left);
-                }
                 drop(engine);
                 self.draw_needed.set(true);
             }
@@ -2210,12 +2146,7 @@ impl App {
             | Msg::TerminalFindPrev => {
                 self.handle_terminal_msg(msg);
             }
-            Msg::ToggleMenuBar
-            | Msg::HandleMenuAction(_)
-            | Msg::MenuRedraw
-            | Msg::MruNavBack
-            | Msg::MruNavForward
-            | Msg::OpenCommandCenter => {
+            Msg::ToggleMenuBar | Msg::MenuRedraw => {
                 self.handle_menu_msg(msg);
             }
             Msg::DebugSidebarClick(_, _)
@@ -2251,15 +2182,11 @@ impl App {
             Msg::AiSidebarKey(_, _, _) | Msg::AiSidebarClick(_, _) => {
                 self.handle_ai_sidebar_msg(msg);
             }
-            Msg::WindowMinimize
-            | Msg::WindowMaximize
-            | Msg::WindowClose
-            | Msg::OpenFileDialog
+            Msg::OpenFileDialog
             | Msg::OpenFolderDialog
             | Msg::OpenWorkspaceDialog
             | Msg::SaveWorkspaceAsDialog
             | Msg::OpenRecentDialog
-            | Msg::ShowQuitConfirm
             | Msg::QuitConfirmed
             | Msg::ShowCloseTabConfirm
             | Msg::CloseTabConfirmed { .. } => {
@@ -2393,7 +2320,7 @@ impl App {
                 }
             }
             EngineAction::QuitWithUnsaved => {
-                self.dispatch(Msg::ShowQuitConfirm);
+                self.show_quit_confirm();
             }
             EngineAction::ToggleSidebar => {
                 // Engine handles this internally; sync local cache.
@@ -3865,7 +3792,7 @@ impl App {
                 use crate::core::engine::BottomPanelZone;
                 if matches!(zone, BottomPanelZone::TabBar) {
                     self.engine.borrow_mut().handle_bottom_tab_bar_click(x);
-                    self.dispatch(Msg::Resize);
+                    self.handle_resize();
                     return;
                 }
                 self.engine.borrow_mut().terminal_has_focus = true;
@@ -4836,75 +4763,84 @@ impl App {
     /// Kept as a named no-op so its two call sites stay self-documenting.
     fn sync_menu_overlay(&self) {}
 
+    /// Navigate back in MRU tab history (command-center back arrow).
+    fn mru_nav_back(&mut self) {
+        self.engine.borrow_mut().tab_nav_back();
+        self.draw_needed.set(true);
+    }
+
+    /// Open the Command Center picker (command-center search box).
+    fn open_command_center_picker(&mut self) {
+        self.engine.borrow_mut().open_command_center();
+        self.draw_needed.set(true);
+    }
+
+    /// Navigate forward in MRU tab history (command-center forward arrow).
+    fn mru_nav_forward(&mut self) {
+        self.engine.borrow_mut().tab_nav_forward();
+        self.draw_needed.set(true);
+    }
+
+    /// Dispatch a menu action by command string, as produced by
+    /// `quadraui::MenuEvent::Activated`.
+    fn handle_menu_action(&mut self, action: String) {
+        match action.as_str() {
+            "open_file_dialog" => {
+                self.dispatch(Msg::OpenFileDialog);
+            }
+            "open_folder_dialog" => {
+                self.dispatch(Msg::OpenFolderDialog);
+            }
+            "open_workspace_dialog" => {
+                self.engine.borrow_mut().open_workspace_from_file();
+                self.dispatch(Msg::RefreshFileTree);
+            }
+            "save_workspace_as_dialog" => {
+                self.dispatch(Msg::SaveWorkspaceAsDialog);
+            }
+            "openrecent" => {
+                self.dispatch(Msg::OpenRecentDialog);
+            }
+            "find" => {
+                self.engine.borrow_mut().open_find_replace();
+                self.draw_needed.set(true);
+            }
+            "quit_menu" => {
+                if self.engine.borrow().has_any_unsaved() {
+                    self.show_quit_confirm();
+                } else {
+                    self.save_session_and_exit();
+                }
+            }
+            _ => {
+                let engine_action = self.engine.borrow_mut().dispatch_menu_action(&action);
+                match engine_action {
+                    EngineAction::Quit | EngineAction::SaveQuit => {
+                        self.dispatch(Msg::QuitConfirmed);
+                    }
+                    EngineAction::QuitWithUnsaved => {
+                        self.show_quit_confirm();
+                    }
+                    EngineAction::ToggleSidebar => {
+                        self.sync_sidebar_from_engine();
+                    }
+                    EngineAction::OpenTerminal => {
+                        self.dispatch(Msg::NewTerminalTab);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.sync_menu_overlay();
+        self.draw_needed.set(true);
+    }
+
     fn handle_menu_msg(&mut self, msg: Msg) {
         match msg {
             Msg::ToggleMenuBar => {
                 self.draw_needed.set(true);
             }
-            Msg::MruNavBack => {
-                self.engine.borrow_mut().tab_nav_back();
-                self.draw_needed.set(true);
-            }
-            Msg::OpenCommandCenter => {
-                self.engine.borrow_mut().open_command_center();
-                self.draw_needed.set(true);
-            }
-            Msg::MruNavForward => {
-                self.engine.borrow_mut().tab_nav_forward();
-                self.draw_needed.set(true);
-            }
             Msg::MenuRedraw => {
-                self.sync_menu_overlay();
-                self.draw_needed.set(true);
-            }
-            Msg::HandleMenuAction(action) => {
-                match action.as_str() {
-                    "open_file_dialog" => {
-                        self.dispatch(Msg::OpenFileDialog);
-                    }
-                    "open_folder_dialog" => {
-                        self.dispatch(Msg::OpenFolderDialog);
-                    }
-                    "open_workspace_dialog" => {
-                        self.engine.borrow_mut().open_workspace_from_file();
-                        self.dispatch(Msg::RefreshFileTree);
-                    }
-                    "save_workspace_as_dialog" => {
-                        self.dispatch(Msg::SaveWorkspaceAsDialog);
-                    }
-                    "openrecent" => {
-                        self.dispatch(Msg::OpenRecentDialog);
-                    }
-                    "find" => {
-                        self.engine.borrow_mut().open_find_replace();
-                        self.draw_needed.set(true);
-                    }
-                    "quit_menu" => {
-                        if self.engine.borrow().has_any_unsaved() {
-                            self.dispatch(Msg::ShowQuitConfirm);
-                        } else {
-                            self.save_session_and_exit();
-                        }
-                    }
-                    _ => {
-                        let engine_action = self.engine.borrow_mut().dispatch_menu_action(&action);
-                        match engine_action {
-                            EngineAction::Quit | EngineAction::SaveQuit => {
-                                self.dispatch(Msg::QuitConfirmed);
-                            }
-                            EngineAction::QuitWithUnsaved => {
-                                self.dispatch(Msg::ShowQuitConfirm);
-                            }
-                            EngineAction::ToggleSidebar => {
-                                self.sync_sidebar_from_engine();
-                            }
-                            EngineAction::OpenTerminal => {
-                                self.dispatch(Msg::NewTerminalTab);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 self.sync_menu_overlay();
                 self.draw_needed.set(true);
             }
@@ -6966,27 +6902,70 @@ impl App {
         }
     }
 
+    /// Minimize the application window (inline window-control button).
+    fn window_minimize(&mut self) {
+        if let Some(ref w) = self.window {
+            w.minimize();
+        }
+    }
+
+    /// Maximize or restore the application window (inline window-control
+    /// button).
+    fn window_toggle_maximize(&mut self) {
+        if self.window.as_ref().is_some_and(|w| w.is_maximized()) {
+            if let Some(ref w) = self.window {
+                w.unmaximize();
+            }
+        } else if let Some(ref w) = self.window {
+            w.maximize();
+        }
+    }
+
+    /// Close the application window (inline window-control button).
+    fn window_close(&mut self) {
+        if let Some(ref w) = self.window {
+            w.close();
+        }
+    }
+
+    /// User triggered quit; exit straight away when nothing is unsaved,
+    /// otherwise raise the "unsaved changes" confirmation dialog.
+    fn show_quit_confirm(&mut self) {
+        if !self.engine.borrow().has_any_unsaved() {
+            self.save_session_and_exit();
+            return;
+        }
+        use crate::core::engine::DialogButton;
+        self.engine.borrow_mut().show_dialog(
+            "quit_unsaved",
+            "Unsaved Changes",
+            vec![
+                "You have unsaved changes.".to_string(),
+                "Do you want to save before quitting?".to_string(),
+            ],
+            vec![
+                DialogButton {
+                    label: "Save All & Quit".into(),
+                    hotkey: 's',
+                    action: "save_quit".into(),
+                },
+                DialogButton {
+                    label: "Quit Without Saving".into(),
+                    hotkey: 'q',
+                    action: "discard_quit".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+        self.draw_needed.set(true);
+    }
+
     fn handle_dialog_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::WindowMinimize => {
-                if let Some(ref w) = self.window {
-                    w.minimize();
-                }
-            }
-            Msg::WindowMaximize => {
-                if self.window.as_ref().is_some_and(|w| w.is_maximized()) {
-                    if let Some(ref w) = self.window {
-                        w.unmaximize();
-                    }
-                } else if let Some(ref w) = self.window {
-                    w.maximize();
-                }
-            }
-            Msg::WindowClose => {
-                if let Some(ref w) = self.window {
-                    w.close();
-                }
-            }
             Msg::OpenFileDialog => {
                 // Deferred to tick(), which has the runner-owned `backend`
                 // handle PlatformServices needs — see PendingFileDialog (#572).
@@ -7041,40 +7020,6 @@ impl App {
                     engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
                 }
                 drop(engine);
-                self.draw_needed.set(true);
-            }
-
-            Msg::ShowQuitConfirm => {
-                if !self.engine.borrow().has_any_unsaved() {
-                    self.save_session_and_exit();
-                    return;
-                }
-                use crate::core::engine::DialogButton;
-                self.engine.borrow_mut().show_dialog(
-                    "quit_unsaved",
-                    "Unsaved Changes",
-                    vec![
-                        "You have unsaved changes.".to_string(),
-                        "Do you want to save before quitting?".to_string(),
-                    ],
-                    vec![
-                        DialogButton {
-                            label: "Save All & Quit".into(),
-                            hotkey: 's',
-                            action: "save_quit".into(),
-                        },
-                        DialogButton {
-                            label: "Quit Without Saving".into(),
-                            hotkey: 'q',
-                            action: "discard_quit".into(),
-                        },
-                        DialogButton {
-                            label: "Cancel".into(),
-                            hotkey: '\0',
-                            action: "cancel".into(),
-                        },
-                    ],
-                );
                 self.draw_needed.set(true);
             }
 
@@ -8848,7 +8793,7 @@ impl quadraui::ShellApp for App {
             let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
             match menu_event {
                 quadraui::MenuEvent::Activated(id) => {
-                    self.handle_menu_msg(Msg::HandleMenuAction(id.as_str().to_string()));
+                    self.handle_menu_action(id.as_str().to_string());
                     self.draw_needed.set(true);
                     return quadraui::Reaction::Redraw;
                 }
@@ -8886,15 +8831,15 @@ impl quadraui::ShellApp for App {
                 .map(|l| l.hit_test(position.x, position.y));
             match cc_hit {
                 Some(quadraui::CommandCenterHit::Back) => {
-                    self.dispatch(Msg::MruNavBack);
+                    self.mru_nav_back();
                     return quadraui::Reaction::Redraw;
                 }
                 Some(quadraui::CommandCenterHit::Forward) => {
-                    self.dispatch(Msg::MruNavForward);
+                    self.mru_nav_forward();
                     return quadraui::Reaction::Redraw;
                 }
                 Some(quadraui::CommandCenterHit::SearchBox) => {
-                    self.dispatch(Msg::OpenCommandCenter);
+                    self.open_command_center_picker();
                     return quadraui::Reaction::Redraw;
                 }
                 // `Bar` (command-center background, not an interactive
@@ -8921,9 +8866,9 @@ impl quadraui::ShellApp for App {
                 match action {
                     quadraui::StatusBarAction::Clicked(id) => {
                         match id.as_str() {
-                            render::WINDOW_MINIMIZE_ACTION => self.dispatch(Msg::WindowMinimize),
-                            render::WINDOW_MAXIMIZE_ACTION => self.dispatch(Msg::WindowMaximize),
-                            render::WINDOW_CLOSE_ACTION => self.dispatch(Msg::WindowClose),
+                            render::WINDOW_MINIMIZE_ACTION => self.window_minimize(),
+                            render::WINDOW_MAXIMIZE_ACTION => self.window_toggle_maximize(),
+                            render::WINDOW_CLOSE_ACTION => self.window_close(),
                             _ => {}
                         }
                         self.draw_needed.set(true);
@@ -9073,21 +9018,16 @@ impl quadraui::ShellApp for App {
                 let (w, h) = (main.width as f64, main.height as f64);
                 match button {
                     MouseButton::Left if modifiers.ctrl => {
-                        self.dispatch(Msg::CtrlMouseClick {
-                            x: position.x as f64,
-                            y: position.y as f64,
-                            width: w,
-                            height: h,
-                        });
+                        self.handle_ctrl_mouse_click(position.x as f64, position.y as f64);
                     }
                     MouseButton::Left => {
-                        self.dispatch(Msg::MouseClick {
-                            x: position.x as f64,
-                            y: position.y as f64,
-                            width: w,
-                            height: h,
-                            alt: modifiers.alt,
-                        });
+                        self.handle_mouse_click_msg(
+                            position.x as f64,
+                            position.y as f64,
+                            w,
+                            h,
+                            modifiers.alt,
+                        );
                     }
                     MouseButton::Right => {
                         // #546 FAILED-1: this used to unconditionally build
@@ -9118,32 +9058,21 @@ impl quadraui::ShellApp for App {
                             })
                         };
                         if let Some((group_id, tab_idx)) = tab_target {
-                            self.dispatch(Msg::TabRightClick {
-                                group_id,
-                                tab_idx,
-                                x: rx,
-                                y: ry,
-                            });
+                            self.handle_tab_right_click(group_id, tab_idx, rx, ry);
                         } else {
-                            self.dispatch(Msg::EditorRightClick { x: rx, y: ry });
+                            self.handle_editor_right_click(rx, ry);
                         }
                     }
                     _ => {}
                 }
                 // Mouse clicks always require a redraw (cursor movement, selection,
-                // focus change). draw_needed may already be set by dispatch(), but
-                // set it unconditionally so handle() returns Reaction::Redraw even
-                // when dispatch() takes an early-return path in ShellApp mode.
+                // focus change). draw_needed may already be set by the handler
+                // above, but set it unconditionally so handle() returns
+                // Reaction::Redraw even when a handler takes an early-return path.
                 self.draw_needed.set(true);
             }
             UiEvent::DoubleClick { position, .. } => {
-                let main = ctx.layout.main_content_bounds;
-                self.dispatch(Msg::MouseDoubleClick {
-                    x: position.x as f64,
-                    y: position.y as f64,
-                    width: main.width as f64,
-                    height: main.height as f64,
-                });
+                self.handle_mouse_double_click_msg(position.x as f64, position.y as f64);
                 self.draw_needed.set(true);
             }
             UiEvent::MouseMoved { position, buttons } => {
@@ -9151,22 +9080,22 @@ impl quadraui::ShellApp for App {
                     .set((position.x as f64, position.y as f64));
                 if buttons.left {
                     let main = ctx.layout.main_content_bounds;
-                    self.dispatch(Msg::MouseDrag {
-                        x: position.x as f64,
-                        y: position.y as f64,
-                        width: main.width as f64,
-                        height: main.height as f64,
-                    });
+                    self.handle_mouse_drag_msg(
+                        position.x as f64,
+                        position.y as f64,
+                        main.width as f64,
+                        main.height as f64,
+                    );
                 }
             }
             UiEvent::MouseUp { .. } => {
-                self.dispatch(Msg::MouseUp);
+                self.handle_mouse_up_msg();
             }
             UiEvent::Scroll {
                 delta, position, ..
             } => {
                 // #646: record where the wheel event happened before dispatching.
-                // `Msg::MouseScroll` carries only the delta, and reads the pointer
+                // `handle_mouse_scroll_msg` takes only the delta, and reads the pointer
                 // back out of `last_editor_pointer` to decide which window (or
                 // registered scroll surface) the wheel targets. Nothing set that
                 // cell after the #540 Relm4→ShellApp migration removed the
@@ -9190,13 +9119,13 @@ impl quadraui::ShellApp for App {
                 //   flips one into the other — it constructs
                 //   `ScrollDelta::new(dx, -dy)`.
                 //
-                // Everything downstream of `Msg::MouseScroll` — the
+                // Everything downstream of `handle_mouse_scroll_msg` — the
                 // `delta_y > 0.0 => dir = 1` viewport step, the `picker_scroll`
                 // sign, `Engine::handle_terminal_scroll`'s "> 0 = toward live"
                 // policy — was written against GTK's raw polarity and is
                 // unchanged since before the #540 Relm4→ShellApp migration.
                 // Pre-migration the Relm4 `connect_scroll` closure fed it GTK's
-                // `dy` directly (`Msg::MouseScroll { delta_x: dx, delta_y: dy }`)
+                // `dy` directly (as the retired `Msg::MouseScroll`'s payload)
                 // and *separately* pushed the negated `gdk_scroll_to_uievent`
                 // form onto the backend event queue. The migration deleted that
                 // closure and left the runner's already-negated `UiEvent::Scroll`
@@ -9205,10 +9134,7 @@ impl quadraui::ShellApp for App {
                 //
                 // Only y is negated: `gdk_scroll_to_uievent` passes `dx`
                 // through unchanged, so `delta.x` is already GTK-raw.
-                self.dispatch(Msg::MouseScroll {
-                    delta_x: delta.x as f64,
-                    delta_y: -(delta.y as f64),
-                });
+                self.handle_mouse_scroll_msg(delta.x as f64, -(delta.y as f64));
             }
             UiEvent::WindowResized { .. } => {
                 // Runner sets new line_height/char_width after resize.
@@ -9216,10 +9142,10 @@ impl quadraui::ShellApp for App {
                 self.cached_char_width = backend.char_width() as f64;
                 self.line_height_cell.set(self.cached_line_height);
                 self.char_width_cell.set(self.cached_char_width);
-                self.dispatch(Msg::Resize);
+                self.handle_resize();
             }
             UiEvent::WindowClose => {
-                self.dispatch(Msg::ShowQuitConfirm);
+                self.show_quit_confirm();
             }
             // #593: quadraui's runner reads the system clipboard on Ctrl+V /
             // Ctrl+Shift+V / middle-click and delivers the text here,
