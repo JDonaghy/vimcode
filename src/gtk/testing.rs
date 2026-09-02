@@ -5277,7 +5277,12 @@ mod overlay_band_z_order {
     // `Vec<OverlayOp>`** for the same engine state. A single test cannot drive
     // both backends — the GTK `App` lives in the `vimcode` bin target,
     // `TuiShellApp` in `vcd` — so "both backends emit the same sequence" is
-    // expressed as two tests sharing one expected value. Keep them in step.
+    // expressed as two tests sharing one expected value. Both call
+    // `render::overlay_band_dialog_over_context_menu_fixture()` /
+    // `render::overlay_band_title_bar_only_fixture()` for that value — a
+    // single `#[cfg(test)]` fn in `render.rs`, compiled into both bin targets
+    // — rather than each transcribing its own `Vec<OverlayOp>` literal, so the
+    // compiler (not comment discipline) keeps the two expectations in step.
 
     /// A dialog both backends paint **in-canvas**.
     ///
@@ -5338,12 +5343,7 @@ mod overlay_band_z_order {
 
         assert_eq!(
             *h.painted_overlay_band.borrow(),
-            vec![
-                crate::render::OverlayOp::MenuDropdown,
-                crate::render::OverlayOp::CommandCenter,
-                crate::render::OverlayOp::ContextMenu,
-                crate::render::OverlayOp::Dialog,
-            ],
+            crate::render::overlay_band_dialog_over_context_menu_fixture(),
             "expected band differs from the TUI twin's \
              (`overlay_band_paints_dialog_above_context_menu_via_shell_app`). \
              Two orderings are pinned here: the title-bar chrome below the modal \
@@ -5354,10 +5354,19 @@ mod overlay_band_z_order {
         );
         // Paint, not just bookkeeping (#587/#592): a recorded rung that never
         // reached the surface is exactly the failure this repo keeps hitting.
+        // `dialog_layout` is set unconditionally in the same match arm right
+        // after `frame.draw(backend)`, so checking it alone would stay green
+        // even if the draw call never reached the Cairo surface — read the
+        // rendered screen instead, exactly like the TUI twin does.
         assert!(
-            h.dialog_layout.borrow().is_some(),
-            "recorded band claims the dialog painted in-canvas, but no \
-             `DialogLayout` was cached — the recorder and the painter disagree"
+            h.driver.screen_contains("ZQXW735DIALOG"),
+            "recorded band claims the dialog painted in-canvas, but its title \
+             is not on screen — the recorder and the painter disagree"
+        );
+        assert!(
+            h.driver.screen_contains("Go to Definition"),
+            "context menu should still be visible underneath the dialog (they \
+             don't overlap in this fixture) — its item label is not on screen"
         );
     }
 
@@ -5376,13 +5385,18 @@ mod overlay_band_z_order {
         let h = harness(engine, 1400, 900);
         assert_eq!(
             *h.painted_overlay_band.borrow(),
-            vec![
-                crate::render::OverlayOp::MenuDropdown,
-                crate::render::OverlayOp::CommandCenter,
-            ],
+            crate::render::overlay_band_title_bar_only_fixture(),
             "no app-level overlay was open, so only the title-bar rungs should \
              have painted — every other arm ran for its cache-clearing side \
              effect only"
+        );
+        // Paint, not just bookkeeping: prove the title-bar chrome the vector
+        // claims painted actually reached the surface, symmetric with the
+        // `screen_contains` check in the sibling test above.
+        assert!(
+            h.driver.screen_contains("File"),
+            "recorded band claims the title-bar/menu row painted, but its \
+             \"File\" menu label is not on screen"
         );
     }
 }

@@ -5577,12 +5577,7 @@ mod tests {
 
         assert_eq!(
             *band.borrow(),
-            vec![
-                render::OverlayOp::MenuDropdown,
-                render::OverlayOp::CommandCenter,
-                render::OverlayOp::ContextMenu,
-                render::OverlayOp::Dialog,
-            ],
+            render::overlay_band_dialog_over_context_menu_fixture(),
             "expected band differs from the GTK twin's \
              (`overlay_band_paints_dialog_above_context_menu_via_gtk_driver`). \
              Two orderings are pinned here: the title-bar chrome below the modal \
