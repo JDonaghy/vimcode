@@ -377,8 +377,8 @@ use crate::core::engine::sidebar::HAMBURGER_PANEL_ID;
 /// etc.) and the render-time caches `Engine` itself already uses
 /// (`sc_panel_layout`, `explorer_tree_rect`, ...).
 ///
-pub(super) struct TuiShellApp {
-    pub(super) engine: Engine,
+pub struct TuiShellApp {
+    pub engine: Engine,
     sidebar: TuiSidebar,
     sidebar_width: u16,
     folder_picker: Option<FolderPickerState>,
@@ -512,7 +512,7 @@ impl TuiShellApp {
     /// Construct the app, running the engine-only startup work that
     /// `tui_main::run()` currently does before entering raw mode
     /// (`mod.rs:641`-`:678`) — none of it needs a terminal or backend.
-    pub(super) fn new(file_path: Option<PathBuf>) -> Self {
+    pub fn new(file_path: Option<PathBuf>) -> Self {
         let mut engine = Engine::new();
         let msv_metrics = quadraui::MsvLayoutMetrics {
             header_size: 1.0,
@@ -681,7 +681,7 @@ impl TuiShellApp {
     /// (`quadraui::tui::shell_runner`) reads to decide whether to call
     /// `AppShell::with_title_bar` at construction — setting them directly
     /// here is simpler than routing through that builder twice.
-    pub(super) fn shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
+    pub fn shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
         fn panel(id: &str, icon: &str, title: &str, tooltip: &str) -> quadraui::PanelDefinition {
             quadraui::PanelDefinition {
                 id: quadraui::WidgetId::new(id),

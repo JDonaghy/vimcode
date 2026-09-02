@@ -1,7 +1,38 @@
-// Library shim for integration tests. No UI deps (GTK/Relm4/Cairo) allowed here.
+//! `vimcode_core` — the whole editor as a library.
+//!
+//! #657 promoted `render`, `tui_main` and `gtk` out of the `vimcode` / `vcd`
+//! binaries and into this crate, so that an **integration test** (a separate
+//! crate that links only against `[lib] vimcode_core`) can reach the UI
+//! backends and their black-box harnesses. Before the promotion, every
+//! black-box test in this repo *had* to be in-crate, because `tests/*.rs`
+//! could see nothing but `core` + `icons`. That made the coordinator's
+//! sealed-`tests/acceptance/` oracle loop impossible here — see the
+//! `tests/acceptance.rs` crate root, and `docs/ARCHITECTURE.md`.
+//!
+//! `src/main.rs` (GTK) and `src/tui_bin.rs` (TUI) are now thin shims over
+//! this crate: argument parsing plus a call into `gtk::run` / `tui_main::run`.
+//!
+//! GTK lives behind the `gui` feature, exactly as it did in the bin, so
+//! `--no-default-features` still builds on a machine with no GTK4 dev libs.
 #![allow(clippy::collapsible_match)]
 pub mod core;
 pub mod icons;
+
+// #657: promoted out of `src/main.rs` / `src/tui_bin.rs`, which used to
+// declare these as private `mod`s. No lint allows are re-stated here: each of
+// the three already carries the inner attributes it needs at the top of its
+// own file (`render.rs`'s `#![allow(dead_code)]`, `tui_main/mod.rs`'s
+// `#![allow(unused_assignments, ...)]`, `gtk/mod.rs`'s
+// `#![allow(deprecated)]`), and repeating them here trips clippy's
+// `duplicated_attributes`.
+pub mod render;
+pub mod tui_main;
+
+/// The GTK backend, behind the `gui` feature exactly as it was in the
+/// `vimcode` bin — so `--no-default-features` still builds on a machine with
+/// no GTK4 dev libs.
+#[cfg(feature = "gui")]
+pub mod gtk;
 
 // Re-export quadraui so integration tests + downstream consumers pin to the
 // same version vimcode is built against.

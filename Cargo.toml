@@ -32,8 +32,36 @@ required-features = ["gui"]
 name = "vcd"
 path = "src/tui_bin.rs"
 
+# #657: `tests/acceptance.rs` — the sealed oracle-loop suite root — is entirely
+# `#![cfg(all(feature = "test-support", feature = "gui"))]`. Without this
+# stanza a driver invocation that forgot the flags would compile the target
+# down to zero tests and report a vacuous "0 passed" success. Pinning
+# `required-features` turns that into a loud failure instead: with the features
+# missing, `cargo test --test acceptance` errors out naming them, and a plain
+# `cargo test --no-default-features` simply skips the target rather than
+# pretending the GTK half of the suite ran on a machine with no GTK.
+#
+# The configured driver command (coord-settings, `kind: tui-tuidriver`) is:
+#   RUSTC_BOOTSTRAP=1 cargo test --test acceptance --features test-support \
+#     -- -Z unstable-options --format json
+# `gui` comes along via `default`; `RUSTC_BOOTSTRAP=1` is what makes
+# `--format json` accepted by a stable rustc.
+[[test]]
+name = "acceptance"
+path = "tests/acceptance.rs"
+required-features = ["test-support", "gui"]
+
 [features]
 default = ["gui"]
+
+# #657: exposes the in-crate black-box harnesses to an *external*
+# integration-test crate — `gtk::testing::{Harness, harness}` and
+# `tui_main::testing::TuiShellApp` — so `tests/acceptance.rs` can drive both
+# backends the way the in-crate `#[cfg(test)]` suites do. Off for a normal
+# `cargo build` / `cargo test`; enable with `cargo test --features
+# test-support`. Everything it unlocks is already compiled under `cfg(test)`,
+# so this feature adds no new code, only reach.
+test-support = []
 # `quadraui/gtk` enables the public `quadraui::gtk::draw_*` rasterisers
 # (#223). vimcode adopts them one primitive at a time inside
 # `src/gtk/quadraui_gtk.rs`.

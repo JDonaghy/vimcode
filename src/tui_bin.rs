@@ -2,21 +2,17 @@
 //!
 //! Build with: `cargo build --release --bin vimcode-tui --no-default-features`
 
-// Shared modules contain code used only by the GTK binary — suppress warnings.
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_assignments,
-    clippy::collapsible_match
-)]
+//! #657: `core` / `icons` / `render` / `tui_main` were promoted into
+//! `vimcode_core`, so this binary no longer re-compiles them as private
+//! modules — it just calls into the library. The crate-wide
+//! `allow(dead_code, unused_imports)` this file used to carry (because the
+//! shared modules contain GTK-only code with no caller on this lane) moved
+//! with them, narrowed to `render` / `tui_main` on the no-GTK lane only.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-mod core;
-mod icons;
-mod render;
-mod tui_main;
+use vimcode_core::tui_main;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

@@ -1,12 +1,12 @@
-// Relm4 view! macro generates #[name = "..."] bindings that trigger this lint.
-// TreeView/TreeStore are deprecated in GTK4 4.10+ but still functional.
-#![allow(unused_assignments, deprecated, clippy::collapsible_match)]
+//! Thin GTK-binary shim over `vimcode_core` (#657).
+//!
+//! Everything this binary used to declare as a `mod` — `core`, `gtk`,
+//! `icons`, `render`, `tui_main` — now lives in the library crate, so that
+//! integration tests under `tests/` (a separate crate, which links only
+//! against `[lib] vimcode_core`) can reach the UI backends and their
+//! black-box harnesses. See `src/lib.rs`.
 
-mod core;
-mod gtk;
-mod icons;
-mod render;
-mod tui_main;
+use vimcode_core::{gtk, tui_main};
 
 use std::path::PathBuf;
 

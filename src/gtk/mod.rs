@@ -31,8 +31,10 @@ mod css;
 mod events;
 mod explorer;
 mod services;
-#[cfg(test)]
-mod testing;
+// #657: also compiled under `test-support` so the sealed acceptance suite in
+// `tests/acceptance.rs` — a separate crate — can reach the #646 harness.
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 mod util;
 
 use click::*;
@@ -1285,7 +1287,7 @@ impl App {
     /// assertions — `GtkDriver` only exposes the opaque `ShellAdapter`, with no
     /// accessor back to the concrete `App` (the same constraint the TUI tests
     /// document on `driver_with_shell`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn new_headless(engine: Rc<RefCell<Engine>>) -> Self {
         let (use_nerd_fonts, last_colorscheme) = {
             let e = engine.borrow();
@@ -7635,7 +7637,10 @@ fn h_scrollbar_hit_test(
 // handling), so that mechanism itself is unaffected.
 
 /// Entry point for GTK mode.
-pub(crate) fn run(file_path: Option<PathBuf>) {
+///
+/// `pub` rather than `pub(crate)` since #657: the caller is `src/main.rs`,
+/// which is now a separate crate from this module's.
+pub fn run(file_path: Option<PathBuf>) {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
         std::env::set_var("DISPLAY", ":0");
     }

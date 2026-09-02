@@ -4,6 +4,31 @@ Load this file when working on code structure, adding files, or navigating unfam
 
 ## Directory Layout
 
+### Crate layout: everything is in the library (#657)
+
+`[lib] vimcode_core` (`src/lib.rs`) owns **all** the code: `core`, `icons`,
+`render`, `tui_main`, and `gtk` (the last behind the `gui` feature). The two
+binaries are thin shims that parse argv and call in:
+
+| Target | File | Role |
+|---|---|---|
+| `[lib] vimcode_core` | `src/lib.rs` | every module; `pub mod gtk` is `#[cfg(feature = "gui")]` |
+| `[[bin]] vimcode` | `src/main.rs` | `required-features = ["gui"]`; `use vimcode_core::{gtk, tui_main}` |
+| `[[bin]] vcd` | `src/tui_bin.rs` | TUI-only; `use vimcode_core::tui_main` |
+
+Before #657, `render`/`tui_main`/`gtk` were private `mod`s **inside the
+binaries**, so `tests/*.rs` — a separate crate linking only against the lib —
+could see nothing but `core` + `icons`. That is why every black-box test in
+this repo is in-crate: it had to be. It also blocked the coordinator's oracle
+loop, which hardcodes a `tests/acceptance/` integration-test directory. If you
+are adding a module, add it to `src/lib.rs`, not to a bin.
+
+The `test-support` feature (off by default) re-exports the two black-box
+harnesses for that external crate: `gtk::testing::{Harness, harness}` (the #646
+headless `GtkDriver` wrapper) and `tui_main::testing::TuiShellApp` (for
+quadraui's `driver_with_shell`). See `tests/acceptance.rs` and
+`tests/acceptance/ms-example/contract.md`.
+
 ### GTK directory (`src/gtk/`)
 
 | File | What goes here |
