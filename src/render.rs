@@ -2363,6 +2363,22 @@ pub struct AiPanelData {
     pub input_cursor: usize,
 }
 
+/// Row zones painted by [`draw_ai_sidebar_panel`], in the caller's own
+/// coordinate space (character cells for TUI, pixels for GTK) — mirrors
+/// [`ScSidebarBands`], the git-panel equivalent this pattern is copied
+/// from. Cache the returned value and reuse it for click routing (#544):
+/// re-deriving the layout in the click handler is the bug #544/#582/#646
+/// all trace back to.
+#[derive(Debug, Clone, Copy)]
+pub struct AiSidebarBands {
+    /// Header row ("AI ASSISTANT" title).
+    pub header: quadraui::Rect,
+    /// Scrollable message-history area.
+    pub messages: quadraui::Rect,
+    /// Separator row + input box (everything below the message history).
+    pub input: quadraui::Rect,
+}
+
 // ─── SettingDef ───────────────────────────────────────────────────────────────
 
 // SettingType, SettingDef, and SETTING_DEFS are defined in settings.rs and
@@ -10525,6 +10541,272 @@ fn build_ai_panel_data(engine: &Engine) -> Option<AiPanelData> {
         scroll_top: engine.ai_scroll_top,
         input_cursor: engine.ai_input_cursor,
     })
+}
+
+/// One full-row `StatusBar` used as a plain text row — the same
+/// "single-segment `StatusBar` stands in for a plain text row" trick
+/// [`tab_hover_tooltip_paint`] and TUI's retired `draw_rule_row_q` use
+/// (#609/#671). `draw_status_bar`'s own per-backend impl already fills the
+/// row's background across the *entire* rect regardless of text length, so
+/// unlike that retired TUI-only helper there is no manual space-padding of
+/// `text` to `rect`'s width.
+fn draw_ai_text_row(
+    backend: &mut dyn quadraui::Backend,
+    rect: quadraui::Rect,
+    text: &str,
+    fg: quadraui::Color,
+    bg: quadraui::Color,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let bar = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("ai:row"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: text.to_string(),
+            fg,
+            bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: vec![],
+    };
+    let _ = backend.draw_status_bar(rect, &bar, None, None);
+}
+
+/// Paint the AI assistant sidebar panel through `Backend` primitives —
+/// header row, scrollable message history (`Backend::draw_message_list`),
+/// separator, and a multi-line growing input box with an inline cursor
+/// cell. One implementation shared by TUI's `render_ai_sidebar` and GTK's
+/// `render_content` `PANEL_AI` arm (#730 — the 14th and last `ScreenLayout`
+/// field #592 tracked, and the straggler #670 deferred).
+///
+/// `unit_w` / `unit_h` scale a character cell / text row into the caller's
+/// native coordinate space: `1.0, 1.0` for TUI (cell-native — `area` is
+/// already in character cells), or `char_width, line_height` in pixels for
+/// GTK — the same convention [`tab_hover_tooltip_paint`] and
+/// [`sc_sidebar_bands`] use.
+///
+/// Returns the [`AiSidebarBands`] this frame painted — cache it and reuse
+/// it for click routing (#544/#582/#646: never re-derive the layout in the
+/// click handler).
+pub fn draw_ai_sidebar_panel(
+    backend: &mut dyn quadraui::Backend,
+    area: quadraui::Rect,
+    ai: &AiPanelData,
+    theme: &Theme,
+    unit_w: f32,
+    unit_h: f32,
+) -> AiSidebarBands {
+    let empty_bands = AiSidebarBands {
+        header: quadraui::Rect::new(area.x, area.y, 0.0, 0.0),
+        messages: quadraui::Rect::new(area.x, area.y, 0.0, 0.0),
+        input: quadraui::Rect::new(area.x, area.y, 0.0, 0.0),
+    };
+    if area.width <= 0.0 || area.height <= 0.0 || unit_w <= 0.0 || unit_h <= 0.0 {
+        return empty_bands;
+    }
+
+    backend.set_theme(to_quadraui_theme(theme));
+
+    let header_fg = to_quadraui_color(theme.status_fg);
+    let header_bg = to_quadraui_color(theme.status_bg);
+    let default_fg = to_quadraui_color(theme.foreground);
+    let dim_fg = to_quadraui_color(theme.line_number_fg);
+    let panel_bg = to_quadraui_color(theme.completion_bg);
+    let input_active_bg = to_quadraui_color(theme.fuzzy_selected_bg);
+
+    let area_rows = (area.height / unit_h).floor().max(0.0) as usize;
+    let area_cols = (area.width / unit_w).floor().max(0.0) as usize;
+    let bottom = area.y + area.height;
+    let mut y = area.y;
+
+    // ── Row 0: header ─────────────────────────────────────────────────────────
+    let header_rect = quadraui::Rect::new(area.x, y, area.width, unit_h);
+    if y < bottom {
+        let hdr = if ai.streaming {
+            " \u{f0e5} AI ASSISTANT  (thinking…)"
+        } else {
+            " \u{f0e5} AI ASSISTANT"
+        };
+        draw_ai_text_row(backend, header_rect, hdr, header_fg, header_bg);
+        y += unit_h;
+    }
+
+    // ── Compute input height (grows with content) ─────────────────────────────
+    let pfx_len = 3usize; // " > " / "   "
+    let content_w = area_cols.saturating_sub(pfx_len).max(1);
+    let input_chars: Vec<char> = ai.input.chars().collect();
+    let input_line_count = {
+        let raw = if input_chars.is_empty() {
+            1
+        } else {
+            input_chars.len().div_ceil(content_w)
+        };
+        // cap so messages keep at least 3 rows
+        raw.min(area_rows.saturating_sub(5).max(1))
+    };
+    // +1 for separator row
+    let input_rows = input_line_count + 1;
+    let msg_area_rows = area_rows.saturating_sub(1 + input_rows);
+
+    // ── Message history ───────────────────────────────────────────────────────
+    let scroll = ai.scroll_top;
+    let wrap_w = content_w.saturating_sub(1).max(10); // slightly narrower for "  " indent
+    let q_user_fg = to_quadraui_color(theme.keyword);
+    let q_asst_fg = to_quadraui_color(theme.string_lit);
+    let q_default_fg = to_quadraui_color(theme.foreground);
+    let q_panel_bg = to_quadraui_color(theme.completion_bg);
+    let mut rows: Vec<quadraui::MessageRow> = Vec::new();
+    for msg in &ai.messages {
+        let is_user = msg.role == "user";
+        let role_label = if is_user { "You:" } else { "AI:" };
+        let role_fg = if is_user { q_user_fg } else { q_asst_fg };
+        rows.push(quadraui::MessageRow::new(role_label, role_fg, 0.0));
+        for line in msg.content.lines() {
+            if line.is_empty() {
+                rows.push(quadraui::MessageRow::new("", q_default_fg, 2.0));
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let mut pos = 0;
+            while pos < chars.len() {
+                let end = (pos + wrap_w).min(chars.len());
+                let chunk: String = chars[pos..end].iter().collect();
+                rows.push(quadraui::MessageRow::new(chunk, q_default_fg, 2.0));
+                pos = end;
+            }
+        }
+        rows.push(quadraui::MessageRow::new("", q_panel_bg, 0.0)); // blank separator
+    }
+
+    let total = rows.len();
+    let start = scroll.min(total.saturating_sub(msg_area_rows));
+    let msg_list = quadraui::MessageList {
+        id: quadraui::WidgetId::new("ai:messages"),
+        rows,
+        scroll_top: start,
+    };
+    let msg_area_top = y;
+    let messages_rect = quadraui::Rect::new(
+        area.x,
+        msg_area_top,
+        area.width,
+        msg_area_rows as f32 * unit_h,
+    );
+    backend.draw_message_list(messages_rect, &msg_list);
+    y += msg_area_rows as f32 * unit_h;
+
+    // Fill any rows the message list didn't cover (when there are
+    // fewer messages than the visible area).
+    let painted = msg_list.rows.len().saturating_sub(start).min(msg_area_rows);
+    let mut fill_y = msg_area_top + painted as f32 * unit_h;
+    let msg_bottom = msg_area_top + msg_area_rows as f32 * unit_h;
+    while fill_y < msg_bottom {
+        draw_ai_text_row(
+            backend,
+            quadraui::Rect::new(area.x, fill_y, area.width, unit_h),
+            "",
+            dim_fg,
+            panel_bg,
+        );
+        fill_y += unit_h;
+    }
+
+    // ── Separator ─────────────────────────────────────────────────────────────
+    if y < bottom {
+        let sep: String = std::iter::repeat_n('─', area_cols).collect();
+        draw_ai_text_row(
+            backend,
+            quadraui::Rect::new(area.x, y, area.width, unit_h),
+            &sep,
+            dim_fg,
+            header_bg,
+        );
+        y += unit_h;
+    }
+
+    let input_top = y;
+
+    // ── Input area (multi-line, grows with content) ────────────────────────────
+    let (inp_bg, inp_fg) = if ai.input_active {
+        (input_active_bg, default_fg)
+    } else {
+        (panel_bg, dim_fg)
+    };
+    let cursor = ai.input_cursor.min(input_chars.len());
+    let cursor_line = cursor.checked_div(content_w).unwrap_or(0);
+    let cursor_col = if content_w > 0 {
+        cursor % content_w
+    } else {
+        cursor
+    };
+
+    if ai.input_active || !ai.input.is_empty() {
+        // Split input into visual chunks
+        let chunks: Vec<&[char]> = if input_chars.is_empty() {
+            vec![&[][..]]
+        } else {
+            input_chars.chunks(content_w).collect()
+        };
+        for (line_idx, chunk) in chunks.iter().enumerate().take(input_line_count) {
+            if y >= bottom {
+                break;
+            }
+            // Prefix (" > " on first line, "   " on continuations) + content,
+            // in one call — the row-blank, prefix-write, and content-write
+            // are always the same `inp_fg`/`inp_bg` pair, and
+            // `draw_status_bar` fills the whole row's background regardless
+            // of text length, so painting the concatenated text in a single
+            // call is behaviour-identical to a three-pass cell-by-cell
+            // version.
+            let pfx = if line_idx == 0 { " > " } else { "   " };
+            let content: String = chunk.iter().collect();
+            let text = format!("{pfx}{content}");
+            draw_ai_text_row(
+                backend,
+                quadraui::Rect::new(area.x, y, area.width, unit_h),
+                &text,
+                inp_fg,
+                inp_bg,
+            );
+            // Cursor (inverted cell on the cursor line)
+            if ai.input_active && line_idx == cursor_line {
+                let cx = area.x + (pfx_len + cursor_col) as f32 * unit_w;
+                if cx < area.x + area.width {
+                    let cursor_ch = input_chars.get(cursor).copied().unwrap_or(' ');
+                    draw_ai_text_row(
+                        backend,
+                        quadraui::Rect::new(cx, y, unit_w, unit_h),
+                        &cursor_ch.to_string(),
+                        inp_bg,
+                        inp_fg,
+                    );
+                }
+            }
+            y += unit_h;
+        }
+    } else if y < bottom {
+        // Placeholder when input is empty and not active
+        let placeholder = if ai.streaming {
+            " (waiting for response…)"
+        } else {
+            " Press i to type…"
+        };
+        draw_ai_text_row(
+            backend,
+            quadraui::Rect::new(area.x, y, area.width, unit_h),
+            placeholder,
+            inp_fg,
+            inp_bg,
+        );
+    }
+
+    AiSidebarBands {
+        header: header_rect,
+        messages: messages_rect,
+        input: quadraui::Rect::new(area.x, input_top, area.width, (bottom - input_top).max(0.0)),
+    }
 }
 
 /// Build the cell grid for a single terminal session.

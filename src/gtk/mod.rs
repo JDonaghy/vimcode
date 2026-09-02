@@ -726,6 +726,12 @@ struct App {
     /// `engine.dap_sidebar_action_hits` are relative to this rect's origin, so
     /// the router needs it to translate an absolute press (#544).
     cached_dap_action_rect: Cell<Option<quadraui::Rect>>,
+    /// AI-sidebar band geometry (header / message history / input) as the
+    /// last `render_content` pass painted it, from
+    /// `render::draw_ai_sidebar_panel`. `route_ai_sidebar_event` resolves
+    /// presses against this so the click and paint derivations cannot drift
+    /// (#544/#730).
+    cached_ai_bands: Cell<Option<render::AiSidebarBands>>,
     /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
     /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
     /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
@@ -1712,6 +1718,7 @@ impl App {
             sidebar_pointer_captured: Cell::new(false),
             cached_sc_bands: Cell::new(None),
             cached_dap_action_rect: Cell::new(None),
+            cached_ai_bands: Cell::new(None),
             cached_tab_bar_zones: Rc::new(RefCell::new(HashMap::new())),
             cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
             cached_drop_tbh: Rc::new(Cell::new(0.0)),
@@ -7407,9 +7414,10 @@ impl App {
                 engine.handle_ext_sidebar_ui_event(event.clone());
                 true
             }
-            // PANEL_AI and unknowns are not painted through `render_content`
-            // yet (same `_ =>` holdout that arm has), so there is nothing for a
-            // click to hit — let it fall through rather than swallow it.
+            PANEL_AI => self.route_ai_sidebar_event(event),
+            // Unknown panel id: nothing was painted, so there is nothing
+            // for a click to hit — let it fall through rather than
+            // swallow it.
             _ => false,
         };
 
@@ -7540,6 +7548,50 @@ impl App {
             }
         }
         engine.handle_sc_sidebar_ui_event(event.clone());
+        true
+    }
+
+    /// Sidebar routing for the AI panel (#544/#730).
+    ///
+    /// `render_content` caches the header/messages/input bands in
+    /// `cached_ai_bands` at paint time (`render::draw_ai_sidebar_panel`'s
+    /// return value) — resolving a press against that means the click
+    /// router can never derive a different layout than the one actually on
+    /// screen (#544/#582/#646). Neither TUI nor the pre-#730 GTK arm had any
+    /// body-click routing here (AI-panel focus/edit was keyboard-only on
+    /// both backends); this adds the same "click focuses the panel,
+    /// click-in-input activates editing" policy the git sidebar's commit
+    /// box already uses (`route_sc_sidebar_event` above), consuming the
+    /// press unconditionally like every other panel arm in
+    /// `try_route_sidebar_mouse_event` — a click on empty panel padding
+    /// still belongs to this panel, not the editor underneath it.
+    fn route_ai_sidebar_event(&mut self, event: &quadraui::UiEvent) -> bool {
+        let Some(bands) = self.cached_ai_bands.get() else {
+            return false;
+        };
+        let starts_interaction = matches!(
+            event,
+            quadraui::UiEvent::MouseDown { .. } | quadraui::UiEvent::DoubleClick { .. }
+        );
+        let pos = match event {
+            quadraui::UiEvent::MouseDown { position, .. }
+            | quadraui::UiEvent::DoubleClick { position, .. }
+            | quadraui::UiEvent::MouseUp { position, .. }
+            | quadraui::UiEvent::MouseMoved { position, .. }
+            | quadraui::UiEvent::Scroll { position, .. } => *position,
+            _ => return false,
+        };
+        if starts_interaction {
+            let mut engine = self.engine.borrow_mut();
+            engine.ai_has_focus = true;
+            let in_input = pos.y >= bands.input.y && pos.y < bands.input.y + bands.input.height;
+            if in_input {
+                engine.ai_input_active = true;
+                engine.ai_input_cursor = engine.ai_input.chars().count();
+            } else {
+                engine.ai_input_active = false;
+            }
+        }
         true
     }
 
@@ -9446,12 +9498,29 @@ impl quadraui::ShellApp for App {
                     engine.ext_sidebar_body_rect.set(q_sb);
                     engine.ext_sidebar_system.borrow().render(backend, q_sb);
                 }
+                PANEL_AI => {
+                    // #730: the last of #592's 14 `ScreenLayout` fields,
+                    // and the straggler #670 deferred. Paints through the
+                    // same `render::draw_ai_sidebar_panel` builder TUI's
+                    // `render_ai_sidebar` calls — `unit_w`/`unit_h` here are
+                    // the pixel `char_width`/`line_height` GTK's other
+                    // row-based panels (PANEL_GIT, PANEL_DEBUG) already
+                    // convert through, unlike TUI's cell-native `1.0, 1.0`.
+                    // Bands are cached for `route_ai_sidebar_event` so the
+                    // click and paint derivations cannot drift (#544).
+                    if let Some(ref ai) = screen.ai_panel {
+                        let bands = render::draw_ai_sidebar_panel(
+                            backend, q_sb, ai, &theme, cw as f32, lh as f32,
+                        );
+                        self.cached_ai_bands.set(Some(bands));
+                    } else {
+                        self.cached_ai_bands.set(None);
+                    }
+                }
                 _ => {
-                    // PANEL_AI and unknowns: not yet migrated to Backend
-                    // primitives (#670 scoped only the other four panel
-                    // surfaces — quickfix/bottom_tabs/debug_toolbar/
-                    // panel_hover — and left AI for a follow-up issue; see
-                    // that issue's own "no PANEL_AI arm at all" note).
+                    // Unknown panel id: nothing painted, nothing to route a
+                    // click to.
+                    self.cached_ai_bands.set(None);
                 }
             }
 
