@@ -2165,6 +2165,71 @@ pub fn route_modal_overlay_click(
     ModalOverlayRoute::None
 }
 
+// ─── Modal keyboard routing (#734 slice 1) ────────────────────────────────────
+//
+// The keyboard twin of `route_modal_overlay_click` above, and the top rung
+// of the precedence ladder #734 exists to state once. Before this, the ladder
+// was transcribed per backend and had drifted:
+//
+//   TUI  dialog → folder picker → activity bar → sidebar (which carried its
+//        OWN copy of the context-menu rung) → … → context menu → engine
+//   GTK  context menu (hand-rolled, NOT `Engine::handle_context_menu_key`) →
+//        activity bar → explorer (which carried a SECOND hand-rolled copy of
+//        the context-menu rung, plus a dialog patch-up) → … → engine
+//
+// Four hand-rolled copies of one rung, and GTK had no top-level dialog rung
+// at all — so a dialog opened while the activity bar / explorer / an
+// extension panel held focus lost its keys to that panel.
+//
+// `Engine::handle_key` already sequences these three correctly for the keys
+// that reach it (`core/engine/keys.rs`: spell suggestions → dialog → context
+// menu). This function states the same order for the *backends*, so their
+// focus ladders can no longer cut in front of it.
+
+/// Which modal surface owns a keystroke, resolved before either backend
+/// consults its own focus ladder (activity bar, sidebar, extension panel,
+/// terminal, editor).
+///
+/// This is pure state inspection over [`Engine`] — no backend-specific
+/// content, which is precisely why both backends were able to transcribe
+/// it independently and then drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalKeyRoute {
+    /// A modal [`Engine::handle_key`] already arbitrates internally —
+    /// spell-suggestion selection or a modal dialog. The backend hands the
+    /// key straight to `Engine::handle_key` and consumes it.
+    Engine,
+    /// The context-menu popup. The backend calls
+    /// [`Engine::handle_context_menu_key`] and dispatches the action it
+    /// returns against [`Engine::context_menu_target_path`] — the one part
+    /// that stays backend-side, because "new_file" / "open_terminal" need
+    /// backend plumbing.
+    ContextMenu,
+    /// No modal is up; the caller continues down its own ladder.
+    None,
+}
+
+/// Resolve the top rung of the *keyboard* ladder against engine state.
+///
+/// Order matches `Engine::handle_key`'s own: spell suggestions, then a
+/// modal dialog, then the context menu.
+pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
+    // Spell-suggestion selection intercepts all keys (`keys.rs`'s first
+    // branch); a dialog is modal and intercepts everything below it.
+    if engine.spell_suggestions.is_some() || engine.dialog.is_some() {
+        return ModalKeyRoute::Engine;
+    }
+
+    // The context menu is modal too, but unlike the two above its confirmed
+    // action needs backend plumbing, so it gets its own route rather than
+    // being folded into `Engine`.
+    if engine.context_menu.is_some() {
+        return ModalKeyRoute::ContextMenu;
+    }
+
+    ModalKeyRoute::None
+}
+
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
 /// Data needed to render the quickfix bottom panel.
@@ -19296,6 +19361,31 @@ mod tests {
             ),
             ModalOverlayRoute::None
         );
+    }
+
+    /// #734 slice 1: the keyboard ladder's top rung, pinned in the order
+    /// `Engine::handle_key` itself uses — spell suggestions, then a modal
+    /// dialog, then the context menu. Both backends match on this, so a
+    /// reorder here is a cross-backend behaviour change and should have to
+    /// break a test to happen.
+    #[test]
+    fn modal_key_router_orders_spell_and_dialog_above_the_context_menu() {
+        let mut engine = Engine::new();
+        assert_eq!(route_modal_key(&engine), ModalKeyRoute::None);
+
+        // A context menu alone routes to its own (backend-dispatched) arm.
+        engine.open_editor_context_menu(5, 5);
+        assert_eq!(route_modal_key(&engine), ModalKeyRoute::ContextMenu);
+
+        // A modal dialog outranks it — the rung GTK was missing entirely.
+        engine.show_quit_confirm();
+        assert!(engine.dialog.is_some());
+        assert!(engine.context_menu.is_some());
+        assert_eq!(route_modal_key(&engine), ModalKeyRoute::Engine);
+
+        // Spell-suggestion selection outranks everything, as in `keys.rs`.
+        engine.spell_suggestions = Some(("teh".into(), vec!["the".into()], String::new()));
+        assert_eq!(route_modal_key(&engine), ModalKeyRoute::Engine);
     }
 
     #[test]

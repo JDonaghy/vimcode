@@ -3039,49 +3039,26 @@ fn dispatch_panel_accelerator_sizeless(
 /// panel re-dispatches it into `SidebarSystem::handle` for its navigation
 /// keys before falling back to the action-key table, which is what
 /// `event_loop`'s `ui_event_saved` clone (`mod.rs:1745`) existed for.
+/// `screen_w` was dropped in #734 slice 1: the deleted context-menu tier
+/// was its only reader.
 #[allow(clippy::too_many_arguments)]
 fn handle_sidebar_focused_key(
     key_event: KeyEvent,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
-    screen_w: u16,
     screen_h: u16,
     backend: &mut dyn quadraui::Backend,
     ui_event: &UiEvent,
 ) -> Reaction {
     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
 
-    // #451: when an explorer context menu is open, intercept j/k/Enter/Esc
-    // HERE — before the panel-specific dispatch below sends j/k to
-    // `dispatch_explorer_key`. Without this, explorer-focused mode hijacks
-    // the keys and the menu's own selection doesn't move.
-    if engine.context_menu.is_some() {
-        let effective_key = match key_event.code {
-            KeyCode::Up => "Up".to_string(),
-            KeyCode::Down => "Down".to_string(),
-            KeyCode::Enter => "Return".to_string(),
-            KeyCode::Esc => "Escape".to_string(),
-            KeyCode::Char(c) => c.to_string(),
-            _ => String::new(),
-        };
-        if !effective_key.is_empty() {
-            let ctx = engine.context_menu_target_path();
-            let (consumed, action) = engine.handle_context_menu_key(&effective_key);
-            if consumed {
-                if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
-                    handle_explorer_context_action(
-                        &act,
-                        engine,
-                        sidebar,
-                        Some(Size::new(screen_w, screen_h)),
-                        ctx_path,
-                        ctx_is_dir,
-                    );
-                }
-                return Reaction::Redraw;
-            }
-        }
-    }
+    // #734 slice 1: the #451 context-menu intercept that used to open this
+    // function is gone. It was the second of TUI's two copies of that rung
+    // (the other sat near the bottom of `handle_key_pressed`) and a fourth
+    // across both backends; `render::route_modal_key` now resolves it above
+    // `handle_key_pressed`'s sidebar tier, which is this function's only
+    // caller — so explorer-focused mode can no longer hijack j/k from an
+    // open menu, for the same reason, stated once.
 
     // Ctrl-W prefix: set pending state for window navigation. A Vim chord,
     // so it stays inline rather than becoming an accelerator.
@@ -3557,25 +3534,66 @@ fn handle_key_pressed(
         return Reaction::Continue;
     };
 
-    // ── Modal dialog intercepts ALL keys (mirrors mod.rs:1629-:1651) ────
-    if engine.dialog.is_some() {
-        if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) {
-            let action = engine.handle_key(&key_name, unicode, ctrl);
-            if handle_action(engine, action) {
-                return Reaction::Exit;
-            }
-        } else if key_event.kind != KeyEventKind::Release {
-            match key_event.code {
-                KeyCode::Tab => {
-                    engine.handle_key("Tab", None, false);
+    // ── Shared modal keyboard rung (#734 slice 1) ──────────────────────
+    // Spell suggestions → modal dialog → context menu, stated once in
+    // `render::route_modal_key` and matched identically by both backends.
+    // Replaces the hand-transcribed dialog tier that used to open this
+    // function *and* the context-menu tier that used to sit near the
+    // bottom of it (below the sidebar tier, which carried its own second
+    // copy — see `handle_sidebar_focused_key`). Both are gone; the ladder
+    // now has one statement, and the spell-suggestion rung — previously
+    // reachable only if nothing else claimed the key first — is genuinely
+    // modal on both backends.
+    match render::route_modal_key(engine) {
+        render::ModalKeyRoute::Engine => {
+            if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) {
+                let action = engine.handle_key(&key_name, unicode, ctrl);
+                if handle_action(engine, action) {
+                    return Reaction::Exit;
                 }
-                KeyCode::BackTab => {
-                    engine.handle_key("Shift_Tab", None, false);
+            } else if key_event.kind != KeyEventKind::Release {
+                match key_event.code {
+                    KeyCode::Tab => {
+                        engine.handle_key("Tab", None, false);
+                    }
+                    KeyCode::BackTab => {
+                        engine.handle_key("Shift_Tab", None, false);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            return Reaction::Redraw;
         }
-        return Reaction::Redraw;
+        render::ModalKeyRoute::ContextMenu => {
+            if key_event.kind == KeyEventKind::Release {
+                return Reaction::Continue;
+            }
+            // `handle_context_menu_key` consumes every key while the menu is
+            // open (its `_` arm closes it), so an untranslatable key is
+            // swallowed rather than falling through to the tier below — the
+            // modal semantics the two old copies only approximated.
+            if let Some((key_name, unicode, _ctrl)) = translate_key(key_event, keyboard_enhanced) {
+                let effective_key = if key_name.is_empty() {
+                    unicode.map(|c| c.to_string()).unwrap_or_default()
+                } else {
+                    key_name
+                };
+                let ctx = engine.context_menu_target_path();
+                let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
+                if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
+                    handle_explorer_context_action(
+                        &act,
+                        engine,
+                        sidebar,
+                        Some(Size::new(screen_w, screen_h)),
+                        ctx_path,
+                        ctx_is_dir,
+                    );
+                }
+            }
+            return Reaction::Redraw;
+        }
+        render::ModalKeyRoute::None => {}
     }
 
     // ── Folder picker modal (mirrors mod.rs:1653-:1708) ─────────────────
@@ -3707,7 +3725,6 @@ fn handle_key_pressed(
             key_event,
             engine,
             sidebar,
-            screen_w,
             screen_h,
             backend,
             state.ui_event,
@@ -3987,29 +4004,9 @@ fn handle_key_pressed(
         }
     }
 
-    // ── Context menu keyboard intercept (mirrors mod.rs:2703-:2706) ─────
-    if engine.context_menu.is_some() {
-        let effective_key = if key_name.is_empty() {
-            unicode.map(|c| c.to_string()).unwrap_or_default()
-        } else {
-            key_name.clone()
-        };
-        let ctx = engine.context_menu_target_path();
-        let (consumed, action) = engine.handle_context_menu_key(&effective_key);
-        if consumed {
-            if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
-                handle_explorer_context_action(
-                    &act,
-                    engine,
-                    sidebar,
-                    Some(Size::new(screen_w, screen_h)),
-                    ctx_path,
-                    ctx_is_dir,
-                );
-            }
-            return Reaction::Redraw;
-        }
-    }
+    // #734 slice 1: the context-menu intercept that used to sit here is
+    // gone — `render::route_modal_key` resolves it at the top of this
+    // function, above every focus tier, instead of below all of them.
 
     // ── General fallback: `Engine::handle_key` (mirrors
     // mod.rs:2637-:2737) ─────────────────────────────────────────────────
@@ -8562,6 +8559,113 @@ mod tests {
             !screen.contains("Ln 1, Col 1"),
             "an outside click must propagate to the editor underneath and \
              move the cursor off line 1; screen:\n{screen}"
+        );
+    }
+
+    // ── #734 slice 1: the shared modal keyboard rung ─────────────────────
+    //
+    // `handle_key_pressed`'s top rung is now `render::route_modal_key`, the
+    // same function `src/gtk/mod.rs::handle_key_press` calls. Both tests
+    // below focus the activity bar first, because that focus tier used to
+    // sit ABOVE the modal it is now beaten by — the concrete shape of the
+    // "the ladder is transcribed, not shared" defect #734 exists to fix.
+
+    /// A misspelled word with a pending spell-suggestion prompt, and the
+    /// activity bar holding keyboard focus.
+    ///
+    /// `spell_suggestions` is set through `Engine`'s own tuple shape rather
+    /// than `spell_suggest_under_cursor` so the fixture does not depend on a
+    /// dictionary being installed on the test machine.
+    fn app_with_spell_suggestions_and_activity_bar_focus() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "teh end\n");
+        app.engine.spell_suggestions =
+            Some(("teh".to_string(), vec!["the".to_string()], String::new()));
+        app.engine.activity_bar_focus_in_at(0);
+        assert!(
+            app.engine.activity_bar_focused,
+            "fixture must actually focus the activity bar"
+        );
+        app
+    }
+
+    /// #734 acceptance, TUI half: spell-suggestion selection is modal — it
+    /// must beat the activity-bar focus tier, not sit below it.
+    ///
+    /// Asserted on the painted frame: the misspelled word is replaced in the
+    /// editor text and the engine's confirmation message reaches the status
+    /// line. Nothing here reads `spell_suggestions` directly.
+    ///
+    /// RED against unfixed `develop`: `handle_key_pressed` reached the
+    /// spell-suggestion branch only via `Engine::handle_key` at the very
+    /// bottom of the ladder, so the activity-bar tier swallowed `'1'` in its
+    /// `_ => {}` arm and the buffer still read "teh end".
+    #[test]
+    fn driver_spell_suggestion_key_beats_a_focused_activity_bar() {
+        let mut driver = driver_with_shell(
+            app_with_spell_suggestions_and_activity_bar_focus(),
+            config(),
+            100,
+            24,
+        );
+        assert!(
+            driver.screen_contains("teh end"),
+            "precondition: the misspelled word paints; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('1'),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("the end"),
+            "'1' must reach the spell-suggestion handler and apply the \
+             correction; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Changed"),
+            "the engine's confirmation message must reach the status line; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// The context-menu twin: an open context menu is modal too, so Escape
+    /// must dismiss *it* rather than being spent unfocusing the activity
+    /// bar underneath.
+    ///
+    /// RED against unfixed `develop`: the context-menu tier sat near the
+    /// BOTTOM of `handle_key_pressed` (and a second copy inside
+    /// `handle_sidebar_focused_key`), both below the activity-bar tier, so
+    /// Escape ran `activity_bar_focus_out()` and the menu stayed painted.
+    #[test]
+    fn driver_context_menu_key_beats_a_focused_activity_bar() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine.open_editor_context_menu(20, 5);
+        app.engine.activity_bar_focus_in_at(0);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen_contains("Paste"),
+            "precondition: the context menu paints its always-enabled Paste \
+             item; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Escape),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Paste"),
+            "Escape must dismiss the modal context menu, not be eaten by the \
+             focused activity bar underneath; screen:\n{screen}"
         );
     }
 }

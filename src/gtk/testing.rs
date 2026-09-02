@@ -3317,6 +3317,93 @@ mod chrome_surfaces {
         );
     }
 
+    // ── #734 slice 1: the shared modal keyboard rung ─────────────────────
+    //
+    // `handle_key_press`'s top rung is now `render::route_modal_key`, the
+    // same function `src/tui_main/shell_app.rs::handle_key_pressed` calls.
+    // GTK previously opened with a *hand-rolled* context-menu rung that did
+    // not go through `Engine::handle_context_menu_key`, and had no
+    // top-level dialog rung at all.
+
+    /// #734 acceptance, GTK half: an open context menu is modal, so a key
+    /// it does not act on must still be consumed — not close the menu *and*
+    /// move the editor cursor underneath it.
+    ///
+    /// `l` is the sharpest probe: `Engine::handle_context_menu_key` treats
+    /// it as "confirm" (the TUI half has always done so), while GTK's
+    /// hand-rolled ladder fell into its `_` arm, which closed the menu and
+    /// then deliberately fell through to normal key handling — where `l` is
+    /// a Normal-mode cursor-right motion.
+    ///
+    /// Both halves are read off the painted frame: the menu's own
+    /// always-enabled "Paste" item, and the status bar's `Ln N, Col N`
+    /// readout, which is where a leaked editor keypress shows up.
+    ///
+    /// RED against unfixed `develop`: the menu closed (first assertion
+    /// passes) but the cursor advanced to `Ln 1, Col 2`.
+    #[test]
+    fn context_menu_key_is_consumed_instead_of_leaking_to_the_editor() {
+        let mut engine = small_engine();
+        engine.open_editor_context_menu(700, 400);
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.driver.screen_contains("Paste"),
+            "precondition: the context menu paints its always-enabled Paste item"
+        );
+        assert!(
+            h.driver.screen_contains("Ln 1, Col 1"),
+            "precondition: the cursor starts at line 1, column 1"
+        );
+
+        h.driver.type_char('l');
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("Paste"),
+            "'l' must reach `Engine::handle_context_menu_key` and close the menu"
+        );
+        assert!(
+            h.driver.screen_contains("Ln 1, Col 1"),
+            "the key must be consumed by the modal menu, not also fall through \
+             to the editor and move the cursor right"
+        );
+    }
+
+    /// The dialog twin: a modal dialog must beat the activity-bar focus
+    /// tier. GTK's `handle_key_press` had no dialog rung of its own — it
+    /// relied on the general `Engine::handle_key` fallback at the *bottom*
+    /// of the ladder, so every focus tier above it (activity bar, explorer,
+    /// extension panel, settings, search, source control) could cut in
+    /// front of an open modal. Four of those tiers carried an inline
+    /// `if engine.dialog.is_some()` patch-up for exactly this; the
+    /// activity-bar tier did not.
+    ///
+    /// RED against unfixed `develop`: `Escape` ran
+    /// `activity_bar_focus_out()` and the dialog stayed painted.
+    #[test]
+    fn open_dialog_takes_keys_from_a_focused_activity_bar() {
+        let mut engine = small_engine();
+        engine.activity_bar_focus_in_at(0);
+        engine.start_move_file_dialog(
+            std::path::Path::new("/tmp/project/foo.rs"),
+            std::path::Path::new("/tmp/project"),
+        );
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.driver.screen_contains("Move 'foo.rs'"),
+            "precondition: the in-canvas modal dialog paints its title"
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Escape);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("Move 'foo.rs'"),
+            "Escape must reach the modal dialog and dismiss it, not be spent \
+             unfocusing the activity bar underneath it"
+        );
+    }
+
     /// Sample a band spanning the bottom half of the whole window — where
     /// the separated status line paints, above the terminal panel. Wide
     /// enough to catch it regardless of the fixture's exact chrome heights.
