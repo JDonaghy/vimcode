@@ -813,7 +813,7 @@ pub(super) fn handle_mouse(
                 && (engine.active_panel_is(PANEL_SEARCH) || engine.active_panel_is(PANEL_SETTINGS));
             let state = render::MouseDragState {
                 layout: last_layout,
-                armed_target: drag_state.is_active(),
+                armed_target: render::drag_state_arms_scrollbar(drag_state),
                 hover_popup_selecting: *hover_selecting,
                 // Modal drags never reach here: the modal-overlay rung at the
                 // top of this function returns first. GTK has no equivalent
@@ -834,6 +834,10 @@ pub(super) fn handle_mouse(
                 divider_grabbed: divider_grab.is_some(),
                 terminal_split_dragging: *dragging_terminal_split,
                 terminal_panel_resizing: *dragging_terminal_resize,
+                // #756 review: keeps a straying pointer from getting
+                // re-routed to the minimap or terminal-content rungs mid
+                // selection — see the field's doc comment in `render.rs`.
+                text_selection_active: engine.mouse_drag_active,
                 // #756: the painted geometry the press path already reads,
                 // instead of the hand-rolled `term_height - bottom_chrome -
                 // quickfix - strip` walk this arm used to redo — the

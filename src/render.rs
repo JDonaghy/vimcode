@@ -3862,6 +3862,31 @@ pub enum MouseDragRoute {
     None,
 }
 
+/// Whether `drag_state` is armed with the rung [`MouseDragRoute::ArmedTarget`]
+/// means: a scrollbar or picker thumb.
+///
+/// **Not** the same as `quadraui::DragState::is_active()`. TUI's editor click
+/// path (#565) arms the *same* shared `DragState` with
+/// `DragTarget::TextSelection` so a later `Drag` event can recover which
+/// window the selection started in — but that gesture belongs to the
+/// [`MouseDragRoute::EditorText`] rung, not `ArmedTarget`, whose handler
+/// (`apply_scrollbar_drag` / GTK's `dispatch_mouse_drag` arm) only reacts to
+/// `UiEvent::ScrollOffsetChanged` and silently drops `TextSelectionChanged`.
+/// Feeding `is_active()` straight into `armed_target` therefore made
+/// `route_mouse_drag` resolve *every* text-selection drag to `ArmedTarget`,
+/// making the `EditorText` rung unreachable for the whole gesture (#756
+/// review). GTK never arms `TextSelection` on its shared `DragState` (it
+/// drives `EditorText` through its own `handle_mouse_drag`), so this is a
+/// no-op there today — called from both backends anyway so the exclusion is
+/// stated once, not re-derived if that ever changes.
+pub fn drag_state_arms_scrollbar(drag_state: &quadraui::DragState) -> bool {
+    drag_state.is_active()
+        && !matches!(
+            drag_state.target(),
+            Some(quadraui::DragTarget::TextSelection { .. })
+        )
+}
+
 /// Everything [`route_mouse_drag`] needs, in the caller's own units.
 ///
 /// The booleans are the caller's drag bookkeeping (its own `dragging_sidebar` /
@@ -3871,7 +3896,10 @@ pub enum MouseDragRoute {
 pub struct MouseDragState<'a> {
     /// The layout the last frame painted, for the minimap and editor hit tests.
     pub layout: Option<&'a ScreenLayout>,
-    /// `quadraui::DragState::is_active()`.
+    /// Whether an `ArmedTarget`-rung gesture (scrollbar/picker thumb) is in
+    /// progress. Compute with [`drag_state_arms_scrollbar`] — **not**
+    /// `quadraui::DragState::is_active()` directly; see that function's doc
+    /// comment for why the two differ on TUI.
     pub armed_target: bool,
     /// A text selection is in progress inside the editor hover popup.
     pub hover_popup_selecting: bool,
@@ -3899,6 +3927,23 @@ pub struct MouseDragState<'a> {
     pub terminal_split_dragging: bool,
     /// The bottom panel is being resized.
     pub terminal_panel_resizing: bool,
+    /// `Engine::mouse_drag_active` — a previous move in this same gesture
+    /// already extended the editor's visual selection.
+    ///
+    /// Armed rather than geometric, for the same reason `sidebar_dnd` is:
+    /// once a selection has started extending, a later move that strays over
+    /// the minimap strip or the terminal-panel rect must not get stolen by
+    /// that geometry — it must keep extending the selection, exactly like
+    /// dragging a native text selection past a window's edge. Set from the
+    /// engine's own state (shared by both backends) rather than from
+    /// `armed_target`/`quadraui::DragState` because [`drag_state_arms_scrollbar`]
+    /// deliberately excludes `DragTarget::TextSelection` from `armed_target` —
+    /// this field is what keeps that exclusion from re-opening the same
+    /// "geometry steals an in-progress gesture" bug one rung down (#756
+    /// review: an editor-text drag whose pointer strays into the terminal
+    /// panel used to get re-routed to [`MouseDragRoute::TerminalContent`]
+    /// once `armed_target` no longer swallowed it).
+    pub text_selection_active: bool,
     /// `true` when the point is inside a painted terminal pane's content cells
     /// — ask [`in_terminal_pane_content`], which both backends call so the
     /// question cannot be answered differently on each.
@@ -3923,6 +3968,7 @@ impl Default for MouseDragState<'_> {
             divider_grabbed: false,
             terminal_split_dragging: false,
             terminal_panel_resizing: false,
+            text_selection_active: false,
             in_terminal_content: false,
             // Cell metrics default to the TUI's whole-cell grid; GTK always
             // states its measured font metrics explicitly.
@@ -3973,6 +4019,9 @@ pub fn route_mouse_drag(state: &MouseDragState<'_>, x: f64, y: f64) -> MouseDrag
     }
     if state.terminal_panel_resizing {
         return MouseDragRoute::TerminalPanelResize;
+    }
+    if state.text_selection_active {
+        return MouseDragRoute::EditorText;
     }
 
     // ── Modal swallow ───────────────────────────────────────────────────────
@@ -23631,6 +23680,11 @@ mod mouse_drag_router_tests {
                 MouseDragRoute::TerminalPanelResize,
             ),
             (
+                "text selection already extending",
+                |s| s.text_selection_active = true,
+                MouseDragRoute::EditorText,
+            ),
+            (
                 "modal swallow",
                 |s| s.modal_hit = true,
                 MouseDragRoute::ModalSwallow,
@@ -23693,6 +23747,53 @@ mod mouse_drag_router_tests {
             route_mouse_drag(&state, text_x, (strip.y + strip.height / 2.0) as f64),
             MouseDragRoute::EditorText,
             "the text area immediately left of the strip must still select text"
+        );
+    }
+
+    /// #756 review (non-blocking concern): once `armed_target` correctly
+    /// excludes `DragTarget::TextSelection` (see [`drag_state_arms_scrollbar`]),
+    /// an in-progress editor text-selection drag is arbitrated purely by
+    /// geometry again — which means a pointer that strays over the minimap
+    /// strip or into the terminal panel mid-selection would get hijacked
+    /// into [`MouseDragRoute::Minimap`] / [`MouseDragRoute::TerminalContent`]
+    /// instead of continuing to extend the editor selection. `text_selection_active`
+    /// is the guard: pins that once a selection has started extending
+    /// (`Engine::mouse_drag_active`), it keeps winning over both geometric
+    /// rungs, the same way `sidebar_dnd` keeps winning over the editor once an
+    /// explorer drag has been picked up.
+    #[test]
+    fn a_selection_already_extending_beats_the_minimap_and_terminal_geometry() {
+        let engine = drag_engine();
+        let layout = frame(&engine, (1.0, 1.0));
+        let mm = layout
+            .minimap
+            .first()
+            .expect("the fixture must paint a minimap strip");
+        let strip = minimap_strip_rect(mm);
+        let state = MouseDragState {
+            layout: Some(&layout),
+            text_selection_active: true,
+            in_terminal_content: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            route_mouse_drag(
+                &state,
+                (strip.x + strip.width / 2.0) as f64,
+                (strip.y + strip.height / 2.0) as f64,
+            ),
+            MouseDragRoute::EditorText,
+            "an in-progress text selection must not be stolen by the minimap \
+             strip it happens to be dragged over"
+        );
+
+        let text_x = strip.x as f64 - 2.0;
+        assert_eq!(
+            route_mouse_drag(&state, text_x, (strip.y + strip.height / 2.0) as f64),
+            MouseDragRoute::EditorText,
+            "nor by `in_terminal_content` geometry, even though it is asserted \
+             true here"
         );
     }
 

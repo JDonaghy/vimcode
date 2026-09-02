@@ -5652,6 +5652,68 @@ mod tests {
         );
     }
 
+    /// #756 review fix: click-then-drag text selection was broken on TUI.
+    /// TUI's own editor-click path (#565) arms the *same* shared
+    /// `quadraui::DragState` this rung's `ArmedTarget` route checks first —
+    /// with `DragTarget::TextSelection`, so `armed_target: drag_state.is_active()`
+    /// made every text-selection drag resolve to `ArmedTarget` (whose handler,
+    /// `apply_scrollbar_drag`, only reacts to `ScrollOffsetChanged` and drops
+    /// `TextSelectionChanged` on the floor), leaving the `EditorText` rung —
+    /// the only place that calls `Engine::mouse_drag` to actually extend the
+    /// selection — unreachable for the whole gesture. The GTK twin of this
+    /// (`an_editor_text_drag_paints_a_selection_through_the_shared_drag_router`
+    /// in `src/gtk/testing.rs`) already covered GTK, which never arms
+    /// `TextSelection` on its `DragState`; this is the missing TUI half.
+    ///
+    /// **RED against the unfixed router** (`armed_target: drag_state.is_active()`
+    /// instead of `render::drag_state_arms_scrollbar(drag_state)`): the click
+    /// arms `TextSelection` at mouse-down, so the `Drag` event right after it
+    /// resolves to `ArmedTarget`, `apply_scrollbar_drag` finds no
+    /// `ScrollOffsetChanged` to apply, and the probed cell's style never
+    /// changes — `before == after`, and this test fails.
+    ///
+    /// Same probe-a-swept-cell's-*style* technique as the GTK twin (`CLAUDE.md`
+    /// testing rule 1: assert on rendered output, not on state).
+    #[test]
+    fn tui_editor_text_drag_paints_a_selection_through_the_shared_drag_router() {
+        let mut app = TuiShellApp::new(None);
+        let mut text = String::new();
+        for i in 0..40 {
+            text.push_str(&format!("line {i} content that is reasonably long\n"));
+        }
+        app.engine.buffer_mut().insert(0, &text);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        let bounds = driver
+            .find_bounds("line 5 content")
+            .expect("the fixture line should be painted");
+        let row_y = bounds.y + bounds.height / 2.0;
+        let start_x = bounds.x + 1.0;
+        let probe_x = (bounds.x + 6.0) as u16;
+        let end_x = bounds.x + 12.0;
+
+        // Park the cursor on the row first (a plain click, not a drag) so the
+        // "before" sample already includes any cursor-line highlight — the
+        // only thing left for the gesture below to change is the selection.
+        driver.click(start_x, row_y);
+        let before = driver.style_at(probe_x, row_y as u16);
+
+        // Press to the left of the probe and drag past it while held — the
+        // press arms `DragTarget::TextSelection` on the shared `DragState`,
+        // and the very next `Drag` event is the one the regression swallowed.
+        driver.mouse_down(start_x, row_y);
+        driver.mouse_move(end_x, row_y);
+        driver.mouse_up(end_x, row_y);
+
+        let after = driver.style_at(probe_x, row_y as u16);
+        assert_ne!(
+            before, after,
+            "a held drag across the editor text must repaint the swept cell \
+             with the selection style; both probes read {before:?} at \
+             column {probe_x}, row {row_y}"
+        );
+    }
+
     /// #609: `render_content` must also paint the tab-hover tooltip —
     /// `render_tab_hover_tooltip`, ported from `draw_frame`'s raw-`Buffer`
     /// write to `Backend::draw_status_bar` (see that function's doc

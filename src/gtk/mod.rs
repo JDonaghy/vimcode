@@ -3461,7 +3461,7 @@ impl App {
             let layout_ref = self.cached_screen_layout.borrow();
             let state = render::MouseDragState {
                 layout: layout_ref.as_ref(),
-                armed_target: drag_rc.borrow().is_active(),
+                armed_target: render::drag_state_arms_scrollbar(&drag_rc.borrow()),
                 hover_popup_selecting: engine.editor_hover_has_focus
                     && engine
                         .editor_hover
@@ -3490,6 +3490,12 @@ impl App {
                 divider_grabbed: self.divider_grab.is_some(),
                 terminal_split_dragging: self.terminal_split_dragging,
                 terminal_panel_resizing: self.terminal_resize_dragging,
+                // #756 review: mirrors TUI's guard — see the field's doc
+                // comment in `render.rs`. GTK's `EditorText` arm doesn't run
+                // through the shared `DragState`, but it drives the same
+                // `Engine::mouse_drag`, so `mouse_drag_active` is just as
+                // valid a "already extending" signal here.
+                text_selection_active: engine.mouse_drag_active,
                 in_terminal_content: render::in_terminal_pane_content(
                     &engine,
                     x,
