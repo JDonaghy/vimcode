@@ -559,7 +559,6 @@ impl Engine {
     // =======================================================================
 
     /// Returns true if any sidebar panel currently has keyboard focus.
-    #[allow(dead_code)]
     pub fn sidebar_has_focus(&self) -> bool {
         self.explorer_has_focus
             || self.search_has_focus

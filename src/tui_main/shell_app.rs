@@ -9816,7 +9816,9 @@ mod tests {
     // `render::route_focus_key` now states the activity-bar → sidebar-panel
     // ladder once for both backends. Its GTK twins live in
     // `src/gtk/testing.rs` (`palette_outranks_a_focused_explorer_on_gtk`,
-    // `focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk`).
+    // `focused_terminal_outranks_a_focused_explorer_on_gtk`,
+    // `focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk`,
+    // `visible_settings_panel_outranks_a_stale_explorer_flag_on_gtk`).
 
     /// An explorer sidebar showing one real file, revealed and focused, with
     /// a temp `cwd` the caller must clean up. Returns the app plus the temp
@@ -9960,6 +9962,164 @@ mod tests {
         assert!(
             after.contains("ZQXWEDIT75"),
             "Backspace must delete exactly one character; screen:\n{after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #757 (divergence 3): a plugin panel's own focus must outrank a
+    /// stale `explorer_has_focus` left set alongside it — the TUI half of
+    /// `focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk`
+    /// (`src/gtk/testing.rs`).
+    ///
+    /// Reached via the *real* keyboard-activation path
+    /// (`Engine::activity_bar_activate`'s ext-panel branch), not by
+    /// hand-set fields: `activity_bar_focus_in_at` parks the toolbar
+    /// cursor on the only registered plugin panel, then a bare `l`
+    /// activates it exactly as a user pressing Enter/`l` on the activity
+    /// bar would. That branch sets `ext_panel_active` +
+    /// `ext_panel_has_focus` without clearing the explorer's own (stale,
+    /// from before the activity bar was ever touched) `explorer_has_focus`
+    /// — see `render::route_focus_key`'s doc comment, divergence 3.
+    ///
+    /// **Not a RED test against unfixed TUI.** The old TUI ladder already
+    /// checked the plugin panel before the explorer (its own removed doc
+    /// comment: "… → ext panel → extensions → settings → … → explorer
+    /// (unguarded fallback)"), so this fixture was already green pre-#757
+    /// on this backend — divergence 3 was GTK-only (GTK checked the
+    /// explorer first). Kept here anyway so both backends carry coverage
+    /// for the *converged*, single-source-of-truth resolver, per
+    /// CLAUDE.md's multi-backend testing rule.
+    #[test]
+    fn focused_plugin_panel_outranks_a_stale_explorer_flag_via_shell_app() {
+        use crate::core::engine::sidebar::TOOLBAR_IDX_EXT_BASE;
+
+        let (mut app, dir) = app_with_focused_explorer("ext_panel_stale");
+        app.engine.explorer_tree.borrow_mut().start_editing(
+            vec![0u16],
+            "ZQXWEXT757".to_string(),
+            "ZQXWEXT757".len(),
+            None,
+            None,
+        );
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            ext_panel_reg("git-insights", "Git Insights"),
+        );
+        // Park the activity bar's keyboard cursor on the (only) plugin panel.
+        app.engine.activity_bar_focus_in_at(TOOLBAR_IDX_EXT_BASE);
+
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+
+        let before = driver.screen();
+        assert!(
+            before.contains("ZQXWEXT757"),
+            "precondition: the explorer's inline edit must paint before \
+             the activity bar is activated; screen:\n{before}"
+        );
+
+        // Activate the plugin panel — the real `Engine::activity_bar_activate`
+        // ext-panel branch, which leaves `explorer_has_focus` stale-true.
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('l'),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+        let mid = driver.screen();
+        assert!(
+            !mid.contains("ZQXWEXT757"),
+            "precondition: the plugin panel must now own the sidebar body \
+             (`render::sidebar_owner` prefers `ext_panel_active`); \
+             screen:\n{mid}"
+        );
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Backspace),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+
+        // Reveal: click the explorer's own activity-bar icon (row 1) to
+        // switch the visible panel back — the same production
+        // `AppShellEvent::PanelChanged` path a real click takes, which
+        // clears `ext_panel_active`/`ext_panel_has_focus` and refocuses
+        // the explorer.
+        driver.click(1.0, 1.0);
+
+        let after = driver.screen();
+        assert!(
+            after.contains("ZQXWEXT757"),
+            "a focused plugin panel must outrank a stale explorer focus \
+             flag — Backspace must not have reached the explorer's inline \
+             edit; screen:\n{after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #757 (divergence 4): a real focus flag must outrank the merely
+    /// *visible* explorer panel — the mirror-image bug of
+    /// `visible_settings_panel_outranks_a_stale_explorer_flag_on_gtk`
+    /// (`src/gtk/testing.rs`), this time on the backend that had it
+    /// backwards: old TUI matched every panel exclusively by
+    /// `active_panel_is` (the visible panel), never by the engine's own
+    /// `*_has_focus` flags.
+    ///
+    /// `render::route_focus_key`'s settings arm matches on
+    /// `engine.settings_has_focus || engine.active_panel_is(PANEL_SETTINGS)`
+    /// — the union old TUI never took, since it kept only the second half.
+    ///
+    /// The explorer is left as the default *visible* panel (never
+    /// switched away from) while `settings_has_focus` is set directly —
+    /// the state a plugin or future codepath that sets the flag without
+    /// also calling `app_shell.show_panel` would produce.
+    /// `app_with_focused_explorer` also sets `explorer_has_focus`, which
+    /// is harmless here: the resolver never consults that flag as a match
+    /// arm, only as the unguarded fallback nothing else claims.
+    ///
+    /// **Verified RED against unfixed `develop`:** the old TUI ladder
+    /// matched Settings only via `active_panel_is(PANEL_SETTINGS)`, which
+    /// is false here (the visible panel is still Explorer), so its
+    /// settings arm never matched; every other arm's `active_panel_is`
+    /// check is equally false, so the key fell through to the unguarded
+    /// explorer fallback and Backspace deleted a character from the
+    /// painted inline edit.
+    #[test]
+    fn focused_settings_panel_outranks_the_default_visible_explorer_via_shell_app() {
+        let (mut app, dir) = app_with_focused_explorer("settings_flag_vs_visible_explorer");
+        app.engine.explorer_tree.borrow_mut().start_editing(
+            vec![0u16],
+            "ZQXWFLAG757".to_string(),
+            "ZQXWFLAG757".len(),
+            None,
+            None,
+        );
+        // A real, current focus flag — but the visible panel (app_shell's
+        // untouched default) is still the explorer.
+        app.engine.settings_has_focus = true;
+
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+
+        let before = driver.screen();
+        assert!(
+            before.contains("ZQXWFLAG757"),
+            "precondition: the explorer's inline edit must paint (it is \
+             still the visible panel); screen:\n{before}"
+        );
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Backspace),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+
+        let after = driver.screen();
+        assert!(
+            after.contains("ZQXWFLAG757"),
+            "a real settings_has_focus must outrank the merely-visible \
+             explorer panel — Backspace must not reach the explorer's \
+             inline edit; screen:\n{after}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
