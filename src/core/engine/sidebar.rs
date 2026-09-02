@@ -36,7 +36,7 @@ pub const HAMBURGER_PANEL_ID: &str = "activity:menu";
 /// `git-insights` extension's panel is `"ext:git-insights"` (#557).
 ///
 /// This is the id both backends already synthesise by hand for extension
-/// panels (GTK's `current_active_panel_id`/`Msg::SwitchPanel`), promoted to a
+/// panels (GTK's `current_active_panel_id`/`App::switch_panel`), promoted to a
 /// shared constant so [`Engine::ext_activity_panels`] can hand *the same* ids
 /// to each backend's `ShellConfig` builder.
 ///

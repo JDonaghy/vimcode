@@ -920,7 +920,7 @@ pub fn breadcrumb_draw_targets(
 /// settings. Both backends call this at startup and once per frame so
 /// runtime toggles (`:set nonerdfonts`) take effect immediately; centralizing
 /// it avoids the #547 regression where GTK's only call site was inside a
-/// message handler (`Msg::CacheFontMetrics`) that stopped firing after the
+/// message handler (GTK's `Msg::CacheFontMetrics`, retired in #732) that stopped firing after the
 /// #540 ShellApp migration, silently freezing the GTK backend's nerd-fonts
 /// flag at its default (`false`) forever.
 pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
@@ -2252,7 +2252,7 @@ fn panel_hover_anchor_y(
 /// Returns `(link_rects, popup_bounds)` in the caller's units. Link rects
 /// carry a trailing `is_native` flag — `true` for the source-control panel's
 /// trusted links (open directly), `false` for extension-provided ones
-/// (confirm before opening) — mirroring `Msg::PanelHoverClick`'s two
+/// (confirm before opening) — mirroring GTK's retired `Msg::PanelHoverClick`'s two
 /// branches.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn panel_hover_popup_paint(

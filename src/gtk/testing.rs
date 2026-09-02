@@ -2302,7 +2302,7 @@ mod sidebar_panel_clicks {
 
     /// Settings: a click on a category row must expand/collapse it.
     ///
-    /// The pre-fix path reached `Msg::SettingsClick`, whose geometry was read
+    /// The pre-fix path reached the since-retired `Msg::SettingsClick` arm, whose geometry was read
     /// off `settings_da_ref` — a `DrawingArea` that is `None` for the whole
     /// life of a ShellApp run, so panel width/height came back `0` and every
     /// row test failed even when the message was dispatched. Nothing dispatched
