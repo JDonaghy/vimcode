@@ -6521,14 +6521,17 @@ mod editor_mouse_rungs {
     // `render::route_focus_key` states the activity-bar → sidebar-panel
     // ladder once for both backends. GTK's old hand-rolled chain of
     // `if engine.*_has_focus` blocks had no picker gate and no terminal
-    // gate, and checked the explorer *above* the plugin panel. Both tests
-    // below aim at what the frame painted, never at engine state — the
-    // pre-#757 bugs left engine state looking perfectly reasonable while
-    // the keys went to the wrong surface.
+    // gate, checked the explorer *above* the plugin panel (divergence 3),
+    // and matched panels by focus flag only, never by the *visible* panel
+    // (divergence 4). All four tests below aim at what the frame painted,
+    // never at engine state — the pre-#757 bugs left engine state looking
+    // perfectly reasonable while the keys went to the wrong surface.
     //
     // The TUI halves of this rung live in `src/tui_main/shell_app.rs`
     // (`activity_bar_ctrl_l_does_not_activate_via_shell_app`,
-    // `explorer_inline_edit_backspace_reaches_the_engine_via_shell_app`).
+    // `explorer_inline_edit_backspace_reaches_the_engine_via_shell_app`,
+    // `focused_plugin_panel_outranks_a_stale_explorer_flag_via_shell_app`,
+    // `focused_settings_panel_outranks_the_default_visible_explorer_via_shell_app`).
 
     /// An engine with a real `cwd` (so `picker_populate_files` finds
     /// entries), the file explorer holding keyboard focus, and the Find
@@ -6681,6 +6684,172 @@ mod editor_mouse_rungs {
             h.driver.screen_contains("ZQXWGTK75") && !h.driver.screen_contains("ZQXWGTK757"),
             "control: with the terminal unfocused the explorer must receive \
              Backspace; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #757 (divergence 3): a plugin panel's own focus must outrank a stale
+    /// `explorer_has_focus` left set alongside it.
+    ///
+    /// `Engine::activity_bar_activate`'s ext-panel branch sets
+    /// `ext_panel_active` + `ext_panel_has_focus` **without** clearing
+    /// `explorer_has_focus` (unlike `focus_sidebar_panel`/
+    /// `apply_activity_panel_switch`, which call `clear_sidebar_focus`
+    /// first) — the state a user is in after focusing the explorer, then
+    /// using the keyboard to open a plugin panel from the activity bar.
+    /// GTK's old chain checked `explorer_has_focus` *before* the plugin
+    /// panel, so a key meant for the panel reached the explorer instead.
+    ///
+    /// Because `ext_panel_active` makes the plugin panel — not the
+    /// explorer — the painted sidebar body (`render::sidebar_owner`), the
+    /// explorer's mutated edit state is invisible in the moment. This
+    /// asserts on it anyway, the same way the moved highlight is read in
+    /// `palette_outranks_a_focused_explorer_on_gtk`: it flips the sidebar
+    /// back to the explorer *after* the keypress (mirroring what closing
+    /// the plugin panel does — `render::sidebar_owner` falls back to
+    /// `app_shell.active_panel_id()`, PANEL_EXPLORER by default, once
+    /// `ext_panel_active` is cleared) and reads the painted text there, so
+    /// a test that only inspected engine flags at keypress time could not
+    /// tell whether the character was actually deleted.
+    ///
+    /// **Verified RED against unfixed `develop`:** restoring GTK's old
+    /// `if engine.explorer_has_focus { … } else if engine.ext_panel_has_focus
+    /// { … }` order routes Backspace to `dispatch_explorer_key`, which
+    /// deletes the last character of the in-progress edit before the
+    /// plugin panel is ever consulted, so re-opening the explorer view
+    /// shows `ZQXWEXT75` and the final assertion fires.
+    #[test]
+    fn focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.explorer_rebuild_rows();
+        engine.explorer_has_focus = true; // stale, per the doc comment above
+        engine.session.explorer_visible = true;
+        engine.explorer_tree.borrow_mut().start_editing(
+            vec![0u16],
+            "ZQXWEXT757".to_string(),
+            "ZQXWEXT757".len(),
+            None,
+            None,
+        );
+
+        engine.ext_panels.clear();
+        engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some('X'),
+                sections: Vec::new(),
+            },
+        );
+        // The exact pair `activity_bar_activate`'s ext-panel branch sets.
+        engine.ext_panel_active = Some("git-insights".to_string());
+        engine.ext_panel_has_focus = true;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("ZQXWEXT757"),
+            "precondition: the explorer must not be what's painted while \
+             ext_panel_active is set — GTK's `id.starts_with(\"ext:\")` arm \
+             (a pre-existing gap, not this issue's to fix) renders the \
+             built-in Extensions *marketplace* tree for any plugin panel \
+             id rather than the specific plugin's own content, so this \
+             checks the explorer's absence rather than the (unrelated)\
+             marketplace's presence; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Backspace);
+        h.driver.render();
+
+        // Reveal: close the plugin panel the way its own "q"/Escape does
+        // NOT (that only clears the focus flag) — clearing
+        // `ext_panel_active` is what `render::sidebar_owner` falls
+        // through on, exactly as leaving the panel via the activity bar
+        // eventually does.
+        h.engine.borrow_mut().ext_panel_active = None;
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("ZQXWEXT757"),
+            "a focused plugin panel must outrank a stale explorer focus \
+             flag — Backspace must not have reached the explorer's inline \
+             edit; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #757 (divergence 4): the *visible* panel must outrank a stale
+    /// `*_has_focus` flag left set on a different, invisible panel.
+    ///
+    /// GTK's old chain matched panels exclusively by focus flag — never by
+    /// `active_panel_is`, the *visible* panel — and checked
+    /// `explorer_has_focus` before Settings. So with the explorer's focus
+    /// flag left stale-true (e.g. from before the user opened Settings)
+    /// and Settings actually on screen, GTK still routed every key to the
+    /// (invisible) explorer.
+    ///
+    /// Same reveal technique as the plugin-panel test above: Settings, not
+    /// the explorer, owns the sidebar body while `app_shell`'s active
+    /// panel is Settings, so the explorer's mutated edit state is only
+    /// checked once the active panel is switched back.
+    ///
+    /// **Verified RED against unfixed `develop`:** GTK's old chain checked
+    /// `explorer_has_focus` (true here, stale) ahead of Settings and never
+    /// consulted `active_panel_is` at all, so Backspace reached
+    /// `dispatch_explorer_key` and deleted a character; switching back to
+    /// the explorer view shows `ZQXWSET75` and the final assertion fires.
+    #[test]
+    fn visible_settings_panel_outranks_a_stale_explorer_flag_on_gtk() {
+        use crate::core::engine::sidebar::{PANEL_EXPLORER, PANEL_SETTINGS};
+
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.explorer_rebuild_rows();
+        engine.explorer_has_focus = true; // stale
+        engine.session.explorer_visible = true;
+        engine.explorer_tree.borrow_mut().start_editing(
+            vec![0u16],
+            "ZQXWSET757".to_string(),
+            "ZQXWSET757".len(),
+            None,
+            None,
+        );
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        // Deliberately left false: the fixture is "the visible panel
+        // disagrees with every *_has_focus flag".
+        engine.settings_has_focus = false;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("ZQXWSET757"),
+            "precondition: Settings, not the explorer, must own the \
+             sidebar body while it is the active panel; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Backspace);
+        h.driver.render();
+
+        h.engine
+            .borrow_mut()
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("ZQXWSET757"),
+            "the visible Settings panel must outrank a stale \
+             explorer_has_focus — Backspace must not have reached the \
+             explorer's inline edit; painted: {:?}",
             h.driver.painted_texts()
         );
     }
