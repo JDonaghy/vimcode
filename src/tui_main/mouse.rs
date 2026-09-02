@@ -1911,21 +1911,18 @@ pub(super) fn handle_mouse(
         let ab_target =
             crate::core::engine::resolve_activity_bar_click(bar_row, bar_height, &ext_names);
         use crate::core::engine::{ActivityBarTarget, SidebarPanel};
-        match ab_target {
-            Some(ActivityBarTarget::MenuToggle) => {
-                engine.toggle_menu_bar();
-                if !engine.menu_bar_visible {
-                    // Close the dropdown. MenuSystem::close() needs &mut Backend,
-                    // but the mouse handler only has (drag_state, modal_stack).
-                    // Pop the modal directly and reset the MenuSystem state by
-                    // re-creating it with the same menu definitions.
-                    modal_stack.pop(&quadraui::WidgetId::new("menu-system-dropdown"));
-                    let menus = crate::render::build_menu_defs(engine.is_vscode_mode());
-                    *engine.menu_system.borrow_mut() = quadraui::MenuSystem::new(menus);
-                }
-                return sidebar_width;
+        if matches!(ab_target, Some(ActivityBarTarget::MenuToggle)) {
+            engine.toggle_menu_bar();
+            if !engine.menu_bar_visible {
+                // Close the dropdown. MenuSystem::close() needs &mut Backend,
+                // but the mouse handler only has (drag_state, modal_stack).
+                // Pop the modal directly and reset the MenuSystem state by
+                // re-creating it with the same menu definitions.
+                modal_stack.pop(&quadraui::WidgetId::new("menu-system-dropdown"));
+                let menus = crate::render::build_menu_defs(engine.is_vscode_mode());
+                *engine.menu_system.borrow_mut() = quadraui::MenuSystem::new(menus);
             }
-            _ => {}
+            return sidebar_width;
         }
         // #754: the ext-panel toggle and the built-in panel switch — which used
         // to be ~50 lines here and a near-copy in GTK's `App::switch_panel` —
