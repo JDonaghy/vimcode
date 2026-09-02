@@ -47,10 +47,6 @@ fn is_ext_panel_id(id: &str) -> bool {
     id.starts_with("ext:")
 }
 
-fn ext_panel_name(id: &str) -> Option<&str> {
-    id.strip_prefix("ext:")
-}
-
 type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 
 /// Pango font family for UI panels (menu bar, sidebars, dropdown,
@@ -2405,6 +2401,19 @@ impl App {
         self.cached_editor_bounds.get()
     }
 
+    /// Left edge of the bottom panel as last painted — the same `x`
+    /// `render_content` hands `draw_tab_bar` / the terminal pane, i.e. the
+    /// editor's left edge, right of the activity bar and sidebar.
+    ///
+    /// [`render::BottomPanelMetrics::panel_left`] (#754). Falls back to `0.0`
+    /// before the first frame, when there is no panel on screen to click.
+    fn painted_bottom_panel_left(&self) -> f64 {
+        self.cached_editor_bounds
+            .get()
+            .map(|(r, _)| r.x)
+            .unwrap_or(0.0)
+    }
+
     /// Both divider lists for the frame just painted, plus whether `(x, y)`
     /// lands on a group's tab bar — everything
     /// [`render::route_divider_grab`] needs from this backend.
@@ -2982,67 +2991,39 @@ impl App {
             // version of this clear was incomplete; tracked all fields via
             // `clear_sidebar_focus()` instead.
             self.engine.borrow_mut().clear_sidebar_focus();
-            // Check if click lands in the terminal panel before general handling.
-            // Layout (bottom to top): status | toolbar | terminal | quickfix | DAP | editor
-            // Geometry is cached at paint time on engine.bottom_panel_geometry (#418).
-            let zone = self.engine.borrow().resolve_bottom_panel_zone(y);
-            if let Some(zone) = zone {
-                use crate::core::engine::BottomPanelZone;
-                if matches!(zone, BottomPanelZone::TabBar) {
-                    self.engine.borrow_mut().handle_bottom_tab_bar_click(x);
+            // ── Bottom panel (tab strip / toolbar / terminal content) — #754 ──
+            // Zone, split hit-test and pane-cell translation are all
+            // `render::route_bottom_panel_click`, shared verbatim with TUI's
+            // `handle_mouse`. What this replaced computed the pane column as a
+            // bare `x / cached_char_width` against a *window-absolute* `x`,
+            // while `render_content` paints the panel at the editor's left
+            // edge — so with the sidebar open every terminal click landed
+            // roughly `(activity_bar + sidebar) / char_width` columns right of
+            // the glyph aimed at. `panel_left` is now a required input.
+            let route = render::route_bottom_panel_click(
+                &self.engine.borrow(),
+                x,
+                y,
+                render::BottomPanelMetrics {
+                    panel_left: self.painted_bottom_panel_left(),
+                    col_width: self.cached_char_width.max(1.0),
+                },
+            );
+            if let Some(route) = route {
+                if !matches!(route, render::BottomPanelRoute::TabBar) {
+                    self.terminal_resize_dragging = false;
+                }
+                let ctx = crate::core::engine::UiEventContext {
+                    terminal_cols: self.terminal_cols(),
+                    terminal_max_rows: self.terminal_target_maximize_rows(),
+                };
+                let effect =
+                    render::apply_bottom_panel_route(&mut self.engine.borrow_mut(), route, x, ctx);
+                self.terminal_split_dragging |= effect.split_drag;
+                self.terminal_resize_dragging |= effect.resize_drag;
+                if effect.relayout {
                     self.handle_resize();
                     return;
-                }
-                self.engine.borrow_mut().terminal_has_focus = true;
-                if let BottomPanelZone::Content { .. } = zone {
-                    let split_layout = *self.engine.borrow().terminal_split_layout.borrow();
-                    if let Some(ref sl) = split_layout {
-                        let hit = sl.hit_test(x as f32, y as f32);
-                        // #533: pass button/mods so the engine can
-                        // forward_mouse(Press) to the child when it has mouse
-                        // reporting enabled.
-                        if self.engine.borrow_mut().handle_terminal_split_click(
-                            hit,
-                            quadraui::MouseButton::Left,
-                            quadraui::Modifiers::default(),
-                        ) {
-                            self.terminal_split_dragging = true;
-                        }
-                    } else {
-                        self.terminal_resize_dragging = false;
-                        let col = (x / self.cached_char_width.max(1.0)) as u16;
-                        let row_offset = match zone {
-                            BottomPanelZone::Content { row_offset } => row_offset,
-                            _ => 0,
-                        };
-                        // #533: shared press handler — tries forward_mouse(Press)
-                        // when the child has mouse reporting, falls back to
-                        // terminal_scroll_reset + local selection start.
-                        self.engine.borrow_mut().handle_terminal_pane_press(
-                            col,
-                            row_offset,
-                            quadraui::MouseButton::Left,
-                            quadraui::Modifiers::default(),
-                        );
-                    }
-                } else {
-                    // Header row — dispatch through cached toolbar hit regions.
-                    let action = self.engine.borrow().resolve_terminal_toolbar_click(x);
-                    let ctx = crate::core::engine::UiEventContext {
-                        terminal_cols: self.terminal_cols(),
-                        terminal_max_rows: self.terminal_target_maximize_rows(),
-                    };
-                    if !self
-                        .engine
-                        .borrow_mut()
-                        .execute_terminal_toolbar_action(action, ctx)
-                        && matches!(
-                            action,
-                            crate::core::engine::TerminalToolbarAction::StartResize
-                        )
-                    {
-                        self.terminal_resize_dragging = true;
-                    }
                 }
                 self.draw_needed.set(true);
             } else {
@@ -3984,40 +3965,19 @@ impl App {
     }
 
     /// Switch the sidebar to a different panel.
+    ///
+    /// #754: the ext-panel-vs-built-in bookkeeping this used to spell out is
+    /// `render::apply_activity_panel_switch`, shared with TUI's activity-bar
+    /// arm. The only thing left here is this backend's own widget re-sync,
+    /// which differs by branch (a plugin panel does not move
+    /// `app_shell.active_panel_id()`, so `sync_sidebar_from_engine` has nothing
+    /// to sync for it).
     fn switch_panel(&mut self, panel_id: String) {
-        if let Some(name) = ext_panel_name(&panel_id) {
-            // Extension panels bypass AppShell (no dynamic registration).
-            let mut engine = self.engine.borrow_mut();
-            let same = engine.ext_panel_active.as_deref() == Some(name)
-                && engine.app_shell.sidebar_visible();
-            if same {
-                engine.app_shell.hide_sidebar();
-                engine.ext_panel_has_focus = false;
-                engine.ext_panel_active = None;
-            } else {
-                if !engine.app_shell.sidebar_visible() {
-                    engine.app_shell.toggle_sidebar();
-                }
-                let already = engine.ext_panel_active.as_deref() == Some(name);
-                engine.ext_panel_has_focus = true;
-                engine.ext_panel_active = Some(name.to_string());
-                if !already {
-                    engine.ext_panel_selected = 0;
-                    engine.plugin_event("panel_focus", name);
-                }
-            }
-            engine.session.explorer_visible = engine.app_shell.sidebar_visible();
-            let _ = engine.session.save();
-            drop(engine);
-            let _ = panel_id; // engine.ext_panel_active drives `current_active_panel_id()`
+        let is_ext = panel_id.starts_with("ext:");
+        render::apply_activity_panel_switch(&mut self.engine.borrow_mut(), &panel_id);
+        if is_ext {
             self.sync_sidebar_widgets();
         } else {
-            {
-                let mut engine = self.engine.borrow_mut();
-                engine.ext_panel_has_focus = false;
-                engine.ext_panel_active = None;
-                engine.toggle_sidebar_panel(&panel_id);
-            }
             self.sync_sidebar_from_engine();
         }
     }
@@ -4320,28 +4280,21 @@ impl App {
             return true;
         }
 
-        // Which panel owns the sidebar body? Derived exactly as
-        // `render_content` derives it, so the click router and the painter can
-        // never disagree about who is on screen.
-        let active_id: String = {
-            let engine = self.engine.borrow();
-            if let Some(ref name) = engine.ext_panel_active {
-                format!("ext:{name}")
-            } else {
-                engine
-                    .app_shell
-                    .active_panel_id()
-                    .map(|id| id.as_str().to_string())
-                    .unwrap_or_else(|| PANEL_EXPLORER.to_string())
-            }
-        };
+        // Which panel owns the sidebar body? `render::sidebar_owner` states
+        // that precedence once (#754) — `ext_panel_active` first, then
+        // `app_shell.active_panel_id()`, Explorer as the fallback — so the
+        // click router, the hover router and the painter can never disagree
+        // about who is on screen. This used to be an inline `format!("ext:{}")`
+        // here and an `if …is_some() / else if active_panel_is(…)` chain on
+        // TUI.
+        let owner = render::sidebar_owner(&self.engine.borrow());
 
-        let consumed = match active_id.as_str() {
-            PANEL_EXPLORER => {
+        let consumed = match &owner {
+            render::SidebarOwner::Explorer => {
                 self.explorer_ui_event(event.clone());
                 true
             }
-            PANEL_SEARCH => {
+            render::SidebarOwner::Search => {
                 let mut engine = self.engine.borrow_mut();
                 if is_press {
                     engine.search_set_focus(true);
@@ -4349,9 +4302,9 @@ impl App {
                 engine.handle_search_sidebar_ui_event(event.clone());
                 true
             }
-            PANEL_DEBUG => self.route_debug_sidebar_event(event),
-            PANEL_GIT => self.route_sc_sidebar_event(event),
-            PANEL_EXTENSIONS => {
+            render::SidebarOwner::Debug => self.route_debug_sidebar_event(event),
+            render::SidebarOwner::Git => self.route_sc_sidebar_event(event),
+            render::SidebarOwner::Extensions => {
                 let mut engine = self.engine.borrow_mut();
                 if is_press {
                     engine.ext_sidebar_has_focus = true;
@@ -4362,7 +4315,7 @@ impl App {
                 }
                 true
             }
-            PANEL_SETTINGS => {
+            render::SidebarOwner::Settings => {
                 let mut engine = self.engine.borrow_mut();
                 if is_press {
                     engine.settings_has_focus = true;
@@ -4379,7 +4332,7 @@ impl App {
                 render::handle_settings_form_ui_event(&mut engine, event, sb);
                 true
             }
-            id if is_ext_panel_id(id) => {
+            render::SidebarOwner::ExtPanel(_) => {
                 // Plugin-provided panel: `render_content` paints it through the
                 // same `ext_sidebar_system` at the same rect, so it routes the
                 // same way.
@@ -4390,11 +4343,11 @@ impl App {
                 engine.handle_ext_sidebar_ui_event(event.clone());
                 true
             }
-            PANEL_AI => self.route_ai_sidebar_event(event),
+            render::SidebarOwner::Ai => self.route_ai_sidebar_event(event),
             // Unknown panel id: nothing was painted, so there is nothing
             // for a click to hit — let it fall through rather than
             // swallow it.
-            _ => false,
+            render::SidebarOwner::Unknown => false,
         };
 
         if consumed {
@@ -6898,6 +6851,45 @@ impl quadraui::ShellApp for App {
                 }
             };
             backend.set_cursor(shape);
+        }
+
+        // ── Sidebar hover — #754 rung ─────────────────────────────────────
+        // This backend already *painted* `screen.panel_hover` (the
+        // `RichTextPopup` block in `render_content`) and already tracked the
+        // popup's own rect, but nothing on this side ever set
+        // `engine.panel_hover` or `engine.sc_button_hovered`: the router was
+        // ~78 lines of TUI-only code. That is the #499/#484 mechanism — paint
+        // without input on one backend, input without a second painter on the
+        // other. `render::route_sidebar_hover` is now the single router and
+        // both backends call it.
+        if let UiEvent::MouseMoved { position, .. } = &event {
+            if let Some(sb) = ctx.layout.sidebar_content_bounds {
+                let lh = backend.line_height();
+                let on_popup = self
+                    .panel_hover_popup_rect
+                    .get()
+                    .is_some_and(|(px, py, pw, ph)| {
+                        let (mx, my) = (position.x as f64, position.y as f64);
+                        mx >= px && mx < px + pw && my >= py && my < py + ph
+                    });
+                let owner = render::sidebar_owner(&self.engine.borrow());
+                let changed = render::route_sidebar_hover(
+                    &mut self.engine.borrow_mut(),
+                    &owner,
+                    position.x,
+                    position.y,
+                    render::SidebarBodyGeometry {
+                        bounds: sb,
+                        row_h: lh.max(1.0),
+                        header_rows: 1.0,
+                    },
+                    true,
+                    on_popup,
+                );
+                if changed {
+                    self.draw_needed.set(true);
+                }
+            }
         }
 
         // ── CSD titlebar background: drag-to-move / double-click-maximize ──

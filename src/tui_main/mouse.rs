@@ -857,7 +857,7 @@ pub(super) fn handle_mouse(
             }
             // Terminal panel resize drag
             if *dragging_terminal_resize {
-                let qf_h: u16 = if engine.quickfix_open { 6 } else { 0 };
+                let qf_h: u16 = render::quickfix_panel_rows(engine);
                 let available = term_height.saturating_sub(row + bottom_chrome + qf_h);
                 // Leave at least 4 editor lines visible (+ menu/tab bar chrome)
                 let min_editor_chrome = 4 + menu_rows + 1; // 4 lines + menu + tab bar
@@ -983,7 +983,7 @@ pub(super) fn handle_mouse(
             // Only activate if the drag originated in the terminal (selection exists)
             // and the mouse is within the terminal panel bounds.
             {
-                let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+                let qf_rows: u16 = render::quickfix_panel_rows(engine);
                 let strip_rows: u16 = if engine.terminal_open {
                     super::effective_terminal_panel_rows_tui(engine, term_height) + 1
                 } else {
@@ -1342,7 +1342,12 @@ pub(super) fn handle_mouse(
         // pre-#451 behavior and issue #575's "or no menu, if one isn't
         // implemented yet for that panel" expectation.
         if sb_visible && col >= ab_width && col < ab_width + sidebar_width {
-            if engine.active_panel_is(PANEL_EXPLORER) {
+            // #754: the same `render::sidebar_owner` the left-click arm and the
+            // hover arm ask. Strictly better than the `active_panel_is` this
+            // replaced for #575's own purpose: a plugin ext panel painted over
+            // the sidebar body leaves `active_panel_id` pointing at Explorer,
+            // so the old gate handed *its* right-clicks to the file tree too.
+            if render::sidebar_owner(engine) == render::SidebarOwner::Explorer {
                 let sidebar_row = row.saturating_sub(menu_rows);
                 let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
                 if tree_row < engine.explorer_rows.len() {
@@ -1413,7 +1418,7 @@ pub(super) fn handle_mouse(
 
         // Right-click on terminal panel → suppress (don't show editor context menu).
         {
-            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+            let qf_rows: u16 = render::quickfix_panel_rows(engine);
             let strip_rows: u16 = if engine.terminal_open {
                 super::effective_terminal_panel_rows_tui(engine, term_height) + 1
             } else {
@@ -1456,78 +1461,29 @@ pub(super) fn handle_mouse(
         engine.cancel_editor_hover_dismiss();
     }
 
-    // ── SC button hover (mouse moved) ───────────────────────────────────────
+    // ── Sidebar hover (mouse moved) — #754 rung ─────────────────────────────
+    // The SC toolbar/section hover and the plugin ext-panel row hover were ~78
+    // lines here and *nothing at all* on GTK — the asymmetry behind #499/#484.
+    // Both are now `render::route_sidebar_hover`, which GTK calls too.
     if matches!(ev.kind, MouseEventKind::Moved) {
-        if sb_visible
-            && engine.active_panel_is(PANEL_GIT)
-            && col >= ab_width
-            && col < ab_width + sidebar_width
-        {
-            // Route via cached SidebarPanelLayout (#509) — no per-frame
-            // arithmetic; hit_test uses absolute terminal coordinates.
-            let hit = {
-                let layout = engine.sc_panel_layout.borrow();
-                layout.as_ref().map(|l| l.hit_test(col as f32, row as f32))
-            };
-            match hit {
-                Some(quadraui::SidebarPanelHit::ToolbarButton(_))
-                | Some(quadraui::SidebarPanelHit::ToolbarEmpty) => {
-                    engine.sc_button_hovered = engine.sc_button_hit(col as f32, row as f32);
-                    if !mouse_on_hover_popup {
-                        engine.dismiss_panel_hover();
-                    }
-                }
-                Some(quadraui::SidebarPanelHit::Content { y: content_y, .. }) => {
-                    engine.sc_button_hovered = None;
-                    // content_y is content-local (row 0 = first section row).
-                    let content_row = content_y as usize;
-                    if let Some((flat_idx, _is_header)) =
-                        engine.sc_content_row_to_flat(content_row, true)
-                    {
-                        engine.panel_hover_mouse_move("source_control", "", flat_idx);
-                    } else if !mouse_on_hover_popup {
-                        engine.dismiss_panel_hover();
-                    }
-                }
-                _ => {
-                    engine.sc_button_hovered = None;
-                    if !mouse_on_hover_popup {
-                        engine.dismiss_panel_hover();
-                    }
-                }
-            }
-        } else {
-            engine.sc_button_hovered = None;
-            // If we were showing an SC hover and mouse left Git panel, dismiss
-            // — unless the mouse is over the popup itself.
-            if engine.panel_hover.is_some() && !mouse_on_hover_popup {
-                engine.dismiss_panel_hover();
-            }
-        }
-    }
-
-    // ── Ext panel hover (mouse moved) ───────────────────────────────────────
-    if matches!(ev.kind, MouseEventKind::Moved) {
-        if sb_visible
-            && sidebar.ext_panel_name.is_some()
-            && col >= ab_width
-            && col < ab_width + sidebar_width
-        {
-            if let Some(ref panel_name) = sidebar.ext_panel_name.clone() {
-                let sidebar_row = row.saturating_sub(menu_rows);
-                // Row 0 is the header; content items start at row 1.
-                if sidebar_row >= 1 {
-                    let flat_idx =
-                        engine.ext_panel_scroll_top + (sidebar_row as usize).saturating_sub(1);
-                    engine.panel_hover_mouse_move(panel_name, "", flat_idx);
-                } else if !mouse_on_hover_popup {
-                    engine.dismiss_panel_hover();
-                }
-            }
-        } else if sidebar.ext_panel_name.is_some() && !mouse_on_hover_popup {
-            // Mouse moved outside the ext panel area — dismiss hover.
-            engine.dismiss_panel_hover();
-        }
+        render::route_sidebar_hover(
+            engine,
+            &render::sidebar_owner(engine),
+            col as f32,
+            row as f32,
+            render::SidebarBodyGeometry {
+                bounds: quadraui::Rect::new(
+                    ab_width as f32,
+                    menu_rows as f32,
+                    sidebar_width as f32,
+                    term_height.saturating_sub(menu_rows) as f32,
+                ),
+                row_h: 1.0,
+                header_rows: 1.0,
+            },
+            sb_visible,
+            mouse_on_hover_popup,
+        );
     }
 
     // ── Tab hover tooltip (mouse moved over tab bar) ────────────────────────
@@ -1815,17 +1771,9 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // ── Bottom panel tab bar click (shared row above Terminal / Debug Output) ──
-    // Geometry is cached at paint time on engine.bottom_panel_geometry (#418).
-    if col >= editor_left
-        && matches!(
-            engine.resolve_bottom_panel_zone(row as f64),
-            Some(crate::core::engine::BottomPanelZone::TabBar)
-        )
-    {
-        engine.handle_bottom_tab_bar_click(col as f64);
-        return sidebar_width;
-    }
+    // #754: the bottom-panel tab-strip arm that used to sit here — and the
+    // ~95-line terminal-panel arm ~90 lines further down — are now one call to
+    // `render::route_bottom_panel_click`, below, shared with GTK.
 
     // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
     {
@@ -1900,105 +1848,53 @@ pub(super) fn handle_mouse(
     // first status band `render::route_chrome_click` walks (above), and the
     // follow-up is `render::apply_status_action`.
 
-    // ── Terminal panel click ───────────────────────────────────────────────────
-    // Zone resolved from cached geometry written at paint time (#418). Toolbar
-    // and content rows live inside the bottom panel area; their absolute y
-    // (e.g. for the scrollbar track) is recovered from the cached top_y.
-    if engine.terminal_open && col >= editor_left {
-        let zone = engine.resolve_bottom_panel_zone(row as f64);
-        let geom = *engine.bottom_panel_geometry.borrow();
-        if let (Some(zone), Some(geom)) = (zone, geom) {
-            use crate::core::engine::BottomPanelZone;
-            // Tab bar was already dispatched above; only Toolbar / Content land here.
-            if matches!(zone, BottomPanelZone::Toolbar) {
-                // Header row — dispatch through cached toolbar hit regions.
-                engine.terminal_has_focus = true;
-                let action = engine.resolve_terminal_toolbar_click(col as f64);
-                let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
-                let panel_cols = terminal_size
-                    .map(|s| s.width)
-                    .unwrap_or(80)
-                    .saturating_sub(editor_left);
-                let ctx = crate::core::engine::UiEventContext {
-                    terminal_cols: panel_cols,
-                    terminal_max_rows: super::terminal_target_maximize_rows_tui(engine, screen_h),
-                };
-                if !engine.execute_terminal_toolbar_action(action, ctx)
-                    && matches!(
-                        action,
-                        crate::core::engine::TerminalToolbarAction::StartResize
-                    )
-                {
-                    *dragging_terminal_resize = true;
-                }
-            } else if let BottomPanelZone::Content { row_offset } = zone {
-                // Use cached TerminalSplitLayout for divider/pane/scrollbar
-                // detection (#430). Non-split fallback uses row_offset directly.
-                let split_layout = engine.terminal_split_layout.borrow();
-                if let Some(ref sl) = *split_layout {
-                    let abs_y = geom.top_y + geom.content_y + row_offset as f64;
-                    let hit = sl.hit_test(col as f32, abs_y as f32);
-                    drop(split_layout);
-                    match hit {
-                        quadraui::TerminalSplitHit::Scrollbar => {
-                            let track_start = (geom.top_y + geom.content_y) as u16;
-                            let track_len = (geom.height - geom.content_y).max(0.0) as u16;
-                            let total = engine
-                                .active_terminal()
-                                .map(|t| t.history_len())
-                                .unwrap_or(0);
-                            let tl = track_len as f32;
-                            drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                                widget: quadraui::WidgetId::new("terminal_scrollback"),
-                                track_start: track_start as f32,
-                                track_length: tl,
-                                thumb_length: (tl / total.max(1) as f32).max(1.0),
-                                max_scroll: total,
-                                grab_offset: 0.0,
-                                inverted: true,
-                            });
-                            apply_scrollbar_drag(
-                                drag_state,
-                                quadraui::Point {
-                                    x: col as f32,
-                                    y: row as f32,
-                                },
-                                engine,
-                                sidebar,
-                            );
-                        }
-                        _ => {
-                            // #533: pass button/mods so split click can
-                            // forward_mouse(Press) to the child when it
-                            // has mouse reporting enabled.
-                            if engine.handle_terminal_split_click(
-                                hit,
-                                quadraui::MouseButton::Left,
-                                quadraui::Modifiers::default(),
-                            ) {
-                                *dragging_terminal_split = true;
-                            }
-                        }
-                    }
-                } else {
-                    drop(split_layout);
-                    // #429/#533: focus + scroll reset + selection / mouse
-                    // forwarding are owned by the engine.  TUI still does
-                    // the col conversion (panel is offset by the
-                    // sidebar/activity-bar on the left).
-                    let term_col = col.saturating_sub(editor_left);
-                    engine.handle_terminal_pane_press(
-                        term_col,
-                        row_offset,
-                        quadraui::MouseButton::Left,
-                        quadraui::Modifiers::default(),
-                    );
-                }
+    // ── Bottom panel (tab strip / toolbar / terminal content) — #754 rung ─────
+    // Zone, split hit-test and pane-cell translation are all
+    // `render::route_bottom_panel_click`, shared verbatim with GTK. Only the
+    // scrollback scrollbar stays here: TUI is the only backend that paints a
+    // track for it (see the rung's banner in `render.rs`).
+    if let Some(route) = render::route_bottom_panel_click(
+        engine,
+        col as f64,
+        row as f64,
+        render::BottomPanelMetrics {
+            panel_left: editor_left as f64,
+            col_width: 1.0,
+        },
+    ) {
+        if route == render::BottomPanelRoute::Split(quadraui::TerminalSplitHit::Scrollbar) {
+            if let Some(target) = render::terminal_scrollback_drag_target(engine) {
+                drag_state.begin(target);
+                apply_scrollbar_drag(
+                    drag_state,
+                    quadraui::Point {
+                        x: col as f32,
+                        y: row as f32,
+                    },
+                    engine,
+                    sidebar,
+                );
             }
             return sidebar_width;
         }
+        let screen_h = terminal_size.map(|s| s.height).unwrap_or(24);
+        let effect = render::apply_bottom_panel_route(
+            engine,
+            route,
+            col as f64,
+            crate::core::engine::UiEventContext {
+                terminal_cols: terminal_size
+                    .map(|s| s.width)
+                    .unwrap_or(80)
+                    .saturating_sub(editor_left),
+                terminal_max_rows: super::terminal_target_maximize_rows_tui(engine, screen_h),
+            },
+        );
+        *dragging_terminal_resize |= effect.resize_drag;
+        *dragging_terminal_split |= effect.split_drag;
+        return sidebar_width;
     }
-    // Click landed outside the terminal panel — return focus to the editor.
+    // Click landed outside the bottom panel — return focus to the editor.
     engine.terminal_has_focus = false;
 
     // ── Activity bar ──────────────────────────────────────────────────────────
@@ -2029,62 +1925,31 @@ pub(super) fn handle_mouse(
                 }
                 return sidebar_width;
             }
-            Some(ActivityBarTarget::ExtensionPanel(name)) => {
-                if sidebar.ext_panel_name.as_deref() == Some(&name)
-                    && engine.app_shell.sidebar_visible()
-                {
-                    engine.app_shell.hide_sidebar();
-                    sidebar.ext_panel_name = None;
-                    engine.ext_panel_has_focus = false;
-                    engine.ext_panel_active = None;
-                } else {
-                    // #637: a plugin panel taking over the sidebar body
-                    // must drop whatever panel's focus flag (and, for
-                    // Extensions, `active_panel_id`-derived state like
-                    // `ext_sidebar_has_focus`) was left set from before —
-                    // `app_shell`'s active-panel id is deliberately left
-                    // untouched here (this isn't a `toggle_sidebar_panel`
-                    // switch), so nothing else clears it. A stale
-                    // `ext_sidebar_has_focus = true` left over from a
-                    // previous visit to the Extensions marketplace panel
-                    // otherwise keeps `active_panel_is(PANEL_EXTENSIONS)`'s
-                    // SidebarSystem intercept looking "focused" even though
-                    // this plugin panel is what's actually on screen.
-                    engine.clear_sidebar_focus();
-                    sidebar.ext_panel_name = Some(name.clone());
-                    if !engine.app_shell.sidebar_visible() {
-                        engine.toggle_sidebar();
-                    }
-                    sidebar.has_focus = true;
-                    engine.ext_panel_active = Some(name.clone());
-                    engine.ext_panel_has_focus = true;
-                    engine.ext_panel_selected = 0;
-                    engine.plugin_event("panel_focus", &name);
-                }
-                engine.session.explorer_visible = engine.app_shell.sidebar_visible();
-                let _ = engine.session.save();
-                return sidebar_width;
-            }
             _ => {}
         }
+        // #754: the ext-panel toggle and the built-in panel switch — which used
+        // to be ~50 lines here and a near-copy in GTK's `App::switch_panel` —
+        // are one call to `render::apply_activity_panel_switch`.
         let target_panel_id = match ab_target {
-            Some(ActivityBarTarget::Panel(p)) => Some(match p {
-                SidebarPanel::Explorer => PANEL_EXPLORER,
-                SidebarPanel::Search => PANEL_SEARCH,
-                SidebarPanel::Debug => PANEL_DEBUG,
-                SidebarPanel::Git => PANEL_GIT,
-                SidebarPanel::Extensions => PANEL_EXTENSIONS,
-                SidebarPanel::Ai => PANEL_AI,
-            }),
-            Some(ActivityBarTarget::Settings) => Some(PANEL_SETTINGS),
+            Some(ActivityBarTarget::ExtensionPanel(name)) => Some(format!("ext:{name}")),
+            Some(ActivityBarTarget::Panel(p)) => Some(
+                match p {
+                    SidebarPanel::Explorer => PANEL_EXPLORER,
+                    SidebarPanel::Search => PANEL_SEARCH,
+                    SidebarPanel::Debug => PANEL_DEBUG,
+                    SidebarPanel::Git => PANEL_GIT,
+                    SidebarPanel::Extensions => PANEL_EXTENSIONS,
+                    SidebarPanel::Ai => PANEL_AI,
+                }
+                .to_string(),
+            ),
+            Some(ActivityBarTarget::Settings) => Some(PANEL_SETTINGS.to_string()),
             _ => None,
         };
         if let Some(panel_id) = target_panel_id {
-            sidebar.ext_panel_name = None;
-            engine.ext_panel_has_focus = false;
-            engine.ext_panel_active = None;
-            engine.toggle_sidebar_panel(panel_id);
-            if engine.app_shell.sidebar_visible() {
+            let switched = render::apply_activity_panel_switch(engine, &panel_id);
+            sidebar.ext_panel_name = switched.ext_panel;
+            if switched.sidebar_visible {
                 sidebar.has_focus = true;
             }
         }
@@ -2096,8 +1961,12 @@ pub(super) fn handle_mouse(
         // Account for menu bar: when visible it occupies absolute row 0, so the
         // sidebar's logical row 0 is at absolute terminal row `menu_rows`.
         let sidebar_row = row.saturating_sub(menu_rows);
-        // Extension panel must be checked FIRST — ext_panel_name overrides active_panel
-        if sidebar.ext_panel_name.is_some() {
+        // #754: who owns the sidebar body is `render::sidebar_owner`, the same
+        // question GTK's `try_route_sidebar_mouse_event` asks — including the
+        // "an ext panel outranks `active_panel_id`" precedence this chain used
+        // to state for itself via `sidebar.ext_panel_name`.
+        let owner = render::sidebar_owner(engine);
+        if matches!(owner, render::SidebarOwner::ExtPanel(_)) {
             sidebar.has_focus = true;
             engine.ext_panel_has_focus = true;
 
@@ -2160,7 +2029,7 @@ pub(super) fn handle_mouse(
                     }
                 }
             }
-        } else if engine.active_panel_is(PANEL_EXPLORER) {
+        } else if owner == render::SidebarOwner::Explorer {
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
 
@@ -2179,7 +2048,7 @@ pub(super) fn handle_mouse(
                     engine.open_file_preview(&path);
                 }
             }
-        } else if engine.active_panel_is(PANEL_DEBUG) {
+        } else if owner == render::SidebarOwner::Debug {
             sidebar.has_focus = true;
             engine.dap_sidebar_has_focus = true;
 
@@ -2218,7 +2087,7 @@ pub(super) fn handle_mouse(
                 engine.dispatch_dap_sidebar_event(sidebar_event);
             }
             return sidebar_width;
-        } else if engine.active_panel_is(PANEL_GIT) {
+        } else if owner == render::SidebarOwner::Git {
             sidebar.has_focus = true;
             engine.sc_set_focus(true);
 
@@ -2275,7 +2144,7 @@ pub(super) fn handle_mouse(
                 }
             }
             return sidebar_width;
-        } else if engine.active_panel_is(PANEL_SEARCH) {
+        } else if owner == render::SidebarOwner::Search {
             sidebar.has_focus = true;
             if !engine.search_has_focus {
                 engine.search_set_focus(true);
@@ -2292,7 +2161,7 @@ pub(super) fn handle_mouse(
             if !engine.search_has_focus {
                 sidebar.has_focus = false;
             }
-        } else if engine.active_panel_is(PANEL_EXTENSIONS) {
+        } else if owner == render::SidebarOwner::Extensions {
             sidebar.has_focus = true;
             engine.ext_sidebar_has_focus = true;
             if sidebar_row == 0 {
@@ -2301,7 +2170,7 @@ pub(super) fn handle_mouse(
                 engine.ext_sidebar_input_active = true;
             }
             // Rows 2+ handled by SidebarSystem mouse intercept in main loop
-        } else if engine.active_panel_is(PANEL_SETTINGS) {
+        } else if owner == render::SidebarOwner::Settings {
             sidebar.has_focus = true;
             engine.settings_has_focus = true;
             let flat_total = engine.settings_flat_list().len();
@@ -2966,7 +2835,7 @@ fn route_and_apply_chrome_click(
         // first: it paints in its own full-width band *outside* every window's
         // rect, so a click there must not fall through to what sits under it.
         if let Some(status) = &layout.separated_status_line {
-            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
+            let qf_rows: u16 = render::quickfix_panel_rows(engine);
             let strip_rows: u16 = if engine.terminal_open {
                 super::effective_terminal_panel_rows_tui(engine, geom.term_height) + 1
             } else {
