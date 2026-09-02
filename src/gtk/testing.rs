@@ -2694,6 +2694,126 @@ mod sidebar_panel_clicks {
         );
     }
 
+    // ── #754 (mouse ladder slice 4: panels) ────────────────────────────────
+
+    /// GTK half of `bottom_panel_tab_strip_click_switches_the_painted_panel_
+    /// via_shell_app`: the shared tab strip must switch which panel is
+    /// **painted** here too, through `render::route_bottom_panel_click` ->
+    /// `render::apply_bottom_panel_route`.
+    ///
+    /// The click is aimed at the geometry the frame actually painted — the
+    /// `slot_positions` `draw_tab_bar` returned into
+    /// `engine.bottom_tab_bar_hits`, and the tab-strip row from
+    /// `engine.bottom_panel_geometry` — never a guessed offset, so a strip
+    /// that paints somewhere else fails rather than passing by luck.
+    #[test]
+    fn bottom_panel_tab_strip_click_switches_the_painted_panel() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        engine.terminal_new_tab(80, 10);
+        engine
+            .dap_output_lines
+            .push("ZQXW754GTKDEBUGMARKER".to_string());
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("ZQXW754GTKDEBUGMARKER"),
+            "precondition: the Terminal tab owns the panel body"
+        );
+
+        // Locate the *second* painted tab slot (Terminal, then Debug Output).
+        let (slot_x, strip_y) = {
+            let engine = h.engine.borrow();
+            let hits = engine.bottom_tab_bar_hits.borrow();
+            let hits = hits
+                .as_ref()
+                .expect("the bottom panel must have painted a tab strip");
+            let &(sx, ex) = hits
+                .slot_positions
+                .get(1)
+                .expect("Terminal + Debug Output are two painted slots");
+            let geom = engine
+                .bottom_panel_geometry
+                .borrow()
+                .expect("the bottom panel must have painted");
+            ((sx + ex) / 2.0, geom.top_y + geom.toolbar_y / 2.0)
+        };
+        h.driver.click(slot_x as f32, strip_y as f32);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("ZQXW754GTKDEBUGMARKER"),
+            "clicking the Debug Output tab must repaint the panel body with the \
+             debug output (#754 `BottomPanelRoute::TabBar`)"
+        );
+    }
+
+    /// The sidebar hover rung must exist **on this backend at all**.
+    ///
+    /// Before #754 the Source Control toolbar's hover highlight was driven by
+    /// ~78 lines that ran only in `tui_main/mouse.rs`: GTK painted
+    /// `SourceControlData::button_hovered` faithfully (`draw_sc_sidebar_panel`
+    /// passes it to `Backend::draw_sidebar_panel` as `hovered_id`) but nothing
+    /// on this side ever set it, so the highlight could not appear no matter
+    /// where the pointer went. That paint-without-input asymmetry is the
+    /// mechanism behind #499/#484.
+    ///
+    /// Asserts on **rendered pixels** (`CLAUDE.md` rule 1) — the button's own
+    /// painted band before and after the pointer arrives. Asserting
+    /// `sc_button_hovered == Some(_)` would pass against a backend that sets
+    /// the field and never repaints, which is precisely the failure this rung
+    /// is fixing in the other direction.
+    ///
+    /// Skipped when the checkout isn't a git repo: with no `SourceControl`
+    /// screen the panel paints no toolbar and there is no button to hover.
+    #[test]
+    fn source_control_toolbar_button_highlights_on_hover() {
+        let mut h = panel_harness(PANEL_GIT);
+        h.driver.render();
+        let sb = match h.painted_sidebar_bounds.get() {
+            Some(sb) if h.engine.borrow().sc_panel_layout.borrow().is_some() => sb,
+            _ => return,
+        };
+
+        // Locate a toolbar button from the layout the frame painted — its own
+        // `bounds`, not a scan or a guess. The hover highlight is a rounded
+        // rect inset 2px inside those bounds, so probe the centre.
+        let button = {
+            let engine = h.engine.borrow();
+            let layout = engine.sc_panel_layout.borrow();
+            layout
+                .as_ref()
+                .and_then(|l| l.toolbar_layout.as_ref())
+                .and_then(|t| t.visible_items.iter().find(|i| i.clickable).cloned())
+        };
+        let Some(button) = button else {
+            return; // no clickable toolbar buttons painted in this repo state
+        };
+        let (bx, by) = (
+            button.bounds.x + button.bounds.width / 2.0,
+            button.bounds.y + button.bounds.height / 2.0,
+        );
+
+        let sample = |h: &mut Harness<_>| -> Vec<(u8, u8, u8)> {
+            let x0 = (button.bounds.x + 3.0) as i32;
+            let x1 = (button.bounds.x + button.bounds.width - 3.0) as i32;
+            (x0..x1).map(|x| h.driver.pixel(x, by as i32)).collect()
+        };
+        let before = sample(&mut h);
+
+        h.driver.mouse_move(bx, by);
+        h.driver.render();
+        let after = sample(&mut h);
+
+        assert_ne!(
+            before, after,
+            "moving the pointer onto a Source Control toolbar button must repaint \
+             it hovered — GTK painted `button_hovered` but nothing set it before \
+             #754 made `render::route_sidebar_hover` shared"
+        );
+    }
+
     /// Debug: a press in the panel body must reach the panel at all — before
     /// #544 it was swallowed by the editor click path, which left
     /// `dap_sidebar_has_focus` false so every subsequent keystroke went to the

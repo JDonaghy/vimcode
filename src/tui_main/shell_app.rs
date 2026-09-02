@@ -5646,6 +5646,105 @@ mod tests {
         );
     }
 
+    // ── #754 (mouse ladder slice 4: panels) ────────────────────────────────
+
+    /// The bottom panel's shared tab strip must switch which panel is
+    /// **painted**, end to end through `driver_with_shell` -> `TuiShellApp::
+    /// handle` -> `mouse::handle_mouse` -> `render::route_bottom_panel_click`
+    /// -> `render::apply_bottom_panel_route`.
+    ///
+    /// Asserts on rendered output (`CLAUDE.md` rule 1): the Debug Output
+    /// marker line has to actually reach the screen. Asserting
+    /// `bottom_panel_kind == DebugOutput` would pass against a router that
+    /// flips the field while the painter still draws the terminal — the
+    /// #587/#592 failure shape.
+    ///
+    /// Before #754 the `TabBar` zone was resolved by a bespoke arm here and a
+    /// different one on GTK; it is now the one `BottomPanelRoute::TabBar` both
+    /// call.
+    #[test]
+    fn bottom_panel_tab_strip_click_switches_the_painted_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.terminal_new_tab(80, 10);
+        app.engine
+            .dap_output_lines
+            .push("ZQXW_754_DEBUG_MARKER".to_string());
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // Settle the sidebar-derived layout before measuring — see
+        // `group_divider_drag_moves_the_painted_divider_via_shell_app`.
+        driver.mouse_up(1.0, 1.0);
+        driver.render();
+        assert!(
+            !driver.screen_contains("ZQXW_754_DEBUG_MARKER"),
+            "precondition: the Terminal tab owns the panel body; screen:\n{}",
+            driver.screen()
+        );
+
+        let (dx, dy) = driver
+            .find("Debug Output")
+            .expect("the bottom panel tab strip must paint a Debug Output tab");
+        driver.click(dx, dy);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("ZQXW_754_DEBUG_MARKER"),
+            "clicking the Debug Output tab must repaint the panel body with the \
+             debug output (#754 `BottomPanelRoute::TabBar`); screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// An **open but empty** quickfix list must reserve no rows for mouse
+    /// routing, because it reserves none for painting.
+    ///
+    /// `compute_editor_layout` gates the quickfix band on `quickfix_open &&
+    /// !quickfix_items.is_empty()`, but `handle_mouse` asked `if
+    /// engine.quickfix_open { 6 }` in four places — so `:copen` on an empty
+    /// list moved every band below the editor six rows up from where it was
+    /// painted. `render::quickfix_panel_rows` is now the single rule.
+    ///
+    /// The discriminator needs no knowledge of the panel's height: with the
+    /// old rule the terminal's right-click *suppression band* starts six rows
+    /// above the painted terminal, so a right-click three rows **above** the
+    /// painted tab strip — plainly in the editor — was silently swallowed and
+    /// no editor context menu appeared. Asserts on rendered output: the menu's
+    /// own painted item text.
+    #[test]
+    fn empty_quickfix_does_not_displace_the_terminal_band_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.terminal_new_tab(80, 8);
+        // `:copen` with nothing in the list — open, but paints nothing.
+        app.engine.quickfix_open = true;
+        app.engine.quickfix_items.clear();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.mouse_up(1.0, 1.0);
+        driver.render();
+
+        let (_, strip_y) = driver
+            .find("Terminal")
+            .expect("the bottom panel tab strip must paint a Terminal tab");
+        // Three rows above the painted strip: editor text, and inside the
+        // six-row band the old rule wrongly attributed to the terminal.
+        let target_y = strip_y - 3.0;
+        assert!(
+            target_y > 1.0,
+            "fixture must leave editor rows above the terminal panel; screen:\n{}",
+            driver.screen()
+        );
+        driver.right_click(40.0, target_y);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Go to Definition"),
+            "a right-click in the editor must open the editor context menu even \
+             with an empty quickfix open — the terminal's suppression band must \
+             not be displaced by rows nothing painted (#754); screen:\n{}",
+            driver.screen()
+        );
+    }
+
     // ── #605 (Stage 6 parity sweep) ────────────────────────────────────────
     //
     // The rest of `draw_frame`'s tail, each asserted through
