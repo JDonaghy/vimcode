@@ -53,7 +53,7 @@ drain to do.
 | 6 | **#734** | Converge keyboard dispatch — ~2,000 lines. The TUI half carries 19 `mirrors mod.rs:NNNN` comments and **every one of those line refs is stale**. |
 | 7 | **#735** | Converge frame composition — ~4,500 lines. **Slice 1 landed** (shared overlay-band z-order). Units differ (px vs cells) and painter models differ intrinsically — both preserved. The feared `draw_frame` raw-`Buffer` residue turned out to be a non-blocker: see the note below. |
 | 8 | **#657** | The oracle loop. Last, deliberately — Stage 1 rewrites every `crate::` path in the three modules the chain is about to shrink by ~9,000 lines. |
-| 9 | **#47** | Native macOS GUI, **re-scoped**: a thin wrapper over `quadraui::macos::shell_runner::run_with_shell`, not Core Graphics. |
+| 9 | **#47** | Native macOS GUI, **re-scoped**: a thin wrapper over `quadraui::macos::shell_runner::run_with_shell`, not Core Graphics. **Picked up 2026-09-02, re-audited, blocked** — see `PLAN.md` "#47 re-audit findings": Stage 1's `App.backend: Rc<RefCell<GtkBackend>>` field can't just move behind a cfg-gate, `GtkBackend`'s Rc-handle modal/drag accessors have no `MacBackend`/`Backend`-trait equivalent. Needs a quadraui-side decision before any vimcode code moves. |
 | ∥ | **quadraui#596 → #597 → #658** | The preview tier. #596/#597 were open, unassigned and **in nobody's queue** while #658 sat blocked on them — the supply-side trap `GOALS.md` exists to catch. Queued 2026-09-01. |
 
 ### #735 staging item 1, answered: `draw_frame` is dead in production
