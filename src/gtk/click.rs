@@ -53,16 +53,6 @@ pub(super) fn pixel_to_click_target(
     _diff_btn_map: &DiffBtnMap,
     _split_btn_map: &SplitBtnMap,
     _action_btn_map: &ActionBtnMap,
-    status_segment_map: &StatusSegmentMap,
-    // Painted rect of the separated status line's status bar (#671/#672),
-    // or `None` if the last frame drew no separated line. Unlike the
-    // per-window status bar — resolved below via `window_zone_hit_test`,
-    // since it lives inside its own window's rect — the separated line sits
-    // in its own full-width band outside every window rect, so it needs its
-    // own rect to hit-test against. Its segment zones live in the same
-    // `status_segment_map`, keyed by `engine.active_window_id()` (see
-    // `render_content`'s "Draw separated status line" block).
-    separated_status_bar: Option<quadraui::Rect>,
     // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
     // painted this frame (#449), plus a `FrameZone::TabBar { idx } -> (GroupId,
     // rect)` table keyed by the tab bar's *global* surface index (editors are
@@ -75,21 +65,13 @@ pub(super) fn pixel_to_click_target(
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     mutate_focus: bool,
 ) -> ClickTarget {
-    // #672: the separated status line paints in its own full-width band,
-    // outside every window's rect, so it can't be reached through the
-    // `ScreenZone::Window` -> `WindowZone::StatusBar` path below (that path
-    // is window-relative by construction). Checked first, and unconditional
-    // on `mutate_focus` to match the per-window `StatusBar` arm's behaviour
-    // (segment actions are query-safe; a drag sweeping over the bar band
-    // still can't extend a selection there either way).
-    if let Some(bar_rect) = separated_status_bar {
-        let active = engine.active_window_id();
-        if let Some(zones) = status_segment_map.get(&active.0) {
-            if let Some(action) = render_mod::status_bar_zone_hit_test(bar_rect, zones, x, y) {
-                return ClickTarget::StatusBarAction(action);
-            }
-        }
-    }
+    // #752: the separated status line's arm was here, and the per-window
+    // status line's arm was in the `WindowZone::StatusBar` match below. Both
+    // are now status bands walked by `render::route_chrome_click`, which
+    // `App::handle_mouse_click_msg` runs *before* it ever reaches this
+    // function — so a status click can no longer arrive here at all, and the
+    // shared router (not this backend) decides the order the three bars are
+    // arbitrated in.
 
     // ── Minimap click / drag (#35, #722) ────────────────────────────────────
     // Pure rect plumbing: the shared resolver owns the hit-test and the
@@ -160,16 +142,6 @@ pub(super) fn pixel_to_click_target(
                 return ClickTarget::None;
             };
             match render_mod::window_zone_hit_test(rw, rel_x, rel_y, line_height, char_width) {
-                WindowZone::StatusBar { local_x, .. } => {
-                    if let Some(zones) = status_segment_map.get(&window_id.0) {
-                        for (start, end, action) in zones {
-                            if local_x >= *start && local_x < *end {
-                                return ClickTarget::StatusBarAction(action.clone());
-                            }
-                        }
-                    }
-                    ClickTarget::None
-                }
                 WindowZone::Gutter {
                     line_idx,
                     gutter_col,
@@ -544,8 +516,6 @@ pub(super) fn handle_mouse_click(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
-    status_segment_map: &StatusSegmentMap,
-    separated_status_bar: Option<quadraui::Rect>,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) -> (Option<bool>, Option<EngineAction>) {
@@ -562,8 +532,6 @@ pub(super) fn handle_mouse_click(
         diff_btn_map,
         split_btn_map,
         action_btn_map,
-        status_segment_map,
-        separated_status_bar,
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
@@ -610,10 +578,6 @@ pub(super) fn handle_mouse_click(
             engine.close_tab();
             (None, None)
         }
-        ClickTarget::StatusBarAction(action) => {
-            let ea = engine.handle_status_action(&action);
-            (None, ea)
-        }
         ClickTarget::ActionMenuButton(group_id) => {
             let col = (x / char_width.max(1.0)) as u16;
             let row = (y / line_height.max(1.0)) as u16;
@@ -650,8 +614,6 @@ pub(super) fn handle_mouse_double_click(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
-    status_segment_map: &StatusSegmentMap,
-    separated_status_bar: Option<quadraui::Rect>,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
@@ -668,8 +630,6 @@ pub(super) fn handle_mouse_double_click(
         diff_btn_map,
         split_btn_map,
         action_btn_map,
-        status_segment_map,
-        separated_status_bar,
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
@@ -712,8 +672,6 @@ pub(super) fn handle_mouse_drag(
     diff_btn_map: &DiffBtnMap,
     split_btn_map: &SplitBtnMap,
     action_btn_map: &ActionBtnMap,
-    status_segment_map: &StatusSegmentMap,
-    separated_status_bar: Option<quadraui::Rect>,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
@@ -740,8 +698,6 @@ pub(super) fn handle_mouse_drag(
         diff_btn_map,
         split_btn_map,
         action_btn_map,
-        status_segment_map,
-        separated_status_bar,
         frame_hit_map,
         tab_bar_zones,
         false, // drag continuation: pure query, no focus/tab/gutter side effects
@@ -1132,10 +1088,8 @@ mod cross_split_drag_focus_tests {
         DiffBtnMap,
         SplitBtnMap,
         ActionBtnMap,
-        StatusSegmentMap,
     ) {
         (
-            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
@@ -1185,14 +1139,8 @@ mod cross_split_drag_focus_tests {
         let y_in_b = rw_b.rect.y + line_height * 2.0;
 
         let backend = Rc::new(RefCell::new(super::super::backend::GtkBackend::new()));
-        let (
-            tab_pixel_hits,
-            tab_slot_positions,
-            diff_btn_map,
-            split_btn_map,
-            action_btn_map,
-            status_segment_map,
-        ) = empty_maps();
+        let (tab_pixel_hits, tab_slot_positions, diff_btn_map, split_btn_map, action_btn_map) =
+            empty_maps();
 
         // Drag continuation: the mouse is over window B's pixels, but this
         // must resolve as a pure hit-test — no focus/group side effects.
@@ -1209,8 +1157,6 @@ mod cross_split_drag_focus_tests {
             &diff_btn_map,
             &split_btn_map,
             &action_btn_map,
-            &status_segment_map,
-            None, // no separated status line painted in this test
             None, // no cached FrameHitMap in this test — exercises the
             // `screen_zone_hit_test` fallback path (#449)
             &HashMap::new(),
@@ -1258,8 +1204,6 @@ mod cross_split_drag_focus_tests {
             &diff_btn_map,
             &split_btn_map,
             &action_btn_map,
-            &status_segment_map,
-            None, // no separated status line painted in this test
             None,
             &HashMap::new(),
             true, // mutate_focus: genuine click
@@ -1434,7 +1378,6 @@ mod frame_hit_map_tests {
         let empty_diff: DiffBtnMap = HashMap::new();
         let empty_split: SplitBtnMap = HashMap::new();
         let empty_action: ActionBtnMap = HashMap::new();
-        let empty_status: StatusSegmentMap = HashMap::new();
 
         let target = pixel_to_click_target(
             &mut engine,
@@ -1449,8 +1392,6 @@ mod frame_hit_map_tests {
             &empty_diff,
             &empty_split,
             &empty_action,
-            &empty_status,
-            None, // no separated status line painted in this test
             Some(&hit_map),
             &tab_bar_zones,
             true,
@@ -1628,8 +1569,6 @@ mod single_group_tab_click_dispatch_tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &HashMap::new(),
-                None, // no separated status line painted in this test
                 None,
                 &HashMap::new(),
                 true, // a genuine click
@@ -1654,8 +1593,6 @@ mod single_group_tab_click_dispatch_tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
-                &HashMap::new(),
-                None, // no separated status line painted in this test
                 None,
                 &HashMap::new(),
             )

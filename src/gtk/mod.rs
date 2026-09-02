@@ -648,6 +648,16 @@ struct App {
     /// independently. Mirrors the existing `picker_popup_rect` /
     /// `tab_switcher_popup_rect` "painted rect for click+test" pattern.
     separated_status_bar_rect: Rc<Cell<Option<quadraui::Rect>>>,
+    /// Segment hit zones for the **global** (bottom-of-screen) status bar,
+    /// local to `Engine::global_status_rect`'s own origin (#752).
+    ///
+    /// Kept in its own field rather than in `status_segment_map` because that
+    /// map is keyed by `WindowId` and the global bar belongs to no window — it
+    /// shows the active buffer's summary in the shell's bottom band. Populated
+    /// by `render_content` from `Backend::status_bar_layout`, the same
+    /// measurement pass that positions the bar's glyphs, so the git-branch
+    /// segment's clickable span is by construction the span it painted at.
+    global_status_zones: Rc<RefCell<render::StatusZones>>,
     /// Cached ScreenLayout from the last draw_editor paint pass. Click handlers
     /// read this instead of recomputing geometry from engine state (#344).
     cached_screen_layout: Rc<RefCell<Option<render::ScreenLayout>>>,
@@ -1225,6 +1235,7 @@ impl App {
             action_btn_map: Rc::new(RefCell::new(HashMap::new())),
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             separated_status_bar_rect: Rc::new(Cell::new(None)),
+            global_status_zones: Rc::new(RefCell::new(Vec::new())),
             cached_screen_layout: Rc::new(RefCell::new(None)),
             cached_frame_hit_map: Rc::new(RefCell::new(None)),
             sidebar_pointer_captured: Cell::new(false),
@@ -1495,8 +1506,6 @@ impl App {
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
                     &self.action_btn_map.borrow(),
-                    &self.status_segment_map.borrow(),
-                    self.separated_status_bar_rect.get(),
                     self.cached_frame_hit_map.borrow().as_ref(),
                     &self.cached_tab_bar_zones.borrow(),
                     true, // real click: focus/tab/gutter side effects are intended
@@ -1569,8 +1578,6 @@ impl App {
                         &self.diff_btn_map.borrow(),
                         &self.split_btn_map.borrow(),
                         &self.action_btn_map.borrow(),
-                        &self.status_segment_map.borrow(),
-                        self.separated_status_bar_rect.get(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                     );
@@ -2735,26 +2742,16 @@ impl App {
         // context menu *below* find/replace and the picker, while
         // `render::OVERLAY_Z_ORDER` paints it above both.
 
-        // Breadcrumb click: shared resolution via cached StatusBarLayout.
-        {
-            let engine = self.engine.borrow();
-            if engine.settings.breadcrumbs {
-                let lh = self.painted_line_height();
-                if let Some(ref screen) = *self.cached_screen_layout.borrow() {
-                    match render::resolve_breadcrumb_click(&screen.breadcrumbs, x, y, lh) {
-                        render::BreadcrumbClickResult::Hit(group_id, idx) => {
-                            drop(engine);
-                            self.engine
-                                .borrow_mut()
-                                .handle_breadcrumb_click(group_id, idx);
-                            self.draw_needed.set(true);
-                            return;
-                        }
-                        render::BreadcrumbClickResult::OnBar => return,
-                        render::BreadcrumbClickResult::Miss => {}
-                    }
-                }
-            }
+        // ── Chrome rung (#752) ────────────────────────────────────────────
+        //
+        // Breadcrumbs → status bands → global status bar, sequenced ONCE in
+        // `render::route_chrome_click` and shared verbatim with TUI's
+        // `handle_mouse`. What used to live here was the breadcrumb arm, and
+        // ~60 lines further down a git-branch hit test that re-derived
+        // `build_status_line`'s formatting by hand and measured it in UTF-8
+        // bytes against a character column. Both are gone.
+        if self.route_and_apply_chrome_click(x, y, render::ChromeMouseAction::LeftPress) {
+            return;
         }
 
         // Debug toolbar click: resolve via cached ToolbarLayout on engine (#510).
@@ -2887,67 +2884,12 @@ impl App {
         // answers the inside/outside question the stack round-trip was
         // recomputing.
         {
-            // ── Status bar branch click — open branch picker ─────────────
-            // (only when per-window status is off — global bar exists)
-            if self.cached_line_height > 0.0 {
-                let lh = self.cached_line_height;
-                let engine = self.engine.borrow();
-                let per_window_status = engine.settings.window_status_line;
-                let wildmenu_px = if engine.wildmenu_items.is_empty() {
-                    0.0
-                } else {
-                    lh
-                };
-                let global_status_rows = if per_window_status { 1.0 } else { 2.0 };
-                let status_bar_height = lh * global_status_rows + wildmenu_px;
-                let status_y = height - status_bar_height;
-                if y >= status_y && y < status_y + lh && engine.git_branch.is_some() {
-                    // Reconstruct branch column range (matching build_status_line logic)
-                    let mode_str = engine.mode_str();
-                    let filename = match engine.file_path() {
-                        Some(p) => p
-                            .file_name()
-                            .map(|f| f.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| p.display().to_string()),
-                        None => "[No Name]".to_string(),
-                    };
-                    let dirty = if engine.dirty() { " [+]" } else { "" };
-                    let recording = if let Some(reg) = engine.macro_recording {
-                        format!(" [recording @{}]", reg)
-                    } else {
-                        String::new()
-                    };
-                    let prefix = format!(" -- {}{} -- {}{}", mode_str, recording, filename, dirty);
-                    let b = engine.git_branch.as_deref().unwrap();
-                    let mut branch_text = b.to_string();
-                    if engine.sc_ahead > 0 || engine.sc_behind > 0 {
-                        let mut parts = Vec::new();
-                        if engine.sc_ahead > 0 {
-                            parts.push(format!("↑{}", engine.sc_ahead));
-                        }
-                        if engine.sc_behind > 0 {
-                            parts.push(format!("↓{}", engine.sc_behind));
-                        }
-                        branch_text = format!("{} {}", branch_text, parts.join(" "));
-                    }
-                    let branch_str = format!(" [{}]", branch_text);
-                    let start = prefix.len();
-                    let end = start + branch_str.len();
-                    let cw = self.cached_char_width.max(1.0);
-                    let click_col = (x / cw) as usize;
-                    drop(engine);
-                    if click_col >= start && click_col < end {
-                        self.engine
-                            .borrow_mut()
-                            .open_picker(crate::core::engine::PickerSource::GitBranches);
-                        self.draw_needed.set(true);
-                        return;
-                    }
-                } else {
-                    drop(engine);
-                }
-            }
-
+            // #752: the git-branch hit test that used to open this block —
+            // ~60 lines re-deriving `build_status_line`'s own formatting, then
+            // comparing a `cached_char_width`-derived column against a UTF-8
+            // *byte* range — is now the global-status-bar rung of
+            // `render::route_chrome_click`, called at the top of this handler.
+            //
             // Clicking in the editor clears every sidebar's keyboard focus.
             // Without this, focus stays on whichever sidebar grabbed it last
             // (Source Control, Extensions, Settings, AI, DAP, …) and the
@@ -3184,8 +3126,6 @@ impl App {
                                 &self.diff_btn_map.borrow(),
                                 &self.split_btn_map.borrow(),
                                 &self.action_btn_map.borrow(),
-                                &self.status_segment_map.borrow(),
-                                self.separated_status_bar_rect.get(),
                                 self.cached_frame_hit_map.borrow().as_ref(),
                                 &self.cached_tab_bar_zones.borrow(),
                             )
@@ -3267,6 +3207,132 @@ impl App {
             .get()
             .unwrap_or(self.cached_line_height)
             .max(1.0)
+    }
+
+    /// Assemble this backend's [`render::ChromeState`] from the geometry the
+    /// last frame actually painted, run the shared chrome rung over it, and
+    /// apply whatever it decides. Returns `true` when the event was consumed.
+    ///
+    /// Every rect fed in here is a *painted* one — `status_segment_map` and
+    /// `separated_status_bar_rect` are filled by `render_content` from the
+    /// same `Surface::StatusBar` rects it draws, `global_status_rect` likewise
+    /// (#752), and the breadcrumb bars carry their own draw-time layout. That
+    /// is the #555 rule: never hit-test against freshly recomputed geometry.
+    fn route_and_apply_chrome_click(
+        &mut self,
+        x: f64,
+        y: f64,
+        action: render::ChromeMouseAction,
+    ) -> bool {
+        let lh = self.painted_line_height();
+
+        let layout_ref = self.cached_screen_layout.borrow();
+        let Some(ref screen) = *layout_ref else {
+            return false;
+        };
+        let engine = self.engine.borrow();
+        let segment_map = self.status_segment_map.borrow();
+
+        // The separated status line is listed first: it is painted in its own
+        // full-width band *outside* every window's rect, so it can never be
+        // reached through the per-window bars' geometry, and a click in that
+        // band must not fall through to whatever sits underneath it.
+        let mut bands: Vec<render::StatusBand<'_>> = Vec::new();
+        if let Some(rect) = self.separated_status_bar_rect.get() {
+            if let Some(zones) = segment_map.get(&screen.active_window_id.0) {
+                bands.push(render::StatusBand { rect, zones });
+            }
+        }
+        for rw in &screen.windows {
+            if rw.status_line.is_none() || rw.rect.height <= lh {
+                continue;
+            }
+            let Some(zones) = segment_map.get(&rw.window_id.0) else {
+                continue;
+            };
+            // The status line occupies the window's bottom row — the same
+            // `rect.height - lh` `render_content` subtracts before painting it.
+            bands.push(render::StatusBand {
+                rect: quadraui::Rect::new(
+                    rw.rect.x as f32,
+                    (rw.rect.y + rw.rect.height - lh) as f32,
+                    rw.rect.width as f32,
+                    lh as f32,
+                ),
+                zones,
+            });
+        }
+
+        // The global bar last, spatially and in arbitration: it is the bottom
+        // band of the shell, below every window.
+        let global_rect = engine.global_status_rect.get();
+        let global_zones;
+        if global_rect.width > 0.0 && global_rect.height > 0.0 {
+            global_zones = self.global_status_zones.borrow().clone();
+            bands.push(render::StatusBand {
+                rect: global_rect,
+                zones: &global_zones,
+            });
+        }
+
+        // The same shared hit test, with the same tolerances, the window-split
+        // divider rung in `handle_mouse_click_msg` runs — see
+        // `render::ChromeState::on_window_divider` (#582/#752).
+        let on_window_divider =
+            self.painted_editor_bounds()
+                .is_some_and(|(content_bounds, tab_bar_h)| {
+                    let (window_rects, _) =
+                        engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+                    render::divider_hit_test(
+                        &engine.calculate_window_dividers(&window_rects),
+                        x,
+                        y,
+                        (6.0, 6.0),
+                        (6.0, 6.0),
+                        false,
+                    )
+                    .is_some()
+                });
+
+        let route = render::route_chrome_click(
+            &render::ChromeState {
+                breadcrumbs_enabled: engine.settings.breadcrumbs,
+                breadcrumbs: &screen.breadcrumbs,
+                line_height: lh,
+                status_bands: &bands,
+                on_window_divider,
+            },
+            action,
+            x,
+            y,
+        );
+
+        drop(segment_map);
+        drop(engine);
+        drop(layout_ref);
+
+        match route {
+            render::ChromeRoute::None => return false,
+            render::ChromeRoute::Breadcrumb { group_id, idx } => {
+                self.engine
+                    .borrow_mut()
+                    .handle_breadcrumb_click(group_id, idx);
+            }
+            render::ChromeRoute::StatusAction(action) => {
+                let cols = self.terminal_cols();
+                let follow_up =
+                    render::apply_status_action(&mut self.engine.borrow_mut(), &action, cols);
+                if matches!(
+                    follow_up,
+                    Some(crate::core::engine::EngineAction::ToggleSidebar)
+                ) {
+                    self.sync_sidebar_from_engine();
+                }
+            }
+            render::ChromeRoute::BreadcrumbBar | render::ChromeRoute::StatusBar => {}
+        }
+        self.draw_needed.set(true);
+        true
     }
 
     /// Character-cell advance the last frame actually painted with — the
@@ -3526,8 +3592,6 @@ impl App {
                     &self.diff_btn_map.borrow(),
                     &self.split_btn_map.borrow(),
                     &self.action_btn_map.borrow(),
-                    &self.status_segment_map.borrow(),
-                    self.separated_status_bar_rect.get(),
                     self.cached_frame_hit_map.borrow().as_ref(),
                     &self.cached_tab_bar_zones.borrow(),
                     true, // resolving the original tab-bar mouse-down; switching tabs is intended
@@ -3667,8 +3731,6 @@ impl App {
                         &self.diff_btn_map.borrow(),
                         &self.split_btn_map.borrow(),
                         &self.action_btn_map.borrow(),
-                        &self.status_segment_map.borrow(),
-                        self.separated_status_bar_rect.get(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                     );
@@ -5454,19 +5516,10 @@ impl quadraui::ShellApp for App {
                 // `window_zone_hit_test` hit-tests with — no coordinate
                 // translation needed.
                 let sb_layout = backend.status_bar_layout(sb_rect, &win_bar);
-                let mut zones = Vec::new();
-                for (rect, hit) in &sb_layout.hit_regions {
-                    if let quadraui::StatusBarHit::Segment(ref id) = hit {
-                        if let Some(action) = render::status_action_from_id(id.as_str()) {
-                            let start = rect.x as f64;
-                            let end = start + rect.width as f64;
-                            zones.push((start, end, action));
-                        }
-                    }
-                }
-                self.status_segment_map
-                    .borrow_mut()
-                    .insert(rw.window_id.0, zones);
+                self.status_segment_map.borrow_mut().insert(
+                    rw.window_id.0,
+                    render::status_bar_zones_from_layout(&sb_layout),
+                );
             }
         }
 
@@ -6073,19 +6126,10 @@ impl quadraui::ShellApp for App {
             // `pixel_to_click_target` looks its zones up under, matching the
             // dead `draw.rs::draw_window_status_bar` call site this replaces.
             let sb_layout = backend.status_bar_layout(sb_rect, &bar);
-            let mut zones = Vec::new();
-            for (rect, hit) in &sb_layout.hit_regions {
-                if let quadraui::StatusBarHit::Segment(ref id) = hit {
-                    if let Some(action) = render::status_action_from_id(id.as_str()) {
-                        let start = rect.x as f64;
-                        let end = start + rect.width as f64;
-                        zones.push((start, end, action));
-                    }
-                }
-            }
-            self.status_segment_map
-                .borrow_mut()
-                .insert(screen.active_window_id.0, zones);
+            self.status_segment_map.borrow_mut().insert(
+                screen.active_window_id.0,
+                render::status_bar_zones_from_layout(&sb_layout),
+            );
             self.separated_status_bar_rect.set(Some(sb_rect));
         } else {
             self.separated_status_bar_rect.set(None);
@@ -6097,8 +6141,17 @@ impl quadraui::ShellApp for App {
         // quickfix/bottom-panel/debug-toolbar block above), so the status
         // bar's own band no longer needs to re-subtract them.
         let status_y = y + h - status_bar_h;
+        // #752: publish the painted rect for `route_chrome_click`, the twin of
+        // TUI's `render_impl.rs` call site. The bespoke branch hit-test this
+        // replaces re-derived the band from `height - lh * rows - wildmenu_px`
+        // in the click handler — a second copy of the arithmetic three lines
+        // above, and one that had no way to know what was really drawn.
         if let Some(ref bar) = screen.global_status_bar {
             let sb_rect = quadraui::Rect::new(x as f32, status_y as f32, w as f32, lh as f32);
+            self.engine.borrow().global_status_rect.set(sb_rect);
+            // Same zone recovery as the per-window and separated bars above.
+            *self.global_status_zones.borrow_mut() =
+                render::status_bar_zones_from_layout(&backend.status_bar_layout(sb_rect, bar));
             let mut frame = QSL::new();
             frame.push(Surface::StatusBar {
                 rect: sb_rect,
@@ -6107,6 +6160,12 @@ impl quadraui::ShellApp for App {
                 pressed: None,
             });
             frame.draw(backend);
+        } else {
+            self.engine
+                .borrow()
+                .global_status_rect
+                .set(quadraui::Rect::default());
+            self.global_status_zones.borrow_mut().clear();
         }
         if let Some(ref wm) = screen.wildmenu {
             let wm_bar = render::wildmenu_to_status_bar(wm, &theme);

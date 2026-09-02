@@ -2904,6 +2904,22 @@ pub struct Engine {
     /// #695). Empty rect (`width`/`height` 0) means "not currently painted",
     /// matching GTK's `unwrap_or_default()` convention.
     pub menu_bar_rect: std::cell::Cell<quadraui::Rect>,
+    /// Cached global (bottom-of-screen) status bar rect from the last paint
+    /// (#752) — the exact twin of [`Self::menu_bar_rect`] one band lower, and
+    /// for the same reason.
+    ///
+    /// Before this, neither backend hit-tested the rect it had painted:
+    /// TUI re-derived the row as `row + 2 == term_height` and then swallowed
+    /// every click on it (`// no interactive segments`), while GTK re-derived
+    /// the band from `height - lh * rows - wildmenu_px` and hit-tested the git
+    /// branch inside it against `cached_char_width`, not the width the frame
+    /// painted with. Caching what paint actually did is the #555 rule, and
+    /// `render::route_chrome_click` reads this rect on both backends.
+    ///
+    /// Empty rect (`width`/`height` 0) means "not currently painted" — the bar
+    /// is absent whenever `settings.window_status_line` is on — matching
+    /// [`Self::menu_bar_rect`]'s convention.
+    pub global_status_rect: std::cell::Cell<quadraui::Rect>,
     /// quadraui SidebarSystem — owns debug sidebar (4 sections: Variables,
     /// Watch, Call Stack, Breakpoints) selection, scroll, keyboard nav, and
     /// mouse handling. Both TUI and GTK call `render()` and `handle()`.
@@ -3774,6 +3790,7 @@ impl Engine {
                 Vec::new(),
             ))),
             menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),
             dap_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("vars", "VARIABLES"),

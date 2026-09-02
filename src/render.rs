@@ -2857,6 +2857,325 @@ pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
     ModalKeyRoute::None
 }
 
+// ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
+//
+// The rung directly beneath [`route_modal_overlay_click`]: once no modal
+// overlay has claimed the event, the *chrome* bands get their turn — the
+// breadcrumb bar under each tab bar, and the three status bands (per-window,
+// separated, global) along the bottom.
+//
+// Same story as slice 1, one rung down. The geometry was already shared
+// (`resolve_breadcrumb_click`, `resolve_tab_bar_click`,
+// `compute_status_hit_regions`, `status_bar_zone_hit_test`) and the actions
+// were already shared (`Engine::handle_breadcrumb_click`,
+// `handle_tab_bar_click`, `handle_status_action`) — what was still transcribed
+// twice was the **router that sequences them**, and, as always when a sequence
+// is written down twice, the two copies had drifted:
+//
+//  1. **The global status bar was dead on both backends, differently.** TUI
+//     swallowed the whole row with a `// no interactive segments` comment;
+//     GTK routed exactly one segment (the git branch) through ~60 lines that
+//     re-derived the bar's text by hand — a second copy of
+//     [`build_status_line`]'s own formatting — and then hit-tested it with
+//     `cached_char_width` rather than the width the frame actually painted
+//     with (the #751 bug, one band lower).
+//
+//  2. **`branch_range` was measured in bytes and consumed as columns.**
+//     [`build_status_line`] computed `prefix.len()` / `branch.len()`, i.e.
+//     UTF-8 *byte* offsets, and its consumer compared them against a
+//     character column. Any non-ASCII in the mode string, the filename or the
+//     branch decoration — and the ahead/behind arrows `↑`/`↓` are three bytes
+//     each, so merely being ahead of origin was enough — shifted the clickable
+//     branch right of the painted one, growing with each multi-byte glyph.
+//
+//     Fixing the units would have been the small change; the range is gone
+//     instead. [`build_global_status_bar`] now emits the branch as its own
+//     `StatusBarSegment` with an `action_id`, so its hit region is produced by
+//     the same `StatusBar::layout` pass that positions its glyphs — the way
+//     the per-window bar has always worked. That also fixes a *second*, hidden
+//     error the byte fix would have left behind: GTK paints the status bar at
+//     a ~6.6px advance while `painted_char_width()` reports 8.0, so *any*
+//     column-arithmetic hit test on that bar was wrong by ~20% of x even with
+//     perfect units. Measured geometry beats arithmetic.
+//
+//  3. **TUI re-implemented `handle_tab_bar_click` inline** for the
+//     single-group case (the split-group case two branches above it already
+//     delegated), and the copy had lost `active_group` assignment and the
+//     `lsp_ensure_active_buffer()` call, so clicking a tab in an unsplit
+//     window left the LSP pointed at the previous buffer.
+//
+//  4. **GTK recovered status-bar hit zones from a painted layout in two
+//     places** with the same nine-line loop; the global bar, needing a third,
+//     is what made that worth naming once ([`status_bar_zones_from_layout`]).
+//
+// Deliberately unit-agnostic in the same way slice 1's router is: the caller
+// states its own scale ([`ChromeState::line_height`], and status bands carry
+// their painted rect plus bar-local zones), and the *sequence* underneath is
+// unit-free. TUI passes cells with a `1.0` line height; GTK passes device
+// pixels and its painted line height.
+//
+// **Not rungs of this router, deliberately** — three chrome surfaces that are
+// shared by *other* means, with the verdict recorded here so the next slice
+// does not re-litigate it:
+//
+//   * **The bottom-panel tab bar.** Both backends already delegate it to
+//     `Engine::resolve_bottom_panel_zone` + `handle_bottom_tab_bar_click` in
+//     three lines each, and the geometry lives on the engine
+//     (`bottom_panel_geometry`, #418) rather than in either rasteriser. There
+//     is no second copy of anything to converge.
+//
+//   * **The command centre.** Its hit test is one shared call
+//     (`CommandCenterLayout::hit_test`) and its actions are now one shared
+//     call ([`apply_command_center_hit`]) — but its *position in the ladder*
+//     is intrinsically per-backend and must stay so. GTK paints the centre
+//     into the CSD title bar, so it has to be arbitrated above the inline
+//     window controls and the drag-to-move fallback, neither of which TUI
+//     has; TUI arbitrates it on the menu-bar row, which GTK does not paint
+//     the centre into. Folding it into the sequence below would force one
+//     backend to state an order it cannot honour — the failure #735 warns
+//     about, in reverse.
+//
+//   * **The tab bar.** Its *geometry* genuinely cannot be shared and is not a
+//     drift bug: GTK lays tabs out with proportional-font Pango widths and
+//     resolves clicks against the pixel bounds the rasteriser actually drew
+//     (`tab_pixel_hits`, #515), while TUI's monospace char-cell `hit_regions`
+//     are exact. What *was* transcribed is the dispatch of a resolved
+//     [`crate::core::engine::TabBarClickTarget`], and the engine has owned
+//     that since `Engine::handle_tab_bar_click` — GTK's split path and TUI's
+//     split path both called it; only TUI's single-group path still had a
+//     hand-rolled copy, now deleted (see item 3 above).
+//
+// The GTK-only CSD titlebar drag-to-move fallback has no TUI twin at all.
+
+/// The subset of mouse actions the chrome rung distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeMouseAction {
+    /// Left button pressed — the only action that *fires* a chrome control.
+    LeftPress,
+    /// Anything else: release, drag, right-click, scroll, motion. Chrome
+    /// bands still **consume** these (a drag sweeping across the tab bar must
+    /// not extend an editor selection through it), they just do not act.
+    Other,
+}
+
+/// `(start, end, action)` hit zones for one status bar, **local to that bar's
+/// own origin** — the shape [`status_bar_zones_from_layout`] produces and
+/// [`status_bar_zone_hit_test`] consumes, in whatever unit the producer
+/// measured in (pixels on GTK, cells on TUI).
+pub type StatusZones = Vec<(f64, f64, StatusAction)>;
+
+/// One painted status band, in the caller's own units.
+///
+/// Covers all three of vimcode's status surfaces — the per-window status line,
+/// the separated status line above the terminal, and the global bottom bar —
+/// because from the router's point of view they differ only in where they were
+/// painted and which zones they carry.
+#[derive(Debug, Clone)]
+pub struct StatusBand<'a> {
+    /// The rect the last frame actually painted this bar into.
+    pub rect: quadraui::Rect,
+    /// `(start, end, action)` triples **local to `rect`'s own origin**, as
+    /// produced by [`status_bar_zones_from_layout`].
+    pub zones: &'a [(f64, f64, StatusAction)],
+}
+
+/// The painted chrome bands, in the order they are arbitrated.
+///
+/// Every field is optional/empty-able: a backend that does not paint a band
+/// this frame simply leaves it out, and the router skips that rung rather than
+/// the caller having to guard the call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChromeState<'a> {
+    /// `Engine::settings.breadcrumbs` — the gate, kept separate from the data
+    /// so an empty slice and "disabled" stay distinguishable.
+    pub breadcrumbs_enabled: bool,
+    /// Every group's painted breadcrumb bar (`ScreenLayout::breadcrumbs`).
+    pub breadcrumbs: &'a [BreadcrumbBar],
+    /// One text row, in the caller's units: `1.0` for TUI cells, the painted
+    /// line height for GTK.
+    pub line_height: f64,
+    /// Status bands painted this frame, nearest-to-the-user first.
+    pub status_bands: &'a [StatusBand<'a>],
+    /// `true` when the caller's window-split-divider hit test (the shared
+    /// [`divider_hit_test`], on both backends) already claims this point.
+    ///
+    /// The two bands genuinely overlap and one has to win. #582 established
+    /// that with `window_status_line` on — the default — a `:split` boundary
+    /// draws *no glyph of its own*: the upper window's own status-line row is
+    /// the only thing marking it, and is therefore the row the user aims at to
+    /// drag the split. So that row is both "the status bar" and "the divider
+    /// grab handle".
+    ///
+    /// The **divider wins**, because that is what both backends did before
+    /// #752 (each ran its divider rung above its status arm) and because
+    /// losing a resize gesture is the worse failure — a status segment can be
+    /// clicked again, a drag that silently does nothing reads as a broken
+    /// window manager. Stated here rather than left implicit in each
+    /// backend's ladder order, which is the whole point of the router.
+    pub on_window_divider: bool,
+}
+
+/// What the chrome rung decided about one event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChromeRoute {
+    /// A breadcrumb segment was hit — `Engine::handle_breadcrumb_click`.
+    Breadcrumb { group_id: GroupId, idx: usize },
+    /// On a breadcrumb bar but not on a segment — consume.
+    BreadcrumbBar,
+    /// A status segment was hit — apply with [`apply_status_action`].
+    StatusAction(StatusAction),
+    /// On a status band but not on an actionable segment — consume.
+    StatusBar,
+    /// No chrome band claimed the event; the caller continues down its own
+    /// ladder (tab bar, editor, …).
+    None,
+}
+
+/// Sequence the chrome bands against one mouse event.
+///
+/// `(x, y)` are absolute, in the caller's own units — cells for TUI, device
+/// pixels for GTK. See the module comment above this function for why the
+/// order below is stated here rather than transcribed into each backend.
+pub fn route_chrome_click(
+    state: &ChromeState<'_>,
+    action: ChromeMouseAction,
+    x: f64,
+    y: f64,
+) -> ChromeRoute {
+    // ── Breadcrumbs ─────────────────────────────────────────────────────
+    // Above the tab bar in arbitration because it is painted *below* it and
+    // the two bands abut: a click on the breadcrumb row must never be
+    // mistaken for the tab row beneath which it sits.
+    if state.breadcrumbs_enabled {
+        match resolve_breadcrumb_click(state.breadcrumbs, x, y, state.line_height) {
+            BreadcrumbClickResult::Hit(group_id, idx) => {
+                if action == ChromeMouseAction::LeftPress {
+                    return ChromeRoute::Breadcrumb { group_id, idx };
+                }
+                return ChromeRoute::BreadcrumbBar;
+            }
+            BreadcrumbClickResult::OnBar => return ChromeRoute::BreadcrumbBar,
+            BreadcrumbClickResult::Miss => {}
+        }
+    }
+
+    // ── Status bands ────────────────────────────────────────────────────
+    // A window-split divider grab outranks the status row it shares — see
+    // `ChromeState::on_window_divider`. The *global* bar is unaffected in
+    // practice: it sits in the shell's own bottom band, outside every window
+    // rect, so no divider can reach it.
+    for band in state
+        .status_bands
+        .iter()
+        .filter(|_| !state.on_window_divider)
+    {
+        if let Some(hit) = status_bar_zone_hit_test(band.rect, band.zones, x, y) {
+            if action == ChromeMouseAction::LeftPress {
+                return ChromeRoute::StatusAction(hit);
+            }
+            return ChromeRoute::StatusBar;
+        }
+        if point_in_rect(band.rect, x, y) {
+            return ChromeRoute::StatusBar;
+        }
+    }
+
+    ChromeRoute::None
+}
+
+/// Absolute point-in-rect, in whatever units the caller measures in.
+fn point_in_rect(rect: quadraui::Rect, x: f64, y: f64) -> bool {
+    x >= rect.x as f64
+        && x < (rect.x + rect.width) as f64
+        && y >= rect.y as f64
+        && y < (rect.y + rect.height) as f64
+}
+
+/// Recover `(start, end, action)` hit zones from a status bar that has already
+/// been laid out for painting.
+///
+/// The returned spans are **local to the bar's own origin**, matching
+/// [`status_bar_zone_hit_test`]'s contract, because `StatusBar::layout` always
+/// lays segments out from `(0, 0)` regardless of the rect it will be drawn
+/// into.
+///
+/// #752: GTK had this nine-line loop transcribed once per painted bar (the
+/// per-window line and the separated line), and the global bar needed a third.
+pub fn status_bar_zones_from_layout(layout: &quadraui::StatusBarLayout) -> StatusZones {
+    layout
+        .hit_regions
+        .iter()
+        .filter_map(|(rect, hit)| match hit {
+            quadraui::StatusBarHit::Segment(id) => status_action_from_id(id.as_str())
+                .map(|action| (rect.x as f64, (rect.x + rect.width) as f64, action)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Minimum inter-segment gap, in cells, every status-bar layout is measured
+/// with. Named because the *draw* path (`render_window_status_line`) and the
+/// *hit-test* path must pass the same number or clicks land on the wrong
+/// segment.
+pub const STATUS_BAR_MIN_GAP_CELLS: f32 = 2.0;
+
+/// Lay a `quadraui::StatusBar` out in **character cells** and recover its hit
+/// zones.
+///
+/// The cell-unit twin of [`status_bar_zones_from_layout`], for the TUI — which
+/// has no persistent pixel cache to consult and so re-derives the bar's layout
+/// on each click, exactly as `render_window_status_line` /
+/// `TuiBackend::draw_status_bar` derive it on each paint. Segment widths are
+/// `chars().count()`, the monospace cell count, matching the draw path.
+pub fn status_bar_zones_in_cells(bar: &quadraui::StatusBar, width_cells: usize) -> StatusZones {
+    let layout = bar.layout(width_cells as f32, 1.0, STATUS_BAR_MIN_GAP_CELLS, |seg| {
+        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
+    });
+    status_bar_zones_from_layout(&layout)
+}
+
+/// [`status_bar_zones_in_cells`] for a [`WindowStatusLine`], which has to be
+/// converted to the primitive first.
+pub fn window_status_line_zones(status: &WindowStatusLine, width_cells: usize) -> StatusZones {
+    let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:window"));
+    status_bar_zones_in_cells(&bar, width_cells)
+}
+
+/// Apply a resolved [`StatusAction`], including the follow-up both backends
+/// used to transcribe around `Engine::handle_status_action`.
+///
+/// `terminal_cols` is the width a newly-opened terminal should be created at.
+/// Returns any [`crate::core::engine::EngineAction`] the *caller* still has to
+/// act on — today only `ToggleSidebar`, which GTK answers by re-syncing its
+/// sidebar widget and TUI by doing nothing (the engine already toggled it).
+pub fn apply_status_action(
+    engine: &mut Engine,
+    action: &StatusAction,
+    terminal_cols: u16,
+) -> Option<crate::core::engine::EngineAction> {
+    use crate::core::engine::EngineAction;
+    match engine.handle_status_action(action) {
+        Some(EngineAction::OpenTerminal) => {
+            let rows = engine.session.terminal_panel_rows;
+            engine.terminal_new_tab(terminal_cols, rows);
+            None
+        }
+        other => other,
+    }
+}
+
+/// Apply a resolved [`quadraui::CommandCenterHit`]. Returns `true` when the
+/// hit was an interactive control (so the caller consumes and redraws).
+pub fn apply_command_center_hit(engine: &mut Engine, hit: quadraui::CommandCenterHit) -> bool {
+    match hit {
+        quadraui::CommandCenterHit::Back => engine.tab_nav_back(),
+        quadraui::CommandCenterHit::Forward => engine.tab_nav_forward(),
+        quadraui::CommandCenterHit::SearchBox => engine.open_command_center(),
+        _ => return false,
+    }
+    true
+}
+
 // ─── Overlay-band composition (#735 slice 1) ──────────────────────────────────
 //
 // The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and
@@ -14124,7 +14443,23 @@ pub fn calculate_gutter_cols(
     }
 }
 
-fn build_status_line(engine: &Engine) -> (String, String, Option<(usize, usize)>) {
+/// The global status bar's three pieces: `(prefix, branch, right)`.
+///
+/// #752: `branch` used to be concatenated into a single `left` blob, with a
+/// separate `Option<(start, end)>` range measured in **UTF-8 bytes** telling
+/// the one interested caller where inside that blob the git decoration sat.
+/// That range was then compared against a *character column* derived from a
+/// stale `cached_char_width`, so on any repo ahead of or behind its remote
+/// (`↑`/`↓` are three bytes each) or any file with a non-ASCII name, the
+/// clickable branch drifted right of the painted one.
+///
+/// Returning the branch as its own string lets `build_global_status_bar` emit
+/// it as a real `StatusBarSegment` with an `action_id`, so its hit region
+/// comes from the same `StatusBar::layout` the rasteriser paints with — no
+/// hand-measured range, no assumed cell width, and correct in a proportional
+/// font too. Left segments lay out contiguously, so the painted result is
+/// byte-identical to the old single blob.
+fn build_status_line(engine: &Engine) -> (String, String, String) {
     let mode_str = engine.mode_str();
 
     let filename = match engine.file_path() {
@@ -14162,15 +14497,6 @@ fn build_status_line(engine: &Engine) -> (String, String, Option<(usize, usize)>
     };
 
     let prefix = format!(" -- {}{} -- {}{}", mode_str, recording, filename, dirty);
-    let branch_range = if branch.is_empty() {
-        None
-    } else {
-        let start = prefix.len();
-        let end = start + branch.len();
-        Some((start, end))
-    };
-
-    let left = format!("{}{}", prefix, branch);
 
     let cursor = engine.cursor();
     let (errors, warnings) = engine.diagnostic_counts();
@@ -14187,30 +14513,37 @@ fn build_status_line(engine: &Engine) -> (String, String, Option<(usize, usize)>
         diag_str
     );
 
-    (left, right, branch_range)
+    (prefix, branch, right)
 }
 
 /// Build a quadraui `StatusBar` for the global (bottom-of-screen) status bar.
 pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::StatusBar {
-    let (left, right, _branch_range) = build_status_line(engine);
+    let (prefix, branch, right) = build_status_line(engine);
     let fg = quadraui::Color::rgb(theme.status_fg.r, theme.status_fg.g, theme.status_fg.b);
     let bg = quadraui::Color::rgb(theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
+    let seg = |text: String, action_id: Option<quadraui::WidgetId>| quadraui::StatusBarSegment {
+        text,
+        fg,
+        bg,
+        bold: false,
+        action_id,
+    };
+    let mut left_segments = vec![seg(prefix, None)];
+    // #752: the branch is its own **clickable** segment rather than a
+    // hand-measured span inside one blob, so `StatusBar::layout` produces its
+    // hit region from the same measurement pass that positions its glyphs.
+    // `status_action_from_id` maps this id back to `StatusAction::SwitchBranch`,
+    // exactly as it does for the per-window bar's segments.
+    if !branch.is_empty() {
+        left_segments.push(seg(
+            branch,
+            Some(quadraui::WidgetId::new("status:switch_branch")),
+        ));
+    }
     quadraui::StatusBar {
         id: quadraui::WidgetId::new("status:global"),
-        left_segments: vec![quadraui::StatusBarSegment {
-            text: left,
-            fg,
-            bg,
-            bold: false,
-            action_id: None,
-        }],
-        right_segments: vec![quadraui::StatusBarSegment {
-            text: right,
-            fg,
-            bg,
-            bold: false,
-            action_id: None,
-        }],
+        left_segments,
+        right_segments: vec![seg(right, None)],
     }
 }
 
