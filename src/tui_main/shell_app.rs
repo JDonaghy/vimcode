@@ -9179,28 +9179,48 @@ mod tests {
     /// hand-rolling `TabBarClickTarget` dispatch, so there is exactly one
     /// place this rung can drift from again.
     ///
-    /// # RED-verification note (honesty over the PR's own claim)
+    /// It is also the regression test for the geometry half of that arm:
+    /// the hit test now measures against `GroupTabBar::bounds` — the rect
+    /// this frame *painted* — instead of re-deriving `menu_rows` /
+    /// `editor_left` from live engine state at click time.
     ///
-    /// The removed hand-rolled arm's `Tab(i)` case still called
-    /// `engine.goto_tab(i)`, which has unconditionally called
-    /// `self.lsp_ensure_active_buffer()` internally since long before this
-    /// PR (`windows.rs`, unchanged history). Restoring that exact removed
-    /// code and re-running this test leaves it **green**, not red: for a
-    /// single, always-active group, the omitted explicit `active_group =
-    /// group_id` assignment is a no-op (there is only one group to point
-    /// at), so this specific input does not reproduce the LSP-desync this
-    /// fix's own comment (and the review finding echoing it) describes.
-    /// Verified by temporarily restoring the removed arm and re-running —
-    /// not asserted from reading the diff alone.
+    /// # RED-verification note
     ///
-    /// The test is kept anyway because it satisfies the review finding's
-    /// own stated fallback bar ("at minimum the active buffer/tab tracks
-    /// the click") and because it pins the *converged* dispatch path
-    /// (`handle_tab_bar_click`) against any *future* regression that would
-    /// show up here even though this particular historical one does not.
-    /// There is no live LSP server under `driver_with_shell` to assert on
-    /// LSP state directly, and `lsp_ensure_active_buffer` no-ops for a
-    /// `.txt` fixture with no configured language server regardless.
+    /// **Dispatch half — not RED.** The removed hand-rolled arm's `Tab(i)`
+    /// case still called `engine.goto_tab(i)`, which has unconditionally
+    /// called `self.lsp_ensure_active_buffer()` internally since long before
+    /// this PR (`windows.rs`, unchanged history). Restoring that exact
+    /// removed code and re-running this test leaves it green: for a single,
+    /// always-active group the omitted explicit `active_group = group_id`
+    /// assignment is a no-op (there is only one group to point at), so this
+    /// input does not reproduce the LSP-desync the fix's comment describes.
+    /// Verified by restoring the removed arm and re-running, not asserted
+    /// from reading the diff. There is no live LSP server under
+    /// `driver_with_shell` to assert on directly, and
+    /// `lsp_ensure_active_buffer` no-ops for a `.txt` fixture with no
+    /// configured language server regardless.
+    ///
+    /// **Geometry half — RED.** Restore `let local_col = rel_col;` (i.e.
+    /// `col - editor_left`) with the `row == menu_rows` gate in
+    /// `mouse.rs`'s single-group arm and this test fails on the first
+    /// assertion below, on any machine: the pinned precondition is a
+    /// *hidden shadow sidebar* with the runner still booted on the
+    /// hamburger panel, so the very click under test reconciles the runner
+    /// (`take_requested_panel`) and collapses the painted sidebar. Live
+    /// `editor_left` therefore drops by the sidebar's whole width *during*
+    /// the click, `rel_col` lands ~31 columns right of the tab the user
+    /// actually clicked, and the tab switch is silently swallowed — the
+    /// user has to click the tab twice. Painted `bounds.x` does not move.
+    ///
+    /// # Why the sidebar state is pinned (#634)
+    ///
+    /// Sidebar visibility on a bare `TuiShellApp::new` is *ambient* — see
+    /// `app_with_sidebar_open`'s doc comment. This test hides it explicitly
+    /// for the opposite reason that fixture shows it: on a developer box
+    /// whose session has the explorer open, the runner reconciles onto
+    /// Explorer, the painted sidebar never collapses and the pre-fix bug
+    /// does not reproduce at all. Pinning it here is what makes the RED
+    /// note above true everywhere rather than only on a fresh checkout.
     #[test]
     fn tab_click_in_unsplit_window_switches_active_buffer_via_shell_app() {
         let dir = std::env::temp_dir().join(format!(
@@ -9215,6 +9235,13 @@ mod tests {
         std::fs::write(&file_b, "BBB752 content\n").unwrap();
 
         let mut app = TuiShellApp::new(None);
+        // Pin the ambient sidebar state (#634, see the doc comment above):
+        // shadow sidebar hidden, while the runner's own `AppShell` still
+        // boots on the hamburger panel with its sidebar shown. That is the
+        // state a fresh checkout starts in, and it is what makes the click
+        // under test change the painted geometry mid-dispatch.
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
         app.engine
             .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
             .unwrap();

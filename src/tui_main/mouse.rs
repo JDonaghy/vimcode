@@ -2418,8 +2418,10 @@ pub(super) fn handle_mouse(
     // ── Tab bar click ──────────────────────────────────────────────────────
     // For split groups, any group's tab bar row is clickable (not just the top row).
     if let Some(layout) = last_layout {
-        let rel_col = col - editor_left;
-
+        // #752: no `rel_col = col - editor_left` here any more — *both* arms
+        // below now measure against the painted `GroupTabBar::bounds.x`, so
+        // neither needs the live sidebar-derived origin (nor can underflow on
+        // it when the sidebar's visibility changed earlier in this same click).
         if let Some(ref split) = layout.editor_group_split {
             // Find which group's tab bar row matches the clicked row.
             // Tab bar sits tab_bar_height rows above the group's window content.
@@ -2500,48 +2502,87 @@ pub(super) fn handle_mouse(
                 // clicks on empty tab-bar space can start a resize drag.
             }
         }
-        // Single group: check top tab bar row only.
-        if row == menu_rows
-            && layout.editor_group_split.is_none()
+        // Single group: check the active group's painted tab-bar row.
+        //
+        // #752: the row *and* the left edge come from `gtb.bounds` — the rect
+        // this frame actually painted — instead of the live
+        // `menu_rows`/`editor_left` re-derivation this arm used to do. Same
+        // reasoning as #695 moving `menu_rows` onto the painted
+        // `menu_bar_rect` cache: a click can *change* the state those are
+        // derived from before this hit test runs. Concretely, with the
+        // hamburger "Menu" panel open in the sidebar, the click that lands on
+        // a tab first dismisses that panel; when no panel takes its place the
+        // sidebar collapses, `sb_visible` flips false and `editor_left` drops
+        // by the sidebar's whole width — so `rel_col` pointed ~31 columns
+        // right of the tab the user clicked and the switch was silently
+        // swallowed (the user had to click the tab twice). The split-group
+        // branch above has hit-tested against absolute painted bounds since
+        // #550; this arm now does too, so both read one geometry.
+        let single_group_bar = if layout.editor_group_split.is_none()
             && !engine.is_tab_bar_hidden(engine.active_group)
         {
-            // #654: the last hand-rolled tab geometry in the TUI — this used
-            // to rebuild the `TabBar` primitive and re-measure every tab with
-            // `name.chars().count() + TAB_CLOSE_COLS` before calling
-            // `hit_test`. The split-group branch above, the tooltip lookup and
-            // the drag-slot map all already read `hit_regions`, so this now
-            // does too: one geometry, computed once in `build_screen_layout`.
-            let local_col = rel_col;
-            // #752: this used to re-implement `Engine::handle_tab_bar_click`
-            // arm by arm — the split-group branch a few lines above already
-            // delegated to it, and GTK's `dispatch_tab_bar_target` did too, so
-            // this was the last hand-rolled copy of a dispatch the engine has
-            // owned all along. The copy had drifted: it never set
-            // `active_group` and never called `lsp_ensure_active_buffer()`,
-            // so clicking a tab in an *unsplit* window left the LSP pointed at
-            // the previously-active buffer, while doing the same in a split
-            // did not.
-            let group_id = engine.active_group;
-            match render::resolve_tab_bar_click(&layout.tab_bar_hit_regions, local_col) {
-                Some(TabBarClickTarget::ActionMenu) => {
-                    // Needs screen coordinates, so the engine's own arm is a
-                    // deliberate no-op (see `handle_tab_bar_click`). #434:
-                    // pass the tab-row height (1.0 row in TUI) so the engine
-                    // drives `Below` placement.
-                    engine.active_group = group_id;
-                    engine.open_editor_action_menu(group_id, col, row, 1.0);
-                }
-                Some(target) => {
-                    let is_tab = matches!(target, TabBarClickTarget::Tab(_));
-                    if engine.handle_tab_bar_click(group_id, target) {
-                        engine.show_close_tab_confirm();
-                    } else if is_tab {
-                        *tab_drag_start = Some((col, row));
+            layout
+                .group_tab_bars
+                .iter()
+                .find(|gtb| gtb.group_id == engine.active_group)
+        } else {
+            None
+        };
+        // The tab bar sits `click_tbh` rows above the group's window content
+        // (2 with breadcrumbs, 1 without) — the same offset the split branch
+        // above applies.
+        let single_tab_bar_row = single_group_bar.map(|gtb| {
+            let click_tbh: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
+            (gtb.bounds.y as u16).saturating_sub(click_tbh)
+        });
+        if let (Some(gtb), Some(tab_bar_row)) = (single_group_bar, single_tab_bar_row) {
+            let gx = gtb.bounds.x as u16;
+            let gw = gtb.bounds.width as u16;
+            if row == tab_bar_row && col >= gx && col < gx + gw {
+                // #654: the last hand-rolled tab geometry in the TUI — this used
+                // to rebuild the `TabBar` primitive and re-measure every tab with
+                // `name.chars().count() + TAB_CLOSE_COLS` before calling
+                // `hit_test`. The split-group branch above, the tooltip lookup and
+                // the drag-slot map all already read `hit_regions`, so this now
+                // does too: one geometry, computed once in `build_screen_layout`.
+                let local_col = col - gx;
+                // #752: this used to re-implement `Engine::handle_tab_bar_click`
+                // arm by arm — the split-group branch a few lines above already
+                // delegated to it, and GTK's `dispatch_tab_bar_target` did too, so
+                // this was the last hand-rolled copy of a dispatch the engine has
+                // owned all along. The copy had drifted: it never set
+                // `active_group` and never called `lsp_ensure_active_buffer()`,
+                // so clicking a tab in an *unsplit* window left the LSP pointed at
+                // the previously-active buffer, while doing the same in a split
+                // did not.
+                let group_id = engine.active_group;
+                // Per-group `hit_regions`, not `layout.tab_bar_hit_regions`: both
+                // are computed from the same tabs, scroll offset and bounding-box
+                // width, but only the per-group one is paired with the `bounds`
+                // this arm now measures `local_col` against (#735's audit note on
+                // `ScreenLayout::tab_bar_hit_regions` called this arm out as its
+                // last remaining reader).
+                match render::resolve_tab_bar_click(&gtb.hit_regions, local_col) {
+                    Some(TabBarClickTarget::ActionMenu) => {
+                        // Needs screen coordinates, so the engine's own arm is a
+                        // deliberate no-op (see `handle_tab_bar_click`). #434:
+                        // pass the tab-row height (1.0 row in TUI) so the engine
+                        // drives `Below` placement.
+                        engine.active_group = group_id;
+                        engine.open_editor_action_menu(group_id, col, row, 1.0);
                     }
+                    Some(target) => {
+                        let is_tab = matches!(target, TabBarClickTarget::Tab(_));
+                        if engine.handle_tab_bar_click(group_id, target) {
+                            engine.show_close_tab_confirm();
+                        } else if is_tab {
+                            *tab_drag_start = Some((col, row));
+                        }
+                    }
+                    None => {}
                 }
-                None => {}
+                return sidebar_width;
             }
-            return sidebar_width;
         }
     }
 
