@@ -6605,8 +6605,17 @@ impl quadraui::ShellApp for App {
         // rasterisation stay here, in pixels, because that is the genuine
         // per-backend difference; only the *order* moved.
         //
-        // Every arm gates itself and, when it paints, pushes its rung onto
-        // `painted_band`. Arms whose surface is absent still run — several own
+        // Every arm gates itself and, when it paints, records the rung it
+        // painted — naming the variant explicitly (`push(OverlayOp::Dialog)`),
+        // never `push(op)`. That distinction is the difference between a test
+        // that can fail and one that cannot: with `push(op)` the record follows
+        // the *pattern* the walk is currently at, so swapping two arms' bodies
+        // paints them in the wrong order while still recording the right one.
+        // Naming the variant makes the record describe what was drawn, so
+        // `check_overlay_band_order` (and the black-box tests reading this
+        // field) catch that swap.
+        //
+        // Arms whose surface is absent still run — several own
         // a hit-test cache (`picker_popup_rect`, `dialog_layout`,
         // `context_menu_layout`, `tab_switcher_popup_rect`,
         // `command_center_layout`, `toast_layout`) that must be *cleared* on
@@ -6645,7 +6654,7 @@ impl quadraui::ShellApp for App {
                         app_icon_rect,
                         controls_rect,
                     );
-                    painted_band.push(op);
+                    painted_band.push(render::OverlayOp::MenuDropdown);
                 }
 
                 // ── Command Center: nav arrows + search box (#676) ────────────
@@ -6676,7 +6685,7 @@ impl quadraui::ShellApp for App {
                         );
                         let cc_layout = backend.draw_command_center(cc_rect, &cc);
                         engine.command_center_layout.replace(Some(cc_layout));
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::CommandCenter);
                     } else {
                         engine.command_center_layout.replace(None);
                     }
@@ -6702,7 +6711,7 @@ impl quadraui::ShellApp for App {
                 render::OverlayOp::FindReplace => {
                     if let Some(ref find_replace) = screen.find_replace {
                         backend.draw_find_replace(popup_viewport, find_replace);
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::FindReplace);
                     }
                 }
 
@@ -6744,7 +6753,7 @@ impl quadraui::ShellApp for App {
                             geo.popup_w as f64,
                             geo.popup_h as f64,
                         )));
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::UnifiedPicker);
                     } else {
                         self.picker_popup_rect.set(None);
                     }
@@ -6784,7 +6793,7 @@ impl quadraui::ShellApp for App {
                                 geo.bounds.width as f64,
                                 geo.bounds.height as f64,
                             )));
-                            painted_band.push(op);
+                            painted_band.push(render::OverlayOp::TabSwitcher);
                         }
                     }
                 }
@@ -6814,7 +6823,7 @@ impl quadraui::ShellApp for App {
                             });
                             frame.draw(backend);
                             *self.context_menu_layout.borrow_mut() = Some(mlayout);
-                            painted_band.push(op);
+                            painted_band.push(render::OverlayOp::ContextMenu);
                         }
                         None => *self.context_menu_layout.borrow_mut() = None,
                     }
@@ -6875,7 +6884,7 @@ impl quadraui::ShellApp for App {
                                 });
                                 frame.draw(backend);
                                 *self.dialog_layout.borrow_mut() = Some(dlayout);
-                                painted_band.push(op);
+                                painted_band.push(render::OverlayOp::Dialog);
                             }
                         },
                         None => {
@@ -6900,7 +6909,7 @@ impl quadraui::ShellApp for App {
                     if let Some(stack) = render::build_toast_stack(&engine) {
                         let toast_layout = backend.draw_toast_stack(popup_viewport, &stack);
                         engine.toast_layout.replace(Some(toast_layout));
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::ToastStack);
                     } else {
                         engine.toast_layout.replace(None);
                     }

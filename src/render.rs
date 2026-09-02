@@ -4793,6 +4793,14 @@ pub struct ScreenLayout {
     pub signature_help: Option<SignatureHelp>,
     /// Menu bar strip data, or `None` when the bar is hidden.
     pub menu_bar_visible: bool,
+    /// **#735 audit verdict: deliberately not composed.** Zero paint readers
+    /// on either backend, and that is correct — `MenuSystem` owns its own
+    /// `open_item`, and both backends' `OverlayOp::MenuDropdown` rung just
+    /// calls `MenuSystem::render`, which decides for itself whether a dropdown
+    /// body is open. This field's only consumers are the
+    /// `collect_*_ui_elements` parity harnesses below, which need the flag as
+    /// *state* to declare the expected element set. Keeping it is what lets
+    /// those harnesses assert on a dropdown without reaching into `MenuSystem`.
     pub menu_dropdown_open: bool,
     /// Debug toolbar strip data, or `None` when hidden and no active session.
     pub debug_toolbar: Option<DebugToolbarData>,
@@ -4823,6 +4831,14 @@ pub struct ScreenLayout {
     /// backends can paint it unconditionally (#551). Distinct from
     /// `window_dividers`, which are the `:split`/`:vsplit` boundaries *within*
     /// each group.
+    /// **#735 audit verdict: composed on TUI, hit-tested on both, painted on
+    /// neither by GTK.** TUI paints these via `render_group_dividers`; GTK
+    /// paints `window_dividers` (the `:split`/`:vsplit` boundaries) and leaves
+    /// group-split boundaries with no drawn line, while still resolving drags
+    /// against them through `screen_zone_hit_test` (`gtk/click.rs`). So the
+    /// field is genuinely read on GTK, just transitively and for input only —
+    /// the missing *paint* is a real cross-backend gap, but it belongs to the
+    /// editor band (#735 stage 3), not the overlay band this slice converged.
     pub group_dividers: Vec<GroupDivider>,
     /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
     pub ext_sidebar: Option<ExtSidebarData>,
@@ -4839,6 +4855,15 @@ pub struct ScreenLayout {
     /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
     pub diff_peek: Option<DiffPeekPopup>,
     /// Diff toolbar data for the single-group tab bar.
+    ///
+    /// **#735 audit verdict: superseded, never composed.** Zero readers on
+    /// either backend. #551 made `group_tab_bars` populated for *every* group
+    /// count (a single group is a split of one), and both backends paint from
+    /// the per-group [`GroupTabBar::diff_toolbar`] via `tab_bar_draw_targets`.
+    /// This single-group mirror survives only as input to
+    /// `collect_expected_ui_elements` / `collect_ui_elements_tui` below, and to
+    /// TUI's `mouse.rs` hit-test. Fold those onto `group_tab_bars` and it can
+    /// go.
     pub diff_toolbar: Option<DiffToolbarData>,
     /// Modal dialog popup — `Some` when a dialog is open.
     pub dialog: Option<DialogPanel>,
@@ -4849,8 +4874,21 @@ pub struct ScreenLayout {
     /// Tab hover tooltip: shortened file path to display near the hovered tab.
     pub tab_tooltip: Option<String>,
     /// Tab scroll offset for the single-group tab bar.
+    ///
+    /// **#735 audit verdict: superseded, never composed.** Same #551 story as
+    /// [`Self::diff_toolbar`]: both backends read the per-group
+    /// [`GroupTabBar::tab_scroll_offset`] (folded into `gtb.bar` by
+    /// `build_tab_bar_primitive` for paint, and read directly by
+    /// `build_tab_drop_groups` for drop zones). The only remaining reader of
+    /// *this* field is a TUI test assertion.
     pub tab_scroll_offset: usize,
     /// Pre-built quadraui `TabBar` primitive for the single-group tab bar.
+    ///
+    /// **#735 audit verdict: superseded, never composed.** Zero readers
+    /// anywhere — not even a test. `tab_bar_draw_targets` hands both backends
+    /// the per-group `gtb.bar` instead (#551). Deleting it is a mechanical
+    /// follow-up this slice deliberately leaves alone, since it touches the
+    /// editor band rather than the overlay band.
     pub tab_bar_primitive: quadraui::TabBar,
     /// Hit regions (char-cell columns, relative to the tab bar's left edge) for
     /// the single-group / active tab bar drawn from `tab_bar_primitive`. Empty in
@@ -16079,6 +16117,130 @@ pub fn matches_key_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Overlay-band composition (#735 slice 1) ──────────────────────────
+
+    /// Pins the canonical z-order itself. Not a tautology: this is the *only*
+    /// place the order is written down now, so the assertion is what a reviewer
+    /// reads to see it, and reordering the constant to "fix" a backend fails
+    /// here first with a diff that names both rungs.
+    #[test]
+    fn overlay_z_order_is_the_single_shared_ladder() {
+        assert_eq!(
+            OVERLAY_Z_ORDER,
+            [
+                OverlayOp::MenuDropdown,
+                OverlayOp::CommandCenter,
+                OverlayOp::FindReplace,
+                OverlayOp::UnifiedPicker,
+                OverlayOp::TabSwitcher,
+                OverlayOp::ContextMenu,
+                OverlayOp::Dialog,
+                OverlayOp::ToastStack,
+            ],
+            "the shared overlay z-order changed — both backends walk this array, \
+             so a reorder here moves both. Confirm the new order against \
+             `route_modal_overlay_click`'s arbitration before accepting."
+        );
+
+        // The two placements #735 had to *pick* between, called out so a future
+        // edit that quietly reverts either one fails with the reason attached.
+        let pos = |op: OverlayOp| OVERLAY_Z_ORDER.iter().position(|c| *c == op).unwrap();
+        assert!(
+            pos(OverlayOp::Dialog) > pos(OverlayOp::ContextMenu),
+            "a modal dialog takes every event ahead of the context menu \
+             (`route_modal_key` / `route_modal_overlay_click`), so it must also \
+             paint above it — GTK had this inverted before #735"
+        );
+        assert!(
+            pos(OverlayOp::Dialog) > pos(OverlayOp::MenuDropdown),
+            "title-bar chrome is chrome: a modal covers it — TUI had this \
+             inverted before #735"
+        );
+        assert!(
+            pos(OverlayOp::CommandCenter) > pos(OverlayOp::MenuDropdown),
+            "`MenuSystem::render` repaints `draw_menu_bar` across the whole \
+             band, erasing a command centre drawn first (#676 on GTK, #712 on \
+             TUI)"
+        );
+        assert!(
+            pos(OverlayOp::ToastStack) == OVERLAY_Z_ORDER.len() - 1,
+            "toasts sit on top of everything, and are the first rung \
+             `route_modal_overlay_click` arbitrates"
+        );
+    }
+
+    #[test]
+    fn compose_overlay_band_filters_to_live_rungs_in_canonical_order() {
+        let none = OverlayPresence::default();
+        assert!(compose_overlay_band(&none).is_empty());
+
+        // Deliberately set in an order that is *not* the paint order, to prove
+        // the output order comes from `OVERLAY_Z_ORDER` and not from the
+        // struct's field order or the caller's.
+        let mut p = OverlayPresence::default();
+        p.toast_stack = true;
+        p.context_menu = true;
+        p.menu_dropdown = true;
+        p.dialog = true;
+        assert_eq!(
+            compose_overlay_band(&p),
+            vec![
+                OverlayOp::MenuDropdown,
+                OverlayOp::ContextMenu,
+                OverlayOp::Dialog,
+                OverlayOp::ToastStack,
+            ]
+        );
+
+        let all = OverlayPresence {
+            menu_dropdown: true,
+            command_center: true,
+            find_replace: true,
+            unified_picker: true,
+            tab_switcher: true,
+            context_menu: true,
+            dialog: true,
+            toast_stack: true,
+        };
+        assert_eq!(compose_overlay_band(&all), OVERLAY_Z_ORDER.to_vec());
+    }
+
+    #[test]
+    fn check_overlay_band_order_accepts_any_canonical_subsequence() {
+        assert!(check_overlay_band_order(&[]).is_ok());
+        assert!(check_overlay_band_order(&OVERLAY_Z_ORDER).is_ok());
+        assert!(check_overlay_band_order(&[OverlayOp::ContextMenu, OverlayOp::Dialog]).is_ok());
+        assert!(check_overlay_band_order(&[
+            OverlayOp::MenuDropdown,
+            OverlayOp::UnifiedPicker,
+            OverlayOp::ToastStack
+        ])
+        .is_ok());
+    }
+
+    /// The exact pre-#735 GTK sequence, which is what this check exists to
+    /// reject. Keeps the regression legible: if someone hoists a rung back out
+    /// of the shared walk, this is the shape it produces.
+    #[test]
+    fn check_overlay_band_order_rejects_the_gtk_dialog_context_menu_inversion() {
+        let err = check_overlay_band_order(&[OverlayOp::Dialog, OverlayOp::ContextMenu])
+            .expect_err("dialog-then-context-menu runs backwards against OVERLAY_Z_ORDER");
+        assert!(err.contains("ContextMenu"), "{err}");
+        assert!(err.contains("out of z-order"), "{err}");
+
+        // And the pre-#735 TUI one: title-bar chrome after the modal stack.
+        assert!(check_overlay_band_order(&[
+            OverlayOp::Dialog,
+            OverlayOp::MenuDropdown,
+            OverlayOp::CommandCenter,
+            OverlayOp::ToastStack,
+        ])
+        .is_err());
+
+        // A repeated rung is a double-paint, not a valid band.
+        assert!(check_overlay_band_order(&[OverlayOp::Dialog, OverlayOp::Dialog]).is_err());
+    }
 
     fn empty_sc_data() -> SourceControlData {
         SourceControlData {

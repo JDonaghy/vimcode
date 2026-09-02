@@ -109,6 +109,12 @@ pub(super) struct Harness<A: AppLogic> {
     /// for click routing (`App::tab_switcher_popup_rect`).
     #[allow(clippy::type_complexity)]
     pub tab_switcher_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    /// The overlay rungs the last frame actually painted, in paint order
+    /// (#735). The GTK half of the cross-backend z-order assertion —
+    /// `TuiShellApp` carries the identical `painted_overlay_band` and its
+    /// `overlay_band_*_via_shell_app` tests assert against the same expected
+    /// `Vec<OverlayOp>` for the same engine state.
+    pub painted_overlay_band: Rc<RefCell<Vec<crate::render::OverlayOp>>>,
     /// The sidebar content rect the last frame painted the active panel into,
     /// or `None` if the sidebar was hidden. The sidebar twin of
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
@@ -369,6 +375,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
     let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
+    let painted_overlay_band = Rc::clone(&app.painted_overlay_band);
     let status_segment_map = Rc::clone(&app.status_segment_map);
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
@@ -388,6 +395,7 @@ pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl A
         editor_hover_popup_rect,
         panel_hover_popup_rect,
         tab_switcher_popup_rect,
+        painted_overlay_band,
         status_segment_map,
         separated_status_bar_rect,
         title_bar_rect,
@@ -5242,6 +5250,139 @@ mod scrollbar_paint {
              re-diagnosis of #723) — if this now fails, GTK has grown a \
              live scrollbar paint and this test's doc comment needs \
              updating to match, not silently deleting"
+        );
+    }
+}
+
+#[cfg(test)]
+mod overlay_band_z_order {
+    //! #735 slice 1: the GTK half of the shared overlay-band z-order.
+    //!
+    //! Frame composition — which surface is laid down, in what order — used to
+    //! be transcribed once per backend, and had inverted twice. Both backends
+    //! now walk `render::OVERLAY_Z_ORDER` and record what they painted into
+    //! `painted_overlay_band`; these tests read that record.
+    //!
+    //! **One intrinsic difference, deliberately not converged:** GTK's menu bar
+    //! *is* its client-side titlebar, so `App::setup` forces
+    //! `engine.menu_bar_visible = true` unconditionally (#552) and the
+    //! `MenuDropdown` / `CommandCenter` rungs are therefore always live here.
+    //! TUI shows its menu row only in vscode-mode or via Alt. So the fixtures
+    //! below turn the menu bar *on* for TUI too, and the two backends then
+    //! assert the identical band.
+    use super::*;
+
+    // The twin lives in `tui_main/shell_app.rs`
+    // (`overlay_band_*_via_shell_app`) and asserts against the **same expected
+    // `Vec<OverlayOp>`** for the same engine state. A single test cannot drive
+    // both backends — the GTK `App` lives in the `vimcode` bin target,
+    // `TuiShellApp` in `vcd` — so "both backends emit the same sequence" is
+    // expressed as two tests sharing one expected value. Keep them in step.
+
+    /// A dialog both backends paint **in-canvas**.
+    ///
+    /// The `input` field is what forces that: `quadraui::native_dialog_options`
+    /// returns `None` for a dialog carrying a text input, so `render_content`'s
+    /// `OverlayOp::Dialog` arm draws the generic primitive instead of queueing a
+    /// real OS `AlertDialog` (#727). A plain button-only dialog would go native
+    /// here and never enter the band at all, which would make the cross-backend
+    /// comparison compare two different things.
+    ///
+    /// `tui_main/shell_app.rs`'s `in_canvas_dialog` is the byte-identical twin.
+    fn in_canvas_dialog(title: &str) -> crate::core::engine::Dialog {
+        crate::core::engine::Dialog {
+            title: title.to_string(),
+            body: vec!["body line".to_string()],
+            buttons: vec![crate::core::engine::DialogButton {
+                label: "OK".to_string(),
+                hotkey: 'o',
+                action: "ok".to_string(),
+            }],
+            selected: 0,
+            tag: String::new(),
+            input: Some(crate::core::engine::DialogInput {
+                label: "Passphrase".to_string(),
+                value: String::new(),
+                is_password: true,
+            }),
+        }
+    }
+
+    /// Opens a context menu and an in-canvas modal dialog in the same frame and
+    /// asserts the *painted* band is `[ContextMenu, Dialog]` — the dialog on
+    /// top, byte-identical to what the TUI twin asserts.
+    ///
+    /// **RED-verified against unfixed `develop`.** Before #735, GTK's
+    /// `render_content` painted `screen.dialog` and *then* `screen.context_menu`
+    /// — the inversion this issue exists to remove. Restoring that order (hoist
+    /// the `Dialog` arm's body above the `ContextMenu` arm's, out of the
+    /// `OVERLAY_Z_ORDER` walk) makes this fail with
+    /// `[Dialog, ContextMenu]`, and trips `check_overlay_band_order`'s
+    /// `debug_assert` in `render_content` on the way. Restored before
+    /// committing.
+    #[test]
+    fn overlay_band_paints_dialog_above_context_menu_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.open_editor_context_menu(4, 4);
+        assert!(
+            engine
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty()),
+            "fixture needs a non-empty context menu — an empty one is not painted"
+        );
+        engine.dialog = Some(in_canvas_dialog("ZQXW735DIALOG"));
+
+        let h = harness(engine, 1400, 900);
+
+        assert_eq!(
+            *h.painted_overlay_band.borrow(),
+            vec![
+                crate::render::OverlayOp::MenuDropdown,
+                crate::render::OverlayOp::CommandCenter,
+                crate::render::OverlayOp::ContextMenu,
+                crate::render::OverlayOp::Dialog,
+            ],
+            "expected band differs from the TUI twin's \
+             (`overlay_band_paints_dialog_above_context_menu_via_shell_app`). \
+             Two orderings are pinned here: the title-bar chrome below the modal \
+             stack (TUI had that inverted before #735) and the dialog above the \
+             context menu (GTK had *that* inverted — a modal dialog takes every \
+             event once open, per `route_modal_key` / \
+             `route_modal_overlay_click`, so it must paint above the menu too)"
+        );
+        // Paint, not just bookkeeping (#587/#592): a recorded rung that never
+        // reached the surface is exactly the failure this repo keeps hitting.
+        assert!(
+            h.dialog_layout.borrow().is_some(),
+            "recorded band claims the dialog painted in-canvas, but no \
+             `DialogLayout` was cached — the recorder and the painter disagree"
+        );
+    }
+
+    /// A frame with no app-level overlay open records only the title-bar
+    /// chrome — the recorder is not just "whatever `OVERLAY_Z_ORDER` contains".
+    ///
+    /// Guards the arms that must still run for their *clearing* side-effect
+    /// (stale `dialog_layout` / `context_menu_layout` / `picker_popup_rect`
+    /// geometry is the #587 class of bug) without that being mistaken for a
+    /// paint. `MenuDropdown` / `CommandCenter` survive because GTK's menu bar is
+    /// its titlebar and `setup()` pins it visible (#552) — see the module doc.
+    #[test]
+    fn overlay_band_holds_only_the_title_bar_when_no_overlay_is_open_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        let h = harness(engine, 1400, 900);
+        assert_eq!(
+            *h.painted_overlay_band.borrow(),
+            vec![
+                crate::render::OverlayOp::MenuDropdown,
+                crate::render::OverlayOp::CommandCenter,
+            ],
+            "no app-level overlay was open, so only the title-bar rungs should \
+             have painted — every other arm ran for its cache-clearing side \
+             effect only"
         );
     }
 }
