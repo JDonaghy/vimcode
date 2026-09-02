@@ -1819,6 +1819,11 @@ impl ShellApp for TuiShellApp {
         }
 
         // ── Global status bar ────────────────────────────────────────────
+        // #752: publish the painted rect for `render::route_chrome_click`, the
+        // twin of `render_impl.rs`'s `draw_frame` call site (this backend
+        // still paints the bottom band from two places — module-doc gap 1) and
+        // of GTK's in `App::render_content`. Cleared when no global bar is
+        // drawn, matching `Engine::menu_bar_rect`'s empty-rect convention.
         if let Some(ref bar) = screen.global_status_bar {
             let q_rect = quadraui::Rect::new(
                 chrome.status.x as f32,
@@ -1826,7 +1831,12 @@ impl ShellApp for TuiShellApp {
                 chrome.status.width as f32,
                 chrome.status.height as f32,
             );
+            self.engine.global_status_rect.set(q_rect);
             backend.draw_status_bar(q_rect, bar, None, None);
+        } else {
+            self.engine
+                .global_status_rect
+                .set(quadraui::Rect::default());
         }
 
         // ── Command line (+ mouse drag-selection inversion) ──────────────
@@ -9053,6 +9063,111 @@ mod tests {
             !screen.contains(&title),
             "a second click on the already-selected row must confirm it and \
              close the palette; screen:\n{screen}"
+        );
+    }
+
+    // ─── #752 / #733 slice 2: the chrome rung ────────────────────────────
+    //
+    // The TUI half of the cross-backend pair; the GTK half is
+    // `gtk::testing::chrome_rung`. Breadcrumbs and all three status bands
+    // are now sequenced by `render::route_chrome_click`, which both
+    // `handle_mouse` and `App::handle_mouse_click_msg` call.
+
+    /// An app whose **global** (bottom-of-screen) status bar paints, with a
+    /// git branch decorated by ahead/behind counts.
+    ///
+    /// `window_status_line = false` is what makes `build_screen_layout` emit
+    /// `global_status_bar` instead of per-window lines — the two are
+    /// mutually exclusive.
+    fn app_with_global_status_branch() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.window_status_line = false;
+        app.engine.git_branch = Some("ZQXW752BR".to_string());
+        app.engine.sc_ahead = 2;
+        app.engine.sc_behind = 1;
+        app
+    }
+
+    /// #752: clicking the git branch in the global status bar opens the
+    /// branch picker.
+    ///
+    /// # Why this is red against unfixed `develop`
+    ///
+    /// TUI did not route this row at all. `handle_mouse` swallowed it with
+    ///
+    /// ```ignore
+    /// // Global status bar row — consume click (no interactive segments).
+    /// if row + 2 == term_height && !engine.settings.window_status_line && col >= ab_width {
+    ///     return sidebar_width;
+    /// }
+    /// ```
+    ///
+    /// — a comment that had stopped being true: GTK routed the branch (badly;
+    /// see the GTK twin), TUI routed nothing. Restore that early return and
+    /// the picker never opens.
+    ///
+    /// The click target is located with `find`, i.e. from the **painted cell
+    /// grid**, so it is the column the user actually sees — never a
+    /// re-derivation of the range the production hit test uses.
+    #[test]
+    fn global_status_branch_click_opens_the_branch_picker_via_shell_app() {
+        let mut driver = driver_with_shell(app_with_global_status_branch(), config(), 100, 24);
+        assert!(
+            driver.screen_contains("ZQXW752BR"),
+            "fixture must actually paint the branch in the global status bar; screen:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver
+            .find("ZQXW752BR")
+            .expect("the branch just asserted to be on screen must be locatable");
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Switch Branch"),
+            "clicking the painted branch must open the branch picker, whose \
+             painted title is its own evidence; screen:\n{screen}"
+        );
+    }
+
+    /// #752 companion: the **per-window** status line still fires its
+    /// segments now that it is routed as a `render::StatusBand` from the
+    /// shared rung, rather than by a bespoke arm buried ~250 lines deep in
+    /// `handle_mouse`'s window walk.
+    ///
+    /// Not RED on this backend — TUI's own arm worked. It is here because
+    /// that arm is gone: three status arms (per-window, separated, global)
+    /// collapsed into one shared band walk, and this is what catches it if
+    /// `window_status_line_zones` or the band's rect arithmetic drifts from
+    /// what `render_window_status_line` paints.
+    #[test]
+    fn window_status_line_segment_click_still_fires_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        // The default, but stated: this is the setting that selects the
+        // per-window bar over the global one.
+        app.engine.settings.window_status_line = true;
+        app.engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+        // `Engine::new` picks the real repo's branch up, and on a long branch
+        // name `TuiBackend::draw_status_bar` truncates the painted segment
+        // while `StatusBar::layout`'s `chars().count()` measure does not — a
+        // pre-existing TUI paint/hit-test drift, unrelated to this rung and
+        // older than it (the deleted `status_segment_hit_test` measured the
+        // same way). Cleared so this test asserts on the rung, not on that.
+        app.engine.git_branch = None;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let (x, y) = driver
+            .find("Ln 1, Col 1")
+            .expect("the per-window status line must paint its cursor segment");
+
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Go to Line") || screen.contains("Command"),
+            "clicking the cursor-position segment must open the go-to-line \
+             palette (`StatusAction::GoToLine`); screen:\n{screen}"
         );
     }
 }
