@@ -5407,6 +5407,105 @@ mod tests {
         );
     }
 
+    /// #753 fix iteration 1: the tab-drag rung (`render::TabDragState`,
+    /// shared by both backends via `mouse.rs`'s single-group tab-bar arm
+    /// and GTK's `handle_mouse_drag_msg`) had black-box coverage on GTK
+    /// (`tab_drag_past_a_neighbour_reorders_the_painted_tab_bar` in
+    /// `src/gtk/testing.rs`) but none on TUI — the sibling test just above
+    /// only proves the drag *ghost overlay* paints, never that a drop
+    /// actually reorders the tab bar. This is the TUI twin of the GTK test:
+    /// drive a real press → move → move → release through `TuiDriver` on
+    /// the unsplit tab bar and assert the painted tab labels actually swap
+    /// order, i.e. that `TabDragState::handle_release` ->
+    /// `Engine::apply_tab_drop_zone` actually ran through `mouse.rs`'s
+    /// `Crossed`/`Tracking` arms (which — unlike GTK's — trust the press
+    /// point rather than re-resolving it, see those arms' comments).
+    ///
+    /// Confirmed RED against unfixed `develop` (pre-#753's own hand-rolled
+    /// `tab_drag_start`/`tab_dragging` machinery): reverting this file's
+    /// `tab_drag` field back to a manual `Option<(f64, f64)>` drag-start (no
+    /// `handle_release` commit wired to a release with no drag arm) leaves
+    /// this test asserting `left_after.x > right_after.x` against tabs that
+    /// never moved — it fails.
+    ///
+    /// Two moves, not one, for the same reason the ghost-overlay test above
+    /// and the GTK twin both need it: `TabDragState::handle_move`'s first
+    /// call after `arm` only crosses the threshold (`TabDragMove::Crossed`
+    /// -> `begin`); the second is the first one actually `track`ed into a
+    /// drop zone. A single move would release with `DropZone::None` and
+    /// drop nothing — the same sequencing the live backend has always had.
+    #[test]
+    fn tui_tab_drag_past_a_neighbour_reorders_the_painted_tab_bar() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_753_tui_tab_drag_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("zqa753.txt");
+        let b = dir.join("zqb753.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.new_tab(Some(&a));
+        app.engine.new_tab(Some(&b));
+        assert_eq!(
+            app.engine.group_layout.leaf_count(),
+            1,
+            "this test covers the unsplit single-group tab bar arm"
+        );
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        // `find_bounds` scans rows top-down and the tab bar always paints on
+        // row 0 (see `render_content_paints_single_group_tab_bar_via_shell_app`
+        // above), strictly above any breadcrumb/status-bar repaint of the
+        // same file name further down — so the first match is always the
+        // tab label, no trailing-space disambiguation needed (unlike the GTK
+        // twin, which has no such row ordering to rely on).
+        let left_before = driver
+            .find_bounds("zqa753.txt")
+            .expect("tab a should be painted on the tab bar");
+        let right_before = driver
+            .find_bounds("zqb753.txt")
+            .expect("tab b should be painted on the tab bar");
+        assert!(
+            left_before.x < right_before.x,
+            "new_tab appends, so a's tab should paint left of b's; a={left_before:?} b={right_before:?}"
+        );
+
+        let from = (
+            left_before.x + left_before.width / 2.0,
+            left_before.y + left_before.height / 2.0,
+        );
+        let to = (
+            right_before.x + right_before.width / 2.0,
+            right_before.y + right_before.height / 2.0,
+        );
+        driver.mouse_down(from.0, from.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_up(to.0, to.1);
+
+        let left_after = driver
+            .find_bounds("zqa753.txt")
+            .expect("tab a should still be painted after the drop");
+        let right_after = driver
+            .find_bounds("zqb753.txt")
+            .expect("tab b should still be painted after the drop");
+        assert!(
+            left_after.x > right_after.x,
+            "dragging a onto b must repaint it to the right of b \
+             (was {} < {}, now {} vs {})",
+            left_before.x,
+            right_before.x,
+            left_after.x,
+            right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #609: `render_content` must also paint the tab-hover tooltip —
     /// `render_tab_hover_tooltip`, ported from `draw_frame`'s raw-`Buffer`
     /// write to `Backend::draw_status_bar` (see that function's doc
