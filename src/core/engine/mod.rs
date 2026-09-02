@@ -4083,7 +4083,7 @@ impl Engine {
     /// - `format_save_quit_ready` — backends must check and trigger exit
     /// - `pending_terminal_command` — needs backend-supplied terminal size
     /// - `ext_panel_focus_pending` — extension panel reveals (needs dynamic AppShell panels)
-    /// - `explorer_needs_refresh` — GTK sends Msg::RefreshFileTree
+    /// - `explorer_needs_refresh` — GTK calls `App::refresh_file_tree`
     /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
     /// - Settings file auto-reload (#376)
     pub fn poll_idle(&mut self) -> bool {

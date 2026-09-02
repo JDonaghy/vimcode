@@ -397,59 +397,59 @@ fn register_panel_accelerators(
 // registration is removed.
 fn dispatch_gtk_panel_accelerator(
     id: &str,
-    sender: &MsgSender,
+    deferred: &DeferredQueue,
     engine: &Rc<RefCell<Engine>>,
 ) -> bool {
     match id {
         ACC_OPEN_TERMINAL => {
-            sender.send(Msg::ToggleTerminal).ok();
+            deferred.send(DeferredAction::ToggleTerminal);
             true
         }
         ACC_TOGGLE_SIDEBAR => {
-            sender.send(Msg::ToggleSidebar).ok();
+            deferred.send(DeferredAction::ToggleSidebar);
             true
         }
         ACC_FOCUS_EXPLORER => {
-            sender.send(Msg::ToggleFocusExplorer).ok();
+            deferred.send(DeferredAction::ToggleFocusExplorer);
             true
         }
         ACC_FOCUS_SEARCH => {
-            sender.send(Msg::ToggleFocusSearch).ok();
+            deferred.send(DeferredAction::ToggleFocusSearch);
             true
         }
         ACC_FUZZY_FINDER => {
             engine
                 .borrow_mut()
                 .open_picker(core::engine::PickerSource::Files);
-            sender.send(Msg::Resize).ok();
+            deferred.send(DeferredAction::Resize);
             true
         }
         ACC_LIVE_GREP => {
             engine
                 .borrow_mut()
                 .open_picker(core::engine::PickerSource::Grep);
-            sender.send(Msg::Resize).ok();
+            deferred.send(DeferredAction::Resize);
             true
         }
         ACC_COMMAND_PALETTE => {
             engine
                 .borrow_mut()
                 .open_picker(core::engine::PickerSource::Commands);
-            sender.send(Msg::Resize).ok();
+            deferred.send(DeferredAction::Resize);
             true
         }
         ACC_TERMINAL_TOGGLE_MAX => {
-            sender.send(Msg::ToggleTerminalMaximize).ok();
+            deferred.send(DeferredAction::ToggleTerminalMaximize);
             true
         }
         ACC_ADD_CURSOR => {
             engine.borrow_mut().add_cursor_at_next_match();
-            sender.send(Msg::Resize).ok();
+            deferred.send(DeferredAction::Resize);
             true
         }
         ACC_SELECT_ALL_MATCHES => {
             engine.borrow_mut().select_all_occurrences();
-            sender.send(Msg::Resize).ok();
+            deferred.send(DeferredAction::Resize);
             true
         }
         ACC_SPLIT_EDITOR_RIGHT => {
@@ -476,27 +476,58 @@ fn dispatch_gtk_panel_accelerator(
     }
 }
 
-/// Drop-in replacement for the removed `relm4::Sender<Msg>`.
+/// Work that a GTK callback with no `&mut App` in hand must hand back to the
+/// next frame.
 ///
-/// Async GTK callbacks (clipboard reads, file dialogs, timers) clone this
-/// sender and push messages to the shared VecDeque. `ShellApp::tick` drains
-/// the queue on every frame to process them synchronously.
+/// #732 tranche 3: the nine deferrals below are all that is left of the
+/// Relm4-era `Msg` bus. They are genuine deferrals, not translations — each
+/// originates somewhere that cannot call an `&mut self` method at all: a
+/// `gio::FileMonitor` signal, a `glib::timeout_add_local_once` closure, or
+/// `dispatch_gtk_panel_accelerator`, which is a free function holding only a
+/// clone of the queue.
+///
+/// quadraui has no deferral seam of its own to move onto — `ShellApp::tick`
+/// *is* the seam (its doc names "draining channels" as the intended use), and
+/// the queued payload is necessarily app-specific, so the queue stays here
+/// rather than becoming a quadraui gap to file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredAction {
+    /// Clear the yank highlight after the flash duration has elapsed.
+    ClearYankHighlight,
+    /// Refresh the file tree from the current working directory.
+    RefreshFileTree,
+    /// Redraw after an accelerator mutated engine state directly.
+    Resize,
+    /// `settings.json` changed on disk.
+    SettingsFileChanged,
+    /// Toggle focus between the explorer and the editor.
+    ToggleFocusExplorer,
+    /// Toggle focus between the search panel and the editor.
+    ToggleFocusSearch,
+    /// Toggle sidebar visibility.
+    ToggleSidebar,
+    /// Toggle the integrated terminal panel open/closed.
+    ToggleTerminal,
+    /// Toggle the "terminal maximized" state.
+    ToggleTerminalMaximize,
+}
+
+/// Shared queue of [`DeferredAction`]s, drained by `ShellApp::tick`.
 #[derive(Clone)]
-struct MsgSender(Rc<RefCell<VecDeque<Msg>>>);
+struct DeferredQueue(Rc<RefCell<VecDeque<DeferredAction>>>);
 
-impl MsgSender {
+impl DeferredQueue {
     fn new() -> Self {
-        MsgSender(Rc::new(RefCell::new(VecDeque::new())))
+        DeferredQueue(Rc::new(RefCell::new(VecDeque::new())))
     }
 
-    /// Enqueue a message for processing in the next `tick()` call.
-    fn send(&self, msg: Msg) -> Result<(), ()> {
-        self.0.borrow_mut().push_back(msg);
-        Ok(())
+    /// Enqueue an action for processing in the next `tick()` call.
+    fn send(&self, action: DeferredAction) {
+        self.0.borrow_mut().push_back(action);
     }
 
-    /// Take all pending messages, leaving the queue empty.
-    fn drain(&self) -> Vec<Msg> {
+    /// Take all pending actions, leaving the queue empty.
+    fn drain(&self) -> Vec<DeferredAction> {
         let mut q = self.0.borrow_mut();
         q.drain(..).collect()
     }
@@ -572,7 +603,7 @@ struct App {
     fr_input_dragging: bool,
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
     settings_monitor: Option<gio::FileMonitor>,
-    sender: MsgSender,
+    deferred: DeferredQueue,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
     last_clipboard_content: Option<String>,
@@ -829,7 +860,7 @@ struct App {
     backend: Rc<RefCell<backend::GtkBackend>>,
 }
 
-/// Decode an activity bar widget ID into a panel ID for `Msg::SwitchPanel`.
+/// Decode an activity bar widget ID into a panel ID for [`App::switch_panel`].
 /// Dead in ShellApp mode until the activity bar DA is re-wired (#448-C follow-on).
 #[allow(dead_code)]
 fn activity_id_to_panel_id(id: &str) -> Option<String> {
@@ -1007,17 +1038,17 @@ fn setup_gtk_clipboard(engine: &mut Engine) {
     }));
 }
 
-/// A native file dialog requested by `Msg::OpenFileDialog` /
-/// `Msg::SaveWorkspaceAsDialog`, deferred to the next `tick()` (#572).
+/// A native file dialog requested by [`App::open_file_dialog`] /
+/// [`App::save_workspace_as_dialog`], deferred to the next `tick()` (#572).
 ///
-/// `dispatch()` — where those `Msg` variants are handled — has no
+/// Neither of those methods has a
 /// `backend: &mut dyn quadraui::Backend` in scope, but `PlatformServices`
 /// (and the re-entrancy-guarded nested-mainloop pump backing it, see
 /// `quadraui::gtk::services` #427) is only reachable through that
 /// runner-owned `backend` parameter. `tick()` receives it every frame, so
 /// the request is stashed here and drained there instead of threading
-/// `backend` through the whole `dispatch`/`dispatch_engine_action`/
-/// `handle_menu_msg` call graph.
+/// `backend` through the whole `dispatch_engine_action`/`handle_menu_action`
+/// call graph.
 ///
 /// Deliberately **not** routed through `self.backend` (`App`'s own
 /// `Rc<RefCell<GtkBackend>>`, used for modal-stack/drag-state handles) —
@@ -1044,56 +1075,6 @@ fn dialog_btn_index(id: &quadraui::WidgetId) -> Option<usize> {
     id.as_str()
         .strip_prefix("dialog:btn:")
         .and_then(|s| s.parse::<usize>().ok())
-}
-
-#[derive(Debug)]
-#[allow(dead_code)] // Variants used in later phases
-enum Msg {
-    /// Notify that a resize happened (triggers redraw).
-    Resize,
-    /// Toggle sidebar visibility.
-    ToggleSidebar,
-    /// Switch to a different sidebar panel.
-    SwitchPanel(String),
-    /// Explorer CRUD action triggered by keyboard shortcut (the char string).
-    ExplorerAction(String),
-    /// UiEvent (scroll, mouse) on the explorer DrawingArea — routed
-    /// through TreeController.handle() for scrollbar interaction.
-    ExplorerUiEvent(quadraui::UiEvent),
-    /// Refresh the file tree from current working directory.
-    RefreshFileTree,
-    /// Toggle focus between explorer and editor.
-    ToggleFocusExplorer,
-    /// Toggle focus between search panel and editor.
-    ToggleFocusSearch,
-    /// Settings file changed on disk.
-    SettingsFileChanged,
-    /// Toggle the integrated terminal panel open/closed.
-    ToggleTerminal,
-    /// Toggle the "terminal maximized" state (panel fills editor area).
-    ToggleTerminalMaximize,
-    /// Open a new terminal tab at a specific directory.
-    OpenTerminalAt(PathBuf),
-    /// Open a new terminal tab.
-    NewTerminalTab,
-    /// Run a command in a visible terminal pane (for installs).
-    RunCommandInTerminal(String),
-    /// Show a native "Open File" dialog.
-    OpenFileDialog,
-    /// Show a native "Open Folder" dialog.
-    OpenFolderDialog,
-    /// Show a native "Open Workspace" dialog.
-    OpenWorkspaceDialog,
-    /// Show a native "Save Workspace As" dialog.
-    SaveWorkspaceAsDialog,
-    /// Show a "Open Recent" picker.
-    OpenRecentDialog,
-    /// User confirmed quit (after saving or choosing to discard changes).
-    QuitConfirmed,
-    /// Clear the yank highlight after the flash duration has elapsed.
-    ClearYankHighlight,
-    /// User clicked ✕ on a tab with unsaved changes — ask what to do.
-    ShowCloseTabConfirm,
 }
 
 /// Create a new `App` instance.
@@ -1134,7 +1115,7 @@ impl App {
             );
         }
 
-        let sender = MsgSender::new();
+        let deferred = DeferredQueue::new();
 
         // File watcher for settings.json hot-reload.
         let settings_path = std::env::var("HOME")
@@ -1144,10 +1125,10 @@ impl App {
         let settings_monitor =
             match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
                 Ok(monitor) => {
-                    let sender_for_monitor = sender.clone();
+                    let deferred_for_monitor = deferred.clone();
                     monitor.connect_changed(move |_, _, _, event| {
                         if event == gio::FileMonitorEvent::ChangesDoneHint {
-                            sender_for_monitor.send(Msg::SettingsFileChanged).ok();
+                            deferred_for_monitor.send(DeferredAction::SettingsFileChanged);
                         }
                     });
                     Some(monitor)
@@ -1157,7 +1138,7 @@ impl App {
 
         Self::assemble(
             engine,
-            sender,
+            deferred,
             css_provider,
             last_colorscheme,
             settings_monitor,
@@ -1179,7 +1160,7 @@ impl App {
     /// plus a `GtkBackend::new()`; none of it touches GDK.
     fn assemble(
         engine: Rc<RefCell<Engine>>,
-        sender: MsgSender,
+        deferred: DeferredQueue,
         css_provider: Option<gtk4::CssProvider>,
         last_colorscheme: String,
         settings_monitor: Option<gio::FileMonitor>,
@@ -1203,7 +1184,7 @@ impl App {
             h_sb_drag_cell: Rc::new(Cell::new(None)),
             fr_input_dragging: false,
             settings_monitor,
-            sender,
+            deferred,
             last_clipboard_content: None,
             tab_close_hover: None,
             tab_slot_positions: Rc::new(RefCell::new(HashMap::new())),
@@ -1295,7 +1276,7 @@ impl App {
             (e.settings.use_nerd_fonts, e.settings.colorscheme.clone())
         };
         icons::set_nerd_fonts(use_nerd_fonts);
-        Self::assemble(engine, MsgSender::new(), None, last_colorscheme, None)
+        Self::assemble(engine, DeferredQueue::new(), None, last_colorscheme, None)
     }
 }
 
@@ -1321,7 +1302,7 @@ impl App {
                         .engine
                         .borrow_mut()
                         .open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent);
-                    self.dispatch(Msg::RefreshFileTree);
+                    self.refresh_file_tree();
                 }
             }
             PendingFileDialog::SaveWorkspaceAs => {
@@ -1388,7 +1369,7 @@ impl App {
     fn apply_dialog_action(&mut self, action: EngineAction) {
         if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
-            self.dispatch(Msg::RefreshFileTree);
+            self.refresh_file_tree();
         }
         match action {
             EngineAction::Quit | EngineAction::SaveQuit => {
@@ -1690,67 +1671,19 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    fn dispatch(&mut self, msg: Msg) {
-        match msg {
-            Msg::ClearYankHighlight => {
-                self.engine.borrow_mut().clear_yank_highlight();
-                self.draw_needed.set(true);
-            }
-            Msg::Resize => {
-                self.handle_resize();
-            }
-            Msg::ToggleSidebar | Msg::SwitchPanel(_) => {
-                self.handle_sidebar_panel_msg(msg);
-            }
-            Msg::ExplorerAction(_)
-            | Msg::RefreshFileTree
-            | Msg::ToggleFocusExplorer
-            | Msg::ToggleFocusSearch => {
-                self.handle_explorer_msg(msg);
-            }
-            Msg::SettingsFileChanged => {
-                if self.engine.borrow_mut().check_settings_reload() {
-                    self.dispatch(Msg::RefreshFileTree);
-                    self.draw_needed.set(true);
-                }
-            }
-            Msg::ToggleTerminal
-            | Msg::ToggleTerminalMaximize
-            | Msg::OpenTerminalAt(_)
-            | Msg::NewTerminalTab
-            | Msg::RunCommandInTerminal(_) => {
-                self.handle_terminal_msg(msg);
-            }
-            Msg::ExplorerUiEvent(_) => {
-                self.handle_explorer_msg(msg);
-            }
-            Msg::OpenFileDialog
-            | Msg::OpenFolderDialog
-            | Msg::OpenWorkspaceDialog
-            | Msg::SaveWorkspaceAsDialog
-            | Msg::OpenRecentDialog
-            | Msg::QuitConfirmed
-            | Msg::ShowCloseTabConfirm => {
-                self.handle_dialog_msg(msg);
-            }
+    /// Clear the yank highlight after the flash duration has elapsed.
+    fn clear_yank_highlight(&mut self) {
+        self.engine.borrow_mut().clear_yank_highlight();
+        self.draw_needed.set(true);
+    }
+
+    /// `settings.json` changed on disk — reload it and, if the reload took,
+    /// refresh the file tree (`show_hidden_files` may have flipped).
+    fn settings_file_changed(&mut self) {
+        if self.engine.borrow_mut().check_settings_reload() {
+            self.refresh_file_tree();
+            self.draw_needed.set(true);
         }
-
-        // #731: `sync_scrollbar` (rebuilding/repositioning native
-        // `gtk4::Scrollbar` overlay widgets) used to run here on every
-        // non-scrollbar message. It was gated on `self.overlay` /
-        // `self.drawing_area`, both permanently `None` under the ShellApp
-        // runner, so it was already a no-op — see the function's removal
-        // for the full story, including the live #723 re-diagnosis.
-
-        // #435: engine-drawn ctx menu keys (j/k/Enter/Esc) are dispatched on
-        // the editor DA's key controller. If the trigger click landed on a
-        // sibling DA (sidebar, ext panel) the DA never claimed focus, so keys
-        // are dead until the user clicks inside the menu. Grab focus whenever
-        // a ctx menu is open — grab_focus is idempotent if already focused.
-        //
-        // #426: do NOT do this for explorer-targeted ctx menus — those render
-        // on the explorer DA and have their own key handler. Stealing focus
-        // back to the editor DA would break keyboard nav of the explorer menu.
     }
 
     /// Reveal `target` in the explorer sidebar: expand all ancestors,
@@ -1829,35 +1762,35 @@ impl App {
             }
             EngineAction::OpenTerminal => {
                 if is_macro {
-                    self.dispatch(Msg::ToggleTerminal);
+                    self.toggle_terminal();
                 } else {
-                    self.dispatch(Msg::NewTerminalTab);
+                    self.new_terminal_tab();
                 }
             }
             EngineAction::ToggleTerminalMaximize => {
-                self.dispatch(Msg::ToggleTerminalMaximize);
+                self.toggle_terminal_maximize();
             }
             EngineAction::RunInTerminal(cmd) => {
-                self.dispatch(Msg::RunCommandInTerminal(cmd));
+                self.run_command_in_terminal(cmd);
             }
             EngineAction::OpenFolderDialog => {
                 if !is_macro {
-                    self.dispatch(Msg::OpenFolderDialog);
+                    self.open_folder_dialog();
                 }
             }
             EngineAction::OpenWorkspaceDialog => {
                 if !is_macro {
-                    self.dispatch(Msg::OpenWorkspaceDialog);
+                    self.open_workspace_dialog();
                 }
             }
             EngineAction::SaveWorkspaceAsDialog => {
                 if !is_macro {
-                    self.dispatch(Msg::SaveWorkspaceAsDialog);
+                    self.save_workspace_as_dialog();
                 }
             }
             EngineAction::OpenRecentDialog => {
                 if !is_macro {
-                    self.dispatch(Msg::OpenRecentDialog);
+                    self.open_recent_dialog();
                 }
             }
             EngineAction::QuitWithUnsaved => {
@@ -1940,7 +1873,7 @@ impl App {
                     }
                     drop(engine);
                     if needs_refresh {
-                        self.dispatch(Msg::RefreshFileTree);
+                        self.refresh_file_tree();
                     }
                     self.draw_needed.set(true);
                     return;
@@ -2028,9 +1961,12 @@ impl App {
         // GTK focus on sidebar DrawingAreas is unreliable, so we check
         // the engine focus flags here (same approach as TUI backend).
 
-        // Explorer keys are routed through Msg::ExplorerKey when the DA
-        // has focus. This fallback catches keys when the DA lacks GTK
-        // widget focus (grab_focus is unreliable for DrawingAreas).
+        // Explorer keys used to be routed through a per-DrawingArea key
+        // controller when the DA had focus (#732 retired the `Msg` variant it
+        // sent; nothing has produced it since #540). This is the only live
+        // path: it catches keys via the engine's own focus flag, which does
+        // not depend on GTK widget focus (grab_focus is unreliable for
+        // DrawingAreas).
         if self.engine.borrow().explorer_has_focus {
             let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
             self.handle_explorer_da_key(key_mapped, unicode, ctrl);
@@ -2228,9 +2164,9 @@ impl App {
 
         // If a yank just happened, schedule a 200 ms one-shot to clear the highlight.
         if self.engine.borrow().yank_highlight.is_some() {
-            let s = self.sender.clone();
+            let q = self.deferred.clone();
             gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                s.send(Msg::ClearYankHighlight).ok();
+                q.send(DeferredAction::ClearYankHighlight);
             });
         }
 
@@ -2302,7 +2238,7 @@ impl App {
         // Format-on-save + :wq/:x deferred quit
         if self.engine.borrow().format_save_quit_ready {
             self.engine.borrow_mut().format_save_quit_ready = false;
-            self.dispatch(Msg::QuitConfirmed);
+            self.quit_confirmed();
         }
         // Run pending terminal commands (needs backend-supplied terminal size).
         if self.engine.borrow().pending_terminal_command.is_some() {
@@ -2312,13 +2248,13 @@ impl App {
                 .pending_terminal_command
                 .take()
                 .unwrap();
-            self.dispatch(Msg::RunCommandInTerminal(cmd));
+            self.run_command_in_terminal(cmd);
         }
         let active_panel = self.current_active_panel_id();
         // Explorer refresh after confirmed file move.
         if self.engine.borrow().explorer_needs_refresh {
             self.engine.borrow_mut().explorer_needs_refresh = false;
-            self.dispatch(Msg::RefreshFileTree);
+            self.refresh_file_tree();
         }
         // Auto-refresh SC panel periodically (gated on sidebar visibility).
         if self.current_sidebar_visible()
@@ -2516,7 +2452,7 @@ impl App {
                                 .borrow_mut()
                                 .pop(&cm_id);
                             if needs_tree_refresh {
-                                self.dispatch(Msg::RefreshFileTree);
+                                self.refresh_file_tree();
                             }
                         }
                     }
@@ -3569,8 +3505,8 @@ impl App {
                         }
                         Some(core::engine::EngineAction::OpenTerminal) => {
                             // Create the terminal tab immediately (not via
-                            // async Msg::ToggleTerminal) so the panel
-                            // appears on this same draw cycle.
+                            // the deferred `DeferredAction::ToggleTerminal`)
+                            // so the panel appears on this same draw cycle.
                             let cols = self.terminal_cols();
                             let rows = engine.session.terminal_panel_rows;
                             engine.terminal_new_tab(cols, rows);
@@ -3583,7 +3519,7 @@ impl App {
                     match click_result {
                         Some(true) => {
                             drop(engine);
-                            self.dispatch(Msg::ShowCloseTabConfirm);
+                            self.show_close_tab_confirm();
                             self.draw_needed.set(true);
                             return;
                         }
@@ -4126,65 +4062,69 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    fn handle_terminal_msg(&mut self, msg: Msg) {
-        match msg {
-            Msg::ToggleTerminal => {
-                let needs_new_tab = {
-                    let engine = self.engine.borrow();
-                    (!engine.terminal_open || !engine.terminal_has_focus)
-                        && engine.terminal_panes.is_empty()
-                };
-                if needs_new_tab {
-                    // Use the actual drawing area width so the PTY matches the visible panel.
-                    let cols = self.terminal_cols();
-                    let rows = self.engine.borrow().session.terminal_panel_rows;
-                    self.engine.borrow_mut().terminal_new_tab(cols, rows);
-                } else {
-                    self.engine.borrow_mut().toggle_terminal();
-                }
-                self.draw_needed.set(true);
-            }
-            Msg::ToggleTerminalMaximize => {
-                // Phase B.2: route through engine's UiEvent dispatch — same
-                // path as the keybinding above + the EngineAction handler
-                // + the toolbar click handler.
-                let ctx = crate::core::engine::UiEventContext {
-                    terminal_cols: self.terminal_cols(),
-                    terminal_max_rows: self.terminal_target_maximize_rows(),
-                };
-                self.engine.borrow_mut().handle_ui_event(
-                    crate::core::engine::UiEvent::Accelerator(
-                        crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
-                        quadraui::Modifiers::default(),
-                    ),
-                    ctx,
-                );
-                self.draw_needed.set(true);
-            }
-            Msg::OpenTerminalAt(dir) => {
-                let cols = self.terminal_cols();
-                let rows = self.engine.borrow().session.terminal_panel_rows;
-                self.engine
-                    .borrow_mut()
-                    .terminal_new_tab_at(cols, rows, Some(&dir));
-                self.draw_needed.set(true);
-            }
-            Msg::NewTerminalTab => {
-                let cols = self.terminal_cols();
-                let rows = self.engine.borrow().session.terminal_panel_rows;
-                self.engine.borrow_mut().terminal_new_tab(cols, rows);
-                self.draw_needed.set(true);
-            }
-            Msg::RunCommandInTerminal(cmd) => {
-                let cols = self.terminal_cols();
-                let rows = self.engine.borrow().session.terminal_panel_rows;
-                self.engine
-                    .borrow_mut()
-                    .terminal_run_command(&cmd, cols, rows);
-                self.draw_needed.set(true);
-            }
-            _ => unreachable!(),
+    /// Toggle the integrated terminal panel open/closed.
+    fn toggle_terminal(&mut self) {
+        let needs_new_tab = {
+            let engine = self.engine.borrow();
+            (!engine.terminal_open || !engine.terminal_has_focus)
+                && engine.terminal_panes.is_empty()
+        };
+        if needs_new_tab {
+            // Use the actual drawing area width so the PTY matches the visible panel.
+            let cols = self.terminal_cols();
+            let rows = self.engine.borrow().session.terminal_panel_rows;
+            self.engine.borrow_mut().terminal_new_tab(cols, rows);
+        } else {
+            self.engine.borrow_mut().toggle_terminal();
         }
+        self.draw_needed.set(true);
+    }
+
+    /// Toggle the "terminal maximized" state (panel fills editor area).
+    fn toggle_terminal_maximize(&mut self) {
+        // Phase B.2: route through engine's UiEvent dispatch — same
+        // path as the keybinding above + the EngineAction handler
+        // + the toolbar click handler.
+        let ctx = crate::core::engine::UiEventContext {
+            terminal_cols: self.terminal_cols(),
+            terminal_max_rows: self.terminal_target_maximize_rows(),
+        };
+        self.engine.borrow_mut().handle_ui_event(
+            crate::core::engine::UiEvent::Accelerator(
+                crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
+                quadraui::Modifiers::default(),
+            ),
+            ctx,
+        );
+        self.draw_needed.set(true);
+    }
+
+    /// Open a new terminal tab rooted at `dir`.
+    fn open_terminal_at(&mut self, dir: PathBuf) {
+        let cols = self.terminal_cols();
+        let rows = self.engine.borrow().session.terminal_panel_rows;
+        self.engine
+            .borrow_mut()
+            .terminal_new_tab_at(cols, rows, Some(&dir));
+        self.draw_needed.set(true);
+    }
+
+    /// Open a new terminal tab.
+    fn new_terminal_tab(&mut self) {
+        let cols = self.terminal_cols();
+        let rows = self.engine.borrow().session.terminal_panel_rows;
+        self.engine.borrow_mut().terminal_new_tab(cols, rows);
+        self.draw_needed.set(true);
+    }
+
+    /// Run `cmd` in a visible terminal pane (used for extension installs).
+    fn run_command_in_terminal(&mut self, cmd: String) {
+        let cols = self.terminal_cols();
+        let rows = self.engine.borrow().session.terminal_panel_rows;
+        self.engine
+            .borrow_mut()
+            .terminal_run_command(&cmd, cols, rows);
+        self.draw_needed.set(true);
     }
 
     /// #731: was `if let Some(ref da) = *self.menu_dropdown_da.borrow()`
@@ -4218,20 +4158,20 @@ impl App {
     fn handle_menu_action(&mut self, action: String) {
         match action.as_str() {
             "open_file_dialog" => {
-                self.dispatch(Msg::OpenFileDialog);
+                self.open_file_dialog();
             }
             "open_folder_dialog" => {
-                self.dispatch(Msg::OpenFolderDialog);
+                self.open_folder_dialog();
             }
             "open_workspace_dialog" => {
                 self.engine.borrow_mut().open_workspace_from_file();
-                self.dispatch(Msg::RefreshFileTree);
+                self.refresh_file_tree();
             }
             "save_workspace_as_dialog" => {
-                self.dispatch(Msg::SaveWorkspaceAsDialog);
+                self.save_workspace_as_dialog();
             }
             "openrecent" => {
-                self.dispatch(Msg::OpenRecentDialog);
+                self.open_recent_dialog();
             }
             "find" => {
                 self.engine.borrow_mut().open_find_replace();
@@ -4248,7 +4188,7 @@ impl App {
                 let engine_action = self.engine.borrow_mut().dispatch_menu_action(&action);
                 match engine_action {
                     EngineAction::Quit | EngineAction::SaveQuit => {
-                        self.dispatch(Msg::QuitConfirmed);
+                        self.quit_confirmed();
                     }
                     EngineAction::QuitWithUnsaved => {
                         self.show_quit_confirm();
@@ -4257,7 +4197,7 @@ impl App {
                         self.sync_sidebar_from_engine();
                     }
                     EngineAction::OpenTerminal => {
-                        self.dispatch(Msg::NewTerminalTab);
+                        self.new_terminal_tab();
                     }
                     _ => {}
                 }
@@ -4311,201 +4251,198 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    fn handle_sidebar_panel_msg(&mut self, msg: Msg) {
-        match msg {
-            Msg::ToggleSidebar => {
-                self.engine.borrow_mut().toggle_sidebar();
-                self.sync_sidebar_from_engine();
-            }
-            Msg::SwitchPanel(panel_id) => {
-                if let Some(name) = ext_panel_name(&panel_id) {
-                    // Extension panels bypass AppShell (no dynamic registration).
-                    let mut engine = self.engine.borrow_mut();
-                    let same = engine.ext_panel_active.as_deref() == Some(name)
-                        && engine.app_shell.sidebar_visible();
-                    if same {
-                        engine.app_shell.hide_sidebar();
-                        engine.ext_panel_has_focus = false;
-                        engine.ext_panel_active = None;
-                    } else {
-                        if !engine.app_shell.sidebar_visible() {
-                            engine.app_shell.toggle_sidebar();
-                        }
-                        let already = engine.ext_panel_active.as_deref() == Some(name);
-                        engine.ext_panel_has_focus = true;
-                        engine.ext_panel_active = Some(name.to_string());
-                        if !already {
-                            engine.ext_panel_selected = 0;
-                            engine.plugin_event("panel_focus", name);
-                        }
-                    }
-                    engine.session.explorer_visible = engine.app_shell.sidebar_visible();
-                    let _ = engine.session.save();
-                    drop(engine);
-                    let _ = panel_id; // engine.ext_panel_active drives `current_active_panel_id()`
-                    self.sync_sidebar_widgets();
-                } else {
-                    {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.ext_panel_has_focus = false;
-                        engine.ext_panel_active = None;
-                        engine.toggle_sidebar_panel(&panel_id);
-                    }
-                    self.sync_sidebar_from_engine();
+    /// Toggle sidebar visibility.
+    fn toggle_sidebar_panel(&mut self) {
+        self.engine.borrow_mut().toggle_sidebar();
+        self.sync_sidebar_from_engine();
+    }
+
+    /// Switch the sidebar to a different panel.
+    fn switch_panel(&mut self, panel_id: String) {
+        if let Some(name) = ext_panel_name(&panel_id) {
+            // Extension panels bypass AppShell (no dynamic registration).
+            let mut engine = self.engine.borrow_mut();
+            let same = engine.ext_panel_active.as_deref() == Some(name)
+                && engine.app_shell.sidebar_visible();
+            if same {
+                engine.app_shell.hide_sidebar();
+                engine.ext_panel_has_focus = false;
+                engine.ext_panel_active = None;
+            } else {
+                if !engine.app_shell.sidebar_visible() {
+                    engine.app_shell.toggle_sidebar();
+                }
+                let already = engine.ext_panel_active.as_deref() == Some(name);
+                engine.ext_panel_has_focus = true;
+                engine.ext_panel_active = Some(name.to_string());
+                if !already {
+                    engine.ext_panel_selected = 0;
+                    engine.plugin_event("panel_focus", name);
                 }
             }
-            _ => unreachable!(),
+            engine.session.explorer_visible = engine.app_shell.sidebar_visible();
+            let _ = engine.session.save();
+            drop(engine);
+            let _ = panel_id; // engine.ext_panel_active drives `current_active_panel_id()`
+            self.sync_sidebar_widgets();
+        } else {
+            {
+                let mut engine = self.engine.borrow_mut();
+                engine.ext_panel_has_focus = false;
+                engine.ext_panel_active = None;
+                engine.toggle_sidebar_panel(&panel_id);
+            }
+            self.sync_sidebar_from_engine();
         }
     }
 
-    fn handle_explorer_msg(&mut self, msg: Msg) {
-        match msg {
-            Msg::ExplorerAction(action_str) => {
-                use crate::core::settings::ExplorerAction;
-                let action = match action_str.as_str() {
-                    "new_file" => Some(ExplorerAction::NewFile),
-                    "new_folder" => Some(ExplorerAction::NewFolder),
-                    "rename" => Some(ExplorerAction::Rename),
-                    "delete" => Some(ExplorerAction::Delete),
-                    "move_file" => Some(ExplorerAction::MoveFile),
-                    _ => None,
+    /// Explorer CRUD action triggered by a keyboard shortcut or context menu.
+    fn explorer_action(&mut self, action_str: String) {
+        use crate::core::settings::ExplorerAction;
+        let action = match action_str.as_str() {
+            "new_file" => Some(ExplorerAction::NewFile),
+            "new_folder" => Some(ExplorerAction::NewFolder),
+            "rename" => Some(ExplorerAction::Rename),
+            "delete" => Some(ExplorerAction::Delete),
+            "move_file" => Some(ExplorerAction::MoveFile),
+            _ => None,
+        };
+        if let Some(action) = action {
+            self.engine.borrow_mut().dispatch_explorer_crud(action);
+            self.queue_explorer_draw();
+            self.draw_needed.set(true);
+        }
+    }
+
+    /// Refresh the file tree from the current working directory.
+    fn refresh_file_tree(&mut self) {
+        self.refresh_explorer();
+        if let Some(path) = self.engine.borrow().file_path().cloned() {
+            self.reveal_path_in_explorer(&path);
+        }
+        self.draw_needed.set(true);
+    }
+
+    /// Toggle focus between the explorer and the editor.
+    fn toggle_focus_explorer(&mut self) {
+        if self.engine.borrow().explorer_has_focus {
+            self.engine.borrow_mut().explorer_has_focus = false;
+        } else {
+            let mut engine = self.engine.borrow_mut();
+            engine.ext_panel_active = None;
+            engine.focus_sidebar_panel(PANEL_EXPLORER);
+            drop(engine);
+            self.sync_sidebar_widgets();
+        }
+        self.draw_needed.set(true);
+    }
+
+    /// Toggle focus between the search panel and the editor.
+    fn toggle_focus_search(&mut self) {
+        if self.current_active_panel_id() == PANEL_SEARCH && self.current_sidebar_visible() {
+            // Just give the editor DA back keyboard focus.
+        } else {
+            let mut engine = self.engine.borrow_mut();
+            engine.ext_panel_active = None;
+            engine.focus_sidebar_panel(PANEL_SEARCH);
+            drop(engine);
+            self.sync_sidebar_widgets();
+        }
+        self.draw_needed.set(true);
+    }
+
+    /// `UiEvent` (scroll, mouse) over the explorer panel — routed through
+    /// `TreeController::handle` for scrollbar interaction.
+    fn explorer_ui_event(&mut self, ev: quadraui::UiEvent) {
+        let dominated = matches!(
+            ev,
+            quadraui::UiEvent::MouseDown { .. }
+                | quadraui::UiEvent::DoubleClick { .. }
+                | quadraui::UiEvent::MouseUp { .. }
+                | quadraui::UiEvent::Scroll { .. }
+        ) || matches!(
+            ev,
+            quadraui::UiEvent::MouseMoved {
+                buttons: quadraui::ButtonMask { left: true, .. },
+                ..
+            }
+        );
+        if dominated {
+            let rect = self.engine.borrow().explorer_tree_rect.get();
+            if rect.width > 0.0 {
+                let theme = {
+                    let eng = self.engine.borrow();
+                    render::Theme::from_name(&eng.settings.colorscheme)
                 };
-                if let Some(action) = action {
-                    self.engine.borrow_mut().dispatch_explorer_crud(action);
+                crate::render::populate_explorer_tree_controller(&self.engine.borrow(), &theme);
+                let tree_event = {
+                    let mut b = self.backend.borrow_mut();
+                    // Re-apply the metrics the tree was drawn with so the
+                    // hit-test row math matches the rendered rows. (#540)
+                    let (lh, cw) = self.cached_explorer_metrics.get();
+                    b.set_current_line_height(lh);
+                    b.set_current_char_width(cw);
+                    self.engine
+                        .borrow()
+                        .explorer_tree
+                        .borrow_mut()
+                        .handle(&ev, &mut *b, rect)
+                };
+                // #546: a right-click MouseDown lands here too (this
+                // arm doesn't filter by button — `try_route_sidebar_
+                // mouse_event` forwards ALL MouseDown in the sidebar
+                // bounds), and `TreeController::handle()` already
+                // resolves it to `ContextMenuRequested{path, position}`
+                // with the correct target row. But
+                // `dispatch_explorer_tree_event`'s catch-all silently
+                // dropped that variant, so explorer right-click did
+                // nothing at all — independent of the render gap
+                // this issue otherwise fixes. Editor/tab-bar
+                // right-click are unaffected (dedicated
+                // `MouseButton::Right` branches before generic
+                // routing); TUI is unaffected too (it intercepts
+                // right-clicks at the raw crossterm layer, before
+                // UiEvent translation, so it never reaches
+                // `ContextMenuRequested`). `position` is in the same
+                // absolute pixel space `TreeController` just used for
+                // its own hit-test, so convert with the same
+                // `(lh, cw)` metrics used above.
+                if let quadraui::TreeControllerEvent::ContextMenuRequested { path, position } =
+                    &tree_event
+                {
+                    if let Some(&row_idx) = path.first() {
+                        let idx = row_idx as usize;
+                        let target_info = {
+                            let eng = self.engine.borrow();
+                            eng.explorer_rows
+                                .get(idx)
+                                .map(|row| (row.path.clone(), row.is_dir))
+                        };
+                        if let Some((target, is_dir)) = target_info {
+                            let (lh, cw) = self.cached_explorer_metrics.get();
+                            let cx = (position.x / (cw.max(1.0) as f32)) as u16;
+                            let cy = (position.y / (lh.max(1.0) as f32)) as u16;
+                            self.engine
+                                .borrow_mut()
+                                .open_explorer_context_menu(target, is_dir, cx, cy);
+                        }
+                    }
                     self.queue_explorer_draw();
                     self.draw_needed.set(true);
+                    return;
                 }
-            }
-            Msg::RefreshFileTree => {
-                self.refresh_explorer();
-                if let Some(path) = self.engine.borrow().file_path().cloned() {
-                    self.reveal_path_in_explorer(&path);
+                if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
+                    self.engine
+                        .borrow_mut()
+                        .dispatch_explorer_tree_event(tree_event);
+                } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
+                    self.engine
+                        .borrow_mut()
+                        .handle_explorer_mouse_event(tree_event);
                 }
+                self.queue_explorer_draw();
                 self.draw_needed.set(true);
             }
-            Msg::ToggleFocusExplorer => {
-                if self.engine.borrow().explorer_has_focus {
-                    self.engine.borrow_mut().explorer_has_focus = false;
-                } else {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.ext_panel_active = None;
-                    engine.focus_sidebar_panel(PANEL_EXPLORER);
-                    drop(engine);
-                    self.sync_sidebar_widgets();
-                }
-                self.draw_needed.set(true);
-            }
-            Msg::ToggleFocusSearch => {
-                if self.current_active_panel_id() == PANEL_SEARCH && self.current_sidebar_visible()
-                {
-                    // Just give the editor DA back keyboard focus.
-                } else {
-                    let mut engine = self.engine.borrow_mut();
-                    engine.ext_panel_active = None;
-                    engine.focus_sidebar_panel(PANEL_SEARCH);
-                    drop(engine);
-                    self.sync_sidebar_widgets();
-                }
-                self.draw_needed.set(true);
-            }
-            Msg::ExplorerUiEvent(ev) => {
-                let dominated = matches!(
-                    ev,
-                    quadraui::UiEvent::MouseDown { .. }
-                        | quadraui::UiEvent::DoubleClick { .. }
-                        | quadraui::UiEvent::MouseUp { .. }
-                        | quadraui::UiEvent::Scroll { .. }
-                ) || matches!(
-                    ev,
-                    quadraui::UiEvent::MouseMoved {
-                        buttons: quadraui::ButtonMask { left: true, .. },
-                        ..
-                    }
-                );
-                if dominated {
-                    let rect = self.engine.borrow().explorer_tree_rect.get();
-                    if rect.width > 0.0 {
-                        let theme = {
-                            let eng = self.engine.borrow();
-                            render::Theme::from_name(&eng.settings.colorscheme)
-                        };
-                        crate::render::populate_explorer_tree_controller(
-                            &self.engine.borrow(),
-                            &theme,
-                        );
-                        let tree_event = {
-                            let mut b = self.backend.borrow_mut();
-                            // Re-apply the metrics the tree was drawn with so the
-                            // hit-test row math matches the rendered rows. (#540)
-                            let (lh, cw) = self.cached_explorer_metrics.get();
-                            b.set_current_line_height(lh);
-                            b.set_current_char_width(cw);
-                            self.engine
-                                .borrow()
-                                .explorer_tree
-                                .borrow_mut()
-                                .handle(&ev, &mut *b, rect)
-                        };
-                        // #546: a right-click MouseDown lands here too (this
-                        // arm doesn't filter by button — `try_route_sidebar_
-                        // mouse_event` forwards ALL MouseDown in the sidebar
-                        // bounds), and `TreeController::handle()` already
-                        // resolves it to `ContextMenuRequested{path, position}`
-                        // with the correct target row. But
-                        // `dispatch_explorer_tree_event`'s catch-all silently
-                        // dropped that variant, so explorer right-click did
-                        // nothing at all — independent of the render gap
-                        // this issue otherwise fixes. Editor/tab-bar
-                        // right-click are unaffected (dedicated
-                        // `MouseButton::Right` branches before generic
-                        // routing); TUI is unaffected too (it intercepts
-                        // right-clicks at the raw crossterm layer, before
-                        // UiEvent translation, so it never reaches
-                        // `ContextMenuRequested`). `position` is in the same
-                        // absolute pixel space `TreeController` just used for
-                        // its own hit-test, so convert with the same
-                        // `(lh, cw)` metrics used above.
-                        if let quadraui::TreeControllerEvent::ContextMenuRequested {
-                            path,
-                            position,
-                        } = &tree_event
-                        {
-                            if let Some(&row_idx) = path.first() {
-                                let idx = row_idx as usize;
-                                let target_info = {
-                                    let eng = self.engine.borrow();
-                                    eng.explorer_rows
-                                        .get(idx)
-                                        .map(|row| (row.path.clone(), row.is_dir))
-                                };
-                                if let Some((target, is_dir)) = target_info {
-                                    let (lh, cw) = self.cached_explorer_metrics.get();
-                                    let cx = (position.x / (cw.max(1.0) as f32)) as u16;
-                                    let cy = (position.y / (lh.max(1.0) as f32)) as u16;
-                                    self.engine
-                                        .borrow_mut()
-                                        .open_explorer_context_menu(target, is_dir, cx, cy);
-                                }
-                            }
-                            self.queue_explorer_draw();
-                            self.draw_needed.set(true);
-                            return;
-                        }
-                        if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
-                            self.engine
-                                .borrow_mut()
-                                .dispatch_explorer_tree_event(tree_event);
-                        } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
-                            self.engine
-                                .borrow_mut()
-                                .handle_explorer_mouse_event(tree_event);
-                        }
-                        self.queue_explorer_draw();
-                        self.draw_needed.set(true);
-                    }
-                }
-            }
-            _ => unreachable!(),
         }
     }
 
@@ -4675,7 +4612,7 @@ impl App {
 
         let consumed = match active_id.as_str() {
             PANEL_EXPLORER => {
-                self.dispatch(Msg::ExplorerUiEvent(event.clone()));
+                self.explorer_ui_event(event.clone());
                 true
             }
             PANEL_SEARCH => {
@@ -4945,15 +4882,15 @@ impl App {
             _ => key_name.clone(),
         };
         if printable == pk_toggle {
-            self.dispatch(Msg::ToggleSidebar);
+            self.toggle_sidebar_panel();
             return;
         }
         if printable == pk_explorer {
-            self.dispatch(Msg::ToggleFocusExplorer);
+            self.toggle_focus_explorer();
             return;
         }
         if printable == pk_search {
-            self.dispatch(Msg::ToggleFocusSearch);
+            self.toggle_focus_search();
             return;
         }
 
@@ -5138,7 +5075,7 @@ impl App {
     fn dispatch_explorer_ctx_action(&mut self, action: &str, target: &std::path::Path) {
         match action {
             "new_file" | "new_folder" | "rename" | "delete" | "move_file" => {
-                self.dispatch(Msg::ExplorerAction(action.to_string()));
+                self.explorer_action(action.to_string());
             }
             "open_terminal" => {
                 let dir = if target.is_dir() {
@@ -5149,10 +5086,10 @@ impl App {
                         .unwrap_or(std::path::Path::new("."))
                         .to_path_buf()
                 };
-                self.dispatch(Msg::OpenTerminalAt(dir));
+                self.open_terminal_at(dir);
             }
             "find_in_folder" => {
-                self.dispatch(Msg::ToggleFocusSearch);
+                self.toggle_focus_search();
             }
             _ => {} // engine-handled actions (copy_path, reveal, etc.)
         }
@@ -5220,99 +5157,104 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    fn handle_dialog_msg(&mut self, msg: Msg) {
-        match msg {
-            Msg::OpenFileDialog => {
-                // Deferred to tick(), which has the runner-owned `backend`
-                // handle PlatformServices needs — see PendingFileDialog (#572).
-                self.pending_file_dialog
-                    .set(Some(PendingFileDialog::OpenFile));
-                self.draw_needed.set(true);
-            }
-            Msg::OpenFolderDialog => {
-                // #572: still direct gtk4::FileDialog — quadraui::PlatformServices
-                // has no folder-select mode yet (only show_file_open_dialog /
-                // show_file_save_dialog, both file pickers). Needs a new
-                // quadraui issue (folder-select support) before this can move.
-                let engine = self.engine.clone();
-                let sender2 = self.sender.clone();
-                let dialog = gtk4::FileDialog::new();
-                dialog.set_title("Open Folder");
-                dialog.set_accept_label(Some("Open Folder"));
-                let win = self.window.clone();
-                dialog.select_folder(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
-                    if let Ok(file) = result {
-                        // Use UFCS to call gtk4's FileExt::path (avoids gio version conflict)
-                        if let Some(path) = gtk4::prelude::FileExt::path(&file) {
-                            engine.borrow_mut().open_folder(&path);
-                            sender2.send(Msg::RefreshFileTree).ok();
-                        }
-                    }
-                });
-                self.draw_needed.set(true);
-            }
-            Msg::OpenWorkspaceDialog => {
-                // open_workspace_from_file() already ran in the engine;
-                // just refresh the file tree.
-                self.dispatch(Msg::RefreshFileTree);
-                self.draw_needed.set(true);
-            }
-            Msg::SaveWorkspaceAsDialog => {
-                // Deferred to tick() — see PendingFileDialog (#572).
-                self.pending_file_dialog
-                    .set(Some(PendingFileDialog::SaveWorkspaceAs));
-                self.draw_needed.set(true);
-            }
-            Msg::OpenRecentDialog => {
-                // #274: replaced the native gtk4::Dialog with the engine's
-                // unified picker (PickerSource::RecentWorkspaces). Picker
-                // confirm calls open_folder + sets explorer_needs_refresh
-                // so the file tree rebuilds on the next render — no
-                // backend-specific Msg dispatch needed here.
-                let mut engine = self.engine.borrow_mut();
-                if engine.session.recent_workspaces.is_empty() {
-                    engine.message = "No recent workspaces".to_string();
-                } else {
-                    engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
+    /// Show a native "Open File" dialog.
+    fn open_file_dialog(&mut self) {
+        // Deferred to tick(), which has the runner-owned `backend`
+        // handle PlatformServices needs — see PendingFileDialog (#572).
+        self.pending_file_dialog
+            .set(Some(PendingFileDialog::OpenFile));
+        self.draw_needed.set(true);
+    }
+
+    /// Show a native "Open Folder" dialog.
+    fn open_folder_dialog(&mut self) {
+        // #572: still direct gtk4::FileDialog — quadraui::PlatformServices
+        // has no folder-select mode yet (only show_file_open_dialog /
+        // show_file_save_dialog, both file pickers). Needs a new
+        // quadraui issue (folder-select support) before this can move.
+        let engine = self.engine.clone();
+        let deferred2 = self.deferred.clone();
+        let dialog = gtk4::FileDialog::new();
+        dialog.set_title("Open Folder");
+        dialog.set_accept_label(Some("Open Folder"));
+        let win = self.window.clone();
+        dialog.select_folder(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
+            if let Ok(file) = result {
+                // Use UFCS to call gtk4's FileExt::path (avoids gio version conflict)
+                if let Some(path) = gtk4::prelude::FileExt::path(&file) {
+                    engine.borrow_mut().open_folder(&path);
+                    deferred2.send(DeferredAction::RefreshFileTree);
                 }
-                drop(engine);
-                self.draw_needed.set(true);
             }
+        });
+        self.draw_needed.set(true);
+    }
 
-            Msg::QuitConfirmed => {
-                // Save session state then exit the process.
-                self.save_session_and_exit();
-            }
+    /// Finish an "Open Workspace" action started in the engine.
+    fn open_workspace_dialog(&mut self) {
+        // open_workspace_from_file() already ran in the engine;
+        // just refresh the file tree.
+        self.refresh_file_tree();
+        self.draw_needed.set(true);
+    }
 
-            Msg::ShowCloseTabConfirm => {
-                use crate::core::engine::DialogButton;
-                self.engine.borrow_mut().show_dialog(
-                    "close_tab_confirm",
-                    "Unsaved Changes",
-                    vec!["This file has unsaved changes.".to_string()],
-                    vec![
-                        DialogButton {
-                            label: "Save & Close".into(),
-                            hotkey: 's',
-                            action: "save_close".into(),
-                        },
-                        DialogButton {
-                            label: "Discard & Close".into(),
-                            hotkey: 'd',
-                            action: "discard".into(),
-                        },
-                        DialogButton {
-                            label: "Cancel".into(),
-                            hotkey: '\0',
-                            action: "cancel".into(),
-                        },
-                    ],
-                );
-                self.draw_needed.set(true);
-            }
+    /// Show a native "Save Workspace As" dialog.
+    fn save_workspace_as_dialog(&mut self) {
+        // Deferred to tick() — see PendingFileDialog (#572).
+        self.pending_file_dialog
+            .set(Some(PendingFileDialog::SaveWorkspaceAs));
+        self.draw_needed.set(true);
+    }
 
-            _ => unreachable!(),
+    /// Show the "Open Recent" workspace picker.
+    fn open_recent_dialog(&mut self) {
+        // #274: replaced the native gtk4::Dialog with the engine's
+        // unified picker (PickerSource::RecentWorkspaces). Picker
+        // confirm calls open_folder + sets explorer_needs_refresh
+        // so the file tree rebuilds on the next render — no
+        // backend-specific Msg dispatch needed here.
+        let mut engine = self.engine.borrow_mut();
+        if engine.session.recent_workspaces.is_empty() {
+            engine.message = "No recent workspaces".to_string();
+        } else {
+            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
         }
+        drop(engine);
+        self.draw_needed.set(true);
+    }
+
+    /// User confirmed quit — save session state then exit the process.
+    fn quit_confirmed(&mut self) {
+        // Save session state then exit the process.
+        self.save_session_and_exit();
+    }
+
+    /// User clicked ✕ on a tab with unsaved changes — ask what to do.
+    fn show_close_tab_confirm(&mut self) {
+        use crate::core::engine::DialogButton;
+        self.engine.borrow_mut().show_dialog(
+            "close_tab_confirm",
+            "Unsaved Changes",
+            vec!["This file has unsaved changes.".to_string()],
+            vec![
+                DialogButton {
+                    label: "Save & Close".into(),
+                    hotkey: 's',
+                    action: "save_close".into(),
+                },
+                DialogButton {
+                    label: "Discard & Close".into(),
+                    hotkey: 'd',
+                    action: "discard".into(),
+                },
+                DialogButton {
+                    label: "Cancel".into(),
+                    hotkey: '\0',
+                    action: "cancel".into(),
+                },
+            ],
+        );
+        self.draw_needed.set(true);
     }
 
     /// #731: was `if let Some(da) = self.drawing_area…` — that field is
@@ -5347,10 +5289,11 @@ impl quadraui::ShellApp for App {
         self.line_height_cell.set(self.cached_line_height);
         self.char_width_cell.set(self.cached_char_width);
         // (#547) Seed the backend's nerd-fonts flag. The only prior call
-        // site was `Msg::CacheFontMetrics`, which stopped firing after the
-        // #540 ShellApp migration, silently freezing quadraui's GTK backend
+        // site was the `Msg::CacheFontMetrics` arm, which stopped firing after
+        // the #540 ShellApp migration, silently freezing quadraui's GTK backend
         // at its default of `false` — the cause of the explorer treeview
-        // falling back to ASCII icons.
+        // falling back to ASCII icons. (That arm had still never regained a
+        // producer, so #732 deleted it; this call is the live replacement.)
         render::sync_nerd_fonts(backend, &self.engine.borrow());
 
         // Try to grab the runner-created GTK window now so minimize/maximize/
@@ -5420,8 +5363,8 @@ impl quadraui::ShellApp for App {
         // honour for both paint and their no-paint measurement twins
         // (quadraui#624). Before this call `ui_font` on the paint backend
         // (a *separate* `GtkBackend` instance from `self.backend`, which
-        // `Msg::CacheFontMetrics` above already keeps synced for click-time
-        // hit-testing — see that match arm's doc) was never touched, so it
+        // `sync_nerd_fonts` above already keeps synced for click-time
+        // hit-testing) was never touched, so it
         // sat at quadraui's own "Sans 11" default forever: chrome text
         // didn't track `settings.ui_font_size`, and — per #700's item 3 —
         // status-bar-painted breadcrumb text had no font of its own to
@@ -7058,10 +7001,12 @@ impl quadraui::ShellApp for App {
         // drag-to-move check would otherwise claim) routes to tab-nav / the
         // picker instead of starting a window drag. Mirrors TUI's
         // `mouse.rs` "Menu bar row click — command center only" precedence.
-        // `MruNavBack` / `MruNavForward` / `OpenCommandCenter` are the
-        // pre-#540 Relm4 `Msg` variants for this exact action — already
-        // wired end-to-end in `handle_menu_msg` but never dispatched from
-        // anywhere since the cutover; this is their first live caller.
+        // `mru_nav_back` / `mru_nav_forward` / `open_command_center_picker`
+        // were the pre-#540 Relm4 `Msg::MruNavBack` / `MruNavForward` /
+        // `OpenCommandCenter` variants for this exact action — already wired
+        // end-to-end but never dispatched from anywhere since the cutover.
+        // This block was their first live caller (#676); #732 turned them into
+        // the plain methods called below.
         if let UiEvent::MouseDown {
             button: MouseButton::Left,
             position,
@@ -7251,7 +7196,7 @@ impl quadraui::ShellApp for App {
             }
             UiEvent::Accelerator(id, _mods) => {
                 let id_str = id.as_str().to_string();
-                dispatch_gtk_panel_accelerator(&id_str, &self.sender, &self.engine);
+                dispatch_gtk_panel_accelerator(&id_str, &self.deferred, &self.engine);
                 self.draw_needed.set(true);
             }
             UiEvent::MouseDown {
@@ -7371,7 +7316,8 @@ impl quadraui::ShellApp for App {
                 // policy — was written against GTK's raw polarity and is
                 // unchanged since before the #540 Relm4→ShellApp migration.
                 // Pre-migration the Relm4 `connect_scroll` closure fed it GTK's
-                // `dy` directly (as the retired `Msg::MouseScroll`'s payload)
+                // `dy` directly (as the retired `Msg::MouseScroll`'s payload
+                // — the whole bus is gone as of #732)
                 // and *separately* pushed the negated `gdk_scroll_to_uievent`
                 // form onto the backend event queue. The migration deleted that
                 // closure and left the runner's already-negated `UiEvent::Scroll`
@@ -7429,15 +7375,25 @@ impl quadraui::ShellApp for App {
         // is `Some`.
         self.capture_window_and_apply_csd();
 
-        // Drain messages queued by async GTK callbacks.
-        let msgs = self.sender.drain();
-        for msg in msgs {
-            self.dispatch(msg);
+        // Drain the actions async GTK callbacks queued for this frame.
+        for action in self.deferred.drain() {
+            match action {
+                DeferredAction::ClearYankHighlight => self.clear_yank_highlight(),
+                DeferredAction::RefreshFileTree => self.refresh_file_tree(),
+                DeferredAction::Resize => self.handle_resize(),
+                DeferredAction::SettingsFileChanged => self.settings_file_changed(),
+                DeferredAction::ToggleFocusExplorer => self.toggle_focus_explorer(),
+                DeferredAction::ToggleFocusSearch => self.toggle_focus_search(),
+                DeferredAction::ToggleSidebar => self.toggle_sidebar_panel(),
+                DeferredAction::ToggleTerminal => self.toggle_terminal(),
+                DeferredAction::ToggleTerminalMaximize => self.toggle_terminal_maximize(),
+            }
         }
 
         // Run a file dialog requested this frame — needs the runner-owned
         // `backend` handle for `PlatformServices` (#572). See
-        // `PendingFileDialog` for why this can't happen in `dispatch()`.
+        // `PendingFileDialog` for why this can't happen in the
+        // `open_file_dialog` / `save_workspace_as_dialog` handlers themselves.
         if let Some(req) = self.pending_file_dialog.take() {
             self.run_pending_file_dialog(req, backend);
         }
@@ -7472,10 +7428,10 @@ impl quadraui::ShellApp for App {
                 // dispatches on `engine.ext_panel_active`, which
                 // `show_panel` would leave untouched (and, since the engine's
                 // AppShell has no such panel, it would no-op entirely) — so
-                // route them through the existing `Msg::SwitchPanel` handler
+                // route them through the existing `switch_panel` handler
                 // that owns the ext-panel focus/toggle bookkeeping.
                 if is_ext_panel_id(panel_id.as_str()) {
-                    self.handle_sidebar_panel_msg(Msg::SwitchPanel(panel_id.as_str().to_string()));
+                    self.switch_panel(panel_id.as_str().to_string());
                     return;
                 }
                 // Sync the runner's active panel into the engine's AppShell so
@@ -7498,7 +7454,7 @@ impl quadraui::ShellApp for App {
                     engine.app_shell.hide_sidebar();
                     // #557: this is also how a *second* click on an open
                     // extension panel's icon arrives, so drop the plugin
-                    // panel's claim too (`Msg::SwitchPanel`'s own toggle
+                    // panel's claim too (`switch_panel`'s own toggle
                     // branch clears the same two fields). Re-opening still
                     // works: `AppShell::handle_activity_click` reports a click
                     // on the active panel as `PanelChanged`, not
