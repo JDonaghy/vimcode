@@ -2954,6 +2954,79 @@ second line here
         );
     }
 
+    /// #756 acceptance, GTK half of the drag rung: an editor text-selection
+    /// drag must still paint a selection now that
+    /// `render::route_mouse_drag` — not `handle_mouse_drag_msg`'s own
+    /// hand-ordered ladder — decides that the point belongs to the editor.
+    ///
+    /// Asserted on painted pixels (`CLAUDE.md` testing rule 1): the cell the
+    /// drag sweeps over must change background between before and after, which
+    /// is only true if the `MouseDragRoute::EditorText` arm actually reached
+    /// `handle_mouse_drag`. Confirmed RED by disabling that arm
+    /// (`EditorText if false =>`, so the route falls to the no-op group): the
+    /// two probes then both read `(39, 39, 43)`.
+    #[test]
+    fn an_editor_text_drag_paints_a_selection_through_the_shared_drag_router() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        let mut text = String::new();
+        for _ in 0..60 {
+            text.push_str("alpha beta gamma delta epsilon\n");
+        }
+        engine.buffer_mut().insert(0, &text);
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        let cw = h.painted_char_width();
+        let lh = h
+            .painted_line_height()
+            .expect("the frame must publish the line height it painted with");
+        assert!(
+            cw > 0.0,
+            "the frame must publish the char width it painted with"
+        );
+
+        // Anchor inside the *text*, not at the pane's centre: every line in
+        // the fixture is 30 characters, so a pane-centre press would land past
+        // end-of-line on both ends of the sweep and select nothing.
+        let (text_x, row_y) = {
+            let layout = h.screen_layout.borrow();
+            let rw = layout
+                .as_ref()
+                .expect("a frame must have painted")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active pane must be in the layout");
+            (
+                rw.rect.x + rw.gutter_char_width as f64 * cw,
+                rw.rect.y + lh * 2.5,
+            )
+        };
+        let probe = ((text_x + cw * 3.5) as i32, row_y as i32);
+        // Park the caret on the probe's row *first*, so the `before` sample
+        // already includes the cursor-line highlight and the only thing left
+        // for the gesture below to change is the selection itself.
+        h.driver.click((text_x + cw * 0.5) as f32, row_y as f32);
+        let before = h.driver.pixel(probe.0, probe.1);
+
+        // Press to the left of the probe and sweep past it while held — the
+        // press anchors the selection, the *move* is the rung under test.
+        h.driver
+            .mouse_down((text_x + cw * 0.5) as f32, row_y as f32);
+        h.driver
+            .mouse_move((text_x + cw * 8.5) as f32, row_y as f32);
+        h.driver.mouse_up((text_x + cw * 8.5) as f32, row_y as f32);
+
+        let after = h.driver.pixel(probe.0, probe.1);
+        assert_ne!(
+            before, after,
+            "a held drag across the editor text must repaint the swept cell \
+             with the selection background; both probes read {before:?} at \
+             {probe:?}"
+        );
+    }
+
     /// The mirror image of the test above: a drag that *starts* inside the
     /// sidebar must keep its grab for the rest of the gesture even once the
     /// pointer wanders out over the editor — a panel scrollbar-thumb or tree
