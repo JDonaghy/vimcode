@@ -807,6 +807,22 @@ impl Engine {
         }
     }
 
+    /// Paste `text` into the active pane's PTY, then poll it so the echo
+    /// lands in the frame the caller is about to paint.
+    ///
+    /// Delegates the bracketed-paste decision to quadraui's
+    /// `TerminalSession::paste` (quadraui#343/#415), which wraps in
+    /// `ESC[200~ … ESC[201~` only when the child has actually enabled DEC
+    /// private mode 2004. Both call sites used to hand-roll an
+    /// *unconditional* wrap, which leaked literal `[200~` bytes into programs
+    /// that do not strip them (`cat`, `less`, a shell without a line editor).
+    pub fn terminal_paste(&mut self, text: &str) {
+        if let Some(term) = self.active_terminal_mut() {
+            term.paste(text);
+        }
+        self.poll_terminal();
+    }
+
     /// Resize all terminal panes (shared panel height).
     pub fn terminal_resize(&mut self, cols: u16, rows: u16) {
         for slot in &mut self.terminal_panes {

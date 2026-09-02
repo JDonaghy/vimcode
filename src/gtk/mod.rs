@@ -1888,7 +1888,14 @@ impl App {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn handle_key_press(&mut self, key_name: String, unicode: Option<char>, ctrl: bool, alt: bool) {
+    fn handle_key_press(
+        &mut self,
+        key_name: String,
+        unicode: Option<char>,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) {
         // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
         // `render::route_modal_key` states the spell-suggestion → dialog →
         // context-menu ladder once for both backends. GTK used to hand-roll
@@ -1958,6 +1965,30 @@ impl App {
 
         if focus_route == render::FocusKeyRoute::ActivityBar {
             self.handle_activity_bar_key(&key_name, ctrl);
+            self.draw_needed.set(true);
+            return;
+        }
+
+        // ── Shared terminal (PTY) keyboard rung (#758 / #734 slice 3) ──
+        // GTK had no terminal rung at all between #540 and this change: the
+        // block that forwarded keys to the PTY lived in the Relm4 `view!`'s
+        // `EventControllerKey` closure and was deleted with it, so every key
+        // typed into a focused terminal fell through to `Engine::handle_key`
+        // and ran vim commands on the *editor buffer* (#471). It sits here,
+        // directly below the focus owners and above the debug F-keys, so the
+        // ladder matches TUI's exactly: `route_focus_key` already returns
+        // `FocusKeyRoute::None` while the terminal holds focus, and a focused
+        // terminal must take F5/F9/F10/F11 to the PTY rather than the
+        // debugger — which is what `vim`/`htop` running inside it expect.
+        if render::route_terminal_key(
+            &mut self.engine.borrow_mut(),
+            &key_name,
+            unicode,
+            ctrl,
+            shift,
+            alt,
+        ) {
+            self.sync_plus_register_to_clipboard();
             self.draw_needed.set(true);
             return;
         }
@@ -6875,13 +6906,19 @@ impl quadraui::ShellApp for App {
                     }
                 };
                 if !key_name.is_empty() || unicode.is_some() {
-                    self.handle_key_press(key_name, unicode, modifiers.ctrl, modifiers.alt);
+                    self.handle_key_press(
+                        key_name,
+                        unicode,
+                        modifiers.ctrl,
+                        modifiers.shift,
+                        modifiers.alt,
+                    );
                 }
             }
             UiEvent::CharTyped(c) => {
                 // Ctrl-modified characters arrive via KeyPressed; CharTyped is
                 // for IME-composed printable characters only.
-                self.handle_key_press(c.to_string(), Some(c), false, false);
+                self.handle_key_press(c.to_string(), Some(c), false, false, false);
             }
             UiEvent::Accelerator(id, _mods) => {
                 let id_str = id.as_str().to_string();

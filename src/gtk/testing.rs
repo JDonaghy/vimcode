@@ -2762,6 +2762,115 @@ mod sidebar_panel_clicks {
         );
     }
 
+    // ── #758 / #734 slice 3: the shared terminal (PTY) keyboard rung ───────
+
+    /// GTK half of `terminal_ctrl_f_opens_the_painted_find_bar_via_shell_app`
+    /// (`tui_main/shell_app.rs`): with the terminal focused, Ctrl+F must open
+    /// the *terminal's* find bar, and subsequent characters must land in that
+    /// bar's query — through `App::handle` -> `handle_key_press` ->
+    /// `render::route_terminal_key` -> `Engine::handle_terminal_key`.
+    ///
+    /// GTK had **no terminal keyboard rung at all** between #540 and #758:
+    /// the `if engine.borrow().terminal_has_focus { … }` block lived in the
+    /// Relm4 `view!`'s `EventControllerKey` closure and was deleted with it,
+    /// so Ctrl+F opened the editor's find/replace overlay and every other key
+    /// ran a vim command on the buffer while the user was looking at a shell
+    /// prompt (#471).
+    ///
+    /// Asserts on rendered output (`CLAUDE.md` rule 1): the terminal
+    /// toolbar's painted `" FIND: …"` text (`render::build_terminal_toolbar`,
+    /// drawn by `draw_terminal_panel`), never `terminal_find_active`.
+    ///
+    /// **Verified RED against unfixed `develop`:** without the
+    /// `render::route_terminal_key` call, Ctrl+F falls through to
+    /// `Engine::handle_key` and no `"FIND:"` ever paints — the second
+    /// assertion fires.
+    #[test]
+    fn terminal_ctrl_f_opens_the_painted_find_bar() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        // `terminal_new_tab` opens the panel and focuses it.
+        engine.terminal_new_tab(80, 10);
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("FIND:"),
+            "precondition: the terminal toolbar starts as a tab strip; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.ctrl_char('f');
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("FIND:"),
+            "Ctrl+F with the terminal focused must open the terminal find bar, \
+             not the editor find/replace overlay; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.type_char('z');
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("FIND: z"),
+            "characters typed after Ctrl+F must reach the terminal find query \
+             through the shared router; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// A focused terminal must swallow ordinary keys so they never reach the
+    /// editor buffer. This is the user-visible shape of the missing GTK rung:
+    /// typing `x` at a shell prompt deleted a character from the *file*.
+    ///
+    /// Asserts on the painted buffer text, with a positive control — the same
+    /// key on the same fixture with the terminal unfocused must delete the
+    /// character — so a fixture whose text could not change would fail.
+    ///
+    /// **Verified RED against unfixed `develop`:** without the router call
+    /// the first `x` reaches `Engine::handle_key`, the painted line drops to
+    /// `QXWTERMGTK758` immediately, and the second assertion fires.
+    #[test]
+    fn focused_terminal_swallows_editor_keys_on_gtk() {
+        let build = |focused: bool| {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = false;
+            engine.buffer_mut().insert(0, "ZQXWTERMGTK758\n");
+            engine.terminal_new_tab(80, 6);
+            engine.terminal_has_focus = focused;
+            harness(engine, 1400, 900)
+        };
+
+        let mut h = build(true);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXWTERMGTK758"),
+            "precondition: the buffer line must paint; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.type_char('x');
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXWTERMGTK758"),
+            "`x` with the terminal focused must go to the PTY, not delete a \
+             character from the editor buffer; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let mut control = build(false);
+        control.driver.render();
+        control.driver.type_char('x');
+        control.driver.render();
+        assert!(
+            control.driver.screen_contains("QXWTERMGTK758")
+                && !control.driver.screen_contains("ZQXWTERMGTK758"),
+            "control: with the terminal unfocused `x` must delete the first \
+             character; painted: {:?}",
+            control.driver.painted_texts()
+        );
+    }
+
     /// The sidebar hover rung must exist **on this backend at all**.
     ///
     /// Before #754 the Source Control toolbar's hover highlight was driven by

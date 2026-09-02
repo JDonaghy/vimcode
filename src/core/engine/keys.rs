@@ -7723,10 +7723,7 @@ impl Engine {
                     }
                 }
             } else if !text.is_empty() {
-                self.terminal_write(b"\x1b[200~");
-                self.terminal_write(text.as_bytes());
-                self.terminal_write(b"\x1b[201~");
-                self.poll_terminal();
+                self.terminal_paste(text);
             }
             return;
         }
