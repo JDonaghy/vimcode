@@ -815,6 +815,16 @@ impl Engine {
     }
 
     /// Return selected terminal text from the active pane for clipboard copy.
+    ///
+    /// #732: GTK's only caller was the `Msg::TerminalCopySelection` arm, which
+    /// had no producer left after the #540 Relm4→ShellApp cutover (the
+    /// per-DrawingArea key controller that used to send it went with it), and
+    /// TUI has never called it — so the `vimcode` bin, which compiles `core` as
+    /// a private module, now reports it dead. Kept (rather than deleted with
+    /// the orphaned arm) because it is part of `vimcode_core`'s public surface
+    /// and is what a re-wired terminal-copy binding on either backend will
+    /// call; `#[allow]` documents that it is currently unreached, not unwanted.
+    #[allow(dead_code)]
     pub fn terminal_copy_selection(&mut self) -> Option<String> {
         self.active_terminal()?.selected_text()
     }
