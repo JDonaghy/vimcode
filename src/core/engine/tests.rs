@@ -19957,6 +19957,26 @@ fn test_explorer_rename_ctrl_v_paste() {
     assert_eq!(rename.input, "pasted_name.rs");
 }
 
+/// #593: `UiEvent::ClipboardPaste` (delivered by quadraui's GTK runner when
+/// it intercepts Ctrl+V, and by TUI's crossterm bracketed-paste) reaches the
+/// engine as a call to `route_paste`, not a raw `KeyPressed("v", ctrl)` —
+/// so the explorer-rename ctrl+v branch in `handle_explorer_rename_key`
+/// (exercised by `test_explorer_rename_ctrl_v_paste` above) never fires for
+/// it. `route_paste` needs its own explorer-rename arm, checked before this
+/// fix landed: it fell through to the mode-based dispatch at the bottom of
+/// `route_paste` and did nothing, since `start_explorer_rename` doesn't
+/// change `engine.mode`.
+#[test]
+fn test_explorer_rename_route_paste() {
+    let mut e = Engine::new();
+    e.start_explorer_rename(PathBuf::from("/tmp/hello.rs"));
+    // Selection is "hello" (anchor=0, cursor=5) — route_paste must replace it,
+    // same as the ctrl+v key path does.
+    e.route_paste("pasted_name");
+    let rename = e.explorer_rename.as_ref().unwrap();
+    assert_eq!(rename.input, "pasted_name.rs");
+}
+
 #[test]
 fn test_explorer_rename_ctrl_c_copies_selection() {
     use std::sync::{Arc, Mutex};

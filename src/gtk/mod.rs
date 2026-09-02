@@ -1294,10 +1294,6 @@ enum Msg {
     SelectForDiff(PathBuf),
     /// Open a vsplit diff: current file is right side, stored path is left.
     DiffWithSelected(PathBuf),
-    /// GDK clipboard text arrived for pasting into command/search/insert input.
-    ClipboardPasteToInput {
-        text: String,
-    },
     /// Toggle the integrated terminal panel open/closed.
     ToggleTerminal,
     /// Toggle the "terminal maximized" state (panel fills editor area).
@@ -2463,7 +2459,6 @@ impl App {
             | Msg::CopyRelativePath(_)
             | Msg::SelectForDiff(_)
             | Msg::DiffWithSelected(_)
-            | Msg::ClipboardPasteToInput { .. }
             | Msg::WindowClosing { .. } => {
                 self.handle_file_ops_msg(msg);
             }
@@ -2986,25 +2981,6 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn handle_key_press(&mut self, key_name: String, unicode: Option<char>, ctrl: bool, alt: bool) {
-        // Handle Ctrl-Shift-V paste (sent as synthetic "PasteClipboard" key):
-        // do async GDK clipboard read → ClipboardPasteToInput
-        if key_name == "PasteClipboard" {
-            if let Some(display) = gdk::Display::default() {
-                let sender = self.sender.clone();
-                display
-                    .clipboard()
-                    .read_text_async(gtk4::gio::Cancellable::NONE, move |result| {
-                        let text = result
-                            .ok()
-                            .flatten()
-                            .map(|s| s.to_string())
-                            .unwrap_or_default();
-                        sender.send(Msg::ClipboardPasteToInput { text }).ok();
-                    });
-            }
-            return;
-        }
-
         // Dismiss context menu on any key press (Escape, or j/k for nav, Enter to confirm).
         if self.engine.borrow().context_menu.is_some() {
             let mut engine = self.engine.borrow_mut();
@@ -3185,25 +3161,12 @@ impl App {
                 let mapped = map_gtk_key_name(key_name.as_str());
                 if engine.dialog.is_some() {
                     engine.handle_key(mapped, unicode, ctrl);
-                } else if ctrl && mapped == "v" {
-                    drop(engine);
-                    if let Some(display) = gdk::Display::default() {
-                        let sender = self.sender.clone();
-                        display.clipboard().read_text_async(
-                            gtk4::gio::Cancellable::NONE,
-                            move |result| {
-                                let text = result
-                                    .ok()
-                                    .flatten()
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_default();
-                                sender.send(Msg::ClipboardPasteToInput { text }).ok();
-                            },
-                        );
-                    }
-                    self.draw_needed.set(true);
-                    return;
                 } else {
+                    // Ctrl+V no longer reaches here: quadraui's runner
+                    // intercepts it and delivers `UiEvent::ClipboardPaste`
+                    // straight to `ShellApp::handle`, which routes through
+                    // `Engine::route_paste` (covers the search/replace
+                    // fields too) before any key event is dispatched (#593).
                     engine.dispatch_search_sidebar_key_unified(mapped, ctrl, alt, unicode);
                 }
                 let still_focused = engine.search_has_focus;
@@ -8034,10 +7997,6 @@ impl App {
                 drop(engine);
                 self.draw_needed.set(true);
             }
-            Msg::ClipboardPasteToInput { text } => {
-                self.engine.borrow_mut().route_paste(&text);
-                self.draw_needed.set(true);
-            }
             Msg::WindowClosing { width, height } => {
                 let mut engine = self.engine.borrow_mut();
                 engine.session.window.width = width;
@@ -10299,6 +10258,19 @@ impl quadraui::ShellApp for App {
             }
             UiEvent::WindowClose => {
                 self.dispatch(Msg::ShowQuitConfirm);
+            }
+            // #593: quadraui's runner reads the system clipboard on Ctrl+V /
+            // Ctrl+Shift+V / middle-click and delivers the text here,
+            // unconditionally consuming the key — there is no raw KeyPressed
+            // fallback to catch a paste with. `Engine::route_paste` is the
+            // same focus-priority router TUI's `UiEvent::ClipboardPaste` arm
+            // already calls (`tui_main/shell_app.rs`), so this one arm covers
+            // the command line, search/replace fields, explorer rename, and
+            // the editor buffer — see that fn's doc for the full priority
+            // chain.
+            UiEvent::ClipboardPaste(text) => {
+                self.engine.borrow_mut().route_paste(&text);
+                self.draw_needed.set(true);
             }
             _ => {}
         }

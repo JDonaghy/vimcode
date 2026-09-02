@@ -7708,10 +7708,10 @@ impl Engine {
 
     /// Route pasted text to the correct input context.
     ///
-    /// Checks active contexts in priority order (terminal, picker, search,
-    /// SC commit, extension sidebar, AI chat) before falling through to
-    /// mode-based dispatch. Both backends call this instead of reimplementing
-    /// the priority chain.
+    /// Checks active contexts in priority order (terminal, picker, explorer
+    /// rename, search, SC commit, extension sidebar, AI chat) before falling
+    /// through to mode-based dispatch. Both backends call this instead of
+    /// reimplementing the priority chain.
     pub fn route_paste(&mut self, text: &str) {
         let first_line = text.lines().next().unwrap_or("");
 
@@ -7741,6 +7741,28 @@ impl Engine {
             self.picker_scroll_top = 0;
             self.picker_filter();
             self.picker_load_preview();
+            return;
+        }
+
+        // Tree inline-edit (explorer rename). Mirrors the selection-replace
+        // + insert behaviour `handle_explorer_rename_key`'s own `ctrl+v`
+        // branch already has — that branch reads `self.clipboard_read`
+        // directly and only ever fired from a raw `KeyPressed("v", ctrl)`,
+        // which quadraui's GTK runner no longer delivers (#593: Ctrl+V is
+        // intercepted and turned into this fn's `text` argument instead).
+        if let Some(state) = self.explorer_rename.as_mut() {
+            if !first_line.is_empty() {
+                if let Some(anchor) = state.selection_anchor.take() {
+                    let lo = anchor.min(state.cursor);
+                    let hi = anchor.max(state.cursor);
+                    if lo != hi {
+                        state.input.drain(lo..hi);
+                        state.cursor = lo;
+                    }
+                }
+                state.input.insert_str(state.cursor, first_line);
+                state.cursor += first_line.len();
+            }
             return;
         }
 
