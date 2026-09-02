@@ -2230,6 +2230,219 @@ pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
     ModalKeyRoute::None
 }
 
+// ─── Overlay-band composition (#735 slice 1) ──────────────────────────────────
+//
+// The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and
+// the first rung of #735 to be stated once instead of twice.
+//
+// Frame *content* has been shared for a long time (`build_screen_layout` and
+// the ~30 builders around it); frame *composition* — which surface is laid
+// down, in what order — was still transcribed per backend, and had drifted in
+// exactly the way #592 warned about:
+//
+//   GTK  menu dropdown → command centre → find/replace → picker →
+//        tab switcher → **dialog → context menu** → toasts
+//   TUI  find/replace → picker → tab switcher → **context menu → dialog** →
+//        menu dropdown → command centre → toasts
+//
+// Two independent inversions in one band:
+//
+//  1. **dialog vs. context menu.** A modal dialog is the one surface that eats
+//     every event (`route_modal_overlay_click` returns `Swallow` for anything
+//     that isn't a press the moment `dialog_open` is set, ahead of every other
+//     rung except toasts). On GTK it was nevertheless painted *under* the
+//     context menu, so an editor/tab/explorer context menu left open when a
+//     dialog opens paints on top of the thing that owns the input — input and
+//     paint disagreeing, the #587/#592 failure shape.
+//  2. **menu dropdown / command centre vs. the modal stack.** TUI painted the
+//     title-bar band on top of every modal; GTK painted it underneath.
+//
+// [`OVERLAY_Z_ORDER`] is now the single artefact both backends walk, so the
+// order is no longer a property either one can hold an opinion about. The
+// canonical order below takes GTK's placement for the title-bar chrome (it is
+// chrome, and modals should cover it) and TUI's placement for the modal stack
+// (it is the one that agrees with `route_modal_overlay_click`'s own
+// arbitration: tab switcher below dialog below toasts).
+//
+// **Not in this band, deliberately** — the two rungs that exist on one backend
+// only, and therefore cannot be part of a shared *sequence*:
+//
+//   * GTK's tab-drag drop overlay, app-icon slot and inline window controls.
+//     TUI paints its tab-drag ghost in the editor band and has neither an app
+//     icon nor in-canvas window controls. The app icon and window controls are
+//     painted from the [`OverlayOp::MenuDropdown`] arm, because
+//     `MenuSystem::render` repaints the whole title-bar band and would erase
+//     anything laid down before it (#676/#712).
+//   * TUI's folder/workspace picker. GTK's equivalent is a *native* GTK file
+//     chooser deferred through `PendingFileDialog` and run from `tick()`, so it
+//     is not a canvas rung at all.
+//
+// **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"):
+// quadraui already owns the *shell* composition — `compose::app_shell::AppShell`
+// hands both backends `AppShellLayout` (title-bar / activity-bar / sidebar /
+// bottom-panel / main-content bounds), and vimcode consumes it verbatim. The
+// overlay band is a different thing: it is vimcode's own set of app-level
+// surfaces, and quadraui's nearest neighbour — `ModalStack` — explicitly
+// disclaims it ("**Painting**: the stack has no opinions on draw order. Apps
+// still paint modals last (highest z); the stack is queried only when *events*
+// arrive"). So the ordering is vimcode's to state, and `render.rs` is where
+// vimcode states cross-backend contracts.
+
+/// One rung of the shared overlay band — the app-level surfaces both backends
+/// lay down on top of the editor and chrome, once the shell's own zones are
+/// painted.
+///
+/// Deliberately unit-agnostic: the rung says *what* is painted and *in what
+/// order*, never where or how big. Geometry stays per backend (GTK composes in
+/// pixels, TUI in cells) and rasterisation stays per backend (Cairo
+/// painter-order vs. ratatui cell coalescence) — those are the intrinsic
+/// differences #735 exists to *preserve* while removing the accidental one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OverlayOp {
+    /// `MenuSystem::render` — repaints the whole title-bar band, so it must
+    /// come before anything else that draws into that band. On GTK this arm
+    /// also paints the app-icon slot and the inline window controls.
+    MenuDropdown,
+    /// `Backend::draw_command_center`. Must follow [`Self::MenuDropdown`]:
+    /// `MenuSystem::render` repaints `draw_menu_bar` across the entire band,
+    /// including the command centre's columns, and painting the centre first
+    /// left a populated-but-invisible `command_center_layout` on both backends
+    /// (#676 on GTK, #712 on TUI).
+    CommandCenter,
+    /// `Backend::draw_find_replace`.
+    FindReplace,
+    /// The unified picker / command palette (`Surface::Palette` on GTK,
+    /// `render_picker_popup` on TUI).
+    UnifiedPicker,
+    /// The Ctrl+Tab MRU popup (`Backend::draw_list`).
+    TabSwitcher,
+    /// `Backend::draw_context_menu`.
+    ContextMenu,
+    /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
+    /// matching `route_modal_overlay_click`'s own arbitration.
+    Dialog,
+    /// `Backend::draw_toast_stack` — top of the stack on both backends, and
+    /// the first rung `route_modal_overlay_click` arbitrates.
+    ToastStack,
+}
+
+/// The canonical overlay z-order, **lowest z first** (index 0 is painted
+/// first, and everything after it may cover it).
+///
+/// Both backends iterate this array unconditionally and `match` each rung, so
+/// "which order do we paint the overlays in" is one artefact rather than two
+/// hand-kept transcriptions. Adding a surface means adding a variant here —
+/// which is a compile error in both backends' `match` until both paint it,
+/// making "populated but never composed" (#587/#592) structurally harder to
+/// reach.
+pub const OVERLAY_Z_ORDER: [OverlayOp; 8] = [
+    OverlayOp::MenuDropdown,
+    OverlayOp::CommandCenter,
+    OverlayOp::FindReplace,
+    OverlayOp::UnifiedPicker,
+    OverlayOp::TabSwitcher,
+    OverlayOp::ContextMenu,
+    OverlayOp::Dialog,
+    OverlayOp::ToastStack,
+];
+
+/// Which overlay rungs are live this frame, as a pure function of state.
+///
+/// Separate from [`OVERLAY_Z_ORDER`] because the backends walk the *whole*
+/// order every frame (each arm still has to clear its own hit-test cache when
+/// its surface is absent — a stale `dialog_layout` is the #587 bug in
+/// miniature). This type is what lets a test say "given this state, exactly
+/// these rungs should have been painted, in this order".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OverlayPresence {
+    pub menu_dropdown: bool,
+    pub command_center: bool,
+    pub find_replace: bool,
+    pub unified_picker: bool,
+    pub tab_switcher: bool,
+    pub context_menu: bool,
+    pub dialog: bool,
+    pub toast_stack: bool,
+}
+
+impl OverlayPresence {
+    /// The five rungs whose gate is a `ScreenLayout` field, so a caller only
+    /// has to supply the three that come from engine/geometry state
+    /// (`menu_dropdown`, `command_center`, `toast_stack`).
+    pub fn from_screen(screen: &ScreenLayout) -> Self {
+        Self {
+            menu_dropdown: false,
+            command_center: false,
+            find_replace: screen.find_replace.is_some(),
+            unified_picker: screen.picker.is_some(),
+            tab_switcher: screen.tab_switcher.is_some(),
+            // Matches both backends' own gate: an items-less context menu is
+            // not painted (GTK skips it and clears `context_menu_layout`).
+            context_menu: screen
+                .context_menu
+                .as_ref()
+                .is_some_and(|p| !p.items.is_empty()),
+            dialog: screen.dialog.is_some(),
+            toast_stack: false,
+        }
+    }
+
+    /// Is this rung live?
+    pub fn is_live(&self, op: OverlayOp) -> bool {
+        match op {
+            OverlayOp::MenuDropdown => self.menu_dropdown,
+            OverlayOp::CommandCenter => self.command_center,
+            OverlayOp::FindReplace => self.find_replace,
+            OverlayOp::UnifiedPicker => self.unified_picker,
+            OverlayOp::TabSwitcher => self.tab_switcher,
+            OverlayOp::ContextMenu => self.context_menu,
+            OverlayOp::Dialog => self.dialog,
+            OverlayOp::ToastStack => self.toast_stack,
+        }
+    }
+}
+
+/// The ordered list of overlay rungs a frame with this `presence` must paint.
+///
+/// This is the expected value a backend's *recorded* band is compared against
+/// (see `OverlayBandRecorder` on each shell app, and the
+/// `overlay_band_*_via_shell_app` / `overlay_band_*_via_gtk_driver` tests).
+pub fn compose_overlay_band(presence: &OverlayPresence) -> Vec<OverlayOp> {
+    OVERLAY_Z_ORDER
+        .iter()
+        .copied()
+        .filter(|op| presence.is_live(*op))
+        .collect()
+}
+
+/// Assert a backend's *actually painted* overlay sequence never runs backwards
+/// against [`OVERLAY_Z_ORDER`].
+///
+/// The weaker half of the #735 acceptance test, and the one every black-box
+/// render test can afford to call: it does not care which rungs were live, only
+/// that whatever *was* painted came out in canonical order. A rung hoisted out
+/// of the shared walk — which is exactly how both of the inversions above got
+/// in — fails this even when the exact live set is awkward to pin.
+///
+/// Returns `Err` with a human-readable diagnosis rather than panicking, so
+/// callers on either backend can attach their own context.
+pub fn check_overlay_band_order(painted: &[OverlayOp]) -> Result<(), String> {
+    let mut cursor = 0usize;
+    for op in painted {
+        match OVERLAY_Z_ORDER[cursor..].iter().position(|c| c == op) {
+            Some(offset) => cursor += offset + 1,
+            None => {
+                return Err(format!(
+                    "overlay band painted out of z-order: {painted:?}\n\
+                     {op:?} came after a rung that OVERLAY_Z_ORDER puts above it.\n\
+                     canonical order is {OVERLAY_Z_ORDER:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
 /// Data needed to render the quickfix bottom panel.
