@@ -670,6 +670,113 @@ mod tests {
         );
     }
 
+    /// #731 review: the test above only proves `debug_output_scroll`
+    /// (engine *state*) advances — CLAUDE.md calls that exact pattern out
+    /// by name as insufficient black-box coverage ("assert on rendered
+    /// output — never on state being populated"). Before #731, this same
+    /// `"debug_output" =>` arm called `if let Some(da) =
+    /// self.drawing_area.borrow().as_ref() { da.queue_draw(); }` on a
+    /// handle permanently `None` under the ShellApp runner, and nothing
+    /// else in the arm set `draw_needed`. So `App::handle` fell through to
+    /// `Reaction::Continue`, `GtkDriver::dispatch` never called `render()`,
+    /// and the painted frame would have stayed byte-identical to the
+    /// pre-scroll one even though engine state changed — the #587/#592 "state
+    /// changes, screen doesn't" bug class.
+    ///
+    /// Scrolling *down* (as the test above does) doesn't actually move the
+    /// painted content here: `dap_output_lines` starts with `auto_scroll:
+    /// true` (pins the view to the tail), and `handle_debug_output_scroll`'s
+    /// `delta_y > 0.0` branch only sets `auto_scroll = true` — it never turns
+    /// it off — so the panel keeps rendering the same tail lines no matter
+    /// how far `debug_output_scroll` climbs (verified empirically: a fresh
+    /// harness built with `debug_output_scroll: 0` and one built with `: 3`
+    /// paint byte-identical panels). Scrolling *up* is the direction that
+    /// exercises the fix: `handle_debug_output_scroll`'s `else` branch
+    /// unconditionally sets `auto_scroll = false`, switching the painted
+    /// view from "pinned to the tail" to "pinned to `scroll_offset`" —
+    /// `quadraui::TextDisplay`'s documented `auto_scroll` semantics
+    /// (`primitives/text_display.rs`) — which repaints a visibly different
+    /// set of lines even though `debug_output_scroll` itself stays 0. This
+    /// test fails red against the pre-#731 code: it snapshots the panel,
+    /// scrolls up, re-snapshots, and requires at least one pixel to differ.
+    #[test]
+    fn wheel_scroll_up_on_debug_output_panel_repaints_the_unpinned_view() {
+        let mut engine = Engine::new();
+        engine.bottom_panel_open = true;
+        engine.bottom_panel_kind = crate::core::engine::BottomPanelKind::DebugOutput;
+        engine.dap_output_lines = (0..200).map(|i| format!("line {i}")).collect();
+        assert!(
+            engine.debug_output_auto_scroll,
+            "fixture sanity: auto-scroll must start on (pinned to the tail) \
+             for the pre-#731 failure mode below to be reachable at all"
+        );
+        let mut h = harness(engine, 1400, 900);
+
+        let geometry = h
+            .engine
+            .borrow()
+            .bottom_panel_geometry
+            .borrow()
+            .expect("the debug output panel must have painted geometry");
+        let win_x = h
+            .screen_layout
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.windows.first())
+            .map(|w| w.rect.x)
+            .expect("the editor window must have painted a rect");
+
+        let x = (win_x + 50.0) as f32;
+        let y = (geometry.top_y + geometry.content_y + geometry.content_row_h) as f32;
+
+        // Sample the panel's whole content band.
+        let (bx0, by0) = (win_x as i32, geometry.top_y as i32);
+        let (bx1, by1) = (
+            (win_x + 400.0) as i32,
+            (geometry.top_y + geometry.height) as i32,
+        );
+        let sample = |h: &mut Harness<_>| {
+            let mut px = Vec::new();
+            let mut sy = by0;
+            while sy < by1 {
+                let mut sx = bx0;
+                while sx < bx1 {
+                    px.push(h.driver.pixel(sx, sy));
+                    sx += 2;
+                }
+                sy += 2;
+            }
+            px
+        };
+
+        let before = sample(&mut h);
+
+        // Opposite sign from the "wheel down" test above — GTK-raw wheel-up,
+        // routed the same way (`Msg::MouseScroll` -> `dispatch_scroll` ->
+        // this `"debug_output" =>` arm) but landing in
+        // `handle_debug_output_scroll`'s `else` branch.
+        h.driver.dispatch(UiEvent::Scroll {
+            widget: None,
+            position: Point::new(x, y),
+            delta: ScrollDelta::new(0.0, 1.0),
+        });
+
+        assert!(
+            !h.engine.borrow().debug_output_auto_scroll,
+            "fixture sanity: wheel-up must turn auto-scroll off, or this \
+             test can't distinguish a real repaint fix from coincidence"
+        );
+
+        let after = sample(&mut h);
+        assert_ne!(
+            before, after,
+            "wheel-scrolling up on the debug output panel must repaint the \
+             now-unpinned view, not just flip `auto_scroll` silently behind \
+             an unqueued redraw — see this test's doc comment for the exact \
+             pre-#731 failure mode this catches"
+        );
+    }
+
     /// #672: the per-window status bar's segment click hit-test
     /// (`click.rs::pixel_to_click_target`'s `WindowZone::StatusBar` arm)
     /// reads `status_segment_map`, but under `ShellApp` nothing ever

@@ -5681,17 +5681,30 @@ impl App {
                 let row_idx = ((y_move - line_height) / line_height) as usize;
                 let flat_idx = scroll_top + row_idx;
                 let _ = x_move;
-                let changed =
-                    self.engine
-                        .borrow_mut()
-                        .panel_hover_mouse_move(&panel_name, "", flat_idx);
-                // #731: was `if let Some(ref da) = *self.ext_dyn_panel_da_ref.borrow()
-                // { da.queue_draw(); }` — permanently `None` under the ShellApp
-                // runner. `render_content` repaints from engine state every
-                // frame, so `draw_needed` is the live equivalent.
-                if changed {
-                    self.draw_needed.set(true);
-                }
+                // #731 review: this whole arm is unreachable dead code, not
+                // just the widget-handle guard it used to have. Nothing in
+                // this crate ever constructs `Msg::ExtPanelMouseMove` — the
+                // `EventControllerMotion` that used to send it was removed
+                // by the #540 ShellApp cutover (see the deleted 20Hz
+                // hover-poll block's doc comment on `handle_poll_tick`) and
+                // nothing has replaced it since, so this match arm has had
+                // no live caller since before this issue's first pass over
+                // it. Restoring ext-panel hover-highlight-on-mouse-move is
+                // real, wanted behavior, but it needs the same live mouse-
+                // position plumbing that block's removal flagged as
+                // follow-up work — it is not a "swap the redraw call" fix
+                // like the debug-output-panel scroll arm nearby. Left as a
+                // strict no-op (matching what `if let Some(ref da) =
+                // *self.ext_dyn_panel_da_ref.borrow() { da.queue_draw(); }`
+                // on the always-`None` handle already was) rather than
+                // adding an unverifiable `draw_needed.set(true)` — there is
+                // no UI event path a black-box test could dispatch to
+                // exercise this arm, so "add a driver test" isn't available
+                // as a remedy until the plumbing above exists.
+                let _ = self
+                    .engine
+                    .borrow_mut()
+                    .panel_hover_mouse_move(&panel_name, "", flat_idx);
             }
             Msg::ExtPanelScroll(dy) => {
                 let scroll_amount = (dy.abs() * 3.0).ceil() as usize;
