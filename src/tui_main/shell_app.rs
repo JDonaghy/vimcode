@@ -884,16 +884,10 @@ impl TuiShellApp {
                     self.sidebar.has_focus = true;
                     self.engine.dap_sidebar_has_focus = true;
                 }
-                render::populate_dap_sidebar_system(&self.engine);
-                let sidebar_event = self
-                    .engine
-                    .dap_sidebar_system
-                    .borrow_mut()
-                    .handle(&event, backend, rect);
-                // #637: the event landed inside this panel's own body rect —
-                // it must be claimed here unconditionally, even when the
-                // inner `SidebarEvent` comes back `Ignored` (e.g. a click on
-                // empty space below the last row, or between two headers
+                // #637 / #754: the event landed inside this panel's own body
+                // rect — it must be claimed here unconditionally, even when
+                // the inner `SidebarEvent` comes back `Ignored` (e.g. a click
+                // on empty space below the last row, or between two headers
                 // when the list is empty). Only returning `Redraw` on a
                 // "successful" dispatch let an `Ignored` result fall through
                 // to `mouse::handle_mouse`'s unrelated legacy dispatcher,
@@ -903,7 +897,9 @@ impl TuiShellApp {
                 // `debug_sidebar_intercept_claims_focus_on_mouse_down` /
                 // `ext_sidebar_intercept_claims_focus_on_mouse_down`, which
                 // hit exactly this path whenever the panel's list is empty).
-                self.engine.dispatch_dap_sidebar_event(sidebar_event);
+                // The dispatch itself is `render::dispatch_dap_sidebar_body_event`
+                // — the same function GTK's `route_debug_sidebar_event` calls.
+                render::dispatch_dap_sidebar_body_event(&mut self.engine, &event, rect, backend);
                 return Reaction::Redraw;
             }
         }
@@ -1034,28 +1030,40 @@ impl TuiShellApp {
             if is_explorer_event {
                 let rect = self.engine.explorer_tree_rect.get();
                 let theme = self.theme();
-                render::populate_explorer_tree_controller(&self.engine, &theme);
-                let tree_event = self
-                    .engine
-                    .explorer_tree
-                    .borrow_mut()
-                    .handle(&event, backend, rect);
-                let is_scrollbar =
-                    matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
+                // #754: the `TreeController` dispatch itself is
+                // `render::route_explorer_tree_event`, the same function
+                // GTK's `explorer_ui_event` and `mouse::handle_mouse`'s own
+                // explorer arm call. `(1.0, 1.0)`: TUI's tree paints one
+                // row/column per cell, so there is no pixel metric to
+                // re-apply the way GTK does.
+                let tree_event = render::route_explorer_tree_event(
+                    &mut self.engine,
+                    &event,
+                    rect,
+                    (1.0, 1.0),
+                    &theme,
+                    backend,
+                );
                 match &event {
                     UiEvent::DoubleClick { .. } => {
-                        self.engine.explorer_has_focus = true;
-                        self.sidebar.has_focus = true;
-                        self.engine.dispatch_explorer_tree_event(tree_event);
-                    }
-                    UiEvent::MouseDown { .. } => {
-                        if is_scrollbar {
-                            self.explorer_sb_dragging = true;
-                        } else {
+                        if let Some(tree_event) = tree_event {
                             self.engine.explorer_has_focus = true;
                             self.sidebar.has_focus = true;
+                            self.engine.dispatch_explorer_tree_event(tree_event);
                         }
-                        self.engine.handle_explorer_mouse_event(tree_event);
+                    }
+                    UiEvent::MouseDown { .. } => {
+                        if let Some(tree_event) = tree_event {
+                            let is_scrollbar =
+                                matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
+                            if is_scrollbar {
+                                self.explorer_sb_dragging = true;
+                            } else {
+                                self.engine.explorer_has_focus = true;
+                                self.sidebar.has_focus = true;
+                            }
+                            self.engine.handle_explorer_mouse_event(tree_event);
+                        }
                     }
                     UiEvent::MouseUp { .. } => {
                         self.explorer_sb_dragging = false;
@@ -1237,32 +1245,33 @@ impl TuiShellApp {
         }
     }
 
-    /// #557: open the plugin-provided panel `name` in the sidebar.
+    /// #557/#754: open the plugin-provided panel `name` in the sidebar.
     ///
-    /// Verbatim mirror of `mouse::handle_mouse`'s
-    /// `ActivityBarTarget::ExtensionPanel` "open" branch minus its
-    /// toggle-vs-open decision — on the `ShellApp` path `AppShell` has already
-    /// made that call and reports a *second* click on the open panel's icon as
-    /// [`quadraui::AppShellEvent::SidebarHidden`], not `PanelChanged`.
+    /// The switch itself is `render::apply_activity_panel_switch` — the same
+    /// call `mouse::handle_mouse`'s `ActivityBarTarget::ExtensionPanel` arm
+    /// makes — rather than a second hand-rolled copy of it. That matters
+    /// here specifically: `on_shell_event`'s `PanelChanged` arm (this
+    /// method's only caller) can run `activate_ext_panel` again for a
+    /// panel that's already active — e.g. a plugin re-registering itself
+    /// mid-session — and the un-shared version of this method used to reset
+    /// `ext_panel_selected` to `0` and re-fire `plugin_event("panel_focus",
+    /// …)` unconditionally on *every* call, scrolling the list back to the
+    /// top and double-firing the plugin's own focus hook for a no-op
+    /// re-activation. `apply_activity_panel_switch`'s `already_showing`
+    /// check is exactly that guard, previously GTK-only.
     ///
-    /// The `clear_sidebar_focus()` first is the #637 fix: a plugin panel
-    /// taking over the sidebar body has to drop whatever built-in panel's
-    /// focus flag was left set, or e.g. a stale `ext_sidebar_has_focus` from
-    /// an earlier Extensions-marketplace visit keeps claiming clicks meant for
-    /// this panel.
+    /// A literal second left-click on the icon never reaches here at all —
+    /// `AppShell` reports that as [`quadraui::AppShellEvent::SidebarHidden`]
+    /// instead of a repeat `PanelChanged` — but `apply_activity_panel_switch`
+    /// still handles it correctly (hides the sidebar) on the rare path where
+    /// it would.
     fn activate_ext_panel(&mut self, name: &str) {
-        self.engine.clear_sidebar_focus();
-        self.sidebar.ext_panel_name = Some(name.to_string());
-        if !self.engine.app_shell.sidebar_visible() {
-            self.engine.toggle_sidebar();
+        let switched =
+            render::apply_activity_panel_switch(&mut self.engine, &format!("ext:{name}"));
+        self.sidebar.ext_panel_name = switched.ext_panel;
+        if switched.sidebar_visible {
+            self.sidebar.has_focus = true;
         }
-        self.sidebar.has_focus = true;
-        self.engine.ext_panel_active = Some(name.to_string());
-        self.engine.ext_panel_has_focus = true;
-        self.engine.ext_panel_selected = 0;
-        self.engine.plugin_event("panel_focus", name);
-        self.engine.session.explorer_visible = self.engine.app_shell.sidebar_visible();
-        let _ = self.engine.session.save();
     }
 }
 
@@ -4854,6 +4863,71 @@ mod tests {
             !app.engine.explorer_has_focus,
             "the explorer must not also claim focus — `focus_sidebar_panel` \
              is the wrong call for an extension id"
+        );
+    }
+
+    /// #754: re-activating a plugin panel that's already the active one
+    /// (but whose sidebar was hidden through some *other* path — e.g. a
+    /// global sidebar-toggle key — without clearing `ext_panel_active`)
+    /// must not reset its scroll position or re-fire the plugin's
+    /// `panel_focus` hook. A second `PanelChanged` for the *visible*
+    /// already-active panel is the toggle-closed case, covered by
+    /// `on_shell_event_sidebar_hidden_clears_extension_panel_state` above
+    /// (`AppShell` reports that specific case as `SidebarHidden`, not a
+    /// repeat `PanelChanged`, but `apply_activity_panel_switch` handles it
+    /// the same way if one ever arrived) — this test is the other of
+    /// `apply_activity_panel_switch`'s two branches: `already_showing` but
+    /// *not* currently visible.
+    ///
+    /// `activate_ext_panel`'s pre-#754 body was TUI-only and unconditional
+    /// — every call, including one for a panel that's already active, reset
+    /// `ext_panel_selected` to `0` and called `plugin_event("panel_focus",
+    /// …)` again. `render::apply_activity_panel_switch`'s doc comment calls
+    /// this out by name: "the re-entry guard was GTK-only" — GTK's
+    /// `App::switch_panel` always routed through the shared function, so it
+    /// never had this bug; TUI's real activity-bar entry point
+    /// (`on_shell_event`'s `PanelChanged` arm, which every activity-bar
+    /// click drives — see `driver_click_on_extension_icon_opens_the_plugin_
+    /// panel`, above) called this method directly and did not. Verified RED
+    /// against the pre-#754 `activate_ext_panel` (reinstating its old
+    /// unconditional body resets `ext_panel_selected` back to `0` here).
+    #[allow(deprecated)]
+    #[test]
+    fn reactivating_the_open_plugin_panel_does_not_reset_its_scroll_position() {
+        let mut app = app_with_ext_panel();
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new("ext:git-insights"),
+        });
+        assert_eq!(app.engine.ext_panel_active.as_deref(), Some("git-insights"));
+
+        // Simulate the user having scrolled the panel's list, then hidden
+        // the sidebar via some path that leaves `ext_panel_active` alone
+        // (e.g. a global sidebar-toggle key) rather than the icon's own
+        // "close" click (which clears it — see
+        // `on_shell_event_sidebar_hidden_clears_extension_panel_state`).
+        app.engine.ext_panel_selected = 5;
+        app.engine.app_shell.hide_sidebar();
+        assert!(!app.engine.app_shell.sidebar_visible());
+
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new("ext:git-insights"),
+        });
+
+        assert!(
+            app.engine.app_shell.sidebar_visible(),
+            "re-activating the icon must re-show the sidebar"
+        );
+        assert_eq!(
+            app.engine.ext_panel_selected, 5,
+            "re-activating the panel that was already active must not reset \
+             its selection/scroll back to the top (#754 — \
+             apply_activity_panel_switch's re-entry guard, previously \
+             GTK-only)"
+        );
+        assert_eq!(
+            app.engine.ext_panel_active.as_deref(),
+            Some("git-insights"),
+            "and it must still be the active plugin panel"
         );
     }
 

@@ -2814,6 +2814,85 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #637/#754: switching to a plugin ("extension") panel from the
+    /// activity bar must clear focus flags a previously-visited panel left
+    /// set, on **this** backend too.
+    ///
+    /// `render::apply_activity_panel_switch`'s own doc comment: "#637's
+    /// focus clear was TUI-only" — TUI's `App::switch_panel` twin
+    /// (`mouse.rs`'s `ActivityBarTarget` match) called
+    /// `engine.clear_sidebar_focus()` before showing a plugin panel; GTK's
+    /// pre-#754 `switch_panel` never did, so a stale `ext_sidebar_has_focus`
+    /// left by an earlier visit to the Extensions *marketplace* panel
+    /// stayed stuck `true` after switching to an unrelated plugin panel.
+    /// TUI's regression test for the mirror-image bug is
+    /// `plugin_ext_panel_wins_focus_and_clicks_after_marketplace_visit`
+    /// (`tui_main/shell_app.rs`) — this is the GTK half.
+    ///
+    /// Drives a **real activity-bar click** through `GtkDriver` —
+    /// `AppShellEvent::PanelChanged` -> `App::switch_panel` ->
+    /// `render::apply_activity_panel_switch` — aimed at the exact row
+    /// `quadraui::gtk::ACTIVITY_ROW_PX` (the fixed per-icon height both the
+    /// painter and the runner's own hit-test use) puts the newly-registered
+    /// ext panel at. GTK's activity bar has no menu-toggle row (unlike
+    /// TUI's optional menu bar, GTK's is always the CSD title bar), so the
+    /// six fixed top-pinned items — explorer, search, debug, git,
+    /// extensions, ai (`sidebar::FIXED_ACTIVITY_PANEL_IDS`, the same shared
+    /// order both backends' shell config builds from) — occupy indices 0-5
+    /// and the ext panel lands at index 6; found empirically with a probe
+    /// harness clicking each row and checking `ext_panel_active`, since
+    /// this backend has no cached hit-region equivalent to
+    /// `bottom_tab_bar_hits` to read the geometry from directly.
+    #[test]
+    fn switching_to_a_plugin_panel_clears_stale_marketplace_focus() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        engine.ext_panels.clear();
+        engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some('X'),
+                sections: Vec::new(),
+            },
+        );
+        // Visit the Extensions marketplace panel first, as a user would
+        // before ever opening a plugin panel this session.
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXTENSIONS));
+        engine.ext_sidebar_has_focus = true;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        let ab_top = (h.menu_row_rect.get().y + h.menu_row_rect.get().height) as f32;
+
+        // Click the plugin panel's activity-bar icon (index 6 — see doc
+        // comment above).
+        let y = ab_top + (6.0 + 0.5) * quadraui::gtk::ACTIVITY_ROW_PX as f32;
+        h.driver.click(20.0, y);
+
+        assert_eq!(
+            h.engine.borrow().ext_panel_active.as_deref(),
+            Some("git-insights"),
+            "precondition: the click must have actually switched to the \
+             plugin panel — if this fails, the click missed the icon"
+        );
+        assert!(
+            !h.engine.borrow().ext_sidebar_has_focus,
+            "switching to a plugin panel must clear the Extensions \
+             marketplace's stale ext_sidebar_has_focus (#637's GTK gap — \
+             apply_activity_panel_switch now calls clear_sidebar_focus() \
+             on both backends)"
+        );
+        assert!(
+            h.engine.borrow().ext_panel_has_focus,
+            "the plugin panel itself must take focus"
+        );
+    }
+
     /// Debug: a press in the panel body must reach the panel at all — before
     /// #544 it was swallowed by the editor click path, which left
     /// `dap_sidebar_has_focus` false so every subsequent keystroke went to the
