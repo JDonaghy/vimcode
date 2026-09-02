@@ -734,21 +734,18 @@ struct App {
     terminal_resize_dragging: bool,
     /// True while the user drags the terminal split divider left/right.
     terminal_split_dragging: bool,
-    /// Split index being dragged (None if not dragging a group divider).
-    group_divider_dragging: Option<usize>,
-    /// (owning GroupId, tree-local split_index) being dragged, or `None`
-    /// (#582 — `:split`/`:vsplit` window-split divider, distinct from the
-    /// editor-group divider above; each group's `WindowLayout` numbers its
-    /// own splits independently, so the owning group must travel with it).
-    window_divider_dragging: Option<(core::window::GroupId, usize)>,
-    /// True while the user is dragging a tab between groups.
-    tab_dragging: bool,
-    /// Start position of a potential tab drag (set on MouseClick in tab bar).
-    tab_drag_start: Option<(f64, f64)>,
-    /// Source of the active tab drag: (group_id, tab_index).  Set when drag starts.
-    tab_drag_source: Option<(core::window::GroupId, usize)>,
-    /// Most recently computed drop zone during an active tab drag.
-    tab_drag_drop_zone: core::window::DropZone,
+    /// The divider currently grabbed — an editor-group boundary or a
+    /// `:split`/`:vsplit` window boundary (#582; each group's `WindowLayout`
+    /// numbers its own splits independently, so the owning group travels with
+    /// it). #753 collapsed the two mutually-exclusive `group_divider_dragging`
+    /// / `window_divider_dragging` fields into the shared
+    /// [`render::DividerGrab`], which TUI holds too.
+    divider_grab: Option<render::DividerGrab>,
+    /// Tab drag-and-drop arm → threshold → track → commit machine. #753
+    /// replaced the four parallel fields (`tab_dragging`, `tab_drag_start`,
+    /// `tab_drag_source`, `tab_drag_drop_zone`) with the shared
+    /// [`render::TabDragState`], which TUI holds too.
+    tab_drag: render::TabDragState,
     /// GTK window handle — set in `ShellApp::setup` once the runner creates the window.
     window: Option<gtk4::Window>,
     /// Editor content bounds + tab-bar height as used by the LAST
@@ -1250,12 +1247,8 @@ impl App {
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
             terminal_resize_dragging: false,
             terminal_split_dragging: false,
-            group_divider_dragging: None,
-            window_divider_dragging: None,
-            tab_dragging: false,
-            tab_drag_start: None,
-            tab_drag_source: None,
-            tab_drag_drop_zone: core::window::DropZone::None,
+            divider_grab: None,
+            tab_drag: render::TabDragState::default(),
             window: None,
             cached_editor_bounds: Cell::new(None),
             menu_row_rect: Rc::new(Cell::new(quadraui::Rect::default())),
@@ -2412,6 +2405,96 @@ impl App {
         self.cached_editor_bounds.get()
     }
 
+    /// Both divider lists for the frame just painted, plus whether `(x, y)`
+    /// lands on a group's tab bar — everything
+    /// [`render::route_divider_grab`] needs from this backend.
+    ///
+    /// Derived from [`Self::painted_editor_bounds`] rather than a fresh
+    /// drawing-area measurement, for the #582 reason recorded there.
+    /// #753 named it because the click arm and the drag arm both needed it and
+    /// each used to re-derive its own half.
+    ///
+    /// `on_tab_bar` exists so a click on a group's tab bar reaches the tab
+    /// handlers instead of arming a group-divider drag; it is deliberately
+    /// GTK-only (see `render::DividerState::on_tab_bar`). It is also skipped
+    /// entirely in single-group mode, where `group_dividers` is empty and
+    /// nothing could match anyway.
+    fn painted_divider_geometry(
+        &self,
+        x: f64,
+        y: f64,
+    ) -> Option<(
+        Vec<core::window::GroupDivider>,
+        Vec<core::window::WindowDivider>,
+        bool,
+    )> {
+        let (content_bounds, tab_bar_h) = self.painted_editor_bounds()?;
+        let engine = self.engine.borrow();
+        let single = engine.group_layout.is_single_group();
+        let group_dividers = if single {
+            Vec::new()
+        } else {
+            engine.group_layout.dividers(content_bounds, &mut 0)
+        };
+        let on_tab_bar = !single
+            && engine
+                .group_layout
+                .calculate_group_rects(content_bounds, tab_bar_h)
+                .iter()
+                .any(|(gid, grect)| {
+                    if engine.is_tab_bar_hidden(*gid) {
+                        return false;
+                    }
+                    let ty = grect.y - tab_bar_h;
+                    y >= ty && y < ty + tab_bar_h && x >= grect.x && x < grect.x + grect.width
+                });
+        let (window_rects, _) = engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+        let window_dividers = engine.calculate_window_dividers(&window_rects);
+        Some((group_dividers, window_dividers, on_tab_bar))
+    }
+
+    /// Re-resolve a tab-drag press point to `(group, tab index)`, or `None`
+    /// when the press was not on a tab after all.
+    ///
+    /// GTK arms the drag for the whole tab-bar band (its tab geometry is
+    /// proportional-font pixel bounds, resolved by `pixel_to_click_target`, not
+    /// the exact cell hit TUI gets for free), so the confirmation that
+    /// `render::TabDragMove::Crossed` asks for is a real second hit-test here.
+    fn tab_drag_source_at(&self, x: f64, y: f64) -> Option<(core::window::GroupId, usize)> {
+        let layout_ref = self.cached_screen_layout.borrow();
+        let layout = layout_ref.as_ref()?;
+        let mut engine = self.engine.borrow_mut();
+        let target = pixel_to_click_target(
+            &mut engine,
+            &self.backend,
+            x,
+            y,
+            self.cached_line_height,
+            self.cached_char_width,
+            layout,
+            &self.cached_tab_pixel_hits.borrow(),
+            &self.tab_slot_positions.borrow(),
+            &self.diff_btn_map.borrow(),
+            &self.split_btn_map.borrow(),
+            &self.action_btn_map.borrow(),
+            self.cached_frame_hit_map.borrow().as_ref(),
+            &self.cached_tab_bar_zones.borrow(),
+            true, // resolving the original tab-bar mouse-down; switching tabs is intended
+        );
+        if !matches!(target, ClickTarget::TabBar) {
+            return None;
+        }
+        // The tab was already switched by `pixel_to_click_target`, so the
+        // active group + active tab *is* the drag source.
+        let gid = engine.active_group;
+        let tidx = engine
+            .editor_groups
+            .get(&gid)
+            .map(|g| g.active_tab)
+            .unwrap_or(0);
+        Some((gid, tidx))
+    }
+
     /// Resolve the modal-overlay rung (#733) for one point/action against
     /// the layouts the last frame actually painted
     /// (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
@@ -3039,66 +3122,27 @@ impl App {
                     }
                 }
 
-                // ── Editor group divider hit-test ─────────────────────────────
-                if let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() {
-                    let engine = self.engine.borrow();
-                    if !engine.group_layout.is_single_group() {
-                        // Compute tab bar regions so we can exclude them from
-                        // divider drag — tab bar clicks should go to tab handlers.
-                        let group_rects = engine
-                            .group_layout
-                            .calculate_group_rects(content_bounds, tab_bar_h);
-                        let in_tab_bar = group_rects.iter().any(|(gid, grect)| {
-                            if engine.is_tab_bar_hidden(*gid) {
-                                return false;
-                            }
-                            let ty = grect.y - tab_bar_h;
-                            y >= ty
-                                && y < ty + tab_bar_h
-                                && x >= grect.x
-                                && x < grect.x + grect.width
-                        });
-
-                        if !in_tab_bar {
-                            let dividers = engine.group_layout.dividers(content_bounds, &mut 0);
-                            if let Some(i) = render::divider_hit_test(
-                                &dividers,
-                                x,
-                                y,
-                                (6.0, 6.0),
-                                (6.0, 6.0),
-                                false,
-                            ) {
-                                let si = dividers[i].split_index;
-                                drop(engine);
-                                self.group_divider_dragging = Some(si);
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                // ── Window-split divider hit-test (#582) ───────────────────────
-                // `:split`/`:vsplit` panes within a single editor group —
-                // independent of the group-divider check above, which only
-                // fires when there are 2+ editor groups.
-                if let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() {
-                    let engine = self.engine.borrow();
-                    let (window_rects, _group_dividers) =
-                        engine.calculate_group_window_rects(content_bounds, tab_bar_h);
-                    let window_dividers = engine.calculate_window_dividers(&window_rects);
-                    if let Some(i) = render::divider_hit_test(
-                        &window_dividers,
+                // ── Divider hit-test (#753 shared rung) ───────────────────────
+                // Editor-group boundaries then `:split`/`:vsplit` boundaries
+                // (#582), sequenced by `render::route_divider_grab`. GTK's only
+                // contribution is its own painted geometry and its own grab
+                // margin — a symmetric 6px around the thin drawn line, against
+                // continuous positions (`quantize: false`); TUI's cell metrics
+                // differ, the ordering does not.
+                if let Some((group_dividers, window_dividers, on_tab_bar)) =
+                    self.painted_divider_geometry(x, y)
+                {
+                    if let Some(grab) = render::route_divider_grab(
+                        &render::DividerState {
+                            group_dividers: &group_dividers,
+                            window_dividers: &window_dividers,
+                            metrics: render::GTK_DIVIDER_METRICS,
+                            on_tab_bar,
+                        },
                         x,
                         y,
-                        (6.0, 6.0),
-                        (6.0, 6.0),
-                        false,
                     ) {
-                        let div = &window_dividers[i];
-                        let target = (div.group_id, div.split_index);
-                        drop(engine);
-                        self.window_divider_dragging = Some(target);
+                        self.divider_grab = Some(grab);
                         return;
                     }
                 }
@@ -3179,7 +3223,7 @@ impl App {
                             }
                             // Tab bar / split button click — skip hooks.
                             // Record drag start position for tab drag-and-drop.
-                            self.tab_drag_start = Some((x, y));
+                            self.tab_drag.arm(x, y);
                             drop(engine);
                             self.draw_needed.set(true);
                             return;
@@ -3549,117 +3593,57 @@ impl App {
                 return;
             }
         }
-        // Tab drag-and-drop handling.
-        if self.tab_dragging {
-            // Update drop zone while dragging, using the per-group bounds cached by
-            // render_content. Cursor (x, y) and those bounds are both in absolute
-            // surface coordinates, so the hit-test matches what the overlay draws.
-            // (#515 — previously used relative 0-based bounds vs an absolute cursor,
-            // which misclassified the zone after a split.)
-            let groups = self.cached_drop_groups.borrow();
-            let zone = render::compute_tab_drop_zone(
-                x as f32,
-                y as f32,
-                &groups,
-                self.cached_drop_tbh.get(),
-            );
-            drop(groups);
-            self.tab_drag_drop_zone = zone;
-            self.draw_needed.set(true);
-            return;
-        }
-        // Check if a tab drag should start (mouse moved far enough from tab click).
-        if let Some((sx, sy)) = self.tab_drag_start {
-            let dx = x - sx;
-            let dy = y - sy;
-            if dx * dx + dy * dy > 64.0 {
-                let layout_ref = self.cached_screen_layout.borrow();
-                let Some(ref layout) = *layout_ref else {
-                    self.tab_drag_start = None;
-                    return;
-                };
-                let mut engine = self.engine.borrow_mut();
-                let target = pixel_to_click_target(
-                    &mut engine,
-                    &self.backend,
-                    sx,
-                    sy,
-                    self.cached_line_height,
-                    self.cached_char_width,
-                    layout,
-                    &self.cached_tab_pixel_hits.borrow(),
-                    &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_map.borrow(),
-                    &self.split_btn_map.borrow(),
-                    &self.action_btn_map.borrow(),
-                    self.cached_frame_hit_map.borrow().as_ref(),
-                    &self.cached_tab_bar_zones.borrow(),
-                    true, // resolving the original tab-bar mouse-down; switching tabs is intended
+        // Tab drag-and-drop: the arm → threshold → track machine is shared
+        // with TUI (`render::TabDragState`, #753). `64.0` is the squared
+        // 8-device-pixel threshold.
+        match self.tab_drag.handle_move(x, y, 64.0) {
+            render::TabDragMove::Tracking => {
+                // Compute the drop zone from the per-group bounds cached by
+                // render_content. Cursor (x, y) and those bounds are both in
+                // absolute surface coordinates, so the hit-test matches what
+                // the overlay draws. (#515 — previously used relative 0-based
+                // bounds vs an absolute cursor, which misclassified the zone
+                // after a split.)
+                let groups = self.cached_drop_groups.borrow();
+                let zone = render::compute_tab_drop_zone(
+                    x as f32,
+                    y as f32,
+                    &groups,
+                    self.cached_drop_tbh.get(),
                 );
-                if let ClickTarget::TabBar = target {
-                    // The tab was already switched by pixel_to_click_target.
-                    // Use the active group + active tab as the drag source.
-                    let gid = engine.active_group;
-                    let tidx = engine
-                        .editor_groups
-                        .get(&gid)
-                        .map(|g| g.active_tab)
-                        .unwrap_or(0);
-                    self.tab_drag_source = Some((gid, tidx));
-                    self.tab_drag_drop_zone = core::window::DropZone::None;
-                    self.tab_dragging = true;
-                    self.tab_drag_start = None;
+                drop(groups);
+                self.tab_drag.track(zone);
+                self.draw_needed.set(true);
+                return;
+            }
+            render::TabDragMove::Crossed { press_x, press_y } => {
+                // Unlike TUI, GTK's arm fires for the whole tab-bar band, so
+                // the press has to be re-resolved to confirm it was on a tab.
+                if let Some(source) = self.tab_drag_source_at(press_x, press_y) {
+                    self.tab_drag.begin(source, x, y);
                     self.draw_needed.set(true);
                     return;
                 }
-                // Not a tab — clear drag start and fall through.
-                self.tab_drag_start = None;
-            } else {
-                // Haven't moved enough yet, don't start any drag.
-                return;
+                // Not a tab — the press is disarmed and we fall through.
+                self.tab_drag.disarm();
             }
+            // Haven't moved enough yet, don't start any drag.
+            render::TabDragMove::Pending => return,
+            render::TabDragMove::Idle => {}
         }
-        // Editor group divider drag — adjust split ratio.
-        if let Some(split_index) = self.group_divider_dragging {
-            let Some((content_bounds, _tab_bar_h)) = self.painted_editor_bounds() else {
-                return;
-            };
-            let dividers = self
-                .engine
-                .borrow()
-                .group_layout
-                .dividers(content_bounds, &mut 0);
-            if let Some(div) = dividers.iter().find(|d| d.split_index == split_index) {
-                let new_ratio = render::divider_ratio_from_pos(div, x, y);
-                self.engine
-                    .borrow_mut()
-                    .group_layout
-                    .set_ratio_at_index(split_index, new_ratio);
-            }
-            self.draw_needed.set(true);
-            return;
-        }
-        // Window-split divider drag — adjust ratio (#582).
-        if let Some((group_id, split_index)) = self.window_divider_dragging {
-            let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
-                return;
-            };
-            let engine = self.engine.borrow();
-            let (window_rects, _group_dividers) =
-                engine.calculate_group_window_rects(content_bounds, tab_bar_h);
-            let window_dividers = engine.calculate_window_dividers(&window_rects);
-            drop(engine);
-            if let Some(div) = window_dividers
-                .iter()
-                .find(|d| d.group_id == group_id && d.split_index == split_index)
+        // Divider drag — group boundary or `:split` boundary, both through the
+        // shared applier (#753).
+        if let Some(grab) = self.divider_grab {
+            if let Some((group_dividers, window_dividers, _)) = self.painted_divider_geometry(x, y)
             {
-                let new_ratio = render::divider_ratio_from_pos(div, x, y);
-                if let Some(group) = self.engine.borrow_mut().editor_groups.get_mut(&group_id) {
-                    group
-                        .active_tab_mut()
-                        .layout
-                        .set_ratio_at_index(split_index, new_ratio);
-                }
+                render::apply_divider_drag(
+                    &mut self.engine.borrow_mut(),
+                    grab,
+                    &group_dividers,
+                    &window_dividers,
+                    x,
+                    y,
+                );
             }
             self.draw_needed.set(true);
             return;
@@ -3766,19 +3750,12 @@ impl App {
             }
         }
 
-        // Tab drag drop.
-        if self.tab_dragging {
-            self.tab_dragging = false;
-            if let Some((src_gid, src_tab_idx)) = self.tab_drag_source.take() {
-                let zone = self.tab_drag_drop_zone;
-                self.tab_drag_drop_zone = core::window::DropZone::None;
-                self.engine
-                    .borrow_mut()
-                    .apply_tab_drop_zone(src_gid, src_tab_idx, zone);
-            }
+        // Tab drag drop (#753 — the same `handle_release` TUI calls; it also
+        // clears any armed-but-never-dragged press, which is what the bare
+        // `tab_drag_start = None` this replaced was for).
+        if self.tab_drag.handle_release(&mut self.engine.borrow_mut()) {
             self.draw_needed.set(true);
         }
-        self.tab_drag_start = None;
         if self.terminal_split_dragging {
             self.terminal_split_dragging = false;
             if self.cached_char_width > 0.0 {
@@ -3816,8 +3793,7 @@ impl App {
             let _ = self.engine.borrow().session.save();
         }
         self.h_sb_drag_cell.set(None);
-        self.group_divider_dragging = None;
-        self.window_divider_dragging = None;
+        self.divider_grab = None;
         {
             let mut engine = self.engine.borrow_mut();
             engine.mouse_drag_active = false;
@@ -6441,12 +6417,12 @@ impl quadraui::ShellApp for App {
         // ── Draw tab drag overlay ─────────────────────────────────────────────
         // When a tab drag is in progress, paint the drop-zone highlight + insertion
         // bar on top of all other content, using the geometry cached just above.
-        if self.tab_dragging {
+        if self.tab_drag.is_dragging() {
             let groups = self.cached_drop_groups.borrow();
             let eff_tbh = self.cached_drop_tbh.get();
             let (mx, my) = self.mouse_pos_cell.get();
             if let Some(ov) = render::compute_tab_drop_overlay(
-                &self.tab_drag_drop_zone,
+                self.tab_drag.zone(),
                 &groups,
                 (mx as f32, my as f32),
                 eff_tbh,

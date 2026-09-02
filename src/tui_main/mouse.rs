@@ -163,8 +163,7 @@ pub(super) fn handle_mouse(
     dragging_sidebar: &mut bool,
     dragging_terminal_resize: &mut bool,
     dragging_terminal_split: &mut bool,
-    dragging_group_divider: &mut Option<usize>,
-    dragging_window_divider: &mut Option<(crate::core::window::GroupId, usize)>,
+    divider_grab: &mut Option<render::DividerGrab>,
     drag_state: &mut quadraui::DragState,
     modal_stack: &mut quadraui::ModalStack,
     last_layout: Option<&render::ScreenLayout>,
@@ -176,11 +175,7 @@ pub(super) fn handle_mouse(
     should_quit: &mut bool,
     explorer_drag_src: &mut Option<usize>,
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
-    tab_drag_start: &mut Option<(u16, u16)>,
-    tab_dragging: &mut bool,
-    tab_drag_source: &mut Option<(crate::core::window::GroupId, usize)>,
-    tab_drag_cursor: &mut Option<(f64, f64)>,
-    tab_drop_zone: &mut crate::core::window::DropZone,
+    tab_drag: &mut render::TabDragState,
     hover_link_rects: &[(u16, u16, u16, u16, String)],
     hover_popup_rect: Option<(u16, u16, u16, u16)>,
     editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
@@ -803,40 +798,39 @@ pub(super) fn handle_mouse(
                     return sidebar_width;
                 }
             }
-            // Tab drag-and-drop: update drop zone while dragging.
-            if *tab_dragging {
-                *tab_drag_cursor = Some((col as f64, row as f64));
-                *tab_drop_zone = compute_tui_tab_drop_zone(
-                    engine,
-                    col,
-                    row,
-                    editor_left,
-                    last_layout,
-                    *terminal_size,
-                );
-                return sidebar_width;
-            }
-            // Tab drag-and-drop: detect drag start (mouse moved far enough).
-            if let Some((sx, sy)) = *tab_drag_start {
-                let dx = col.abs_diff(sx);
-                let dy = row.abs_diff(sy);
-                if dx + dy >= 2 {
-                    // Use the active group + active tab as the drag source.
+            // Tab drag-and-drop: the arm → threshold → track machine is
+            // shared with GTK (`render::TabDragState`, #753). `2.0` is the
+            // squared cell threshold — see `handle_move`'s doc for why it is
+            // exactly the Manhattan `dx + dy >= 2` this replaced.
+            match tab_drag.handle_move(col as f64, row as f64, 2.0) {
+                render::TabDragMove::Tracking => {
+                    tab_drag.track(compute_tui_tab_drop_zone(
+                        engine,
+                        col,
+                        row,
+                        editor_left,
+                        last_layout,
+                        *terminal_size,
+                    ));
+                    return sidebar_width;
+                }
+                render::TabDragMove::Crossed { .. } => {
+                    // Only the tab-bar arm arms the drag here, so the press
+                    // point is known to have been on a tab: use the active
+                    // group + active tab as the source (GTK has to re-resolve
+                    // the press because its arm covers the whole band).
                     let gid = engine.active_group;
                     let tidx = engine
                         .editor_groups
                         .get(&gid)
                         .map(|g| g.active_tab)
                         .unwrap_or(0);
-                    *tab_drag_source = Some((gid, tidx));
-                    *tab_drag_cursor = Some((col as f64, row as f64));
-                    *tab_drop_zone = crate::core::window::DropZone::None;
-                    *tab_dragging = true;
-                    *tab_drag_start = None;
+                    tab_drag.begin((gid, tidx), col as f64, row as f64);
                     return sidebar_width;
                 }
                 // Haven't moved enough yet — don't start any drag.
-                return sidebar_width;
+                render::TabDragMove::Pending => return sidebar_width,
+                render::TabDragMove::Idle => {}
             }
             // Command-line text selection drag
             if *cmd_dragging {
@@ -874,44 +868,22 @@ pub(super) fn handle_mouse(
                 engine.session.terminal_panel_rows = new_rows;
                 return sidebar_width;
             }
-            // Group divider drag — update ratio based on mouse position.
+            // Divider drag — group boundary or `:split` boundary, both
+            // through the shared applier (#753).
+            //
             // #550: `div.axis_start`/`.axis_size` are already absolute
             // terminal-screen coordinates, so `col`/`row` compare directly
             // with no editor-origin subtraction.
-            if let Some(split_index) = *dragging_group_divider {
+            if let Some(grab) = *divider_grab {
                 if let Some(layout) = last_layout {
-                    // #551: `group_dividers` is empty in single-group mode, so
-                    // the `editor_group_split.is_some()` gate this used to sit
-                    // behind is redundant — nothing can match.
-                    if let Some(div) = layout
-                        .group_dividers
-                        .iter()
-                        .find(|d| d.split_index == split_index)
-                    {
-                        let new_ratio = render::divider_ratio_from_pos(div, col as f64, row as f64);
-                        engine
-                            .group_layout
-                            .set_ratio_at_index(split_index, new_ratio);
-                    }
-                }
-                return sidebar_width;
-            }
-            // Window-split divider drag — update ratio based on mouse position (#582).
-            if let Some((group_id, split_index)) = *dragging_window_divider {
-                if let Some(layout) = last_layout {
-                    if let Some(div) = layout
-                        .window_dividers
-                        .iter()
-                        .find(|d| d.group_id == group_id && d.split_index == split_index)
-                    {
-                        let new_ratio = render::divider_ratio_from_pos(div, col as f64, row as f64);
-                        if let Some(group) = engine.editor_groups.get_mut(&group_id) {
-                            group
-                                .active_tab_mut()
-                                .layout
-                                .set_ratio_at_index(split_index, new_ratio);
-                        }
-                    }
+                    render::apply_divider_drag(
+                        engine,
+                        grab,
+                        &layout.group_dividers,
+                        &layout.window_dividers,
+                        col as f64,
+                        row as f64,
+                    );
                 }
                 return sidebar_width;
             }
@@ -1066,19 +1038,13 @@ pub(super) fn handle_mouse(
             engine.handle_search_sidebar_ui_event(up_ev);
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            // Tab drag-and-drop: execute drop on release.
-            if *tab_dragging {
-                *tab_dragging = false;
-                *tab_drag_start = None;
-                if let Some((src_gid, src_tab_idx)) = tab_drag_source.take() {
-                    let zone = *tab_drop_zone;
-                    *tab_drop_zone = crate::core::window::DropZone::None;
-                    engine.apply_tab_drop_zone(src_gid, src_tab_idx, zone);
-                }
-                *tab_drag_cursor = None;
+            // Tab drag-and-drop: execute drop on release (#753 — the same
+            // `handle_release` GTK calls; it also clears any armed-but-never-
+            // dragged press, which is what the bare `tab_drag_start = None`
+            // this replaced was for).
+            if tab_drag.handle_release(engine) {
                 return sidebar_width;
             }
-            *tab_drag_start = None;
             // Explorer drag-and-drop: execute move on release.
             if let Some((src_row, Some(target_row))) = explorer_drag_active.take() {
                 *explorer_drag_src = None;
@@ -1107,8 +1073,7 @@ pub(super) fn handle_mouse(
             // drags (`DragTarget::TextSelection`) clear here too, replacing the
             // old separate `mouse_text_drag = false` reset.
             drag_state.end();
-            *dragging_group_divider = None;
-            *dragging_window_divider = None;
+            *divider_grab = None;
             *cmd_dragging = false;
             *hover_selecting = false;
             if *dragging_terminal_resize {
@@ -2475,7 +2440,7 @@ pub(super) fn handle_mouse(
                             if needs_confirm {
                                 engine.show_close_tab_confirm();
                             }
-                            *tab_drag_start = Some((col, row));
+                            tab_drag.arm(col as f64, row as f64);
                         }
                         TabBarClickTarget::CloseTab(_) => {
                             let needs_confirm = engine.handle_tab_bar_click(group_id, target);
@@ -2576,7 +2541,7 @@ pub(super) fn handle_mouse(
                         if engine.handle_tab_bar_click(group_id, target) {
                             engine.show_close_tab_confirm();
                         } else if is_tab {
-                            *tab_drag_start = Some((col, row));
+                            tab_drag.arm(col as f64, row as f64);
                         }
                     }
                     None => {}
@@ -2591,60 +2556,46 @@ pub(super) fn handle_mouse(
     // `col`/`row` are used directly throughout this block — no
     // editor-area-relative translation needed.
 
-    // ── Group divider click — start drag ──────────────────────────────────────
-    // #452: must use the same float-to-int conversion as the divider
-    // renderer (`render_impl.rs::draw_frame` truncates with `as u16`) —
-    // `render::divider_hit_test`'s `quantize: true` handles this. Using
-    // `.round()` here meant clicks on a divider at e.g. col 40.5 (rendered at
-    // 40) were hit-tested at 41 and missed.
+    // ── Divider click — start drag (#753 shared rung) ─────────────────────────
+    // Group boundaries then `:split`/`:vsplit` boundaries, sequenced by
+    // `render::route_divider_grab`. Only the tolerances below are TUI-specific:
+    // they describe what *this* rasteriser drew, and the full rationale for the
+    // shape of `DividerMetrics` lives on that type. In short:
     //
-    // For horizontal splits the "visual divider" is the second group's
-    // entire tab-bar block (per render_impl.rs:359). When breadcrumbs are
-    // on the block is 2 rows tall — accept a click on either row (the
-    // asymmetric `(0.0, tab_bar_rows)` horizontal tolerance below).
-    // #551: no `editor_group_split.is_some()` gate needed — `group_dividers`
-    // is empty with one group, so the hit test can never match there.
+    // * `quantize: true` (#452) — hit-test against the same `position as u16`
+    //   truncation `render_impl.rs::draw_frame` draws at.
+    // * `tol_before = 1` on every *vertical* band and on the window bands
+    //   (#582, and #753 for the group one) — `div.position` is the first
+    //   column/row of the *second* pane and carries no glyph; the visible mark
+    //   is one cell before it (a neighbouring separator/scrollbar column for
+    //   `:vsplit`, the upper window's status row for `:split`, the group
+    //   divider glyph for a group split). Reaching back one cell is what makes
+    //   the thing the user aims at grabbable.
+    // * `group_horizontal: (0.0, tab_bar_rows)` — here the visible divider *is*
+    //   the lower group's whole tab-bar block (render_impl.rs:359), 2 rows tall
+    //   with breadcrumbs on, so the band reaches forward instead of back; the
+    //   row before it is the upper group's own status line and must keep its
+    //   clicks. #551: no `editor_group_split.is_some()` gate is needed —
+    //   `group_dividers` is empty with one group, so nothing can match.
     if let Some(layout) = last_layout {
         let tab_bar_rows: u16 = if engine.settings.breadcrumbs { 2 } else { 1 };
-        if let Some(i) = render::divider_hit_test(
-            &layout.group_dividers,
+        if let Some(grab) = render::route_divider_grab(
+            &render::DividerState {
+                group_dividers: &layout.group_dividers,
+                window_dividers: &layout.window_dividers,
+                metrics: render::DividerMetrics {
+                    group_vertical: (1.0, 1.0),
+                    group_horizontal: (0.0, tab_bar_rows as f64),
+                    window_vertical: (1.0, 1.0),
+                    window_horizontal: (1.0, 1.0),
+                    quantize: true,
+                },
+                on_tab_bar: false,
+            },
             col as f64,
             row as f64,
-            (0.0, 1.0),
-            (0.0, tab_bar_rows as f64),
-            true,
         ) {
-            *dragging_group_divider = Some(layout.group_dividers[i].split_index);
-            return sidebar_width;
-        }
-    }
-
-    // ── Window-split divider click — start drag (#582) ─────────────────────────
-    // `:split`/`:vsplit` panes within a single editor group. `div.position` is
-    // the boundary column/row itself (first column/row of the *second* pane),
-    // but the only thing actually drawn there is one cell *before* it: for
-    // `:vsplit`, `render_separators` paints the neighbouring window's own
-    // separator/scrollbar column at `sep_x - 1`; for `:split`, the upper
-    // window's per-window status line (its own reserved bottom row) occupies
-    // `sep_y - 1` and there's no separate glyph at all. A `(0.0, 1.0)`
-    // tolerance only accepted `col`/`row == position`, one cell past
-    // whatever the user can actually see and click — 100% miss for
-    // `:split` (no glyph ever sat at `position`) and a coin-flip for
-    // `:vsplit` (only imprecise aim ever landed exactly on `position`
-    // instead of the visible glyph at `position - 1`). Extend `tol_before`
-    // to 1 so both the visible mark and the boundary cell register (#582
-    // smoke-test failure: TUI :split divider unclickable, :vsplit flaky).
-    if let Some(layout) = last_layout {
-        if let Some(i) = render::divider_hit_test(
-            &layout.window_dividers,
-            col as f64,
-            row as f64,
-            (1.0, 1.0),
-            (1.0, 1.0),
-            true,
-        ) {
-            let div = &layout.window_dividers[i];
-            *dragging_window_divider = Some((div.group_id, div.split_index));
+            *divider_grab = Some(grab);
             return sidebar_width;
         }
     }
@@ -3194,7 +3145,6 @@ mod tests {
             &mut false,
             &mut false,
             &mut None,
-            &mut None,
             &mut drag_state,
             &mut modal_stack,
             None,
@@ -3206,11 +3156,7 @@ mod tests {
             &mut should_quit,
             &mut None,
             &mut None,
-            &mut None,
-            &mut false,
-            &mut None,
-            &mut None,
-            &mut crate::core::window::DropZone::None,
+            &mut render::TabDragState::default(),
             &[],
             None,
             None,
@@ -3405,8 +3351,7 @@ mod tests {
         col: u16,
         row: u16,
         last_layout: Option<&render::ScreenLayout>,
-        dragging_group_divider: &mut Option<usize>,
-        dragging_window_divider: &mut Option<(crate::core::window::GroupId, usize)>,
+        divider_grab: &mut Option<render::DividerGrab>,
     ) {
         let ev = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -3433,8 +3378,7 @@ mod tests {
             &mut false,
             &mut false,
             &mut false,
-            dragging_group_divider,
-            dragging_window_divider,
+            divider_grab,
             &mut drag_state,
             &mut modal_stack,
             last_layout,
@@ -3446,11 +3390,7 @@ mod tests {
             &mut should_quit,
             &mut None,
             &mut None,
-            &mut None,
-            &mut false,
-            &mut None,
-            &mut None,
-            &mut crate::core::window::DropZone::None,
+            &mut render::TabDragState::default(),
             &[],
             None,
             None,
@@ -3513,37 +3453,54 @@ mod tests {
         let row = (div.cross_start + 1.0) as u16;
 
         let mut engine_hit = split_engine_with_sidebar_and_menu();
-        let mut dragging = None;
-        let mut dragging_window = None;
-        dispatch_left_click(
-            &mut engine_hit,
-            col,
-            row,
-            Some(&screen),
-            &mut dragging,
-            &mut dragging_window,
-        );
+        let mut grab = None;
+        dispatch_left_click(&mut engine_hit, col, row, Some(&screen), &mut grab);
         assert_eq!(
-            dragging,
-            Some(div.split_index),
+            grab,
+            Some(render::DividerGrab::Group {
+                split_index: div.split_index
+            }),
             "click at the painted divider column ({col}, {row}) must start the divider drag"
         );
 
-        // One column off must NOT hit the divider.
-        let mut engine_miss = split_engine_with_sidebar_and_menu();
-        let mut dragging_miss = None;
-        let mut dragging_window_miss = None;
+        // `col - 1` is where `render_group_dividers` actually paints the
+        // visible │ — `div.position` is the first column of the *second*
+        // group and carries no glyph of its own. #753 widened `tol_before` to
+        // 1 so the column the user can see is grabbable too; before that, the
+        // only grabbable column was the invisible one (the #582 off-by-one,
+        // fixed for window dividers then and for group dividers now).
+        let mut engine_glyph = split_engine_with_sidebar_and_menu();
+        let mut grab_glyph = None;
         dispatch_left_click(
-            &mut engine_miss,
+            &mut engine_glyph,
             col - 1,
             row,
             Some(&screen),
-            &mut dragging_miss,
-            &mut dragging_window_miss,
+            &mut grab_glyph,
         );
         assert_eq!(
-            dragging_miss, None,
-            "click one column off the divider must not start a drag"
+            grab_glyph,
+            Some(render::DividerGrab::Group {
+                split_index: div.split_index
+            }),
+            "click on the visible divider glyph ({}, {row}), one column before \
+             the boundary, must also start the drag",
+            col - 1
+        );
+
+        // Two columns off must NOT hit the divider.
+        let mut engine_miss = split_engine_with_sidebar_and_menu();
+        let mut grab_miss = None;
+        dispatch_left_click(
+            &mut engine_miss,
+            col - 2,
+            row,
+            Some(&screen),
+            &mut grab_miss,
+        );
+        assert_eq!(
+            grab_miss, None,
+            "click two columns off the divider must not start a drag"
         );
     }
 
@@ -3615,19 +3572,14 @@ mod tests {
 
         // Click on the painted divider column starts the drag.
         let mut engine_hit = vsplit_engine_with_sidebar_and_menu();
-        let mut dragging_group = None;
-        let mut dragging_window = None;
-        dispatch_left_click(
-            &mut engine_hit,
-            col,
-            row,
-            Some(&screen),
-            &mut dragging_group,
-            &mut dragging_window,
-        );
+        let mut grab = None;
+        dispatch_left_click(&mut engine_hit, col, row, Some(&screen), &mut grab);
         assert_eq!(
-            dragging_window,
-            Some((group_id, split_index)),
+            grab,
+            Some(render::DividerGrab::Window {
+                group_id,
+                split_index
+            }),
             "click at the painted window-divider column ({col}, {row}) must start the drag"
         );
 
@@ -3638,37 +3590,36 @@ mod tests {
         // actually see used to miss ~half the time). Two columns off must
         // still miss.
         let mut engine_hit_neighbor = vsplit_engine_with_sidebar_and_menu();
-        let mut dragging_group_neighbor = None;
-        let mut dragging_window_neighbor = None;
+        let mut grab_neighbor = None;
         dispatch_left_click(
             &mut engine_hit_neighbor,
             col - 1,
             row,
             Some(&screen),
-            &mut dragging_group_neighbor,
-            &mut dragging_window_neighbor,
+            &mut grab_neighbor,
         );
         assert_eq!(
-            dragging_window_neighbor,
-            Some((group_id, split_index)),
+            grab_neighbor,
+            Some(render::DividerGrab::Window {
+                group_id,
+                split_index
+            }),
             "click on the visible glyph column ({}, {row}), one before the boundary, must also start the drag",
             col - 1
         );
 
         // Two columns off must NOT hit the divider.
         let mut engine_miss = vsplit_engine_with_sidebar_and_menu();
-        let mut dragging_group_miss = None;
-        let mut dragging_window_miss = None;
+        let mut grab_miss = None;
         dispatch_left_click(
             &mut engine_miss,
             col - 2,
             row,
             Some(&screen),
-            &mut dragging_group_miss,
-            &mut dragging_window_miss,
+            &mut grab_miss,
         );
         assert_eq!(
-            dragging_window_miss, None,
+            grab_miss, None,
             "click two columns off the window divider must not start a drag"
         );
 
@@ -3698,8 +3649,7 @@ mod tests {
             &mut false,
             &mut false,
             &mut false,
-            &mut dragging_group,
-            &mut dragging_window,
+            &mut grab,
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
@@ -3711,11 +3661,7 @@ mod tests {
             &mut should_quit,
             &mut None,
             &mut None,
-            &mut None,
-            &mut false,
-            &mut None,
-            &mut None,
-            &mut crate::core::window::DropZone::None,
+            &mut render::TabDragState::default(),
             &[],
             None,
             None,
@@ -3832,37 +3778,30 @@ mod tests {
         // row actually marked in this default (`window_status_line = true`)
         // configuration — must start the drag.
         let mut engine_hit = hsplit_engine_with_sidebar_and_menu();
-        let mut dragging_group = None;
-        let mut dragging_window = None;
-        dispatch_left_click(
-            &mut engine_hit,
-            col,
-            row - 1,
-            Some(&screen),
-            &mut dragging_group,
-            &mut dragging_window,
-        );
+        let mut grab = None;
+        dispatch_left_click(&mut engine_hit, col, row - 1, Some(&screen), &mut grab);
         assert_eq!(
-            dragging_window,
-            Some((group_id, split_index)),
+            grab,
+            Some(render::DividerGrab::Window {
+                group_id,
+                split_index
+            }),
             "click on the status-line row ({col}, {}), one row above the boundary, must start the drag",
             row - 1
         );
 
         // Two rows off must NOT hit the divider.
         let mut engine_miss = hsplit_engine_with_sidebar_and_menu();
-        let mut dragging_group_miss = None;
-        let mut dragging_window_miss = None;
+        let mut grab_miss = None;
         dispatch_left_click(
             &mut engine_miss,
             col,
             row - 2,
             Some(&screen),
-            &mut dragging_group_miss,
-            &mut dragging_window_miss,
+            &mut grab_miss,
         );
         assert_eq!(
-            dragging_window_miss, None,
+            grab_miss, None,
             "click two rows off the window divider must not start a drag"
         );
 
@@ -3891,8 +3830,7 @@ mod tests {
             &mut false,
             &mut false,
             &mut false,
-            &mut dragging_group,
-            &mut dragging_window,
+            &mut grab,
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
@@ -3904,11 +3842,7 @@ mod tests {
             &mut should_quit,
             &mut None,
             &mut None,
-            &mut None,
-            &mut false,
-            &mut None,
-            &mut None,
-            &mut crate::core::window::DropZone::None,
+            &mut render::TabDragState::default(),
             &[],
             None,
             None,
@@ -4011,7 +3945,6 @@ mod tests {
             &mut false,
             &mut false,
             &mut None,
-            &mut None,
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
@@ -4023,11 +3956,7 @@ mod tests {
             &mut should_quit,
             &mut None,
             &mut None,
-            &mut None,
-            &mut false,
-            &mut None,
-            &mut None,
-            &mut crate::core::window::DropZone::None,
+            &mut render::TabDragState::default(),
             &[],
             None,
             None,

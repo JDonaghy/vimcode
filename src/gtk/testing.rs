@@ -444,6 +444,219 @@ mod tests {
         quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID)
     }
 
+    // ── #753 (mouse ladder slice 3): dividers + drag ────────────────────
+    //
+    // The GTK half of the rung this slice lifted into `render.rs`
+    // (`route_divider_grab` / `apply_divider_drag` / `TabDragState`); the TUI
+    // half lives in `tui_main::shell_app`'s
+    // `group_divider_drag_moves_the_painted_divider_via_shell_app` and
+    // `group_divider_click_without_move_leaves_the_divider_put_via_shell_app`.
+
+    /// Scan one painted row for the x of the window-split divider line.
+    ///
+    /// `draw_split` paints no text, so `find`/`find_bounds` cannot see it —
+    /// this is the #555 "probe pixels when the content is not a label" route.
+    /// Searches for `colour` within `+/- span` of `near`, which keeps the test
+    /// honest about *where* the line ended up without hardcoding either end of
+    /// the drag.
+    fn painted_divider_x<A: AppLogic>(
+        h: &mut Harness<A>,
+        near: i32,
+        y: i32,
+        span: i32,
+        colour: (u8, u8, u8),
+    ) -> Option<i32> {
+        (near - span..=near + span).find(|x| h.driver.pixel(*x, y) == colour)
+    }
+
+    /// #753, GTK half: dragging a `:vsplit` window divider must repaint the
+    /// divider line at the new position.
+    ///
+    /// Asserts on **rendered pixels** (`CLAUDE.md` rule 1), not on
+    /// `App::divider_grab` becoming `Some` — a router that arms the grab and
+    /// never applies it would pass that, and "arm" and "apply" are exactly the
+    /// two halves this slice moved into shared code.
+    ///
+    /// The divider's own painted colour is read off the *first* frame rather
+    /// than hardcoded, so a theme change cannot silently turn this test into a
+    /// tautology.
+    #[test]
+    fn window_split_divider_drag_repaints_the_line_at_the_new_position() {
+        let mut engine = engine_with_long_buffer();
+        engine.split_window(SplitDirection::Vertical, None);
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // Locate the divider from the geometry the frame actually painted.
+        let (start_x, mid_y) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have been painted");
+            let div = layout
+                .window_dividers
+                .first()
+                .expect("a `:vsplit` paints exactly one window divider");
+            (
+                div.position as i32,
+                (div.cross_start + div.cross_size / 2.0) as i32,
+            )
+        };
+        let line_colour = h.driver.pixel(start_x, mid_y);
+        let background = h.driver.pixel(start_x - 40, mid_y);
+        assert_ne!(
+            line_colour, background,
+            "the divider line must be visually distinct from the pane behind it, \
+             or this test cannot tell whether it moved"
+        );
+
+        // Grab the painted line and drag it 200px left.
+        let target_x = start_x - 200;
+        h.driver.mouse_down(start_x as f32, mid_y as f32);
+        h.driver.mouse_move(target_x as f32, mid_y as f32);
+        h.driver.mouse_up(target_x as f32, mid_y as f32);
+        h.driver.render();
+
+        let repainted = painted_divider_x(&mut h, target_x, mid_y, 8, line_colour)
+            .unwrap_or_else(|| panic!("no divider line found near the drag column {target_x}"));
+        assert!(
+            repainted.abs_diff(target_x) <= 2,
+            "the divider line must repaint at the drag column ({target_x}), found it at {repainted}"
+        );
+        assert!(
+            painted_divider_x(&mut h, start_x, mid_y, 4, line_colour).is_none(),
+            "the divider line must no longer paint at its old column ({start_x})"
+        );
+    }
+
+    /// #753, GTK half: a press on the divider followed by a release with no
+    /// intervening move must leave the line exactly where it was.
+    ///
+    /// The arm-without-apply case that `route_divider_grab` and
+    /// `apply_divider_drag` are deliberately split across — a router that
+    /// applied a ratio on press would nudge the divider here.
+    #[test]
+    fn window_split_divider_click_without_move_leaves_the_line_put() {
+        let mut engine = engine_with_long_buffer();
+        engine.split_window(SplitDirection::Vertical, None);
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let (start_x, mid_y) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have been painted");
+            let div = layout
+                .window_dividers
+                .first()
+                .expect("a `:vsplit` paints exactly one window divider");
+            (
+                div.position as i32,
+                (div.cross_start + div.cross_size / 2.0) as i32,
+            )
+        };
+        let line_colour = h.driver.pixel(start_x, mid_y);
+
+        h.driver.mouse_down(start_x as f32, mid_y as f32);
+        h.driver.mouse_up(start_x as f32, mid_y as f32);
+        h.driver.render();
+
+        assert_eq!(
+            painted_divider_x(&mut h, start_x, mid_y, 8, line_colour),
+            Some(start_x),
+            "a press-and-release on the divider with no drag must not move it"
+        );
+    }
+
+    /// #753, GTK half of the tab-drag rung: dragging one tab past another must
+    /// reorder the **painted** tab bar.
+    ///
+    /// Drives the whole shared `render::TabDragState` machine through
+    /// production dispatch — arm on the tab-bar press, cross the 8px threshold
+    /// on the move, re-resolve the press through `pixel_to_click_target`
+    /// (GTK's `TabDragMove::Crossed` confirmation), track the drop zone, and
+    /// commit on release via `Engine::apply_tab_drop_zone`.
+    ///
+    /// Asserts on the x of the two painted tab labels, not on
+    /// `editor_groups[..].tabs` order: `ScreenLayout` fields have been
+    /// populated-but-unpainted before (#587/#592), and the point of a reorder
+    /// is what the user sees.
+    #[test]
+    fn tab_drag_past_a_neighbour_reorders_the_painted_tab_bar() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_753_gtk_tab_drag_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("zqa753.txt");
+        let b = dir.join("zqb753.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.new_tab(Some(&a));
+        engine.new_tab(Some(&b));
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // The tab *label* is recorded with a trailing space ("zqa753.txt ");
+        // the per-window status line and the breadcrumb row paint the same
+        // file name without it. Match the trailing space so `find_bounds`
+        // cannot resolve to the status bar 800px lower down.
+        let tab_label = |name: &str| format!("{name}.txt ");
+        let bounds = |h: &Harness<_>, name: &str| {
+            let needle = tab_label(name);
+            h.driver
+                .find_bounds(&needle)
+                .unwrap_or_else(|| panic!("tab label {needle:?} must be painted"))
+        };
+        // Which of the two paints first is `new_tab`'s business, not this
+        // test's — take the painted order as given and drag the left one onto
+        // the right one.
+        let (left, right) = {
+            let (a, b) = (bounds(&h, "zqa753"), bounds(&h, "zqb753"));
+            if a.x < b.x {
+                ("zqa753", "zqb753")
+            } else {
+                ("zqb753", "zqa753")
+            }
+        };
+        let left_before = bounds(&h, left);
+        let right_before = bounds(&h, right);
+
+        let from = (
+            left_before.x + left_before.width / 2.0,
+            left_before.y + left_before.height / 2.0,
+        );
+        let to = (
+            right_before.x + right_before.width / 2.0,
+            right_before.y + right_before.height / 2.0,
+        );
+        // Two moves, not one: the first crosses the 8px threshold and *starts*
+        // the drag (`TabDragMove::Crossed` -> `TabDragState::begin`), the
+        // second is the first one to be tracked into a drop zone
+        // (`TabDragMove::Tracking` -> `track`). A single move would release
+        // with `DropZone::None` and drop nothing — the same sequencing the
+        // live backend has always had.
+        h.driver.mouse_down(from.0, from.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_up(to.0, to.1);
+        h.driver.render();
+
+        let left_after = bounds(&h, left);
+        let right_after = bounds(&h, right);
+        assert!(
+            left_after.x > right_after.x,
+            "dragging {left} onto {right} must repaint it to the right of it \
+             (was {} < {}, now {} vs {})",
+            left_before.x,
+            right_before.x,
+            left_after.x,
+            right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Harness smoke: the real `App` + the *live* `ShellConfig` construct and
     /// paint a first frame with no display attached. The GTK twin of the TUI's
     /// `shell_app_constructs_via_driver_with_shell`.
