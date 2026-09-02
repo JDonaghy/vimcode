@@ -61,8 +61,8 @@ star's architectural work and it closed on **2026-08-26**:
 
 | Epic | Milestone | Outcome |
 |---|---|---|
-| **#448** GTK event dispatch → `ShellApp::handle(UiEvent)` | #8 | ✅ Closed. Relm4 stripped (#540); regressions D–J all fixed. `impl ShellApp for App` at `src/gtk/mod.rs:8123`. |
-| **#595** TUI → `ShellApp` + `run_with_shell` | #9 | ✅ Closed. All ten stages landed; **`fn event_loop` no longer exists in `src/`** (#634). `TuiShellApp` at `src/tui_main/shell_app.rs:1251`. |
+| **#448** GTK event dispatch → `ShellApp::handle(UiEvent)` | #8 | ✅ Closed. Relm4 stripped (#540); regressions D–J all fixed. `impl quadraui::ShellApp for App` in `src/gtk/mod.rs`. |
+| **#595** TUI → `ShellApp` + `run_with_shell` | #9 | ✅ Closed. All ten stages landed; **`fn event_loop` no longer exists in `src/`** (#634). `impl ShellApp for TuiShellApp` in `src/tui_main/shell_app.rs`. |
 
 Every issue in the old "Ready now" table — #512, #449, #454, #459, #477, #478,
 #133, #479, #481, #493, #508, #515, #480 — is **closed**. #7 Platform-Neutral now
@@ -181,6 +181,10 @@ about to be deleted, then re-resolving on every subsequent PR), **not an oversig
 
 ## How to use this doc
 
+- **Line numbers:** this file cites none, on purpose — locate by symbol
+  (`grep -n "impl quadraui::ShellApp for App" src/gtk/mod.rs`). The queue moves thousands
+  of lines; #727 alone shifted `enum Msg` 1096→1131 within hours of merging. Counts and
+  sizes here are evidence measured on a named revision, not coordinates — regenerate them.
 - **Agents:** treat this as the standing objective behind all planning and triage.
   Work the drive-queue chain in "Critical path" in order; never write new
   per-backend code (`CLAUDE.md` Platform-Neutrality Rule). When you adopt a quadraui

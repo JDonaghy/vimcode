@@ -15,8 +15,8 @@ there is no feature logic left in the existing backends to re-implement.
 
 - **Both structural migrations closed 2026-08-26.** #448 (GTK → `ShellApp::handle`) and
   #595 (TUI → `ShellApp` + `run_with_shell`). `fn event_loop` no longer exists in `src/`.
-  `impl ShellApp for App` at `src/gtk/mod.rs:8123`; `TuiShellApp` at
-  `src/tui_main/shell_app.rs:1251`.
+  `impl quadraui::ShellApp for App` in `src/gtk/mod.rs`; `impl ShellApp for TuiShellApp`
+  in `src/tui_main/shell_app.rs`.
 - **The orphaned GTK paint path is gone.** #669/#670/#671/#672 painted 13 of the 14
   dropped `ScreenLayout` fields on GTK's live path and deleted `src/gtk/draw.rs`
   (−2,327 production lines). #676 recovered the Command Center, the one sibling the
@@ -45,7 +45,7 @@ drain to do.
 
 | Order | Issue | Scope |
 |---|---|---|
-| 1 | **#730** | `#592-E` — paint `screen.ai_panel` on GTK. The 14th and last field from #592's table; #670 deferred it to a follow-up nobody filed (`mod.rs:9364-9369`, click holdout `:7325`). **Closes #592.** |
+| 1 | **#730** | `#592-E` — paint `screen.ai_panel` on GTK. The 14th and last field from #592's table; #670 deferred it to a follow-up nobody filed — `grep -n "PANEL_AI and unknowns" src/gtk/mod.rs` finds both the paint holdout and the click holdout. **Closes #592.** |
 | 2 | **#593** | `Ctrl+V` on GTK. Unblocked by #672; #646's `GtkDriver` supersedes its stale "needs live smoke" plan. Smallest user-visible fix in the chain. Given a `## Files` block so the overlap predictor can order it. |
 | 3 | **#731** | 22 Relm4-era widget handles permanently `None`, guarding ~103 unreachable arms. **Also re-derives #723**, whose landed fix (`e02a824`) targets a `gtk4::Scrollbar` that is never constructed. |
 | 4 | **#732** | Retire the GTK `Msg` bus — 124 variants, 301 sites, 684-line `dispatch`, 16 `handle_*_msg` methods. |
@@ -119,6 +119,22 @@ in made the burndown mean two things. **#47** was put in #5 Cross-Platform UI Cr
 the same reason (`GOALS.md` defines #5 as covering "the macOS/Windows backends").
 
 Result: **#7 is 10 open / 29 closed, and all ten are queued.**
+
+### A note on line numbers in this file
+
+There are none, deliberately. Locate code by **symbol**, not coordinate:
+`grep -n "impl quadraui::ShellApp for App" src/gtk/mod.rs` and friends.
+
+The queue above deletes and moves thousands of lines in `src/gtk/mod.rs` and
+`src/tui_main/`, so any line number written here is wrong within days — #727 alone moved
+`enum Msg` 1096→1131 and `fn dispatch` 1799→1896 in a few hours. #734 exists because
+`src/tui_main/` carries 19 `mirrors mod.rs:NNNN` comments whose targets all drifted after
+#540, leaving the only record of a cross-backend contract pointing at unrelated code.
+
+Where a *count* appears (301 `Msg::` sites, 12,588 production lines, ~103 dead arms), it
+is evidence measured on a named revision, not a coordinate — regenerate it with the grep
+rather than trusting it. The chain issues (#730–#735) each carry a runnable anchor block
+for exactly this reason.
 
 ### Supply side: the macOS gate is cleared
 
