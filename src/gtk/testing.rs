@@ -6515,4 +6515,173 @@ mod editor_mouse_rungs {
             h.driver.painted_texts()
         );
     }
+
+    // ── #757 slice 2: the shared focus-owner keyboard rung ─────────────
+    //
+    // `render::route_focus_key` states the activity-bar → sidebar-panel
+    // ladder once for both backends. GTK's old hand-rolled chain of
+    // `if engine.*_has_focus` blocks had no picker gate and no terminal
+    // gate, and checked the explorer *above* the plugin panel. Both tests
+    // below aim at what the frame painted, never at engine state — the
+    // pre-#757 bugs left engine state looking perfectly reasonable while
+    // the keys went to the wrong surface.
+    //
+    // The TUI halves of this rung live in `src/tui_main/shell_app.rs`
+    // (`activity_bar_ctrl_l_does_not_activate_via_shell_app`,
+    // `explorer_inline_edit_backspace_reaches_the_engine_via_shell_app`).
+
+    /// An engine with a real `cwd` (so `picker_populate_files` finds
+    /// entries), the file explorer holding keyboard focus, and the Find
+    /// Files palette open on top of it — the exact state a user is in after
+    /// clicking into the explorer and then hitting the fuzzy-finder key.
+    fn engine_with_palette_over_focused_explorer() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.explorer_has_focus = true;
+        engine.open_picker(crate::core::engine::PickerSource::Files);
+        engine
+    }
+
+    /// #757: an open picker must outrank a focused sidebar panel.
+    ///
+    /// TUI gated its whole sidebar keyboard tier on `!engine.picker_open`;
+    /// GTK's chain had no such gate, so with the explorer focused every
+    /// Down/Up went to the file tree and the palette the user was looking
+    /// at would not move. `render::route_focus_key` returns
+    /// `FocusKeyRoute::None` while a picker is open, letting the key fall
+    /// through to `Engine::handle_key` → `handle_picker_key`, on both
+    /// backends.
+    ///
+    /// # Why this asserts on pixels
+    ///
+    /// The palette is a `quadraui::Palette` and `GtkBackend::draw_palette`
+    /// records no painted text (see this module's header, and the longer
+    /// note on `breadcrumb_segment_click_opens_the_dropdown_and_selection_
+    /// dispatches`), so `find` / `screen_contains` cannot see its rows. The
+    /// probes read each painted row's *background*, which is the selection
+    /// highlight itself — strictly stronger than reading
+    /// `engine.picker_selected`, which would have passed against the bug.
+    ///
+    /// **Verified RED against unfixed `develop`:** restoring the
+    /// `if self.engine.borrow().explorer_has_focus { … }` block above the
+    /// picker fall-through sends Down to `handle_explorer_da_key`, the
+    /// painted highlight stays on row 0, and the final two assertions fire.
+    #[test]
+    fn palette_outranks_a_focused_explorer_on_gtk() {
+        let mut h = harness(engine_with_palette_over_focused_explorer(), 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().explorer_has_focus,
+            "precondition: the explorer must hold focus — that is the flag \
+             GTK's old chain consulted before anything else"
+        );
+        let (px, py, pw, ph) = h
+            .picker_popup()
+            .expect("the palette must actually paint, not just flip engine state");
+        assert!(pw > 0.0 && ph > 0.0, "degenerate palette rect {pw}x{ph}");
+        assert!(
+            h.engine.borrow().picker_items.len() > 1,
+            "fixture must list at least two files for a selection to move to"
+        );
+
+        // Row 0 is the open-state selection; row 1 is where Down must take it.
+        let (p0x, p0y) = h.picker_row_probe(0).expect("row 0 must be painted");
+        let (p1x, p1y) = h.picker_row_probe(1).expect("row 1 must be painted");
+        let selected_bg = h.driver.pixel(p0x, p0y);
+        let unselected_bg = h.driver.pixel(p1x, p1y);
+        assert_ne!(
+            selected_bg, unselected_bg,
+            "precondition: the painted palette must highlight its selected \
+             row, otherwise the probes below cannot tell the rows apart; \
+             popup ({px}, {py}) {pw}x{ph}"
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Down);
+        h.driver.render();
+
+        assert_eq!(
+            h.driver.pixel(p1x, p1y),
+            selected_bg,
+            "Down must reach the open palette and move its painted highlight \
+             to row 1, even though the explorer holds focus"
+        );
+        assert_eq!(
+            h.driver.pixel(p0x, p0y),
+            unselected_bg,
+            "row 0 must paint as unselected once the highlight has moved"
+        );
+    }
+
+    /// #757: a focused terminal must outrank a focused sidebar panel.
+    ///
+    /// TUI gated its whole sidebar keyboard tier on
+    /// `!engine.terminal_has_focus` — the state you are in while an
+    /// extension install waits on "Press Enter to close…". GTK's chain had
+    /// no such gate, so with the explorer also focused those keys were eaten
+    /// by the file tree. `render::route_focus_key` returns
+    /// `FocusKeyRoute::None` while the terminal holds focus, on both
+    /// backends.
+    ///
+    /// Asserts on the painted explorer inline-edit text — the same
+    /// observable the TUI half
+    /// (`explorer_inline_edit_backspace_reaches_the_engine_via_shell_app`)
+    /// uses — and carries its own positive control: clearing
+    /// `terminal_has_focus` and repeating the *identical* keypress must then
+    /// edit the text, so a fixture whose edit simply could not change would
+    /// fail the second half.
+    ///
+    /// **Verified RED against unfixed `develop`:** without the terminal gate
+    /// the first Backspace reaches `handle_explorer_da_key`, the painted
+    /// text drops to `ZQXWGTK75` immediately, and the first assertion fires.
+    #[test]
+    fn focused_terminal_outranks_a_focused_explorer_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.explorer_rebuild_rows();
+        engine.explorer_has_focus = true;
+        engine.session.explorer_visible = true;
+        engine.explorer_tree.borrow_mut().start_editing(
+            vec![0u16],
+            "ZQXWGTK757".to_string(),
+            "ZQXWGTK757".len(),
+            None,
+            None,
+        );
+        // The state an extension install's "Press Enter to close…" leaves
+        // behind: the terminal owns the keyboard while the explorer's focus
+        // flag is still set.
+        engine.terminal_has_focus = true;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXWGTK757"),
+            "precondition: the explorer's inline edit must paint; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Backspace);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXWGTK757"),
+            "a focused terminal must outrank the focused explorer — Backspace \
+             must not reach the file tree's inline edit; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Positive control: the very same keypress, with the terminal no
+        // longer focused, must edit the text.
+        h.engine.borrow_mut().terminal_has_focus = false;
+        h.driver.press_named(quadraui::NamedKey::Backspace);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXWGTK75") && !h.driver.screen_contains("ZQXWGTK757"),
+            "control: with the terminal unfocused the explorer must receive \
+             Backspace; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
