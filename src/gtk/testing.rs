@@ -5630,3 +5630,177 @@ mod modal_rung {
         );
     }
 }
+
+/// #752 / #733 slice 2 — the chrome rung: breadcrumbs, the three status
+/// bands, and the global status bar, all sequenced by
+/// `render::route_chrome_click` and shared verbatim with TUI's `handle_mouse`.
+///
+/// The GTK half of the cross-backend pair; the TUI half lives in
+/// `tui_main::shell_app`'s `chrome_rung_*_via_shell_app` tests.
+#[cfg(test)]
+mod chrome_rung {
+    use super::*;
+
+    // ── #752: the shared chrome rung ──────────────────────────────────────
+
+    /// An engine whose global (bottom-of-screen) status bar is painted, with
+    /// a git branch decorated by ahead/behind arrows and a filename carrying
+    /// several non-ASCII characters.
+    ///
+    /// Both are load-bearing, not colour: `↑`/`↓` are three UTF-8 bytes each
+    /// and every accented Latin letter is two, while all of them occupy one
+    /// monospace column. That gap between `len()` and `chars().count()` is
+    /// exactly the drift #752 fixes, and a plain-ASCII fixture would make this
+    /// test pass against the bug.
+    ///
+    /// The accented letters are Latin-1, deliberately: CJK would drift the
+    /// byte count faster but is *double-width* when painted, which would break
+    /// the uniform-advance arithmetic `global_status_left_run` relies on.
+    fn engine_with_decorated_global_status_bar() -> Engine {
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut engine = Engine::new_for_test();
+        engine.cwd = cwd.clone();
+        // Off => the *global* bar is the one that paints (`build_screen_layout`).
+        engine.settings.window_status_line = false;
+        let buf = engine.active_buffer_id();
+        if let Some(st) = engine.buffer_manager.get_mut(buf) {
+            st.file_path = Some(cwd.join("rés-café-naïve-über.rs"));
+        }
+        engine.git_branch = Some("féature".to_string());
+        engine.sc_ahead = 2;
+        engine.sc_behind = 1;
+        engine
+    }
+
+    /// The painted global status bar's left run: `(text, bounds)` for the one
+    /// Pango run that carries `needle`.
+    ///
+    /// Deliberately reads the run back out of the recorded paint rather than
+    /// re-deriving it from `build_status_line`: a test that located the branch
+    /// with the same range the production hit-test uses would agree with the
+    /// bug and could never go red (`CLAUDE.md` Testing rule 2).
+    fn global_status_left_run<A: AppLogic>(
+        h: &Harness<A>,
+        needle: &str,
+    ) -> (String, quadraui::Rect) {
+        let text = h
+            .driver
+            .painted_texts()
+            .into_iter()
+            .find(|t| t.contains(needle))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the global status bar must paint a run containing {needle:?}; \
+                     painted: {:?}",
+                    h.driver.painted_texts()
+                )
+            })
+            .to_string();
+        let bounds = h
+            .driver
+            .find_bounds(needle)
+            .expect("the run located above must have recorded bounds");
+        (text, bounds)
+    }
+
+    /// Absolute centre of character `char_idx` within a painted monospace run.
+    fn char_center(text: &str, bounds: quadraui::Rect, char_idx: usize) -> (f32, f32) {
+        let advance = bounds.width / text.chars().count().max(1) as f32;
+        (
+            bounds.x + (char_idx as f32 + 0.5) * advance,
+            bounds.y + bounds.height / 2.0,
+        )
+    }
+
+    /// #752: clicking the git branch in the **global** status bar opens the
+    /// branch picker — and does so at the columns the branch was *painted* at.
+    ///
+    /// # Why this is red against unfixed `develop`
+    ///
+    /// Two independent defects, both in the ~60 lines this replaced:
+    ///
+    ///  1. `build_status_line` measured the branch's range with `prefix.len()`
+    ///     — UTF-8 **bytes** — and GTK compared a character column against it.
+    ///     This fixture's filename carries five non-ASCII letters ahead of the
+    ///     branch, so the clickable range started five columns right of the
+    ///     painted one. A click on the branch's opening `[` fell into the gap
+    ///     and did nothing.
+    ///  2. The column was derived with `cached_char_width`, not the width the
+    ///     frame actually painted with (the #751 bug, one band lower).
+    ///
+    /// Restore either and this goes red: the picker never opens.
+    ///
+    /// Asserts on rendered output at both ends — the click target comes from
+    /// the recorded paint, and the verdict is the palette's own painted title,
+    /// never `engine.picker_open`.
+    #[test]
+    fn global_status_branch_click_lands_where_the_branch_painted_via_gtk_driver() {
+        let mut h = harness(engine_with_decorated_global_status_bar(), 1600, 900);
+        h.driver.render();
+
+        let (text, bounds) = global_status_left_run(&h, "[féature");
+        let open_bracket = text
+            .chars()
+            .position(|c| c == '[')
+            .expect("the branch decoration paints as ` [branch …]`");
+
+        // The `[` itself: the first column of the branch, and the one the byte
+        // -vs-column drift pushes out of range first.
+        let (x, y) = char_center(&text, bounds, open_bracket);
+        h.driver.click(x, y);
+        h.driver.render();
+
+        // Assert on the palette's own painted chrome, not on the branch name —
+        // that string is already on screen in the status bar this test clicked,
+        // so matching it would pass without any picker at all.
+        assert!(
+            h.driver.screen_contains("Switch Branch"),
+            "clicking the painted branch must open the branch picker, whose \
+             painted title is its own evidence; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert_eq!(
+            h.engine.borrow().picker_source,
+            crate::core::engine::PickerSource::GitBranches,
+            "the branch segment must route to the GitBranches picker"
+        );
+    }
+
+    /// #752 companion: a click on the global status bar that is *not* on the
+    /// branch must be consumed by the bar, not fall through to the editor.
+    ///
+    /// The bar is chrome; before the shared rung GTK let every non-branch
+    /// pixel of it drop through to `handle_mouse_click`, which resolved it as
+    /// an editor position and moved the cursor. TUI swallowed the whole row.
+    /// The router now makes both consume it.
+    #[test]
+    fn global_status_bar_consumes_non_branch_clicks_via_gtk_driver() {
+        let mut engine = engine_with_decorated_global_status_bar();
+        engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\ndelta\n");
+        let mut h = harness(engine, 1600, 900);
+        h.driver.render();
+
+        let before = {
+            let e = h.engine.borrow();
+            (e.cursor().line, e.cursor().col)
+        };
+        let (text, bounds) = global_status_left_run(&h, "NORMAL");
+        // Column 1 — inside ` -- NORMAL …`, far left of the branch.
+        let (x, y) = char_center(&text, bounds, 1);
+        h.driver.click(x, y);
+        h.driver.render();
+
+        let after = {
+            let e = h.engine.borrow();
+            (e.cursor().line, e.cursor().col)
+        };
+        assert_eq!(
+            after, before,
+            "a click on the status bar's mode segment must not move the editor cursor"
+        );
+        assert!(
+            !h.engine.borrow().picker_open,
+            "…and must not open the branch picker either"
+        );
+    }
+}

@@ -830,6 +830,10 @@ pub(super) fn draw_frame(
     }
 
     // ── Status / command ──────────────────────────────────────────────────────
+    // #752: publish the rect actually painted so `route_chrome_click` can hit-
+    // test against it, instead of `mouse.rs` re-deriving the row as
+    // `row + 2 == term_height`. Cleared to the empty rect when no global bar is
+    // drawn (per-window status lines are on), matching `menu_bar_rect`.
     if let Some(ref bar) = screen.global_status_bar {
         let q_rect = quadraui::Rect::new(
             status_area.x as f32,
@@ -837,7 +841,10 @@ pub(super) fn draw_frame(
             status_area.width as f32,
             status_area.height as f32,
         );
+        engine.global_status_rect.set(q_rect);
         backend.draw_status_bar(q_rect, bar, None, None);
+    } else {
+        engine.global_status_rect.set(quadraui::Rect::default());
     }
 
     // `render_command_line` also applies the `cmd_sel` mouse-selection
