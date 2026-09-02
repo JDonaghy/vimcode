@@ -60,70 +60,18 @@ fn apply_scrollbar_drag(
     let mut handled = false;
     for ev in &events {
         if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
-            let key = widget.as_str();
-            match key {
-                "explorer:sb" => {
-                    engine
-                        .explorer_tree
-                        .borrow_mut()
-                        .set_scroll_offset(*new_offset);
-                    handled = true;
-                }
-                "ext_panel:sb" => {
-                    engine.ext_panel_scroll_top = *new_offset;
-                    handled = true;
-                }
-                "editor_hover" => {
-                    engine.editor_hover_set_scroll(*new_offset);
-                    handled = true;
-                }
-                "tui:search_results" => {
-                    handled = true;
-                }
-                // Inverted scrollbars: top of track = max offset (oldest
-                // content), bottom = 0 (newest). dispatch_mouse_drag
-                // reports the raw forward offset; flip it here.
-                "terminal_scrollback" => {
-                    if let Some(term) = engine.active_terminal_mut() {
-                        term.set_scroll_offset(*new_offset);
-                    }
-                    handled = true;
-                }
-                "tui:debug_output" => {
-                    engine.debug_output_scroll = *new_offset;
-                    engine.debug_output_auto_scroll = false;
-                    handled = true;
-                }
-                // debug_sidebar:N — no longer needed, SidebarSystem handles scrollbar internally
-                other if other.starts_with("debug_sidebar:") => {
-                    handled = true;
-                }
-                // Editor window scrollbars — widget id format
-                // `tui:editor:<window_id>:<vsb|hsb>`. Apply-side parses the
-                // window id and routes to the per-window scroll setters.
-                other if other.starts_with("tui:editor:") => {
-                    if let Some(rest) = other.strip_prefix("tui:editor:") {
-                        if let Some((wid_str, axis)) = rest.split_once(':') {
-                            if let Ok(wid) = wid_str.parse::<usize>() {
-                                let window_id = crate::core::WindowId(wid);
-                                match axis {
-                                    "vsb" => {
-                                        engine.set_scroll_top_for_window(window_id, *new_offset);
-                                        engine.sync_scroll_binds();
-                                        handled = true;
-                                    }
-                                    "hsb" => {
-                                        engine.set_scroll_left_for_window(window_id, *new_offset);
-                                        handled = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+            // #756: the widget-id → scroll-state table is
+            // `render::apply_scroll_offset`, shared with GTK. The two
+            // per-backend copies this replaced each knew ids the other did
+            // not — see the rung's banner in `render.rs`, point 2.
+            handled |= render::apply_scroll_offset(
+                engine,
+                widget.as_str(),
+                *new_offset,
+                render::ScrollApplyContext {
+                    picker_visible_rows: 0,
+                },
+            );
         }
     }
     handled
@@ -149,6 +97,150 @@ fn text_drag_origin_window(region: &quadraui::WidgetId) -> Option<crate::core::W
         .and_then(|rest| rest.strip_suffix(":text"))
         .and_then(|wid_str| wid_str.parse::<usize>().ok())
         .map(crate::core::WindowId)
+}
+
+/// The sidebar band this backend painted, for the drag rung's `SidebarBody`
+/// apply. Pure plumbing — every number is already derived above the call site.
+struct SidebarBodyDragGeometry {
+    ab_width: u16,
+    sidebar_width: u16,
+    term_height: u16,
+    menu_rows: u16,
+    sb_visible: bool,
+}
+
+/// Apply a [`render::MouseDragRoute::SidebarBody`] drag.
+///
+/// The *ordering* question — does the sidebar body win this move at all — is
+/// [`render::route_mouse_drag`]'s and is shared with GTK. What is left here is
+/// the apply, which is TUI-shaped: the explorer's row arithmetic counts cells,
+/// and the search/settings form controllers are handed a cell-space `Rect`.
+fn apply_tui_sidebar_body_drag(
+    engine: &mut Engine,
+    col: u16,
+    row: u16,
+    geo: SidebarBodyDragGeometry,
+    explorer_drag_src: &mut Option<usize>,
+    explorer_drag_active: &mut Option<(usize, Option<usize>)>,
+) {
+    let in_sidebar_cols =
+        geo.sb_visible && col >= geo.ab_width && col < geo.ab_width + geo.sidebar_width;
+
+    // Explorer drag-and-drop: activate or update the target row.
+    if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
+        if in_sidebar_cols && engine.active_panel_is(PANEL_EXPLORER) {
+            let sidebar_row = row.saturating_sub(geo.menu_rows);
+            if sidebar_row >= 1 {
+                let tree_row = (sidebar_row as usize).saturating_sub(1)
+                    + engine.explorer_tree.borrow().scroll_offset();
+                if tree_row < engine.explorer_rows.len() {
+                    if let Some(src_row) = *explorer_drag_src {
+                        // Only activate the drag if the target differs from the source.
+                        if tree_row != src_row {
+                            *explorer_drag_active = Some((src_row, Some(tree_row)));
+                            *explorer_drag_src = None;
+                        }
+                    } else if let Some((src, _)) = explorer_drag_active {
+                        *explorer_drag_active = Some((*src, Some(tree_row)));
+                    }
+                }
+            }
+        } else if let Some((src, _)) = explorer_drag_active {
+            // Dragged outside the sidebar — clear the target but keep the drag active.
+            *explorer_drag_active = Some((*src, None));
+        }
+        if explorer_drag_active.is_some() {
+            return;
+        }
+    }
+
+    if !in_sidebar_cols {
+        return;
+    }
+    let move_ev = quadraui::UiEvent::MouseMoved {
+        position: quadraui::Point::new(col as f32, row as f32),
+        buttons: quadraui::ButtonMask {
+            left: true,
+            right: false,
+            middle: false,
+        },
+    };
+    if engine.active_panel_is(PANEL_SEARCH) {
+        engine.handle_search_sidebar_ui_event(move_ev);
+    } else if engine.active_panel_is(PANEL_SETTINGS) {
+        let content_start = 2_u16;
+        let content_height = geo.term_height.saturating_sub(4);
+        let q_rect = quadraui::Rect::new(
+            geo.ab_width as f32,
+            content_start as f32,
+            geo.sidebar_width as f32,
+            content_height as f32,
+        );
+        render::populate_settings_form_controller(engine);
+        let result = engine
+            .settings_form_controller
+            .borrow_mut()
+            .handle_cached(&move_ev, q_rect);
+        if !matches!(result, quadraui::FormControllerEvent::Ignored) {
+            engine.settings_scroll_top = engine.settings_form_controller.borrow().scroll_offset();
+        }
+    }
+}
+
+/// Apply a [`render::MouseDragRoute::EditorText`] drag: extend the visual
+/// selection to the cell under the cursor.
+///
+/// #565: which window the gesture "belongs to" flows through the
+/// `DragTarget::TextSelection` armed at mouse-down, mirroring how scrollbar
+/// drags carry their owning widget id, so a drag can neither leak into nor be
+/// hijacked by another split.
+///
+/// Still per backend because the column inverse is: TUI divides by a whole
+/// cell, GTK asks Pango per glyph (`quadraui::gtk::editor_col_at_x`, see #560).
+/// The *routing* above it is shared.
+fn apply_tui_editor_text_drag(
+    engine: &mut Engine,
+    drag_state: &quadraui::DragState,
+    last_layout: Option<&render::ScreenLayout>,
+    col: u16,
+    row: u16,
+) {
+    let text_drag_origin = match drag_state.target() {
+        Some(quadraui::DragTarget::TextSelection { region, .. }) => text_drag_origin_window(region),
+        _ => None,
+    };
+    let Some(layout) = last_layout else { return };
+    // #550: `rw.rect` is already absolute terminal-screen space, so the raw
+    // event `col`/`row` are used directly — no editor-area-relative translation.
+    let Some(idx) = render::find_window_at(layout, col as f64, row as f64) else {
+        return;
+    };
+    let rw = &layout.windows[idx];
+    let zone = render::window_zone_hit_test(
+        rw,
+        (col as f64) - rw.rect.x,
+        (row as f64) - rw.rect.y,
+        1.0,
+        1.0,
+    );
+    let render::WindowZone::TextArea {
+        view_row, buf_line, ..
+    } = zone
+    else {
+        return;
+    };
+    // Cross-split guard: if this drag started in a different window, ignore it
+    // here — matches the engine's own `mouse_drag_origin_window` guard (kept as
+    // defence in depth) but decided earlier, from the arbitrated drag target.
+    if text_drag_origin.is_some_and(|w| w != rw.window_id) {
+        return;
+    }
+    // #560: resolve via the shared quadraui text-layout inverse
+    // (`EditorLayout::col_at_x`) instead of hand-rolled cell math, so TUI and
+    // GTK column resolution can never diverge.
+    let (editor, editor_layout) = render::editor_text_layout(rw, 1.0, 1.0);
+    let col_in_text = editor_layout.col_at_x(&editor, view_row, col as f32);
+    engine.mouse_drag(rw.window_id, buf_line, col_in_text);
 }
 
 // ─── Mouse handling ───────────────────────────────────────────────────────────
@@ -698,334 +790,190 @@ pub(super) fn handle_mouse(
             *dragging_sidebar = true;
             return sidebar_width;
         }
-        MouseEventKind::Drag(MouseButton::Left) if *dragging_sidebar => {
-            let new_w = col.saturating_sub(ab_width);
-            return new_w.clamp(15, 150);
-        }
-        MouseEventKind::Drag(MouseButton::Left) if *hover_selecting => {
-            // Extend text selection in the editor hover popup
-            if let Some((px, py, _pw, _ph)) = editor_hover_popup_rect {
-                let scroll = engine
-                    .editor_hover
-                    .as_ref()
-                    .map(|h| h.scroll_top)
-                    .unwrap_or(0);
-                let content_line = (row.saturating_sub(py + 1)) as usize + scroll;
-                let content_col = col.saturating_sub(px + 2) as usize;
-                engine.editor_hover_extend_selection(content_line, content_col);
-            }
-            return sidebar_width;
-        }
-        MouseEventKind::Drag(MouseButton::Left)
-            if sb_visible
-                && col >= ab_width
-                && col < ab_width + sidebar_width
-                && engine.active_panel_is(PANEL_SEARCH) =>
-        {
-            let move_ev = quadraui::UiEvent::MouseMoved {
-                position: quadraui::Point::new(col as f32, row as f32),
-                buttons: quadraui::ButtonMask {
-                    left: true,
-                    right: false,
-                    middle: false,
-                },
-            };
-            engine.handle_search_sidebar_ui_event(move_ev);
-            return sidebar_width;
-        }
-        MouseEventKind::Drag(MouseButton::Left)
-            if sb_visible
-                && engine.active_panel_is(PANEL_SETTINGS)
-                && col >= ab_width
-                && col < ab_width + sidebar_width =>
-        {
-            let content_start = 2_u16;
-            let content_height = term_height.saturating_sub(4);
-            let q_rect = quadraui::Rect::new(
-                ab_width as f32,
-                content_start as f32,
-                sidebar_width as f32,
-                content_height as f32,
-            );
-            let move_ev = quadraui::UiEvent::MouseMoved {
-                position: quadraui::Point::new(col as f32, row as f32),
-                buttons: quadraui::ButtonMask {
-                    left: true,
-                    middle: false,
-                    right: false,
-                },
-            };
-            render::populate_settings_form_controller(engine);
-            let result = engine
-                .settings_form_controller
-                .borrow_mut()
-                .handle_cached(&move_ev, q_rect);
-            if !matches!(result, quadraui::FormControllerEvent::Ignored) {
-                engine.settings_scroll_top =
-                    engine.settings_form_controller.borrow().scroll_offset();
-            }
-            return sidebar_width;
-        }
+        // ── Drag-follow-through rung (#756, mouse-ladder slice 6) ────────────
+        //
+        // Which gesture owns a move-with-the-button-held is
+        // `render::route_mouse_drag`, sequenced ONCE and shared verbatim with
+        // GTK's `handle_mouse_drag_msg`. Five separately-guarded match arms and
+        // a ~260-line catch-all used to state that order here, in an order GTK
+        // did not share — and with a minimap arm that this backend wrote for
+        // `Down | Drag` but placed below a `Down`-only gate, so press-and-hold
+        // on a TUI minimap seeked once and then froze. See the rung's banner in
+        // `render.rs` for all three drifts it collapses.
         MouseEventKind::Drag(MouseButton::Left) => {
-            // Explorer drag-and-drop: activate or update target row.
-            if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
-                if sb_visible
-                    && engine.active_panel_is(PANEL_EXPLORER)
-                    && col >= ab_width
-                    && col < ab_width + sidebar_width
-                {
-                    let sidebar_row = row.saturating_sub(menu_rows);
-                    if sidebar_row >= 1 {
-                        let tree_row = (sidebar_row as usize).saturating_sub(1)
-                            + engine.explorer_tree.borrow().scroll_offset();
-                        if tree_row < engine.explorer_rows.len() {
-                            if let Some(src_row) = *explorer_drag_src {
-                                // Only activate drag if target differs from source.
-                                if tree_row != src_row {
-                                    *explorer_drag_active = Some((src_row, Some(tree_row)));
-                                    *explorer_drag_src = None;
-                                }
-                            } else if let Some((src, _)) = explorer_drag_active {
-                                *explorer_drag_active = Some((*src, Some(tree_row)));
-                            }
-                        }
-                    }
-                } else if let Some((src, _)) = explorer_drag_active {
-                    // Mouse dragged outside sidebar — clear target but keep active.
-                    *explorer_drag_active = Some((*src, None));
-                }
-                if explorer_drag_active.is_some() {
-                    return sidebar_width;
-                }
+            let point = quadraui::Point {
+                x: col as f32,
+                y: row as f32,
+            };
+            let bottom_metrics = render::BottomPanelMetrics {
+                panel_left: editor_left as f64,
+                col_width: 1.0,
+            };
+            let sidebar_panel_drags = sb_visible
+                && (engine.active_panel_is(PANEL_SEARCH) || engine.active_panel_is(PANEL_SETTINGS));
+            let state = render::MouseDragState {
+                layout: last_layout,
+                armed_target: drag_state.is_active(),
+                hover_popup_selecting: *hover_selecting,
+                // Modal drags never reach here: the modal-overlay rung at the
+                // top of this function returns first. GTK has no equivalent
+                // early return, so the flag is the backend's to set.
+                modal_hit: false,
+                sidebar_resizing: *dragging_sidebar,
+                sidebar_dnd: explorer_drag_src.is_some() || explorer_drag_active.is_some(),
+                sidebar_body: sidebar_panel_drags.then(|| {
+                    quadraui::Rect::new(
+                        ab_width as f32,
+                        0.0,
+                        sidebar_width as f32,
+                        term_height as f32,
+                    )
+                }),
+                tab_dragging: tab_drag.is_armed_or_dragging(),
+                command_line_selecting: *cmd_dragging,
+                divider_grabbed: divider_grab.is_some(),
+                terminal_split_dragging: *dragging_terminal_split,
+                terminal_panel_resizing: *dragging_terminal_resize,
+                // #756: the painted geometry the press path already reads,
+                // instead of the hand-rolled `term_height - bottom_chrome -
+                // quickfix - strip` walk this arm used to redo — the
+                // arithmetic that #754 found wrong in four places on the press
+                // side and left untouched here.
+                in_terminal_content: render::in_terminal_pane_content(
+                    engine,
+                    col as f64,
+                    row as f64,
+                    bottom_metrics,
+                ),
+                cell: (1.0, 1.0),
+            };
+            let route = render::route_mouse_drag(&state, col as f64, row as f64);
+            if route == render::MouseDragRoute::SidebarResize {
+                return col.saturating_sub(ab_width).clamp(15, 150);
             }
-            // Tab drag-and-drop: the arm → threshold → track machine is
-            // shared with GTK (`render::TabDragState`, #753). `2.0` is the
-            // squared cell threshold — see `handle_move`'s doc for why it is
-            // exactly the Manhattan `dx + dy >= 2` this replaced.
-            match tab_drag.handle_move(col as f64, row as f64, 2.0) {
-                render::TabDragMove::Tracking => {
-                    tab_drag.track(compute_tui_tab_drop_zone(
+            match route {
+                render::MouseDragRoute::ArmedTarget => {
+                    apply_scrollbar_drag(drag_state, point, engine, sidebar);
+                }
+                render::MouseDragRoute::HoverPopupSelection => {
+                    if let Some((px, py, _pw, _ph)) = editor_hover_popup_rect {
+                        let scroll = engine
+                            .editor_hover
+                            .as_ref()
+                            .map(|h| h.scroll_top)
+                            .unwrap_or(0);
+                        let content_line = (row.saturating_sub(py + 1)) as usize + scroll;
+                        let content_col = col.saturating_sub(px + 2) as usize;
+                        engine.editor_hover_extend_selection(content_line, content_col);
+                    }
+                }
+                render::MouseDragRoute::SidebarBody => {
+                    apply_tui_sidebar_body_drag(
                         engine,
                         col,
                         row,
-                        editor_left,
-                        last_layout,
-                        *terminal_size,
-                    ));
-                    return sidebar_width;
-                }
-                render::TabDragMove::Crossed { .. } => {
-                    // Only the tab-bar arm arms the drag here, so the press
-                    // point is known to have been on a tab: use the active
-                    // group + active tab as the source (GTK has to re-resolve
-                    // the press because its arm covers the whole band).
-                    let gid = engine.active_group;
-                    let tidx = engine
-                        .editor_groups
-                        .get(&gid)
-                        .map(|g| g.active_tab)
-                        .unwrap_or(0);
-                    tab_drag.begin((gid, tidx), col as f64, row as f64);
-                    return sidebar_width;
-                }
-                // Haven't moved enough yet — don't start any drag.
-                render::TabDragMove::Pending => return sidebar_width,
-                render::TabDragMove::Idle => {}
-            }
-            // Command-line text selection drag
-            if *cmd_dragging {
-                if let Some(ref mut sel) = *cmd_sel {
-                    sel.1 = col as usize;
-                }
-                return sidebar_width;
-            }
-            // Phase B.4 Stage 5c: every scrollbar drag flows through the
-            // shared `quadraui::DragState::ScrollbarY` + `dispatch_mouse_drag`.
-            // Widget id routes the resulting `ScrollOffsetChanged` to the
-            // matching scroll-state field. Sites covered:
-            // - `explorer:sb`, `ext_panel:sb`, `editor_hover` (Stage 5a)
-            // - `tui:search_results`, `tui:debug_sidebar:N` (5c)
-            // - `terminal_scrollback`, `tui:debug_output` (5c, inverted)
-            if drag_state.is_active() {
-                let point = quadraui::Point {
-                    x: col as f32,
-                    y: row as f32,
-                };
-                if apply_scrollbar_drag(drag_state, point, engine, sidebar) {
-                    return sidebar_width;
-                }
-            }
-            // Terminal panel resize drag
-            if *dragging_terminal_resize {
-                let qf_h: u16 = render::quickfix_panel_rows(engine);
-                let available = term_height.saturating_sub(row + bottom_chrome + qf_h);
-                // Leave at least 4 editor lines visible (+ menu/tab bar chrome)
-                let min_editor_chrome = 4 + menu_rows + 1; // 4 lines + menu + tab bar
-                let max_rows = term_height
-                    .saturating_sub(bottom_chrome + qf_h + min_editor_chrome + 2) // +2 for terminal tab bar + header
-                    .max(5);
-                let new_rows = available.saturating_sub(1).clamp(5, max_rows);
-                engine.session.terminal_panel_rows = new_rows;
-                return sidebar_width;
-            }
-            // Divider drag — group boundary or `:split` boundary, both
-            // through the shared applier (#753).
-            //
-            // #550: `div.axis_start`/`.axis_size` are already absolute
-            // terminal-screen coordinates, so `col`/`row` compare directly
-            // with no editor-origin subtraction.
-            if let Some(grab) = *divider_grab {
-                if let Some(layout) = last_layout {
-                    render::apply_divider_drag(
-                        engine,
-                        grab,
-                        &layout.group_dividers,
-                        &layout.window_dividers,
-                        col as f64,
-                        row as f64,
+                        SidebarBodyDragGeometry {
+                            ab_width,
+                            sidebar_width,
+                            term_height,
+                            menu_rows,
+                            sb_visible,
+                        },
+                        explorer_drag_src,
+                        explorer_drag_active,
                     );
                 }
-                return sidebar_width;
-            }
-            // Terminal split divider drag — update visual column position (no PTY resize yet).
-            if *dragging_terminal_split {
-                let panel_col = col.saturating_sub(editor_left);
-                let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
-                let panel_w = screen_w.saturating_sub(editor_left);
-                let left_cols = panel_col.clamp(5, panel_w.saturating_sub(6));
-                engine.terminal_split_set_drag_cols(left_cols);
-                return sidebar_width;
-            }
-            // Phase B.4 Stage 5c: terminal scrollback + debug output
-            // scrollbars are inverted (top of track = oldest content,
-            // bottom = live view). Their drag math now lives in the
-            // shared `if drag_state.is_active()` block above; the
-            // receive site for `terminal_scrollback` /
-            // `tui:debug_output` flips the offset with `max - new_offset`
-            // so `term.set_scroll_offset` / `engine.debug_output_scroll`
-            // continue to mean "lines from the bottom".
-
-            // Phase B.4 Stage 5d: editor-window scrollbar drag math now
-            // lives in the shared `if drag_state.is_active()` block above
-            // via `tui:editor:N:vsb` / `tui:editor:N:hsb` widget ids. The
-            // legacy `dragging_scrollbar` local + `ScrollDragState` are
-            // gone.
-            // Text drag-to-select — find window under cursor and extend visual
-            // selection. #565: the drag-origin arbitration (which window this
-            // gesture "belongs to", so a drag can't leak into or be hijacked
-            // by another split) now flows through the `DragTarget::TextSelection`
-            // armed at mouse-down, mirroring how scrollbar drags carry their
-            // owning widget id — replacing the old bespoke `mouse_text_drag`
-            // bool. The document-model hit-testing below
-            // (`window_zone_hit_test` → `buf_line`/`col` → `engine.mouse_drag`)
-            // is unchanged.
-            let text_drag_origin = match drag_state.target() {
-                Some(quadraui::DragTarget::TextSelection { region, .. }) => {
-                    text_drag_origin_window(region)
-                }
-                _ => None,
-            };
-            let text_drag_armed = matches!(
-                drag_state.target(),
-                Some(quadraui::DragTarget::TextSelection { .. })
-            );
-            if col >= editor_left {
-                if let Some(layout) = last_layout {
-                    // #550: `rw.rect` (and everything `find_window_at`/
-                    // `window_zone_hit_test` compare it against) is already
-                    // absolute terminal-screen space, so the raw event
-                    // `col`/`row` are used directly — no editor-area-relative
-                    // translation.
-                    if let Some(idx) = render::find_window_at(layout, col as f64, row as f64) {
-                        let rw = &layout.windows[idx];
-                        let zone = render::window_zone_hit_test(
-                            rw,
-                            (col as f64) - rw.rect.x,
-                            (row as f64) - rw.rect.y,
-                            1.0,
-                            1.0,
-                        );
-                        if let render::WindowZone::TextArea {
-                            view_row, buf_line, ..
-                        } = zone
-                        {
-                            // Cross-split guard: if this drag started in a
-                            // different window, ignore it here — matches the
-                            // engine's own `mouse_drag_origin_window` guard
-                            // (kept as defense-in-depth) but decided earlier,
-                            // from the arbitrated drag target.
-                            let cross_split = text_drag_origin.is_some_and(|w| w != rw.window_id);
-                            if !cross_split {
-                                // #560: resolve via the shared quadraui
-                                // text-layout inverse (`EditorLayout::col_at_x`)
-                                // instead of hand-rolled cell math, so TUI and
-                                // GTK column resolution can never diverge.
-                                // `col_at_x` takes an absolute x matching
-                                // `editor.rect`'s space (mirrors GTK's
-                                // `editor_col_at_x` call, see gtk/click.rs).
-                                let (editor, editor_layout) =
-                                    render::editor_text_layout(rw, 1.0, 1.0);
-                                let col_in_text =
-                                    editor_layout.col_at_x(&editor, view_row, col as f32);
-                                engine.mouse_drag(rw.window_id, buf_line, col_in_text);
-                            }
-                            return sidebar_width;
+                render::MouseDragRoute::TabDrag => {
+                    match tab_drag.handle_move(col as f64, row as f64, 2.0) {
+                        render::TabDragMove::Tracking => {
+                            tab_drag.track(compute_tui_tab_drop_zone(
+                                engine,
+                                col,
+                                row,
+                                editor_left,
+                                last_layout,
+                                *terminal_size,
+                            ));
                         }
+                        render::TabDragMove::Crossed { .. } => {
+                            // Only the tab-bar arm arms the drag here, so the press
+                            // point is known to have been on a tab: use the active
+                            // group + active tab as the source (GTK has to
+                            // re-resolve the press because its arm covers the whole
+                            // band).
+                            let gid = engine.active_group;
+                            let tidx = engine
+                                .editor_groups
+                                .get(&gid)
+                                .map(|g| g.active_tab)
+                                .unwrap_or(0);
+                            tab_drag.begin((gid, tidx), col as f64, row as f64);
+                        }
+                        render::TabDragMove::Pending | render::TabDragMove::Idle => {}
                     }
                 }
-                // Editor drag moved outside all windows (e.g. into terminal area) —
-                // stop processing so it doesn't bleed into other panels.
-                if text_drag_armed {
-                    return sidebar_width;
+                render::MouseDragRoute::CommandLine => {
+                    if let Some(ref mut sel) = *cmd_sel {
+                        sel.1 = col as usize;
+                    }
                 }
-            }
-            // Terminal drag-to-select in content rows.
-            // Only activate if the drag originated in the terminal (selection exists)
-            // and the mouse is within the terminal panel bounds.
-            {
-                let qf_rows: u16 = render::quickfix_panel_rows(engine);
-                let strip_rows: u16 = if engine.terminal_open {
-                    super::effective_terminal_panel_rows_tui(engine, term_height) + 1
-                } else {
-                    0
-                };
-                let term_strip_top =
-                    term_height.saturating_sub(bottom_chrome + qf_rows + strip_rows);
-                if engine.terminal_open
-                    && strip_rows > 0
-                    && col >= editor_left
-                    && row > term_strip_top
-                    && row < term_strip_top + strip_rows
-                    && engine
-                        .active_terminal()
-                        .is_some_and(|t| t.selection.is_some())
-                {
-                    let term_row = row - term_strip_top - 1;
-                    // #444: pane-relative col. Click uses
-                    // TerminalSplitLayout::hit_test which returns
-                    // 0-based col from the active pane's left edge.
-                    // Drag must match, otherwise right-pane drag
-                    // overshoots by left_pane_cols. Left pane is
-                    // unaffected because left.x == editor_left.
-                    let split_layout = engine.terminal_split_layout.borrow();
-                    let active_pane_x = if let Some(ref sl) = *split_layout {
-                        if engine.terminal_active == 1 {
-                            sl.right.x as u16
-                        } else {
-                            sl.left.x as u16
-                        }
-                    } else {
-                        editor_left
-                    };
-                    drop(split_layout);
-                    let term_col = col.saturating_sub(active_pane_x);
+                render::MouseDragRoute::Divider => {
+                    // #550: `div.axis_start`/`.axis_size` are already absolute
+                    // terminal-screen coordinates, so `col`/`row` compare
+                    // directly with no editor-origin subtraction.
+                    if let (Some(grab), Some(layout)) = (*divider_grab, last_layout) {
+                        render::apply_divider_drag(
+                            engine,
+                            grab,
+                            &layout.group_dividers,
+                            &layout.window_dividers,
+                            col as f64,
+                            row as f64,
+                        );
+                    }
+                }
+                render::MouseDragRoute::TerminalSplitDivider => {
+                    let panel_col = col.saturating_sub(editor_left);
+                    let screen_w = terminal_size.map(|s| s.width).unwrap_or(80);
+                    let panel_w = screen_w.saturating_sub(editor_left);
+                    let left_cols = panel_col.clamp(5, panel_w.saturating_sub(6));
+                    engine.terminal_split_set_drag_cols(left_cols);
+                }
+                render::MouseDragRoute::TerminalPanelResize => {
+                    let qf_h: u16 = render::quickfix_panel_rows(engine);
+                    let available = term_height.saturating_sub(row + bottom_chrome + qf_h);
+                    // Leave at least 4 editor lines visible (+ menu/tab bar chrome)
+                    let min_editor_chrome = 4 + menu_rows + 1; // 4 lines + menu + tab bar
+                    let max_rows = term_height
+                        .saturating_sub(bottom_chrome + qf_h + min_editor_chrome + 2) // +2 for terminal tab bar + header
+                        .max(5);
+                    engine.session.terminal_panel_rows =
+                        available.saturating_sub(1).clamp(5, max_rows);
+                }
+                render::MouseDragRoute::Minimap => {
+                    if let Some(layout) = last_layout {
+                        render::apply_minimap_click(engine, layout, col as f64, row as f64);
+                    }
+                }
+                render::MouseDragRoute::TerminalContent => {
                     // #533: shared drag handler — tries forward_mouse(Move)
-                    // when the child has mouse reporting, falls back to
-                    // local selection update.
-                    engine.handle_terminal_pane_drag(term_col, term_row);
-                    return sidebar_width;
+                    // when the child has mouse reporting, falls back to local
+                    // selection update.
+                    render::apply_terminal_content_drag(
+                        engine,
+                        col as f64,
+                        row as f64,
+                        bottom_metrics,
+                    );
                 }
+                render::MouseDragRoute::EditorText => {
+                    apply_tui_editor_text_drag(engine, drag_state, last_layout, col, row);
+                }
+                render::MouseDragRoute::ModalSwallow
+                | render::MouseDragRoute::SidebarResize
+                | render::MouseDragRoute::None => {}
             }
+            return sidebar_width;
         }
         MouseEventKind::Up(MouseButton::Left)
             if sb_visible && engine.active_panel_is(PANEL_SEARCH) =>
@@ -2444,23 +2392,23 @@ pub(super) fn handle_mouse(
         }
     }
 
-    // ── Minimap click / drag (#35) ──────────────────────────────────────────
-    // Pure rect plumbing: hand the click's cell coordinates to the shared
-    // resolver, which owns the hit-test and the scroll. Drag keeps seeking
-    // while the button is held, matching the GTK side.
+    // ── Minimap press (#35) ─────────────────────────────────────────────────
+    // Pure rect plumbing: hand the press's cell coordinates to the shared
+    // resolver, which owns the hit-test and the scroll.
     //
     // Deliberately *after* both divider hit-tests: the strip is carved off
     // the active window's right edge, so in a `:vsplit` it abuts (and would
     // otherwise swallow) the divider's grab column — and a divider drag is
     // the more destructive gesture to lose.
-    if matches!(
-        ev.kind,
-        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
-    ) {
-        if let Some(layout) = last_layout {
-            if render::apply_minimap_click(engine, layout, col as f64, row as f64).is_some() {
-                return sidebar_width;
-            }
+    //
+    // #756: this arm used to match `Down | Drag`, but it sits below the
+    // `ev.kind != Down(Left) → return` gate above, so the `Drag` half was
+    // unreachable and press-and-hold on a TUI minimap seeked exactly once. The
+    // drag half is now `render::MouseDragRoute::Minimap`, shared with GTK,
+    // which had the arm working all along.
+    if let Some(layout) = last_layout {
+        if render::apply_minimap_click(engine, layout, col as f64, row as f64).is_some() {
+            return sidebar_width;
         }
     }
 

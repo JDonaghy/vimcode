@@ -5580,6 +5580,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #756 acceptance, TUI half of the drag rung: pressing and holding on the
+    /// minimap and dragging must keep seeking — the GTK twin of this
+    /// (`minimap_drag_keeps_seeking_while_the_button_is_held` in
+    /// `src/gtk/testing.rs`) has passed since #35, and this backend had no
+    /// equivalent behaviour at all.
+    ///
+    /// **RED against unfixed `develop`.** `mouse.rs`'s minimap arm matched
+    /// `Down(Left) | Drag(Left)`, but it sits below an
+    /// `if ev.kind != Down(Left) { return }` gate, so the `Drag` half was
+    /// unreachable: a press seeked once and every subsequent held move fell
+    /// through to the text-selection arm. Reverting `handle_mouse`'s
+    /// `MouseDragRoute::Minimap` arm leaves the second assertion below
+    /// comparing two identical screens — it fails.
+    ///
+    /// Asserted on the *painted* buffer lines (`CLAUDE.md` testing rule 1), not
+    /// on `scroll_top`: the lowest `line N content` marker visible on screen
+    /// must move further down the file after the held move than it did after
+    /// the press alone.
+    #[test]
+    fn tui_minimap_drag_keeps_seeking_while_the_button_is_held() {
+        /// Lowest `line N content` marker painted on screen — i.e. the first
+        /// buffer line the viewport is showing.
+        fn top_painted_line(screen: &str) -> Option<usize> {
+            screen
+                .match_indices("line ")
+                .filter_map(|(i, _)| {
+                    let rest = &screen[i + "line ".len()..];
+                    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if digits.is_empty() || !rest[digits.len()..].starts_with(" content") {
+                        return None;
+                    }
+                    digits.parse::<usize>().ok()
+                })
+                .min()
+        }
+
+        let mut app = TuiShellApp::new(None);
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(&format!("line {i} content\n"));
+        }
+        app.engine.buffer_mut().insert(0, &text);
+        assert!(
+            app.engine.settings.minimap,
+            "setup sanity: the minimap must default on, or this test proves nothing"
+        );
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        // `minimap_reserved_width` gives a 100-column pane a 15-column strip
+        // (`min(MINIMAP_TARGET_COLS, 100 * MINIMAP_WIDTH_FRACTION)`, clamped
+        // into `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]`), painted flush against
+        // the pane's right edge — so column 97 is inside the strip with room
+        // to spare on either side of the exact width.
+        let strip_col = 97.0;
+
+        driver.mouse_down(strip_col, 6.0);
+        let after_down = top_painted_line(&driver.screen())
+            .expect("the editor must paint `line N content` markers after the press");
+
+        driver.mouse_move(strip_col, 17.0);
+        let after_drag = top_painted_line(&driver.screen())
+            .expect("the editor must still paint `line N content` markers after the drag");
+
+        assert!(
+            after_drag > after_down,
+            "a held drag further down the minimap must scroll further into the \
+             file, but the painted viewport still starts at line {after_down} \
+             (press) vs {after_drag} (drag); screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #609: `render_content` must also paint the tab-hover tooltip —
     /// `render_tab_hover_tooltip`, ported from `draw_frame`'s raw-`Buffer`
     /// write to `Backend::draw_status_bar` (see that function's doc

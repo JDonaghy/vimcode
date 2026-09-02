@@ -638,8 +638,8 @@ pub(super) fn handle_mouse_double_click(
     }
 }
 
-/// Handle mouse drag — extend visual selection, or keep seeking the
-/// minimap while a minimap drag is held.
+/// Apply a [`render::MouseDragRoute::EditorText`] drag — extend the visual
+/// selection to the glyph under the cursor.
 ///
 /// #568: this only ever fires while a mouse button is held (drag
 /// continuation), so text-selection resolution goes through
@@ -649,15 +649,10 @@ pub(super) fn handle_mouse_double_click(
 /// origin-window lock then keeps the selection itself pinned to the split
 /// the drag started in.
 ///
-/// The minimap check (#35) is deliberately *not* routed through that
-/// `mutate_focus`-gated call: it isn't a text-selection drag at all (a
-/// mouse-down that lands on the minimap resolves to `ClickTarget::Minimap`,
-/// never `BufferPos`, so no selection-drag ever originates there), and the
-/// gate exists solely to stop a text-selection drag stealing focus/actions
-/// elsewhere — a concern that doesn't apply to continuing to scroll the
-/// strip the drag started on. Checked first and unconditionally, mirroring
-/// `src/tui_main/mouse.rs`, which resolves `Down` and `Drag` through
-/// `apply_minimap_click` identically.
+/// #756: the minimap check that used to open this function is gone — the
+/// strip is now [`render::MouseDragRoute::Minimap`], arbitrated above the
+/// editor text area by the shared drag router, so this function is only
+/// reached once that router has already ruled the point out.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_mouse_drag(
     engine: &mut Engine,
@@ -675,16 +670,6 @@ pub(super) fn handle_mouse_drag(
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
-    // ── Minimap drag-to-scroll (#35) ────────────────────────────────────────
-    // Checked first, before the mutate_focus-gated resolver below: see the
-    // doc comment on this function for why this is not the "focus-stealing
-    // text-selection drag" case that gate exists to stop. If the pointer is
-    // over the strip, keep seeking and skip buffer-selection resolution
-    // entirely for this event.
-    if render_mod::apply_minimap_click(engine, cached_layout, x, y).is_some() {
-        return;
-    }
-
     if let ClickTarget::BufferPos(wid, line, col) = pixel_to_click_target(
         engine,
         backend,

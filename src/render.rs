@@ -3678,6 +3678,17 @@ impl TabDragState {
         self.dragging
     }
 
+    /// `true` while the machine would consume a move — either a live drag or an
+    /// armed press still under the travel threshold.
+    ///
+    /// [`route_mouse_drag`] asks this rather than `is_dragging` because a
+    /// still-armed press must also win the event: it is the move that promotes
+    /// it, and letting a lower rung claim that move first is how an
+    /// almost-a-drag turns into a stray text selection.
+    pub fn is_armed_or_dragging(&self) -> bool {
+        self.dragging || self.press.is_some()
+    }
+
     /// Latest pointer position during a live drag, for the ghost label.
     pub fn cursor(&self) -> Option<(f64, f64)> {
         self.cursor
@@ -3756,6 +3767,415 @@ impl TabDragState {
         }
         self.cursor = None;
         true
+    }
+}
+
+// ═══ Drag-follow-through rung (#756, mouse-ladder slice 6) ═══════════════════
+//
+// Everything above arbitrates a *press*. This rung arbitrates the events that
+// come after one: pointer moves with the left button still held. Both backends
+// had a complete, independently-ordered copy of that ladder —
+// `MouseEventKind::Drag(Left)` in `src/tui_main/mouse.rs` and
+// `App::handle_mouse_drag_msg` in `src/gtk/mod.rs` — and they had drifted in
+// three ways that no amount of reading either one in isolation would reveal:
+//
+//  1. **The minimap had no TUI drag arm at all.** GTK checks
+//     `apply_minimap_click` first thing in `handle_mouse_drag`, so holding the
+//     button on the strip keeps seeking. TUI's minimap arm sits *below* an
+//     `if ev.kind != Down(Left) { return }` gate, so its `Down | Drag` match was
+//     unreachable for `Drag`: press-and-hold on a TUI minimap scrolled once and
+//     then froze. The arm was written to handle both; the ladder order silently
+//     took the drag half away. That is exactly the "one backend arbitrates a
+//     rung and the other does not" failure #756 exists to end.
+//
+//  2. **The armed-scrollbar table was two disjoint half-tables.** Both run
+//     `quadraui::dispatch_mouse_drag` and then switch on the emitted
+//     `ScrollOffsetChanged { widget, .. }`. TUI's switch knew `explorer:sb`,
+//     `ext_panel:sb`, `tui:search_results`, `debug_sidebar:*` and
+//     `tui:editor:N:vsb|hsb`; GTK's knew `picker` and `editor:h_sb:N`; each was
+//     missing every id the other had, and the three ids they *did* share
+//     (`editor_hover`, `terminal_scrollback`, `debug_output`) were written out
+//     twice. Today each missing id names a surface only the other backend
+//     registers, so nothing is visibly broken — but the failure mode is a
+//     silent one: register an existing surface on the second backend and its
+//     thumb tracks (quadraui does that) over content that never scrolls,
+//     because nothing on that side applies the offset. [`apply_scroll_offset`]
+//     is the union, once, so registering the surface is the whole of the work.
+//
+//  3. **The orders disagreed on which gesture wins.** TUI ran
+//     sidebar-resize → hover-popup-selection → sidebar-body → explorer-DnD →
+//     tab-drag → command-line → armed-scrollbar → …; GTK ran
+//     armed-scrollbar → hover-popup-selection → modal-swallow → tab-drag →
+//     divider → …. Most pairs are spatially disjoint so the divergence was
+//     invisible until a surface overlapped — which is precisely how it will
+//     re-fork the next time someone adds one. [`route_mouse_drag`] states the
+//     order once; `render::mouse_drag_router_tests` pins it, and the parity test
+//     in that module drives the same `ScreenLayout` and point through both
+//     backends' unit conventions and asserts they land on the same rung.
+//
+// **Deliberately still per backend**: the *apply* half of the rungs whose
+// arithmetic is genuinely in the backend's own units — the terminal panel's
+// resize clamp (TUI counts rows off the bottom chrome, GTK divides pixels by
+// `cached_line_height`) and the split divider's column clamp. Those are unit
+// conversions, not policy, and the policy — which gesture owns the event — is
+// what this rung moved.
+
+/// Which rung of the pointer-drag ladder owns a move-with-button-held event.
+///
+/// Resolved by [`route_mouse_drag`] from geometry and drag bookkeeping alone —
+/// no engine mutation — so a test can ask "who would win here?" on either
+/// backend without driving a real gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseDragRoute {
+    /// A `quadraui::DragState` target is armed — a scrollbar or picker thumb.
+    /// The caller runs `dispatch_mouse_drag` and feeds the resulting
+    /// `ScrollOffsetChanged` ids to [`apply_scroll_offset`].
+    ArmedTarget,
+    /// The editor hover popup is mid text-selection (#216).
+    HoverPopupSelection,
+    /// The point is inside an open modal and nothing is armed — swallow it so
+    /// the drag cannot leak to the editor underneath (#192).
+    ModalSwallow,
+    /// The sidebar separator is being dragged to resize the sidebar.
+    SidebarResize,
+    /// The sidebar body owns the gesture: the search / settings form
+    /// controllers' own drag handling, or an explorer drag-and-drop in flight.
+    SidebarBody,
+    /// The tab drag machine ([`TabDragState`]) is armed or already tracking.
+    TabDrag,
+    /// Command-line / message-line text selection.
+    CommandLine,
+    /// A group or `:split` divider is grabbed.
+    Divider,
+    /// The terminal split's vertical divider is being dragged.
+    TerminalSplitDivider,
+    /// The bottom panel's top edge is being dragged (panel resize).
+    TerminalPanelResize,
+    /// The pointer is over a minimap strip — keep seeking.
+    Minimap,
+    /// The pointer is inside the terminal's content rows — extend the
+    /// terminal's own selection (or forward the move to the child).
+    TerminalContent,
+    /// The editor text area — extend the visual selection.
+    EditorText,
+    /// Nothing owns it.
+    None,
+}
+
+/// Everything [`route_mouse_drag`] needs, in the caller's own units.
+///
+/// The booleans are the caller's drag bookkeeping (its own `dragging_sidebar` /
+/// `divider_grab` / … flags); the rects are what the last frame actually
+/// painted. Nothing here is recomputed by the router.
+#[derive(Debug, Clone, Copy)]
+pub struct MouseDragState<'a> {
+    /// The layout the last frame painted, for the minimap and editor hit tests.
+    pub layout: Option<&'a ScreenLayout>,
+    /// `quadraui::DragState::is_active()`.
+    pub armed_target: bool,
+    /// A text selection is in progress inside the editor hover popup.
+    pub hover_popup_selecting: bool,
+    /// `ModalStack::hit_test(point).is_some()`.
+    pub modal_hit: bool,
+    /// The sidebar separator is being dragged.
+    pub sidebar_resizing: bool,
+    /// An explorer drag-and-drop is in flight. Armed rather than geometric:
+    /// once a row is picked up the gesture belongs to the tree even while the
+    /// pointer is outside the sidebar (that is how "dragged away, no target"
+    /// is expressed), so a geometric test alone would hand the move to the
+    /// editor the moment the user left the panel.
+    pub sidebar_dnd: bool,
+    /// The sidebar body's painted bounds, when that body wants drag events
+    /// (search / settings form controllers, or an explorer DnD in flight).
+    /// `None` when the sidebar is hidden or its panel has no drag behaviour.
+    pub sidebar_body: Option<quadraui::Rect>,
+    /// [`TabDragState`] is armed or dragging.
+    pub tab_dragging: bool,
+    /// A command-line / message-line selection is in progress.
+    pub command_line_selecting: bool,
+    /// A divider is grabbed.
+    pub divider_grabbed: bool,
+    /// The terminal split divider is being dragged.
+    pub terminal_split_dragging: bool,
+    /// The bottom panel is being resized.
+    pub terminal_panel_resizing: bool,
+    /// `true` when the point is inside a painted terminal pane's content cells
+    /// — ask [`in_terminal_pane_content`], which both backends call so the
+    /// question cannot be answered differently on each.
+    pub in_terminal_content: bool,
+    /// One text cell in the caller's units: `(char_width, line_height)`.
+    /// `(1.0, 1.0)` on TUI, the measured font advance/line height on GTK.
+    pub cell: (f64, f64),
+}
+
+impl Default for MouseDragState<'_> {
+    fn default() -> Self {
+        Self {
+            layout: None,
+            armed_target: false,
+            hover_popup_selecting: false,
+            modal_hit: false,
+            sidebar_resizing: false,
+            sidebar_dnd: false,
+            sidebar_body: None,
+            tab_dragging: false,
+            command_line_selecting: false,
+            divider_grabbed: false,
+            terminal_split_dragging: false,
+            terminal_panel_resizing: false,
+            in_terminal_content: false,
+            // Cell metrics default to the TUI's whole-cell grid; GTK always
+            // states its measured font metrics explicitly.
+            cell: (1.0, 1.0),
+        }
+    }
+}
+
+/// Arbitrate a pointer move with the left button held.
+///
+/// The order below is the converged one; see this section's banner for what the
+/// two per-backend orders it replaced each got wrong. Two properties are load
+/// bearing and pinned by tests:
+///
+/// * **Armed gestures beat geometry.** Every flag-driven rung (an armed drag
+///   target, a live divider grab, a tab drag, …) is tested before any hit test,
+///   because a gesture that has already started must not be stolen by whatever
+///   the pointer happens to fly over mid-drag.
+/// * **The minimap beats the editor text area.** The strip is carved off the
+///   active window's right edge, so `find_window_at` matches there too; testing
+///   the editor first would make press-and-hold on the strip select text
+///   instead of seeking, which is the GTK behaviour TUI was missing.
+pub fn route_mouse_drag(state: &MouseDragState<'_>, x: f64, y: f64) -> MouseDragRoute {
+    // ── Armed gestures, in the order they can be armed ──────────────────────
+    if state.armed_target {
+        return MouseDragRoute::ArmedTarget;
+    }
+    if state.hover_popup_selecting {
+        return MouseDragRoute::HoverPopupSelection;
+    }
+    if state.sidebar_resizing {
+        return MouseDragRoute::SidebarResize;
+    }
+    if state.sidebar_dnd {
+        return MouseDragRoute::SidebarBody;
+    }
+    if state.tab_dragging {
+        return MouseDragRoute::TabDrag;
+    }
+    if state.command_line_selecting {
+        return MouseDragRoute::CommandLine;
+    }
+    if state.divider_grabbed {
+        return MouseDragRoute::Divider;
+    }
+    if state.terminal_split_dragging {
+        return MouseDragRoute::TerminalSplitDivider;
+    }
+    if state.terminal_panel_resizing {
+        return MouseDragRoute::TerminalPanelResize;
+    }
+
+    // ── Modal swallow ───────────────────────────────────────────────────────
+    // Below the armed rungs (a scrollbar thumb *inside* a modal is an armed
+    // target and must keep dragging) and above every geometric rung (nothing
+    // painted under a modal may see the event).
+    if state.modal_hit {
+        return MouseDragRoute::ModalSwallow;
+    }
+
+    // ── Geometry ────────────────────────────────────────────────────────────
+    if state
+        .sidebar_body
+        .is_some_and(|r| x >= r.x as f64 && x < (r.x + r.width) as f64 && y >= r.y as f64)
+    {
+        return MouseDragRoute::SidebarBody;
+    }
+    if let Some(layout) = state.layout {
+        if minimap_click_line(layout, x, y).is_some() {
+            return MouseDragRoute::Minimap;
+        }
+    }
+    if state.in_terminal_content {
+        return MouseDragRoute::TerminalContent;
+    }
+    // The editor area needs no left-edge gate: `layout.windows` holds only the
+    // painted editor windows, so a point over the activity bar or sidebar
+    // simply matches none of them. (TUI used to carry an `editor_left` guard
+    // here; it was a second, hand-maintained statement of the same fact.)
+    if let Some(layout) = state.layout {
+        if let Some(idx) = find_window_at(layout, x, y) {
+            let rw = &layout.windows[idx];
+            let zone = window_zone_hit_test(
+                rw,
+                x - rw.rect.x,
+                y - rw.rect.y,
+                state.cell.1.max(f64::MIN_POSITIVE),
+                state.cell.0.max(f64::MIN_POSITIVE),
+            );
+            if matches!(zone, WindowZone::TextArea { .. }) {
+                return MouseDragRoute::EditorText;
+            }
+        }
+    }
+    MouseDragRoute::None
+}
+
+/// `true` when `(x, y)` is inside a painted terminal pane's *content* cells —
+/// the [`MouseDragRoute::TerminalContent`] gate, asked the same way on both
+/// backends so the two cannot disagree about where the terminal starts.
+///
+/// Deliberately the same resolver the press path uses
+/// ([`route_bottom_panel_click`]), so a press that anchored a terminal
+/// selection and the drags that extend it can never land in different spaces.
+pub fn in_terminal_pane_content(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    metrics: BottomPanelMetrics,
+) -> bool {
+    matches!(
+        route_bottom_panel_click(engine, x, y, metrics),
+        Some(BottomPanelRoute::Pane { .. })
+            | Some(BottomPanelRoute::Split(
+                quadraui::TerminalSplitHit::LeftPane { .. }
+                    | quadraui::TerminalSplitHit::RightPane { .. }
+            ))
+    )
+}
+
+/// Apply a pointer *drag* inside the bottom panel's content rows.
+///
+/// Resolves through the same [`route_bottom_panel_click`] the press path uses,
+/// so a terminal selection drag reads the same pane-local cell the press
+/// anchored it to. This replaces two hand-rolled translations: TUI reconstructed
+/// the strip's top row and the active pane's x from `terminal_split_layout` by
+/// hand, and GTK did a bare `x / char_width` against a window-absolute `x`
+/// (bug 2 of the `#754` banner, which the press path fixed and the drag path
+/// kept). Returns `true` when the drag was consumed.
+pub fn apply_terminal_content_drag(
+    engine: &mut Engine,
+    x: f64,
+    y: f64,
+    metrics: BottomPanelMetrics,
+) -> bool {
+    match route_bottom_panel_click(engine, x, y, metrics) {
+        Some(BottomPanelRoute::Pane { col, row_offset }) => {
+            engine.handle_terminal_pane_drag(col, row_offset);
+            true
+        }
+        Some(BottomPanelRoute::Split(
+            quadraui::TerminalSplitHit::LeftPane { col, row }
+            | quadraui::TerminalSplitHit::RightPane { col, row },
+        )) => {
+            engine.handle_terminal_pane_drag(col, row);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Per-frame context [`apply_scroll_offset`] needs for the widgets whose apply
+/// depends on more than the offset itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollApplyContext {
+    /// Rows the unified picker's result list can show, for the selection clamp
+    /// [`apply_picker_scroll_offset`] applies. `0` when no picker is open.
+    pub picker_visible_rows: usize,
+}
+
+/// Apply one `quadraui::UiEvent::ScrollOffsetChanged` to the scroll state the
+/// `widget` id names. Returns `true` when the id was recognised.
+///
+/// This is the union of the two tables described in point 2 of this section's
+/// banner, so a widget that scrolls on one backend now scrolls on both. Ids
+/// that a backend never emits simply never match there — the cost of the union
+/// is a few dead arms, and the cost of *not* unioning it was a silently
+/// non-scrolling scrollbar.
+///
+/// Some ids are handled entirely inside quadraui's `SidebarSystem`
+/// (`tui:search_results`, `debug_sidebar:*`); they return `true` so the caller
+/// still consumes the event rather than letting it fall through to the editor.
+pub fn apply_scroll_offset(
+    engine: &mut Engine,
+    widget: &str,
+    new_offset: usize,
+    ctx: ScrollApplyContext,
+) -> bool {
+    match widget {
+        "picker" => {
+            apply_picker_scroll_offset(engine, new_offset, ctx.picker_visible_rows);
+            true
+        }
+        "explorer:sb" => {
+            engine
+                .explorer_tree
+                .borrow_mut()
+                .set_scroll_offset(new_offset);
+            true
+        }
+        "ext_panel:sb" => {
+            engine.ext_panel_scroll_top = new_offset;
+            true
+        }
+        "editor_hover" => {
+            engine.editor_hover_set_scroll(new_offset);
+            true
+        }
+        // Inverted scrollbars: `Terminal::set_scroll_offset` and
+        // `debug_output_scroll` both mean "lines from the bottom", and
+        // `dispatch_mouse_drag` already reports the offset in that space.
+        "terminal_scrollback" => {
+            if let Some(term) = engine.active_terminal_mut() {
+                term.set_scroll_offset(new_offset);
+            }
+            true
+        }
+        // TUI's drag path emits the `tui:`-prefixed id, its click path and GTK
+        // emit the bare one. Both name the same surface.
+        "debug_output" | "tui:debug_output" => {
+            engine.debug_output_scroll = new_offset;
+            engine.debug_output_auto_scroll = false;
+            true
+        }
+        "tui:settings" => {
+            engine.settings_scroll_top = new_offset;
+            true
+        }
+        // Owned by quadraui's `SidebarSystem` — consume without applying.
+        "tui:search_results" => true,
+        other if other.starts_with("debug_sidebar:") => true,
+        // Editor window scrollbars. TUI encodes both axes as
+        // `tui:editor:<window_id>:<vsb|hsb>`; GTK only paints a horizontal one
+        // and encodes it as `editor:h_sb:<window_id>`.
+        other if other.starts_with("tui:editor:") => {
+            let Some((wid_str, axis)) = other["tui:editor:".len()..].split_once(':') else {
+                return false;
+            };
+            let Ok(wid) = wid_str.parse::<usize>() else {
+                return false;
+            };
+            let window_id = crate::core::WindowId(wid);
+            match axis {
+                "vsb" => {
+                    engine.set_scroll_top_for_window(window_id, new_offset);
+                    engine.sync_scroll_binds();
+                    true
+                }
+                "hsb" => {
+                    engine.set_scroll_left_for_window(window_id, new_offset);
+                    true
+                }
+                _ => false,
+            }
+        }
+        other if other.starts_with("editor:h_sb:") => {
+            let Ok(wid) = other["editor:h_sb:".len()..].parse::<usize>() else {
+                return false;
+            };
+            engine.set_scroll_left_for_window(crate::core::WindowId(wid), new_offset);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -23115,6 +23535,311 @@ mod tests {
         assert!(
             svg.contains("viewBox=\"0 0 1024 1024\""),
             "APP_ICON_INTRINSIC_SIZE must match the asset's own viewBox"
+        );
+    }
+}
+
+// ═══ Drag-rung tests (#756, mouse-ladder slice 6) ════════════════════════════
+
+#[cfg(test)]
+mod mouse_drag_router_tests {
+    use super::*;
+    use crate::core::Mode;
+
+    /// A buffer long and deep enough that `build_screen_layout` paints a
+    /// minimap strip — the rung the two backends disagreed about.
+    fn drag_engine() -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new_for_test();
+        e.mode = Mode::Normal;
+        let mut text = String::new();
+        for i in 0..400 {
+            text.push_str(&format!("line {i} content that is reasonably long\n"));
+        }
+        e.buffer_mut().insert(0, &text);
+        e.settings.minimap = true;
+        e
+    }
+
+    /// Paint one frame at the caller's cell metrics.
+    ///
+    /// `cell = (1.0, 1.0)` is the TUI's whole-cell grid; `(9.0, 18.0)` stands in
+    /// for a GTK font's advance/line height. The *same* logical 80×24 screen is
+    /// described in both, which is what makes the parity assertion below mean
+    /// "the two backends see one screen", not "two screens happen to agree".
+    fn frame(engine: &Engine, cell: (f64, f64)) -> ScreenLayout {
+        let (cw, ch) = cell;
+        let bounds = WindowRect::new(0.0, 0.0, 80.0 * cw, 24.0 * ch);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, ch);
+        let theme = Theme::onedark();
+        build_screen_layout(engine, &theme, &rects, ch, cw, true)
+    }
+
+    /// Every rung, in the order [`route_mouse_drag`] must resolve them, paired
+    /// with the one state field that selects it.
+    ///
+    /// Not a tautology: this is the only place the order is written down, so a
+    /// reviewer reads it here, and reordering the router fails this first with
+    /// a diff that names both rungs.
+    #[test]
+    fn armed_gestures_resolve_in_a_fixed_order() {
+        type Arm = (&'static str, fn(&mut MouseDragState<'_>), MouseDragRoute);
+        let ladder: &[Arm] = &[
+            (
+                "armed drag target",
+                |s| s.armed_target = true,
+                MouseDragRoute::ArmedTarget,
+            ),
+            (
+                "hover popup selection",
+                |s| s.hover_popup_selecting = true,
+                MouseDragRoute::HoverPopupSelection,
+            ),
+            (
+                "sidebar resize",
+                |s| s.sidebar_resizing = true,
+                MouseDragRoute::SidebarResize,
+            ),
+            (
+                "sidebar drag-and-drop",
+                |s| s.sidebar_dnd = true,
+                MouseDragRoute::SidebarBody,
+            ),
+            (
+                "tab drag",
+                |s| s.tab_dragging = true,
+                MouseDragRoute::TabDrag,
+            ),
+            (
+                "command line selection",
+                |s| s.command_line_selecting = true,
+                MouseDragRoute::CommandLine,
+            ),
+            (
+                "divider grab",
+                |s| s.divider_grabbed = true,
+                MouseDragRoute::Divider,
+            ),
+            (
+                "terminal split divider",
+                |s| s.terminal_split_dragging = true,
+                MouseDragRoute::TerminalSplitDivider,
+            ),
+            (
+                "terminal panel resize",
+                |s| s.terminal_panel_resizing = true,
+                MouseDragRoute::TerminalPanelResize,
+            ),
+            (
+                "modal swallow",
+                |s| s.modal_hit = true,
+                MouseDragRoute::ModalSwallow,
+            ),
+        ];
+
+        // Turning every flag on at once must yield the *first* rung; dropping
+        // that rung must reveal the next, all the way down. One pass pins both
+        // membership and order.
+        for skip in 0..ladder.len() {
+            let mut state = MouseDragState::default();
+            for (_, set, _) in &ladder[skip..] {
+                set(&mut state);
+            }
+            let (name, _, expected) = &ladder[skip];
+            assert_eq!(
+                route_mouse_drag(&state, 10.0, 10.0),
+                *expected,
+                "with every rung from `{name}` down asserted, `{name}` must win"
+            );
+        }
+    }
+
+    /// A held drag over the minimap strip belongs to the minimap.
+    ///
+    /// Red against unfixed `develop`: there was no shared drag router at all,
+    /// and TUI's own minimap arm sat below a `Down`-only gate, so a TUI
+    /// press-and-hold on the strip resolved to nothing after the first cell.
+    ///
+    /// `build_screen_layout` shrinks each window rect by exactly the reserved
+    /// width, so the strip and the text area are spatially disjoint — this
+    /// pins that the strip is *claimed*, and the editor assertion beside it
+    /// pins that claiming it did not swallow the text area next door.
+    #[test]
+    fn a_held_drag_over_the_minimap_strip_keeps_seeking() {
+        let engine = drag_engine();
+        let layout = frame(&engine, (1.0, 1.0));
+        let mm = layout
+            .minimap
+            .first()
+            .expect("the fixture must paint a minimap strip");
+        let strip = minimap_strip_rect(mm);
+        let state = MouseDragState {
+            layout: Some(&layout),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            route_mouse_drag(
+                &state,
+                (strip.x + strip.width / 2.0) as f64,
+                (strip.y + strip.height / 2.0) as f64,
+            ),
+            MouseDragRoute::Minimap,
+            "a held drag over the minimap must keep seeking"
+        );
+
+        let text_x = strip.x as f64 - 2.0;
+        assert_eq!(
+            route_mouse_drag(&state, text_x, (strip.y + strip.height / 2.0) as f64),
+            MouseDragRoute::EditorText,
+            "the text area immediately left of the strip must still select text"
+        );
+    }
+
+    /// **The parity test #756 asks for.** One engine, painted twice — once in
+    /// the TUI's whole-cell units and once in GTK-shaped pixel units — then the
+    /// *same logical points* driven through [`route_mouse_drag`] in each
+    /// backend's own convention. Every point must land on the same rung.
+    ///
+    /// Verified RED by re-forking the ladder the way the two backends were
+    /// forked before this slice: hardcoding `route_mouse_drag`'s editor-zone
+    /// hit test to `1.0, 1.0` (the TUI's cell metrics, i.e. writing the shared
+    /// router from one backend's side and letting the other inherit its
+    /// units) fails here — `cell (0.5, 2.5): TUI routed a held drag to None
+    /// but GTK routed the same point on the same screen to EditorText` — with
+    /// a diff that names both rungs. That is the class of divergence — one
+    /// backend's
+    /// convention silently baked into a "shared" rung — that the two
+    /// independently-ordered ladders kept producing.
+    #[test]
+    fn both_backends_resolve_the_same_layout_and_point_to_the_same_rung() {
+        const GTK_CELL: (f64, f64) = (9.0, 18.0);
+        let engine = drag_engine();
+        let tui = frame(&engine, (1.0, 1.0));
+        let gtk = frame(&engine, GTK_CELL);
+
+        assert_eq!(
+            tui.windows.len(),
+            gtk.windows.len(),
+            "the two frames must describe the same screen"
+        );
+        assert_eq!(
+            tui.minimap.len(),
+            gtk.minimap.len(),
+            "the two frames must describe the same screen"
+        );
+
+        // Logical cell coordinates walked across the whole screen, plus the
+        // centre of the minimap strip so the rung that actually differed is
+        // always sampled regardless of grid alignment.
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for col in (0..80).step_by(3) {
+            for row in (0..24).step_by(2) {
+                points.push((col as f64 + 0.5, row as f64 + 0.5));
+            }
+        }
+        let strip = minimap_strip_rect(&tui.minimap[0]);
+        points.push((
+            (strip.x + strip.width / 2.0) as f64,
+            (strip.y + strip.height / 2.0) as f64,
+        ));
+
+        let mut saw_minimap = false;
+        let mut saw_editor = false;
+        for (cx, cy) in points {
+            let tui_route = route_mouse_drag(
+                &MouseDragState {
+                    layout: Some(&tui),
+                    cell: (1.0, 1.0),
+                    ..Default::default()
+                },
+                cx,
+                cy,
+            );
+            let gtk_route = route_mouse_drag(
+                &MouseDragState {
+                    layout: Some(&gtk),
+                    cell: GTK_CELL,
+                    ..Default::default()
+                },
+                cx * GTK_CELL.0,
+                cy * GTK_CELL.1,
+            );
+            assert_eq!(
+                tui_route, gtk_route,
+                "cell ({cx}, {cy}): TUI routed a held drag to {tui_route:?} but \
+                 GTK routed the same point on the same screen to {gtk_route:?} \
+                 — the ladder has re-forked"
+            );
+            saw_minimap |= tui_route == MouseDragRoute::Minimap;
+            saw_editor |= tui_route == MouseDragRoute::EditorText;
+        }
+        assert!(
+            saw_minimap && saw_editor,
+            "the sampled points must actually exercise both the minimap and the \
+             editor text area (minimap={saw_minimap}, editor={saw_editor}), or \
+             agreement is vacuous"
+        );
+    }
+
+    /// The union table from point 2 of the rung's banner: every widget id
+    /// *either* backend emits must apply on *both*. The pre-#756 copies each
+    /// knew roughly half of this list, so a scrollbar that tracked on one
+    /// backend silently scrolled nothing on the other.
+    #[test]
+    fn the_scroll_offset_table_is_the_union_of_both_backends() {
+        let ids = [
+            "picker",
+            "explorer:sb",
+            "ext_panel:sb",
+            "editor_hover",
+            "terminal_scrollback",
+            "debug_output",
+            "tui:debug_output",
+            "tui:settings",
+            "tui:search_results",
+            "debug_sidebar:0",
+            "tui:editor:0:vsb",
+            "tui:editor:0:hsb",
+            "editor:h_sb:0",
+        ];
+        let mut engine = drag_engine();
+        for id in ids {
+            assert!(
+                apply_scroll_offset(&mut engine, id, 1, ScrollApplyContext::default()),
+                "`{id}` is emitted by at least one backend and must apply on both"
+            );
+        }
+        assert!(
+            !apply_scroll_offset(
+                &mut engine,
+                "not:a:widget",
+                1,
+                ScrollApplyContext::default()
+            ),
+            "an unknown id must report unhandled so the caller can fall through"
+        );
+    }
+
+    /// The union is not just an arm-count: an id only *one* backend registers
+    /// today must still actually move the state it names when the other
+    /// backend starts registering it. Asserted on the tree's own scroll
+    /// offset, not on the table having an arm for the id.
+    #[test]
+    fn an_explorer_scrollbar_offset_moves_the_tree_on_either_backend() {
+        let mut engine = drag_engine();
+        engine.explorer_tree.borrow_mut().set_scroll_offset(0);
+        assert!(apply_scroll_offset(
+            &mut engine,
+            "explorer:sb",
+            7,
+            ScrollApplyContext::default()
+        ));
+        assert_eq!(
+            engine.explorer_tree.borrow().scroll_offset(),
+            7,
+            "applying an `explorer:sb` offset must move the tree, whichever \
+             backend's drag emitted it"
         );
     }
 }

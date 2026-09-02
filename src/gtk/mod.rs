@@ -3416,274 +3416,256 @@ impl App {
         )
     }
 
+    // ── Drag-follow-through rung (#756, mouse-ladder slice 6) ────────────────
+    //
+    // Which gesture owns a move-with-the-button-held is
+    // `render::route_mouse_drag`, sequenced ONCE and shared verbatim with TUI's
+    // `handle_mouse`. This backend used to state its own order here — armed
+    // scrollbar → hover popup → modal swallow → tab drag → divider → split →
+    // resize → terminal → editor — while TUI stated a different one, and each
+    // knew scrollbar widget ids the other did not. See the rung's banner in
+    // `render.rs`.
     fn handle_mouse_drag_msg(&mut self, x: f64, y: f64, width: f64, height: f64) {
-        // Phase B.4 drag dispatch: feed the move through quadraui's
-        // dispatcher so an active drag (scrollbar, handle, etc.)
-        // translates into primitive-specific events, then guard
-        // against drag-events-inside-modal leaking through to the
-        // base layer (#192).
-        //
-        // Keep the stack fresh: if the picker is open, ensure its
-        // current bounds are recorded (popup size depends on
-        // has_preview which can change mid-picker).
+        // Keep the picker's modal-stack entry fresh before anything hit-tests
+        // the stack: the popup's size depends on `has_preview`, which can change
+        // mid-picker.
+        let picker_open = self.engine.borrow().picker_open;
         {
-            let engine = self.engine.borrow();
-            let picker_open = engine.picker_open;
-            drop(engine);
             let picker_id = quadraui::WidgetId::new("picker");
+            let stack_rc = self.backend.borrow().modal_stack_handle();
+            let mut stack = stack_rc.borrow_mut();
             if picker_open {
                 let (px, py, pw, ph) = self.compute_picker_popup_bounds(width, height);
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .push(
-                        picker_id.clone(),
-                        quadraui::Rect {
-                            x: px as f32,
-                            y: py as f32,
-                            width: pw as f32,
-                            height: ph as f32,
-                        },
-                    );
+                stack.push(
+                    picker_id,
+                    quadraui::Rect {
+                        x: px as f32,
+                        y: py as f32,
+                        width: pw as f32,
+                        height: ph as f32,
+                    },
+                );
             } else {
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&picker_id);
+                stack.pop(&picker_id);
             }
+        }
 
-            let drag_rc = self.backend.borrow().drag_state_handle();
-            let drag = drag_rc.borrow();
-            let drag_active = drag.is_active();
-            if drag_active {
-                // Run dispatch_mouse_drag: emits MouseMoved + any
-                // primitive-specific drag-update events.
+        let bottom_metrics = render::BottomPanelMetrics {
+            panel_left: self.painted_bottom_panel_left(),
+            col_width: self.cached_char_width.max(1.0),
+        };
+        let drag_rc = self.backend.borrow().drag_state_handle();
+        let stack_rc = self.backend.borrow().modal_stack_handle();
+        let route = {
+            let engine = self.engine.borrow();
+            let layout_ref = self.cached_screen_layout.borrow();
+            let state = render::MouseDragState {
+                layout: layout_ref.as_ref(),
+                armed_target: drag_rc.borrow().is_active(),
+                hover_popup_selecting: engine.editor_hover_has_focus
+                    && engine
+                        .editor_hover
+                        .as_ref()
+                        .is_some_and(|h| h.selection.is_some())
+                    && self.editor_hover_popup_rect.get().is_some(),
+                modal_hit: stack_rc
+                    .borrow()
+                    .hit_test(quadraui::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    })
+                    .is_some(),
+                // GTK has no canvas sidebar separator, command-line selection or
+                // explorer drag-and-drop: the separator is a `gtk::Paned`, the
+                // command line paints through `Surface::CommandLine` (which
+                // exposes no character hit test — the quadraui gap #752
+                // recorded), and the file tree is a native widget with its own
+                // DnD. Stated here rather than omitted so the asymmetry is
+                // visible at the call site.
+                sidebar_resizing: false,
+                sidebar_dnd: false,
+                sidebar_body: None,
+                command_line_selecting: false,
+                tab_dragging: self.tab_drag.is_armed_or_dragging(),
+                divider_grabbed: self.divider_grab.is_some(),
+                terminal_split_dragging: self.terminal_split_dragging,
+                terminal_panel_resizing: self.terminal_resize_dragging,
+                in_terminal_content: render::in_terminal_pane_content(
+                    &engine,
+                    x,
+                    y,
+                    bottom_metrics,
+                ),
+                cell: (
+                    self.cached_char_width.max(1.0),
+                    self.cached_line_height.max(1.0),
+                ),
+            };
+            render::route_mouse_drag(&state, x, y)
+        };
+
+        match route {
+            render::MouseDragRoute::ArmedTarget => {
                 let events = quadraui::dispatch_mouse_drag(
-                    &drag,
+                    &drag_rc.borrow(),
                     quadraui::Point {
                         x: x as f32,
                         y: y as f32,
                     },
                     Default::default(),
                 );
-                drop(drag);
-                // Apply each scroll event by widget id.
+                let picker_visible_rows = if picker_open {
+                    let lh = self.cached_line_height.max(1.0);
+                    let has_preview = self.engine.borrow().picker_preview.is_some();
+                    render::PickerGeometry::compute(
+                        width as f32,
+                        height as f32,
+                        has_preview,
+                        &render::gtk_picker_sizing(lh as f32),
+                    )
+                    .visible_rows
+                } else {
+                    0
+                };
                 for ev in &events {
                     if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
-                        match widget.as_str() {
-                            "picker" => {
-                                let lh = self.cached_line_height.max(1.0);
-                                let has_preview = self.engine.borrow().picker_preview.is_some();
-                                let geo = render::PickerGeometry::compute(
-                                    width as f32,
-                                    height as f32,
-                                    has_preview,
-                                    &render::gtk_picker_sizing(lh as f32),
-                                );
-                                let vis = geo.visible_rows;
-                                let mut engine = self.engine.borrow_mut();
-                                engine.picker_scroll_top = *new_offset;
-                                if engine.picker_selected < *new_offset {
-                                    engine.picker_selected = *new_offset;
-                                } else if vis > 0 && engine.picker_selected >= *new_offset + vis {
-                                    engine.picker_selected = *new_offset + vis - 1;
-                                }
-                                engine.picker_load_preview();
-                                self.draw_needed.set(true);
-                            }
-                            "editor_hover" => {
-                                self.engine
-                                    .borrow_mut()
-                                    .editor_hover_set_scroll(*new_offset);
-                                self.draw_needed.set(true);
-                            }
-                            "terminal_scrollback" => {
-                                if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                                    term.set_scroll_offset(*new_offset);
-                                }
-                                self.draw_needed.set(true);
-                            }
-                            "debug_output" => {
-                                let mut engine = self.engine.borrow_mut();
-                                engine.debug_output_scroll = *new_offset;
-                                engine.debug_output_auto_scroll = false;
-                                self.draw_needed.set(true);
-                            }
-                            w if w.starts_with("editor:h_sb:") => {
-                                if let Some(id_str) = w.strip_prefix("editor:h_sb:") {
-                                    if let Ok(id) = id_str.parse::<usize>() {
-                                        let win_id = core::WindowId(id);
-                                        self.engine
-                                            .borrow_mut()
-                                            .set_scroll_left_for_window(win_id, *new_offset);
-                                        self.draw_needed.set(true);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                        // #756: the widget-id → scroll-state table is
+                        // `render::apply_scroll_offset`, shared with TUI. The
+                        // copy this replaced knew `picker` and `editor:h_sb:N`
+                        // and nothing else — see the rung's banner in
+                        // `render.rs`, point 2, for why two half-tables is a
+                        // silent trap rather than a live bug.
+                        render::apply_scroll_offset(
+                            &mut self.engine.borrow_mut(),
+                            widget.as_str(),
+                            *new_offset,
+                            render::ScrollApplyContext {
+                                picker_visible_rows,
+                            },
+                        );
                     }
                 }
-                return;
             }
-            drop(drag);
-
-            // Editor hover popup text selection drag (#216). Must run
-            // BEFORE the modal-stack-swallow guard below so an
-            // in-progress selection drag inside the popup (which is
-            // now on the modal stack) doesn't get short-circuited.
-            {
-                let engine = self.engine.borrow();
-                if engine.editor_hover_has_focus
-                    && engine
+            render::MouseDragRoute::HoverPopupSelection => {
+                if let Some((px, py, _pw, _ph)) = self.editor_hover_popup_rect.get() {
+                    let padding = 4.0;
+                    let lh = self.cached_line_height.max(1.0);
+                    let scroll = self
+                        .engine
+                        .borrow()
                         .editor_hover
                         .as_ref()
-                        .is_some_and(|h| h.selection.is_some())
-                {
-                    if let Some((px, py, _pw, _ph)) = self.editor_hover_popup_rect.get() {
-                        let padding = 4.0;
-                        let lh = self.cached_line_height.max(1.0);
-                        let scroll = engine
-                            .editor_hover
-                            .as_ref()
-                            .map(|h| h.scroll_top)
-                            .unwrap_or(0);
-                        drop(engine);
-                        let rel_x = x - px - padding;
-                        let rel_y = y - py - padding;
-                        let content_line = (rel_y / lh).max(0.0) as usize + scroll;
-                        let content_col = self.pixel_to_editor_hover_col(rel_x, content_line);
-                        self.engine
-                            .borrow_mut()
-                            .editor_hover_extend_selection(content_line, content_col);
-                        self.draw_needed.set(true);
-                        return;
+                        .map(|h| h.scroll_top)
+                        .unwrap_or(0);
+                    let rel_x = x - px - padding;
+                    let rel_y = y - py - padding;
+                    let content_line = (rel_y / lh).max(0.0) as usize + scroll;
+                    let content_col = self.pixel_to_editor_hover_col(rel_x, content_line);
+                    self.engine
+                        .borrow_mut()
+                        .editor_hover_extend_selection(content_line, content_col);
+                }
+            }
+            render::MouseDragRoute::TabDrag => {
+                // `64.0` is the squared 8-device-pixel threshold.
+                match self.tab_drag.handle_move(x, y, 64.0) {
+                    render::TabDragMove::Tracking => {
+                        // Cursor and the cached per-group bounds are both in
+                        // absolute surface coordinates, so the hit-test matches
+                        // what the overlay draws (#515).
+                        let groups = self.cached_drop_groups.borrow();
+                        let zone = render::compute_tab_drop_zone(
+                            x as f32,
+                            y as f32,
+                            &groups,
+                            self.cached_drop_tbh.get(),
+                        );
+                        drop(groups);
+                        self.tab_drag.track(zone);
                     }
+                    render::TabDragMove::Crossed { press_x, press_y } => {
+                        // Unlike TUI, this backend's arm fires for the whole
+                        // tab-bar band, so the press has to be re-resolved to
+                        // confirm it was on a tab. If it was not, disarm and
+                        // re-route the same event with the machine idle — the
+                        // one rung that can decline after being asked.
+                        if let Some(source) = self.tab_drag_source_at(press_x, press_y) {
+                            self.tab_drag.begin(source, x, y);
+                        } else {
+                            self.tab_drag.disarm();
+                            self.draw_needed.set(true);
+                            self.handle_mouse_drag_msg(x, y, width, height);
+                            return;
+                        }
+                    }
+                    render::TabDragMove::Pending | render::TabDragMove::Idle => {}
                 }
             }
-
-            let stack_rc = self.backend.borrow().modal_stack_handle();
-            let stack = stack_rc.borrow();
-            let hit_point = quadraui::Point {
-                x: x as f32,
-                y: y as f32,
-            };
-            if stack.hit_test(hit_point).is_some() {
-                // Drag landed inside an open modal but there's no
-                // active drag target — swallow so it doesn't leak to
-                // the editor (#192). Active modal drags have already
-                // been handled above.
-                return;
-            }
-        }
-        // Tab drag-and-drop: the arm → threshold → track machine is shared
-        // with TUI (`render::TabDragState`, #753). `64.0` is the squared
-        // 8-device-pixel threshold.
-        match self.tab_drag.handle_move(x, y, 64.0) {
-            render::TabDragMove::Tracking => {
-                // Compute the drop zone from the per-group bounds cached by
-                // render_content. Cursor (x, y) and those bounds are both in
-                // absolute surface coordinates, so the hit-test matches what
-                // the overlay draws. (#515 — previously used relative 0-based
-                // bounds vs an absolute cursor, which misclassified the zone
-                // after a split.)
-                let groups = self.cached_drop_groups.borrow();
-                let zone = render::compute_tab_drop_zone(
-                    x as f32,
-                    y as f32,
-                    &groups,
-                    self.cached_drop_tbh.get(),
-                );
-                drop(groups);
-                self.tab_drag.track(zone);
-                self.draw_needed.set(true);
-                return;
-            }
-            render::TabDragMove::Crossed { press_x, press_y } => {
-                // Unlike TUI, GTK's arm fires for the whole tab-bar band, so
-                // the press has to be re-resolved to confirm it was on a tab.
-                if let Some(source) = self.tab_drag_source_at(press_x, press_y) {
-                    self.tab_drag.begin(source, x, y);
-                    self.draw_needed.set(true);
-                    return;
+            render::MouseDragRoute::Divider => {
+                if let (Some(grab), Some((group_dividers, window_dividers, _))) =
+                    (self.divider_grab, self.painted_divider_geometry(x, y))
+                {
+                    render::apply_divider_drag(
+                        &mut self.engine.borrow_mut(),
+                        grab,
+                        &group_dividers,
+                        &window_dividers,
+                        x,
+                        y,
+                    );
                 }
-                // Not a tab — the press is disarmed and we fall through.
-                self.tab_drag.disarm();
             }
-            // Haven't moved enough yet, don't start any drag.
-            render::TabDragMove::Pending => return,
-            render::TabDragMove::Idle => {}
-        }
-        // Divider drag — group boundary or `:split` boundary, both through the
-        // shared applier (#753).
-        if let Some(grab) = self.divider_grab {
-            if let Some((group_dividers, window_dividers, _)) = self.painted_divider_geometry(x, y)
-            {
-                render::apply_divider_drag(
+            render::MouseDragRoute::TerminalSplitDivider => {
+                if self.cached_char_width > 0.0 {
+                    const SB_W: f64 = 6.0;
+                    let min_x = self.cached_char_width * 5.0;
+                    let max_x = (width - SB_W - self.cached_char_width * 5.0).max(min_x);
+                    let clamped_x = x.clamp(min_x, max_x);
+                    let left_cols = (clamped_x / self.cached_char_width) as u16;
+                    self.engine
+                        .borrow_mut()
+                        .terminal_split_set_drag_cols(left_cols);
+                }
+            }
+            render::MouseDragRoute::TerminalPanelResize => {
+                if self.cached_line_height > 0.0 {
+                    let global_status_rows = if self.engine.borrow().settings.window_status_line {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    let status_h = (1.0 + global_status_rows) * self.cached_line_height;
+                    let available = (height - y - status_h).max(0.0);
+                    // Leave at least 4 editor lines visible (+ tab bar chrome)
+                    let min_editor_lines = 4.0 + 1.0;
+                    let max_rows =
+                        ((height - status_h - min_editor_lines * self.cached_line_height)
+                            / self.cached_line_height) as u16;
+                    let max_rows = max_rows.saturating_sub(2).max(5);
+                    let new_rows = ((available / self.cached_line_height) as u16)
+                        .saturating_sub(2)
+                        .clamp(5, max_rows);
+                    self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
+                }
+            }
+            render::MouseDragRoute::Minimap => {
+                let layout_ref = self.cached_screen_layout.borrow();
+                if let Some(ref layout) = *layout_ref {
+                    let mut engine = self.engine.borrow_mut();
+                    render::apply_minimap_click(&mut engine, layout, x, y);
+                }
+            }
+            render::MouseDragRoute::TerminalContent => {
+                // #533: shared drag handler — tries forward_mouse(Move) when the
+                // child has mouse reporting, falls back to local selection.
+                render::apply_terminal_content_drag(
                     &mut self.engine.borrow_mut(),
-                    grab,
-                    &group_dividers,
-                    &window_dividers,
                     x,
                     y,
+                    bottom_metrics,
                 );
             }
-            self.draw_needed.set(true);
-            return;
-        }
-        // Terminal split divider drag — update visual position (no PTY resize yet).
-        if self.terminal_split_dragging {
-            if self.cached_char_width > 0.0 {
-                const SB_W: f64 = 6.0;
-                let min_x = self.cached_char_width * 5.0;
-                let max_x = (width - SB_W - self.cached_char_width * 5.0).max(min_x);
-                let clamped_x = x.clamp(min_x, max_x);
-                let left_cols = (clamped_x / self.cached_char_width) as u16;
-                self.engine
-                    .borrow_mut()
-                    .terminal_split_set_drag_cols(left_cols);
-                self.draw_needed.set(true);
-            }
-        // Terminal panel resize drag.
-        } else if self.terminal_resize_dragging {
-            if self.cached_line_height > 0.0 {
-                let global_status_rows = if self.engine.borrow().settings.window_status_line {
-                    0.0
-                } else {
-                    1.0
-                };
-                let status_h = (1.0 + global_status_rows) * self.cached_line_height;
-                let available = (height - y - status_h).max(0.0);
-                // Leave at least 4 editor lines visible (+ tab bar chrome)
-                let min_editor_lines = 4.0 + 1.0; // 4 lines + tab bar
-                let max_rows = ((height - status_h - min_editor_lines * self.cached_line_height)
-                    / self.cached_line_height) as u16;
-                let max_rows = max_rows.saturating_sub(2).max(5);
-                let new_rows = ((available / self.cached_line_height) as u16)
-                    .saturating_sub(2)
-                    .clamp(5, max_rows);
-                self.engine.borrow_mut().session.terminal_panel_rows = new_rows;
-                self.draw_needed.set(true);
-            }
-        } else {
-            // Drag in the terminal content area (text selection). Geometry is
-            // cached at paint time on engine.bottom_panel_geometry (#418).
-            let content_row = match self.engine.borrow().resolve_bottom_panel_zone(y) {
-                Some(crate::core::engine::BottomPanelZone::Content { row_offset }) => {
-                    Some(row_offset)
-                }
-                _ => None,
-            };
-            if let Some(row) = content_row {
-                let col = (x / self.cached_char_width.max(1.0)) as u16;
-                // #533: shared drag handler — tries forward_mouse(Move)
-                // when the child has mouse reporting, falls back to local
-                // selection update.
-                self.engine.borrow_mut().handle_terminal_pane_drag(col, row);
-                self.draw_needed.set(true);
-            } else {
+            render::MouseDragRoute::EditorText => {
                 let layout_ref = self.cached_screen_layout.borrow();
                 if let Some(ref layout) = *layout_ref {
                     let mut engine = self.engine.borrow_mut();
@@ -3704,9 +3686,16 @@ impl App {
                         &self.cached_tab_bar_zones.borrow(),
                     );
                 }
-                self.draw_needed.set(true);
             }
+            // #192: a drag inside an open modal with nothing armed is swallowed
+            // so it cannot leak to the editor underneath.
+            render::MouseDragRoute::ModalSwallow
+            | render::MouseDragRoute::SidebarResize
+            | render::MouseDragRoute::SidebarBody
+            | render::MouseDragRoute::CommandLine
+            | render::MouseDragRoute::None => {}
         }
+        self.draw_needed.set(true);
     }
 
     fn handle_mouse_up_msg(&mut self) {
