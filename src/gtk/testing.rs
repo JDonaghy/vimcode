@@ -453,7 +453,7 @@ mod tests {
     /// This was dead on GTK after the #540 Relm4→ShellApp migration. Two
     /// independent causes, both fixed alongside this test:
     ///
-    /// 1. `Msg::MouseScroll` reads the pointer out of `App::last_editor_pointer`,
+    /// 1. `handle_mouse_scroll_msg` reads the pointer out of `App::last_editor_pointer`,
     ///    which nothing assigned once the `EventControllerMotion` that used to
     ///    write it was removed — so it was permanently `None`.
     /// 2. The hovered-window lookup was gated on `App::drawing_area`, which is
@@ -495,7 +495,7 @@ mod tests {
         // negates GTK's raw `dy` to produce it. This closure previously
         // dispatched `+1.0` and still asserted `scroll_top` *increases*, which
         // only held because the GTK `UiEvent::Scroll` arm was passing the
-        // quadraui-convention delta straight through to `Msg::MouseScroll`
+        // quadraui-convention delta straight through to `handle_mouse_scroll_msg`
         // (which wants GTK-raw polarity) — the very inversion #554 reports.
         let wheel_down_at = |h: &mut Harness<_>, x: f32, y: f32| {
             h.driver.dispatch(UiEvent::Scroll {
@@ -549,13 +549,13 @@ mod tests {
     /// ```text
     ///   GDK dy  ──gdk_scroll_to_uievent──▶  UiEvent::Scroll.delta.y
     ///   (+ = down)        (negates)          (+ = up, quadraui convention)
-    ///           ──ShellApp::handle──▶  Msg::MouseScroll.delta_y
+    ///           ──ShellApp::handle──▶  handle_mouse_scroll_msg delta_y
     ///                (negates back)      (+ = down, GTK-raw — what every
     ///                                     downstream consumer expects)
     /// ```
     ///
     /// The #540 Relm4→ShellApp migration deleted the `connect_scroll` closure
-    /// that fed `Msg::MouseScroll` GTK's raw `dy` and left the runner's
+    /// that fed the scroll handler GTK's raw `dy` and left the runner's
     /// already-negated `UiEvent::Scroll` as the only source, dropping the
     /// second negation. Every wheel notch then reached the engine with the
     /// sign flipped: wheel-down scrolled the text up.
@@ -617,7 +617,7 @@ mod tests {
     /// #672: the debug-output bottom panel's scroll wheel routes through
     /// `quadraui::dispatch_scroll` against `engine.scroll_surfaces` — a list
     /// that, under `ShellApp`, only the dead `src/gtk/draw.rs` ever pushed
-    /// to. `Msg::MouseScroll` hit-tests it (mod.rs `"debug_output" =>` arm)
+    /// to. `handle_mouse_scroll_msg` hit-tests it (mod.rs `"debug_output" =>` arm)
     /// but nothing populated it, so this scroll was a silent no-op with the
     /// panel visible and painted. This test fails red against an empty list
     /// (falls through to the generic active-window viewport scroll instead,
@@ -752,7 +752,7 @@ mod tests {
         let before = sample(&mut h);
 
         // Opposite sign from the "wheel down" test above — GTK-raw wheel-up,
-        // routed the same way (`Msg::MouseScroll` -> `dispatch_scroll` ->
+        // routed the same way (`handle_mouse_scroll_msg` -> `dispatch_scroll` ->
         // this `"debug_output" =>` arm) but landing in
         // `handle_debug_output_scroll`'s `else` branch.
         h.driver.dispatch(UiEvent::Scroll {
