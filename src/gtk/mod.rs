@@ -817,6 +817,21 @@ struct App {
     /// handler. (B.5b Stage 7.)
     #[allow(clippy::type_complexity)]
     tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// The overlay rungs this frame actually painted, in paint order (#735).
+    ///
+    /// Written by the [`render::OVERLAY_Z_ORDER`] walk at the tail of
+    /// `render_content` — every arm that draws pushes its own
+    /// [`render::OverlayOp`], and arms that only clear a stale hit-test cache
+    /// do not. It is the *observable* that makes "both backends compose the
+    /// overlay band in the same order" testable: `TuiShellApp` keeps the
+    /// identical field, and the two backends' recorded sequences are asserted
+    /// equal against the same expected `Vec<OverlayOp>`.
+    ///
+    /// Cheap enough to keep in release builds (at most
+    /// `OVERLAY_Z_ORDER.len()` pushes into a reused `Vec` per frame) and
+    /// useful there too — `check_overlay_band_order` turns a z-order
+    /// inversion into a diagnosable string rather than a visual mystery.
+    painted_overlay_band: Rc<RefCell<Vec<render::OverlayOp>>>,
     /// Picker/command-palette popup rect `(x, y, w, h)` **as the last frame
     /// actually painted it** — see [`App::compute_picker_popup_bounds`] for
     /// why the click path must not re-derive it (#555).
@@ -1229,6 +1244,7 @@ impl App {
             completion_layout: Rc::new(RefCell::new(None)),
             context_menu_layout: Rc::new(RefCell::new(None)),
             tab_switcher_popup_rect: Rc::new(Cell::new(None)),
+            painted_overlay_band: Rc::new(RefCell::new(Vec::new())),
             picker_popup_rect: Rc::new(Cell::new(None)),
             painted_sidebar_bounds: Rc::new(Cell::new(None)),
             painted_line_height: Rc::new(Cell::new(None)),
@@ -5103,6 +5119,98 @@ impl App {
 
 // ── Dormant ShellApp impl (#448-B) ──────────────────────────────────────────
 // This impl compiles alongside the Relm4 path but is NOT wired up.
+impl App {
+    /// Paint the title-bar band: the menu bar + any open dropdown, the app-icon
+    /// slot, and the inline window controls.
+    ///
+    /// One function because all three draw into the *same* strip and their
+    /// order within it is fixed by a rasteriser detail rather than by taste:
+    /// `MenuSystem::render` calls `draw_menu_bar` across the whole band, so the
+    /// icon slot and the controls must follow it or get erased (the #552
+    /// round-2/3 "buttons render blank" regression). Kept off
+    /// [`render::OVERLAY_Z_ORDER`] because TUI has neither an app icon nor
+    /// in-canvas window controls, so they cannot be part of a *shared*
+    /// sequence; they ride the `MenuDropdown` rung instead (#735).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_title_bar_band(
+        &self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        theme: &Theme,
+        menu_row_rect: quadraui::Rect,
+        menu_items_rect: quadraui::Rect,
+        app_icon_rect: quadraui::Rect,
+        controls_rect: Option<quadraui::Rect>,
+    ) {
+        {
+            // `menu_items_rect`, not `menu_row_rect` — the app icon owns the
+            // leading slot (#720). `MenuSystem::render` positions the open
+            // dropdown from this same rect, so passing the narrowed one is
+            // what keeps a dropdown under the label that opened it.
+            engine.menu_system.borrow().render(backend, menu_items_rect);
+
+            // ── App icon, left of `File` (#720) ──────────────────────────
+            // `draw_menu_bar` above only filled `menu_items_rect`, so the
+            // reserved slot still shows the frame-clear colour
+            // (`theme.background`) rather than the bar's own `tab_bar_bg`.
+            // Painting an *item-less* `MenuBar` across the slot fills it
+            // through the very same rasteriser as the strip beside it, so
+            // the two backgrounds cannot drift apart the way a hand-picked
+            // theme colour would.
+            if app_icon_rect.width > 0.0 && app_icon_rect.height > 0.0 {
+                let filler = quadraui::MenuBar {
+                    id: quadraui::WidgetId::new("app_icon_slot"),
+                    items: Vec::new(),
+                    open_item: None,
+                    focused_item: None,
+                };
+                let _ = backend.draw_menu_bar(
+                    quadraui::Rect::new(
+                        menu_row_rect.x,
+                        menu_row_rect.y,
+                        (menu_items_rect.x - menu_row_rect.x).max(0.0),
+                        menu_row_rect.height,
+                    ),
+                    &filler,
+                );
+                // `util::app_icon_image`, not `render::app_icon_image`: the
+                // former hands over a once-rasterised small PNG instead of the
+                // 1024x1024 SVG, which `Backend::draw_image` would otherwise
+                // re-render through librsvg on *every* frame (+16.5ms per
+                // repaint — see that function's doc comment).
+                let _ = backend.draw_image(app_icon_rect, &util::app_icon_image());
+            }
+        }
+
+        // ── Inline window controls (min/max/close) — after the bar (#552) ────
+        // `menu_system.render()` above repaints `draw_menu_bar` across the full
+        // `menu_row_rect` band, so the controls must be painted *after* it or
+        // they get erased (the round-2/3 "buttons render blank" regression).
+        // The controls sit in the title-bar band, to the right of the menu
+        // labels; the dropdown body drops *below* the band, so painting here
+        // never covers an open dropdown.
+        //
+        // #735 moved this from the very end of `render_content` (below the
+        // dialog and context menu) to here. It is title-bar chrome, so the
+        // modal rungs of `render::OVERLAY_Z_ORDER` now paint over it — which is
+        // the point: a modal dialog covering the window controls is what
+        // "modal" means, and it is what TUI already did with everything it
+        // painted into its own title-bar row.
+        if let Some(controls_rect) = controls_rect {
+            let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+            let controls_bar = render::window_controls_status_bar(theme, maximized);
+            let interaction = self.title_bar_interaction.borrow();
+            let hits = backend.draw_status_bar(
+                controls_rect,
+                &controls_bar,
+                interaction.hovered_id(),
+                interaction.pressed_id(),
+            );
+            interaction.set_layout(hits);
+        }
+    }
+}
+
 impl quadraui::ShellApp for App {
     fn setup(&mut self, backend: &mut dyn quadraui::Backend) {
         // Seed cached metrics from runner defaults.
@@ -6487,292 +6595,325 @@ impl quadraui::ShellApp for App {
             }
         }
 
-        // ── Menu dropdown overlay ────────────────────────────────────────────
-        // Rendered last so it paints on top of everything else, matching TUI
-        // (render_impl.rs: "dropdown is rendered LAST ... so it draws on top").
-        if engine.menu_bar_visible {
-            // `menu_items_rect`, not `menu_row_rect` — the app icon owns the
-            // leading slot (#720). `MenuSystem::render` positions the open
-            // dropdown from this same rect, so passing the narrowed one is
-            // what keeps a dropdown under the label that opened it.
-            engine.menu_system.borrow().render(backend, menu_items_rect);
-
-            // ── App icon, left of `File` (#720) ──────────────────────────
-            // `draw_menu_bar` above only filled `menu_items_rect`, so the
-            // reserved slot still shows the frame-clear colour
-            // (`theme.background`) rather than the bar's own `tab_bar_bg`.
-            // Painting an *item-less* `MenuBar` across the slot fills it
-            // through the very same rasteriser as the strip beside it, so
-            // the two backgrounds cannot drift apart the way a hand-picked
-            // theme colour would.
-            if app_icon_rect.width > 0.0 && app_icon_rect.height > 0.0 {
-                let filler = quadraui::MenuBar {
-                    id: quadraui::WidgetId::new("app_icon_slot"),
-                    items: Vec::new(),
-                    open_item: None,
-                    focused_item: None,
-                };
-                let _ = backend.draw_menu_bar(
-                    quadraui::Rect::new(
-                        menu_row_rect.x,
-                        menu_row_rect.y,
-                        (menu_items_rect.x - menu_row_rect.x).max(0.0),
-                        menu_row_rect.height,
-                    ),
-                    &filler,
-                );
-                // `util::app_icon_image`, not `render::app_icon_image`: the
-                // former hands over a once-rasterised small PNG instead of the
-                // 1024x1024 SVG, which `Backend::draw_image` would otherwise
-                // re-render through librsvg on *every* frame (+16.5ms per
-                // repaint — see that function's doc comment).
-                let _ = backend.draw_image(app_icon_rect, &util::app_icon_image());
-            }
-        }
-
-        // ── Command Center: nav arrows + search box (#676) ────────────────────
-        // Painted *after* `menu_system.render()` above, which repaints
-        // `draw_menu_bar` across the entire `menu_row_rect` band and would
-        // erase anything drawn here first — the identical ordering hazard
-        // documented on the window controls below (#552 round-2/3 "buttons
-        // render blank"). This is the VS Code-style Command Center dropped
-        // by the #540 Relm4→ShellApp cutover and never re-wired: it used to
-        // live in the deleted `impl SimpleComponent for App` `view!`
-        // scaffolding. Cached into `engine.command_center_layout` for
-        // `handle()`'s click hit-test, mirroring TUI's `shell_app.rs`
-        // (#635 Stage 6b item A) and `mouse.rs`'s "Menu bar row click —
-        // command center only".
-        if let Some(cc_rect) = command_center_rect.filter(|r| r.width >= 1.0) {
-            let title = engine
-                .cwd
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "VimCode".to_string());
-            let cc = render::build_command_center_view(
-                engine.tab_nav_can_go_back(),
-                engine.tab_nav_can_go_forward(),
-                &title,
-            );
-            let cc_layout = backend.draw_command_center(cc_rect, &cc);
-            engine.command_center_layout.replace(Some(cc_layout));
-        } else {
-            engine.command_center_layout.replace(None);
-        }
-
-        // ── Dialog + context-menu popups (#546) ───────────────────────────────
-        // The ShellApp render path never painted `screen.dialog` /
-        // `screen.context_menu` at all — their draw + click-geometry caches
-        // were populated only by the dead legacy `draw_editor` Cairo path
-        // (src/gtk/draw.rs), which has zero live callers under ShellApp. That
-        // left right-click menus invisible/unclickable and dialogs
-        // (":about", Unsaved-Changes on tab close, etc.) invisible AND
-        // undismissable by mouse — `dialog.is_some()` stayed true forever and
-        // `handle_mouse_click_msg`'s dialog block swallowed all subsequent
-        // clicks. Drawn here — after the menu dropdown, before the always-
-        // on-top window controls — using only generic `Backend` metrics
-        // (`render::dialog_generic_layout` / `context_menu_generic_layout`,
-        // shared with TUI) since this fn has no raw Pango/Cairo access.
-        // Resolved geometry is cached into `dialog_layout` /
-        // `context_menu_layout` — the exact caches `handle_mouse_click_msg`
-        // already reads (and was simply never being fed).
+        // ══ Overlay band (#735 slice 1) ══════════════════════════════════════
+        //
+        // Everything from here to the end of `render_content` is composed from
+        // `render::OVERLAY_Z_ORDER` — the single ordered artefact both backends
+        // walk, replacing the two hand-kept transcriptions that had already
+        // inverted twice against each other (see that constant's own comment
+        // for the two inversions and which order won). Geometry and
+        // rasterisation stay here, in pixels, because that is the genuine
+        // per-backend difference; only the *order* moved.
+        //
+        // Every arm gates itself and, when it paints, pushes its rung onto
+        // `painted_band`. Arms whose surface is absent still run — several own
+        // a hit-test cache (`picker_popup_rect`, `dialog_layout`,
+        // `context_menu_layout`, `tab_switcher_popup_rect`,
+        // `command_center_layout`, `toast_layout`) that must be *cleared* on
+        // the frame the surface disappears, or the next click resolves against
+        // last frame's geometry (the #587 class of bug).
+        //
+        // Not part of the shared band, and deliberately left above it: the tab
+        // drag overlay (TUI paints its drag ghost in the editor band instead)
+        // and — see the `MenuDropdown` arm — the app-icon slot and inline
+        // window controls, neither of which TUI has at all.
         let popup_vp = backend.viewport();
         let popup_viewport = quadraui::Rect::new(0.0, 0.0, popup_vp.width, popup_vp.height);
+        let mut painted_band: Vec<render::OverlayOp> = Vec::new();
 
-        // ── Find/replace overlay (#671) ─────────────────────────────────────
-        // Confirmed by #592 to open in engine state (`KEYDBG: OVERLAY STATE
-        // OPEN: ["find_replace"]`) with nothing painting on GTK. Unlike
-        // quickfix/panel_hover (#670) there *was* a dead painter to port —
-        // `draw.rs::draw_find_replace_popup` — but it routed through
-        // `Surface::FindReplace` with a rect the rasteriser ignores; calling
-        // `Backend::draw_find_replace` directly (same trait method TUI's
-        // `TuiShellApp::render_content` calls) is simpler and identical in
-        // effect. The GTK rasteriser positions the panel from its own
-        // `panel.group_bounds` (already absolute pixel coordinates — #550,
-        // same as TUI's absolute cell coordinates) and reads
-        // `current_line_height`/`current_char_width` off the backend
-        // (set once per frame by quadraui's GTK runner before
-        // `render_content` runs), so the `rect` argument here is unused by
-        // the GTK rasteriser too; passed for parity with the trait's
-        // signature and the TUI call site.
-        if let Some(ref find_replace) = screen.find_replace {
-            backend.draw_find_replace(popup_viewport, find_replace);
-        }
-
-        // ── Picker / command-palette overlay (#587) ───────────────────────────
-        // Same class of bug #546 fixed for dialog/context-menu: the palette was
-        // painted only by the dead legacy `draw_editor` Cairo path
-        // (`draw.rs::draw_picker_popup`), which has zero live callers under
-        // ShellApp. So `Ctrl+Shift+P` opened the picker in engine state
-        // (`picker_open = true`, items populated) but nothing ever painted — the
-        // "command palette fails to open silently" symptom. Geometry comes from
-        // the same generic helpers the legacy path used (`PickerGeometry` +
-        // `gtk_picker_sizing`), so no Pango/Cairo access is needed here.
-        //
-        // Drawn *before* dialog / context menu to match TUI's modal z-order
-        // (`tui_main/render_impl.rs`: picker at :940, context menu :983,
-        // dialog :1009) — the picker is the lowest of the modal overlays.
-        if let Some(ref picker) = screen.picker {
-            let has_preview = picker.preview.is_some();
-            let geo = render::PickerGeometry::compute(
-                popup_vp.width,
-                popup_vp.height,
-                has_preview,
-                &render::gtk_picker_sizing(lh as f32),
-            );
-            let palette = render::picker_panel_to_palette(picker);
-            let mut frame = QSL::new();
-            frame.push(Surface::Palette {
-                rect: quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h),
-                palette: &palette,
-            });
-            frame.draw(backend);
-            // Hand the *painted* rect to the click/drag handlers (#555).
-            self.picker_popup_rect.set(Some((
-                geo.popup_x as f64,
-                geo.popup_y as f64,
-                geo.popup_w as f64,
-                geo.popup_h as f64,
-            )));
-        } else {
-            self.picker_popup_rect.set(None);
-        }
-
-        // ── Tab switcher popup (Ctrl+Tab MRU list) (#671) ───────────────────
-        // `self.tab_switcher_popup_rect` already exists and is read by
-        // `handle_mouse_press`'s "Tab switcher modal arbitration" block
-        // (added ahead of this painter, expecting to be fed) — this is the
-        // first frame that actually sets it. Sizing/positioning ported from
-        // the dead `draw.rs::draw_tab_switcher_popup_list` (pixel-tuned
-        // clamp(350, 600) width, unlike TUI's percent-of-terminal-columns
-        // sizing, which wouldn't make sense in pixel space); content comes
-        // from the same shared `render::tab_switcher_to_quadraui_list_view`
-        // adapter TUI's `TuiShellApp::render_content` uses, through
-        // `Backend::draw_list`.
-        self.tab_switcher_popup_rect.set(None);
-        if let Some(ref ts) = screen.tab_switcher {
-            // #733: geometry comes from the shared `TabSwitcherGeometry`
-            // so the rect handed to `route_modal_overlay_click` below is
-            // the rect that was painted, and TUI resolves the identical
-            // popup through the same code with its own sizing constant.
-            if let Some(geo) = render::TabSwitcherGeometry::compute(
-                popup_viewport,
-                ts.items.len(),
-                &render::gtk_tab_switcher_sizing(lh as f32),
-            ) {
-                let list = render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
-                backend.draw_list(geo.bounds, &list);
-                self.tab_switcher_popup_rect.set(Some((
-                    geo.bounds.x as f64,
-                    geo.bounds.y as f64,
-                    geo.bounds.width as f64,
-                    geo.bounds.height as f64,
-                )));
-            }
-        }
-
-        // #727: a natively-expressible `screen.dialog` (no `DialogTable`,
-        // no text input — `quadraui::native_dialog_options` is the single
-        // source of truth for that split, no hand-maintained tag list here)
-        // goes through a real OS `AlertDialog` instead of this in-canvas
-        // primitive. Unlike this primitive, which is happily repainted every
-        // frame, a native dialog must be presented exactly once per open —
-        // `native_dialog_shown` is the edge-trigger: the first
-        // `render_content` call to see a given open queues the present (via
-        // `pending_native_dialog`, drained by `tick()` since the blocking
-        // `PlatformServices` call can't run from inside this paint callback,
-        // mirroring `PendingFileDialog` #572) and flips the flag; every
-        // subsequent call before the dialog closes just suppresses the
-        // in-canvas draw without re-queuing.
-        match screen
-            .dialog
-            .as_ref()
-            .map(render::dialog_panel_to_quadraui_dialog)
-        {
-            Some(dialog) => match quadraui::native_dialog_options(&dialog) {
-                Some(opts) => {
-                    if !self.native_dialog_shown.get() {
-                        self.native_dialog_shown.set(true);
-                        self.pending_native_dialog.set(Some(opts));
+        for op in render::OVERLAY_Z_ORDER {
+            match op {
+                // ── Menu dropdown overlay ────────────────────────────────────
+                // First rung of the band: `MenuSystem::render` repaints
+                // `draw_menu_bar` across the whole title-bar strip, so nothing
+                // that wants to survive may be drawn into that band before it.
+                // #735 moved the *modal* rungs above it (they used to paint
+                // underneath on GTK and on top on TUI) — a modal dialog now
+                // covers an open dropdown on both backends, matching
+                // `route_modal_overlay_click`'s own "a dialog eats everything"
+                // arbitration.
+                render::OverlayOp::MenuDropdown => {
+                    if !engine.menu_bar_visible {
+                        continue;
                     }
-                    *self.dialog_layout.borrow_mut() = None;
+                    self.paint_title_bar_band(
+                        backend,
+                        &engine,
+                        &theme,
+                        menu_row_rect,
+                        menu_items_rect,
+                        app_icon_rect,
+                        controls_rect,
+                    );
+                    painted_band.push(op);
                 }
-                None => {
-                    // Carries a `DialogTable` or text input (e.g. the
-                    // SSH-passphrase prompt) — no native alert facility
-                    // hosts either, so this stays in-canvas exactly as
-                    // before.
-                    let panel = screen.dialog.as_ref().expect("just matched Some above");
-                    let (dialog, dlayout) =
-                        render::dialog_generic_layout(panel, popup_viewport, cw, lh);
-                    let mut frame = QSL::new();
-                    frame.push(Surface::Dialog {
-                        dialog: &dialog,
-                        layout: &dlayout,
-                    });
-                    frame.draw(backend);
-                    *self.dialog_layout.borrow_mut() = Some(dlayout);
+
+                // ── Command Center: nav arrows + search box (#676) ────────────
+                // Painted *after* `menu_system.render()` above, which repaints
+                // `draw_menu_bar` across the entire `menu_row_rect` band and
+                // would erase anything drawn here first — the identical
+                // ordering hazard documented on the window controls (#552
+                // round-2/3 "buttons render blank"). This is the VS Code-style
+                // Command Center dropped by the #540 Relm4→ShellApp cutover and
+                // never re-wired: it used to live in the deleted `impl
+                // SimpleComponent for App` `view!` scaffolding. Cached into
+                // `engine.command_center_layout` for `handle()`'s click
+                // hit-test, mirroring TUI's `shell_app.rs` (#635 Stage 6b item
+                // A) and `mouse.rs`'s "Menu bar row click — command center
+                // only".
+                render::OverlayOp::CommandCenter => {
+                    if let Some(cc_rect) = command_center_rect.filter(|r| r.width >= 1.0) {
+                        let title = engine
+                            .cwd
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "VimCode".to_string());
+                        let cc = render::build_command_center_view(
+                            engine.tab_nav_can_go_back(),
+                            engine.tab_nav_can_go_forward(),
+                            &title,
+                        );
+                        let cc_layout = backend.draw_command_center(cc_rect, &cc);
+                        engine.command_center_layout.replace(Some(cc_layout));
+                        painted_band.push(op);
+                    } else {
+                        engine.command_center_layout.replace(None);
+                    }
                 }
-            },
-            None => {
-                self.native_dialog_shown.set(false);
-                *self.dialog_layout.borrow_mut() = None;
+
+                // ── Find/replace overlay (#671) ──────────────────────────────
+                // Confirmed by #592 to open in engine state (`KEYDBG: OVERLAY
+                // STATE OPEN: ["find_replace"]`) with nothing painting on GTK.
+                // Unlike quickfix/panel_hover (#670) there *was* a dead painter
+                // to port — `draw.rs::draw_find_replace_popup` — but it routed
+                // through `Surface::FindReplace` with a rect the rasteriser
+                // ignores; calling `Backend::draw_find_replace` directly (same
+                // trait method TUI's `TuiShellApp::render_content` calls) is
+                // simpler and identical in effect. The GTK rasteriser positions
+                // the panel from its own `panel.group_bounds` (already absolute
+                // pixel coordinates — #550, same as TUI's absolute cell
+                // coordinates) and reads `current_line_height` /
+                // `current_char_width` off the backend (set once per frame by
+                // quadraui's GTK runner before `render_content` runs), so the
+                // `rect` argument here is unused by the GTK rasteriser too;
+                // passed for parity with the trait's signature and the TUI call
+                // site.
+                render::OverlayOp::FindReplace => {
+                    if let Some(ref find_replace) = screen.find_replace {
+                        backend.draw_find_replace(popup_viewport, find_replace);
+                        painted_band.push(op);
+                    }
+                }
+
+                // ── Picker / command-palette overlay (#587) ──────────────────
+                // Same class of bug #546 fixed for dialog/context-menu: the
+                // palette was painted only by the dead legacy `draw_editor`
+                // Cairo path (`draw.rs::draw_picker_popup`), which has zero live
+                // callers under ShellApp. So `Ctrl+Shift+P` opened the picker in
+                // engine state (`picker_open = true`, items populated) but
+                // nothing ever painted — the "command palette fails to open
+                // silently" symptom. Geometry comes from the same generic
+                // helpers the legacy path used (`PickerGeometry` +
+                // `gtk_picker_sizing`), so no Pango/Cairo access is needed here.
+                render::OverlayOp::UnifiedPicker => {
+                    if let Some(ref picker) = screen.picker {
+                        let has_preview = picker.preview.is_some();
+                        let geo = render::PickerGeometry::compute(
+                            popup_vp.width,
+                            popup_vp.height,
+                            has_preview,
+                            &render::gtk_picker_sizing(lh as f32),
+                        );
+                        let palette = render::picker_panel_to_palette(picker);
+                        let mut frame = QSL::new();
+                        frame.push(Surface::Palette {
+                            rect: quadraui::Rect::new(
+                                geo.popup_x,
+                                geo.popup_y,
+                                geo.popup_w,
+                                geo.popup_h,
+                            ),
+                            palette: &palette,
+                        });
+                        frame.draw(backend);
+                        // Hand the *painted* rect to the click/drag handlers (#555).
+                        self.picker_popup_rect.set(Some((
+                            geo.popup_x as f64,
+                            geo.popup_y as f64,
+                            geo.popup_w as f64,
+                            geo.popup_h as f64,
+                        )));
+                        painted_band.push(op);
+                    } else {
+                        self.picker_popup_rect.set(None);
+                    }
+                }
+
+                // ── Tab switcher popup (Ctrl+Tab MRU list) (#671) ────────────
+                // `self.tab_switcher_popup_rect` already exists and is read by
+                // `handle_mouse_press`'s "Tab switcher modal arbitration" block
+                // (added ahead of this painter, expecting to be fed) — this is
+                // the first frame that actually sets it. Sizing/positioning
+                // ported from the dead `draw.rs::draw_tab_switcher_popup_list`
+                // (pixel-tuned clamp(350, 600) width, unlike TUI's
+                // percent-of-terminal-columns sizing, which wouldn't make sense
+                // in pixel space); content comes from the same shared
+                // `render::tab_switcher_to_quadraui_list_view` adapter TUI's
+                // `TuiShellApp::render_content` uses, through
+                // `Backend::draw_list`.
+                render::OverlayOp::TabSwitcher => {
+                    self.tab_switcher_popup_rect.set(None);
+                    if let Some(ref ts) = screen.tab_switcher {
+                        // #733: geometry comes from the shared
+                        // `TabSwitcherGeometry` so the rect handed to
+                        // `route_modal_overlay_click` below is the rect that was
+                        // painted, and TUI resolves the identical popup through
+                        // the same code with its own sizing constant.
+                        if let Some(geo) = render::TabSwitcherGeometry::compute(
+                            popup_viewport,
+                            ts.items.len(),
+                            &render::gtk_tab_switcher_sizing(lh as f32),
+                        ) {
+                            let list =
+                                render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
+                            backend.draw_list(geo.bounds, &list);
+                            self.tab_switcher_popup_rect.set(Some((
+                                geo.bounds.x as f64,
+                                geo.bounds.y as f64,
+                                geo.bounds.width as f64,
+                                geo.bounds.height as f64,
+                            )));
+                            painted_band.push(op);
+                        }
+                    }
+                }
+
+                // ── Context menu (#546) ──────────────────────────────────────
+                // The ShellApp render path never painted `screen.context_menu`
+                // at all — its draw + click-geometry cache was populated only by
+                // the dead legacy `draw_editor` Cairo path (src/gtk/draw.rs),
+                // which has zero live callers under ShellApp, leaving right-click
+                // menus invisible and unclickable. Drawn with only generic
+                // `Backend` metrics (`render::context_menu_generic_layout`,
+                // shared with TUI) since this fn has no raw Pango/Cairo access.
+                render::OverlayOp::ContextMenu => {
+                    match screen.context_menu.as_ref().filter(|p| !p.items.is_empty()) {
+                        Some(panel) => {
+                            let (menu, mlayout) = render::context_menu_generic_layout(
+                                panel,
+                                popup_viewport,
+                                cw,
+                                lh,
+                                0.0,
+                            );
+                            let mut frame = QSL::new();
+                            frame.push(Surface::ContextMenu {
+                                menu: &menu,
+                                layout: &mlayout,
+                            });
+                            frame.draw(backend);
+                            *self.context_menu_layout.borrow_mut() = Some(mlayout);
+                            painted_band.push(op);
+                        }
+                        None => *self.context_menu_layout.borrow_mut() = None,
+                    }
+                }
+
+                // ── Modal dialog (#546) ──────────────────────────────────────
+                // Same #546 story as the context menu above: invisible AND
+                // undismissable by mouse under ShellApp — `dialog.is_some()`
+                // stayed true forever and `handle_mouse_click_msg`'s dialog block
+                // swallowed all subsequent clicks. #735 moved it *above* the
+                // context menu (it used to paint underneath on GTK, and on top
+                // on TUI): a dialog is the surface `route_modal_overlay_click`
+                // hands every event to, so it must also be the surface the user
+                // can see.
+                //
+                // #727: a natively-expressible `screen.dialog` (no `DialogTable`,
+                // no text input — `quadraui::native_dialog_options` is the single
+                // source of truth for that split, no hand-maintained tag list
+                // here) goes through a real OS `AlertDialog` instead of this
+                // in-canvas primitive. Unlike this primitive, which is happily
+                // repainted every frame, a native dialog must be presented
+                // exactly once per open — `native_dialog_shown` is the
+                // edge-trigger: the first `render_content` call to see a given
+                // open queues the present (via `pending_native_dialog`, drained
+                // by `tick()` since the blocking `PlatformServices` call can't
+                // run from inside this paint callback, mirroring
+                // `PendingFileDialog` #572) and flips the flag; every subsequent
+                // call before the dialog closes just suppresses the in-canvas
+                // draw without re-queuing. A native dialog is *not* recorded in
+                // `painted_band`: nothing was composed into this frame.
+                render::OverlayOp::Dialog => {
+                    match screen
+                        .dialog
+                        .as_ref()
+                        .map(render::dialog_panel_to_quadraui_dialog)
+                    {
+                        Some(dialog) => match quadraui::native_dialog_options(&dialog) {
+                            Some(opts) => {
+                                if !self.native_dialog_shown.get() {
+                                    self.native_dialog_shown.set(true);
+                                    self.pending_native_dialog.set(Some(opts));
+                                }
+                                *self.dialog_layout.borrow_mut() = None;
+                            }
+                            None => {
+                                // Carries a `DialogTable` or text input (e.g. the
+                                // SSH-passphrase prompt) — no native alert
+                                // facility hosts either, so this stays in-canvas
+                                // exactly as before.
+                                let panel =
+                                    screen.dialog.as_ref().expect("just matched Some above");
+                                let (dialog, dlayout) =
+                                    render::dialog_generic_layout(panel, popup_viewport, cw, lh);
+                                let mut frame = QSL::new();
+                                frame.push(Surface::Dialog {
+                                    dialog: &dialog,
+                                    layout: &dlayout,
+                                });
+                                frame.draw(backend);
+                                *self.dialog_layout.borrow_mut() = Some(dlayout);
+                                painted_band.push(op);
+                            }
+                        },
+                        None => {
+                            self.native_dialog_shown.set(false);
+                            *self.dialog_layout.borrow_mut() = None;
+                        }
+                    }
+                }
+
+                // ── Toast overlay (#454) — top of the band ───────────────────
+                // Anchored to the full window viewport (matches TUI's
+                // `layout.window_bounds`), not just `main_content_bounds`, so it
+                // sits in the bottom-right corner of the whole app like the
+                // TUI/VSCode toasts. `Backend::draw_toast_stack` does its own
+                // pango measurement internally (unlike `dialog`/`context_menu`
+                // above, whose generic layout is computed vimcode-side), so its
+                // returned layout is the only source of truth — cached for
+                // `handle_mouse_click_msg`'s hit-test → `handle_toast_hit`
+                // dispatch, and the first rung `route_modal_overlay_click`
+                // arbitrates.
+                render::OverlayOp::ToastStack => {
+                    if let Some(stack) = render::build_toast_stack(&engine) {
+                        let toast_layout = backend.draw_toast_stack(popup_viewport, &stack);
+                        engine.toast_layout.replace(Some(toast_layout));
+                        painted_band.push(op);
+                    } else {
+                        engine.toast_layout.replace(None);
+                    }
+                }
             }
         }
 
-        if let Some(ref panel) = screen.context_menu {
-            if panel.items.is_empty() {
-                *self.context_menu_layout.borrow_mut() = None;
-            } else {
-                let (menu, mlayout) =
-                    render::context_menu_generic_layout(panel, popup_viewport, cw, lh, 0.0);
-                let mut frame = QSL::new();
-                frame.push(Surface::ContextMenu {
-                    menu: &menu,
-                    layout: &mlayout,
-                });
-                frame.draw(backend);
-                *self.context_menu_layout.borrow_mut() = Some(mlayout);
-            }
-        } else {
-            *self.context_menu_layout.borrow_mut() = None;
-        }
-
-        // ── Inline window controls (min/max/close) — draw LAST (#552) ─────────
-        // `menu_system.render()` above repaints `draw_menu_bar` across the full
-        // `menu_row_rect` band, so the controls must be painted *after* it or
-        // they get erased (the round-2/3 "buttons render blank" regression).
-        // The controls sit in the title-bar band, to the right of the menu
-        // labels; the dropdown body drops *below* the band, so painting here
-        // never covers an open dropdown.
-        if let Some(controls_rect) = controls_rect {
-            let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
-            let controls_bar = render::window_controls_status_bar(&theme, maximized);
-            let interaction = self.title_bar_interaction.borrow();
-            let hits = backend.draw_status_bar(
-                controls_rect,
-                &controls_bar,
-                interaction.hovered_id(),
-                interaction.pressed_id(),
-            );
-            interaction.set_layout(hits);
-        }
-
-        // ── Toast overlay (#454) — drawn LAST so it sits on top of ─────────────
-        // everything, including the window controls above. Anchored to the
-        // full window viewport (matches TUI's `frame.area()` in
-        // render_impl.rs), not just `main_content_bounds`, so it sits in the
-        // bottom-right corner of the whole app like the TUI/VSCode toasts.
-        // `Backend::draw_toast_stack` does its own pango measurement
-        // internally (unlike `dialog`/`context_menu` above, whose generic
-        // layout is computed vimcode-side), so its returned layout is the
-        // only source of truth — cache it for `handle_mouse_click_msg`'s
-        // hit-test → `handle_toast_hit` dispatch.
-        if let Some(stack) = render::build_toast_stack(&engine) {
-            let toast_layout = backend.draw_toast_stack(popup_viewport, &stack);
-            engine.toast_layout.replace(Some(toast_layout));
-        } else {
-            engine.toast_layout.replace(None);
+        *self.painted_overlay_band.borrow_mut() = painted_band;
+        // Read back through the field rather than the local, so the *stored*
+        // observable is what gets validated — a frame that recorded one thing
+        // and painted another would be a lie the tests then trusted.
+        if let Err(why) = render::check_overlay_band_order(&self.painted_overlay_band.borrow()) {
+            debug_assert!(false, "GTK {why}");
         }
     }
 

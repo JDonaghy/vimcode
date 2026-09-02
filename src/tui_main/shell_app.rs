@@ -427,6 +427,17 @@ pub(super) struct TuiShellApp {
     /// to `render::route_modal_overlay_click`; never recomputed at click
     /// time (#582 / #646).
     tab_switcher_popup_rect: RefCell<Option<quadraui::Rect>>,
+    /// The overlay rungs this frame actually painted, in paint order (#735).
+    ///
+    /// Written by the [`render::OVERLAY_Z_ORDER`] walk at the tail of
+    /// `render_content` — every arm that draws pushes its own
+    /// [`render::OverlayOp`], and arms that only clear a stale hit-test cache
+    /// do not. `App` (`gtk/mod.rs`) keeps the identical field for the identical
+    /// reason: it is the observable that makes "both backends compose the
+    /// overlay band in the same order" a thing a test can assert, rather than
+    /// something two hand-kept ladders promise each other in comments (they
+    /// promised, and they had drifted — twice; see `OVERLAY_Z_ORDER`).
+    painted_overlay_band: RefCell<Vec<render::OverlayOp>>,
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
@@ -576,6 +587,7 @@ impl TuiShellApp {
             context_menu_layout: RefCell::new(None),
             dialog_layout: RefCell::new(None),
             tab_switcher_popup_rect: RefCell::new(None),
+            painted_overlay_band: RefCell::new(Vec::new()),
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
@@ -1863,137 +1875,204 @@ impl ShellApp for TuiShellApp {
             backend.draw_palette(q_rect, &palette);
         }
 
-        // ── Find/replace overlay ─────────────────────────────────────────
-        // `find_replace.group_bounds` is already absolute terminal-screen
-        // space (#550), so the rect passed here only supplies the clip
-        // viewport — see `draw_frame`'s longer comment on the `editor_left`
-        // no-op translation.
-        if let Some(ref find_replace) = screen.find_replace {
-            let q_area = quadraui::Rect::new(
-                win_area.x as f32,
-                win_area.y as f32,
-                win_area.width as f32,
-                win_area.height as f32,
-            );
-            backend.draw_find_replace(q_area, find_replace);
-        }
-
-        // ── Unified picker modal ─────────────────────────────────────────
-        if let Some(ref picker) = screen.picker {
-            render_picker_popup(picker, win_area, &theme, backend);
-        }
-
-        // ── Tab switcher popup ───────────────────────────────────────────
-        // #733: geometry from the shared `TabSwitcherGeometry` (same
-        // `compute`, different sizing constant, as GTK), and the *painted*
-        // rect is cached for `handle_mouse`'s modal-overlay rung — before
-        // this the TUI had no tab-switcher mouse arm at all, so a click on
-        // the popup fell through to the editor underneath (#733).
-        *self.tab_switcher_popup_rect.borrow_mut() = None;
-        if let Some(ref ts) = screen.tab_switcher {
-            if let Some(geo) = render::TabSwitcherGeometry::compute(
-                quadraui::Rect::new(
-                    win_area.x as f32,
-                    win_area.y as f32,
-                    win_area.width as f32,
-                    win_area.height as f32,
-                ),
-                ts.items.len(),
-                &render::TUI_TAB_SWITCHER_SIZING,
-            ) {
-                let list = render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
-                backend.draw_list(geo.bounds, &list);
-                *self.tab_switcher_popup_rect.borrow_mut() = Some(geo.bounds);
-            }
-        }
-
-        // ── Context menu popup ───────────────────────────────────────────
-        // Painting this also closes the residual #602 seam noted in the
-        // module doc: `handle_mouse` receives `context_menu_layout` from the
-        // cell written here, so a click on a menu item now resolves to that
-        // item instead of falling through to "close the menu".
-        if let Some(ref ctx_menu) = screen.context_menu {
-            let inner_viewport = quadraui::Rect::new(
-                (win_area.x + 1) as f32,
-                (win_area.y + 1) as f32,
-                win_area.width.saturating_sub(2) as f32,
-                win_area.height.saturating_sub(2) as f32,
-            );
-            let inset_panel = render::ContextMenuPanel {
-                screen_col: ctx_menu.screen_col + 1,
-                screen_row: ctx_menu.screen_row + 1,
-                ..ctx_menu.clone()
-            };
-            let (menu, menu_layout) =
-                render::context_menu_generic_layout(&inset_panel, inner_viewport, 1.0, 1.0, 1.0);
-            let _ = backend.draw_context_menu(&menu, &menu_layout);
-            *self.context_menu_layout.borrow_mut() = Some(menu_layout);
-        } else {
-            *self.context_menu_layout.borrow_mut() = None;
-        }
-
-        // ── Modal dialog ─────────────────────────────────────────────────
-        if let Some(ref dialog) = screen.dialog {
-            let viewport = quadraui::Rect::new(
-                win_area.x as f32,
-                win_area.y as f32,
-                win_area.width as f32,
-                win_area.height as f32,
-            );
-            let (q_dialog, dlg_layout) = render::dialog_generic_layout(dialog, viewport, 1.0, 1.0);
-            let _ = backend.draw_dialog(&q_dialog, &dlg_layout);
-            *self.dialog_layout.borrow_mut() = Some(dlg_layout);
-        } else {
-            *self.dialog_layout.borrow_mut() = None;
-        }
-
-        // ── Menu dropdown (#635, Stage 6b item A) — rendered after the
-        // dialog so it draws on top of everything below it, mirroring
-        // `draw_frame`'s own "rendered last so it draws on top of
-        // everything" comment on this exact block (`render_impl.rs`, right
-        // before the toast overlay). `MenuSystem::render` was already a
-        // trait call; the only reason this couldn't paint before was the
-        // same missing `layout.title_bar_bounds` reservation the menu bar
-        // block above now provides. #695: read the same
-        // `engine.menu_bar_rect` cache the bar-paint block above just wrote,
-        // rather than re-reading `layout.title_bar_bounds` a second time —
-        // one write, every reader downstream (paint and hit-test alike)
-        // consumes it verbatim.
-        if self.engine.menu_bar_visible {
-            let bar_rect = self.engine.menu_bar_rect.get();
-            if bar_rect.width >= 1.0 && bar_rect.height >= 1.0 {
-                self.engine.menu_system.borrow().render(backend, bar_rect);
-            }
-        }
-
-        // ── Command centre (#635 Stage 6b item A, #712) ───────────────────
-        // Painted *after* `menu_system.render()` above, which repaints
-        // `draw_menu_bar` across the entire `bar_rect` band and would erase
-        // anything drawn here first — see `pending_command_center`'s own
-        // comment (menu-bar block, top of this function) for the full
-        // story and the matching GTK ordering (`gtk/mod.rs`'s "#676:
-        // painted *after* `menu_system.render()`"). `None` both when the
-        // bar is hidden and when this frame's reserved row was degenerate
-        // (zero width/height) — either way `command_center_layout` must
-        // agree with what actually got painted, not linger with last
-        // frame's stale layout (mouse.rs's hit test reads this cache
-        // directly).
-        self.engine.command_center_layout.replace(
-            pending_command_center.map(|(cc_rect, cc)| backend.draw_command_center(cc_rect, &cc)),
+        // ══ Overlay band (#735 slice 1) ══════════════════════════════════
+        //
+        // Composed from `render::OVERLAY_Z_ORDER` — the single ordered
+        // artefact both backends walk, replacing the two hand-kept
+        // transcriptions that had already inverted twice against each other
+        // (see that constant's own comment for the two inversions and which
+        // order won). Geometry stays here, in cells, because that is the
+        // genuine per-backend difference; only the *order* moved.
+        //
+        // Two rungs of this ladder moved as a result:
+        //
+        //   * the **menu dropdown and command centre** used to paint *last*,
+        //     on top of the modals. They are title-bar chrome, and a modal
+        //     dialog covering them is what "modal" means — GTK already had
+        //     them below, so #735 took GTK's placement.
+        //   * the **dialog** used to paint below the context menu on GTK.
+        //     TUI already had it above, which is the order
+        //     `route_modal_overlay_click` itself arbitrates, so #735 took
+        //     TUI's placement. This side is unchanged.
+        //
+        // Not part of the shared band, and deliberately left above it: TUI's
+        // folder/workspace picker (GTK's equivalent is a *native* GTK file
+        // chooser deferred through `PendingFileDialog` and run from `tick()`,
+        // so it is not a canvas rung at all).
+        //
+        // Every arm gates itself and, when it paints, pushes its rung onto
+        // `painted_band`. Arms whose surface is absent still run — several own
+        // a hit-test cache (`tab_switcher_popup_rect`, `context_menu_layout`,
+        // `dialog_layout`, `command_center_layout`, `toast_layout`) that must
+        // be *cleared* on the frame the surface disappears, or the next click
+        // resolves against last frame's geometry (the #587 class of bug).
+        let win_q = quadraui::Rect::new(
+            win_area.x as f32,
+            win_area.y as f32,
+            win_area.width as f32,
+            win_area.height as f32,
         );
+        let mut painted_band: Vec<render::OverlayOp> = Vec::new();
 
-        // ── Toast overlay (#450) — last, so it sits on top of everything ─
-        if let Some(stack) = render::build_toast_stack(&self.engine) {
-            let q_toast_area = quadraui::Rect::new(
-                win_area.x as f32,
-                win_area.y as f32,
-                win_area.width as f32,
-                win_area.height as f32,
-            );
-            let toast_layout = backend.draw_toast_stack(q_toast_area, &stack);
-            self.engine.toast_layout.replace(Some(toast_layout));
-        } else {
-            self.engine.toast_layout.replace(None);
+        for op in render::OVERLAY_Z_ORDER {
+            match op {
+                // ── Menu dropdown (#635, Stage 6b item A) ────────────────
+                // `MenuSystem::render` repaints `draw_menu_bar` across the
+                // whole reserved row, so nothing that wants to survive may be
+                // drawn into that row before it — which is exactly why this is
+                // the *first* rung and `CommandCenter` is the second. #695:
+                // read the same `engine.menu_bar_rect` cache the measure-only
+                // block at the top of this function wrote, rather than
+                // re-reading `layout.title_bar_bounds` a second time — one
+                // write, every reader downstream (paint and hit-test alike)
+                // consumes it verbatim.
+                render::OverlayOp::MenuDropdown => {
+                    if self.engine.menu_bar_visible {
+                        let bar_rect = self.engine.menu_bar_rect.get();
+                        if bar_rect.width >= 1.0 && bar_rect.height >= 1.0 {
+                            self.engine.menu_system.borrow().render(backend, bar_rect);
+                            painted_band.push(op);
+                        }
+                    }
+                }
+
+                // ── Command centre (#635 Stage 6b item A, #712) ───────────
+                // Painted *after* `menu_system.render()` above, which repaints
+                // `draw_menu_bar` across the entire `bar_rect` band and would
+                // erase anything drawn here first — see
+                // `pending_command_center`'s own comment (menu-bar block, top
+                // of this function) for the full story and the matching GTK
+                // ordering (`gtk/mod.rs`'s "#676: painted *after*
+                // `menu_system.render()`"). `None` both when the bar is hidden
+                // and when this frame's reserved row was degenerate (zero
+                // width/height) — either way `command_center_layout` must
+                // agree with what actually got painted, not linger with last
+                // frame's stale layout (mouse.rs's hit test reads this cache
+                // directly).
+                render::OverlayOp::CommandCenter => {
+                    let painted = pending_command_center
+                        .take()
+                        .map(|(cc_rect, cc)| backend.draw_command_center(cc_rect, &cc));
+                    if painted.is_some() {
+                        painted_band.push(op);
+                    }
+                    self.engine.command_center_layout.replace(painted);
+                }
+
+                // ── Find/replace overlay ─────────────────────────────────
+                // `find_replace.group_bounds` is already absolute
+                // terminal-screen space (#550), so the rect passed here only
+                // supplies the clip viewport.
+                render::OverlayOp::FindReplace => {
+                    if let Some(ref find_replace) = screen.find_replace {
+                        backend.draw_find_replace(win_q, find_replace);
+                        painted_band.push(op);
+                    }
+                }
+
+                // ── Unified picker modal ─────────────────────────────────
+                render::OverlayOp::UnifiedPicker => {
+                    if let Some(ref picker) = screen.picker {
+                        render_picker_popup(picker, win_area, &theme, backend);
+                        painted_band.push(op);
+                    }
+                }
+
+                // ── Tab switcher popup ───────────────────────────────────
+                // #733: geometry from the shared `TabSwitcherGeometry` (same
+                // `compute`, different sizing constant, as GTK), and the
+                // *painted* rect is cached for `handle_mouse`'s modal-overlay
+                // rung — before this the TUI had no tab-switcher mouse arm at
+                // all, so a click on the popup fell through to the editor
+                // underneath (#733).
+                render::OverlayOp::TabSwitcher => {
+                    *self.tab_switcher_popup_rect.borrow_mut() = None;
+                    if let Some(ref ts) = screen.tab_switcher {
+                        if let Some(geo) = render::TabSwitcherGeometry::compute(
+                            win_q,
+                            ts.items.len(),
+                            &render::TUI_TAB_SWITCHER_SIZING,
+                        ) {
+                            let list =
+                                render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
+                            backend.draw_list(geo.bounds, &list);
+                            *self.tab_switcher_popup_rect.borrow_mut() = Some(geo.bounds);
+                            painted_band.push(op);
+                        }
+                    }
+                }
+
+                // ── Context menu popup ───────────────────────────────────
+                // Painting this also closes the residual #602 seam noted in
+                // the module doc: `handle_mouse` receives `context_menu_layout`
+                // from the cell written here, so a click on a menu item now
+                // resolves to that item instead of falling through to "close
+                // the menu".
+                render::OverlayOp::ContextMenu => {
+                    match screen.context_menu.as_ref().filter(|p| !p.items.is_empty()) {
+                        Some(ctx_menu) => {
+                            let inner_viewport = quadraui::Rect::new(
+                                (win_area.x + 1) as f32,
+                                (win_area.y + 1) as f32,
+                                win_area.width.saturating_sub(2) as f32,
+                                win_area.height.saturating_sub(2) as f32,
+                            );
+                            let inset_panel = render::ContextMenuPanel {
+                                screen_col: ctx_menu.screen_col + 1,
+                                screen_row: ctx_menu.screen_row + 1,
+                                ..ctx_menu.clone()
+                            };
+                            let (menu, menu_layout) = render::context_menu_generic_layout(
+                                &inset_panel,
+                                inner_viewport,
+                                1.0,
+                                1.0,
+                                1.0,
+                            );
+                            let _ = backend.draw_context_menu(&menu, &menu_layout);
+                            *self.context_menu_layout.borrow_mut() = Some(menu_layout);
+                            painted_band.push(op);
+                        }
+                        None => *self.context_menu_layout.borrow_mut() = None,
+                    }
+                }
+
+                // ── Modal dialog ─────────────────────────────────────────
+                // Above the context menu, matching
+                // `route_modal_overlay_click`'s own arbitration: once a dialog
+                // is open it takes every event, so it must also be the surface
+                // the user can see. GTK painted it *underneath* until #735.
+                render::OverlayOp::Dialog => {
+                    if let Some(ref dialog) = screen.dialog {
+                        let (q_dialog, dlg_layout) =
+                            render::dialog_generic_layout(dialog, win_q, 1.0, 1.0);
+                        let _ = backend.draw_dialog(&q_dialog, &dlg_layout);
+                        *self.dialog_layout.borrow_mut() = Some(dlg_layout);
+                        painted_band.push(op);
+                    } else {
+                        *self.dialog_layout.borrow_mut() = None;
+                    }
+                }
+
+                // ── Toast overlay (#450) — top of the band ───────────────
+                render::OverlayOp::ToastStack => {
+                    if let Some(stack) = render::build_toast_stack(&self.engine) {
+                        let toast_layout = backend.draw_toast_stack(win_q, &stack);
+                        self.engine.toast_layout.replace(Some(toast_layout));
+                        painted_band.push(op);
+                    } else {
+                        self.engine.toast_layout.replace(None);
+                    }
+                }
+            }
+        }
+
+        *self.painted_overlay_band.borrow_mut() = painted_band;
+        // Read back through the field rather than the local, so the *stored*
+        // observable is what gets validated — a frame that recorded one thing
+        // and painted another would be a lie the tests then trusted.
+        if let Err(why) = render::check_overlay_band_order(&self.painted_overlay_band.borrow()) {
+            debug_assert!(false, "TUI {why}");
         }
 
         // ── Cache the painted layout for mouse hit-testing (#634) ────────
