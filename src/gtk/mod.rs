@@ -1941,9 +1941,22 @@ impl App {
             self.engine.borrow_mut().prepare_paste_clipboard(text);
         }
 
-        // Activity bar keyboard navigation: j/k move cursor, l/Enter activate,
-        // h/Esc return focus to the editor.
-        if self.engine.borrow().activity_bar_focused && !self.engine.borrow().picker_open {
+        // ── Shared focus-owner keyboard rung (#757 / #734 slice 2) ─────
+        // `render::route_focus_key` states the activity-bar → sidebar-panel
+        // ladder once for both backends; GTK used to hand-roll it as a chain
+        // of `if engine.*_has_focus` blocks that disagreed with TUI's chain in
+        // four ways, all enumerated (with the resolution) at `route_focus_key`.
+        // GTK keeps no "the sidebar band holds the keyboard" latch of its own,
+        // so it passes `Engine::sidebar_has_focus()` — the disjunction of the
+        // very flags the resolver's arms test, making that gate a no-op here
+        // and preserving GTK's per-flag behaviour exactly.
+        let focus_route = {
+            let engine = self.engine.borrow();
+            let band = engine.sidebar_has_focus();
+            render::route_focus_key(&engine, band)
+        };
+
+        if focus_route == render::FocusKeyRoute::ActivityBar {
             self.handle_activity_bar_key(&key_name, ctrl);
             self.draw_needed.set(true);
             return;
@@ -1965,124 +1978,99 @@ impl App {
             }
         }
 
-        // Route keys to sidebar handlers when a sidebar has focus.
-        // GTK focus on sidebar DrawingAreas is unreliable, so we check
-        // the engine focus flags here (same approach as TUI backend).
-
-        // Explorer keys used to be routed through a per-DrawingArea key
-        // controller when the DA had focus (#732 retired the `Msg` variant it
-        // sent; nothing has produced it since #540). This is the only live
-        // path: it catches keys via the engine's own focus flag, which does
-        // not depend on GTK widget focus (grab_focus is unreliable for
-        // DrawingAreas).
-        if self.engine.borrow().explorer_has_focus {
-            let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
-            self.handle_explorer_da_key(key_mapped, unicode, ctrl);
-            self.draw_needed.set(true);
-            return;
-        }
-
-        {
-            let mut engine = self.engine.borrow_mut();
-            if engine.ext_panel_has_focus {
+        // GTK focus on sidebar DrawingAreas is unreliable (grab_focus does not
+        // stick), so the engine focus flags the resolver read above are the
+        // only truth — the same approach the TUI backend uses. Each arm yields
+        // `Some(panel_still_focused)` for the shared epilogue below, replacing
+        // seven verbatim copies of it. The `if engine.dialog.is_some()`
+        // patch-up the Debug and AI arms used to open with is gone: it
+        // re-stated the dialog rung `render::route_modal_key` now resolves at
+        // the top of this function, so it was unreachable.
+        let panel_still_focused: Option<bool> = match focus_route {
+            render::FocusKeyRoute::ExtPanel => {
+                let mut engine = self.engine.borrow_mut();
                 let mapped = map_gtk_key_name(key_name.as_str());
                 if engine.ext_panel_input_active {
                     engine.handle_ext_panel_input_key(mapped, false, unicode);
                 } else {
                     engine.handle_ext_panel_key(mapped, false, unicode);
                 }
-                let still_focused = engine.ext_panel_has_focus;
-                let has_dialog = engine.dialog.is_some();
-                drop(engine);
                 // h/Left moves focus to the activity bar; other exits go to the editor.
-                self.focus_after_sidebar_key(still_focused && !has_dialog);
+                let outcome = engine.ext_panel_has_focus && engine.dialog.is_none();
+                drop(engine);
                 self.sync_plus_register_to_clipboard();
-                self.draw_needed.set(true);
-                return;
+                Some(outcome)
             }
-            if engine.ext_sidebar_has_focus {
+            render::FocusKeyRoute::ExtSidebar => {
+                let mut engine = self.engine.borrow_mut();
                 let mapped = map_gtk_key_name(key_name.as_str());
                 engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
-                let still_focused = engine.ext_sidebar_has_focus;
-                let has_dialog = engine.dialog.is_some();
-                drop(engine);
-                self.focus_after_sidebar_key(still_focused && !has_dialog);
-                self.draw_needed.set(true);
-                return;
+                Some(engine.ext_sidebar_has_focus && engine.dialog.is_none())
             }
-            if engine.settings_has_focus {
+            render::FocusKeyRoute::Settings => {
+                let mut engine = self.engine.borrow_mut();
                 let mapped = map_gtk_key_name(key_name.as_str());
                 engine.handle_settings_key(mapped, ctrl, unicode);
-                let still_focused = engine.settings_has_focus;
-                let has_dialog = engine.dialog.is_some();
-                drop(engine);
-                self.focus_after_sidebar_key(still_focused && !has_dialog);
-                self.draw_needed.set(true);
-                return;
+                Some(engine.settings_has_focus && engine.dialog.is_none())
             }
-            if engine.search_has_focus {
+            render::FocusKeyRoute::Search => {
+                let mut engine = self.engine.borrow_mut();
                 let mapped = map_gtk_key_name(key_name.as_str());
-                // Ctrl+V no longer reaches here: quadraui's runner
-                // intercepts it and delivers `UiEvent::ClipboardPaste`
-                // straight to `ShellApp::handle`, which routes through
-                // `Engine::route_paste` (covers the search/replace
-                // fields too) before any key event is dispatched (#593).
+                // Ctrl+V no longer reaches here: quadraui's runner intercepts
+                // it and delivers `UiEvent::ClipboardPaste` straight to
+                // `ShellApp::handle`, which routes through
+                // `Engine::route_paste` (covering the search/replace fields)
+                // before any key event is dispatched (#593).
                 engine.dispatch_search_sidebar_key_unified(mapped, ctrl, alt, unicode);
-                let still_focused = engine.search_has_focus;
-                drop(engine);
-                self.focus_after_sidebar_key(still_focused);
-                self.draw_needed.set(true);
-                return;
+                Some(engine.search_has_focus)
             }
-            if engine.sc_has_focus {
+            render::FocusKeyRoute::SourceControl => {
+                let mut engine = self.engine.borrow_mut();
                 let (mapped, sc_unicode) = map_gtk_key_with_unicode(key_name.as_str());
                 engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, sc_unicode);
-                let still_focused = engine.sc_has_focus;
-                drop(engine);
-                self.focus_after_sidebar_key(still_focused);
-                self.draw_needed.set(true);
-                return;
+                Some(engine.sc_has_focus)
             }
-            if engine.dap_sidebar_has_focus {
-                if engine.dialog.is_some() {
-                    engine.handle_key(&key_name, unicode, ctrl);
+            render::FocusKeyRoute::Debug => {
+                let mut engine = self.engine.borrow_mut();
+                let mapped = map_gtk_key_name(key_name.as_str());
+                let rect = engine.dap_sidebar_body_rect.get();
+                render::populate_dap_sidebar_system(&engine);
+                let consumed = if let Some(ui_event) = gtk_key_name_to_quadraui(mapped, ctrl) {
+                    let backend_rc = self.backend.clone();
+                    let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                        &ui_event,
+                        &mut *backend_rc.borrow_mut(),
+                        rect,
+                    );
+                    engine.dispatch_dap_sidebar_event(sidebar_event)
                 } else {
-                    let mapped = map_gtk_key_name(key_name.as_str());
-                    let rect = engine.dap_sidebar_body_rect.get();
-                    render::populate_dap_sidebar_system(&engine);
-                    let consumed = if let Some(ui_event) = gtk_key_name_to_quadraui(mapped, ctrl) {
-                        let backend_rc = self.backend.clone();
-                        let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
-                            &ui_event,
-                            &mut *backend_rc.borrow_mut(),
-                            rect,
-                        );
-                        engine.dispatch_dap_sidebar_event(sidebar_event)
-                    } else {
-                        false
-                    };
-                    if !consumed {
-                        engine.dispatch_dap_sidebar_action_key(mapped);
-                    }
+                    false
+                };
+                if !consumed {
+                    engine.dispatch_dap_sidebar_action_key(mapped);
                 }
-                let still_focused = engine.dap_sidebar_has_focus;
-                drop(engine);
-                self.focus_after_sidebar_key(still_focused);
+                Some(engine.dap_sidebar_has_focus)
+            }
+            render::FocusKeyRoute::Ai => {
+                let mut engine = self.engine.borrow_mut();
+                engine.handle_ai_panel_key(&key_name, ctrl, unicode);
+                Some(engine.ai_has_focus)
+            }
+            render::FocusKeyRoute::Explorer => {
+                // Explorer keys used to be routed through a per-DrawingArea
+                // key controller when the DA had focus (#732 retired the
+                // `Msg` variant it sent; nothing has produced it since #540).
+                let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
+                self.handle_explorer_da_key(key_mapped, unicode, ctrl);
                 self.draw_needed.set(true);
                 return;
             }
-            if engine.ai_has_focus {
-                if engine.dialog.is_some() {
-                    engine.handle_key(&key_name, unicode, ctrl);
-                } else {
-                    engine.handle_ai_panel_key(&key_name, ctrl, unicode);
-                }
-                let still_focused = engine.ai_has_focus;
-                drop(engine);
-                self.focus_after_sidebar_key(still_focused);
-                self.draw_needed.set(true);
-                return;
-            }
+            render::FocusKeyRoute::ActivityBar | render::FocusKeyRoute::None => None,
+        };
+        if let Some(still_focused) = panel_still_focused {
+            self.focus_after_sidebar_key(still_focused);
+            self.draw_needed.set(true);
+            return;
         }
 
         // Hover popup copy: intercept y/Ctrl-C when hover is focused so the
@@ -4529,40 +4517,31 @@ impl App {
         }
     }
 
-    /// Handle a key press while the activity bar has keyboard focus.
-    /// j/k move the cursor, l/Enter activates, h/Esc returns to the editor.
+    /// Handle a key press while the activity bar has keyboard focus. The key
+    /// table itself is shared (`render::activity_bar_key_action`); this is the
+    /// GTK sink for the actions it names.
     fn handle_activity_bar_key(&mut self, key_name: &str, ctrl: bool) {
-        let mapped = map_gtk_key_name(key_name);
-        match mapped {
-            "j" | "Down" => {
-                self.engine.borrow_mut().activity_bar_move_down();
-            }
-            "k" | "Up" => {
-                self.engine.borrow_mut().activity_bar_move_up();
-            }
-            "l" | "Right" | "Return" if !ctrl => {
+        use render::ActivityBarKeyAction;
+        match render::activity_bar_key_action(map_gtk_key_name(key_name), ctrl) {
+            ActivityBarKeyAction::MoveDown => self.engine.borrow_mut().activity_bar_move_down(),
+            ActivityBarKeyAction::MoveUp => self.engine.borrow_mut().activity_bar_move_up(),
+            ActivityBarKeyAction::Activate => {
                 use crate::core::engine::sidebar::ActivityBarActivation;
                 let activation = self.engine.borrow_mut().activity_bar_activate();
                 match activation {
-                    ActivityBarActivation::MenuToggled => {
-                        // Menu bar is repainted every frame by
-                        // `render_content`'s `ShellApp` path (no dedicated
-                        // overlay DA to invalidate under the #540 cutover).
-                        self.draw_needed.set(true);
-                    }
-                    ActivityBarActivation::PanelFocused => {
-                        self.sync_sidebar_from_engine();
-                    }
-                    ActivityBarActivation::ExtPanelFocused(_) => {
+                    // The menu bar is repainted every frame by
+                    // `render_content`'s `ShellApp` path (no dedicated overlay
+                    // DA to invalidate under the #540 cutover).
+                    ActivityBarActivation::MenuToggled => self.draw_needed.set(true),
+                    ActivityBarActivation::PanelFocused
+                    | ActivityBarActivation::ExtPanelFocused(_) => {
                         self.sync_sidebar_from_engine();
                     }
                     ActivityBarActivation::NoOp => {}
                 }
             }
-            "h" | "Left" | "Escape" if !ctrl => {
-                self.engine.borrow_mut().activity_bar_focus_out();
-            }
-            "q" => {
+            ActivityBarKeyAction::FocusOut => self.engine.borrow_mut().activity_bar_focus_out(),
+            ActivityBarKeyAction::Collapse => {
                 let mut engine = self.engine.borrow_mut();
                 engine.activity_bar_focus_out();
                 engine.app_shell.hide_sidebar();
@@ -4570,7 +4549,7 @@ impl App {
                 engine.session.explorer_visible = false;
                 let _ = engine.session.save();
             }
-            _ => {}
+            ActivityBarKeyAction::Ignore => {}
         }
         // Suppress the default engine key handler — key is consumed.
     }

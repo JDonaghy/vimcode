@@ -218,7 +218,7 @@
 //! completion-popup state internally), plus — #635 (Stage 6b, item D) —
 //! activity-bar-focused and command-output-selection (`cmd_sel`) tiers, and
 //! — #634 (Stage 6) — the sidebar-focused tier
-//! ([`handle_sidebar_focused_key`]), terminal/PTY key routing, the
+//! ([`handle_focus_owner_key`]), terminal/PTY key routing, the
 //! Alt-modifier block, clipboard paste pre-load, Ctrl+Shift+V, the
 //! Shift+F5/F11 debug shortcuts and the post-key epilogue. See
 //! `handle_key_pressed`'s own doc comment for the exact precedence chain and
@@ -309,7 +309,7 @@
 //! dispatchers (search / debug / plugin extension panel / extensions /
 //! settings / AI / source control / explorer) plus its own context-menu
 //! intercept and Ctrl-W navigation, `mod.rs:1886`-`:2415` — landed in #634
-//! as [`handle_sidebar_focused_key`], since the cutover would otherwise
+//! as [`handle_focus_owner_key`], since the cutover would otherwise
 //! have dropped every one of those keys through to the general
 //! `Engine::handle_key` fallback.
 //!
@@ -3050,104 +3050,80 @@ fn dispatch_panel_accelerator_sizeless(
     }
 }
 
-/// Route a `KeyPressed` event through `Engine::handle_key`, replicating four
-/// of `event_loop()`'s precedence tiers for it (`mod.rs:1629`-`:2737`) —
-/// see the "Not ported" note below for the tiers this function deliberately
-/// skips:
+/// The [`render::FocusKeyRoute::ActivityBar`] arm of
+/// [`handle_focus_owner_key`], split out so the panel arms read as one ladder.
+/// Same table as GTK's `handle_activity_bar_key`; the TUI-local halves are
+/// `TuiSidebar::{has_focus, ext_panel_name}` and closing the quadraui
+/// `MenuSystem`, which needs the `&mut dyn Backend`.
+fn handle_activity_bar_focused_key(
+    key_event: KeyEvent,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    backend: &mut dyn quadraui::Backend,
+) -> Reaction {
+    use render::ActivityBarKeyAction;
+    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+    let key = match key_event.code {
+        KeyCode::Char(c) => c.to_string(),
+        code => tui_key_to_engine_name(code).unwrap_or("").to_string(),
+    };
+    match render::activity_bar_key_action(&key, ctrl) {
+        ActivityBarKeyAction::MoveDown => engine.activity_bar_move_down(),
+        ActivityBarKeyAction::MoveUp => engine.activity_bar_move_up(),
+        ActivityBarKeyAction::Activate => {
+            use crate::core::engine::sidebar::ActivityBarActivation;
+            match engine.activity_bar_activate() {
+                ActivityBarActivation::MenuToggled => {
+                    if !engine.menu_bar_visible {
+                        engine.menu_system.borrow_mut().close(backend);
+                    }
+                }
+                ActivityBarActivation::PanelFocused => {
+                    sidebar.ext_panel_name = None;
+                    sidebar.has_focus = true;
+                }
+                ActivityBarActivation::ExtPanelFocused(name) => {
+                    sidebar.ext_panel_name = Some(name);
+                    sidebar.has_focus = true;
+                }
+                ActivityBarActivation::NoOp => {}
+            }
+        }
+        ActivityBarKeyAction::FocusOut => engine.activity_bar_focus_out(),
+        ActivityBarKeyAction::Collapse => {
+            engine.activity_bar_focus_out();
+            engine.app_shell.hide_sidebar();
+            engine.clear_sidebar_focus();
+            sidebar.has_focus = false;
+            engine.session.explorer_visible = false;
+            let _ = engine.session.save();
+        }
+        ActivityBarKeyAction::Ignore => {}
+    }
+    Reaction::Redraw
+}
+
+/// The focus-owner keyboard *sink*: TUI's half of the rung
+/// [`render::route_focus_key`] resolves (#757 / #734 slice 2), which is where
+/// the ladder — and the four cross-backend divergences it used to hide — is
+/// now stated. This function only performs the per-panel dispatch, which stays
+/// backend-side because every arm needs TUI plumbing (the crossterm `KeyCode`
+/// → engine-key-name tables, `TuiSidebar`, the `&mut dyn Backend` the DAP
+/// panel's `SidebarSystem::handle` re-dispatch takes) — the same split
+/// `route_modal_key` made for `ModalKeyRoute::ContextMenu`.
 ///
-/// 1. **Modal dialog** (`mod.rs:1629`-`:1651`) intercepts *all* keys —
-///    checked first and returns unconditionally, exactly like the legacy
-///    loop's own early `continue`.
-/// 2. **Folder picker modal** (`mod.rs:1653`-`:1708`) — checked next,
-///    ahead of context-menu/general-fallback, because it operates purely
-///    on `folder_picker: &mut Option<FolderPickerState>` (mirroring how
-///    `sidebar`/`context_menu` state is already threaded through) and,
-///    like the modal dialog above, must intercept every key once open —
-///    type-to-filter, Up/Down/j/k, Enter, Esc, `-`, Backspace — so they
-///    never fall through to `Engine::handle_key` and get misinterpreted as
-///    Normal/Insert-mode editor input.
-/// 3. **Context menu** (`mod.rs:2703`-`:2706`) — checked ahead of
-///    `Engine::handle_key`, even though `Engine::handle_key` has its own
-///    context-menu branch (`keys.rs:66`-`:71`), because the engine's copy
-///    only consumes the key and discards the resulting action. This
-///    function's copy dispatches that action to
-///    [`handle_explorer_context_action`] (new_file/rename/delete/
-///    open_terminal/find_in_folder/…), which needs TUI-local state
-///    (`sidebar`, terminal size) `Engine::handle_key` has no access to.
-/// 4. **General fallback** (`mod.rs:2637`-`:2737`) — this is also where
-///    command-palette (`picker_open`) and completion-popup
-///    (`completion_idx`) keys land: `Engine::handle_key` already resolves
-///    both internally (see `keys.rs`'s own precedence chain), so this
-///    function's job for those two is purely getting the key there,
-///    then unpacking the `EngineAction` side effects `Engine::handle_key`
-///    can't perform itself because they need backend-supplied terminal
-///    size or TUI-local state (`folder_picker`, `sidebar`): open terminal,
-///    toggle-maximize, run-in-terminal, folder/workspace/recent dialogs,
-///    quit confirmation.
+/// **Unconditionally terminal:** every arm returns, and `Explorer` is the
+/// resolver's fallback rather than a guarded arm, so a key reaching here never
+/// falls through to the editor tier.
 ///
-/// **#635 (Stage 6b item D) ported two of the three tiers `mod.rs:1629`-
-/// `:2737` used to leave out:** the activity-bar-focused tier (mirrors
-/// `mod.rs:1805`-`:1854` — `j`/`k`/`l`/`h`/`Enter`/`Esc`/`q` while
-/// `engine.activity_bar_focused`, reachable now that gap 2/mouse is closed
-/// by #602 and sets that flag for real) and command-output-selection
-/// (`cmd_sel` — mirrors `mod.rs:2651`-`:2701`: Ctrl+C copies the selected
-/// message/command-line substring via `tui_copy_to_clipboard`, any other
-/// key clears it; `cmd_sel` itself was already populated by mouse drag and
-/// painted by `panels::render_command_line`, so this closes the keyboard
-/// side only).
-///
-/// **Still not ported:** the sidebar-focused tier (`mod.rs:1856`-`:2385` —
-/// per-panel keyboard dispatch for search/debug/extension-panel/source-
-/// control/explorer while `sidebar.has_focus`, plus its own nested
-/// context-menu intercept and Ctrl-W toolbar/panel/editor navigation). At
-/// ~500 lines across five nested per-panel dispatchers it's an order of
-/// magnitude larger than the other two tiers and wasn't safely portable in
-/// the same pass; left as the one open item from Stage 6b's item D. Until
-/// it lands, a key press while `sidebar.has_focus` is true falls through
-/// to the general `Engine::handle_key` fallback below, same as before this
-/// stage — no regression, just the pre-existing gap narrowed rather than
-/// closed.
-///
-/// Translates the backend-neutral `Key`/`Modifiers` into the
-/// `(key_name, unicode, ctrl)` shape `Engine::handle_key` expects by
-/// reusing the legacy `translate_key` — synthesizing a crossterm
-/// `KeyEvent` via quadraui's own `synth_keyevent` first, the same
-/// `UiEvent -> crossterm::Event` round trip `event_loop()`'s live loop
-/// already performs (`events::uievent_to_crossterm`) — rather than
-/// re-deriving `translate_key`'s crossterm quirk table (Ctrl+\, Ctrl+/,
-/// kitty shift-symbol resolution, …) a second time for `quadraui::Key`.
-///
-/// A free function (mirrors [`dispatch_panel_accelerator_sizeless`])
-/// rather than a `TuiShellApp` method: `ShellContext` has no public
-/// constructor (`pub(crate) fn new`, quadraui-internal), so
-/// `TuiShellApp::handle()` itself can only be driven through
-/// `driver_with_shell`, which has no accessor back to the concrete app's
-/// fields. Structuring the real logic as a free function over borrowed
-/// pieces keeps it directly unit-testable against a bare `Engine`.
-///
-/// The sidebar-focused keyboard tier — `event_loop`'s `mod.rs:1886`-`:2415`,
-/// ported verbatim (#634, closing the last open item of #635's item D).
-///
-/// Split into its own function purely for size: at ~340 lines across eight
-/// per-panel dispatchers plus two prologue blocks it dwarfs every other tier
-/// in [`handle_key_pressed`], and inlining it there would bury the precedence
-/// chain that function's doc comment describes.
-///
-/// **Unconditionally terminal.** The caller checks the outer guard
-/// (`sidebar.has_focus && !picker_open && !terminal_has_focus && !Release`)
-/// and returns whatever this returns — matching the legacy loop, where every
-/// sub-block ends `needs_redraw = true; continue;` and the trailing explorer
-/// block carries no panel guard of its own, so a key that reaches this tier
-/// never falls through to the editor tier.
-///
-/// `ui_event` is the original, un-round-tripped [`UiEvent`]: the debug/DAP
-/// panel re-dispatches it into `SidebarSystem::handle` for its navigation
-/// keys before falling back to the action-key table, which is what
-/// `event_loop`'s `ui_event_saved` clone (`mod.rs:1745`) existed for.
-/// `screen_w` was dropped in #734 slice 1: the deleted context-menu tier
-/// was its only reader.
+/// A free function (mirrors [`dispatch_panel_accelerator_sizeless`]) because
+/// `TuiShellApp::handle()` is only reachable through `driver_with_shell`,
+/// which has no accessor back to the concrete app's fields; over borrowed
+/// pieces it stays directly unit-testable against a bare `Engine`. `ui_event`
+/// is the original, un-round-tripped [`UiEvent`] the DAP arm re-dispatches.
 #[allow(clippy::too_many_arguments)]
-fn handle_sidebar_focused_key(
+fn handle_focus_owner_key(
+    route: render::FocusKeyRoute,
     key_event: KeyEvent,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
@@ -3157,16 +3133,16 @@ fn handle_sidebar_focused_key(
 ) -> Reaction {
     let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
 
-    // #734 slice 1: the #451 context-menu intercept that used to open this
-    // function is gone. It was the second of TUI's two copies of that rung
-    // (the other sat near the bottom of `handle_key_pressed`) and a fourth
-    // across both backends; `render::route_modal_key` now resolves it above
-    // `handle_key_pressed`'s sidebar tier, which is this function's only
-    // caller — so explorer-focused mode can no longer hijack j/k from an
-    // open menu, for the same reason, stated once.
+    // ── Activity bar (toolbar) ──────────────────────────────────────────
+    if route == render::FocusKeyRoute::ActivityBar {
+        return handle_activity_bar_focused_key(key_event, engine, sidebar, backend);
+    }
 
     // Ctrl-W prefix: set pending state for window navigation. A Vim chord,
-    // so it stays inline rather than becoming an accelerator.
+    // so it stays inline rather than becoming an accelerator. Still
+    // TUI-only — GTK has no per-keypress chord latch to hang
+    // `pending_ctrl_w` on, which is #406; converging it needs the latch
+    // promoted into the engine and is out of scope for this slice.
     if ctrl && matches!(key_event.code, KeyCode::Char('w') | KeyCode::Char('W')) {
         sidebar.pending_ctrl_w = true;
         return Reaction::Redraw;
@@ -3193,7 +3169,7 @@ fn handle_sidebar_focused_key(
     }
 
     // ── Search panel ────────────────────────────────────────────────────
-    if engine.active_panel_is(PANEL_SEARCH) {
+    if route == render::FocusKeyRoute::Search {
         // Ctrl+V paste (backend-specific clipboard access)
         if ctrl && key_event.code == KeyCode::Char('v') {
             let is_replace =
@@ -3204,25 +3180,11 @@ fn handle_sidebar_focused_key(
             return Reaction::Redraw;
         }
         let key_name = match key_event.code {
-            KeyCode::Enter => "Return",
-            KeyCode::Backspace => "BackSpace",
-            KeyCode::Delete => "Delete",
-            KeyCode::Left => "Left",
-            KeyCode::Right => "Right",
-            KeyCode::Home => "Home",
-            KeyCode::End => "End",
-            KeyCode::Up => "Up",
-            KeyCode::Down => "Down",
-            KeyCode::Tab => "Tab",
-            KeyCode::BackTab => "BackTab",
-            KeyCode::Esc => "Escape",
-            KeyCode::PageUp => "Page_Up",
-            KeyCode::PageDown => "Page_Down",
             // Single-char keys use the char as the key name (via `unicode`
             // below); Ctrl+b is the one that needs an explicit name.
             KeyCode::Char('b') if ctrl => "b",
             KeyCode::Char(_) => "",
-            _ => "",
+            code => tui_key_to_engine_name(code).unwrap_or(""),
         };
         let unicode = match key_event.code {
             KeyCode::Char(c) if !ctrl => Some(c),
@@ -3243,7 +3205,7 @@ fn handle_sidebar_focused_key(
     }
 
     // ── Debug (DAP) panel ───────────────────────────────────────────────
-    if engine.active_panel_is(PANEL_DEBUG) {
+    if route == render::FocusKeyRoute::Debug {
         // Route navigation keys through SidebarSystem first.
         render::populate_dap_sidebar_system(engine);
         let rect = engine.dap_sidebar_body_rect.get();
@@ -3287,7 +3249,7 @@ fn handle_sidebar_focused_key(
     }
 
     // ── Plugin-provided extension panel ─────────────────────────────────
-    if engine.ext_panel_has_focus && sidebar.ext_panel_name.is_some() {
+    if route == render::FocusKeyRoute::ExtPanel {
         // When the input field is active, characters are input text rather
         // than navigation commands.
         if engine.ext_panel_input_active {
@@ -3344,7 +3306,7 @@ fn handle_sidebar_focused_key(
     }
 
     // ── Extensions marketplace panel ────────────────────────────────────
-    if engine.active_panel_is(PANEL_EXTENSIONS) {
+    if route == render::FocusKeyRoute::ExtSidebar {
         let (key_name, unicode) = match key_event.code {
             KeyCode::Char(c) => (c.to_string(), Some(c)),
             code => (
@@ -3365,7 +3327,7 @@ fn handle_sidebar_focused_key(
     }
 
     // ── Settings panel ──────────────────────────────────────────────────
-    if engine.active_panel_is(PANEL_SETTINGS) {
+    if route == render::FocusKeyRoute::Settings {
         // h/Left focus-to-activity-bar lives inside `handle_settings_key`:
         // when the selected row is not an enum, `h` sets
         // `activity_bar_focused`.
@@ -3413,7 +3375,7 @@ fn handle_sidebar_focused_key(
     }
 
     // ── AI assistant panel ──────────────────────────────────────────────
-    if engine.active_panel_is(PANEL_AI) {
+    if route == render::FocusKeyRoute::Ai {
         // h/Left focus-to-activity-bar lives inside `handle_ai_panel_key`.
         if ctrl && key_event.code == KeyCode::Char('v') {
             let text = match engine.clipboard_read {
@@ -3466,7 +3428,7 @@ fn handle_sidebar_focused_key(
     }
 
     // ── Source Control panel ────────────────────────────────────────────
-    if engine.active_panel_is(PANEL_GIT) {
+    if route == render::FocusKeyRoute::SourceControl {
         // h/Left focus-to-activity-bar lives inside
         // `dispatch_sc_sidebar_key_unified`. Ctrl+b hides the sidebar.
         if ctrl && matches!(key_event.code, KeyCode::Char('b')) {
@@ -3482,20 +3444,6 @@ fn handle_sidebar_focused_key(
         // before matching the whitelist.
         let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
         let (key_str, unicode): (&str, Option<char>) = match key_event.code {
-            KeyCode::Enter => ("Return", None),
-            KeyCode::Esc => ("Escape", None),
-            KeyCode::Backspace => ("BackSpace", None),
-            KeyCode::Delete => ("Delete", None),
-            KeyCode::Up => ("Up", None),
-            KeyCode::Down => ("Down", None),
-            KeyCode::Left => ("Left", None),
-            KeyCode::Right => ("Right", None),
-            KeyCode::Home => ("Home", None),
-            KeyCode::End => ("End", None),
-            KeyCode::Tab => ("Tab", None),
-            KeyCode::BackTab => ("BackTab", None),
-            KeyCode::PageUp => ("Page_Up", None),
-            KeyCode::PageDown => ("Page_Down", None),
             KeyCode::Char(ch) => {
                 let resolved = if shift && ch.is_ascii_lowercase() {
                     ch.to_ascii_uppercase()
@@ -3526,7 +3474,7 @@ fn handle_sidebar_focused_key(
                 };
                 (name, Some(resolved))
             }
-            _ => ("", None),
+            code => (tui_key_to_engine_name(code).unwrap_or(""), None),
         };
         if !key_str.is_empty() || unicode.is_some() {
             use crate::core::engine::ScKeyResult;
@@ -3541,7 +3489,7 @@ fn handle_sidebar_focused_key(
         return Reaction::Redraw;
     }
 
-    // ── Explorer (the fallback: no panel guard) ─────────────────────────
+    // ── Explorer (`FocusKeyRoute::Explorer`, the resolver's fallback) ───
     {
         use crate::core::engine::ExplorerKeyResult;
         if ctrl && key_event.code == KeyCode::Char('b') {
@@ -3551,26 +3499,21 @@ fn handle_sidebar_focused_key(
             engine.session.explorer_visible = false;
             let _ = engine.session.save();
         } else {
+            // `tui_key_to_engine_name` rather than a fourth bespoke copy of
+            // the same table: it also supplies "BackSpace"/"Delete", which
+            // the old explorer-local table dropped even though
+            // `dispatch_explorer_edit_key` handles them — so rename/new-entry
+            // editing lost those two keys on TUI while GTK
+            // (`map_gtk_key_name`) had them. `Page_Up`/`Page_Down` and
+            // `PageUp`/`PageDown` are both accepted by the engine.
             let key_name = match key_event.code {
-                KeyCode::Esc => "Escape",
-                KeyCode::Enter => "Return",
-                KeyCode::Up => "Up",
-                KeyCode::Down => "Down",
-                KeyCode::Left => "Left",
-                KeyCode::Right => "Right",
-                KeyCode::Home => "Home",
-                KeyCode::End => "End",
-                KeyCode::PageUp => "PageUp",
-                KeyCode::PageDown => "PageDown",
-                KeyCode::Char(c) => match c {
-                    'j' => "j",
-                    'k' => "k",
-                    'h' => "h",
-                    'l' => "l",
-                    'q' => "q",
-                    _ => "",
-                },
-                _ => "",
+                KeyCode::Char('j') => "j",
+                KeyCode::Char('k') => "k",
+                KeyCode::Char('h') => "h",
+                KeyCode::Char('l') => "l",
+                KeyCode::Char('q') => "q",
+                KeyCode::Char(_) => "",
+                code => tui_key_to_engine_name(code).unwrap_or(""),
             };
             let chr = if let KeyCode::Char(c) = key_event.code {
                 Some(c)
@@ -3645,7 +3588,7 @@ fn handle_key_pressed(
     // Replaces the hand-transcribed dialog tier that used to open this
     // function *and* the context-menu tier that used to sit near the
     // bottom of it (below the sidebar tier, which carried its own second
-    // copy — see `handle_sidebar_focused_key`). Both are gone; the ladder
+    // copy — see `handle_focus_owner_key`). Both are gone; the ladder
     // now has one statement, and the spell-suggestion rung — previously
     // reachable only if nothing else claimed the key first — is genuinely
     // modal on both backends.
@@ -3761,79 +3704,26 @@ fn handle_key_pressed(
         return Reaction::Redraw;
     }
 
-    // ── Activity bar (toolbar) focused (mirrors mod.rs:1805-:1854) ──────
-    // #635 (Stage 6b item D): ported now that gap 2 (mouse) is closed by
-    // #602 — `engine.activity_bar_focused` is set by `mouse::handle_mouse`
-    // via `TuiShellApp::handle_mouse_event`, so this tier is reachable from
-    // a real click sequence, not just synthetic test state.
-    if engine.activity_bar_focused && !engine.picker_open && key_event.kind != KeyEventKind::Release
-    {
-        match key_event.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                engine.activity_bar_move_down();
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                engine.activity_bar_move_up();
-            }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                use crate::core::engine::sidebar::ActivityBarActivation;
-                let activation = engine.activity_bar_activate();
-                match activation {
-                    ActivityBarActivation::MenuToggled => {
-                        if !engine.menu_bar_visible {
-                            engine.menu_system.borrow_mut().close(backend);
-                        }
-                    }
-                    ActivityBarActivation::PanelFocused => {
-                        sidebar.ext_panel_name = None;
-                        sidebar.has_focus = true;
-                    }
-                    ActivityBarActivation::ExtPanelFocused(name) => {
-                        sidebar.ext_panel_name = Some(name);
-                        sidebar.has_focus = true;
-                    }
-                    ActivityBarActivation::NoOp => {}
-                }
-            }
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Esc => {
-                // Leave toolbar, return focus to editor.
-                engine.activity_bar_focus_out();
-            }
-            KeyCode::Char('q') => {
-                // Collapse sidebar from toolbar.
-                engine.activity_bar_focus_out();
-                engine.app_shell.hide_sidebar();
-                engine.clear_sidebar_focus();
-                sidebar.has_focus = false;
-                engine.session.explorer_visible = false;
-                let _ = engine.session.save();
-            }
-            _ => {}
+    // ── Focus owners: activity bar + sidebar panels (#757) ─────────────
+    // One shared resolver, `render::route_focus_key`, replaces the two
+    // hand-transcribed ladders this tier used to carry (the activity-bar
+    // `if` that lived here, and `handle_focus_owner_key`'s if-chain over
+    // `active_panel_is`). The picker and terminal gates that used to be
+    // spelled out on the sidebar guard below now live in the resolver, where
+    // GTK gets them too.
+    if key_event.kind != KeyEventKind::Release {
+        let route = render::route_focus_key(engine, sidebar.has_focus);
+        if route != render::FocusKeyRoute::None {
+            return handle_focus_owner_key(
+                route,
+                key_event,
+                engine,
+                sidebar,
+                screen_h,
+                backend,
+                state.ui_event,
+            );
         }
-        return Reaction::Redraw;
-    }
-
-    // ── Sidebar focused (mirrors mod.rs:1886-:2415) ─────────────────────
-    // #634: the last of #635's item-D tiers. Suppressed while a picker
-    // modal is open and while the terminal has focus (e.g. "Press Enter to
-    // close…" after an extension install), exactly like the legacy loop.
-    if sidebar.has_focus
-        && !engine.picker_open
-        && !engine.terminal_has_focus
-        && key_event.kind != KeyEventKind::Release
-    {
-        // Unlike the tiers above, this one is unconditionally terminal:
-        // every sub-block in `event_loop`'s copy ends `needs_redraw = true;
-        // continue;`, and the trailing explorer block has no panel guard, so
-        // once the outer guard passes the key never reaches the editor tier.
-        return handle_sidebar_focused_key(
-            key_event,
-            engine,
-            sidebar,
-            screen_h,
-            backend,
-            state.ui_event,
-        );
     }
 
     if key_event.kind == KeyEventKind::Release {
@@ -8214,7 +8104,7 @@ mod tests {
     /// The single highest-value regression guard for the cutover: with the
     /// sidebar focused, a bare letter must be consumed by the sidebar tier,
     /// not fall through to `Engine::handle_key` as a Vim command. Before
-    /// #634 ported `handle_sidebar_focused_key`, `x` would have deleted a
+    /// #634 ported the sidebar-focused tier (now `handle_focus_owner_key`), `x` would have deleted a
     /// character out of the *editor buffer* while the user was navigating
     /// the file tree.
     #[test]
@@ -9413,7 +9303,7 @@ mod tests {
     ///
     /// RED against unfixed `develop`: the context-menu tier sat near the
     /// BOTTOM of `handle_key_pressed` (and a second copy inside
-    /// `handle_sidebar_focused_key`), both below the activity-bar tier, so
+    /// `handle_focus_owner_key`), both below the activity-bar tier, so
     /// Escape ran `activity_bar_focus_out()` and the menu stayed painted.
     #[test]
     fn driver_context_menu_key_beats_a_focused_activity_bar() {
