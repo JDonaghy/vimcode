@@ -149,6 +149,11 @@ pub struct Harness<A: AppLogic> {
     /// #727: `true` once a native message-dialog present has been queued
     /// (or already shown) for the `engine.dialog` currently open.
     pub native_dialog_shown: Rc<Cell<bool>>,
+    /// Cached `ContextMenuLayout` from the last `render_content` paint, or
+    /// `None` if that frame drew no context menu (an items-less menu is not
+    /// painted). The locate-target for menu-row pixel probes — never assert on
+    /// this being `Some`, assert on the pixels it points at (#751).
+    pub context_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
     /// #727: a native message dialog queued by `render_content`'s
     /// edge-trigger check, awaiting `tick()` to drain it. Tests read this
     /// with `Cell::take` directly (never calling `tick()`, which would
@@ -381,6 +386,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
     let menu_row_rect = Rc::clone(&app.menu_row_rect);
     let dialog_layout = Rc::clone(&app.dialog_layout);
+    let context_menu_layout = Rc::clone(&app.context_menu_layout);
     let native_dialog_shown = Rc::clone(&app.native_dialog_shown);
     let pending_native_dialog = Rc::clone(&app.pending_native_dialog);
     Harness {
@@ -401,6 +407,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         title_bar_rect,
         menu_row_rect,
         dialog_layout,
+        context_menu_layout,
         native_dialog_shown,
         pending_native_dialog,
     }
@@ -5397,6 +5404,229 @@ mod overlay_band_z_order {
             h.driver.screen_contains("File"),
             "recorded band claims the title-bar/menu row painted, but its \
              \"File\" menu label is not on screen"
+        );
+    }
+}
+
+#[cfg(test)]
+mod modal_rung {
+    use super::*;
+
+    fn small_engine() -> Engine {
+        let mut engine = Engine::new();
+        engine
+            .buffer_mut()
+            .insert(0, "fn main() {\n    println!(\"hi\");\n}\n");
+        engine
+    }
+
+    // ─── #751: the modal rung, finished (context menu / picker / find-replace)
+    //
+    // Three rungs that #733 slice 1 left transcribed per backend now go through
+    // `render::route_modal_overlay_click`. Each test below has a TUI twin in
+    // `src/tui_main/shell_app.rs`.
+
+    /// Background colour of the menu row that paints `label`, sampled just
+    /// inside the menu's left edge so the probe lands on the row's fill rather
+    /// than on glyph pixels (`CLAUDE.md` rule 1: probe pixels, never hardcode
+    /// coordinates).
+    fn context_menu_row_bg<A: quadraui::AppLogic>(h: &mut Harness<A>, label: &str) -> (u8, u8, u8) {
+        let bounds = h
+            .driver
+            .find_bounds(label)
+            .unwrap_or_else(|| panic!("context menu must paint a {label:?} item"));
+        let menu = h
+            .context_menu_layout
+            .borrow()
+            .as_ref()
+            .map(|l| l.bounds)
+            .expect("a painted context menu must publish its layout");
+        let x = (menu.x + 2.0) as i32;
+        let y = (bounds.y + bounds.height / 2.0) as i32;
+        h.driver.pixel(x, y)
+    }
+
+    /// #373 / #751: hovering a context-menu item must move the highlight onto
+    /// it. Asserted on painted pixels — the hovered row's background changes,
+    /// and the row that *was* selected loses its highlight.
+    ///
+    /// **RED-verified against unfixed `develop`.** GTK's `UiEvent::MouseMoved`
+    /// arm did nothing at all unless the left button was held (it went straight
+    /// to `handle_mouse_drag_msg`), so there was no hover rung on this backend:
+    /// whichever item was selected when the menu opened stayed highlighted
+    /// wherever the pointer went. Deleting the `!buttons.left` hover block in
+    /// `App::handle` reproduces that and fails both assertions below. Restored
+    /// before committing.
+    #[test]
+    fn context_menu_hover_moves_the_highlight_via_gtk_driver() {
+        let mut engine = small_engine();
+        engine.open_editor_context_menu(700, 400);
+        let mut h = harness(engine, 1400, 900);
+
+        // Whichever row the menu opens on, plus a second always-enabled row
+        // that is definitely not it.
+        let (selected_label, target_label) = {
+            let engine = h.engine.borrow();
+            let menu = engine.context_menu.as_ref().unwrap();
+            let selected = menu.items[menu.selected].label.clone();
+            let other = menu
+                .items
+                .iter()
+                .find(|i| i.enabled && i.label != selected && !i.label.is_empty())
+                .expect("the editor context menu must offer a second enabled item")
+                .label
+                .clone();
+            (selected, other)
+        };
+        assert_ne!(selected_label, target_label);
+
+        let target = h
+            .driver
+            .find(&target_label)
+            .unwrap_or_else(|| panic!("the context menu must paint {target_label:?}"));
+        let selected_bg_before = context_menu_row_bg(&mut h, &selected_label);
+        let target_bg_before = context_menu_row_bg(&mut h, &target_label);
+        assert_ne!(
+            selected_bg_before, target_bg_before,
+            "sanity: the selected row must already paint differently from an \
+             unselected one, otherwise this test cannot see a highlight move"
+        );
+
+        h.driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(target.0, target.1),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        h.driver.render();
+
+        assert_eq!(
+            context_menu_row_bg(&mut h, &target_label),
+            selected_bg_before,
+            "the hovered row must paint with the selection background the \
+             previously selected row had — GTK painted no hover highlight at \
+             all before #751 (#373)"
+        );
+        assert_eq!(
+            context_menu_row_bg(&mut h, &selected_label),
+            target_bg_before,
+            "the previously selected row must lose its highlight when a \
+             sibling is hovered (#373)"
+        );
+    }
+
+    /// #751: the find/replace overlay must be clickable where it is *painted*.
+    ///
+    /// The panel is anchored to the active editor group
+    /// (`quadraui::gtk::find_replace` uses `group_bounds.x + group_bounds.width`),
+    /// but this backend hit-tested against the drawing-area width and a
+    /// `line_height * 2.5` top edge. With the sidebar open those differ by the
+    /// activity-bar + sidebar width, so the clickable panel sat a couple of
+    /// hundred pixels left of the visible one. Both now come from
+    /// `render::FindReplaceHitGeometry::from_panel`.
+    ///
+    /// **RED-verified against unfixed `develop`.** With the sidebar open the
+    /// click on the painted toggle missed the old hit rect entirely and fell
+    /// through to the editor, leaving the toggle's pixels unchanged.
+    #[test]
+    fn find_replace_toggle_click_lands_where_the_panel_painted_via_gtk_driver() {
+        let mut engine = small_engine();
+        engine.find_replace_open = true;
+        engine.find_replace_query = "ZQXW751FR".to_string();
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.driver.screen_contains("ZQXW751FR"),
+            "fixture must actually paint the find/replace panel; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.painted_sidebar_bounds.get().is_some(),
+            "fixture needs the sidebar open — that is the offset the old \
+             drawing-area-width hit test dropped"
+        );
+
+        // `×` is painted three times on this frame (tab close, window close,
+        // and the panel's own) so it cannot disambiguate the panel; `Aa` is
+        // unique to it. Clicking the case-sensitivity toggle flips it, and
+        // `quadraui::gtk::find_replace` fills an *active* toggle with the
+        // accent colour and inverts its label — a rendered change, not a
+        // state read.
+        let toggle = h
+            .driver
+            .find_bounds("Aa")
+            .expect("the panel must paint its Aa case-sensitivity toggle");
+        // Sample the whole toggle cell rather than one pixel: the fill, the
+        // border stroke and the glyph all change together, and which of the
+        // three a single probe lands on depends on the font.
+        let sample = |h: &mut Harness<_>| {
+            let mut px = Vec::new();
+            let (x0, x1) = ((toggle.x - 4.0) as i32, (toggle.x + toggle.width) as i32);
+            let (y0, y1) = (toggle.y as i32, (toggle.y + toggle.height) as i32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    px.push(h.driver.pixel(x, y));
+                }
+            }
+            px
+        };
+        let before = sample(&mut h);
+
+        h.driver.click(
+            toggle.x + toggle.width / 2.0,
+            toggle.y + toggle.height / 2.0,
+        );
+        h.driver.render();
+
+        assert_ne!(
+            sample(&mut h),
+            before,
+            "clicking the painted Aa toggle must repaint it as active; its \
+             pixels are unchanged, so the click hit-tested somewhere the panel \
+             is not"
+        );
+    }
+
+    /// #751: clicking the picker row that is already selected confirms it, the
+    /// behaviour TUI has always had (`render::apply_picker_row_click`).
+    ///
+    /// **RED-verified against unfixed `develop`.** GTK's picker block only ever
+    /// did `picker_selected = clicked_idx; picker_load_preview()`, so a second
+    /// click on the same row was a no-op and the palette stayed open — a GTK
+    /// user had to click and then press Enter.
+    #[test]
+    fn second_click_on_a_picker_row_confirms_it_via_gtk_driver() {
+        let mut engine = small_engine();
+        // A short, self-contained item list: confirming a row swaps the
+        // buffer's line-ending style and closes the palette, with no file
+        // system or LSP dependency.
+        engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.picker_popup().is_some(),
+            "fixture must actually paint the command palette"
+        );
+        assert_eq!(
+            h.engine.borrow().picker_selected,
+            0,
+            "fixture assumes the palette opens on row 0, so row 1 is a \
+             not-yet-selected row"
+        );
+        let row = h
+            .picker_row_center(1)
+            .expect("the palette must paint at least two result rows");
+
+        h.driver.click(row.0, row.1);
+        h.driver.render();
+        assert!(
+            h.picker_popup().is_some(),
+            "the first click only selects — the palette must still be painted"
+        );
+
+        h.driver.click(row.0, row.1);
+        h.driver.render();
+        assert!(
+            h.picker_popup().is_none(),
+            "a second click on the already-selected row must confirm it and \
+             close the palette (parity with TUI); painted: {:?}",
+            h.driver.painted_texts()
         );
     }
 }
