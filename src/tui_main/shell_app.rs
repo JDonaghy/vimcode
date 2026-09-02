@@ -437,7 +437,13 @@ pub(super) struct TuiShellApp {
     /// overlay band in the same order" a thing a test can assert, rather than
     /// something two hand-kept ladders promise each other in comments (they
     /// promised, and they had drifted — twice; see `OVERLAY_Z_ORDER`).
-    painted_overlay_band: RefCell<Vec<render::OverlayOp>>,
+    ///
+    /// `Rc` because `driver_with_shell` returns `TuiDriver<impl AppLogic>` —
+    /// an opaque `ShellAdapter` with no accessor back to the concrete
+    /// `TuiShellApp` — so a test has to clone the handle *before* handing the
+    /// app over, exactly as `gtk/testing.rs`'s `Harness` does for every one of
+    /// its painted-geometry observables.
+    painted_overlay_band: std::rc::Rc<RefCell<Vec<render::OverlayOp>>>,
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
@@ -587,7 +593,7 @@ impl TuiShellApp {
             context_menu_layout: RefCell::new(None),
             dialog_layout: RefCell::new(None),
             tab_switcher_popup_rect: RefCell::new(None),
-            painted_overlay_band: RefCell::new(Vec::new()),
+            painted_overlay_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
@@ -1900,8 +1906,17 @@ impl ShellApp for TuiShellApp {
         // chooser deferred through `PendingFileDialog` and run from `tick()`,
         // so it is not a canvas rung at all).
         //
-        // Every arm gates itself and, when it paints, pushes its rung onto
-        // `painted_band`. Arms whose surface is absent still run — several own
+        // Every arm gates itself and, when it paints, records the rung it
+        // painted — naming the variant explicitly (`push(OverlayOp::Dialog)`),
+        // never `push(op)`. That distinction is the difference between a test
+        // that can fail and one that cannot: with `push(op)` the record follows
+        // the *pattern* the walk is currently at, so swapping two arms' bodies
+        // paints them in the wrong order while still recording the right one.
+        // Naming the variant makes the record describe what was drawn, so
+        // `check_overlay_band_order` (and the black-box tests reading this
+        // field) catch that swap.
+        //
+        // Arms whose surface is absent still run — several own
         // a hit-test cache (`tab_switcher_popup_rect`, `context_menu_layout`,
         // `dialog_layout`, `command_center_layout`, `toast_layout`) that must
         // be *cleared* on the frame the surface disappears, or the next click
@@ -1931,7 +1946,7 @@ impl ShellApp for TuiShellApp {
                         let bar_rect = self.engine.menu_bar_rect.get();
                         if bar_rect.width >= 1.0 && bar_rect.height >= 1.0 {
                             self.engine.menu_system.borrow().render(backend, bar_rect);
-                            painted_band.push(op);
+                            painted_band.push(render::OverlayOp::MenuDropdown);
                         }
                     }
                 }
@@ -1954,7 +1969,7 @@ impl ShellApp for TuiShellApp {
                         .take()
                         .map(|(cc_rect, cc)| backend.draw_command_center(cc_rect, &cc));
                     if painted.is_some() {
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::CommandCenter);
                     }
                     self.engine.command_center_layout.replace(painted);
                 }
@@ -1966,7 +1981,7 @@ impl ShellApp for TuiShellApp {
                 render::OverlayOp::FindReplace => {
                     if let Some(ref find_replace) = screen.find_replace {
                         backend.draw_find_replace(win_q, find_replace);
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::FindReplace);
                     }
                 }
 
@@ -1974,7 +1989,7 @@ impl ShellApp for TuiShellApp {
                 render::OverlayOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
                         render_picker_popup(picker, win_area, &theme, backend);
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::UnifiedPicker);
                     }
                 }
 
@@ -1997,7 +2012,7 @@ impl ShellApp for TuiShellApp {
                                 render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
                             backend.draw_list(geo.bounds, &list);
                             *self.tab_switcher_popup_rect.borrow_mut() = Some(geo.bounds);
-                            painted_band.push(op);
+                            painted_band.push(render::OverlayOp::TabSwitcher);
                         }
                     }
                 }
@@ -2031,7 +2046,7 @@ impl ShellApp for TuiShellApp {
                             );
                             let _ = backend.draw_context_menu(&menu, &menu_layout);
                             *self.context_menu_layout.borrow_mut() = Some(menu_layout);
-                            painted_band.push(op);
+                            painted_band.push(render::OverlayOp::ContextMenu);
                         }
                         None => *self.context_menu_layout.borrow_mut() = None,
                     }
@@ -2048,7 +2063,7 @@ impl ShellApp for TuiShellApp {
                             render::dialog_generic_layout(dialog, win_q, 1.0, 1.0);
                         let _ = backend.draw_dialog(&q_dialog, &dlg_layout);
                         *self.dialog_layout.borrow_mut() = Some(dlg_layout);
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::Dialog);
                     } else {
                         *self.dialog_layout.borrow_mut() = None;
                     }
@@ -2059,7 +2074,7 @@ impl ShellApp for TuiShellApp {
                     if let Some(stack) = render::build_toast_stack(&self.engine) {
                         let toast_layout = backend.draw_toast_stack(win_q, &stack);
                         self.engine.toast_layout.replace(Some(toast_layout));
-                        painted_band.push(op);
+                        painted_band.push(render::OverlayOp::ToastStack);
                     } else {
                         self.engine.toast_layout.replace(None);
                     }
@@ -5482,6 +5497,124 @@ mod tests {
         assert!(
             screen.contains("ZQXW605DIALOG"),
             "modal dialog should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    // ─── Overlay-band z-order (#735 slice 1) ─────────────────────────────
+
+    /// A dialog both backends paint **in-canvas**.
+    ///
+    /// The `input` field is what forces that: `quadraui::native_dialog_options`
+    /// returns `None` for a dialog carrying a text input, so GTK's
+    /// `OverlayOp::Dialog` arm draws the generic primitive instead of queueing
+    /// a real OS `AlertDialog` (#727). A plain button-only dialog would go
+    /// native on GTK and never enter its band at all, which would make the
+    /// cross-backend comparison compare two different things.
+    ///
+    /// `gtk/testing.rs`'s `in_canvas_dialog` is the byte-identical twin — keep
+    /// them in step.
+    fn in_canvas_dialog(title: &str) -> crate::core::engine::Dialog {
+        crate::core::engine::Dialog {
+            title: title.to_string(),
+            body: vec!["body line".to_string()],
+            buttons: vec![crate::core::engine::DialogButton {
+                label: "OK".to_string(),
+                hotkey: 'o',
+                action: "ok".to_string(),
+            }],
+            selected: 0,
+            tag: String::new(),
+            input: Some(crate::core::engine::DialogInput {
+                label: "Passphrase".to_string(),
+                value: String::new(),
+                is_password: true,
+            }),
+        }
+    }
+    //
+    // These are the TUI half of the acceptance test. `gtk/testing.rs`'s
+    // `mod overlay_band_z_order` carries the GTK half, asserting against the
+    // **same expected `Vec<OverlayOp>`** for the same engine state. A single
+    // test cannot drive both backends (the GTK `App` lives in the `vimcode` bin
+    // target, `TuiShellApp` in `vcd`), so "both backends emit the same
+    // sequence" is expressed as two tests with one expected value; keep them in
+    // step.
+    //
+    // The fixtures below turn the menu bar *on* because GTK's menu bar is its
+    // client-side titlebar and `App::setup` pins it visible unconditionally
+    // (#552) — the one intrinsic difference between the two ladders. Turning it
+    // on here is what makes the two expected bands literally identical rather
+    // than "identical modulo two rungs".
+
+    /// Opens a context menu and a modal dialog in the same frame and asserts
+    /// the *painted* band is `[ContextMenu, Dialog]` — the dialog on top.
+    ///
+    /// RED against unfixed `develop`: TUI already painted these two in this
+    /// order, but nothing recorded or asserted it, so GTK's inverted copy
+    /// (`Dialog` then `ContextMenu`) went unnoticed. Move either backend's arm
+    /// out of the `OVERLAY_Z_ORDER` walk — which is exactly the shape the bug
+    /// had — and the recorded sequence changes here or in the GTK twin.
+    #[test]
+    fn overlay_band_paints_dialog_above_context_menu_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.menu_bar_visible = true;
+        app.engine.open_editor_context_menu(4, 4);
+        assert!(
+            app.engine
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty()),
+            "fixture needs a non-empty context menu — an empty one is not painted"
+        );
+        app.engine.dialog = Some(in_canvas_dialog("ZQXW735DIALOG"));
+
+        let band = app.painted_overlay_band.clone();
+        // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
+        // is what reserves `layout.title_bar_bounds`, and with no reserved row
+        // the menu-dropdown rung has nothing to paint into.
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let screen = driver.screen();
+
+        assert_eq!(
+            *band.borrow(),
+            vec![
+                render::OverlayOp::MenuDropdown,
+                render::OverlayOp::CommandCenter,
+                render::OverlayOp::ContextMenu,
+                render::OverlayOp::Dialog,
+            ],
+            "expected band differs from the GTK twin's \
+             (`overlay_band_paints_dialog_above_context_menu_via_gtk_driver`). \
+             Two orderings are pinned here: the title-bar chrome below the modal \
+             stack (TUI had that inverted before #735 — it painted the menu row \
+             over open dialogs) and the dialog above the context menu (GTK had \
+             *that* inverted); screen:\n{screen}"
+        );
+        // Paint, not just bookkeeping: the dialog really did reach the cells.
+        assert!(
+            screen.contains("ZQXW735DIALOG"),
+            "recorded band claims the dialog painted, but its title is not on \
+             screen — the recorder and the rasteriser disagree; screen:\n{screen}"
+        );
+    }
+
+    /// A frame with no overlays open records an empty band — the recorder is
+    /// not just "whatever `OVERLAY_Z_ORDER` contains".
+    ///
+    /// Guards the arms that must run for their *clearing* side-effect (stale
+    /// `dialog_layout` / `context_menu_layout` / `tab_switcher_popup_rect`
+    /// geometry is the #587 class of bug) without that being mistaken for a
+    /// paint.
+    #[test]
+    fn overlay_band_is_empty_when_no_overlay_is_open_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        let band = app.painted_overlay_band.clone();
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let _ = driver.screen();
+        assert_eq!(
+            *band.borrow(),
+            Vec::<render::OverlayOp>::new(),
+            "no overlay was open, so nothing in the band should have painted"
         );
     }
 

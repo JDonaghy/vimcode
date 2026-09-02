@@ -51,10 +51,40 @@ drain to do.
 | 4 | **#732** | Retire the GTK `Msg` bus — 124 variants, 301 sites, 684-line `dispatch`, 16 `handle_*_msg` methods. |
 | 5 | **#733** | Converge the two mouse routers — ~4,800 lines, one precedence ladder written twice. |
 | 6 | **#734** | Converge keyboard dispatch — ~2,000 lines. The TUI half carries 19 `mirrors mod.rs:NNNN` comments and **every one of those line refs is stale**. |
-| 7 | **#735** | Converge frame composition — ~4,500 lines. The hard one: units differ (px vs cells), `draw_frame` has raw-`Buffer` residue `render_content` structurally cannot reach, and painter models differ intrinsically. |
+| 7 | **#735** | Converge frame composition — ~4,500 lines. **Slice 1 landed** (shared overlay-band z-order). Units differ (px vs cells) and painter models differ intrinsically — both preserved. The feared `draw_frame` raw-`Buffer` residue turned out to be a non-blocker: see the note below. |
 | 8 | **#657** | The oracle loop. Last, deliberately — Stage 1 rewrites every `crate::` path in the three modules the chain is about to shrink by ~9,000 lines. |
 | 9 | **#47** | Native macOS GUI, **re-scoped**: a thin wrapper over `quadraui::macos::shell_runner::run_with_shell`, not Core Graphics. |
 | ∥ | **quadraui#596 → #597 → #658** | The preview tier. #596/#597 were open, unassigned and **in nobody's queue** while #658 sat blocked on them — the supply-side trap `GOALS.md` exists to catch. Queued 2026-09-01. |
+
+### #735 staging item 1, answered: `draw_frame` is dead in production
+
+The issue's own staging said "enumerate the raw-`Buffer` residue in `draw_frame` first —
+everything else waits on this answer", on the theory that some of what `draw_frame` paints
+was never portable to `Backend` and might force #735 into three issues. It does not:
+
+**`src/tui_main/render_impl.rs::draw_frame` is `#[cfg(test)]`-gated** (the attribute sits
+immediately above its `pub(super) fn`). Its only three call sites are inside
+`#[cfg(test)] mod tests` in the same file, all wrapped in the likewise test-only
+`with_frame_scope`. #634 deleted `event_loop()`, its last production caller;
+`TuiShellApp::render_content` has been the sole live TUI paint path since.
+
+Every raw-`Frame`/`Buffer` rung in it is therefore either already solved on the live path or
+not a paint at all:
+
+| Residue | Verdict |
+|---|---|
+| Activity bar (`panels::render_activity_bar`, raw `Buffer`) | quadraui's `AppShell::render` paints it via `Backend::draw_activity_bar` before `render_content` runs |
+| Sidebar separator column (`set_cell` loop) | `AppShell::render` paints the divider itself; the rule-cell trick (`draw_rule_row_themed`, #609) covers the general case |
+| Terminal panel background wipe (`render_terminal_panel(frame, …)`) | `panels::render_terminal_panel_content` is the trait-pure twin `render_content` already calls |
+| Cursor placement (`frame.set_cursor_position`) | not a widget — quadraui's `tui/run.rs` applies `take_last_cursor_position()` after `render_content` (#604 / quadraui#466) |
+| `frame.area()` reads | `layout.main_content_bounds` / `layout.window_bounds`, which already account for the shell's reserved bands |
+
+**Consequence for the remaining #735 slices:** they do not have to compose around a
+non-portable ladder. `draw_frame` and its three test-only helpers
+(`panels::render_activity_bar`, `render_sidebar`, `render_terminal_panel`) should be
+**deleted** once the snapshot suite is retargeted at `render_content` — which is already
+listed as follow-up work in `tui_main/mod.rs`'s own comment. That is stage 6 of the issue's
+staging, and it is smaller than it looks.
 
 ### The five pockets — all now issue-shaped
 
