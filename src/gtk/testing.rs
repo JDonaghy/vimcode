@@ -4769,3 +4769,142 @@ mod clipboard_paste {
         );
     }
 }
+
+#[cfg(test)]
+mod scrollbar_paint {
+    //! #731's re-derivation of #723: this issue deleted 22 Relm4-era widget
+    //! handles that were permanently `None` under the ShellApp runner
+    //! (`self.overlay`, `self.drawing_area`, and friends), including the
+    //! only code that ever created a native `gtk4::Scrollbar` overlay
+    //! widget (`App::sync_scrollbar` / `create_window_scrollbars`, guarded
+    //! on those same dead handles). That path never ran even once under
+    //! ShellApp, so #723's fix (`e02a824`, insetting that native widget
+    //! past the minimap strip) was never visible on screen either — see
+    //! the doc comment on the `Surface::Editor` push in
+    //! `App::render_content` for the full re-diagnosis and where the fix
+    //! actually needs to move (quadraui's `gtk::editor::draw_editor`,
+    //! which documents that it deliberately skips scrollbars on GTK today
+    //! and defers to the very host path this issue just deleted).
+    //!
+    //! `GtkDriver` paints into an in-memory Cairo `ImageSurface` and can
+    //! only ever see Cairo-painted pixels, never native GTK overlay
+    //! widgets (see this module's own doc comment) — so it cannot directly
+    //! observe "no `gtk4::Scrollbar` was constructed". What it *can*
+    //! observe, definitively, is that nothing paints scrollbar-colored
+    //! pixels for a window that needs one, which is what a user actually
+    //! sees. This test is unchanged by this issue's diff (painting was
+    //! already dead beforehand — see the PR description) — it is the
+    //! executable evidence for the re-diagnosis above, not a red→green bug
+    //! fix: it was verified to also pass unmodified against `develop`
+    //! before this issue's changes were applied.
+    use super::*;
+
+    /// Buffer with enough lines that the pane cannot show them all — the
+    /// same fixture `mod tests`' `engine_with_long_buffer` uses, redefined
+    /// here since these `#[cfg(test)] mod`s are siblings, not nested.
+    /// Minimap and cursorline off: both default on and each paints real,
+    /// non-background content across the right-edge strip this test scans
+    /// (the minimap strip directly; cursorline as a full-width highlight
+    /// band on the cursor's row) — either would make the assertion below a
+    /// false positive unrelated to scrollbars.
+    fn engine_with_long_buffer() -> Engine {
+        let mut engine = Engine::new();
+        let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        engine.buffer_mut().insert(0, &text);
+        engine.settings.minimap = false;
+        engine.settings.cursorline = false;
+        engine
+    }
+
+    /// `true` iff any pixel in `rect` differs from `bg` (coarse grid scan).
+    fn region_has_non_background_pixel(
+        driver: &mut quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        rect: quadraui::Rect,
+        bg: (u8, u8, u8),
+    ) -> bool {
+        let (x0, y0) = (rect.x.round() as i32, rect.y.round() as i32);
+        let (x1, y1) = (
+            (rect.x + rect.width).round() as i32,
+            (rect.y + rect.height).round() as i32,
+        );
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                if driver.pixel(x, y) != bg {
+                    return true;
+                }
+                x += 1;
+            }
+            y += 2;
+        }
+        false
+    }
+
+    /// No vertical scrollbar affordance is painted along the right edge of
+    /// an editor pane that needs one (500 lines in an 900px-tall window).
+    /// A native `gtk4::Scrollbar` would be invisible to this test either
+    /// way (see module doc), but quadraui's shared rasteriser paints
+    /// scrollbars as ordinary Cairo pixels on TUI (`super::draw_scrollbar`
+    /// in `quadraui::tui::editor`) — if GTK ever grows the same inline
+    /// paint, this test starts failing and must be updated alongside it,
+    /// which is exactly the point: it pins today's (lack of) behavior so
+    /// that change is deliberate, not silent.
+    #[test]
+    fn no_scrollbar_pixels_paint_for_an_overflowing_editor_pane() {
+        let mut h = harness(engine_with_long_buffer(), 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        let rect = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active window must have painted")
+                .rect
+        };
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = {
+            let c = crate::render::to_quadraui_color(theme.background);
+            (c.r, c.g, c.b)
+        };
+        let thumb = {
+            let c = crate::render::to_quadraui_color(theme.scrollbar_thumb);
+            (c.r, c.g, c.b)
+        };
+        assert_ne!(
+            bg, thumb,
+            "fixture sanity: the theme's scrollbar thumb color must differ \
+             from its background, or a painted scrollbar would be \
+             indistinguishable from this test's own baseline"
+        );
+
+        // Right-hand strip wide enough to hold any plausible scrollbar
+        // (native widgets in the deleted code were ~10-12px; TUI's is one
+        // character cell), short of the pane's own left edge. Bottom
+        // `line_height` excluded: that row is the per-window status line
+        // (window_status_line, on by default), a real, unrelated feature
+        // painted in a distinct color across the full pane width.
+        const STRIP_W: f64 = 16.0;
+        let line_height = h
+            .painted_line_height()
+            .expect("render_content must publish the painted line height");
+        let strip = quadraui::Rect::new(
+            (rect.x + rect.width - STRIP_W).max(rect.x) as f32,
+            rect.y as f32,
+            STRIP_W.min(rect.width) as f32,
+            (rect.height - line_height).max(0.0) as f32,
+        );
+
+        assert!(
+            !region_has_non_background_pixel(&mut h.driver, strip, bg),
+            "no scrollbar should be painted on GTK today (#731's \
+             re-diagnosis of #723) — if this now fails, GTK has grown a \
+             live scrollbar paint and this test's doc comment needs \
+             updating to match, not silently deleting"
+        );
+    }
+}
