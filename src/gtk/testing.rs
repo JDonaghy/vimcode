@@ -2462,6 +2462,71 @@ second line here
              release lands on top of the editor pane (#544)"
         );
     }
+
+    /// AI: selecting the panel must paint its content — the 14th and last of
+    /// #592's `ScreenLayout` fields, and the straggler #670 deferred (#730).
+    ///
+    /// Asserts on the *rendered* header text via `screen_contains`, never on
+    /// `ai_panel`/`ai_has_focus` state alone — `ScreenLayout.picker` sat
+    /// populated on GTK for months while nothing painted it (CLAUDE.md
+    /// rule 1 / #587).
+    #[test]
+    fn ai_panel_paints_its_header() {
+        let h = panel_harness(PANEL_AI);
+        assert!(
+            h.driver.screen_contains("AI ASSISTANT"),
+            "selecting the AI panel must paint its header (#730)"
+        );
+    }
+
+    /// AI: a press in the message-history area must focus the panel without
+    /// opening the input box, and a press in the input box's own band must
+    /// also activate text entry — the same "click focuses, click-in-input
+    /// edits" split `git_panel_click_activates_the_commit_box_but_not_the_
+    /// header` exercises for the git sidebar's commit box (#544/#730).
+    ///
+    /// The input band is always the bottom-most one `render::draw_ai_
+    /// sidebar_panel` paints (header, then message history, then separator +
+    /// input), so a point near the very bottom edge is reliably inside it
+    /// without re-deriving the exact row math here.
+    #[test]
+    fn ai_panel_click_focuses_panel_and_activates_input_box() {
+        let mut h = panel_harness(PANEL_AI);
+        // Give the input box enough text to wrap across several rows, so its
+        // band grows well past the ~1-row margin `window_edge` (checked
+        // before sidebar routing, for CSD edge-resize) reserves along the
+        // window's outer bottom edge. Without this, a click low enough to
+        // land in the (1-row-tall, empty-input) input band also lands in
+        // that resize margin and never reaches sidebar routing at all.
+        h.engine.borrow_mut().ai_input = "x ".repeat(120);
+        assert!(!h.engine.borrow().ai_has_focus);
+        assert!(!h.engine.borrow().ai_input_active);
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        let lh = h.painted_line_height.get().unwrap() as f32;
+
+        // A press a few rows down (comfortably below the 1-row header, still
+        // well above the input box) must focus the panel but leave the input
+        // box inactive.
+        h.driver.click(sb.x + 20.0, sb.y + lh * 3.0);
+        assert!(
+            h.engine.borrow().ai_has_focus,
+            "a click in the panel body must focus it (#544)"
+        );
+        assert!(
+            !h.engine.borrow().ai_input_active,
+            "a click in the message-history area must not activate the input box"
+        );
+
+        // A press well inside the (now multi-row) input box's band — but
+        // clear of the window's bottom-edge resize margin — must also
+        // activate text entry.
+        h.driver.click(sb.x + 20.0, sb.y + sb.height - lh * 2.5);
+        assert!(
+            h.engine.borrow().ai_input_active,
+            "a click in the input box must activate it (#544)"
+        );
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor
