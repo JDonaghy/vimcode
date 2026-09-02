@@ -4031,6 +4031,209 @@ pub fn route_sidebar_hover(
     inside
 }
 
+// ─── Sidebar panel body dispatch (#754) ───────────────────────────────────────
+//
+// The rung the issue names by line count: "who owns the sidebar body"
+// (`sidebar_owner`, above) was already shared, but what each owner's press
+// actually *did* — translate the event, feed the same widget/engine call the
+// painter's own geometry lines up with — was re-derived independently on
+// each backend. The five functions below are that dispatch, stated once.
+// Callers keep their own gating (sidebar bounds, picker/context-menu
+// precedence, drag-capture bookkeeping) — that's real per-backend plumbing,
+// not duplicated business logic — and their own geometry *derivation*
+// (GTK caches it from paint time; TUI recomputes it from cheap closed-form
+// row math), because a pixel bounds and a cell bounds are answers to two
+// different questions. What's shared is what happens once that geometry and
+// the event are in hand.
+
+/// Route an explorer-sidebar event through the shared `TreeController`
+/// widget and resolve the result against the engine.
+///
+/// `metrics` is `(line_height, char_width)` in the caller's native unit —
+/// GTK re-applies the pixel metrics the tree was painted with before
+/// hit-testing (its `Backend::set_current_line_height`/`set_current_char_width`
+/// are inherent, not trait methods, so the caller must set them before this
+/// call); TUI's cell grid needs no such re-application and passes `(1.0,
+/// 1.0)`. Both values are also used to convert a `ContextMenuRequested`'s
+/// pixel/cell `position` back into the `(col, row)` `open_explorer_context_menu`
+/// wants.
+///
+/// A `ContextMenuRequested` result is fully resolved here (opening the same
+/// `engine.open_explorer_context_menu` both backends used to call
+/// independently) and reported back as `None`, since it is already consumed.
+/// Any other event is returned to the caller for its own DoubleClick /
+/// MouseDown dispatch and focus bookkeeping, which differ enough between a
+/// GTK press and a TUI scrollbar-drag lifecycle that folding them in here
+/// would just move the duplication rather than remove it.
+pub fn route_explorer_tree_event(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+    metrics: (f64, f64),
+    theme: &Theme,
+    backend: &mut dyn quadraui::Backend,
+) -> Option<quadraui::TreeControllerEvent> {
+    if rect.width <= 0.0 {
+        return None;
+    }
+    populate_explorer_tree_controller(engine, theme);
+    let (lh, cw) = metrics;
+    let tree_event = engine
+        .explorer_tree
+        .borrow_mut()
+        .handle(event, backend, rect);
+
+    if let quadraui::TreeControllerEvent::ContextMenuRequested { path, position } = &tree_event {
+        if let Some(&row_idx) = path.first() {
+            let idx = row_idx as usize;
+            let target_info = engine
+                .explorer_rows
+                .get(idx)
+                .map(|row| (row.path.clone(), row.is_dir));
+            if let Some((target, is_dir)) = target_info {
+                let cx = (position.x / (cw.max(1.0) as f32)) as u16;
+                let cy = (position.y / (lh.max(1.0) as f32)) as u16;
+                engine.open_explorer_context_menu(target, is_dir, cx, cy);
+            }
+        }
+        return None;
+    }
+    Some(tree_event)
+}
+
+/// Dispatch a mouse/scroll event to the debug ("run and debug") sidebar's
+/// *body* — everything below its title + action-button chrome — through the
+/// shared `SidebarSystem` widget. The chrome band itself is
+/// [`dap_sidebar_action_click_at`], a separate function because it needs
+/// only a local point, not a whole event.
+pub fn dispatch_dap_sidebar_body_event(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) {
+    populate_dap_sidebar_system(engine);
+    let sidebar_event = engine
+        .dap_sidebar_system
+        .borrow_mut()
+        .handle(event, backend, rect);
+    engine.dispatch_dap_sidebar_event(sidebar_event);
+}
+
+/// Resolve a press against the debug sidebar's title + action-button chrome
+/// row, at a point already translated into that row's own local space (`(0,
+/// 0)` at the row's own top-left — `StatusBar::layout`'s own convention).
+/// GTK translates by subtracting its cached `action_rect`'s origin; TUI's
+/// action row already paints at `y == 0` of its own local frame, so its
+/// local point is the raw column. Returns whether a segment was actually
+/// hit — the caller claims the whole chrome row regardless, matching both
+/// backends' pre-#754 behaviour.
+pub fn dap_sidebar_action_click_at(engine: &mut Engine, local_x: f32, local_y: f32) -> bool {
+    let matched = {
+        let hits = engine.dap_sidebar_action_hits.borrow();
+        hits.as_ref().is_some_and(|l| {
+            matches!(
+                l.hit_test(local_x, local_y),
+                quadraui::StatusBarHit::Segment(_)
+            )
+        })
+    };
+    if matched {
+        engine.handle_dap_sidebar_action_click();
+    }
+    matched
+}
+
+/// Which band of the git sidebar a [`route_sc_sidebar_click`] press landed
+/// on. Both variants mean "consumed" — the split only exists because TUI's
+/// double-click synthesis (crossterm has no native double-click) must fire
+/// only for a genuine content-row click, matching what GTK's toolkit-native
+/// `DoubleClick` event would have hit had it landed in the same place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScSidebarClickOutcome {
+    /// Header, commit-input box, or a toolbar button — chrome consumed the
+    /// press directly.
+    Chrome,
+    /// Fell through to `handle_sc_sidebar_ui_event` — a section/content-row
+    /// click (or a non-`starts_interaction` follow-through, e.g. a drag).
+    Content,
+}
+
+/// Route a press/scroll to the git ("source control") sidebar, given the
+/// [`ScSidebarBands`] the shared painter laid the panel out into and the
+/// event's position in that *same* absolute space. Mirrors the GTK-only
+/// `route_sc_sidebar_event` this replaced: header row clears the commit
+/// input, the commit-input band activates it, a toolbar-button hit routes
+/// through `sc_button_hit`/`sc_activate_button`, and anything else in the
+/// slab (or a non-`starts_interaction` follow-through, e.g. a drag) falls
+/// through to `handle_sc_sidebar_ui_event`.
+pub fn route_sc_sidebar_click(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    pos: quadraui::Point,
+    bands: &ScSidebarBands,
+    starts_interaction: bool,
+) -> ScSidebarClickOutcome {
+    if starts_interaction {
+        engine.sc_set_focus(true);
+        let commit_bottom = bands.commit_input.y + bands.commit_input.height;
+        if pos.y < bands.header.y + bands.header.height {
+            engine.sc_commit_input_active = false;
+            return ScSidebarClickOutcome::Chrome;
+        }
+        if pos.y < commit_bottom {
+            engine.sc_commit_input_active = true;
+            engine.sc_commit_cursor = engine.sc_commit_message.len();
+            return ScSidebarClickOutcome::Chrome;
+        }
+        engine.sc_commit_input_active = false;
+        let hit = {
+            let layout = engine.sc_panel_layout.borrow();
+            layout.as_ref().map(|l| l.hit_test(pos.x, pos.y))
+        };
+        if let Some(quadraui::SidebarPanelHit::ToolbarButton(_)) = hit {
+            if let Some(idx) = engine.sc_button_hit(pos.x, pos.y) {
+                engine.sc_activate_button(idx);
+            }
+            return ScSidebarClickOutcome::Chrome;
+        }
+    }
+    engine.handle_sc_sidebar_ui_event(event.clone());
+    ScSidebarClickOutcome::Content
+}
+
+/// Route a press to the AI assistant sidebar's body, given the
+/// [`AiSidebarBands`] the shared painter (`draw_ai_sidebar_panel`) laid the
+/// panel out into. A press in the input band activates editing there
+/// (cursor at end); anywhere else in the panel just moves focus — mirrors
+/// `#730`'s GTK-only `route_ai_sidebar_event`, which this replaces.
+///
+/// TUI paints this same panel (`panels::render_ai_sidebar` also calls
+/// `draw_ai_sidebar_panel`) but has never cached the returned bands for
+/// click routing the way GTK's `cached_ai_bands` does, so it does not yet
+/// call this function — the AI panel stayed keyboard-only there before
+/// #754 and stays that way after it. That is a real, separate gap (wiring a
+/// bands cache into `TuiShellApp`), not the duplication this function
+/// fixes: there was never a second copy of this dispatch logic on TUI to
+/// converge with.
+pub fn route_ai_sidebar_click(
+    engine: &mut Engine,
+    pos: quadraui::Point,
+    bands: &AiSidebarBands,
+    starts_interaction: bool,
+) {
+    if starts_interaction {
+        engine.ai_has_focus = true;
+        let in_input = pos.y >= bands.input.y && pos.y < bands.input.y + bands.input.height;
+        if in_input {
+            engine.ai_input_active = true;
+            engine.ai_input_cursor = engine.ai_input.chars().count();
+        } else {
+            engine.ai_input_active = false;
+        }
+    }
+}
+
 // ─── Overlay-band composition (#735 slice 1) ──────────────────────────────────
 //
 // The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and

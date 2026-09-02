@@ -2030,45 +2030,58 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.explorer_has_focus = true;
 
-            let tree_row = sidebar_row as usize + engine.explorer_tree.borrow().scroll_offset();
-            if tree_row < engine.explorer_rows.len() {
-                // Record potential drag source for DnD.
-                *explorer_drag_src = Some(tree_row);
-                engine
-                    .explorer_tree
-                    .borrow_mut()
-                    .set_selected_path(Some(vec![tree_row as u16]));
-                if engine.explorer_rows[tree_row].is_dir {
-                    engine.explorer_toggle_dir(tree_row);
-                } else {
-                    let path = engine.explorer_rows[tree_row].path.clone();
-                    engine.open_file_preview(&path);
+            // #754: the `TreeController` dispatch itself —
+            // populate/handle/resolve — is `render::route_explorer_tree_event`,
+            // the same function GTK's `explorer_ui_event` and this same
+            // struct's `TuiShellApp::handle_mouse_event` explorer intercept
+            // call. Cell-native metrics (`(1.0, 1.0)`): TUI's tree paints at
+            // one row/column per cell, so there is no pixel scale to
+            // re-apply the way GTK does.
+            let rect = engine.explorer_tree_rect.get();
+            let click_ev = quadraui::UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(col as f32, row as f32),
+                modifiers: quadraui::Modifiers::default(),
+            };
+            let theme = render::Theme::from_name(&engine.settings.colorscheme);
+            let mut tui_backend = super::backend::TuiBackend::default();
+            if let Some(tree_event) = render::route_explorer_tree_event(
+                engine,
+                &click_ev,
+                rect,
+                (1.0, 1.0),
+                &theme,
+                &mut tui_backend,
+            ) {
+                // Record potential drag source for DnD — only a genuine row
+                // selection (not a chevron toggle or a scrollbar drag) arms
+                // one, matching what a hit *on the row* used to mean before
+                // the TreeController's own hit-test replaced the raw
+                // `sidebar_row` arithmetic here.
+                if let quadraui::TreeControllerEvent::RowSelected { ref path } = tree_event {
+                    if let Some(&row_idx) = path.first() {
+                        *explorer_drag_src = Some(row_idx as usize);
+                    }
                 }
+                engine.handle_explorer_mouse_event(tree_event);
             }
         } else if owner == render::SidebarOwner::Debug {
             sidebar.has_focus = true;
             engine.dap_sidebar_has_focus = true;
 
             if sidebar_row < 2 {
-                // Chrome rows (title + action button).
-                let guard = engine.dap_sidebar_action_hits.borrow();
-                let matched = guard
-                    .as_ref()
-                    .map(|l| {
-                        matches!(
-                            l.hit_test(col as f32, 0.0),
-                            quadraui::StatusBarHit::Segment(_)
-                        )
-                    })
-                    .unwrap_or(false);
-                drop(guard);
-                if matched {
-                    engine.handle_dap_sidebar_action_click();
-                }
+                // Chrome rows (title + action button). TUI's action-hit
+                // layout is already populated in absolute-column space (`y`
+                // is always `0.0` — a single-row band), unlike GTK's, which
+                // is bar-local and needs its cached rect subtracted first;
+                // `dap_sidebar_action_click_at` takes the already-local
+                // point either way (#754).
+                render::dap_sidebar_action_click_at(engine, col as f32, 0.0);
             } else {
-                // Route body click through SidebarSystem.
+                // Route body click through the shared `SidebarSystem`
+                // dispatch (#754) — same function GTK calls.
                 let rect = engine.dap_sidebar_body_rect.get();
-                crate::render::populate_dap_sidebar_system(engine);
                 let click_event = quadraui::UiEvent::MouseDown {
                     widget: None,
                     button: quadraui::MouseButton::Left,
@@ -2076,68 +2089,56 @@ pub(super) fn handle_mouse(
                     modifiers: quadraui::Modifiers::default(),
                 };
                 let mut tui_backend = super::backend::TuiBackend::default();
-                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                render::dispatch_dap_sidebar_body_event(
+                    engine,
                     &click_event,
-                    &mut tui_backend,
                     rect,
+                    &mut tui_backend,
                 );
-                engine.dispatch_dap_sidebar_event(sidebar_event);
             }
             return sidebar_width;
         } else if owner == render::SidebarOwner::Git {
             sidebar.has_focus = true;
-            engine.sc_set_focus(true);
 
-            // sidebar_row layout after #509 (option a, no padding):
-            //   0               = header
-            //   1 .. commit_end = commit input (quadraui::TextInput box,
-            //                     including its 1-row border top+bottom — #480)
-            //   commit_end      = toolbar slot (button row, SidebarPanel)
-            //   commit_end+1 .. = sections (SidebarPanel content area)
-            let commit_box_h = render::sc_commit_input_box_height(&engine.sc_commit_message);
-            let commit_end = 1 + commit_box_h;
-
-            if sidebar_row == 0 {
-                engine.sc_commit_input_active = false;
-            } else if sidebar_row >= 1 && sidebar_row < commit_end {
-                engine.sc_commit_input_active = true;
-                engine.sc_commit_cursor = engine.sc_commit_message.len();
-            } else {
-                // Route via cached SidebarPanelLayout (#509).
-                engine.sc_commit_input_active = false;
-                let hit = {
-                    let layout = engine.sc_panel_layout.borrow();
-                    layout.as_ref().map(|l| l.hit_test(col as f32, row as f32))
-                };
-                match hit {
-                    Some(quadraui::SidebarPanelHit::ToolbarButton(_)) => {
-                        if let Some(idx) = engine.sc_button_hit(col as f32, row as f32) {
-                            engine.sc_activate_button(idx);
-                        }
-                    }
-                    Some(quadraui::SidebarPanelHit::Content { .. }) => {
-                        let click_ev = quadraui::UiEvent::MouseDown {
-                            widget: None,
-                            button: quadraui::MouseButton::Left,
-                            position: quadraui::Point::new(col as f32, row as f32),
-                            modifiers: quadraui::Modifiers::default(),
-                        };
-                        engine.handle_sc_sidebar_ui_event(click_ev);
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
-                        if is_double {
-                            let double_ev = quadraui::UiEvent::DoubleClick {
-                                widget: None,
-                                position: quadraui::Point::new(col as f32, row as f32),
-                            };
-                            engine.handle_sc_sidebar_ui_event(double_ev);
-                        }
-                    }
-                    _ => {}
+            // #754: bands built in the *same absolute* frame `sc_panel_layout`/
+            // `sc_button_hit` already hit-test in (the shared painter's own
+            // coordinates — `col`/`row`, not the `sidebar_row` this arm used
+            // pre-#754), so `render::route_sc_sidebar_click` — the same
+            // dispatch GTK calls — resolves identically on both backends.
+            let content_rect = quadraui::Rect::new(
+                ab_width as f32,
+                menu_rows as f32,
+                sidebar_width as f32,
+                term_height.saturating_sub(menu_rows) as f32,
+            );
+            let bands = render::sc_sidebar_bands(&engine.sc_commit_message, content_rect, 1.0, 2.0);
+            let pos = quadraui::Point::new(col as f32, row as f32);
+            let click_ev = quadraui::UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: pos,
+                modifiers: quadraui::Modifiers::default(),
+            };
+            let outcome = render::route_sc_sidebar_click(engine, &click_ev, pos, &bands, true);
+            // Double-click detection stays TUI-only plumbing — crossterm has
+            // no double-click concept, so it must be synthesized here from
+            // click timing before being fed back through the same shared
+            // dispatch, matching how GTK's toolkit-native `DoubleClick`
+            // reaches `route_sc_sidebar_click` directly. Only a genuine
+            // content-row click gets one — a double-click on the header,
+            // commit box, or a toolbar button was never synthesized here.
+            if outcome == render::ScSidebarClickOutcome::Content {
+                let now = Instant::now();
+                let is_double = now.duration_since(*last_click_time) < Duration::from_millis(400)
+                    && *last_click_pos == (col, row);
+                *last_click_time = now;
+                *last_click_pos = (col, row);
+                if is_double {
+                    let double_ev = quadraui::UiEvent::DoubleClick {
+                        widget: None,
+                        position: pos,
+                    };
+                    engine.handle_sc_sidebar_ui_event(double_ev);
                 }
             }
             return sidebar_width;
