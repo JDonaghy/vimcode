@@ -8,7 +8,7 @@ Load this file when working on code structure, adding files, or navigating unfam
 
 | File | What goes here |
 |------|---------------|
-| `mod.rs` | App struct, Msg enum, `SimpleComponent` impl (view/init/update), `impl App`, geometry helpers |
+| `mod.rs` | `App` struct, `quadraui::ShellApp` impl (`setup`/`render_content`/`handle`/`tick`), `impl App` event handlers, `DeferredAction` queue, geometry helpers |
 | `draw.rs` | All `draw_*` free functions (editor, panels, popups, sidebars) |
 | `click.rs` | `ClickTarget` enum, `pixel_to_click_target()`, mouse click/drag/double-click handlers |
 | `css.rs` | `make_theme_css()`, `STATIC_CSS`, `load_css()` |
