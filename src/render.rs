@@ -3176,6 +3176,362 @@ pub fn apply_command_center_hit(engine: &mut Engine, hit: quadraui::CommandCente
     true
 }
 
+// ═══ Divider + drag rung (#753, mouse-ladder slice 3) ═════════════════════════
+//
+// The rung *beneath* the chrome rung above: once no chrome band has claimed the
+// point, the next things that can own it are the resize handles between editor
+// groups and between `:split`/`:vsplit` panes, and the tab drag-and-drop
+// gesture. All three are **stateful** — a press arms them, subsequent moves
+// track them, a release commits — and that state machine was transcribed once
+// per backend, with the usual results:
+//
+//  1. **Two mutually-exclusive `Option` fields per backend**
+//     (`dragging_group_divider` + `dragging_window_divider` on TUI,
+//     `group_divider_dragging` + `window_divider_dragging` on GTK) encoded
+//     "at most one divider is grabbed" as an invariant nothing enforced.
+//     [`DividerGrab`] makes it one field, so the illegal state is unrepresentable.
+//
+//  2. **The drag-application block was written four times** — find the divider
+//     whose `split_index` matches the grab, [`divider_ratio_from_pos`], push the
+//     ratio into `GroupLayout` or the group's active-tab `WindowLayout`. Two
+//     copies per backend, ~11 lines each, differing only in how the divider list
+//     was obtained. It is now [`apply_divider_drag`], called once per backend.
+//
+//  3. **`#582` is named in both backends' banner comments** — the issue title
+//     the tracker uses for "the divider frame mismatch that had to be fixed
+//     twice". The second fix existed *because* the first one landed in only one
+//     rasteriser. The arbitration order (group divider, then window divider) and
+//     the "a grabbed divider outranks everything below it" rule are now stated
+//     once, in [`route_divider_grab`], rather than in two ladders that have
+//     already drifted apart once.
+//
+//  4. **The tab-drag state machine was five fields and four call sites per
+//     backend.** [`TabDragState`] owns arm → threshold → track → commit, and
+//     both backends now hold one field.
+//
+// Deliberately unit-agnostic in the same way slices 1 and 2 are: the caller
+// states its own scale (the tolerances in [`DividerMetrics`], the squared
+// threshold in [`TabDragState::handle_move`]) and the *sequence* underneath is
+// unit-free. TUI passes character cells, GTK device pixels.
+//
+// **Not a rung of this router, deliberately** — recorded here so the next slice
+// does not re-litigate it:
+//
+//   * **The sidebar separator drag.** It has no GTK twin to converge *with*.
+//     TUI paints the separator itself and resizes on drag because it owns every
+//     cell of its own frame; GTK's sidebar is a real widget in the container
+//     hierarchy and GTK's own layout machinery does the resize — there is no
+//     `handle_mouse_drag_msg` arm for it, and adding one so that a shared
+//     router would have two callers would be inventing a duplicate in order to
+//     delete it. The divider *geometry* each backend feeds in is likewise its
+//     own painted geometry (`ScreenLayout::group_dividers` on TUI, the
+//     `cached_editor_bounds` recompute on GTK) for the same reason
+//     `ChromeState` takes painted rects rather than deriving them.
+
+/// Which divider a press grabbed. One field replaces the two
+/// mutually-exclusive `Option`s each backend used to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DividerGrab {
+    /// A boundary *between editor groups* (`Ctrl+W v` / `Ctrl+W s`), resized
+    /// through `Engine::group_layout`.
+    Group { split_index: usize },
+    /// A `:split`/`:vsplit` boundary *within* one group's active tab (#582),
+    /// resized through that group's `WindowLayout`.
+    Window {
+        group_id: GroupId,
+        split_index: usize,
+    },
+}
+
+/// How far off a divider's painted `position` a press still counts as a grab,
+/// in the caller's own units.
+///
+/// Genuinely per-backend, because it describes what each rasteriser *drew*:
+/// TUI's divider occupies exactly one character cell starting at `position`, so
+/// its band is one cell wide and `quantize` must match the renderer's `as u16`
+/// truncation (#452); GTK draws a thin continuous line and wants a symmetric
+/// pixel grab margin around it.
+#[derive(Debug, Clone, Copy)]
+pub struct DividerMetrics {
+    /// Tolerance for vertical (left/right) group dividers.
+    pub group_vertical: DividerTolerance,
+    /// Tolerance for horizontal (top/bottom) group dividers.
+    pub group_horizontal: DividerTolerance,
+    /// Tolerance for vertical window-split dividers.
+    pub window_vertical: DividerTolerance,
+    /// Tolerance for horizontal window-split dividers.
+    pub window_horizontal: DividerTolerance,
+    /// Hit-test against the truncated `position as u16` the renderer drew at
+    /// (TUI) rather than the continuous float position (GTK). See
+    /// [`divider_hit_test`].
+    pub quantize: bool,
+}
+
+/// GTK's grab metrics: a symmetric 6-device-pixel margin around the thin
+/// continuous line the Cairo rasteriser drew, in both split directions.
+pub const GTK_DIVIDER_METRICS: DividerMetrics = DividerMetrics {
+    group_vertical: (6.0, 6.0),
+    group_horizontal: (6.0, 6.0),
+    window_vertical: (6.0, 6.0),
+    window_horizontal: (6.0, 6.0),
+    quantize: false,
+};
+
+/// The painted divider geometry for one frame, plus the caller's grab metrics.
+#[derive(Debug, Clone, Copy)]
+pub struct DividerState<'a> {
+    /// Boundaries between editor groups, as painted.
+    pub group_dividers: &'a [GroupDivider],
+    /// `:split`/`:vsplit` boundaries within each group, as painted (#582).
+    pub window_dividers: &'a [WindowDivider],
+    /// The caller's grab tolerances.
+    pub metrics: DividerMetrics,
+    /// `true` when this point sits on a group's tab bar and the caller wants
+    /// tab-bar clicks to reach the tab handlers instead of arming a group
+    /// divider.
+    ///
+    /// Only GTK sets this. On TUI a *horizontal* group divider **is** the lower
+    /// group's whole tab-bar block (there is no separate glyph to aim at), which
+    /// is why `group_horizontal`'s tolerance runs `(0.0, tab_bar_rows)` there —
+    /// excluding the tab bar would make horizontal group splits unresizable.
+    pub on_tab_bar: bool,
+}
+
+/// Arbitrate a left-press against the painted dividers.
+///
+/// Group dividers are tested first because they are the outer boundary: a
+/// window split lives *inside* one group, so a point on a group boundary can
+/// never also be on a window boundary of the group it separates, and testing
+/// the outer one first keeps the nesting order explicit.
+pub fn route_divider_grab(state: &DividerState<'_>, x: f64, y: f64) -> Option<DividerGrab> {
+    if !state.on_tab_bar {
+        if let Some(i) = divider_hit_test(
+            state.group_dividers,
+            x,
+            y,
+            state.metrics.group_vertical,
+            state.metrics.group_horizontal,
+            state.metrics.quantize,
+        ) {
+            return Some(DividerGrab::Group {
+                split_index: state.group_dividers[i].split_index,
+            });
+        }
+    }
+    let i = divider_hit_test(
+        state.window_dividers,
+        x,
+        y,
+        state.metrics.window_vertical,
+        state.metrics.window_horizontal,
+        state.metrics.quantize,
+    )?;
+    let div = &state.window_dividers[i];
+    Some(DividerGrab::Window {
+        group_id: div.group_id,
+        split_index: div.split_index,
+    })
+}
+
+/// Push a pointer position into the ratio of an already-grabbed divider.
+///
+/// Returns `true` when a divider matching `grab` was found and its ratio
+/// updated, so the caller can consume the event and request a redraw. The
+/// divider slices are the *current* frame's geometry — the grab is remembered
+/// by `split_index`, not by a snapshot of the divider, so a resize that
+/// reflows the layout mid-drag keeps tracking the right boundary.
+pub fn apply_divider_drag(
+    engine: &mut Engine,
+    grab: DividerGrab,
+    group_dividers: &[GroupDivider],
+    window_dividers: &[WindowDivider],
+    x: f64,
+    y: f64,
+) -> bool {
+    match grab {
+        DividerGrab::Group { split_index } => {
+            let Some(div) = group_dividers.iter().find(|d| d.split_index == split_index) else {
+                return false;
+            };
+            let ratio = divider_ratio_from_pos(div, x, y);
+            engine.group_layout.set_ratio_at_index(split_index, ratio);
+            true
+        }
+        DividerGrab::Window {
+            group_id,
+            split_index,
+        } => {
+            let Some(div) = window_dividers
+                .iter()
+                .find(|d| d.group_id == group_id && d.split_index == split_index)
+            else {
+                return false;
+            };
+            let ratio = divider_ratio_from_pos(div, x, y);
+            let Some(group) = engine.editor_groups.get_mut(&group_id) else {
+                return false;
+            };
+            group
+                .active_tab_mut()
+                .layout
+                .set_ratio_at_index(split_index, ratio);
+            true
+        }
+    }
+}
+
+/// What [`TabDragState::handle_move`] wants from the caller after a move.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TabDragMove {
+    /// Nothing armed and nothing dragging — the caller continues down its own
+    /// mouse ladder.
+    Idle,
+    /// A press is armed but the pointer has not travelled far enough yet.
+    /// **Consume the event** and do nothing: this is what stops a twitchy click
+    /// on a tab from starting a drag, and equally what stops the move from
+    /// falling through and extending an editor text selection instead.
+    Pending,
+    /// The threshold was just crossed. The caller must decide whether the
+    /// *press* point was really on a tab — TUI knows it was (only the tab-bar
+    /// arm arms the drag), GTK re-resolves it through `pixel_to_click_target`
+    /// because its arm fires for the whole tab-bar band — and then call
+    /// [`TabDragState::begin`] or [`TabDragState::disarm`]. Consume either way.
+    Crossed { press_x: f64, press_y: f64 },
+    /// A drag is live: compute the drop zone for `(x, y)` in the caller's own
+    /// geometry and hand it to [`TabDragState::track`]. Consume.
+    Tracking,
+}
+
+/// The arm → threshold → track → commit state machine behind tab
+/// drag-and-drop, held as a single field by both backends.
+///
+/// Five parallel fields per backend became one, which is what makes the
+/// invariants checkable: a `source` can only exist while `dragging`, and
+/// `press` and `dragging` are never both set.
+#[derive(Debug, Clone)]
+pub struct TabDragState {
+    /// Where the left button went down inside a tab bar, until either the
+    /// threshold is crossed or the button is released.
+    press: Option<(f64, f64)>,
+    /// `(group, tab index)` being dragged; `Some` exactly while `dragging`.
+    source: Option<(GroupId, usize)>,
+    /// Latest pointer position, for the drag ghost.
+    cursor: Option<(f64, f64)>,
+    /// Latest computed drop zone, for the drop overlay and for the commit.
+    zone: crate::core::window::DropZone,
+    dragging: bool,
+}
+
+impl Default for TabDragState {
+    fn default() -> Self {
+        Self {
+            press: None,
+            source: None,
+            cursor: None,
+            zone: crate::core::window::DropZone::None,
+            dragging: false,
+        }
+    }
+}
+
+impl TabDragState {
+    /// Remember a left-press inside a tab bar as a *potential* drag.
+    pub fn arm(&mut self, x: f64, y: f64) {
+        self.press = Some((x, y));
+    }
+
+    /// Forget any armed press without starting a drag.
+    pub fn disarm(&mut self) {
+        self.press = None;
+    }
+
+    /// `true` while a drag is live — the gate both backends' drop overlays
+    /// paint behind.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    /// Latest pointer position during a live drag, for the ghost label.
+    pub fn cursor(&self) -> Option<(f64, f64)> {
+        self.cursor
+    }
+
+    /// `(group, tab index)` being dragged, for the ghost label's text.
+    pub fn source(&self) -> Option<(GroupId, usize)> {
+        self.source
+    }
+
+    /// Latest computed drop zone, for the drop overlay.
+    pub fn zone(&self) -> &crate::core::window::DropZone {
+        &self.zone
+    }
+
+    /// Advance the machine for a left-button move at `(x, y)`.
+    ///
+    /// `threshold_sq` is the squared travel distance that promotes an armed
+    /// press into a drag, in the caller's own units: `2.0` for TUI (which is
+    /// exactly the old Manhattan `dx + dy >= 2` over integer cells — the
+    /// minimum of `dx² + dy²` subject to `|dx| + |dy| = 2` is 2, and any
+    /// Manhattan distance ≤ 1 has `dx² + dy² ≤ 1`) and `64.0` for GTK's 8
+    /// device pixels.
+    pub fn handle_move(&mut self, x: f64, y: f64, threshold_sq: f64) -> TabDragMove {
+        if self.dragging {
+            self.cursor = Some((x, y));
+            return TabDragMove::Tracking;
+        }
+        let Some((px, py)) = self.press else {
+            return TabDragMove::Idle;
+        };
+        let (dx, dy) = (x - px, y - py);
+        if dx * dx + dy * dy >= threshold_sq {
+            TabDragMove::Crossed {
+                press_x: px,
+                press_y: py,
+            }
+        } else {
+            TabDragMove::Pending
+        }
+    }
+
+    /// Promote a crossed threshold into a live drag of `source`.
+    pub fn begin(&mut self, source: (GroupId, usize), x: f64, y: f64) {
+        self.source = Some(source);
+        self.cursor = Some((x, y));
+        self.zone = crate::core::window::DropZone::None;
+        self.dragging = true;
+        self.press = None;
+    }
+
+    /// Record the drop zone the caller computed for the current pointer
+    /// position. No-op unless a drag is live.
+    pub fn track(&mut self, zone: crate::core::window::DropZone) {
+        if self.dragging {
+            self.zone = zone;
+        }
+    }
+
+    /// Commit on left-release. Applies the pending drop through
+    /// `Engine::apply_tab_drop_zone` and clears the machine; returns `true`
+    /// when a drag was live (so the caller consumes and redraws).
+    ///
+    /// Always clears any armed press, drag or not — a release without travel is
+    /// a plain click and must not leave the machine armed for the *next*
+    /// unrelated move.
+    pub fn handle_release(&mut self, engine: &mut Engine) -> bool {
+        self.press = None;
+        if !self.dragging {
+            return false;
+        }
+        self.dragging = false;
+        let zone = std::mem::replace(&mut self.zone, crate::core::window::DropZone::None);
+        if let Some((gid, tab_idx)) = self.source.take() {
+            engine.apply_tab_drop_zone(gid, tab_idx, zone);
+        }
+        self.cursor = None;
+        true
+    }
+}
+
 // ─── Overlay-band composition (#735 slice 1) ──────────────────────────────────
 //
 // The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and

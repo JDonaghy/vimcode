@@ -386,8 +386,11 @@ pub struct TuiShellApp {
     dragging_sidebar: bool,
     dragging_terminal_resize: bool,
     dragging_terminal_split: bool,
-    dragging_group_divider: Option<usize>,
-    dragging_window_divider: Option<(GroupId, usize)>,
+    /// The divider (group boundary or `:split` boundary) currently grabbed.
+    /// #753 collapsed the two mutually-exclusive `dragging_group_divider` /
+    /// `dragging_window_divider` fields into the shared
+    /// [`render::DividerGrab`], so "both grabbed at once" is unrepresentable.
+    divider_grab: Option<render::DividerGrab>,
     hover_selecting: bool,
     fr_input_dragging: bool,
     last_layout: RefCell<Option<render::ScreenLayout>>,
@@ -406,11 +409,11 @@ pub struct TuiShellApp {
     explorer_sb_dragging: bool,
     explorer_drag_src: Option<usize>,
     explorer_drag_active: Option<(usize, Option<usize>)>,
-    tab_drag_start: Option<(u16, u16)>,
-    tab_dragging: bool,
-    tui_drag_source: Option<(GroupId, usize)>,
-    tui_drag_cursor: Option<(f64, f64)>,
-    tui_tab_drop_zone: crate::core::window::DropZone,
+    /// Tab drag-and-drop arm → threshold → track → commit machine. #753
+    /// replaced the five parallel fields (`tab_drag_start`, `tab_dragging`,
+    /// `tui_drag_source`, `tui_drag_cursor`, `tui_tab_drop_zone`) with the
+    /// shared [`render::TabDragState`], which GTK holds too.
+    tab_drag: render::TabDragState,
     last_clipboard_content: Option<String>,
     pending_startup_msg: Option<String>,
     had_popup_overlay: Cell<bool>,
@@ -562,8 +565,7 @@ impl TuiShellApp {
             dragging_sidebar: false,
             dragging_terminal_resize: false,
             dragging_terminal_split: false,
-            dragging_group_divider: None,
-            dragging_window_divider: None,
+            divider_grab: None,
             hover_selecting: false,
             fr_input_dragging: false,
             last_layout: RefCell::new(None),
@@ -576,11 +578,7 @@ impl TuiShellApp {
             explorer_sb_dragging: false,
             explorer_drag_src: None,
             explorer_drag_active: None,
-            tab_drag_start: None,
-            tab_dragging: false,
-            tui_drag_source: None,
-            tui_drag_cursor: None,
-            tui_tab_drop_zone: crate::core::window::DropZone::None,
+            tab_drag: render::TabDragState::default(),
             last_clipboard_content: None,
             pending_startup_msg,
             had_popup_overlay: Cell::new(false),
@@ -1113,8 +1111,7 @@ impl TuiShellApp {
             &mut self.dragging_sidebar,
             &mut self.dragging_terminal_resize,
             &mut self.dragging_terminal_split,
-            &mut self.dragging_group_divider,
-            &mut self.dragging_window_divider,
+            &mut self.divider_grab,
             drag_state,
             modal_stack,
             last_layout.as_ref(),
@@ -1126,11 +1123,7 @@ impl TuiShellApp {
             &mut should_quit,
             &mut self.explorer_drag_src,
             &mut self.explorer_drag_active,
-            &mut self.tab_drag_start,
-            &mut self.tab_dragging,
-            &mut self.tui_drag_source,
-            &mut self.tui_drag_cursor,
-            &mut self.tui_tab_drop_zone,
+            &mut self.tab_drag,
             &hover_link_rects,
             self.hover_popup_rect.get(),
             self.editor_hover_popup_rect.get(),
@@ -1552,21 +1545,20 @@ impl ShellApp for TuiShellApp {
         );
 
         // ── Tab-drag ghost overlay (#609) ────────────────────────────────
-        // Drag state (`tui_drag_source`/`tui_drag_cursor`/
-        // `tui_tab_drop_zone`) is already live here — #602 wired
-        // `handle_mouse_event` to mutate these three fields via
+        // Drag state (the shared `render::TabDragState`) is already live
+        // here — #602 wired `handle_mouse_event` to advance it via
         // `mouse::handle_mouse` (see `handle()` below) — so painting from
         // it needs no further sequencing with #602, just the paint call
         // itself, which is this issue's scope.
-        if self.tui_drag_source.is_some() {
+        if self.tab_drag.source().is_some() {
             render_tab_drag_overlay(
                 backend,
                 &self.engine,
                 &screen,
                 &theme,
-                self.tui_drag_source,
-                self.tui_drag_cursor,
-                &self.tui_tab_drop_zone,
+                self.tab_drag.source(),
+                self.tab_drag.cursor(),
+                self.tab_drag.zone(),
             );
         }
 
@@ -5257,6 +5249,125 @@ mod tests {
             found_divider,
             "expected the group divider glyph '│' to paint via \
              TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// Terminal column of the group divider glyph in one painted row,
+    /// scanning only to the right of `after` so the sidebar's own tree-indent
+    /// guides (a different screen region entirely) cannot be mistaken for it.
+    /// Shared by the divider-drag tests below.
+    ///
+    /// Takes `TuiDriver::styled_row`'s per-*cell* vec rather than a
+    /// `screen()` line: `screen()` emits one `char` per wide glyph, so a
+    /// string index into it undercounts columns wherever the explorer's
+    /// two-cell icons were painted, and the resulting column would not agree
+    /// with the coordinates `find()` and `mouse_down()` speak.
+    fn divider_col_on_row<S>(cells: &[(char, S)], after: usize) -> Option<usize> {
+        cells
+            .iter()
+            .enumerate()
+            .skip(after)
+            .find(|(_, (c, _))| *c == '\u{2502}')
+            .map(|(i, _)| i)
+    }
+
+    /// #753 (mouse ladder slice 3), TUI half: dragging the editor-group
+    /// divider must actually move it, end to end through the real
+    /// `driver_with_shell` pipeline (`TestBackend` -> `ShellAdapter::handle`
+    /// -> `TuiShellApp::handle` -> `mouse::handle_mouse` -> the shared
+    /// `render::route_divider_grab` / `render::apply_divider_drag`).
+    ///
+    /// Asserts on **rendered output** (`CLAUDE.md` rule 1): the painted
+    /// `\u{2502}` column before the gesture versus after it. Asserting that
+    /// `divider_grab` became `Some` would pass against a router that arms the
+    /// grab and then never applies it — which is exactly the half of the rung
+    /// this slice moved into shared code.
+    ///
+    /// The vertical-split fixture matches
+    /// `render_content_paints_group_divider_via_shell_app` above (short
+    /// content, so neither pane overflows and the #481 scrollbar-as-separator
+    /// guard cannot mask the glyph).
+    #[test]
+    fn group_divider_drag_moves_the_painted_divider_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "short\n");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // The first painted frame is not the settled layout: `handle_mouse`
+        // returns the sidebar width the app then adopts, so the sidebar (and
+        // with it the editor origin, and with it the divider column) only
+        // reaches its steady state after one dispatched mouse event. Settle
+        // with a no-op release before measuring the "before" column, so the
+        // two measurements below are taken in the same regime.
+        driver.mouse_up(1.0, 1.0);
+
+        // Derive the divider's painted column rather than hard-coding it —
+        // `AppShell`'s activity-bar/sidebar reservation owns the origin.
+        let (tab_x, _) = driver
+            .find("[No Name]")
+            .expect("each pane paints its own tab label");
+        let after = tab_x as usize;
+        let row = 5_usize;
+        let before = divider_col_on_row(&driver.styled_row(row as u16), after)
+            .expect("the vertical group split must paint a divider glyph");
+
+        // Grab the divider and drag it 8 cells left.
+        let target = before - 8;
+        driver.mouse_down(before as f32, row as f32);
+        driver.mouse_move(target as f32, row as f32);
+        driver.mouse_up(target as f32, row as f32);
+
+        let moved = divider_col_on_row(&driver.styled_row(row as u16), after)
+            .expect("the divider must still be painted after the drag");
+        let screen = driver.screen();
+        assert!(
+            moved < before,
+            "dragging the group divider from col {before} to col {target} must \
+             repaint it further left, but it stayed at col {moved}; screen:\n{screen}"
+        );
+        assert!(
+            moved.abs_diff(target) <= 1,
+            "the repainted divider (col {moved}) should track the drag column \
+             ({target}) within a cell of rounding; screen:\n{screen}"
+        );
+    }
+
+    /// #753, TUI half: the *release* end of the same rung. A left-press on the
+    /// divider followed by a mouse-up **without** an intervening move must
+    /// leave the divider exactly where it was — the grab is armed but nothing
+    /// is applied, so a plain click on a split boundary is not a silent resize.
+    ///
+    /// This is the arm-without-apply case `route_divider_grab` and
+    /// `apply_divider_drag` are deliberately split across; a router that
+    /// applied on press would move the divider here.
+    #[test]
+    fn group_divider_click_without_move_leaves_the_divider_put_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "short\n");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // See the sibling test for why one dispatched no-op event is needed
+        // before the layout is settled enough to measure.
+        driver.mouse_up(1.0, 1.0);
+
+        let (tab_x, _) = driver
+            .find("[No Name]")
+            .expect("each pane paints its own tab label");
+        let after = tab_x as usize;
+        let row = 5_usize;
+        let before = divider_col_on_row(&driver.styled_row(row as u16), after)
+            .expect("the vertical group split must paint a divider glyph");
+
+        driver.mouse_down(before as f32, row as f32);
+        driver.mouse_up(before as f32, row as f32);
+
+        let after_cells = driver.styled_row(row as u16);
+        let screen = driver.screen();
+        assert_eq!(
+            divider_col_on_row(&after_cells, after),
+            Some(before),
+            "a press-and-release on the divider with no drag must not move it; \
+             screen:\n{screen}"
         );
     }
 
