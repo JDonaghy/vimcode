@@ -14,6 +14,9 @@
 
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;
+use crate::core::engine::sidebar::{
+    PANEL_AI, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+};
 use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
@@ -2855,6 +2858,202 @@ pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
     }
 
     ModalKeyRoute::None
+}
+
+// ─── Focus-owner keyboard routing (#757 / #734 slice 2) ──────────────────────
+//
+// The rung directly beneath [`route_modal_key`]: once no modal surface has
+// claimed the key, the *focus owners* get their turn — the activity bar, and
+// then whichever sidebar panel holds keyboard focus.
+//
+// Before this, the ladder was transcribed per backend and had drifted in four
+// separate ways:
+//
+//   TUI (`handle_sidebar_focused_key`, 442 lines — now `handle_focus_owner_key`)
+//        activity bar → [gate: `sidebar.has_focus && !picker_open &&
+//        !terminal_has_focus`] → search → debug → ext panel → extensions →
+//        settings → AI → source control → explorer (unguarded fallback),
+//        with each panel selected by `active_panel_is(PANEL_*)` — the
+//        *visible* panel — rather than by the engine's focus flag.
+//   GTK (the block inside `handle_key_press`)
+//        activity bar → explorer → ext panel → extensions → settings →
+//        search → source control → debug → AI, each selected by the engine's
+//        `*_has_focus` flag, with no picker/terminal gate at all.
+//
+// The four divergences, all of them user-visible:
+//
+//  1. **Picker.** TUI suppressed the whole band while `picker_open`; GTK did
+//     not. Opening the command palette with the explorer focused sent j/k to
+//     the explorer on GTK and to the palette on TUI.
+//  2. **Terminal.** TUI suppressed the band while `terminal_has_focus` (the
+//     "Press Enter to close…" state after an extension install); GTK did not,
+//     so those keys were eaten by whichever panel still held a focus flag.
+//  3. **Ext panel vs explorer order.** `Engine::activity_bar_activate` sets
+//     `ext_panel_has_focus` *without* clearing `explorer_has_focus` (unlike
+//     `focus_sidebar_panel`, which calls `clear_sidebar_focus` first), so both
+//     flags can be true at once. TUI checked the ext panel first and got the
+//     plugin panel; GTK checked the explorer first and sent the keys to a
+//     panel that is not even on screen.
+//  4. **Visible panel vs focused panel.** TUI keyed its arms off
+//     `active_panel_is`, GTK off the focus flags. They agree whenever
+//     `focus_sidebar_panel` put them in sync and disagree the moment anything
+//     moves one without the other.
+//
+// This function states the ladder once. Both backends keep their own *sinks*
+// (`handle_focus_owner_key` on TUI, the `match` in `handle_key_press` on GTK)
+// because the per-panel dispatch needs backend-local plumbing — key-name
+// translation tables, `TuiSidebar::ext_panel_name`, GTK's
+// `focus_after_sidebar_key` — exactly as `route_modal_key` left
+// `ContextMenu`'s action dispatch backend-side.
+//
+// **Verdict on two rungs deliberately *not* converged here:**
+//
+//  * *Completion popup* (#734 slice 1 listed it as unconverged). Re-measured
+//    on `develop`: **neither backend intercepts completion keys.** There is no
+//    `completion_idx` read anywhere in either keyboard ladder — both hand the
+//    key to `Engine::handle_key`, whose own precedence chain
+//    (`core/engine/keys.rs`) owns Ctrl-N/Ctrl-P/Tab/Up/Down over the popup.
+//    The rung is already stated once, in the engine. Promoting it to
+//    [`ModalKeyRoute`] would *add* behaviour — making the popup outrank the
+//    sidebar band — with no bug behind it, so it is left alone.
+//  * *Folder picker* is deliberately one-sided: GTK uses a native
+//    `GtkFileChooser` via `PendingFileDialog`, so there is no GTK twin to
+//    converge and none is built.
+
+/// Which focus owner owns a keystroke, resolved after [`route_modal_key`] has
+/// declined it and before either backend reaches its editor/terminal tier.
+///
+/// Pure state inspection over [`Engine`] plus the caller's own "the sidebar
+/// band holds the keyboard" latch — see [`route_focus_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusKeyRoute {
+    /// The activity bar (toolbar) strip. j/k move, l/Enter activate, h/Esc
+    /// leave, q collapses the sidebar.
+    ActivityBar,
+    /// A plugin-provided ("extension") sidebar panel —
+    /// `Engine::handle_ext_panel_key` / `handle_ext_panel_input_key`.
+    ExtPanel,
+    /// The search/replace panel — `dispatch_search_sidebar_key_unified`.
+    Search,
+    /// The debug (DAP) panel — `SidebarSystem::handle` first, then
+    /// `dispatch_dap_sidebar_action_key`.
+    Debug,
+    /// The extensions *marketplace* panel —
+    /// `dispatch_ext_sidebar_key_unified`.
+    ExtSidebar,
+    /// The settings panel — `Engine::handle_settings_key`.
+    Settings,
+    /// The AI assistant panel — `Engine::handle_ai_panel_key`.
+    Ai,
+    /// The source-control panel — `dispatch_sc_sidebar_key_unified`.
+    SourceControl,
+    /// The file explorer — `Engine::dispatch_explorer_key`. Also the
+    /// terminal fallback: a key that reaches the sidebar band and matches no
+    /// other panel lands here rather than falling through to the editor,
+    /// mirroring the unguarded trailing block TUI's ladder ended with.
+    Explorer,
+    /// No focus owner claims the key; the caller continues down its own
+    /// ladder (editor, terminal, …).
+    None,
+}
+
+/// Resolve the focus-owner rung against engine state.
+///
+/// `sidebar_band_focused` is the caller's own latch for "the sidebar band, as
+/// opposed to the editor, currently holds the keyboard". TUI passes
+/// `TuiSidebar::has_focus`; GTK, which keeps no such latch, passes
+/// [`Engine::sidebar_has_focus`] — the disjunction of the very flags the arms
+/// below test, so the gate is a no-op there and GTK's per-flag behaviour is
+/// preserved exactly.
+///
+/// [`FocusKeyRoute::ActivityBar`] is resolved *above* that gate on purpose:
+/// `Engine::dispatch_explorer_key`'s `FocusToolbar` result calls
+/// `activity_bar_focus_in_at` while the backend clears its band latch, so the
+/// activity bar is routinely focused with the latch already false.
+pub fn route_focus_key(engine: &Engine, sidebar_band_focused: bool) -> FocusKeyRoute {
+    // A picker modal (command palette / fuzzy finder / live grep) and the
+    // terminal PTY both outrank every focus owner below. TUI gated on both;
+    // GTK gated on neither, which is divergences 1 and 2 above.
+    if engine.picker_open || engine.terminal_has_focus {
+        return FocusKeyRoute::None;
+    }
+
+    if engine.activity_bar_focused {
+        return FocusKeyRoute::ActivityBar;
+    }
+
+    if !sidebar_band_focused {
+        return FocusKeyRoute::None;
+    }
+
+    // Ext panel first: it is the one flag that can be set alongside a stale
+    // built-in panel flag (divergence 3).
+    if engine.ext_panel_has_focus {
+        return FocusKeyRoute::ExtPanel;
+    }
+
+    // Each built-in panel matches on its focus flag *or* on being the visible
+    // panel — the union of the two predicates the backends used to disagree
+    // over (divergence 4). They coincide whenever `focus_sidebar_panel` set
+    // them together, which is the overwhelmingly common case.
+    if engine.search_has_focus || engine.active_panel_is(PANEL_SEARCH) {
+        return FocusKeyRoute::Search;
+    }
+    if engine.dap_sidebar_has_focus || engine.active_panel_is(PANEL_DEBUG) {
+        return FocusKeyRoute::Debug;
+    }
+    if engine.ext_sidebar_has_focus || engine.active_panel_is(PANEL_EXTENSIONS) {
+        return FocusKeyRoute::ExtSidebar;
+    }
+    if engine.settings_has_focus || engine.active_panel_is(PANEL_SETTINGS) {
+        return FocusKeyRoute::Settings;
+    }
+    if engine.ai_has_focus || engine.active_panel_is(PANEL_AI) {
+        return FocusKeyRoute::Ai;
+    }
+    if engine.sc_has_focus || engine.active_panel_is(PANEL_GIT) {
+        return FocusKeyRoute::SourceControl;
+    }
+
+    // The explorer is the unguarded fallback, not a guarded arm — see the
+    // variant doc.
+    FocusKeyRoute::Explorer
+}
+
+/// What a key does once [`FocusKeyRoute::ActivityBar`] has claimed it.
+///
+/// The activity bar's key table was the one part of that arm both backends
+/// transcribed *identically enough to look fine* and still disagreed on: GTK
+/// guarded activation and focus-out with `!ctrl`, TUI did not, so Ctrl-L in
+/// the toolbar activated the selected panel on TUI and did nothing on GTK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityBarKeyAction {
+    /// j / Down — move the toolbar cursor down.
+    MoveDown,
+    /// k / Up — move the toolbar cursor up.
+    MoveUp,
+    /// l / Right / Enter — activate the selected item (`activity_bar_activate`).
+    Activate,
+    /// h / Left / Esc — leave the toolbar, focus returns to the editor.
+    FocusOut,
+    /// q — leave the toolbar *and* collapse the sidebar.
+    Collapse,
+    /// Anything else — swallowed, the toolbar stays as it is.
+    Ignore,
+}
+
+/// Map an engine-space key name (GTK's `map_gtk_key_name` output, TUI's
+/// `tui_key_to_engine_name` output or a bare character) to its activity-bar
+/// action. `ctrl` suppresses activation and focus-out, matching GTK.
+pub fn activity_bar_key_action(key: &str, ctrl: bool) -> ActivityBarKeyAction {
+    match key {
+        "j" | "Down" => ActivityBarKeyAction::MoveDown,
+        "k" | "Up" => ActivityBarKeyAction::MoveUp,
+        "l" | "Right" | "Return" if !ctrl => ActivityBarKeyAction::Activate,
+        "h" | "Left" | "Escape" if !ctrl => ActivityBarKeyAction::FocusOut,
+        "q" => ActivityBarKeyAction::Collapse,
+        _ => ActivityBarKeyAction::Ignore,
+    }
 }
 
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
