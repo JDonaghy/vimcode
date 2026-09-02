@@ -1021,9 +1021,7 @@ impl Engine {
                 self.set_dirty(true);
                 self.update_syntax();
                 let active_id = self.active_buffer_id();
-                if self.preview_buffer_id == Some(active_id) {
-                    self.promote_preview(active_id);
-                }
+                self.preview_tab_promote(active_id);
                 self.lsp_dirty_buffers.insert(active_id, true);
                 self.swap_mark_dirty();
                 if !self.search_matches.is_empty() {
@@ -1590,9 +1588,7 @@ impl Engine {
             self.set_dirty(true);
             self.update_syntax();
             let active_id = self.active_buffer_id();
-            if self.preview_buffer_id == Some(active_id) {
-                self.promote_preview(active_id);
-            }
+            self.preview_tab_promote(active_id);
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
             // Refresh search highlights so they track the new buffer content.

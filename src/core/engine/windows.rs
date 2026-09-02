@@ -1997,9 +1997,7 @@ impl Engine {
             self.blame_annotations_active = false;
             // Clicking a preview tab promotes it to permanent (VSCode behavior).
             let buf_id = self.active_buffer_id();
-            if self.buffer_manager.get(buf_id).is_some_and(|s| s.preview) {
-                self.promote_preview(buf_id);
-            }
+            self.preview_tab_promote(buf_id);
             self.tab_mru_touch();
             self.tab_nav_push();
             self.lsp_ensure_active_buffer();
@@ -2525,8 +2523,8 @@ impl Engine {
             .apply_language_map(buffer_id, &self.settings.language_map);
 
         // If this buffer is the current preview, just promote it in-place.
-        if self.preview_buffer_id == Some(buffer_id) {
-            self.promote_preview(buffer_id);
+        if self.preview_tab.is_preview(&buffer_id.to_string()) {
+            self.preview_tab_promote(buffer_id);
             self.refresh_git_diff(buffer_id);
             self.message = format!("\"{}\"", path.display());
             self.lsp_did_open(buffer_id);
@@ -2632,21 +2630,39 @@ impl Engine {
             return;
         }
 
-        // Find the existing preview tab, if any (within the active group).
-        let mut preview_slot: Option<(usize, WindowId, BufferId)> = None;
-        if let Some(preview_buf_id) = self.preview_buffer_id {
-            for (idx, tab) in self.active_group().tabs.iter().enumerate() {
-                let win_id = tab.active_window;
-                if self
-                    .windows
-                    .get(&win_id)
-                    .is_some_and(|w| w.buffer_id == preview_buf_id)
-                {
-                    preview_slot = Some((idx, win_id, preview_buf_id));
-                    break;
+        // Ask the shared preview tier (quadraui#597) whether this reuses the
+        // existing preview slot or needs a new one; it hands back the old
+        // preview's id (if any) via a `Closed` event so we can unload it.
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let events = self
+            .preview_tab
+            .open_preview(WorkspaceDoc::new(buffer_id.to_string(), label));
+        let mut old_buf_id = None;
+        for ev in &events {
+            if let WorkspaceEvent::Closed { id, .. } = ev {
+                if let Ok(raw) = id.parse::<usize>() {
+                    old_buf_id = Some(BufferId(raw));
                 }
             }
         }
+
+        // Find the tab/window currently showing the old preview buffer, if any.
+        let preview_slot = old_buf_id.and_then(|old_id| {
+            self.active_group()
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(idx, tab)| {
+                    let win_id = tab.active_window;
+                    self.windows
+                        .get(&win_id)
+                        .is_some_and(|w| w.buffer_id == old_id)
+                        .then_some((idx, win_id, old_id))
+                })
+        });
 
         if let Some((tab_idx, win_id, old_buf_id)) = preview_slot {
             // Reuse the existing preview tab: close old preview buffer and
@@ -2658,7 +2674,6 @@ impl Engine {
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.preview = true;
             }
-            self.preview_buffer_id = Some(buffer_id);
             self.active_group_mut().active_tab = tab_idx;
             let view = self.restore_file_position(buffer_id);
             if let Some(w) = self.windows.get_mut(&win_id) {
@@ -2676,12 +2691,12 @@ impl Engine {
             if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                 state.preview = true;
             }
-            self.preview_buffer_id = Some(buffer_id);
             let view = self.restore_file_position(buffer_id);
             if let Some(w) = self.windows.get_mut(&window_id) {
                 w.view = view;
             }
         }
+        self.sync_preview_buffer_id();
 
         self.ensure_active_tab_visible();
         self.refresh_git_diff(buffer_id);
@@ -3082,10 +3097,10 @@ impl Engine {
             }
         }
 
-        // Clear preview tracking if deleting the preview buffer
-        if self.preview_buffer_id == Some(id) {
-            self.preview_buffer_id = None;
-        }
+        // Drop the deleted buffer from the shared preview tier — clears its
+        // preview flag if it held one, and stops its doc entry from lingering.
+        self.preview_tab.close(&id.to_string());
+        self.sync_preview_buffer_id();
 
         self.lsp_did_close(id);
         self.buffer_manager.delete(id, force)

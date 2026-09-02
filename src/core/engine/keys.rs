@@ -426,9 +426,7 @@ impl Engine {
 
             // Auto-promote preview buffer on text modification
             let active_id = self.active_buffer_id();
-            if self.preview_buffer_id == Some(active_id) {
-                self.promote_preview(active_id);
-            }
+            self.preview_tab_promote(active_id);
             // Mark buffer as needing an LSP didChange (debounced)
             self.lsp_dirty_buffers.insert(active_id, true);
 
@@ -5467,9 +5465,7 @@ impl Engine {
         self.set_dirty(true);
         self.update_syntax();
         let active_id = self.active_buffer_id();
-        if self.preview_buffer_id == Some(active_id) {
-            self.promote_preview(active_id);
-        }
+        self.preview_tab_promote(active_id);
         self.lsp_dirty_buffers.insert(active_id, true);
         self.refresh_md_previews();
         self.swap_mark_dirty();

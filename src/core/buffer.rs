@@ -9,6 +9,14 @@ use ropey::Rope;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferId(pub usize);
 
+impl fmt::Display for BufferId {
+    /// Renders as the bare numeric id — used as the opaque document id
+    /// handed to quadraui's `WorkspaceController` preview tier (#658).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Buffer {
     #[allow(dead_code)]
