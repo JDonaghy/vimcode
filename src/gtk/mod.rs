@@ -1512,6 +1512,13 @@ impl App {
     /// retired `Msg::MouseDoubleClick` carried were bound to `_` and are
     /// dropped from the signature.
     fn handle_mouse_double_click_msg(&mut self, x: f64, y: f64) {
+        // #490: a double-click landing on the editor hover popup used to fall
+        // straight through to the editor's word-select underneath, because
+        // this handler never consulted the popup at all. It runs the same
+        // shared rung the single-click path does, first.
+        if self.route_and_apply_editor_hover_popup(x, y) {
+            return;
+        }
         let mut engine = self.engine.borrow_mut();
         if engine.picker_open {
             let in_tree_mode = engine.picker_source
@@ -2291,8 +2298,117 @@ impl App {
     /// `rel_x / char-width`-style fallback in practice — see `terminal_cols`
     /// for the same "no live font-metrics source without a widget handle"
     /// root cause.
+    /// Run the shared editor-hover-popup rung (#755) against this frame's
+    /// painted geometry and apply whatever it decides.
+    ///
+    /// Returns `true` when the press belonged to the popup and must not fall
+    /// through to the editor. Called from `handle_mouse_click_msg` **above**
+    /// the scroll-surface dispatch — this backend used to run its bespoke
+    /// copy ~90 lines *below* it, which is why a click aimed at the popup's
+    /// own scrollbar was swallowed by the surface painted behind it
+    /// (#229/#486) — and from `handle_mouse_double_click_msg`, which never
+    /// consulted the popup at all, so a double-click on it fell through to
+    /// the editor's word-select (#490).
+    fn route_and_apply_editor_hover_popup(&self, x: f64, y: f64) -> bool {
+        let (visible, has_focus) = {
+            let engine = self.engine.borrow();
+            (engine.editor_hover.is_some(), engine.editor_hover_has_focus)
+        };
+        let links: Vec<(quadraui::Rect, String)> = self
+            .editor_hover_link_rects
+            .borrow()
+            .iter()
+            .map(|(lx, ly, lw, lh, uri)| {
+                (
+                    quadraui::Rect::new(*lx as f32, *ly as f32, *lw as f32, *lh as f32),
+                    uri.clone(),
+                )
+            })
+            .collect();
+        let route = render::route_editor_hover_popup_click(
+            visible,
+            &render::EditorHoverPopupState {
+                popup: self
+                    .editor_hover_popup_rect
+                    .get()
+                    .map(|(px, py, pw, ph)| {
+                        quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
+                    }),
+                links: &links,
+                scrollbar: self.editor_hover_scrollbar.get(),
+                has_focus,
+                // `draw_editor_hover_popup` insets its text by 4px on both
+                // axes; the content grid is the editor's own cell size.
+                content: render::PopupContentMetrics {
+                    pad_x: 4.0,
+                    pad_y: 4.0,
+                    col_width: self.cached_char_width.max(1.0) as f32,
+                    line_height: self.cached_line_height.max(1.0) as f32,
+                },
+            },
+            x,
+            y,
+        );
+        let effect =
+            render::apply_editor_hover_popup_route(&mut self.engine.borrow_mut(), route);
+        if let Some(url) = effect.open_url {
+            open_url(&url);
+        }
+        if let Some(target) = effect.begin_drag {
+            let drag_rc = self.backend.borrow().drag_state_handle();
+            drag_rc.borrow_mut().begin(target);
+            // Seek immediately, with the same thumb-aware math the drag
+            // frames will use. This backend used to run a *second*,
+            // ratio-based calculation at press time, so the thumb jumped
+            // once on press and again on the first drag frame.
+            let drag = drag_rc.borrow().clone();
+            for ev in quadraui::dispatch_mouse_drag(
+                &drag,
+                quadraui::Point {
+                    x: x as f32,
+                    y: y as f32,
+                },
+                Default::default(),
+            ) {
+                if let quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } = ev {
+                    if widget.as_str() == "editor_hover" {
+                        self.engine.borrow_mut().editor_hover_set_scroll(new_offset);
+                    }
+                }
+            }
+        }
+        self.draw_needed.set(true);
+        effect.consumed
+    }
+
+    /// Seek to the minimap strip position under `(x, y)`, if any (#35, #723).
+    ///
+    /// Returns `true` when a strip was hit and the press must not fall
+    /// through. Stateless, exactly like TUI's rung: a drag frame re-runs the
+    /// same hit test, so holding the button keeps seeking without either
+    /// backend carrying a `minimap_dragging` flag.
+    fn route_and_apply_minimap_click(&self, x: f64, y: f64) -> bool {
+        let layout_ref = self.cached_screen_layout.borrow();
+        let Some(ref layout) = *layout_ref else {
+            return false;
+        };
+        if render::apply_minimap_click(&mut self.engine.borrow_mut(), layout, x, y).is_some() {
+            self.draw_needed.set(true);
+            return true;
+        }
+        false
+    }
+
+    /// Popup-content column under `rel_x` (pixels from the content origin).
+    ///
+    /// Used by the hover-selection *drag* follow-through; the press itself
+    /// goes through `render::route_editor_hover_popup_click`, which divides by
+    /// the same `col_width`. Before #755 this returned `rel_x as usize` — a
+    /// column per *pixel* — so a drag-selection inside the popup ran off the
+    /// end of the line on the first few pixels of travel and never agreed
+    /// with the column the press had chosen.
     fn pixel_to_editor_hover_col(&self, rel_x: f64, _content_line: usize) -> usize {
-        rel_x.max(0.0) as usize
+        (rel_x.max(0.0) / self.cached_char_width.max(1.0)) as usize
     }
 
     /// Push or pop the editor hover popup on the modal stack so
@@ -2777,6 +2893,19 @@ impl App {
             render::ModalOverlayRoute::None => {}
         }
 
+        // ── Editor hover popup rung (#755) ────────────────────────────────
+        //
+        // Link click, scrollbar grab, focus-or-select and dismiss-on-outside,
+        // sequenced ONCE in `render::route_editor_hover_popup_click` and
+        // shared verbatim with TUI's `handle_mouse`. The ~100 lines this
+        // replaced sat *below* the scroll-surface dispatch, so a press aimed
+        // at the popup's own scrollbar was consumed by the surface painted
+        // behind it (#229/#486). It runs above that dispatch now — where TUI
+        // always had it — because the popup paints on top of the editor.
+        if self.route_and_apply_editor_hover_popup(x, y) {
+            return;
+        }
+
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
         {
             let surfaces = self.engine.borrow().scroll_surfaces.borrow().clone();
@@ -2864,109 +2993,6 @@ impl App {
             }
         }
 
-        // Editor hover: click on the popup focuses it; click elsewhere dismisses it
-        {
-            let engine = self.engine.borrow();
-            if engine.editor_hover.is_some() {
-                let rect = self.editor_hover_popup_rect.get();
-                let on_popup = if let Some((px, py, pw, ph)) = rect {
-                    x >= px && x < px + pw && y >= py && y < py + ph
-                } else {
-                    false
-                };
-                let has_focus = engine.editor_hover_has_focus;
-                drop(engine);
-                if on_popup {
-                    // Scrollbar hit-test (#215). Track click jumps to that
-                    // offset and arms a drag so mouse-move updates the
-                    // offset live; thumb click just begins the drag.
-                    if let Some(sb_hit) = self.editor_hover_scrollbar.get() {
-                        let cx = x as f32;
-                        let cy = y as f32;
-                        let on_thumb = cx >= sb_hit.thumb.x
-                            && cx < sb_hit.thumb.x + sb_hit.thumb.width
-                            && cy >= sb_hit.thumb.y
-                            && cy < sb_hit.thumb.y + sb_hit.thumb.height;
-                        let on_track = !on_thumb
-                            && cx >= sb_hit.track.x
-                            && cx < sb_hit.track.x + sb_hit.track.width
-                            && cy >= sb_hit.track.y
-                            && cy < sb_hit.track.y + sb_hit.track.height;
-                        if on_track || on_thumb {
-                            if on_track {
-                                let max_scroll = sb_hit.total.saturating_sub(sb_hit.visible_rows);
-                                let rel = ((cy - sb_hit.track.y) / sb_hit.track.height.max(1.0))
-                                    .clamp(0.0, 1.0);
-                                let new_offset = (rel * max_scroll as f32).round() as usize;
-                                self.engine.borrow_mut().editor_hover_set_scroll(new_offset);
-                            }
-                            self.backend
-                                .borrow()
-                                .drag_state_handle()
-                                .borrow_mut()
-                                .begin(quadraui::DragTarget::ScrollbarY {
-                                    widget: quadraui::WidgetId::new("editor_hover"),
-                                    track_start: sb_hit.track.y,
-                                    track_length: sb_hit.track.height,
-                                    thumb_length: sb_hit.thumb.height,
-                                    max_scroll: sb_hit.total.saturating_sub(sb_hit.visible_rows),
-                                    grab_offset: 0.0,
-                                    inverted: false,
-                                });
-                            self.draw_needed.set(true);
-                            return;
-                        }
-                    }
-                    // Check if click hit a link rect.
-                    let link_hit = self
-                        .editor_hover_link_rects
-                        .borrow()
-                        .iter()
-                        .find(|(lx, ly, lw, lh, _)| {
-                            x >= *lx && x <= lx + lw && y >= *ly && y <= ly + lh
-                        })
-                        .cloned();
-                    if let Some((_, _, _, _, url)) = link_hit {
-                        if url.starts_with("command:") {
-                            self.engine.borrow_mut().execute_hover_goto(&url);
-                        } else {
-                            open_url(&url);
-                        }
-                        self.engine.borrow_mut().dismiss_editor_hover();
-                    } else if !has_focus {
-                        self.engine.borrow_mut().editor_hover_has_focus = true;
-                    } else {
-                        // Focused, no link hit — start text selection
-                        let lh = self.cached_line_height.max(1.0);
-                        if let Some((px, py, _pw, _ph)) = rect {
-                            let padding = 4.0;
-                            let rel_x = x - px - padding;
-                            let rel_y = y - py - padding;
-                            let engine_ref = self.engine.borrow();
-                            let scroll = engine_ref
-                                .editor_hover
-                                .as_ref()
-                                .map(|h| h.scroll_top)
-                                .unwrap_or(0);
-                            drop(engine_ref);
-                            let content_line = (rel_y / lh).max(0.0) as usize + scroll;
-                            let content_col = self.pixel_to_editor_hover_col(rel_x, content_line);
-                            self.engine
-                                .borrow_mut()
-                                .editor_hover_start_selection(content_line, content_col);
-                        }
-                    }
-                    // Consume click — don't process as editor click
-                    self.draw_needed.set(true);
-                    return;
-                } else if !has_focus {
-                    self.engine.borrow_mut().dismiss_editor_hover();
-                } else {
-                    // Focused popup — click outside dismisses
-                    self.engine.borrow_mut().dismiss_editor_hover();
-                }
-            }
-        }
         // #733: the dialog rung moved to the shared modal-overlay router
         // at the top of this handler (`render::route_modal_overlay_click`),
         // which TUI's `handle_mouse` calls too. Control only reaches here
@@ -3126,6 +3152,21 @@ impl App {
                         self.divider_grab = Some(grab);
                         return;
                     }
+                }
+
+                // ── Minimap click / drag (#35, #723) ─────────────────────────
+                // `render::apply_minimap_click` owns the hit test and the
+                // seek; both backends' only contribution is the point. Before
+                // #755 this rung existed on TUI alone — GTK *painted* every
+                // pane's strip (`render::draw_minimap_strip`) and then had no
+                // handler at all, so clicking one did nothing.
+                //
+                // Placed after both divider hit-tests for the same reason TUI
+                // places it there: the strip is carved off the active window's
+                // right edge, so in a `:vsplit` it abuts the divider's grab
+                // band, and losing a divider drag is the worse failure.
+                if self.route_and_apply_minimap_click(x, y) {
+                    return;
                 }
 
                 {
@@ -3413,6 +3454,20 @@ impl App {
     }
 
     fn handle_mouse_drag_msg(&mut self, x: f64, y: f64, width: f64, height: f64) {
+        // #35/#723: minimap drag follow-through. Same stateless hit test the
+        // press ran (`render::apply_minimap_click`), so holding the button
+        // keeps seeking — exactly as TUI's rung does, and with no
+        // `minimap_dragging` flag on either side. Gated on "no other gesture
+        // already owns this drag" so a text selection or an armed scrollbar
+        // that happens to travel across a strip is never hijacked.
+        if self.divider_grab.is_none()
+            && !self.engine.borrow().mouse_drag_active
+            && !self.backend.borrow().drag_state_handle().borrow().is_active()
+            && self.route_and_apply_minimap_click(x, y)
+        {
+            return;
+        }
+
         // Phase B.4 drag dispatch: feed the move through quadraui's
         // dispatcher so an active drag (scrollbar, handle, etc.)
         // translates into primitive-specific events, then guard

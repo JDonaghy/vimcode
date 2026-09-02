@@ -1576,83 +1576,60 @@ pub(super) fn handle_mouse(
     if ev.kind != MouseEventKind::Down(MouseButton::Left) {
         return sidebar_width;
     }
-    // DEBUG: trace every left-click
-    // ── Click on editor hover popup link → execute command or copy URL ─────
-    if mouse_on_editor_hover && !editor_hover_link_rects.is_empty() {
-        for &(lx, ly, lw, _lh, ref url) in editor_hover_link_rects {
-            if row == ly && col >= lx && col < lx + lw {
-                if url.starts_with("command:") {
-                    engine.execute_hover_goto(url);
-                } else {
-                    tui_copy_to_clipboard(url, engine);
-                    engine.dismiss_editor_hover();
-                }
-                return sidebar_width;
-            }
+    // ── Editor hover popup rung (#755) ─────────────────────────────────────
+    //
+    // Link click, scrollbar grab, focus-or-select and dismiss-on-outside were
+    // four blocks here and four *differently ordered, differently behaving*
+    // blocks on GTK. They are now `render::route_editor_hover_popup_click` +
+    // `apply_editor_hover_popup_route`, which GTK calls too — see the rung's
+    // banner in `render.rs` for the six drifts that collapsed into it.
+    //
+    // Stays above the scroll-surface rung, where TUI already had it and GTK
+    // did not: the popup paints on top of the editor, so it must also win the
+    // click that lands on it (#229/#486).
+    {
+        let popup_links = editor_hover_popup_link_rects(editor_hover_link_rects);
+        let route = render::route_editor_hover_popup_click(
+            engine.editor_hover.is_some(),
+            &render::EditorHoverPopupState {
+                popup: editor_hover_popup_rect.map(|(px, py, pw, ph)| {
+                    quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
+                }),
+                links: &popup_links,
+                scrollbar: editor_hover_scrollbar,
+                has_focus: engine.editor_hover_has_focus,
+                // TUI measures in whole cells: the popup's border eats one
+                // row and two columns before the text starts.
+                content: render::PopupContentMetrics {
+                    pad_x: 2.0,
+                    pad_y: 1.0,
+                    col_width: 1.0,
+                    line_height: 1.0,
+                },
+            },
+            col as f64,
+            row as f64,
+        );
+        let effect = render::apply_editor_hover_popup_route(engine, route);
+        if let Some(url) = effect.open_url {
+            tui_copy_to_clipboard(&url, engine);
         }
-    }
-    // ── Click on editor hover popup scrollbar → jump-scroll or arm drag ────
-    // Same pattern as picker/explorer scrollbars (#215). Track click jumps
-    // to that offset and begins a drag so the mouse-move dispatcher
-    // updates the offset live; thumb click just begins the drag.
-    if mouse_on_editor_hover {
-        if let Some(sb_hit) = editor_hover_scrollbar {
-            let cx = col as f32;
-            let cy = row as f32;
-            let on_thumb = cx >= sb_hit.thumb.x
-                && cx < sb_hit.thumb.x + sb_hit.thumb.width
-                && cy >= sb_hit.thumb.y
-                && cy < sb_hit.thumb.y + sb_hit.thumb.height;
-            let on_track = !on_thumb
-                && cx >= sb_hit.track.x
-                && cx < sb_hit.track.x + sb_hit.track.width
-                && cy >= sb_hit.track.y
-                && cy < sb_hit.track.y + sb_hit.track.height;
-            if on_track || on_thumb {
-                let grab_offset = if on_thumb { cy - sb_hit.thumb.y } else { 0.0 };
-                drag_state.begin(quadraui::DragTarget::ScrollbarY {
-                    widget: quadraui::WidgetId::new("editor_hover"),
-                    track_start: sb_hit.track.y,
-                    track_length: sb_hit.track.height,
-                    thumb_length: sb_hit.thumb.height,
-                    max_scroll: sb_hit.total.saturating_sub(sb_hit.visible_rows),
-                    grab_offset,
-                    inverted: false,
-                });
-                apply_scrollbar_drag(
-                    drag_state,
-                    quadraui::Point { x: cx, y: cy },
-                    engine,
-                    sidebar,
-                );
-                return sidebar_width;
-            }
+        if let Some(target) = effect.begin_drag {
+            drag_state.begin(target);
+            apply_scrollbar_drag(
+                drag_state,
+                quadraui::Point {
+                    x: col as f32,
+                    y: row as f32,
+                },
+                engine,
+                sidebar,
+            );
         }
-    }
-    // ── Click on editor hover popup → focus or start selection ─────────────
-    if mouse_on_editor_hover && engine.editor_hover.is_some() {
-        if engine.editor_hover_has_focus {
-            // Already focused — start text selection
-            if let Some((px, py, _pw, _ph)) = editor_hover_popup_rect {
-                let scroll = engine
-                    .editor_hover
-                    .as_ref()
-                    .map(|h| h.scroll_top)
-                    .unwrap_or(0);
-                let content_line = (row.saturating_sub(py + 1)) as usize + scroll;
-                let content_col = col.saturating_sub(px + 2) as usize;
-                engine.editor_hover_start_selection(content_line, content_col);
-                *hover_selecting = true;
-            }
-        } else {
-            engine.editor_hover_focus();
+        *hover_selecting |= effect.selecting;
+        if effect.consumed {
+            return sidebar_width;
         }
-        return sidebar_width;
-    }
-    // Click elsewhere dismisses editor hover but lets the click fall through
-    // so the cursor moves to the clicked position (instead of requiring a second click).
-    if engine.editor_hover.is_some() && !mouse_on_editor_hover {
-        engine.dismiss_editor_hover();
     }
 
     // ── Chrome rung (#752) ────────────────────────────────────────────────────
@@ -2786,6 +2763,27 @@ pub(super) fn handle_mouse(
     }
 
     sidebar_width
+}
+
+/// Lift the TUI's cached `(col, row, w, h, uri)` hover-link tuples into the
+/// `(Rect, String)` pairs the shared hover-popup rung takes.
+///
+/// A zero-height rect is widened to one cell: `render_impl` only ever paints
+/// links on a single row, and the old TUI hit test encoded that by comparing
+/// `row == ly` and ignoring the height outright. The shared router does a real
+/// half-open rect test, so the height has to be honest.
+fn editor_hover_popup_link_rects(
+    rects: &[(u16, u16, u16, u16, String)],
+) -> Vec<(quadraui::Rect, String)> {
+    rects
+        .iter()
+        .map(|(lx, ly, lw, lh, uri)| {
+            (
+                quadraui::Rect::new(*lx as f32, *ly as f32, *lw as f32, (*lh).max(1) as f32),
+                uri.clone(),
+            )
+        })
+        .collect()
 }
 
 /// The bits of `handle_mouse`'s own layout arithmetic the chrome rung needs to
