@@ -2503,23 +2503,92 @@ impl App {
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
         self.reconcile_editor_hover_modal();
 
-        // ── Toast hit dispatch (#454) ─────────────────────────────────────
-        // Before any other handler so clicking × dismisses the toast
-        // instead of falling through to whatever sits underneath.
-        {
-            let toast_hit = self
-                .engine
-                .borrow()
-                .toast_layout
-                .borrow()
-                .as_ref()
-                .map(|l| l.hit_test(x as f32, y as f32));
-            if let Some(hit) = toast_hit {
+        // ── Modal-overlay rung (#733) ─────────────────────────────────────
+        //
+        // Toast → dialog → tab switcher → completion, sequenced ONCE in
+        // `render::route_modal_overlay_click` and shared verbatim with
+        // TUI's `handle_mouse`. This backend used to hand-roll the order
+        // (toast, then tab switcher, then completion, with the dialog
+        // ~600 lines further down, *below* find/replace) while TUI ran a
+        // different one — the precedence drift #733 exists to kill.
+        //
+        // Every layout fed in is the one the last frame actually painted
+        // (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
+        // `Engine::toast_layout`), never a freshly recomputed one — #582/#646.
+        let modal_route = {
+            let (toast, dialog_open, tab_switcher_open, completion_open) = {
+                let engine = self.engine.borrow();
+                let toast = engine.toast_layout.borrow().clone();
+                (
+                    toast,
+                    engine.dialog.is_some(),
+                    engine.tab_switcher_open,
+                    engine.completion_idx.is_some(),
+                )
+            };
+            let dialog = self.dialog_layout.borrow().clone();
+            let completion = self.completion_layout.borrow().clone();
+            let tab_switcher_bounds = self.tab_switcher_popup_rect.get().map(|(px, py, pw, ph)| {
+                quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
+            });
+            render::route_modal_overlay_click(
+                &render::ModalOverlayState {
+                    toast: toast.as_ref(),
+                    dialog_open,
+                    dialog: dialog.as_ref(),
+                    tab_switcher_open,
+                    tab_switcher_bounds,
+                    completion_open,
+                    completion: completion.as_ref(),
+                },
+                x as f32,
+                y as f32,
+                render::ModalMouseAction::LeftPress,
+            )
+        };
+        match modal_route {
+            render::ModalOverlayRoute::Toast(hit) => {
                 if self.engine.borrow_mut().handle_toast_hit(hit) {
                     self.draw_needed.set(true);
                     return;
                 }
             }
+            render::ModalOverlayRoute::Dialog(hit) => {
+                match hit {
+                    quadraui::DialogHit::Button(id) => {
+                        if let Some(idx) = dialog_btn_index(&id) {
+                            let action = self.engine.borrow_mut().dialog_click_button(idx);
+                            self.apply_dialog_action(action);
+                        }
+                    }
+                    quadraui::DialogHit::Outside => {
+                        let mut engine = self.engine.borrow_mut();
+                        engine.dialog = None;
+                        engine.pending_move = None;
+                    }
+                    quadraui::DialogHit::Body | quadraui::DialogHit::BodyToolbarButton(_) => {}
+                }
+                self.draw_needed.set(true);
+                return;
+            }
+            render::ModalOverlayRoute::TabSwitcher { inside } => {
+                // Click anywhere dismisses; inside also consumes so the
+                // editor underneath doesn't take a cursor move through it.
+                self.engine.borrow_mut().tab_switcher_open = false;
+                self.draw_needed.set(true);
+                if inside {
+                    return;
+                }
+            }
+            render::ModalOverlayRoute::Completion(hit) => {
+                let consumed = self.engine.borrow_mut().handle_completion_click(hit);
+                self.draw_needed.set(true);
+                if consumed {
+                    return;
+                }
+            }
+            render::ModalOverlayRoute::Swallow => return,
+            render::ModalOverlayRoute::None => {}
         }
 
         // ── Scroll-surface click dispatch (scrollbar thumb-drag + track-page). ──
@@ -2568,92 +2637,6 @@ impl App {
                     }
                     _ => {}
                 }
-            }
-        }
-
-        // ── Tab switcher modal arbitration (B.5b Stage 7) ──────────────
-        //
-        // Keyboard-driven popup (Ctrl+Tab cycles, Ctrl release commits,
-        // Esc dismisses). Click anywhere dismisses — inside the popup
-        // also consumes (no editor cursor-move underneath); outside
-        // dismisses + propagates so the editor receives the click.
-        if self.engine.borrow().tab_switcher_open {
-            let switcher_id = quadraui::WidgetId::new("tab_switcher");
-            let inside = if let Some((px, py, pw, ph)) = self.tab_switcher_popup_rect.get() {
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .push(
-                        switcher_id.clone(),
-                        quadraui::Rect {
-                            x: px as f32,
-                            y: py as f32,
-                            width: pw as f32,
-                            height: ph as f32,
-                        },
-                    );
-                let stack_rc = self.backend.borrow().modal_stack_handle();
-                let stack = stack_rc.borrow();
-                let events = quadraui::dispatch_mouse_down(
-                    &stack,
-                    quadraui::Point {
-                        x: x as f32,
-                        y: y as f32,
-                    },
-                    quadraui::MouseButton::Left,
-                    quadraui::Modifiers::default(),
-                );
-                events.iter().any(|ev| {
-                    matches!(
-                        ev,
-                        quadraui::UiEvent::MouseDown { widget: Some(id), .. }
-                            if *id == switcher_id
-                    )
-                })
-            } else {
-                false
-            };
-
-            self.engine.borrow_mut().tab_switcher_open = false;
-            self.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .pop(&switcher_id);
-
-            if inside {
-                self.draw_needed.set(true);
-                return;
-            }
-            // Outside: fall through so editor click proceeds.
-        } else {
-            self.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .pop(&quadraui::WidgetId::new("tab_switcher"));
-        }
-
-        // ── Completion popup modal arbitration (B.5b Stage 5) ──────────
-        //
-        // The popup auto-dismisses on any click. If the click landed
-        // INSIDE the popup we also consume it (return early) so the
-        // editor underneath doesn't pick up a cursor move at the
-        // candidate-row pixel — clicking on the popup shouldn't move
-        // the cursor through it. Click-OUTSIDE simply dismisses and
-        // falls through; the editor click then proceeds normally.
-        if self.engine.borrow().completion_idx.is_some() {
-            let hit = self
-                .completion_layout
-                .borrow()
-                .as_ref()
-                .map(|cl| cl.hit_test(x as f32, y as f32))
-                .unwrap_or(quadraui::CompletionsHit::Empty);
-            let consumed = self.engine.borrow_mut().handle_completion_click(hit);
-            self.draw_needed.set(true);
-            if consumed {
-                return;
             }
         }
 
@@ -3093,104 +3076,15 @@ impl App {
                 }
             }
         }
-        // Dialog button click — highest z-order element.
-        //
-        // Phase B.5b Stage 3: routed through `ModalStack` + the shared
-        // `quadraui::dispatch_mouse_down` arbiter, mirroring the
-        // picker pattern above. The dialog is pushed onto the stack
-        // (idempotently — push() dedupes by id) every time the click
-        // handler runs while the dialog is open, popped when the
-        // dialog closes (here, after a button click or outside-click
-        // dismiss; or in the `else` branch below if the engine
-        // closed it via Esc/Enter without the click handler seeing).
-        // Button hit-testing now goes through the resolved
-        // `quadraui::DialogLayout` cached from the last `render_content`
-        // paint (#546) — `DialogLayout::hit_test` instead of a hand-rolled
-        // per-backend rect scan, mirroring the context-menu block below.
-        if self.engine.borrow().dialog.is_some() {
-            let dialog_layout = self.dialog_layout.borrow().clone();
-
-            let clicked_btn: Option<usize> =
-                dialog_layout
-                    .as_ref()
-                    .and_then(|dl| match dl.hit_test(x as f32, y as f32) {
-                        quadraui::DialogHit::Button(id) => dialog_btn_index(&id),
-                        _ => None,
-                    });
-
-            // Pull the resolved popup bounds from the cached `DialogLayout`.
-            // Earlier the bounds were derived from `btn_rects` with a
-            // 350px-min fudge that overshot the actual popup width on small
-            // dialogs (`:about`), so `dispatch_mouse_down` would
-            // mis-classify outside clicks as inside and the dismiss path
-            // never fired.
-            let dialog_id = quadraui::WidgetId::new("dialog");
-            if let Some(dl) = &dialog_layout {
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .push(dialog_id.clone(), dl.bounds);
-            }
-
-            // Run the shared dispatch to learn whether this click
-            // landed inside the dialog or in the backdrop. We don't
-            // strictly need the inside verdict (button hit-test
-            // already drove that) but the outside verdict is what
-            // replaces the inline `outside = x < popup_x || ...`
-            // computation.
-            let outside = {
-                let stack_rc = self.backend.borrow().modal_stack_handle();
-                let stack = stack_rc.borrow();
-                let events = quadraui::dispatch_mouse_down(
-                    &stack,
-                    quadraui::Point {
-                        x: x as f32,
-                        y: y as f32,
-                    },
-                    quadraui::MouseButton::Left,
-                    quadraui::Modifiers::default(),
-                );
-                events.iter().any(|ev| {
-                    matches!(
-                        ev,
-                        quadraui::UiEvent::Palette(id, _) if *id == dialog_id
-                    )
-                })
-            };
-
-            if let Some(idx) = clicked_btn {
-                let action = self.engine.borrow_mut().dialog_click_button(idx);
-                self.apply_dialog_action(action);
-                // dialog_click_button may have closed the dialog; sync
-                // the stack so the next frame doesn't see a stale entry.
-                if self.engine.borrow().dialog.is_none() {
-                    self.backend
-                        .borrow()
-                        .modal_stack_handle()
-                        .borrow_mut()
-                        .pop(&dialog_id);
-                }
-            } else if outside {
-                self.engine.borrow_mut().dialog = None;
-                self.engine.borrow_mut().pending_move = None;
-                self.backend
-                    .borrow()
-                    .modal_stack_handle()
-                    .borrow_mut()
-                    .pop(&dialog_id);
-            }
-            self.draw_needed.set(true);
-        } else {
-            // Dialog closed (possibly via Esc/Enter while no click was
-            // seen by us). Pop any stale entry so the stack stays in
-            // sync with engine state — same defensive cleanup the
-            // picker block does above.
-            self.backend
-                .borrow()
-                .modal_stack_handle()
-                .borrow_mut()
-                .pop(&quadraui::WidgetId::new("dialog"));
+        // #733: the dialog rung moved to the shared modal-overlay router
+        // at the top of this handler (`render::route_modal_overlay_click`),
+        // which TUI's `handle_mouse` calls too. Control only reaches here
+        // when no dialog is open, so what used to be the `else` arm of the
+        // dialog block is now unconditional. The `ModalStack` push/pop dance
+        // that arm maintained is gone with it: `DialogHit::Outside` already
+        // answers the inside/outside question the stack round-trip was
+        // recomputing.
+        {
             // ── Status bar branch click — open branch picker ─────────────
             // (only when per-window status is off — global bar exists)
             if self.cached_line_height > 0.0 {
@@ -6828,23 +6722,23 @@ impl quadraui::ShellApp for App {
         // `Backend::draw_list`.
         self.tab_switcher_popup_rect.set(None);
         if let Some(ref ts) = screen.tab_switcher {
-            if !ts.items.is_empty() {
-                let max_visible = ((popup_vp.height as f64 * 0.6) / lh) as usize;
-                let visible = ts.items.len().min(max_visible).min(20);
-                let popup_w = (popup_vp.width as f64 * 0.40).clamp(350.0, 600.0);
-                let popup_h = (visible as f64 + 1.5) * lh;
-                let popup_x = (popup_vp.width as f64 - popup_w) / 2.0;
-                let popup_y = (popup_vp.height as f64 - popup_h) / 2.0;
-                let list = render::tab_switcher_to_quadraui_list_view(ts, visible);
-                let q_rect = quadraui::Rect::new(
-                    popup_x as f32,
-                    popup_y as f32,
-                    popup_w as f32,
-                    popup_h as f32,
-                );
-                backend.draw_list(q_rect, &list);
-                self.tab_switcher_popup_rect
-                    .set(Some((popup_x, popup_y, popup_w, popup_h)));
+            // #733: geometry comes from the shared `TabSwitcherGeometry`
+            // so the rect handed to `route_modal_overlay_click` below is
+            // the rect that was painted, and TUI resolves the identical
+            // popup through the same code with its own sizing constant.
+            if let Some(geo) = render::TabSwitcherGeometry::compute(
+                popup_viewport,
+                ts.items.len(),
+                &render::gtk_tab_switcher_sizing(lh as f32),
+            ) {
+                let list = render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
+                backend.draw_list(geo.bounds, &list);
+                self.tab_switcher_popup_rect.set(Some((
+                    geo.bounds.x as f64,
+                    geo.bounds.y as f64,
+                    geo.bounds.width as f64,
+                    geo.bounds.height as f64,
+                )));
             }
         }
 

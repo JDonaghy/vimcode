@@ -3174,6 +3174,94 @@ mod chrome_surfaces {
         );
     }
 
+    // ── #733 slice 1: the shared modal-overlay mouse rung ────────────────
+    //
+    // `handle_mouse_click_msg`'s top rung is now
+    // `render::route_modal_overlay_click`, the same function TUI's
+    // `handle_mouse` calls. Before this the GTK dialog arm sat ~600 lines
+    // *below* the context-menu and find/replace arms, so an open modal
+    // dialog did not actually have top priority — the exact precedence
+    // drift #733 exists to kill.
+
+    /// #733 acceptance, GTK half: an open in-canvas modal dialog must
+    /// swallow a click that lands on the context menu painted underneath
+    /// it. Asserted on the painted surface — the menu's own "Paste" item
+    /// label (always enabled, so it is the item that would fire and close
+    /// the menu) must still be on-screen after the click.
+    ///
+    /// RED against unfixed `develop`: `dispatch_context_menu_click` ran
+    /// before the dialog block, so the click confirmed "Paste",
+    /// `context_menu_confirm` closed the menu, and the label vanished from
+    /// the next frame.
+    ///
+    /// The menu is anchored well inside the editor area rather than at the
+    /// origin because `try_route_sidebar_mouse_event` claims sidebar-bound
+    /// clicks *before* `handle_mouse_click_msg` runs at all, and that entry
+    /// point has not been migrated onto the shared router yet (#733
+    /// slice 4, panels).
+    #[test]
+    fn open_dialog_swallows_a_click_meant_for_the_context_menu() {
+        let mut engine = small_engine();
+        engine.start_move_file_dialog(
+            std::path::Path::new("/tmp/project/foo.rs"),
+            std::path::Path::new("/tmp/project"),
+        );
+        engine.open_editor_context_menu(700, 400);
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.dialog_layout.borrow().is_some(),
+            "fixture must open an in-canvas (non-native) dialog"
+        );
+        let paste = h
+            .driver
+            .find("Paste")
+            .expect("the context menu must paint its always-enabled Paste item");
+
+        h.driver.click(paste.0, paste.1);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Paste"),
+            "an open modal dialog must swallow the click instead of letting \
+             the context menu underneath confirm an item and close"
+        );
+    }
+
+    /// Cross-backend parity for the tab-switcher rung the same router now
+    /// owns on both sides (TUI's half is
+    /// `driver_click_inside_tab_switcher_popup_dismisses_and_is_consumed`
+    /// in `src/tui_main/shell_app.rs`): a click inside the painted popup
+    /// dismisses it. Asserted on the painted surface via the popup's own
+    /// "Open Tabs" title, and on the geometry cache that
+    /// `route_modal_overlay_click` consumes.
+    #[test]
+    fn click_inside_tab_switcher_popup_dismisses_it() {
+        let mut engine = engine_with_two_tabs();
+        engine.open_tab_switcher();
+        let mut h = harness(engine, 1400, 900);
+        let (px, py, pw, ph) = h
+            .tab_switcher_popup_rect
+            .get()
+            .expect("the painted popup must cache its bounds for the router");
+        assert!(
+            h.driver.screen_contains("Open Tabs"),
+            "precondition: the popup paints its title"
+        );
+
+        h.driver
+            .click((px + pw / 2.0) as f32, (py + ph / 2.0) as f32);
+        h.driver.render();
+
+        assert!(
+            h.tab_switcher_popup_rect.get().is_none(),
+            "the popup must stop painting after a click inside it"
+        );
+        assert!(
+            !h.driver.screen_contains("Open Tabs"),
+            "the dismissed popup's title must be gone from the painted surface"
+        );
+    }
+
     /// Sample a band spanning the bottom half of the whole window — where
     /// the separated status line paints, above the terminal panel. Wide
     /// enough to catch it regardless of the fixture's exact chrome heights.

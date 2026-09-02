@@ -422,6 +422,11 @@ pub(super) struct TuiShellApp {
     completion_layout: RefCell<Option<quadraui::CompletionsLayout>>,
     context_menu_layout: RefCell<Option<quadraui::ContextMenuLayout>>,
     dialog_layout: RefCell<Option<quadraui::DialogLayout>>,
+    /// Bounds of the tab-switcher popup as `render_content` last painted
+    /// it — the GTK backend's `tab_switcher_popup_rect` counterpart. Fed
+    /// to `render::route_modal_overlay_click`; never recomputed at click
+    /// time (#582 / #646).
+    tab_switcher_popup_rect: RefCell<Option<quadraui::Rect>>,
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
@@ -570,6 +575,7 @@ impl TuiShellApp {
             completion_layout: RefCell::new(None),
             context_menu_layout: RefCell::new(None),
             dialog_layout: RefCell::new(None),
+            tab_switcher_popup_rect: RefCell::new(None),
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
@@ -1117,6 +1123,7 @@ impl TuiShellApp {
             completion_layout.as_ref(),
             context_menu_layout.as_ref(),
             dialog_layout.as_ref(),
+            *self.tab_switcher_popup_rect.borrow(),
         );
 
         drop(last_layout);
@@ -1877,17 +1884,26 @@ impl ShellApp for TuiShellApp {
         }
 
         // ── Tab switcher popup ───────────────────────────────────────────
+        // #733: geometry from the shared `TabSwitcherGeometry` (same
+        // `compute`, different sizing constant, as GTK), and the *painted*
+        // rect is cached for `handle_mouse`'s modal-overlay rung — before
+        // this the TUI had no tab-switcher mouse arm at all, so a click on
+        // the popup fell through to the editor underneath (#733).
+        *self.tab_switcher_popup_rect.borrow_mut() = None;
         if let Some(ref ts) = screen.tab_switcher {
-            if !ts.items.is_empty() {
-                let width = (win_area.width * 45 / 100).clamp(40, 80);
-                let max_visible = (win_area.height as usize).saturating_sub(4).min(20);
-                let visible = ts.items.len().min(max_visible);
-                let height = visible as u16 + 2;
-                let x = win_area.x + (win_area.width.saturating_sub(width)) / 2;
-                let y = win_area.y + (win_area.height.saturating_sub(height)) / 2;
-                let list = render::tab_switcher_to_quadraui_list_view(ts, max_visible);
-                let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, height as f32);
-                backend.draw_list(q_rect, &list);
+            if let Some(geo) = render::TabSwitcherGeometry::compute(
+                quadraui::Rect::new(
+                    win_area.x as f32,
+                    win_area.y as f32,
+                    win_area.width as f32,
+                    win_area.height as f32,
+                ),
+                ts.items.len(),
+                &render::TUI_TAB_SWITCHER_SIZING,
+            ) {
+                let list = render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
+                backend.draw_list(geo.bounds, &list);
+                *self.tab_switcher_popup_rect.borrow_mut() = Some(geo.bounds);
             }
         }
 
@@ -8410,6 +8426,142 @@ mod tests {
             !screen.contains('█') && !screen.contains('░'),
             "a file that fits entirely within the viewport must paint no \
              scroll thumb/track glyphs anywhere; screen:\n{screen}"
+        );
+    }
+
+    // ── #733 slice 1: the shared modal-overlay mouse rung ────────────────
+    //
+    // `handle_mouse`'s top rung is now `render::route_modal_overlay_click`,
+    // the same function `src/gtk/mod.rs::handle_mouse_click_msg` calls. The
+    // rung this backend was missing entirely is the Ctrl+Tab switcher: TUI
+    // painted the popup but had no mouse arm for it, so a click fell
+    // straight through to the editor underneath.
+
+    /// Two real file tabs so `open_tab_switcher` has more than one MRU
+    /// entry (it no-ops with one) and the editor underneath has enough
+    /// lines that a stray click would visibly move the cursor.
+    fn app_with_two_file_tabs_and_switcher_open() -> TuiShellApp {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_733_tab_switcher_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a733.txt");
+        let file_b = dir.join("b733.txt");
+        let content: String = (0..40).map(|i| format!("AAA733 line {}\n", i)).collect();
+        std::fs::write(&file_a, &content).unwrap();
+        std::fs::write(&file_b, &content).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.new_tab(Some(&file_b));
+        app.engine.open_tab_switcher();
+        assert!(
+            app.engine.tab_switcher_open,
+            "fixture must actually open the tab switcher"
+        );
+        app
+    }
+
+    /// #733 acceptance, TUI half: a click that lands inside the painted
+    /// tab-switcher popup must dismiss it **and be consumed**, so the
+    /// editor underneath never sees it.
+    ///
+    /// Both halves are read off the painted frame — the popup's own
+    /// "Open Tabs" title (located with `find_bounds`, never a hardcoded
+    /// coordinate) and the status line's `Ln N, Col N` readout, which is
+    /// where a leaked editor click shows up.
+    ///
+    /// RED against unfixed `develop`: `handle_mouse` had no tab-switcher
+    /// arm at all, so the click reached `dispatch_left_click`, the popup
+    /// stayed open (first assertion fails) and the cursor jumped to the
+    /// clicked row (second assertion fails).
+    #[test]
+    fn driver_click_inside_tab_switcher_popup_dismisses_and_is_consumed() {
+        let mut driver = driver_with_shell(
+            app_with_two_file_tabs_and_switcher_open(),
+            config(),
+            100,
+            24,
+        );
+        let title = driver
+            .find_bounds("Open Tabs")
+            .expect("the tab-switcher popup must paint its title");
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "precondition: the cursor starts on line 1; screen:\n{}",
+            driver.screen()
+        );
+
+        // Warm-up dispatch: `last_layout` (which the editor click path
+        // hit-tests against) is only populated by a render that follows a
+        // dispatch, so without this a first click never reaches the editor
+        // at all and the "was it consumed?" assertion below could not fail.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        // Two rows below the title sits the popup's item area — inside the
+        // popup, and over the editor text underneath it.
+        driver.click(title.x + 1.0, title.y + 2.0);
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Open Tabs"),
+            "a click inside the tab-switcher popup must dismiss it; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ln 1, Col 1"),
+            "the click must be consumed by the popup, not leak through to \
+             the editor and move the cursor; screen:\n{screen}"
+        );
+    }
+
+    /// The complementary half: a click *outside* the popup still dismisses
+    /// it, but propagates — the editor takes the click and the cursor
+    /// moves. Without this, the router could satisfy the test above by
+    /// swallowing every click while the switcher is open.
+    #[test]
+    fn driver_click_outside_tab_switcher_popup_dismisses_and_propagates() {
+        let mut driver = driver_with_shell(
+            app_with_two_file_tabs_and_switcher_open(),
+            config(),
+            100,
+            24,
+        );
+        let title = driver
+            .find_bounds("Open Tabs")
+            .expect("the tab-switcher popup must paint its title");
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "precondition: the cursor starts on line 1"
+        );
+
+        // Warm-up dispatch: `last_layout` (which the editor click path
+        // hit-tests against) is only populated by a render that follows a
+        // dispatch, so without this a first click never reaches the editor
+        // at all and the "was it consumed?" assertion below could not fail.
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        // Column 20 is editor text (right of the activity bar + gutter),
+        // and still well left of the popup, which is centred in a
+        // 100-column terminal with a 45-column body (left edge = 27).
+        driver.click(20.0, title.y + 2.0);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Open Tabs"),
+            "a click outside the tab-switcher popup must dismiss it too; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Ln 1, Col 1"),
+            "an outside click must propagate to the editor underneath and \
+             move the cursor off line 1; screen:\n{screen}"
         );
     }
 }

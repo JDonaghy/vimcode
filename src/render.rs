@@ -1923,6 +1923,248 @@ pub fn tab_switcher_to_quadraui_list_view(
     }
 }
 
+// ─── TabSwitcherGeometry ──────────────────────────────────────────────────
+//
+// #733 slice 1: the tab-switcher popup rect used to be computed twice — in
+// `TuiShellApp::render_content` (cell units, percent-of-columns) and in
+// `src/gtk/mod.rs::render_content` (pixel units, clamp(350, 600)) — and the
+// GTK copy was *also* the only one fed to a click handler, which is why TUI
+// had no tab-switcher rung at all. One `compute`, two sizing constants,
+// mirroring the `PickerSizing` / `PickerGeometry` split just above.
+
+/// Backend-specific sizing inputs for the tab-switcher popup.
+#[derive(Debug, Clone, Copy)]
+pub struct TabSwitcherSizing {
+    /// Fraction of the viewport width the popup occupies.
+    pub width_ratio: f32,
+    /// `(min, max)` clamp applied to the computed width.
+    pub width_clamp: (f32, f32),
+    /// Height of one list row (1.0 in cell space, `line_height` in pixels).
+    pub line_h: f32,
+    /// Extra height added to `visible * line_h` for the popup border.
+    pub border_h: f32,
+    /// Fraction of viewport height available for rows.
+    pub max_visible_ratio: f32,
+    /// Height subtracted from the row budget before dividing by `line_h`.
+    pub max_visible_reserve: f32,
+    /// Hard cap on visible rows.
+    pub max_visible_cap: usize,
+    /// Snap the resolved rect to whole cells (TUI only). Keeps the
+    /// hit-test rect byte-identical to the integer arithmetic the TUI
+    /// painter used before this was shared.
+    pub snap_to_cells: bool,
+}
+
+/// TUI sizing: 45% of terminal columns, clamped to 40..=80 cells.
+pub const TUI_TAB_SWITCHER_SIZING: TabSwitcherSizing = TabSwitcherSizing {
+    width_ratio: 0.45,
+    width_clamp: (40.0, 80.0),
+    line_h: 1.0,
+    border_h: 2.0,
+    max_visible_ratio: 1.0,
+    max_visible_reserve: 4.0,
+    max_visible_cap: 20,
+    snap_to_cells: true,
+};
+
+/// GTK sizing: 40% of viewport width, clamped to 350..=600 px.
+pub fn gtk_tab_switcher_sizing(line_height: f32) -> TabSwitcherSizing {
+    TabSwitcherSizing {
+        width_ratio: 0.40,
+        width_clamp: (350.0, 600.0),
+        line_h: line_height,
+        border_h: 1.5 * line_height,
+        max_visible_ratio: 0.6,
+        max_visible_reserve: 0.0,
+        max_visible_cap: 20,
+        snap_to_cells: false,
+    }
+}
+
+/// Resolved tab-switcher popup geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabSwitcherGeometry {
+    /// Absolute popup bounds, in the caller's units.
+    pub bounds: quadraui::Rect,
+    /// Rows actually shown (`item_count` capped by the height budget).
+    pub visible_rows: usize,
+    /// The uncapped height budget, i.e. the `max_visible` the list
+    /// adapter uses to decide its scroll offset.
+    pub max_visible: usize,
+}
+
+impl TabSwitcherGeometry {
+    /// Resolve the popup rect for `item_count` entries inside `viewport`.
+    ///
+    /// Returns `None` when there is nothing to show — both painters
+    /// already skipped an empty item list, and the router must agree so
+    /// an empty switcher can't swallow clicks.
+    pub fn compute(
+        viewport: quadraui::Rect,
+        item_count: usize,
+        sizing: &TabSwitcherSizing,
+    ) -> Option<Self> {
+        if item_count == 0 {
+            return None;
+        }
+        let max_visible =
+            ((viewport.height * sizing.max_visible_ratio - sizing.max_visible_reserve).max(0.0)
+                / sizing.line_h) as usize;
+        let max_visible = max_visible.min(sizing.max_visible_cap);
+        let visible_rows = item_count.min(max_visible);
+
+        let mut w =
+            (viewport.width * sizing.width_ratio).clamp(sizing.width_clamp.0, sizing.width_clamp.1);
+        let mut h = visible_rows as f32 * sizing.line_h + sizing.border_h;
+        if sizing.snap_to_cells {
+            w = w.floor();
+            h = h.floor();
+        }
+        let mut x = viewport.x + (viewport.width - w).max(0.0) / 2.0;
+        let mut y = viewport.y + (viewport.height - h).max(0.0) / 2.0;
+        if sizing.snap_to_cells {
+            x = x.floor();
+            y = y.floor();
+        }
+        Some(TabSwitcherGeometry {
+            bounds: quadraui::Rect::new(x, y, w, h),
+            visible_rows,
+            max_visible,
+        })
+    }
+}
+
+// ─── Modal-overlay mouse router (#733 slice 1) ────────────────────────────
+//
+// The top rung of the mouse precedence ladder, implemented once. Both
+// backends used to hand-roll it, in *different* orders: TUI ran
+// toast → find/replace → dialog, GTK ran toast → tab-switcher →
+// completion → context-menu → find/replace → … → dialog. TUI had no
+// tab-switcher arm at all (clicking an open Ctrl+Tab popup fell through
+// to the editor underneath and moved the cursor); GTK resolved the
+// dialog's inside/outside verdict through a `ModalStack` +
+// `dispatch_mouse_down` round-trip that `DialogHit::Outside` already
+// answers directly.
+//
+// Deliberately *not* pushed into quadraui: `FrameHitMap` (quadraui
+// `frame.rs`) resolves "which registered rect is topmost", but the order
+// below is gated on vimcode engine state (`dialog.is_some()`,
+// `tab_switcher_open`, `completion_idx`), which is app knowledge. The
+// per-surface `hit_test()` calls this function sequences *are*
+// quadraui's, and are used as-is.
+//
+// Note every layout below is the one the last frame actually PAINTED
+// (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
+// `Engine::toast_layout`), never a freshly recomputed one — #582 / #646.
+
+/// The subset of mouse actions this rung distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalMouseAction {
+    /// Left button pressed (or, on terminals that swallow `Down`, the
+    /// matching `Up` — see `#456`).
+    LeftPress,
+    /// Anything else: motion, drag, right-click, scroll.
+    Other,
+}
+
+/// The painted modal overlays, in the order they are arbitrated.
+///
+/// Each `*_open` flag is the engine-state gate; the matching layout is
+/// the cached paint result. A gate that is `true` with a `None` layout
+/// means "opened this frame, not painted yet" and is handled
+/// conservatively (swallow rather than dismiss something the user has
+/// not seen).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModalOverlayState<'a> {
+    pub toast: Option<&'a quadraui::ToastStackLayout>,
+    pub dialog_open: bool,
+    pub dialog: Option<&'a quadraui::DialogLayout>,
+    pub tab_switcher_open: bool,
+    pub tab_switcher_bounds: Option<quadraui::Rect>,
+    pub completion_open: bool,
+    pub completion: Option<&'a quadraui::CompletionsLayout>,
+}
+
+/// Which modal overlay owns a mouse event, plus its resolved hit.
+///
+/// `None` means no overlay claimed the point — the caller continues down
+/// its own ladder. `TabSwitcher`/`Completion` carry enough for the caller
+/// to decide whether to keep going (both dismiss on any click, but only
+/// consume when the click landed inside).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModalOverlayRoute {
+    Toast(quadraui::ToastHit),
+    Dialog(quadraui::DialogHit),
+    TabSwitcher {
+        inside: bool,
+    },
+    Completion(quadraui::CompletionsHit),
+    /// An overlay is up and must eat this event without acting on it
+    /// (e.g. mouse motion while a modal dialog is open).
+    Swallow,
+    /// Nothing claimed it.
+    None,
+}
+
+/// Resolve the top rung of the mouse ladder against the painted overlays.
+pub fn route_modal_overlay_click(
+    state: &ModalOverlayState<'_>,
+    x: f32,
+    y: f32,
+    action: ModalMouseAction,
+) -> ModalOverlayRoute {
+    let press = action == ModalMouseAction::LeftPress;
+
+    // ── Toast (× dismiss / action) ────────────────────────────────────
+    // Painted above every other overlay, so it is arbitrated first —
+    // both backends already did this, identically.
+    if press {
+        if let Some(layout) = state.toast {
+            let hit = layout.hit_test(x, y);
+            if hit != quadraui::ToastHit::Empty {
+                return ModalOverlayRoute::Toast(hit);
+            }
+        }
+    }
+
+    // ── Modal dialog ──────────────────────────────────────────────────
+    // A dialog is modal: it eats everything, including motion, so the
+    // editor underneath can't hover-highlight through it. This is TUI's
+    // long-standing behaviour; GTK inherits it here.
+    if state.dialog_open {
+        if !press {
+            return ModalOverlayRoute::Swallow;
+        }
+        // No cached layout yet (opened this frame, not yet painted) —
+        // treat as a body click rather than risk dismissing a dialog the
+        // user hasn't seen.
+        let hit = state
+            .dialog
+            .map(|dl| dl.hit_test(x, y))
+            .unwrap_or(quadraui::DialogHit::Body);
+        return ModalOverlayRoute::Dialog(hit);
+    }
+
+    // ── Tab switcher (Ctrl+Tab MRU popup) ─────────────────────────────
+    if state.tab_switcher_open && press {
+        let inside = state
+            .tab_switcher_bounds
+            .is_some_and(|b| x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height);
+        return ModalOverlayRoute::TabSwitcher { inside };
+    }
+
+    // ── Completion popup ──────────────────────────────────────────────
+    if state.completion_open && press {
+        let hit = state
+            .completion
+            .map(|cl| cl.hit_test(x, y))
+            .unwrap_or(quadraui::CompletionsHit::Empty);
+        return ModalOverlayRoute::Completion(hit);
+    }
+
+    ModalOverlayRoute::None
+}
+
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
 /// Data needed to render the quickfix bottom panel.
@@ -18955,6 +19197,105 @@ mod tests {
         // offset = 4 + 1 - 3 = 2.
         assert_eq!(list.scroll_offset, 2);
         assert_eq!(list.selected_idx, 4);
+    }
+
+    // ── #733: the shared modal-overlay rung ──────────────────────────────
+
+    #[test]
+    fn tab_switcher_geometry_matches_the_two_backends_old_inline_math() {
+        // TUI: width = (cols * 45 / 100).clamp(40, 80); rows capped at
+        // height-4 and 20; height = visible + 2; centred in the viewport.
+        let geo = TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, 100.0, 24.0),
+            2,
+            &TUI_TAB_SWITCHER_SIZING,
+        )
+        .expect("two items must yield a popup");
+        assert_eq!(geo.visible_rows, 2);
+        assert_eq!(geo.max_visible, 20);
+        assert_eq!(geo.bounds.width, 45.0);
+        assert_eq!(geo.bounds.height, 4.0);
+        assert_eq!(geo.bounds.x, 27.0);
+        assert_eq!(geo.bounds.y, 10.0);
+
+        // The clamp still bites on a narrow terminal.
+        let narrow = TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, 60.0, 24.0),
+            2,
+            &TUI_TAB_SWITCHER_SIZING,
+        )
+        .unwrap();
+        assert_eq!(narrow.bounds.width, 40.0);
+
+        // GTK: 40% of viewport width clamped to [350, 600] px, height
+        // = (visible + 1.5) * line_height, no cell snapping.
+        let gtk = TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
+            3,
+            &gtk_tab_switcher_sizing(20.0),
+        )
+        .unwrap();
+        assert_eq!(gtk.bounds.width, 560.0);
+        assert_eq!(gtk.bounds.height, (3.0 + 1.5) * 20.0);
+        assert_eq!(gtk.max_visible, 20); // (900 * 0.6) / 20 = 27, capped
+
+        // No items → no popup, so an empty switcher can't swallow clicks.
+        assert!(TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, 100.0, 24.0),
+            0,
+            &TUI_TAB_SWITCHER_SIZING,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn modal_overlay_router_orders_dialog_above_tab_switcher_and_completion() {
+        // A dialog outranks everything below it, whatever else is open.
+        let state = ModalOverlayState {
+            dialog_open: true,
+            tab_switcher_open: true,
+            tab_switcher_bounds: Some(quadraui::Rect::new(0.0, 0.0, 100.0, 100.0)),
+            completion_open: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            route_modal_overlay_click(&state, 5.0, 5.0, ModalMouseAction::LeftPress),
+            ModalOverlayRoute::Dialog(quadraui::DialogHit::Body),
+        ));
+        // …including for non-press events, which it swallows outright so
+        // the editor underneath can't hover through a modal.
+        assert_eq!(
+            route_modal_overlay_click(&state, 5.0, 5.0, ModalMouseAction::Other),
+            ModalOverlayRoute::Swallow
+        );
+
+        // With the dialog closed, the tab switcher takes the click and
+        // reports whether it landed inside its painted bounds.
+        let state = ModalOverlayState {
+            tab_switcher_open: true,
+            tab_switcher_bounds: Some(quadraui::Rect::new(10.0, 10.0, 20.0, 4.0)),
+            completion_open: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            route_modal_overlay_click(&state, 15.0, 11.0, ModalMouseAction::LeftPress),
+            ModalOverlayRoute::TabSwitcher { inside: true }
+        );
+        assert_eq!(
+            route_modal_overlay_click(&state, 1.0, 1.0, ModalMouseAction::LeftPress),
+            ModalOverlayRoute::TabSwitcher { inside: false }
+        );
+
+        // Nothing open → nothing claimed, and the caller keeps walking.
+        assert_eq!(
+            route_modal_overlay_click(
+                &ModalOverlayState::default(),
+                1.0,
+                1.0,
+                ModalMouseAction::LeftPress,
+            ),
+            ModalOverlayRoute::None
+        );
     }
 
     #[test]

@@ -191,6 +191,7 @@ pub(super) fn handle_mouse(
     completion_layout: Option<&quadraui::CompletionsLayout>,
     context_menu_layout: Option<&quadraui::ContextMenuLayout>,
     dialog_layout: Option<&quadraui::DialogLayout>,
+    tab_switcher_popup_rect: Option<quadraui::Rect>,
 ) -> u16 {
     let col = ev.column;
     let row = ev.row;
@@ -286,20 +287,89 @@ pub(super) fn handle_mouse(
         modal_stack.pop(&quadraui::WidgetId::new("picker"));
     }
 
-    // ── Toast click (× dismiss / action) ───────────────────────────────────────
-    // #450: toasts overlay the editor in the bottom-right. Run hit_test
-    // before any underlying handler so clicking × dismisses the toast
-    // instead of falling through to whatever sits underneath.
-    if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-        let toast_hit = engine
-            .toast_layout
-            .borrow()
-            .as_ref()
-            .map(|layout| layout.hit_test(col as f32, row as f32));
-        if let Some(hit) = toast_hit {
-            if engine.handle_toast_hit(hit) {
+    // ── Modal-overlay rung (#733) ─────────────────────────────────────────────
+    //
+    // Toast → dialog → tab switcher → completion, sequenced ONCE in
+    // `render::route_modal_overlay_click` and shared verbatim with GTK's
+    // `handle_mouse_click_msg`. Before #733 this backend ran
+    // toast → find/replace → dialog → … → completion and GTK ran a
+    // different order; worse, neither arbitrated every surface the other
+    // did — the Ctrl+Tab switcher popup had no TUI mouse arm at all, so a
+    // click on it fell straight through and moved the editor cursor
+    // underneath.
+    //
+    // `tab_switcher_popup_rect` is the rect `TuiShellApp::render_content`
+    // last PAINTED, never one recomputed here (#582 / #646).
+    {
+        let action = if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            render::ModalMouseAction::LeftPress
+        } else {
+            render::ModalMouseAction::Other
+        };
+        let toast = engine.toast_layout.borrow().clone();
+        let route = render::route_modal_overlay_click(
+            &render::ModalOverlayState {
+                toast: toast.as_ref(),
+                dialog_open: engine.dialog.is_some(),
+                dialog: dialog_layout,
+                tab_switcher_open: engine.tab_switcher_open,
+                tab_switcher_bounds: tab_switcher_popup_rect,
+                completion_open: engine.completion_idx.is_some(),
+                completion: completion_layout,
+            },
+            col as f32,
+            row as f32,
+            action,
+        );
+        drop(toast);
+
+        match route {
+            render::ModalOverlayRoute::Toast(hit) => {
+                if engine.handle_toast_hit(hit) {
+                    return sidebar_width;
+                }
+            }
+            render::ModalOverlayRoute::Dialog(hit) => {
+                match hit {
+                    quadraui::DialogHit::Button(id) => {
+                        if let Some(idx) = id
+                            .as_str()
+                            .strip_prefix("dialog:btn:")
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            let dlg_action = engine.dialog_click_button(idx);
+                            if engine.explorer_needs_refresh {
+                                engine.explorer_needs_refresh = false;
+                                engine.explorer_rebuild_rows();
+                            }
+                            if handle_action(engine, dlg_action) {
+                                *should_quit = true;
+                            }
+                        }
+                    }
+                    quadraui::DialogHit::Outside => {
+                        engine.dialog = None;
+                        engine.pending_move = None;
+                    }
+                    quadraui::DialogHit::Body | quadraui::DialogHit::BodyToolbarButton(_) => {}
+                }
                 return sidebar_width;
             }
+            render::ModalOverlayRoute::TabSwitcher { inside } => {
+                // Click anywhere dismisses; inside also consumes so the
+                // editor underneath doesn't take a cursor move through it.
+                engine.tab_switcher_open = false;
+                if inside {
+                    return sidebar_width;
+                }
+            }
+            render::ModalOverlayRoute::Completion(hit) => {
+                if engine.handle_completion_click(hit) {
+                    return sidebar_width;
+                }
+            }
+            render::ModalOverlayRoute::Swallow => return sidebar_width,
+            render::ModalOverlayRoute::None => {}
         }
     }
 
@@ -476,49 +546,6 @@ pub(super) fn handle_mouse(
                 // Click outside panel — fall through to other handlers
             }
         }
-    }
-
-    // ── Dialog popup click handling ─────────────────────────────────────────────
-    // #546: resolve clicks via the `DialogLayout` cached from the render step
-    // (`render::dialog_generic_layout`, called once in `draw_frame`) instead
-    // of recomputing an independently-formulated layout here — the two
-    // copies could (and did, subtly: `.len()` byte count vs `.chars().count()`)
-    // drift apart. Mirrors the context-menu handling just below, which
-    // already consumes its render-cached layout the same way.
-    if engine.dialog.is_some() {
-        if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            // No cached layout yet (dialog opened this frame, not yet
-            // painted) — treat as an inside/no-op click rather than risk
-            // dismissing a dialog the user hasn't even seen painted.
-            let hit = dialog_layout
-                .map(|dl| dl.hit_test(col as f32, row as f32))
-                .unwrap_or(quadraui::DialogHit::Body);
-            match hit {
-                quadraui::DialogHit::Button(id) => {
-                    if let Some(idx) = id
-                        .as_str()
-                        .strip_prefix("dialog:btn:")
-                        .and_then(|s| s.parse::<usize>().ok())
-                    {
-                        let action = engine.dialog_click_button(idx);
-                        if engine.explorer_needs_refresh {
-                            engine.explorer_needs_refresh = false;
-                            engine.explorer_rebuild_rows();
-                        }
-                        if handle_action(engine, action) {
-                            *should_quit = true;
-                        }
-                        return sidebar_width;
-                    }
-                }
-                quadraui::DialogHit::BodyToolbarButton(_) | quadraui::DialogHit::Body => {}
-                quadraui::DialogHit::Outside => {
-                    engine.dialog = None;
-                    engine.pending_move = None;
-                }
-            }
-        }
-        return sidebar_width;
     }
 
     // ── Folder picker mouse handling ────────────────────────────────────────────
@@ -1585,16 +1612,6 @@ pub(super) fn handle_mouse(
         }
 
         return sidebar_width;
-    }
-
-    // ── Completion popup click intercept ──────────────────────────────────────────
-    if engine.completion_idx.is_some() && ev.kind == MouseEventKind::Down(MouseButton::Left) {
-        let hit = completion_layout
-            .map(|cl| cl.hit_test(col as f32, row as f32))
-            .unwrap_or(quadraui::CompletionsHit::Empty);
-        if engine.handle_completion_click(hit) {
-            return sidebar_width;
-        }
     }
 
     // ── Context menu click intercept ────────────────────────────────────────────
@@ -3305,6 +3322,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
     }
 
@@ -3541,6 +3559,7 @@ mod tests {
             None,
             &mut false,
             &mut false,
+            None,
             None,
             None,
             None,
@@ -3808,6 +3827,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // Recompute the group's own window rects the same way
@@ -4000,6 +4020,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let group = engine_hit
@@ -4115,6 +4136,7 @@ mod tests {
             None,
             &mut false,
             &mut false,
+            None,
             None,
             None,
             None,
