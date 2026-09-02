@@ -6394,10 +6394,11 @@ mod editor_mouse_rungs {
     /// painted, never hardcoded.
     #[test]
     fn grabbing_the_hover_popup_scrollbar_thumb_does_not_teleport_it_on_gtk() {
-        let mut engine = long_engine();
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
         // Comfortably more rows than `render::EDITOR_HOVER_MAX_ROWS`, so the
         // popup paints a scrollbar with a thumb shorter than its track.
-        let body: String = (0..40).map(|i| format!("hoverline{i}\n\n")).collect();
+        let body: String = (0..30).map(|i| format!("hoverline{i}\n\n")).collect();
         engine.show_editor_hover(
             1,
             2,
@@ -6406,13 +6407,13 @@ mod editor_mouse_rungs {
             true,
             false,
         );
-        let mut h = harness(engine, 1400, 900);
+        let mut h = harness(engine, 900, 600);
         h.driver.render();
 
         let sb = h
             .editor_hover_scrollbar
             .get()
-            .expect("a 40-line hover body must paint a popup scrollbar");
+            .expect("a 30-line hover body must paint a popup scrollbar");
         assert!(
             sb.thumb.height + 2.0 < sb.track.height,
             "fixture must produce a thumb shorter than its track: thumb {:?} track {:?}",
