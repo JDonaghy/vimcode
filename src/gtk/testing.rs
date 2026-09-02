@@ -71,7 +71,7 @@ use crate::core::Engine;
 /// tests document. Keeping the engine `Rc` alongside the driver is how a test
 /// asserts on engine state after an event, instead of being limited to painted
 /// pixels.
-pub(super) struct Harness<A: AppLogic> {
+pub struct Harness<A: AppLogic> {
     pub driver: GtkDriver<A>,
     pub engine: Rc<RefCell<Engine>>,
     /// The `render::ScreenLayout` the last `render_content` pass painted with
@@ -362,7 +362,7 @@ impl<A: AppLogic> Harness<A> {
 /// The engine is supplied by the caller so each test states exactly the
 /// buffers, tabs and groups it asserts on — no `Engine::startup`, hence no
 /// dependence on the developer's real session (see [`App::new_headless`]).
-pub(super) fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic> {
+pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic> {
     let engine = Rc::new(RefCell::new(engine));
     let app = App::new_headless(Rc::clone(&engine));
     let config = super::build_shell_config(&app);

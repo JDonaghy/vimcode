@@ -27,6 +27,23 @@ mod render_impl;
 mod services;
 mod shell_app;
 
+/// #657 test-support seam — the TUI half of what the sealed acceptance suite
+/// (`tests/acceptance.rs`, a *separate* crate) needs.
+///
+/// `shell_app` stays a private module: the only thing published here is
+/// [`TuiShellApp`] itself, which is exactly what
+/// `quadraui::tui::testing::driver_with_shell` takes. An acceptance slice
+/// therefore drives the same `event → handle → render_content` path the
+/// in-crate `#[cfg(test)]` suite in `shell_app.rs` does, with no privileged
+/// access to internals beyond the public `engine` field.
+///
+/// Compiled under `cfg(test)` too so the in-crate suite and the sealed suite
+/// cannot drift onto different seams.
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing {
+    pub use super::shell_app::TuiShellApp;
+}
+
 #[allow(unused_imports)]
 use mouse::*;
 #[allow(unused_imports)]
@@ -83,10 +100,14 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 #[cfg(test)]
 use ratatui::style::{Color as RColor, Modifier};
 // The legacy full-frame paint path (`render_impl::draw_frame` and friends) is
-// `#[cfg(test)]` now that #634 deleted `event_loop` — see that function's doc
-// comment. These two are only reachable from it, so they follow it.
-#[cfg(test)]
-use ratatui::backend::CrosstermBackend;
+// `#[cfg(test)]` now that #634 deleted `event_loop`, and `render_impl`'s test
+// module reaches `Terminal` through this module's `use super::*`.
+//
+// (#657) The `CrosstermBackend` import that used to sit alongside it is gone:
+// nothing has referenced it since #634, and promoting `tui_main` into
+// `vimcode_core` moved these tests into the lib test target, which — unlike
+// the old `vcd` bin — carries no crate-wide `allow(unused_imports)` to hide
+// the dead import.
 #[cfg(test)]
 use ratatui::Terminal;
 
