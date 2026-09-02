@@ -9677,4 +9677,113 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ── #755 slice 5: the shared editor hover popup rung ──────────────────
+    //
+    // Link click, scrollbar grab, focus-or-select and dismiss-on-outside used
+    // to be four blocks here and four differently-ordered, differently-behaving
+    // blocks on GTK. They are now `render::route_editor_hover_popup_click` +
+    // `render::apply_editor_hover_popup_route`, which both backends call. The
+    // GTK twins live in `src/gtk/testing.rs::editor_mouse_rungs`.
+
+    /// A `TuiShellApp` showing an editor hover popup whose body carries a
+    /// `command:` link, plus a distinctive body word to assert the popup's
+    /// presence on the painted grid with.
+    fn app_with_editor_hover_link() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = false;
+        crate::icons::set_nerd_fonts(false);
+        app.engine.session.explorer_visible = false;
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine.show_editor_hover(
+            0,
+            3,
+            "HOVERBODY755\n\n[Gotodef755](command:definition)",
+            crate::core::engine::EditorHoverSource::Lsp,
+            false,
+            false,
+        );
+        app
+    }
+
+    /// #272/#491 acceptance: clicking a `command:` link inside the editor
+    /// hover popup must navigate **and close the popup**. TUI's bespoke arm
+    /// ran `execute_hover_goto` and then left the popup up, covering the
+    /// definition it had just jumped to; GTK's dismissed. The shared rung
+    /// dismisses on both.
+    ///
+    /// **Not RED on TUI** (`CLAUDE.md` rule 2, stated honestly): reinstating
+    /// the pre-#755 arm — `execute_hover_goto` with no dismiss — keeps this
+    /// green, because `execute_hover_goto`'s own navigation already tears the
+    /// popup down for a `command:definition` URI. The explicit dismiss in the
+    /// shared rung matters for the `command:` URIs that *don't* navigate, and
+    /// this test is the regression pin for the rung as a whole, which TUI had
+    /// no black-box coverage of at all. The RED half of this slice is on GTK
+    /// (`src/gtk/testing.rs::editor_mouse_rungs`, verified against both the
+    /// missing double-click call and the hardcoded `grab_offset: 0.0`).
+    ///
+    /// The link's cell is located with `TuiDriver::find`, never hardcoded.
+    #[test]
+    fn driver_click_on_editor_hover_command_link_navigates_and_closes_the_popup() {
+        let mut driver = driver_with_shell(
+            app_with_editor_hover_link(),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        assert!(
+            driver.screen_contains("HOVERBODY755"),
+            "precondition: the hover popup body must paint; screen:\n{}",
+            driver.screen()
+        );
+        let (x, y) = driver
+            .find("Gotodef755")
+            .expect("the popup's command link label must be painted");
+
+        driver.click(x, y);
+
+        assert!(
+            !driver.screen_contains("HOVERBODY755"),
+            "clicking a `command:` link in the editor hover popup must close \
+             the popup so it does not cover the definition just jumped to \
+             (#272/#491); screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The other half of the same rung: a press that lands **outside** a
+    /// visible popup dismisses it *and* falls through, so the cursor still
+    /// lands where the user aimed instead of costing them a second click.
+    /// `EditorHoverPopupRoute::DismissAndFallThrough` is the only route that
+    /// reports `consumed == false`, and this pins that it stays that way on
+    /// the painted surface.
+    #[test]
+    fn driver_click_outside_editor_hover_popup_dismisses_it_and_falls_through() {
+        let mut driver = driver_with_shell(
+            app_with_editor_hover_link(),
+            TuiShellApp::shell_config(false),
+            80,
+            24,
+        );
+        let (bx, by) = driver
+            .find("HOVERBODY755")
+            .expect("precondition: the hover popup body must paint");
+        // Far from the popup, on the editor's own text row.
+        let (tx, ty) = driver
+            .find("fn main() {}")
+            .expect("the buffer line must be painted");
+        assert!(
+            (tx, ty) != (bx, by),
+            "the buffer line and the popup body must be distinct cells"
+        );
+
+        driver.click(tx, ty);
+
+        assert!(
+            !driver.screen_contains("HOVERBODY755"),
+            "a click outside a visible editor hover popup must dismiss it; \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
 }

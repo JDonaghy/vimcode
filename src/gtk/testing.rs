@@ -99,6 +99,15 @@ pub struct Harness<A: AppLogic> {
     /// (#669).
     #[allow(clippy::type_complexity)]
     pub editor_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    /// The editor hover popup's painted scrollbar track/thumb, or `None` when
+    /// its content fits. Exposed for #755's scrollbar-rung coverage: tests
+    /// aim at the *painted* thumb rather than hardcoding a pixel.
+    pub editor_hover_scrollbar: Rc<std::cell::Cell<Option<crate::render::PopupScrollbarHit>>>,
+    /// The editor hover popup's painted link rects `(x, y, w, h, uri)`.
+    /// Exposed for #755's link-rung coverage, for the same reason as the
+    /// scrollbar above: aim at what was painted, never at a hardcoded pixel.
+    #[allow(clippy::type_complexity)]
+    pub editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
     /// Sidebar-item hover popup bounds `(x, y, w, h)` the last frame painted,
     /// or `None` if that frame drew no panel-hover popup (#670).
     #[allow(clippy::type_complexity)]
@@ -378,6 +387,8 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
     let completion_layout = Rc::clone(&app.completion_layout);
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
+    let editor_hover_scrollbar = Rc::clone(&app.editor_hover_scrollbar);
+    let editor_hover_link_rects = Rc::clone(&app.editor_hover_link_rects);
     let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
     let painted_overlay_band = Rc::clone(&app.painted_overlay_band);
@@ -399,6 +410,8 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         painted_sidebar_bounds,
         completion_layout,
         editor_hover_popup_rect,
+        editor_hover_scrollbar,
+        editor_hover_link_rects,
         panel_hover_popup_rect,
         tab_switcher_popup_rect,
         painted_overlay_band,
@@ -6217,6 +6230,215 @@ mod chrome_rung {
         assert!(
             !h.engine.borrow().picker_open,
             "…and must not open the branch picker either"
+        );
+    }
+}
+
+/// #755 slice 5: black-box coverage for the two editor rungs this slice
+/// converged — the **minimap** (which GTK painted and then had no handler
+/// for at all) and the **editor hover popup** (whose bespoke GTK copy ran
+/// *below* the scroll-surface dispatch, so a press aimed at the popup was
+/// eaten by whatever painted behind it — #229/#486 — and whose double-click
+/// path never consulted the popup at all — #490).
+///
+/// Both assert on the painted surface, per `CLAUDE.md` rule 1. The TUI twins
+/// live in `src/tui_main/shell_app.rs`.
+#[cfg(test)]
+mod editor_mouse_rungs {
+    use super::*;
+
+    /// 60 numbered lines — long enough that `render.rs` publishes a
+    /// `ScreenLayout::minimap` entry and that the top and the middle of the
+    /// file paint visibly different text, short enough to keep these tests'
+    /// rasterisation cost near the rest of this file's.
+    fn long_engine() -> Engine {
+        // `new_for_test`, not `new`: the latter loads the developer's real
+        // config (colourscheme, fonts), which both makes the fixture
+        // machine-dependent and races the process-global theme other
+        // pixel-probing tests in this file pin (`vscode_dimming`).
+        let mut engine = Engine::new_for_test();
+        let mut text = String::new();
+        for i in 0..60 {
+            text.push_str(&format!("line {i} content\n"));
+        }
+        engine.buffer_mut().insert(0, &text);
+        engine
+    }
+
+    /// #35 parity coverage for the minimap rung, which #755's issue body
+    /// listed as GTK-side-missing. It is not: GTK already routes the press
+    /// through `render::apply_minimap_click` in `click.rs`
+    /// (`handle_mouse_click`'s `ClickTarget::Minimap` bypass), the *same*
+    /// shared function TUI's `handle_mouse` calls — so there was nothing to
+    /// converge and this slice deliberately added no GTK minimap arm.
+    ///
+    /// What was missing is a black-box test proving the GTK half actually
+    /// reaches the shared function through the painted geometry, so this
+    /// pins it. Green before and after this slice, and stated as such in the
+    /// PR: it is regression coverage, not a fix.
+    ///
+    /// The strip's rect is read from the published `ScreenLayout`, never
+    /// hardcoded, so it survives any change to `minimap_reserved_width`.
+    #[test]
+    fn minimap_click_scrolls_the_editor_on_gtk() {
+        let mut h = harness(long_engine(), 900, 600);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("line 0 content"),
+            "precondition: the view starts at the top of the file; screen was {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("line 30 content"),
+            "precondition: the middle of the file is not on screen yet"
+        );
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .minimap
+                .first()
+                .expect("a 200-line buffer must publish a minimap strip")
+                .clone();
+            crate::render::minimap_strip_rect(&mm)
+        };
+        // Vertical middle of the track → ~50% of the file.
+        h.driver
+            .click(strip.x + strip.width / 2.0, strip.y + strip.height / 2.0);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("line 30 content"),
+            "clicking the vertical middle of the painted minimap strip must \
+             seek the pane to ~50% of the file (#35/#723); screen was {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #490 acceptance: `handle_mouse_double_click_msg` never consulted the
+    /// editor hover popup, so a double-click landing on it fell straight
+    /// through to `handle_mouse_double_click`, which word-selects in the
+    /// editor *underneath* the popup instead of acting on the popup the user
+    /// actually aimed at.
+    ///
+    /// Driven through a `command:` link so the outcome is legible on the
+    /// painted grid (`CLAUDE.md` rule 1): the shared rung navigates and
+    /// dismisses, so the popup's body text stops being painted.
+    ///
+    /// **RED against unfixed `develop`:** remove the
+    /// `route_and_apply_editor_hover_popup` call at the top of
+    /// `handle_mouse_double_click_msg` and the double-click falls through to
+    /// the editor, leaving `HOVERBODY490` on the grid.
+    ///
+    /// The link's rect comes from what was painted, never hardcoded.
+    #[test]
+    fn double_click_on_editor_hover_popup_link_is_consumed_by_the_popup_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.show_editor_hover(
+            0,
+            3,
+            "HOVERBODY490\n\n[Gotodef490](command:definition)",
+            crate::core::engine::EditorHoverSource::Lsp,
+            false,
+            false,
+        );
+        let mut h = harness(engine, 900, 600);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("HOVERBODY490"),
+            "precondition: the hover popup body must paint; screen was {:?}",
+            h.driver.painted_texts()
+        );
+
+        let (lx, ly, lw, lh, uri) = h
+            .editor_hover_link_rects
+            .borrow()
+            .first()
+            .cloned()
+            .expect("the popup's command link must have painted a hit rect");
+        assert_eq!(uri, "command:definition");
+        h.driver.dispatch(quadraui::UiEvent::DoubleClick {
+            widget: None,
+            position: quadraui::Point::new((lx + lw / 2.0) as f32, (ly + lh / 2.0) as f32),
+        });
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("HOVERBODY490"),
+            "a double-click on the editor hover popup must be consumed by the \
+             shared popup rung — here, navigating the `command:` link and \
+             closing the popup — not fall through to the editor's \
+             word-select underneath (#490); screen was {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #755 acceptance for the popup-scrollbar arm: grabbing the thumb must
+    /// preserve the cursor's offset *within* the thumb.
+    ///
+    /// GTK's bespoke arm hardcoded `grab_offset: 0.0`, so `dispatch_mouse_drag`
+    /// treated wherever you grabbed as the thumb's *top* — the content
+    /// teleported on the first drag frame even when the pointer had not
+    /// moved. TUI's arm had always passed `cy - thumb.y`; the shared rung
+    /// keeps that.
+    ///
+    /// **RED against unfixed `develop`:** with `grab_offset: 0.0` restored,
+    /// the zero-distance drag below scrolls the popup and its first line
+    /// stops being painted, failing the assertion.
+    ///
+    /// Both the thumb rect and the popup's first line come from what was
+    /// painted, never hardcoded.
+    #[test]
+    fn grabbing_the_hover_popup_scrollbar_thumb_does_not_teleport_it_on_gtk() {
+        let mut engine = long_engine();
+        // Comfortably more rows than `render::EDITOR_HOVER_MAX_ROWS`, so the
+        // popup paints a scrollbar with a thumb shorter than its track.
+        let body: String = (0..40).map(|i| format!("hoverline{i}\n\n")).collect();
+        engine.show_editor_hover(
+            1,
+            2,
+            &body,
+            crate::core::engine::EditorHoverSource::Lsp,
+            true,
+            false,
+        );
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let sb = h
+            .editor_hover_scrollbar
+            .get()
+            .expect("a 40-line hover body must paint a popup scrollbar");
+        assert!(
+            sb.thumb.height + 2.0 < sb.track.height,
+            "fixture must produce a thumb shorter than its track: thumb {:?} track {:?}",
+            sb.thumb,
+            sb.track
+        );
+        assert!(
+            h.driver.screen_contains("hoverline0"),
+            "precondition: the popup starts at the top of its content; screen was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Grab the *bottom* of the thumb, then "drag" without moving.
+        let gx = sb.thumb.x + sb.thumb.width / 2.0;
+        let gy = sb.thumb.y + sb.thumb.height - 1.0;
+        h.driver.mouse_down(gx, gy);
+        h.driver.mouse_move(gx, gy);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("hoverline0"),
+            "grabbing the thumb's bottom edge and not moving must not scroll \
+             the popup — GTK's old arm hardcoded `grab_offset: 0.0`, so the \
+             content jumped by the thumb's height on the first drag frame; \
+             screen was {:?}",
+            h.driver.painted_texts()
         );
     }
 }
