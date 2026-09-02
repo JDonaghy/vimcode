@@ -31,6 +31,7 @@ use super::window::{
     GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowDivider, WindowId,
     WindowLayout, WindowRect,
 };
+use quadraui::compose::workspace::{WorkspaceController, WorkspaceDoc, WorkspaceEvent};
 use quadraui::terminal_engine::TerminalSession;
 use std::borrow::Cow;
 
@@ -2311,7 +2312,13 @@ pub struct Engine {
     next_window_id: usize,
     next_tab_id: usize,
     // --- Preview mode ---
-    /// The buffer currently in preview mode (at most one at a time).
+    /// Shared preview-tab policy tier (quadraui#597) — the single source of
+    /// truth for which buffer, if any, is the preview and for applying the
+    /// six promotion triggers. See `sync_preview_buffer_id` and
+    /// `preview_tab_promote` in `engine/buffers.rs`.
+    preview_tab: WorkspaceController,
+    /// Cached mirror of `preview_tab`'s current preview document, refreshed
+    /// by `sync_preview_buffer_id` after every `preview_tab` mutation.
     pub preview_buffer_id: Option<BufferId>,
 
     // --- Global state (not per-window) ---
@@ -3529,6 +3536,7 @@ impl Engine {
             next_group_id: 1,
             next_window_id: 2,
             next_tab_id: 2,
+            preview_tab: WorkspaceController::new("vimcode:preview"),
             preview_buffer_id: None,
             mode: Mode::Normal,
             command_buffer: String::new(),

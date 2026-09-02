@@ -279,9 +279,7 @@ impl Engine {
 
         // Promote preview on save
         let active_id = self.active_buffer_id();
-        if self.preview_buffer_id == Some(active_id) {
-            self.promote_preview(active_id);
-        }
+        self.preview_tab_promote(active_id);
         let state = self.active_buffer_state_mut();
         if let Some(ref path) = state.file_path.clone() {
             match state.save() {
@@ -3047,14 +3045,30 @@ impl Engine {
     // Preview mode
     // =======================================================================
 
-    /// Promote a preview buffer to permanent.
-    pub fn promote_preview(&mut self, buffer_id: BufferId) {
-        if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
-            state.preview = false;
+    /// Refresh the cached `preview_buffer_id` mirror from `preview_tab`
+    /// (quadraui#597's shared preview-tab tier), the single source of truth
+    /// for which buffer, if any, is currently the preview. Call after every
+    /// `preview_tab` mutation.
+    pub(super) fn sync_preview_buffer_id(&mut self) {
+        self.preview_buffer_id = self
+            .preview_tab
+            .docs()
+            .iter()
+            .find(|d| self.preview_tab.is_preview(&d.id))
+            .and_then(|d| d.id.parse::<usize>().ok())
+            .map(BufferId);
+    }
+
+    /// Promote `buffer_id` out of preview into a permanent tab via the
+    /// shared preview tier, then sync buffer/tab state to match. A no-op
+    /// when `buffer_id` isn't currently the preview.
+    pub(super) fn preview_tab_promote(&mut self, buffer_id: BufferId) {
+        if self.preview_tab.promote(&buffer_id.to_string()).is_some() {
+            if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
+                state.preview = false;
+            }
         }
-        if self.preview_buffer_id == Some(buffer_id) {
-            self.preview_buffer_id = None;
-        }
+        self.sync_preview_buffer_id();
     }
 
     /// Open a file in the current window with the given mode.
@@ -3082,7 +3096,7 @@ impl Engine {
                 .is_some_and(|s| !s.preview);
 
         // If buffer already exists as permanent, just switch to it
-        if is_already_permanent && self.preview_buffer_id != Some(buffer_id) {
+        if is_already_permanent && !self.preview_tab.is_preview(&buffer_id.to_string()) {
             let current = self.active_buffer_id();
             if current != buffer_id {
                 self.buffer_manager.alternate_buffer = Some(current);
@@ -3095,24 +3109,35 @@ impl Engine {
 
         match mode {
             OpenMode::Preview => {
-                // Close old preview if it's a different buffer
-                if let Some(old_preview) = self.preview_buffer_id {
-                    if old_preview != buffer_id {
-                        // Only close if no other window shows it
-                        let _ = self.delete_buffer(old_preview, true);
+                // Ask the shared preview tier (quadraui#597) to open/replace
+                // the preview slot; it tells us which old preview buffer, if
+                // any, was displaced so we can unload it.
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let events = self
+                    .preview_tab
+                    .open_preview(WorkspaceDoc::new(buffer_id.to_string(), label));
+                for ev in &events {
+                    if let WorkspaceEvent::Closed { id, .. } = ev {
+                        if let Ok(raw) = id.parse::<usize>() {
+                            let old_id = BufferId(raw);
+                            if old_id != buffer_id {
+                                let _ = self.delete_buffer(old_id, true);
+                            }
+                        }
                     }
                 }
                 // Mark as preview
                 if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
                     state.preview = true;
                 }
-                self.preview_buffer_id = Some(buffer_id);
+                self.sync_preview_buffer_id();
             }
             OpenMode::Permanent => {
                 // If it was a preview, promote it
-                if self.preview_buffer_id == Some(buffer_id) {
-                    self.promote_preview(buffer_id);
-                }
+                self.preview_tab_promote(buffer_id);
             }
         }
 
