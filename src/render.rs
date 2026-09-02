@@ -3532,6 +3532,505 @@ impl TabDragState {
     }
 }
 
+// ═══ Panels rung (#754, mouse-ladder slice 4) ════════════════════════════════
+//
+// The rung beneath the divider rung above: once no modal, no chrome band and no
+// resize handle has claimed the point, the *panels* get a look — the bottom
+// panel (terminal / debug output and the tab strip above them), the activity
+// bar's sidebar band, and the sidebar's own hover feedback.
+//
+// What was wrong with the two transcriptions this replaces:
+//
+//  1. **The quickfix band height had three different rules in one binary.**
+//     The painter reserves rows only for a quickfix that has something in it
+//     (`compute_editor_layout`: `quickfix_open && !quickfix_items.is_empty()`),
+//     but TUI's mouse handler asked `if engine.quickfix_open { 6 }` in **four**
+//     separate places. `:copen` on an empty list therefore moved every band
+//     *below* the editor — the terminal strip, the separated status line, the
+//     terminal-resize clamp — six rows away from where they were painted, so
+//     clicks in the bottom sixth of the screen hit the wrong surface entirely.
+//     [`quickfix_panel_rows`] is now the one rule, and it is the painter's.
+//
+//  2. **GTK measured the terminal pane's columns from the wrong origin.**
+//     `render_content` paints the bottom panel at the *editor's* left edge
+//     (right of the activity bar and sidebar), and TUI's handler duly did
+//     `col.saturating_sub(editor_left)` before calling
+//     `Engine::handle_terminal_pane_press`. GTK's arm did a bare
+//     `x / cached_char_width` against a window-absolute `x`, so with the
+//     sidebar open every click in the terminal landed ~`(activity_bar +
+//     sidebar) / char_width` columns to the right of the glyph the user aimed
+//     at — and the further right you clicked, the further the terminal's own
+//     selection anchor drifted. [`BottomPanelMetrics::panel_left`] makes the
+//     origin an input the caller must state, so it cannot be forgotten again.
+//
+//  3. **The `terminal_open` gate disagreed.** TUI refused to route Toolbar /
+//     Content presses unless `engine.terminal_open`, GTK routed them whenever
+//     geometry existed. `Engine::resolve_bottom_panel_zone` already returns
+//     `None` when the panel is not painted, which is the question both gates
+//     were badly approximating, so the converged router asks only that.
+//
+//  4. **The sidebar hover rung existed on TUI and was blank on GTK** — the
+//     mechanism behind #499/#484. `sc_panel_layout` is populated by the
+//     *shared* painter (`draw_sc_sidebar_panel`), so the geometry a hover needs
+//     was already cross-backend; only the ~78 lines that read it were
+//     TUI-only. [`route_sidebar_hover`] is that code, once, in the caller's own
+//     units.
+//
+// **Deliberately still per backend**: TUI's terminal scrollback scrollbar.
+// `TerminalSplitHit::Scrollbar` is resolved by the shared split layout, but
+// only the TUI paints a scrollback track, so only the TUI arms a drag for it.
+// The *geometry* of that drag is stated here anyway
+// ([`terminal_scrollback_drag_target`]) so the day GTK grows a track it reads
+// the same numbers, rather than re-deriving them from `bottom_panel_geometry`
+// by hand the way both backends historically did with everything else.
+
+/// Rows the quickfix panel occupies, as the **painter** reserves them.
+///
+/// The single source of truth for "how tall is the quickfix band" on the
+/// mouse-routing side, matching `compute_editor_layout`'s `quickfix_rows`
+/// exactly — including the `!quickfix_items.is_empty()` term that TUI's four
+/// hand-rolled `if engine.quickfix_open { 6 }` copies all omitted (see this
+/// section's banner, point 1).
+pub fn quickfix_panel_rows(engine: &Engine) -> u16 {
+    if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+        6
+    } else {
+        0
+    }
+}
+
+/// The caller's own bottom-panel geometry, in the caller's own units.
+///
+/// Everything else the router needs is already cached on the engine at paint
+/// time (`bottom_panel_geometry`, `terminal_split_layout`) by whichever backend
+/// painted the frame, so these two numbers are the whole of the per-backend
+/// input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BottomPanelMetrics {
+    /// Left edge of the painted panel — the editor's left edge, i.e. right of
+    /// the activity bar and sidebar. Cell column on TUI, pixels on GTK.
+    ///
+    /// Pane presses are reported *panel-relative* because that is what
+    /// `Engine::handle_terminal_pane_press` documents ("0-based cells within
+    /// the pane"); getting this wrong is bug 2 in the section banner.
+    pub panel_left: f64,
+    /// Width of one content column: `1.0` on TUI, the char advance on GTK.
+    pub col_width: f64,
+}
+
+/// Where a press inside the bottom panel landed.
+///
+/// Resolved from geometry alone — no engine mutation — so a caller can look
+/// before it leaps (GTK's right-click path needs "is this the terminal?"
+/// without actually driving the terminal).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BottomPanelRoute {
+    /// The shared "TERMINAL / DEBUG CONSOLE" tab strip.
+    TabBar,
+    /// The per-panel toolbar row (terminal tab strip or find bar).
+    Toolbar,
+    /// A hit inside a split terminal's own layout — divider, pane gutter or
+    /// scrollback track.
+    Split(quadraui::TerminalSplitHit),
+    /// A plain (unsplit) terminal pane press, already translated into
+    /// pane-local cells.
+    Pane { col: u16, row_offset: u16 },
+}
+
+/// Resolve a press at `(x, y)` against the bottom panel as last painted.
+///
+/// Returns `None` when the point is outside the panel — which is also the
+/// answer when no panel is painted at all, because
+/// `Engine::resolve_bottom_panel_zone` reads the geometry the painter cached
+/// and clears (see the section banner, point 3: this replaced two different
+/// `terminal_open` gates that were both trying to ask this).
+pub fn route_bottom_panel_click(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    metrics: BottomPanelMetrics,
+) -> Option<BottomPanelRoute> {
+    use crate::core::engine::BottomPanelZone;
+    if x < metrics.panel_left {
+        return None;
+    }
+    let zone = engine.resolve_bottom_panel_zone(y)?;
+    let geom = (*engine.bottom_panel_geometry.borrow())?;
+    Some(match zone {
+        BottomPanelZone::TabBar => BottomPanelRoute::TabBar,
+        BottomPanelZone::Toolbar => BottomPanelRoute::Toolbar,
+        BottomPanelZone::Content { row_offset } => {
+            let split = *engine.terminal_split_layout.borrow();
+            if let Some(sl) = split {
+                // The split layout hit-tests in the *absolute* space it was
+                // built in. TUI reconstructs that y from the cached geometry
+                // (its `row_offset` has already lost the panel origin);
+                // recomputing it here rather than at each call site is what
+                // stops the two backends drifting on which `y` they pass.
+                let abs_y = geom.top_y + geom.content_y + row_offset as f64 * geom.content_row_h;
+                BottomPanelRoute::Split(sl.hit_test(x as f32, abs_y as f32))
+            } else {
+                let col = ((x - metrics.panel_left) / metrics.col_width.max(f64::EPSILON)) as u16;
+                BottomPanelRoute::Pane { col, row_offset }
+            }
+        }
+    })
+}
+
+/// The scrollback-scrollbar drag a [`quadraui::TerminalSplitHit::Scrollbar`]
+/// arms, in the caller's own units.
+///
+/// Only TUI paints a scrollback track today, so only TUI calls this — but the
+/// numbers are derived from the same cached `bottom_panel_geometry` both
+/// backends write, so a future GTK track needs no new arithmetic.
+pub fn terminal_scrollback_drag_target(engine: &Engine) -> Option<quadraui::DragTarget> {
+    let geom = (*engine.bottom_panel_geometry.borrow())?;
+    let track_start = (geom.top_y + geom.content_y) as f32;
+    let track_length = (geom.height - geom.content_y).max(0.0) as f32;
+    let total = engine
+        .active_terminal()
+        .map(|t| t.history_len())
+        .unwrap_or(0);
+    Some(quadraui::DragTarget::ScrollbarY {
+        widget: quadraui::WidgetId::new("terminal_scrollback"),
+        track_start,
+        track_length,
+        thumb_length: (track_length / total.max(1) as f32).max(1.0),
+        max_scroll: total,
+        grab_offset: 0.0,
+        inverted: true,
+    })
+}
+
+/// What the caller still has to do after [`apply_bottom_panel_route`].
+///
+/// Both backends kept these as bare `bool` locals set from inside the arm
+/// (`*dragging_terminal_resize`, `self.terminal_resize_dragging`, …); returning
+/// them makes the arm's contract explicit and stops one backend quietly
+/// growing a follow-up the other lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BottomPanelEffect {
+    /// A terminal-split divider grab started — track it until mouse-up.
+    pub split_drag: bool,
+    /// The panel's own resize handle was grabbed.
+    pub resize_drag: bool,
+    /// The panel's tab strip changed which panel is showing, so the caller
+    /// must re-run its layout (GTK's `handle_resize`).
+    pub relayout: bool,
+}
+
+/// Apply a resolved [`BottomPanelRoute`].
+///
+/// `toolbar_ctx` is the caller's terminal sizing context, used only by the
+/// `Toolbar` arm. Focus bookkeeping (`terminal_has_focus`) is done here so both
+/// backends agree on it — TUI used to set it only in the `Toolbar` arm and GTK
+/// for every zone but `TabBar`.
+pub fn apply_bottom_panel_route(
+    engine: &mut Engine,
+    route: BottomPanelRoute,
+    x: f64,
+    toolbar_ctx: crate::core::engine::UiEventContext,
+) -> BottomPanelEffect {
+    use crate::core::engine::TerminalToolbarAction;
+    let mut effect = BottomPanelEffect::default();
+    match route {
+        BottomPanelRoute::TabBar => {
+            engine.handle_bottom_tab_bar_click(x);
+            effect.relayout = true;
+        }
+        BottomPanelRoute::Toolbar => {
+            engine.terminal_has_focus = true;
+            let action = engine.resolve_terminal_toolbar_click(x);
+            if !engine.execute_terminal_toolbar_action(action, toolbar_ctx)
+                && matches!(action, TerminalToolbarAction::StartResize)
+            {
+                effect.resize_drag = true;
+            }
+        }
+        BottomPanelRoute::Split(hit) => {
+            engine.terminal_has_focus = true;
+            // #533: the button/mods are passed so a split-pane click can
+            // `forward_mouse(Press)` to a child that has mouse reporting on.
+            effect.split_drag = engine.handle_terminal_split_click(
+                hit,
+                quadraui::MouseButton::Left,
+                quadraui::Modifiers::default(),
+            );
+        }
+        BottomPanelRoute::Pane { col, row_offset } => {
+            engine.terminal_has_focus = true;
+            engine.handle_terminal_pane_press(
+                col,
+                row_offset,
+                quadraui::MouseButton::Left,
+                quadraui::Modifiers::default(),
+            );
+        }
+    }
+    effect
+}
+
+/// Which panel owns the sidebar body this frame.
+///
+/// Derived exactly once, from the same two engine fields `render_content` /
+/// `render_sidebar` dispatch on, so the click router, the hover router and the
+/// painter can never disagree about who is on screen. The precedence —
+/// `ext_panel_active` **first**, `app_shell.active_panel_id()` second,
+/// Explorer as the fallback — is the rule both backends had written out
+/// longhand (TUI as an `if ext_panel_name.is_some() … else if
+/// active_panel_is(…)` chain, GTK as a `format!("ext:{name}")` string).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarOwner {
+    Explorer,
+    Search,
+    Debug,
+    Git,
+    Extensions,
+    Settings,
+    Ai,
+    /// A plugin-provided panel, by bare name (no `ext:` prefix).
+    ExtPanel(String),
+    /// A panel id nothing paints — a click on it belongs to whatever is
+    /// underneath, not to the sidebar.
+    Unknown,
+}
+
+impl SidebarOwner {
+    /// The `app_shell` panel id this owner corresponds to, for the arms that
+    /// still need to talk to the engine in strings.
+    pub fn panel_id(&self) -> Option<&'static str> {
+        use crate::core::engine::sidebar::*;
+        Some(match self {
+            SidebarOwner::Explorer => PANEL_EXPLORER,
+            SidebarOwner::Search => PANEL_SEARCH,
+            SidebarOwner::Debug => PANEL_DEBUG,
+            SidebarOwner::Git => PANEL_GIT,
+            SidebarOwner::Extensions => PANEL_EXTENSIONS,
+            SidebarOwner::Settings => PANEL_SETTINGS,
+            SidebarOwner::Ai => PANEL_AI,
+            SidebarOwner::ExtPanel(_) | SidebarOwner::Unknown => return None,
+        })
+    }
+}
+
+/// Resolve [`SidebarOwner`] for the current frame.
+pub fn sidebar_owner(engine: &Engine) -> SidebarOwner {
+    use crate::core::engine::sidebar::*;
+    if let Some(name) = engine.ext_panel_active.as_ref() {
+        return SidebarOwner::ExtPanel(name.clone());
+    }
+    let id = engine
+        .app_shell
+        .active_panel_id()
+        .map(|id| id.as_str().to_string())
+        .unwrap_or_else(|| PANEL_EXPLORER.to_string());
+    match id.as_str() {
+        PANEL_EXPLORER => SidebarOwner::Explorer,
+        PANEL_SEARCH => SidebarOwner::Search,
+        PANEL_DEBUG => SidebarOwner::Debug,
+        PANEL_GIT => SidebarOwner::Git,
+        PANEL_EXTENSIONS => SidebarOwner::Extensions,
+        PANEL_SETTINGS => SidebarOwner::Settings,
+        PANEL_AI => SidebarOwner::Ai,
+        other => match other.strip_prefix("ext:") {
+            Some(name) => SidebarOwner::ExtPanel(name.to_string()),
+            None => SidebarOwner::Unknown,
+        },
+    }
+}
+
+/// What an activity-bar panel switch left behind, for the caller's own
+/// sidebar bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityPanelSwitch {
+    /// Whether the sidebar is showing after the switch.
+    pub sidebar_visible: bool,
+    /// The plugin panel now owning the sidebar body, if any. TUI mirrors this
+    /// into `TuiSidebar::ext_panel_name`.
+    pub ext_panel: Option<String>,
+}
+
+/// Activate the activity-bar item for `panel_id` — the click-on-an-icon
+/// behaviour, stated once.
+///
+/// `panel_id` is either a built-in `PANEL_*` id or an `ext:{name}` plugin
+/// panel; the two need different bookkeeping because plugin panels bypass
+/// `AppShell` entirely (there is no dynamic `PanelDefinition` to `show_panel`),
+/// and *that* asymmetry is the whole reason both backends had grown their own
+/// copy — TUI in the `ActivityBarTarget` match inside `handle_mouse`, GTK in
+/// `App::switch_panel`. The two copies had drifted on both halves:
+///
+///   * **#637's focus clear was TUI-only.** A plugin panel taking over the
+///     sidebar body must drop whatever panel's focus flag was left set, because
+///     `app_shell`'s active-panel id is deliberately *not* moved for a plugin
+///     panel and so nothing else clears it. Without it a stale
+///     `ext_sidebar_has_focus` from an earlier visit to the Extensions
+///     marketplace keeps `active_panel_is(PANEL_EXTENSIONS)`'s `SidebarSystem`
+///     intercept looking focused while a completely different panel is on
+///     screen — GTK had that bug for as long as it had `switch_panel`.
+///   * **the re-entry guard was GTK-only.** TUI reset `ext_panel_selected` to 0
+///     and re-fired `plugin_event("panel_focus", …)` on *every* activation,
+///     including one that merely re-showed the panel already active, so
+///     clicking a plugin icon twice scrolled its list back to the top and made
+///     the plugin see a spurious second focus event.
+///
+/// Both are fixed here, in the one copy.
+pub fn apply_activity_panel_switch(engine: &mut Engine, panel_id: &str) -> ActivityPanelSwitch {
+    match panel_id.strip_prefix("ext:") {
+        Some(name) => {
+            let already_showing = engine.ext_panel_active.as_deref() == Some(name);
+            if already_showing && engine.app_shell.sidebar_visible() {
+                // Second click on the active plugin panel's icon — VS Code
+                // hides the sidebar rather than re-showing it.
+                engine.app_shell.hide_sidebar();
+                engine.ext_panel_has_focus = false;
+                engine.ext_panel_active = None;
+            } else {
+                engine.clear_sidebar_focus();
+                if !engine.app_shell.sidebar_visible() {
+                    engine.toggle_sidebar();
+                }
+                engine.ext_panel_active = Some(name.to_string());
+                engine.ext_panel_has_focus = true;
+                if !already_showing {
+                    engine.ext_panel_selected = 0;
+                    engine.plugin_event("panel_focus", name);
+                }
+            }
+        }
+        None => {
+            engine.ext_panel_has_focus = false;
+            engine.ext_panel_active = None;
+            engine.toggle_sidebar_panel(panel_id);
+        }
+    }
+    engine.session.explorer_visible = engine.app_shell.sidebar_visible();
+    let _ = engine.session.save();
+    ActivityPanelSwitch {
+        sidebar_visible: engine.app_shell.sidebar_visible(),
+        ext_panel: engine.ext_panel_active.clone(),
+    }
+}
+
+/// The painted sidebar body, in the caller's own units, plus the row pitch a
+/// list panel inside it uses.
+///
+/// TUI passes cells (`row_h == 1.0`); GTK passes the pixel
+/// `ShellContext::layout.sidebar_content_bounds` and its line height. Both
+/// numbers come from the frame that was actually painted — never re-derived —
+/// which is the rule that keeps hover highlight and hover *content* on the same
+/// row (CLAUDE.md rule 1's failure mode, one frame earlier).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SidebarBodyGeometry {
+    pub bounds: quadraui::Rect,
+    /// Height of one list row.
+    pub row_h: f32,
+    /// Rows of panel chrome above the first content row. An ext panel paints a
+    /// one-row header; a backend that paints more says so here rather than
+    /// baking the offset into its own index arithmetic.
+    pub header_rows: f32,
+}
+
+impl SidebarBodyGeometry {
+    /// Content-row index under `y`, or `None` when `y` is in the chrome above
+    /// the first content row (or outside the body entirely).
+    fn content_row(&self, y: f32) -> Option<usize> {
+        if self.row_h <= 0.0 || y < self.bounds.y || y >= self.bounds.y + self.bounds.height {
+            return None;
+        }
+        let rel = ((y - self.bounds.y) / self.row_h).floor() - self.header_rows;
+        (rel >= 0.0).then_some(rel as usize)
+    }
+
+    fn contains_x(&self, x: f32) -> bool {
+        x >= self.bounds.x && x < self.bounds.x + self.bounds.width
+    }
+}
+
+/// Hover feedback for the sidebar — the Source Control toolbar buttons and
+/// section rows, and plugin ext-panel rows.
+///
+/// This is the rung the issue calls out as "blank on GTK": the code below ran
+/// only on TUI, so #499/#484's ext-panel hover cards and the SC button
+/// highlight simply did not exist in the GUI, and any fix to one side was
+/// invisible on the other.
+///
+/// `mouse_on_popup` is the caller's own answer to "is the pointer over the
+/// hover card itself" — dismissing while the pointer is on the card is what
+/// makes a hover card impossible to read.
+///
+/// Returns `true` when the pointer was inside the sidebar body (so the caller
+/// can skip its editor-hover rungs).
+pub fn route_sidebar_hover(
+    engine: &mut Engine,
+    owner: &SidebarOwner,
+    x: f32,
+    y: f32,
+    geometry: SidebarBodyGeometry,
+    sidebar_visible: bool,
+    mouse_on_popup: bool,
+) -> bool {
+    let inside = sidebar_visible && geometry.contains_x(x);
+    match owner {
+        SidebarOwner::Git if inside => {
+            // Route via the cached `SidebarPanelLayout` (#509) — no per-frame
+            // arithmetic, and it hit-tests in the same absolute space the
+            // shared painter built it in, which is why this works unchanged on
+            // both backends.
+            let hit = {
+                let layout = engine.sc_panel_layout.borrow();
+                layout.as_ref().map(|l| l.hit_test(x, y))
+            };
+            match hit {
+                Some(quadraui::SidebarPanelHit::ToolbarButton(_))
+                | Some(quadraui::SidebarPanelHit::ToolbarEmpty) => {
+                    engine.sc_button_hovered = engine.sc_button_hit(x, y);
+                    if !mouse_on_popup {
+                        engine.dismiss_panel_hover();
+                    }
+                }
+                Some(quadraui::SidebarPanelHit::Content { y: content_y, .. }) => {
+                    engine.sc_button_hovered = None;
+                    if let Some((flat_idx, _is_header)) =
+                        engine.sc_content_row_to_flat(content_y as usize, true)
+                    {
+                        engine.panel_hover_mouse_move("source_control", "", flat_idx);
+                    } else if !mouse_on_popup {
+                        engine.dismiss_panel_hover();
+                    }
+                }
+                _ => {
+                    engine.sc_button_hovered = None;
+                    if !mouse_on_popup {
+                        engine.dismiss_panel_hover();
+                    }
+                }
+            }
+        }
+        SidebarOwner::ExtPanel(name) if inside => {
+            let name = name.clone();
+            match geometry.content_row(y) {
+                Some(row) => {
+                    let flat_idx = engine.ext_panel_scroll_top + row;
+                    engine.panel_hover_mouse_move(&name, "", flat_idx);
+                }
+                // Header row: nothing to hover.
+                None if !mouse_on_popup => engine.dismiss_panel_hover(),
+                None => {}
+            }
+        }
+        // Pointer left the panel that owns the hover card (or the sidebar
+        // entirely) — drop it, unless the pointer is *on* the card.
+        _ => {
+            engine.sc_button_hovered = None;
+            if engine.panel_hover.is_some() && !mouse_on_popup {
+                engine.dismiss_panel_hover();
+            }
+        }
+    }
+    inside
+}
+
 // ─── Overlay-band composition (#735 slice 1) ──────────────────────────────────
 //
 // The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and
