@@ -9170,4 +9170,101 @@ mod tests {
              palette (`StatusAction::GoToLine`); screen:\n{screen}"
         );
     }
+
+    /// #752: clicking a tab in an *unsplit* window must switch the painted
+    /// editor pane to that tab's own buffer — regression coverage for the
+    /// single-group arm of `handle_mouse` now delegating to
+    /// `Engine::handle_tab_bar_click` (the split-group arm a few lines above
+    /// it, and GTK's `dispatch_tab_bar_target`, already did) instead of
+    /// hand-rolling `TabBarClickTarget` dispatch, so there is exactly one
+    /// place this rung can drift from again.
+    ///
+    /// # RED-verification note (honesty over the PR's own claim)
+    ///
+    /// The removed hand-rolled arm's `Tab(i)` case still called
+    /// `engine.goto_tab(i)`, which has unconditionally called
+    /// `self.lsp_ensure_active_buffer()` internally since long before this
+    /// PR (`windows.rs`, unchanged history). Restoring that exact removed
+    /// code and re-running this test leaves it **green**, not red: for a
+    /// single, always-active group, the omitted explicit `active_group =
+    /// group_id` assignment is a no-op (there is only one group to point
+    /// at), so this specific input does not reproduce the LSP-desync this
+    /// fix's own comment (and the review finding echoing it) describes.
+    /// Verified by temporarily restoring the removed arm and re-running —
+    /// not asserted from reading the diff alone.
+    ///
+    /// The test is kept anyway because it satisfies the review finding's
+    /// own stated fallback bar ("at minimum the active buffer/tab tracks
+    /// the click") and because it pins the *converged* dispatch path
+    /// (`handle_tab_bar_click`) against any *future* regression that would
+    /// show up here even though this particular historical one does not.
+    /// There is no live LSP server under `driver_with_shell` to assert on
+    /// LSP state directly, and `lsp_ensure_active_buffer` no-ops for a
+    /// `.txt` fixture with no configured language server regardless.
+    #[test]
+    fn tab_click_in_unsplit_window_switches_active_buffer_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_752_tab_click_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a752.txt");
+        let file_b = dir.join("b752.txt");
+        std::fs::write(&file_a, "AAA752 content\n").unwrap();
+        std::fs::write(&file_b, "BBB752 content\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.new_tab(Some(&file_b));
+        assert_eq!(
+            app.engine.group_layout.leaf_count(),
+            1,
+            "this test covers the unsplit case"
+        );
+        assert_eq!(
+            app.engine.active_group().active_tab,
+            1,
+            "opening tab B makes it the active tab"
+        );
+
+        // The live config (`TuiShellApp::shell_config`), not the bare
+        // single-panel `config()` test helper: it seeds
+        // `default_sidebar_width` from the same `SIDEBAR_WIDTH` constant
+        // `mouse.rs`'s own click math reads back via `self.sidebar_width`
+        // (`shell_config`'s doc comment above, #634). With the bare helper
+        // the first painted frame lays the sidebar out at quadraui's
+        // built-in default (20 cols) while the click math assumes 30,
+        // so the tab bar's clickable region and its painted column
+        // disagree by the difference — a test-fixture-only trap, not a
+        // production bug (the real runner's `ShellConfig` always goes
+        // through `shell_config`).
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        assert!(
+            driver.screen().contains("BBB752"),
+            "fixture must start out on tab B's content; screen:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver
+            .find("a752.txt")
+            .expect("tab A's label must be painted in the (unsplit) tab bar");
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA752"),
+            "clicking tab A's label must switch the painted editor pane to \
+             its content; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("BBB752"),
+            "the editor pane must not still be showing tab B's stale \
+             content after the click; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
