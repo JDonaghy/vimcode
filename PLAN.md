@@ -6,25 +6,136 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-09-01 — no wave in flight. Both `ShellApp` migrations
-> (#448 GTK, #595 TUI) are closed and `event_loop()` is deleted. Read
-> [`GOALS.md`](GOALS.md) for what to work on next; this file is history until
-> the next multi-stage wave opens.
+> **Last updated:** 2026-09-02 — **#47 re-audited, NOT started.** The chain
+> (#730→#657) is fully landed and #47 is unblocked per the dependency graph,
+> but the re-audit the issue itself mandates at pickup found the real blocker
+> is a `Backend`-trait ergonomics mismatch the issue text didn't anticipate.
+> See "#47 re-audit findings" below before attempting Stage 1.
 
 ---
 
-## 🧭 Current wave — **none in flight**
+## 🧭 Current wave — **#47 (macOS wrapper), Stage 1 blocked on a design question — no code changed**
 
-_As of 2026-09-01._ There is no multi-stage feature mid-flight. Both `ShellApp`
-migrations are closed, so this file has no live pickup instructions; it is
-history plus the course-correction notes below.
+_As of 2026-09-02._ Picked up #47 (native macOS GUI, thin wrapper over
+`quadraui::macos::shell_runner::run_with_shell`). The issue's own body flags
+that every line number/field list in it is stale and demands a re-audit at
+pickup "before writing any code." Did that re-audit; it found Stage 1 ("move
+`App` out of `src/gtk/` into a backend-neutral home") is materially bigger
+than the issue assumed, for a reason specific enough to act on. Writing it up
+here rather than attempting the move blind, per the Platform-Neutrality Rule
+("if a feature requires new code in `src/gtk/` beyond thin wiring, STOP... file
+a quadraui issue... build infra in quadraui first").
 
-**Plan against [`GOALS.md`](GOALS.md), not this file.** It holds the north star
-(eliminate platform-specific code from vimcode, lift it into quadraui) and
-sequences what is actually left. `PROJECT_STATE.md` holds current status.
+### #47 re-audit findings (2026-09-02, `develop @ f93fb3d`, post-#657)
 
-When a multi-stage wave next starts, re-open this section with its stage table
-and pickup instructions — that is the only thing PLAN.md is for.
+`struct App` (`src/gtk/mod.rs:538-878`, 340 lines) now has **four** genuinely
+platform-typed fields — the issue's list (`sidebar_revealer`,
+`settings_monitor`, `window`, `css_provider`) is stale; #731 already deleted
+`sidebar_revealer`. Current four:
+
+| Field | Type | Gateability |
+|---|---|---|
+| `settings_monitor` | `Option<gio::FileMonitor>` | Trivial — `#[cfg(feature = "gui")]`, ~1 call site |
+| `window` | `Option<gtk4::Window>` | Low — ~15 call sites, all window-chrome (resize/maximize/CSD), self-contained |
+| `css_provider` | `Option<gtk4::CssProvider>` | Low — ~3 call sites, colorscheme reload |
+| `backend` | `Rc<RefCell<backend::GtkBackend>>` (`backend::GtkBackend` = `quadraui::gtk::GtkBackend`) | **Not a cfg-gate job — see below** |
+
+**The good news:** most of the ~6,700 lines spanning `struct App` through
+`impl quadraui::ShellApp for App` (`:538`-`:7483`) is *already* portable. Only
+~40 lines in the whole file touch `gtk4::`/`gio::`/`pangocairo::`/`glib::`
+directly. The key-mapping helpers threaded through the giant key-dispatch
+method (`map_gtk_key_name`, `gtk_key_name_to_quadraui`,
+`map_gtk_key_with_unicode`, `:898-982`) *look* GTK-specific by name but take
+and return plain `&str`/`quadraui::UiEvent` — zero `gtk4` dependency, callable
+from `handle_key_press` regardless of backend. Ditto `setup_gtk_clipboard`
+(`:990`): it's already `#[cfg]`-branched for `target_os = "macos"` internally
+(via `copypasta_ext`) and never touches `gtk4`. These can move to `src/app.rs`
+verbatim; that part of Stage 1 is low-risk mechanical work.
+
+**The actual blocker is `backend`.** `backend::GtkBackend` is a re-export of
+`quadraui::gtk::GtkBackend` (`src/gtk/backend.rs`). `App` calls exactly five
+methods on it (`grep -n 'self\.backend\.' src/gtk/mod.rs`, 44 call sites):
+`modal_stack_handle()`, `drag_state_handle()`, `set_current_line_height()`,
+`set_current_char_width()`, `set_pango_context()` (the last is GTK/Pango-only,
+one call site at `:5548`, trivially cfg-gated). The first four are **inherent
+methods on the concrete `GtkBackend` struct, not part of the generic
+`quadraui::Backend` trait** — confirmed against the pinned rev
+(`quadraui/src/backend.rs:312`, `trait Backend`; `quadraui/src/gtk/backend.rs:545-633`
+for the inherent impls).
+
+`quadraui::macos::MacBackend` (`quadraui/src/macos/backend.rs`) has **no**
+matching inherent methods. Its `impl Backend for MacBackend` instead exposes
+`modal_stack_mut(&mut self) -> &mut ModalStack`,
+`drag_and_modal_mut(&mut self) -> (&mut DragState, &mut ModalStack)`,
+`line_height(&self) -> f32`, `char_width(&self) -> f32` — trait methods with
+**short-lived borrow signatures**, not the Rc-handle pattern GTK's inherent
+methods use.
+
+That distinction is not cosmetic. `App`'s dispatch code — mouse drag, modal
+stack push/pop, the sidebar/tree click routers — repeatedly does exactly this
+shape (e.g. `:1429`, `:2587-2601`, `:3266`, `:3540`, `:3871`):
+
+```rust
+let stack_rc = self.backend.borrow().modal_stack_handle();  // stash an Rc, drop the borrow
+// ... other code, other borrows of self.engine / self.backend in between ...
+stack_rc.borrow_mut().push(...);                            // use it later, unrelated borrow scope
+```
+
+`modal_stack_mut`/`drag_and_modal_mut`'s `&mut ModalStack` return type is tied
+to the `&mut dyn Backend` borrow's lifetime — it cannot be stashed and reused
+across the borrow-drop points this pattern relies on. Simply changing
+`App.backend`'s type from `Rc<RefCell<backend::GtkBackend>>` to
+`Rc<RefCell<Box<dyn quadraui::Backend>>>` (the obvious first move) does not
+compile: the trait object exposes the wrong shape for ~40 of the 44 call
+sites, and this is the *safety-critical* code (drag/modal/click dispatch),
+not a corner where a quick workaround is low-risk.
+
+**This is a supply-side gap, not a vimcode design choice** — the
+Platform-Neutrality Rule says stop and file it upstream rather than route
+around it in `src/gtk/`. Two shapes it could take (a quadraui maintainer
+should pick, not a vimcode-side workaround):
+
+1. Add `modal_stack_handle()`/`drag_state_handle()`-style Rc-handle accessors
+   to the generic `Backend` trait (or a `BackendHandles` extension trait every
+   backend implements), matching `GtkBackend`'s existing ergonomics — `MacBackend`
+   would need to grow the same Rc-wrapped state.
+2. Move modal-stack/drag-state ownership out of the backend entirely, into
+   `App` itself (`Rc<RefCell<ModalStack>>` / `Rc<RefCell<DragState>>` fields on
+   `App`, constructed once and hierarchy-shared into whichever concrete backend
+   needs to read them for hit-testing) — bigger change, but removes the
+   asymmetry at the root instead of papering over it per-backend.
+
+**Recommendation:** file this as a quadraui issue (gap in `Backend`/`GtkBackend`
+API symmetry) before any vimcode-side Stage 1 code is written, per the
+Platform-Neutrality Rule. Do **not** attempt the `App` move without that
+decision — the 44 `self.backend` call sites sit in the app's most
+safety-critical dispatch paths (mouse drag, modal overlays), and guessing at
+an API shape here risks the same "three attempts, three reverts" outcome
+`CLAUDE.md`'s #319 negative example documents for exactly this kind of
+per-backend improvisation.
+
+**What did NOT happen this session:** no code was moved. `struct App` and
+`impl quadraui::ShellApp for App` are untouched in `src/gtk/mod.rs`. The three
+other platform fields (`window`, `css_provider`, `settings_monitor`) and the
+key-mapping helpers are confirmed low-risk and ready to move once the
+`backend` question is resolved — re-verify line numbers again at that point,
+since nothing here has landed to keep them stable.
+
+### Stage ordering once unblocked
+
+1. File/resolve the quadraui `Backend`/`GtkBackend` symmetry gap above.
+2. Move `struct App` + its three `impl App` blocks + `impl ShellApp for App`
+   (`src/gtk/mod.rs:538-7483`) to `src/app.rs`, gating `window`/`css_provider`/
+   `settings_monitor` behind `#[cfg(feature = "gui")]` and switching `backend`
+   to whatever shape step 1 lands on.
+3. `src/gtk/mod.rs` keeps only `run()`, `build_shell_config()`, and the
+   genuinely GTK-only helpers (window-chrome, CSS, key-name→GDK glyph tables
+   if any remain GTK-specific after the move).
+4. Then Stage 2 (macOS wrapper, `src/macos/mod.rs`) and Stage 3 (`MacDriver`
+   test) per the issue body — both **cannot be built or verified on this
+   Linux machine** (no Apple SDK / `objc2` toolchain here); flag that
+   explicitly whenever this is picked up next, rather than claiming untested
+   mac-only code compiles.
 
 ---
 
