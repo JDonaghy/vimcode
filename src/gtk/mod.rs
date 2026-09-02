@@ -1855,62 +1855,36 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn handle_key_press(&mut self, key_name: String, unicode: Option<char>, ctrl: bool, alt: bool) {
-        // Dismiss context menu on any key press (Escape, or j/k for nav, Enter to confirm).
-        if self.engine.borrow().context_menu.is_some() {
-            let mut engine = self.engine.borrow_mut();
-            match key_name.as_str() {
-                "Escape" => {
-                    engine.close_context_menu();
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
-                }
-                "Return" => {
-                    let _act = engine.context_menu_confirm();
-                    let needs_refresh = engine.explorer_needs_refresh;
-                    if needs_refresh {
-                        engine.explorer_needs_refresh = false;
-                    }
-                    drop(engine);
-                    if needs_refresh {
-                        self.refresh_file_tree();
-                    }
-                    self.draw_needed.set(true);
-                    return;
-                }
-                "j" | "Down" => {
-                    if let Some(ref mut cm) = engine.context_menu {
-                        let len = cm.items.len();
-                        if len > 0 {
-                            cm.selected = (cm.selected + 1) % len;
-                        }
-                    }
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
-                }
-                "k" | "Up" => {
-                    if let Some(ref mut cm) = engine.context_menu {
-                        let len = cm.items.len();
-                        if len > 0 {
-                            cm.selected = if cm.selected > 0 {
-                                cm.selected - 1
-                            } else {
-                                len - 1
-                            };
-                        }
-                    }
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    return;
-                }
-                _ => {
-                    engine.close_context_menu();
-                    drop(engine);
-                    self.draw_needed.set(true);
-                    // Fall through to normal key handling
-                }
+        // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
+        // `render::route_modal_key` states the spell-suggestion → dialog →
+        // context-menu ladder once for both backends. GTK used to hand-roll
+        // the context-menu rung here (and a second copy in the now-deleted
+        // `handle_explorer_ctx_menu_key`), diverging from
+        // `Engine::handle_context_menu_key` in three ways: `l` did not
+        // confirm, `q`/`h` did not close, j/k did not skip disabled items,
+        // and every other key both closed the menu *and* fell through to the
+        // editor. It also had no top-level dialog rung at all, so a dialog
+        // opened while the activity bar / explorer / an extension panel held
+        // focus lost its keys to that panel.
+        // Bound to a local first: a `RefCell::borrow()` temporary in a `match`
+        // scrutinee lives for the whole `match`, and the arms `borrow_mut()`.
+        let modal_route = render::route_modal_key(&self.engine.borrow());
+        match modal_route {
+            render::ModalKeyRoute::Engine => {
+                let action = {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.handle_key(&key_name, unicode, ctrl)
+                };
+                self.dispatch_engine_action(action, false);
+                self.queue_explorer_draw();
+                self.draw_needed.set(true);
+                return;
             }
+            render::ModalKeyRoute::ContextMenu => {
+                self.dispatch_context_menu_key(&key_name, unicode);
+                return;
+            }
+            render::ModalKeyRoute::None => {}
         }
 
         // Dismiss any panel hover popup on key press.
@@ -1978,9 +1952,7 @@ impl App {
             let mut engine = self.engine.borrow_mut();
             if engine.ext_panel_has_focus {
                 let mapped = map_gtk_key_name(key_name.as_str());
-                if engine.dialog.is_some() {
-                    engine.handle_key(mapped, unicode, false);
-                } else if engine.ext_panel_input_active {
+                if engine.ext_panel_input_active {
                     engine.handle_ext_panel_input_key(mapped, false, unicode);
                 } else {
                     engine.handle_ext_panel_key(mapped, false, unicode);
@@ -1996,11 +1968,7 @@ impl App {
             }
             if engine.ext_sidebar_has_focus {
                 let mapped = map_gtk_key_name(key_name.as_str());
-                if engine.dialog.is_some() {
-                    engine.handle_key(mapped, unicode, false);
-                } else {
-                    engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
-                }
+                engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
                 let still_focused = engine.ext_sidebar_has_focus;
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
@@ -2010,11 +1978,7 @@ impl App {
             }
             if engine.settings_has_focus {
                 let mapped = map_gtk_key_name(key_name.as_str());
-                if engine.dialog.is_some() {
-                    engine.handle_key(mapped, unicode, ctrl);
-                } else {
-                    engine.handle_settings_key(mapped, ctrl, unicode);
-                }
+                engine.handle_settings_key(mapped, ctrl, unicode);
                 let still_focused = engine.settings_has_focus;
                 let has_dialog = engine.dialog.is_some();
                 drop(engine);
@@ -2024,16 +1988,12 @@ impl App {
             }
             if engine.search_has_focus {
                 let mapped = map_gtk_key_name(key_name.as_str());
-                if engine.dialog.is_some() {
-                    engine.handle_key(mapped, unicode, ctrl);
-                } else {
-                    // Ctrl+V no longer reaches here: quadraui's runner
-                    // intercepts it and delivers `UiEvent::ClipboardPaste`
-                    // straight to `ShellApp::handle`, which routes through
-                    // `Engine::route_paste` (covers the search/replace
-                    // fields too) before any key event is dispatched (#593).
-                    engine.dispatch_search_sidebar_key_unified(mapped, ctrl, alt, unicode);
-                }
+                // Ctrl+V no longer reaches here: quadraui's runner
+                // intercepts it and delivers `UiEvent::ClipboardPaste`
+                // straight to `ShellApp::handle`, which routes through
+                // `Engine::route_paste` (covers the search/replace
+                // fields too) before any key event is dispatched (#593).
+                engine.dispatch_search_sidebar_key_unified(mapped, ctrl, alt, unicode);
                 let still_focused = engine.search_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
@@ -2042,11 +2002,7 @@ impl App {
             }
             if engine.sc_has_focus {
                 let (mapped, sc_unicode) = map_gtk_key_with_unicode(key_name.as_str());
-                if engine.dialog.is_some() {
-                    engine.handle_key(mapped, sc_unicode, ctrl);
-                } else {
-                    engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, sc_unicode);
-                }
+                engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, sc_unicode);
                 let still_focused = engine.sc_has_focus;
                 drop(engine);
                 self.focus_after_sidebar_key(still_focused);
@@ -4756,26 +4712,12 @@ impl App {
     }
 
     fn handle_explorer_da_key(&mut self, key_name: String, unicode: Option<char>, ctrl: bool) {
-        // #426: when an explorer ctx menu is open, dispatch j/k/Esc/Enter
-        // to the engine ctx menu handler. On Enter, forward the returned
-        // action via the shared dispatcher so backend-only flows
-        // (new_file, open_terminal, etc.) fire.
-        if self.handle_explorer_ctx_menu_key(&key_name) {
-            self.queue_explorer_draw();
-            self.draw_needed.set(true);
-            return;
-        }
-
-        // When an engine dialog is active (delete confirmation), route
-        // keys to the dialog handler, not the explorer dispatch.
-        if self.engine.borrow().dialog.is_some() {
-            if !util::is_modifier_only_key(&key_name) {
-                let mapped = map_gtk_key_name(&key_name);
-                self.engine.borrow_mut().handle_key(mapped, unicode, false);
-            }
-            self.draw_needed.set(true);
-            return;
-        }
+        // #734 slice 1: the #426 explorer-ctx-menu intercept and the
+        // dialog patch-up ("route keys to the dialog handler, not the
+        // explorer dispatch") that used to open this function are gone —
+        // both were local re-statements of rungs `render::route_modal_key`
+        // now resolves at the top of `handle_key_press`, above the
+        // `explorer_has_focus` rung that is this function's only caller.
 
         // Panel-nav shortcuts before engine dispatch.
         let (pk_toggle, pk_explorer, pk_search) = {
@@ -4909,72 +4851,43 @@ impl App {
         // Suppress the default engine key handler — key is consumed.
     }
 
-    /// #426: Intercept j/k/Enter/Esc on the explorer DA when an
-    /// engine-drawn explorer ctx menu is open. Returns true if consumed.
-    fn handle_explorer_ctx_menu_key(&mut self, key_name: &str) -> bool {
-        use core::engine::ContextMenuTarget;
-        {
-            let eng = self.engine.borrow();
-            match eng.context_menu.as_ref().map(|cm| &cm.target) {
-                Some(
-                    ContextMenuTarget::ExplorerFile { .. } | ContextMenuTarget::ExplorerDir { .. },
-                ) => {}
-                _ => return false,
-            }
+    /// #734 slice 1: the single GTK-side sink for the shared context-menu
+    /// key rung (`render::ModalKeyRoute::ContextMenu`).
+    ///
+    /// Replaces two hand-rolled copies — the block that opened
+    /// `handle_key_press` and `handle_explorer_ctx_menu_key` (#426) on the
+    /// explorer DA path — both of which reimplemented selection movement
+    /// inline instead of calling `Engine::handle_context_menu_key`, and so
+    /// disagreed with TUI on `l` (confirm), `q`/`h` (close) and disabled-item
+    /// skipping. The engine owns all of that now; the only GTK-specific part
+    /// left is dispatching the confirmed action, since `new_file` /
+    /// `open_terminal` / `find_in_folder` need backend plumbing.
+    fn dispatch_context_menu_key(&mut self, key_name: &str, unicode: Option<char>) {
+        let effective_key = if key_name.is_empty() {
+            unicode.map(|c| c.to_string()).unwrap_or_default()
+        } else {
+            key_name.to_string()
+        };
+        let target = self.engine.borrow().context_menu_target_path();
+        let action = {
+            let mut engine = self.engine.borrow_mut();
+            let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
+            action
+        };
+        if let (Some(ref act), Some((ref path, _is_dir))) = (action, target) {
+            self.dispatch_explorer_ctx_action(act, path);
         }
-        match key_name {
-            "Escape" => {
-                self.engine.borrow_mut().close_context_menu();
-                true
-            }
-            "Return" => {
-                let target_path =
-                    self.engine
-                        .borrow()
-                        .context_menu
-                        .as_ref()
-                        .and_then(|cm| match &cm.target {
-                            ContextMenuTarget::ExplorerFile { path }
-                            | ContextMenuTarget::ExplorerDir { path } => Some(path.clone()),
-                            _ => None,
-                        });
-                let action = self.engine.borrow_mut().context_menu_confirm();
-                if let (Some(action), Some(target)) = (action, target_path) {
-                    self.dispatch_explorer_ctx_action(&action, &target);
-                }
-                true
-            }
-            "j" | "Down" => {
-                let mut eng = self.engine.borrow_mut();
-                if let Some(ref mut cm) = eng.context_menu {
-                    let len = cm.items.len();
-                    if len > 0 {
-                        cm.selected = (cm.selected + 1) % len;
-                    }
-                }
-                true
-            }
-            "k" | "Up" => {
-                let mut eng = self.engine.borrow_mut();
-                if let Some(ref mut cm) = eng.context_menu {
-                    let len = cm.items.len();
-                    if len > 0 {
-                        cm.selected = if cm.selected > 0 {
-                            cm.selected - 1
-                        } else {
-                            len - 1
-                        };
-                    }
-                }
-                true
-            }
-            _ => {
-                // Any other key dismisses + falls through to normal explorer
-                // handling so the user can keep navigating.
-                self.engine.borrow_mut().close_context_menu();
-                false
-            }
+        let needs_refresh = {
+            let mut engine = self.engine.borrow_mut();
+            let r = engine.explorer_needs_refresh;
+            engine.explorer_needs_refresh = false;
+            r
+        };
+        if needs_refresh {
+            self.refresh_file_tree();
         }
+        self.queue_explorer_draw();
+        self.draw_needed.set(true);
     }
 
     /// #426: Map the action string returned by `context_menu_confirm` for
