@@ -920,35 +920,24 @@ pub(super) fn draw_frame(
 
     // ── Tab switcher popup ───────────────────────────────────────────────────
     if let Some(ref ts) = screen.tab_switcher {
-        if !ts.items.is_empty() {
-            // Sizing identical to the legacy popup: 45% of viewport
-            // width clamped to [40, 80]; height = visible_items + 2
-            // (top + bottom border rows). The bordered ListView's own
-            // layout reserves rows 0 and N-1 for borders.
-            let term_w = area.width;
-            let term_h = area.height;
-            let width = (term_w * 45 / 100).clamp(40, 80);
-            let max_visible = (term_h as usize).saturating_sub(4).min(20);
-            let visible = ts.items.len().min(max_visible);
-            let height = visible as u16 + 2;
-            let x = (term_w.saturating_sub(width)) / 2;
-            let y = (term_h.saturating_sub(height)) / 2;
-            let popup_area = Rect {
-                x,
-                y,
-                width,
-                height,
-            };
+        // #733: sizing (45% of viewport width clamped to [40, 80];
+        // height = visible_items + 2 border rows) now lives once in
+        // `render::TabSwitcherGeometry`, shared with the GTK painter and
+        // with the modal-overlay mouse router.
+        if let Some(geo) = render::TabSwitcherGeometry::compute(
+            quadraui::Rect::new(
+                area.x as f32,
+                area.y as f32,
+                area.width as f32,
+                area.height as f32,
+            ),
+            ts.items.len(),
+            &render::TUI_TAB_SWITCHER_SIZING,
+        ) {
             // Per D6: build quadraui::ListView (bordered) + draw_list.
             // Phase B.4 Stage 2: route through `Backend::draw_list`.
-            let list = render::tab_switcher_to_quadraui_list_view(ts, max_visible);
-            let q_rect = quadraui::Rect::new(
-                popup_area.x as f32,
-                popup_area.y as f32,
-                popup_area.width as f32,
-                popup_area.height as f32,
-            );
-            backend.draw_list(q_rect, &list);
+            let list = render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
+            backend.draw_list(geo.bounds, &list);
         }
     }
 
@@ -2594,6 +2583,7 @@ mod tests {
             None,
             &mut false,
             &mut false,
+            None,
             None,
             None,
             None,
