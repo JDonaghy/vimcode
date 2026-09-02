@@ -3227,6 +3227,61 @@ mod chrome_surfaces {
         );
     }
 
+    /// #733 review finding: a modal dialog must swallow a *right*-click
+    /// too, not just a left one — it is supposed to eat every event while
+    /// open (see the doc comment on `route_modal_overlay_click`'s dialog
+    /// rung: "eats everything, including motion"). Before this fix,
+    /// `MouseButton::Right` in `handle()`'s `UiEvent::MouseDown` arm never
+    /// consulted `route_modal_overlay_click` at all — only the left-click
+    /// path (`handle_mouse_click_msg`) did — so a right-click landing
+    /// inside the dialog's painted bounds fell straight through to
+    /// `handle_editor_right_click`, which opens the editor's context menu
+    /// underneath the still-open dialog.
+    ///
+    /// RED against the review finding: before the fix, this right-click
+    /// opens the editor context menu and "Paste" (its always-enabled
+    /// item) paints.
+    #[test]
+    fn open_dialog_swallows_a_right_click_meant_for_the_editor_context_menu() {
+        let engine = {
+            let mut engine = small_engine();
+            engine.start_move_file_dialog(
+                std::path::Path::new("/tmp/project/foo.rs"),
+                std::path::Path::new("/tmp/project"),
+            );
+            engine
+        };
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.dialog_layout.borrow().is_some(),
+            "fixture must open an in-canvas (non-native) dialog"
+        );
+        assert!(
+            !h.driver.screen_contains("Paste"),
+            "sanity: no context menu should be open before the right-click"
+        );
+
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(700.0, 400.0),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("Paste"),
+            "an open modal dialog must swallow the right-click instead of \
+             letting it open the editor's context menu underneath; \
+             painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.dialog_layout.borrow().is_some(),
+            "the dialog itself must still be open — swallowed, not dismissed"
+        );
+    }
+
     /// Cross-backend parity for the tab-switcher rung the same router now
     /// owns on both sides (TUI's half is
     /// `driver_click_inside_tab_switcher_popup_dismisses_and_is_consumed`

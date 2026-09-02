@@ -2499,6 +2499,56 @@ impl App {
         self.cached_editor_bounds.get()
     }
 
+    /// Resolve the modal-overlay rung (#733) for one point/action against
+    /// the layouts the last frame actually painted
+    /// (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
+    /// `Engine::toast_layout`), never freshly recomputed ones (#582/#646).
+    ///
+    /// Shared by every mouse-button path that needs to know whether a
+    /// modal overlay owns the event — left-click dispatch
+    /// (`handle_mouse_click_msg`, `ModalMouseAction::LeftPress`) and
+    /// right-click dispatch (the `MouseButton::Right` arm of `handle`,
+    /// `ModalMouseAction::Other`) both call this rather than re-deriving
+    /// the state. TUI's `handle_mouse` already funnels every mouse event
+    /// through one call to `render::route_modal_overlay_click`; this is
+    /// GTK's equivalent single call site.
+    fn route_modal_overlay(
+        &self,
+        x: f64,
+        y: f64,
+        action: render::ModalMouseAction,
+    ) -> render::ModalOverlayRoute {
+        let (toast, dialog_open, tab_switcher_open, completion_open) = {
+            let engine = self.engine.borrow();
+            let toast = engine.toast_layout.borrow().clone();
+            (
+                toast,
+                engine.dialog.is_some(),
+                engine.tab_switcher_open,
+                engine.completion_idx.is_some(),
+            )
+        };
+        let dialog = self.dialog_layout.borrow().clone();
+        let completion = self.completion_layout.borrow().clone();
+        let tab_switcher_bounds = self.tab_switcher_popup_rect.get().map(|(px, py, pw, ph)| {
+            quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
+        });
+        render::route_modal_overlay_click(
+            &render::ModalOverlayState {
+                toast: toast.as_ref(),
+                dialog_open,
+                dialog: dialog.as_ref(),
+                tab_switcher_open,
+                tab_switcher_bounds,
+                completion_open,
+                completion: completion.as_ref(),
+            },
+            x as f32,
+            y as f32,
+            action,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
         self.reconcile_editor_hover_modal();
@@ -2511,41 +2561,7 @@ impl App {
         // (toast, then tab switcher, then completion, with the dialog
         // ~600 lines further down, *below* find/replace) while TUI ran a
         // different one — the precedence drift #733 exists to kill.
-        //
-        // Every layout fed in is the one the last frame actually painted
-        // (`dialog_layout`, `tab_switcher_popup_rect`, `completion_layout`,
-        // `Engine::toast_layout`), never a freshly recomputed one — #582/#646.
-        let modal_route = {
-            let (toast, dialog_open, tab_switcher_open, completion_open) = {
-                let engine = self.engine.borrow();
-                let toast = engine.toast_layout.borrow().clone();
-                (
-                    toast,
-                    engine.dialog.is_some(),
-                    engine.tab_switcher_open,
-                    engine.completion_idx.is_some(),
-                )
-            };
-            let dialog = self.dialog_layout.borrow().clone();
-            let completion = self.completion_layout.borrow().clone();
-            let tab_switcher_bounds = self.tab_switcher_popup_rect.get().map(|(px, py, pw, ph)| {
-                quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
-            });
-            render::route_modal_overlay_click(
-                &render::ModalOverlayState {
-                    toast: toast.as_ref(),
-                    dialog_open,
-                    dialog: dialog.as_ref(),
-                    tab_switcher_open,
-                    tab_switcher_bounds,
-                    completion_open,
-                    completion: completion.as_ref(),
-                },
-                x as f32,
-                y as f32,
-                render::ModalMouseAction::LeftPress,
-            )
-        };
+        let modal_route = self.route_modal_overlay(x, y, render::ModalMouseAction::LeftPress);
         match modal_route {
             render::ModalOverlayRoute::Toast(hit) => {
                 if self.engine.borrow_mut().handle_toast_hit(hit) {
@@ -7115,37 +7131,59 @@ impl quadraui::ShellApp for App {
                         );
                     }
                     MouseButton::Right => {
-                        // #546 FAILED-1: this used to unconditionally build
-                        // `EditorRightClick`, so right-clicking a tab opened
-                        // the *editor's* context menu (identical item list to
-                        // right-clicking in the buffer) instead of a
-                        // tab-specific one. Resolve the click against the
-                        // last-painted tab-bar geometry first — read-only, no
-                        // engine mutation — and only fall back to the editor
-                        // menu when it isn't over a tab.
                         let rx = position.x as f64;
                         let ry = position.y as f64;
-                        let tab_target = {
-                            let engine = self.engine.borrow();
-                            let layout_ref = self.cached_screen_layout.borrow();
-                            layout_ref.as_ref().and_then(|layout| {
-                                resolve_tab_right_click(
-                                    &engine,
-                                    rx,
-                                    ry,
-                                    self.cached_line_height,
-                                    self.cached_char_width,
-                                    layout,
-                                    &self.cached_tab_pixel_hits.borrow(),
-                                    self.cached_frame_hit_map.borrow().as_ref(),
-                                    &self.cached_tab_bar_zones.borrow(),
-                                )
-                            })
-                        };
-                        if let Some((group_id, tab_idx)) = tab_target {
-                            self.handle_tab_right_click(group_id, tab_idx, rx, ry);
+                        // ── Modal-overlay rung (#733 review) ────────────
+                        // A modal dialog eats every event, including
+                        // right-clicks, so it can't be right-clicked
+                        // through to the editor/tab context menu
+                        // underneath — TUI's `handle_mouse` already
+                        // returns unconditionally for any event kind
+                        // while `engine.dialog.is_some()`. This backend's
+                        // left-click path goes through
+                        // `route_modal_overlay_click` via
+                        // `handle_mouse_click_msg`, but the right-click
+                        // path used to skip straight to tab/editor
+                        // resolution below without consulting it, so a
+                        // right-click on an open dialog opened the
+                        // editor's context menu behind it. Route through
+                        // the same shared rung (`ModalMouseAction::Other`)
+                        // before doing anything else.
+                        let modal_route =
+                            self.route_modal_overlay(rx, ry, render::ModalMouseAction::Other);
+                        if modal_route == render::ModalOverlayRoute::Swallow {
+                            self.draw_needed.set(true);
                         } else {
-                            self.handle_editor_right_click(rx, ry);
+                            // #546 FAILED-1: this used to unconditionally build
+                            // `EditorRightClick`, so right-clicking a tab opened
+                            // the *editor's* context menu (identical item list to
+                            // right-clicking in the buffer) instead of a
+                            // tab-specific one. Resolve the click against the
+                            // last-painted tab-bar geometry first — read-only, no
+                            // engine mutation — and only fall back to the editor
+                            // menu when it isn't over a tab.
+                            let tab_target = {
+                                let engine = self.engine.borrow();
+                                let layout_ref = self.cached_screen_layout.borrow();
+                                layout_ref.as_ref().and_then(|layout| {
+                                    resolve_tab_right_click(
+                                        &engine,
+                                        rx,
+                                        ry,
+                                        self.cached_line_height,
+                                        self.cached_char_width,
+                                        layout,
+                                        &self.cached_tab_pixel_hits.borrow(),
+                                        self.cached_frame_hit_map.borrow().as_ref(),
+                                        &self.cached_tab_bar_zones.borrow(),
+                                    )
+                                })
+                            };
+                            if let Some((group_id, tab_idx)) = tab_target {
+                                self.handle_tab_right_click(group_id, tab_idx, rx, ry);
+                            } else {
+                                self.handle_editor_right_click(rx, ry);
+                            }
                         }
                     }
                     _ => {}
