@@ -6963,3 +6963,149 @@ mod editor_mouse_rungs {
         );
     }
 }
+
+#[cfg(test)]
+mod alt_rung {
+    //! #759 / #734 slice 4 — the shared Alt-modifier / VSCode-mode rung.
+    //!
+    //! `render::route_alt_key` states this tier once for both backends. GTK
+    //! had **no Alt tier at all**: `App::handle_key_press` took an `alt: bool`
+    //! and used it only to feed the terminal router and to suppress the debug
+    //! F-keys, then dropped it — `Engine::handle_key` has no `alt` parameter —
+    //! so Alt+Left/Right, Alt+M, Alt+,/., Alt+]/[ and the whole VSCode-mode
+    //! `Alt_*` set have been dead here since the #540 ShellApp cutover.
+    //!
+    //! Both tests below therefore fail against unfixed `develop` by
+    //! construction: with no rung, the chord changes nothing at all. They are
+    //! written as the mirrors of TUI's
+    //! `alt_right_widens_the_painted_sidebar_via_shell_app` and
+    //! `alt_z_toggles_word_wrap_only_in_vscode_mode_via_shell_app`
+    //! (`src/tui_main/shell_app.rs`) and assert the same observables, so the
+    //! pair is the cross-backend "same chord, same mode, same result" check
+    //! the issue asks for. The spelling-identity tier — both backends' key
+    //! *names* fed into one `route_alt_key` call — is
+    //! `render::alt_key_router_tests`.
+    use super::*;
+    use quadraui::{Key, Modifiers, UiEvent};
+
+    /// Press `key` with Alt held, exactly as `App::handle`'s `KeyPressed` arm
+    /// receives it from the live GTK runner.
+    fn alt_press<A: AppLogic>(driver: &mut GtkDriver<A>, key: Key, shift: bool) {
+        driver.dispatch(UiEvent::KeyPressed {
+            key,
+            modifiers: Modifiers {
+                alt: true,
+                shift,
+                ..Default::default()
+            },
+            repeat: false,
+        });
+    }
+
+    /// #759: Alt+Right must widen the sidebar the frame actually **paints**.
+    ///
+    /// Asserted through `painted_sidebar_bounds` — the rect `render_content`
+    /// filled the active panel into on the last pass — rather than through any
+    /// stored width (`CLAUDE.md` rule 1). GTK's authoritative sidebar width is
+    /// the runner's own `AppShell`, so a test that read `engine.app_shell`
+    /// would pass against a fix that never reached the painted layout; that is
+    /// exactly the mirror-state trap #454 documents on this very field.
+    ///
+    /// **Verified RED against unfixed `develop`:** there is no Alt rung there,
+    /// so the sidebar rect is byte-identical before and after and the
+    /// "must grow" assertion fires. (Equivalently, on this branch: change the
+    /// `AltBase::Right` arm of `route_alt_key` to `Fallthrough`.)
+    #[test]
+    fn alt_right_widens_the_painted_sidebar_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        let before = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("precondition: the sidebar must be painted to be resized");
+        assert!(before.width > 0.0, "degenerate sidebar rect {before:?}");
+
+        alt_press(&mut h.driver, Key::Named(quadraui::NamedKey::Right), false);
+        h.driver.render();
+        let wider = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the sidebar must still paint after Alt+Right");
+        assert!(
+            wider.width > before.width,
+            "Alt+Right must widen the *painted* sidebar: {} -> {}",
+            before.width,
+            wider.width
+        );
+
+        alt_press(&mut h.driver, Key::Named(quadraui::NamedKey::Left), false);
+        h.driver.render();
+        let back = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the sidebar must still paint after Alt+Left");
+        assert_eq!(
+            back.width, before.width,
+            "Alt+Left must narrow it straight back — the two arms share one \
+             clamp (`render::alt_resized_sidebar_width`)"
+        );
+    }
+
+    /// #759: Alt+Z is a VS Code editor command (toggle word wrap) in VSCode
+    /// mode and a plain pass-through in Vim mode. That mode-dependence is the
+    /// "vscode-mode divergence" this slice converges: it used to exist only
+    /// inside TUI's `handle_key_pressed`, so on GTK the chord did nothing in
+    /// *either* mode.
+    ///
+    /// Asserts on the painted command line, where `engine.message` renders.
+    /// The editor buffer is not an option here — the GTK backend does not
+    /// `record_painted_text` editor glyphs (see this module's header) — and
+    /// the command line is the same observable TUI's half asserts on, which is
+    /// what makes the pair a cross-backend comparison rather than two
+    /// unrelated tests.
+    ///
+    /// The menu tier above this rung cannot interfere: GTK's menu bar is
+    /// always visible, so `MenuSystem::handle` sees every Alt chord, but
+    /// `MenuBar::find_alt_target('z')` matches no menu label and returns
+    /// `MenuEvent::Ignored`.
+    ///
+    /// **Verified RED against unfixed `develop`:** no Alt rung, so the command
+    /// line stays empty in both modes and the VSCode-mode assertion fires.
+    #[test]
+    fn alt_z_toggles_word_wrap_only_in_vscode_mode_on_gtk() {
+        for (vscode, expect_message) in [(true, true), (false, false)] {
+            let mut engine = Engine::new_for_test();
+            engine.settings.wrap = false;
+            engine.settings.editor_mode = if vscode {
+                crate::core::settings::EditorMode::Vscode
+            } else {
+                crate::core::settings::EditorMode::Vim
+            };
+            engine.mode = if vscode {
+                crate::core::Mode::Insert
+            } else {
+                crate::core::Mode::Normal
+            };
+
+            let mut h = harness(engine, 1200, 800);
+            h.driver.render();
+
+            alt_press(&mut h.driver, Key::Char('z'), false);
+            h.driver.render();
+
+            assert_eq!(
+                h.driver.screen_contains("Word wrap on"),
+                expect_message,
+                "Alt+Z must toggle word wrap in VSCode mode and do nothing in \
+                 Vim mode (vscode = {vscode}); painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+    }
+}

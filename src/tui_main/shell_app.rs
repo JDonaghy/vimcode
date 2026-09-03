@@ -795,11 +795,15 @@ impl TuiShellApp {
         // 20/8/50 — otherwise the very first frame paints a 20-column
         // sidebar while every vimcode-side consumer of `self.sidebar_width`
         // (mouse hit-tests, `tick`'s viewport approximation) assumes 30, and
-        // Alt+Right would silently stop at 50. The bounds match the clamps
-        // `handle_key_pressed`'s Alt+Left/Right arms apply (15..=150).
+        // Alt+Right would silently stop at 50. The bounds are the shared
+        // rung's own clamps (#759): `render::alt_resized_sidebar_width` is
+        // what Alt+Left/Right applies on both backends, so the `AppShell`
+        // underneath must not narrow them further. GTK's
+        // `build_shell_config` sets the identical pair from the same two
+        // constants.
         cfg.default_sidebar_width = SIDEBAR_WIDTH as f32;
-        cfg.min_sidebar_width = 15.0;
-        cfg.max_sidebar_width = 150.0;
+        cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
+        cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
         cfg
     }
 
@@ -3840,71 +3844,19 @@ fn handle_key_pressed(
         return Reaction::Redraw;
     }
 
-    // ── Alt-modifier block (mirrors mod.rs:2526-:2601) ──────────────────
-    if key_event.modifiers.contains(KeyModifiers::ALT) {
-        match key_event.code {
-            // Alt+Left / Alt+Right: resize the sidebar.
-            KeyCode::Left => {
-                *state.sidebar_width = state.sidebar_width.saturating_sub(1).max(15);
-                return Reaction::Redraw;
-            }
-            KeyCode::Right => {
-                *state.sidebar_width = (*state.sidebar_width + 1).min(150);
-                return Reaction::Redraw;
-            }
-            // Shift+Alt+F: LSP format document.
-            KeyCode::Char('F') => {
-                if key_event.modifiers.contains(KeyModifiers::SHIFT) {
-                    engine.lsp_format_current();
-                    return Reaction::Redraw;
-                }
-            }
-            // Alt+M: toggle Vim ↔ VSCode editing mode.
-            KeyCode::Char('m') | KeyCode::Char('M') => {
-                engine.toggle_editor_mode();
-                return Reaction::Redraw;
-            }
-            // Alt+, / Alt+. — resize the editor group split.
-            KeyCode::Char(',') => {
-                engine.group_resize(-0.05);
-                return Reaction::Redraw;
-            }
-            KeyCode::Char('.') => {
-                engine.group_resize(0.05);
-                return Reaction::Redraw;
-            }
-            // Alt+] / Alt+[ — cycle AI ghost-text alternatives.
-            KeyCode::Char(']') => {
-                if engine.mode == crate::core::Mode::Insert {
-                    engine.ai_ghost_next_alt();
-                    return Reaction::Redraw;
-                }
-            }
-            KeyCode::Char('[') => {
-                if engine.mode == crate::core::Mode::Insert {
-                    engine.ai_ghost_prev_alt();
-                    return Reaction::Redraw;
-                }
-            }
-            // Alt+t is handled earlier (tab switcher).
-            _ => {}
+    // ── Shared Alt-modifier / VSCode-mode rung (#759 / #734 slice 4) ────
+    // `render::route_alt_key` states this tier once for both backends. The
+    // ~66-line `match key_event.code` block that used to live here had no GTK
+    // twin at all — GTK took an `alt: bool` and dropped it, so Alt+Left/Right,
+    // Alt+M, Alt+,/., Alt+]/[ and the whole VSCode-mode `Alt_*` encoding were
+    // dead there. See the rung's header comment in `render.rs`.
+    match render::route_alt_key(engine, &key_name, unicode, shift, alt) {
+        render::AltKeyOutcome::ResizeSidebar(delta) => {
+            *state.sidebar_width = render::alt_resized_sidebar_width(*state.sidebar_width, delta);
+            return Reaction::Redraw;
         }
-        // VSCode mode: encode Alt+key into a key name for engine dispatch.
-        if engine.is_vscode_mode() {
-            let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
-            let alt_key_name = match key_event.code {
-                KeyCode::Up if shift => Some("Alt_Shift_Up"),
-                KeyCode::Down if shift => Some("Alt_Shift_Down"),
-                KeyCode::Up => Some("Alt_Up"),
-                KeyCode::Down => Some("Alt_Down"),
-                KeyCode::Char('z') | KeyCode::Char('Z') if !shift => Some("Alt_z"),
-                _ => None,
-            };
-            if let Some(name) = alt_key_name {
-                engine.handle_key(name, None, false);
-                return Reaction::Redraw;
-            }
-        }
+        render::AltKeyOutcome::Handled => return Reaction::Redraw,
+        render::AltKeyOutcome::Fallthrough => {}
     }
 
     // ── Pre-load the system clipboard for paste keys (mirrors
@@ -10331,5 +10283,127 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── #759 / #734 slice 4: the shared Alt-modifier / VSCode-mode rung ──
+    //
+    // The GTK halves of these two live in `src/gtk/testing.rs`
+    // (`alt_right_widens_the_painted_sidebar_on_gtk`,
+    // `alt_z_toggles_word_wrap_only_in_vscode_mode_on_gtk`) and assert the
+    // same observables from the other backend. The spelling-identity tier
+    // (both backends' key names into one `route_alt_key` call) is
+    // `render::alt_key_router_tests`.
+
+    /// Press `key` with Alt (and optionally Shift) held.
+    fn alt_press<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        key: quadraui::Key,
+        shift: bool,
+    ) {
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                shift,
+                ..Default::default()
+            },
+            repeat: false,
+        });
+    }
+
+    /// #759: Alt+Right must widen the sidebar the frame actually paints.
+    ///
+    /// Asserted through the editor text's painted column, not through
+    /// `TuiShellApp::sidebar_width` (`CLAUDE.md` rule 1): the field was
+    /// already being mutated before this change, and a test reading it would
+    /// pass just as happily if the width never reached the `AppShell` that
+    /// carves `main_content_bounds`.
+    ///
+    /// **Verified RED against unfixed `develop`:** deleting the
+    /// `KeyCode::Right` arm from the old Alt block (equivalently, returning
+    /// `AltKeyOutcome::Fallthrough` instead of `ResizeSidebar(1)`) leaves the
+    /// marker in the same column and the `+ 1` assertion fires.
+    #[test]
+    fn alt_right_widens_the_painted_sidebar_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        app.engine.buffer_mut().insert(0, "ZQXW759W");
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 120, 24);
+
+        let before = driver
+            .find_bounds("ZQXW759W")
+            .expect("the editor marker must paint before the resize");
+        alt_press(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::Right),
+            false,
+        );
+        let after = driver
+            .find_bounds("ZQXW759W")
+            .expect("the editor marker must still paint after the resize");
+
+        assert_eq!(
+            after.x,
+            before.x + 1.0,
+            "Alt+Right must widen the painted sidebar by one column, pushing \
+             the editor one column right; screen:\n{}",
+            driver.screen()
+        );
+
+        alt_press(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::Left),
+            false,
+        );
+        let back = driver
+            .find_bounds("ZQXW759W")
+            .expect("the editor marker must still paint after Alt+Left");
+        assert_eq!(
+            back.x,
+            before.x,
+            "Alt+Left must narrow it straight back; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #759: Alt+Z is a VS Code editor command (toggle word wrap) in VSCode
+    /// mode and a pass-through in Vim mode — the vscode-mode divergence this
+    /// slice converges, now stated once in `render::route_alt_key`.
+    ///
+    /// Asserts on the painted command line, which is where `engine.message`
+    /// renders on both backends — the one observable the GTK harness can also
+    /// reach for editor-level state (it records no painted text for editor
+    /// glyphs), so the two backends' tests assert the same string.
+    ///
+    /// **Verified RED against unfixed `develop`:** dropping `Alt_z` from the
+    /// resolver's VSCode arm (equivalently, the `KeyCode::Char('z')` arm of
+    /// the old TUI block) leaves the command line blank and the first
+    /// assertion fires.
+    #[test]
+    fn alt_z_toggles_word_wrap_only_in_vscode_mode_via_shell_app() {
+        for (vscode, expect_message) in [(true, true), (false, false)] {
+            let mut app = TuiShellApp::new(None);
+            app.engine.settings.wrap = false;
+            app.engine.settings.editor_mode = if vscode {
+                crate::core::settings::EditorMode::Vscode
+            } else {
+                crate::core::settings::EditorMode::Vim
+            };
+            app.engine.mode = if vscode {
+                crate::core::Mode::Insert
+            } else {
+                crate::core::Mode::Normal
+            };
+            let mut driver = driver_with_shell(app, TuiShellApp::shell_config(vscode), 100, 24);
+
+            alt_press(&mut driver, quadraui::Key::Char('z'), false);
+
+            let screen = driver.screen();
+            assert_eq!(
+                screen.contains("Word wrap on"),
+                expect_message,
+                "Alt+Z must toggle word wrap in VSCode mode and do nothing in \
+                 Vim mode (vscode = {vscode}); screen:\n{screen}"
+            );
+        }
     }
 }
