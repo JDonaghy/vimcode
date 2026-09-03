@@ -940,8 +940,14 @@ pub(super) fn render_window(
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     let result = backend.draw_editor(editor_q_rect, &editor);
 
-    if let (Some(frame), Some(pos)) = (frame, result.cursor_position) {
-        frame.set_cursor_position(pos);
+    // quadraui#504: `cursor_position` (`(u16, u16)`) is deprecated in favor
+    // of `cursor_position_native` (`Point`, native units — whole cells,
+    // already rounded, for TUI). `Frame::set_cursor_position` only accepts
+    // `(u16, u16)` (`impl From<(u16, u16)> for Position`, no `From<Point>`
+    // quadraui could add without violating the orphan rule), so this is the
+    // vimcode-side migration the quadraui deprecation note asks for.
+    if let (Some(frame), Some(pos)) = (frame, result.cursor_position_native) {
+        frame.set_cursor_position((pos.x as u16, pos.y as u16));
     }
 
     if let (Some(status), Some(sy)) = (&window.status_line, status_bar_row) {
