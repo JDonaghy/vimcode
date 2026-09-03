@@ -3540,6 +3540,152 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
     true
 }
 
+// ─── Panel-accelerator dispatch rung (#761 / #734 slice 6) ──────────────────
+//
+// Both backends register the same 14-entry `panel_keys` accelerator set
+// (`register_panel_accelerators` in `gtk/mod.rs` / `tui_main/mod.rs`) and,
+// until now, each restated its own ~100-line `match id { ... }` translating
+// a fired accelerator into the engine call it makes. `PanelAccelerator`
+// states the 14-entry id table once; [`dispatch_panel_accelerator`] states
+// the nine actions that are pure `Engine` mutations once too.
+//
+// The other five (`ToggleSidebar`, `FocusExplorer`, `FocusSearch`,
+// `OpenTerminal`, `TerminalToggleMax`) go through [`PanelAcceleratorHost`]
+// instead of being inlined here, because their effect genuinely depends on
+// state this module has no business owning:
+//
+// - GTK's `UiEvent::Accelerator` arm has no engine-mutation seam of its own
+//   for these — `toggle_sidebar_panel`/`toggle_focus_explorer`/
+//   `toggle_focus_search`/`toggle_terminal`/`toggle_terminal_maximize` are
+//   `&mut App` methods that also re-sync GTK widgets (file-tree population,
+//   focus-chain), so GTK queues a `DeferredAction` and lets `tick()` (which
+//   *does* have `&mut App`) run the real method next frame — the same
+//   `DeferredQueue` seam every other App-only GTK callback uses (see its
+//   doc comment in `gtk/mod.rs`).
+// - TUI has no such seam (its `handle()` already owns `&mut self` end to
+//   end) but instead carries a second piece of state GTK doesn't have at
+//   all: `TuiSidebar::has_focus`, the single input-focus token a terminal
+//   has to track by hand where GTK gets real widget focus for free from the
+//   toolkit. `focus_explorer`/`focus_search`'s toggle condition reads it
+//   *together with* `engine.explorer_has_focus`/`search_has_focus`, so the
+//   two backends' conditions are not the same expression over the same
+//   state — collapsing them into one body would be papering over a real
+//   platform difference, not deleting duplication.
+//
+// A `host: &mut impl PanelAcceleratorHost` argument is the shared function's
+// seam for that residue — each backend supplies a thumbnail struct (`GtkAccelHost`
+// / `TuiAccelHost`, defined next to their call sites) implementing the five
+// hook methods, so the dispatcher itself never needs to know which backend is
+// calling it.
+
+/// The 14 panel-key accelerator actions, shared by both backends' registries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelAccelerator {
+    ToggleSidebar,
+    FocusExplorer,
+    FocusSearch,
+    FuzzyFinder,
+    LiveGrep,
+    CommandPalette,
+    OpenTerminal,
+    TerminalToggleMax,
+    AddCursor,
+    SelectAllMatches,
+    SplitEditorRight,
+    SplitEditorDown,
+    NavBack,
+    NavForward,
+}
+
+pub const ACC_TOGGLE_SIDEBAR: &str = "panel.toggle_sidebar";
+pub const ACC_FOCUS_EXPLORER: &str = "panel.focus_explorer";
+pub const ACC_FOCUS_SEARCH: &str = "panel.focus_search";
+pub const ACC_FUZZY_FINDER: &str = "panel.fuzzy_finder";
+pub const ACC_LIVE_GREP: &str = "panel.live_grep";
+pub const ACC_COMMAND_PALETTE: &str = "panel.command_palette";
+pub const ACC_OPEN_TERMINAL: &str = "panel.open_terminal";
+/// Also matched by name in `Engine::handle_ui_event` — keep this string
+/// literal in sync with that one if it ever changes.
+pub const ACC_TERMINAL_TOGGLE_MAX: &str = "terminal.toggle_maximize";
+pub const ACC_ADD_CURSOR: &str = "panel.add_cursor";
+pub const ACC_SELECT_ALL_MATCHES: &str = "panel.select_all_matches";
+pub const ACC_SPLIT_EDITOR_RIGHT: &str = "panel.split_editor_right";
+pub const ACC_SPLIT_EDITOR_DOWN: &str = "panel.split_editor_down";
+pub const ACC_NAV_BACK: &str = "panel.nav_back";
+pub const ACC_NAV_FORWARD: &str = "panel.nav_forward";
+
+impl PanelAccelerator {
+    /// Resolve a registered accelerator id to the action it represents.
+    /// Single source of truth for the id table both `register_panel_accelerators`
+    /// (gtk/mod.rs, tui_main/mod.rs) and [`dispatch_panel_accelerator`] key off.
+    pub fn from_id(id: &str) -> Option<Self> {
+        Some(match id {
+            ACC_TOGGLE_SIDEBAR => Self::ToggleSidebar,
+            ACC_FOCUS_EXPLORER => Self::FocusExplorer,
+            ACC_FOCUS_SEARCH => Self::FocusSearch,
+            ACC_FUZZY_FINDER => Self::FuzzyFinder,
+            ACC_LIVE_GREP => Self::LiveGrep,
+            ACC_COMMAND_PALETTE => Self::CommandPalette,
+            ACC_OPEN_TERMINAL => Self::OpenTerminal,
+            ACC_TERMINAL_TOGGLE_MAX => Self::TerminalToggleMax,
+            ACC_ADD_CURSOR => Self::AddCursor,
+            ACC_SELECT_ALL_MATCHES => Self::SelectAllMatches,
+            ACC_SPLIT_EDITOR_RIGHT => Self::SplitEditorRight,
+            ACC_SPLIT_EDITOR_DOWN => Self::SplitEditorDown,
+            ACC_NAV_BACK => Self::NavBack,
+            ACC_NAV_FORWARD => Self::NavForward,
+            _ => return None,
+        })
+    }
+}
+
+/// Backend hook for the five panel-accelerator actions whose effect needs
+/// state `Engine` doesn't own — see the rung's header comment above for why
+/// GTK and TUI each need their own five-method impl rather than one shared
+/// body.
+pub trait PanelAcceleratorHost {
+    fn toggle_sidebar(&mut self, engine: &mut Engine);
+    fn focus_explorer(&mut self, engine: &mut Engine);
+    fn focus_search(&mut self, engine: &mut Engine);
+    fn open_terminal(&mut self, engine: &mut Engine);
+    fn terminal_toggle_max(&mut self, engine: &mut Engine);
+}
+
+/// Resolve `id` and apply the corresponding panel-accelerator action.
+/// Returns the resolved [`PanelAccelerator`] (so callers can layer their own
+/// residual bookkeeping — e.g. GTK's per-action `DeferredAction::Resize`) or
+/// `None` if `id` isn't a registered panel accelerator.
+pub fn dispatch_panel_accelerator(
+    id: &str,
+    engine: &mut Engine,
+    host: &mut impl PanelAcceleratorHost,
+) -> Option<PanelAccelerator> {
+    let action = PanelAccelerator::from_id(id)?;
+    match action {
+        PanelAccelerator::ToggleSidebar => host.toggle_sidebar(engine),
+        PanelAccelerator::FocusExplorer => host.focus_explorer(engine),
+        PanelAccelerator::FocusSearch => host.focus_search(engine),
+        PanelAccelerator::OpenTerminal => host.open_terminal(engine),
+        PanelAccelerator::TerminalToggleMax => host.terminal_toggle_max(engine),
+        PanelAccelerator::FuzzyFinder => {
+            engine.open_picker(crate::core::engine::PickerSource::Files)
+        }
+        PanelAccelerator::LiveGrep => engine.open_picker(crate::core::engine::PickerSource::Grep),
+        PanelAccelerator::CommandPalette => {
+            engine.open_picker(crate::core::engine::PickerSource::Commands)
+        }
+        PanelAccelerator::AddCursor => {
+            engine.add_cursor_at_next_match();
+        }
+        PanelAccelerator::SelectAllMatches => engine.select_all_occurrences(),
+        PanelAccelerator::SplitEditorRight => engine.open_editor_group(SplitDirection::Vertical),
+        PanelAccelerator::SplitEditorDown => engine.open_editor_group(SplitDirection::Horizontal),
+        PanelAccelerator::NavBack => engine.tab_nav_back(),
+        PanelAccelerator::NavForward => engine.tab_nav_forward(),
+    }
+    Some(action)
+}
+
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
 //
 // The rung directly beneath [`route_modal_overlay_click`]: once no modal
