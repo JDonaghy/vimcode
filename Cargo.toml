@@ -87,7 +87,7 @@ gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "7f00f7319292d2777544f513f24c2a4860e3df52", features = ["tui", "terminal"] }
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "42e0f8fa55bd2f9f94bb77f612d70355a88c9356", features = ["tui", "terminal"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 pangocairo = { version = "0.18", optional = true }
 ropey = "1.6.1"
@@ -149,7 +149,7 @@ cc = "1.0"
 # do not remove this without reading both first. #691: same rev as the
 # `quadraui` dep above, resolved via git instead of a sibling path.
 [patch.crates-io]
-vt100 = { git = "https://github.com/JDonaghy/quadraui.git", rev = "7f00f7319292d2777544f513f24c2a4860e3df52" }
+vt100 = { git = "https://github.com/JDonaghy/quadraui.git", rev = "42e0f8fa55bd2f9f94bb77f612d70355a88c9356" }
 
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible
