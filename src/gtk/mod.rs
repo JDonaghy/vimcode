@@ -6155,8 +6155,9 @@ impl quadraui::ShellApp for App {
                                 })
                                 .collect();
                         }
+
+                        composed_chrome.push(render::FrameOp::SidebarPanel);
                     }
-                    composed_chrome.push(render::FrameOp::SidebarPanel);
                 }
 
                 // ── Wildmenu bar (command Tab completion) ────────────────────
@@ -6172,7 +6173,7 @@ impl quadraui::ShellApp for App {
                         };
                         let wm_rect =
                             quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);
-                        backend.draw_status_bar(wm_rect, &wm_bar, None, None);
+                        let _ = backend.draw_status_bar(wm_rect, &wm_bar, None, None);
                         composed_chrome.push(render::FrameOp::Wildmenu);
                     }
                 }
@@ -6194,7 +6195,7 @@ impl quadraui::ShellApp for App {
                             render::status_bar_zones_from_layout(
                                 &backend.status_bar_layout(sb_rect, bar),
                             );
-                        backend.draw_status_bar(sb_rect, bar, None, None);
+                        let _ = backend.draw_status_bar(sb_rect, bar, None, None);
                         composed_chrome.push(render::FrameOp::StatusBar);
                     }
                 }

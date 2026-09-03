@@ -6133,9 +6133,22 @@ mod chrome_band_order {
             h.driver.screen_contains("ZQXWwildA"),
             "Wildmenu was composed but no wildmenu entry painted"
         );
+        // Not `screen_contains("SETTINGS")`: that literal heading is TUI-only
+        // chrome (`panels.rs::render_settings_panel` paints a hardcoded
+        // `" SETTINGS"` header via `draw_settings_chrome`). GTK's `PANEL_SETTINGS`
+        // arm renders straight into the AppShell-provided content rect with no
+        // second header of its own — the sidebar header text above it is
+        // AppShell chrome, painted by the runner *before* `render_content` (and
+        // for this "bottom:" utility panel it does not track the active body,
+        // which is a pre-existing, separate divergence this PR does not touch).
+        // "Appearance" is the first `setting_categories()` entry — the same
+        // platform-neutral category list both backends' settings forms render
+        // through (`render::settings_to_form`) — so its presence proves the
+        // settings *form* itself reached the Cairo surface.
         assert!(
-            h.painted_sidebar_bounds.get().is_some(),
-            "SidebarPanel was composed but no sidebar rect was painted into"
+            h.driver.screen_contains("Appearance"),
+            "SidebarPanel was composed but the settings form never painted; painted: {:?}",
+            h.driver.painted_texts()
         );
     }
 
