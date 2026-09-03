@@ -1,7 +1,12 @@
 use super::*;
+use crate::core::engine::EngineAction;
 use crate::core::window::GroupId;
 use crate::core::WindowId;
+#[cfg(test)]
+use crate::render::Theme;
 use crate::render::{self as render_mod, GutterAction, ScreenZone, WindowZone};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Re-export the shared ClickTarget enum.
 pub(crate) use render_mod::ClickTarget;

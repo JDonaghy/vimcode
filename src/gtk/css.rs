@@ -1,4 +1,4 @@
-use super::*;
+use crate::render::Theme;
 
 /// Generate the full CSS string with colors taken from the active theme.
 pub(crate) fn make_theme_css(theme: &Theme) -> String {
