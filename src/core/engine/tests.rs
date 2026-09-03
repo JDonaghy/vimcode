@@ -13807,8 +13807,47 @@ fn test_dap_var_ref_at_flat_index_with_scope_groups() {
 
 // ── Workspace / open-folder tests ─────────────────────────────────────────
 
+/// Restores the **process** working directory on drop.
+///
+/// `Engine::open_folder` / `open_workspace` deliberately call
+/// `std::env::set_current_dir` (see `buffers.rs`) — that is production
+/// behaviour, not a bug. But the process CWD is one of the few pieces of
+/// genuinely global state a `#[cfg(test)]` run has, and `cargo test` runs
+/// every test in the same process: leaving it pointing at
+/// `$TMPDIR/vimcode_test_*` leaks into every test that starts afterwards, on
+/// any thread.
+///
+/// That is not hypothetical (#785). The GTK harness paints a real file
+/// explorer whose root row is the process CWD, so with the directory leaked
+/// the sidebar renders `VIMCODE_TEST_OPEN_FOLDER` and an empty tree instead
+/// of the repo's name and file list. `vscode_dimming`'s breadcrumb probe
+/// reads pixels out of the frame next to it, and the change of chrome
+/// content moved what landed under its probe — a failure that reproduced
+/// only when the scheduler happened to run the two in the wrong order, i.e.
+/// as an intermittent, load-dependent red on an unrelated PR.
+///
+/// Restoring on `Drop` rather than at the end of the test body means a
+/// panicking assertion can't skip the cleanup and turn one red test into
+/// many.
+struct CwdGuard(Option<std::path::PathBuf>);
+
+impl CwdGuard {
+    fn new() -> Self {
+        Self(std::env::current_dir().ok())
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = std::env::set_current_dir(dir);
+        }
+    }
+}
+
 #[test]
 fn test_open_folder_resets_cwd() {
+    let _cwd = CwdGuard::new();
     let dir = std::env::temp_dir().join("vimcode_test_open_folder");
     std::fs::create_dir_all(&dir).unwrap();
 
@@ -13829,6 +13868,7 @@ fn test_open_folder_resets_cwd() {
 
 #[test]
 fn test_open_workspace_parses_json() {
+    let _cwd = CwdGuard::new();
     let dir = std::env::temp_dir().join("vimcode_test_workspace_json");
     std::fs::create_dir_all(&dir).unwrap();
     let ws_path = dir.join(".vimcode-workspace");
@@ -13848,6 +13888,44 @@ fn test_open_workspace_parses_json() {
     assert_eq!(engine.settings.tabstop, 4);
     // expandtab = true
     assert!(engine.settings.expand_tab);
+}
+
+/// The process CWD must be back where it started once
+/// `test_open_folder_resets_cwd` has run — the regression guard for the
+/// leak [`CwdGuard`] exists to stop (#785).
+///
+/// This asserts on the *guard*, not on test ordering (which `libtest` gives
+/// no control over): it drives the same `open_folder` call in a scope and
+/// checks the directory is restored when that scope ends. Delete the
+/// `let _cwd = CwdGuard::new();` line from either workspace test above and
+/// the equivalent leak comes back; delete it here and this test fails
+/// directly.
+#[test]
+fn open_folder_does_not_leak_the_process_cwd() {
+    let before = std::env::current_dir().expect("test process must have a cwd");
+    let dir = std::env::temp_dir().join("vimcode_test_cwd_guard");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    {
+        let _cwd = CwdGuard::new();
+        let mut engine = Engine::new();
+        engine.open_folder(&dir);
+        assert_eq!(
+            std::env::current_dir().ok().as_deref(),
+            Some(engine.cwd.as_path()),
+            "sanity: open_folder is expected to chdir the process — if it \
+             stopped doing that, CwdGuard is guarding nothing and this test \
+             is no longer meaningful"
+        );
+    }
+
+    assert_eq!(
+        std::env::current_dir().ok(),
+        Some(before),
+        "dropping CwdGuard must put the process working directory back; a \
+         leak here reaches every later test in the run, including the GTK \
+         harness's file-explorer paint (#785)"
+    );
 }
 
 // =========================================================================
