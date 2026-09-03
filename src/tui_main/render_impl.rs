@@ -501,35 +501,28 @@ pub(super) fn draw_frame(
         }
     }
 
-    // ── Render editor ─────────────────────────────────────────────────────────
-    // ONE code path for every editor-group count (#551). This used to be an
-    // `if let Some(split) = screen.editor_group_split { .. } else { .. }` with
-    // a hand-written "exactly one group" arm beside the generic N-group one —
-    // not a different feature, just a second implementation of the same thing,
-    // which is precisely how #547's single-group breadcrumb y-offset drifted
-    // out of sync with the generic calculation. A single group is now a split
-    // of one: `screen.group_tab_bars` holds its tab bar and
-    // `screen.group_dividers` is empty, so the generic loops below cover both.
+    // ══ Editor band (#764, #735 slice 3) ═════════════════════════════════════
     //
-    // Skip-condition + rect math (including the zero-width fallback filter
-    // and the reserved-height subtraction that recovers the tab row's own
-    // top edge from `GroupTabBar::bounds.y`) come from
-    // `render::tab_bar_draw_targets`, shared with GTK, so the two backends
-    // can't drift apart (#549, follow-up to #547's `breadcrumb_draw_targets`).
-    // The draw call + `tab_visible_counts_out` bookkeeping stay here.
+    // ONE code path for every editor-group count (#551), and — since #764 —
+    // one *ordered* code path shared with GTK: `render::compose_editor_band`
+    // is the single artefact both this rasteriser and both production
+    // `render_content`s walk. Keeping this test-only rasteriser on the same
+    // walk is the point: it is the thing whose banner-comment-per-rung ladder
+    // was the second transcription #764 exists to delete, and a `match` on
+    // `EditorOp` makes a future rung a compile error here too.
     //
-    // Draw order is the old split arm's: windows first, then tab bars on top,
-    // which prevents window content from overwriting an adjacent group's tab
-    // bar in horizontal splits. The single-group arm used to draw its tab bar
+    // Window/tab ordering, for the record it used to carry inline: windows
+    // first, then tab bars on top, which prevents window content from
+    // overwriting an adjacent group's tab bar in horizontal splits — see
+    // `EditorOp::Windows`. The pre-#551 single-group arm drew its tab bar
     // *before* the windows; that ordering was interchangeable because the tab
     // row and the window rects never overlap (the row is reserved out of the
-    // group's content bounds), so unifying on windows-first is a no-op there.
+    // group's content bounds).
     let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
         2.0
     } else {
         1.0
     };
-    let tab_bar_targets = render::tab_bar_draw_targets(engine, screen, 1.0, tui_tbh);
     debug_log!(
         "draw_frame: editor_area=({},{},{}x{}) groups={}",
         editor_area.x,
@@ -550,62 +543,94 @@ pub(super) fn draw_frame(
             gtb.tabs.len()
         );
     }
-    render_all_windows(backend, Some(frame), &screen.windows, theme);
-    // #35/#722: minimap strips on every window's right edge (one entry per
-    // `WindowId` in `screen.minimap`, not just the active window's) — one
-    // call, the braille rasteriser is quadraui's.
-    render::draw_minimap_strip(backend, screen);
-    // Draw each group's tab bar. The tab bar sits `tui_tbh` rows above the
-    // group's window content (`bounds.y - tui_tbh`, applied inside
-    // `tab_bar_draw_targets`); with one group that resolves to row 0 of
-    // `editor_area`, exactly what the deleted single-group arm hard-coded.
-    for target in &tab_bar_targets {
-        let g_tab = Rect {
-            x: target.rect.x as u16,
-            y: target.rect.y as u16,
-            width: target.rect.width as u16,
-            height: 1,
-        };
-        let vis = render_tab_bar(backend, g_tab, target.bar, target.icons, theme);
-        tab_visible_counts_out.push((target.group_id, vis));
+    for op in render::compose_editor_band(
+        engine,
+        screen,
+        tab_drag_source.is_some(),
+        engine.terminal_maximized,
+    ) {
+        match op {
+            render::EditorOp::Windows => {
+                render_all_windows(backend, Some(frame), &screen.windows, theme)
+            }
+            // #35/#722: minimap strips on every window's right edge (one entry
+            // per `WindowId` in `screen.minimap`, not just the active
+            // window's) — one call, the braille rasteriser is quadraui's.
+            render::EditorOp::Minimap => {
+                render::draw_minimap_strip(backend, screen);
+            }
+            // Each group's tab bar sits `tui_tbh` rows above the group's
+            // window content (`bounds.y - tui_tbh`, applied inside
+            // `tab_bar_draw_targets`); with one group that resolves to row 0
+            // of `editor_area`, exactly what the deleted single-group arm
+            // hard-coded.
+            render::EditorOp::TabBars => {
+                backend.set_theme(super::quadraui_tui::q_theme(theme));
+                for bar in render::paint_tab_bars(backend, engine, screen, 1.0, tui_tbh, None) {
+                    tab_visible_counts_out.push((bar.group_id, bar.hits.available_cols));
+                }
+            }
+            // Breadcrumb bars, below each group's tab bar. Hidden while the
+            // terminal panel is maximized so it can claim the row.
+            // `bc.bounds.y` already accounts for a hidden tab bar —
+            // `calculate_group_window_rects` →
+            // `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
+            // therefore the derived breadcrumb bounds) up by one row in that
+            // case.
+            render::EditorOp::Breadcrumbs => {
+                backend.set_theme(super::quadraui_tui::q_theme(theme));
+                render::paint_breadcrumb_bars(backend, screen, engine.terminal_maximized);
+            }
+            // Divider lines between editor groups. `div.position`/
+            // `.cross_start` are already absolute terminal-screen coordinates
+            // (#550), matching `editor_area`'s own coordinate space — no
+            // offset addition needed. #609: routed through
+            // `Backend::draw_status_bar` (via `render_group_dividers`/
+            // `group_divider_cells`) instead of a raw `Buffer` write, so
+            // `TuiShellApp::render_content` — which has no `Buffer`/`Frame` to
+            // write into — paints the exact same dividers; see
+            // `group_divider_cells`'s doc comment for how the old
+            // `frame.buffer_mut()[(div_x - 1, y)]` read-back (the #481
+            // phantom-divider-beside-scrollbar guard) became a pure data
+            // computation both call sites now share.
+            render::EditorOp::GroupDividers => render_group_dividers(
+                backend,
+                &screen.group_dividers,
+                &screen.windows,
+                editor_area,
+                theme,
+            ),
+            render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
+                backend,
+                engine,
+                screen,
+                theme,
+                tab_drag_source,
+                tab_drag_cursor,
+                tab_drop_zone,
+            ),
+            // Rendered on top of the editor, just below the tab bar row.
+            // Unlike `TuiShellApp::render_content`'s `area`
+            // (`main_content_bounds`, already offset below whatever
+            // `AppShell::render` painted above it), `editor_area` here is this
+            // rasteriser's own top-level split with an implicitly 0-based `y`,
+            // so the menu row still has to be added back by hand (#635 item
+            // A).
+            render::EditorOp::TabTooltip => {
+                if let Some(ref tooltip_text) = screen.tab_tooltip {
+                    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+                    render_tab_hover_tooltip(
+                        backend,
+                        editor_area.x,
+                        menu_rows + 1, // just below the tab bar row
+                        editor_area.width,
+                        tooltip_text,
+                        theme,
+                    );
+                }
+            }
+        }
     }
-    // Draw breadcrumb bars (below each group's tab bar). Hidden while the
-    // terminal panel is maximized so it can claim the row. Skip conditions +
-    // rect math (including the zero-width fallback filter) come from
-    // `render::breadcrumb_draw_targets`, shared with GTK, so the two backends
-    // can't drift apart (#547). `bc.bounds.y` already accounts for a hidden
-    // tab bar — `calculate_group_window_rects` →
-    // `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
-    // therefore the derived breadcrumb bounds) up by one row in that case.
-    for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized) {
-        let bc_rect = Rect {
-            x: t.rect.x as u16,
-            y: t.rect.y as u16,
-            width: t.rect.width as u16,
-            height: 1,
-        };
-        let layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, theme);
-        *t.draw_layout.borrow_mut() = Some(layout);
-    }
-    // Draw divider lines between editor groups — empty, hence a no-op, when
-    // there is only one group (#551). `div.position`/`.cross_start` are
-    // already absolute terminal-screen coordinates (#550), matching
-    // `editor_area`'s own coordinate space — no offset addition needed. #609:
-    // routed through `Backend::draw_status_bar` (via
-    // `render_group_dividers`/`group_divider_cells`) instead of a raw `Buffer`
-    // write, so `TuiShellApp::render_content` — which has no `Buffer`/`Frame`
-    // to write into — can paint the exact same dividers; see
-    // `group_divider_cells`'s doc comment for how the old
-    // `frame.buffer_mut()[(div_x - 1, y)]` read-back (the #481
-    // phantom-divider-beside-scrollbar guard) became a pure data computation
-    // both call sites now share.
-    render_group_dividers(
-        backend,
-        &screen.group_dividers,
-        &screen.windows,
-        editor_area,
-        theme,
-    );
 
     // Register the editor viewport as a scroll surface so dispatch_scroll
     // routes scroll wheel events to it (per-window routing done in handler).
@@ -622,32 +647,6 @@ pub(super) fn draw_frame(
             ),
             scrollbar: None,
         });
-
-    // ── Tab drag overlay ────────────────────────────────────────────────────
-    if tab_drag_source.is_some() {
-        render_tab_drag_overlay(
-            backend,
-            engine,
-            screen,
-            theme,
-            tab_drag_source,
-            tab_drag_cursor,
-            tab_drop_zone,
-        );
-    }
-
-    // ── Tab hover tooltip (rendered on top of editor, below tab bar) ──────
-    if let Some(ref tooltip_text) = screen.tab_tooltip {
-        let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-        render_tab_hover_tooltip(
-            backend,
-            editor_area.x,
-            menu_rows + 1, // just below the tab bar row
-            editor_area.width,
-            tooltip_text,
-            theme,
-        );
-    }
 
     // ── Editor popups: completion / hover / editor-hover / diff-peek /
     // signature-help — extracted to `paint_editor_popups` (#601) so
@@ -1555,61 +1554,13 @@ pub(super) fn compute_tui_tab_drop_zone(
     render::compute_tab_drop_zone(col as f32, row as f32, &groups, tbh)
 }
 
-/// Render the tab bar via `Backend::draw_tab_bar`. Returns the
-/// **tab-bar content width in cells** — what the engine stores via
-/// `set_tab_visible_count` (misnamed; it's the bar width used by
-/// `ensure_active_tab_visible` to derive scroll offsets).
-///
-/// The pre-built `quadraui::TabBar` primitive comes from `ScreenLayout`
-/// (built by `render::build_screen_layout`).
-/// `backend` is `&mut dyn quadraui::Backend` (not the concrete `TuiBackend`)
-/// so this is callable from `TuiShellApp::render_content` (#601), which only
-/// ever gets a trait object — never a raw `ratatui::Frame`. Existing callers
-/// passing a concrete `&mut TuiBackend` still work unchanged via Rust's
-/// implicit unsized coercion at the call site.
-pub(super) fn render_tab_bar(
-    backend: &mut dyn quadraui::Backend,
-    area: Rect,
-    bar: &quadraui::TabBar,
-    icons: &[Option<quadraui::TabIcon>],
-    theme: &Theme,
-) -> usize {
-    let q_rect = quadraui::Rect::new(
-        area.x as f32,
-        area.y as f32,
-        area.width as f32,
-        area.height as f32,
-    );
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    // #703: `draw_tab_bar_icons` with an empty sidecar is byte-identical to
-    // `draw_tab_bar` (quadraui's `draw_tab_bar` literally forwards to it with
-    // `&[]`), so the Nerd-Fonts-off path keeps today's geometry exactly.
-    let hits = backend.draw_tab_bar_icons(q_rect, bar, icons, None);
-    hits.available_cols
-}
-
-/// Draw the breadcrumb bar via the D6 StatusBar pipeline.
-///
-/// The pre-built `quadraui::StatusBar` primitive comes from
-/// `ScreenLayout` (built by `render::build_screen_layout`).
-/// Returns the `StatusBarLayout` for click-time hit testing.
-/// See `render_tab_bar`'s doc comment for why `backend` is the trait object
-/// rather than the concrete `TuiBackend` (#601).
-pub(super) fn draw_breadcrumb_bar(
-    backend: &mut dyn quadraui::Backend,
-    area: Rect,
-    bar: &quadraui::StatusBar,
-    theme: &Theme,
-) -> quadraui::StatusBarLayout {
-    let q_rect = quadraui::Rect::new(
-        area.x as f32,
-        area.y as f32,
-        area.width as f32,
-        area.height as f32,
-    );
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_status_bar(q_rect, bar, None, None)
-}
+// `render_tab_bar` and `draw_breadcrumb_bar` used to sit here — two
+// `Rect`-taking wrappers whose whole body was "convert to `quadraui::Rect`,
+// set the theme, forward to one `Backend::draw_*` call". #764 folded both into
+// the shared `EditorOp::TabBars` / `EditorOp::Breadcrumbs` rungs
+// (`render::paint_tab_bars` / `render::paint_breadcrumb_bars`), which GTK now
+// calls too, so the per-target loop around them exists once instead of three
+// times (here, `TuiShellApp::render_content`, and `gtk::App::render_content`).
 
 // ─── Editor windows ───────────────────────────────────────────────────────────
 
@@ -2504,8 +2455,13 @@ mod tests {
             height: 24,
         };
         let screen = build_screen_for_tui(&e, &theme, area, &sidebar, 0);
+        // #764: reads the per-group offset the paint actually uses
+        // (`GroupTabBar::tab_scroll_offset`), not the deleted single-group
+        // `ScreenLayout::tab_scroll_offset` mirror — which was this field's
+        // last reader anywhere, and the reason slice 1 could only mark it
+        // "superseded" rather than delete it.
         assert!(
-            screen.tab_scroll_offset > 0,
+            screen.group_tab_bars[0].tab_scroll_offset > 0,
             "test needs a scrolled tab bar to exercise the stale +2 offset"
         );
 

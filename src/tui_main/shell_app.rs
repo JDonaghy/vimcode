@@ -453,6 +453,13 @@ pub struct TuiShellApp {
     /// role — it is what makes "both backends compose the chrome band in the
     /// same order" assertable rather than promised in comments.
     composed_chrome_band: std::rc::Rc<RefCell<Vec<render::FrameOp>>>,
+    /// The editor-band twin of [`Self::composed_chrome_band`] (#764): written
+    /// by the [`render::compose_editor_band`] walk, one [`render::EditorOp`]
+    /// pushed by every arm that actually composed its rung. Same `Rc`
+    /// rationale, same role — it is what makes "both backends compose the
+    /// editor column in the same order" assertable rather than promised in
+    /// comments, which is how GTK came to omit the group dividers entirely.
+    composed_editor_band: std::rc::Rc<RefCell<Vec<render::EditorOp>>>,
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
@@ -518,6 +525,154 @@ pub struct TuiShellApp {
 }
 
 impl TuiShellApp {
+    /// Compose the **editor band** (#764, #735 slice 3) into `backend`.
+    ///
+    /// Walks `render::compose_editor_band` — the single ordered artefact both
+    /// backends walk for the editor column, exactly as `CHROME_Z_ORDER` is for
+    /// the surrounding chrome and `OVERLAY_Z_ORDER` for the app-level
+    /// overlays. Geometry stays here, in cells; the *order* and the *gates*
+    /// live in `render.rs`. `EDITOR_Z_ORDER`'s doc comment records the two
+    /// defects this convergence closed (GTK never painted the group dividers
+    /// at all, and painted its tab-drag ghost above the editor popups).
+    ///
+    /// `area` is `layout.main_content_bounds` in cells. Extracted from
+    /// `render_content` so the entry point *sequences* bands rather than
+    /// inlining each one — the GTK twin splits its own heavier rungs the same
+    /// way (`paint_editor_windows_rung` / `paint_tab_bars_rung`).
+    fn paint_editor_band(
+        &self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &render::ScreenLayout,
+        area: Rect,
+        theme: &Theme,
+    ) {
+        // ══ Editor band (#764, #735 slice 3) ═════════════════════════════
+        //
+        // Composed from `render::compose_editor_band` — the single ordered
+        // artefact both backends walk for the editor column, exactly as
+        // `CHROME_Z_ORDER` (below) is for the surrounding chrome and
+        // `OVERLAY_Z_ORDER` (below that) for the app-level overlays. Geometry
+        // stays here, in cells; only the *order* and the *gates* moved.
+        // `EDITOR_Z_ORDER`'s doc comment records the two defects this closes
+        // (GTK never painted the group dividers at all, and painted its
+        // tab-drag ghost above the editor popups).
+        //
+        // Reset per-frame: `post_draw_apply_widths` wants this frame's
+        // measurements, not an ever-growing accumulation.
+        self.tab_visible_counts.borrow_mut().clear();
+        let tui_tbh: f64 = if self.engine.settings.breadcrumbs && !self.engine.terminal_maximized {
+            2.0
+        } else {
+            1.0
+        };
+        let mut composed_editor: Vec<render::EditorOp> = Vec::new();
+        for op in render::compose_editor_band(
+            &self.engine,
+            screen,
+            // `is_dragging()`, not the `source().is_some()` this call site used
+            // to test: they agree (`begin` sets both, `handle_release` clears
+            // both), but `is_dragging` is the gate that method's own doc names
+            // as "the gate both backends' drop overlays paint behind", and it
+            // is the one GTK already used.
+            self.tab_drag.is_dragging(),
+            self.engine.terminal_maximized,
+        ) {
+            match op {
+                // `render_all_windows` also paints the within-group
+                // (`:split`/`:vsplit`) divider lines unconditionally now
+                // (#609 routed `render_separators` through
+                // `Backend::draw_status_bar` — see its doc comment — so it no
+                // longer needs the raw `Frame` that `frame: None` used to
+                // skip it for).
+                render::EditorOp::Windows => {
+                    render_all_windows(backend, None, &screen.windows, theme)
+                }
+                // #35/#722: minimap strips on every window's right edge (one
+                // entry per `WindowId` in `screen.minimap`, not just the
+                // active window's) — one call, the braille rasteriser is
+                // quadraui's.
+                render::EditorOp::Minimap => {
+                    render::draw_minimap_strip(backend, screen);
+                }
+                render::EditorOp::TabBars => {
+                    backend.set_theme(super::quadraui_tui::q_theme(theme));
+                    let painted =
+                        render::paint_tab_bars(backend, &self.engine, screen, 1.0, tui_tbh, None);
+                    let mut counts = self.tab_visible_counts.borrow_mut();
+                    for bar in &painted {
+                        counts.push((bar.group_id, bar.hits.available_cols));
+                    }
+                }
+                render::EditorOp::Breadcrumbs => {
+                    backend.set_theme(super::quadraui_tui::q_theme(theme));
+                    render::paint_breadcrumb_bars(backend, screen, self.engine.terminal_maximized);
+                }
+                // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed
+                // to the `Windows` rung's within-group `render_separators`)
+                // — ported to `Backend::draw_status_bar` via
+                // `render_group_dividers` (see its doc comment, and
+                // `group_divider_cells`'s for how the #481
+                // phantom-divider-beside-scrollbar guard became a pure data
+                // computation instead of a `Buffer` read-back). GTK
+                // rasterises the same rung through quadraui's `Split`
+                // primitive instead — see `render::draw_dividers_as_splits`
+                // for why the two rasterisers legitimately differ.
+                render::EditorOp::GroupDividers => render_group_dividers(
+                    backend,
+                    &screen.group_dividers,
+                    &screen.windows,
+                    area,
+                    theme,
+                ),
+                // Drag state (the shared `render::TabDragState`) is already
+                // live here — #602 wired `handle_mouse_event` to advance it
+                // via `mouse::handle_mouse` (see `handle()` below).
+                render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
+                    backend,
+                    &self.engine,
+                    screen,
+                    theme,
+                    self.tab_drag.source(),
+                    self.tab_drag.cursor(),
+                    self.tab_drag.zone(),
+                ),
+                // Unlike `draw_frame`'s `editor_area` (whose `y` is
+                // implicitly 0-based — it's the live terminal frame's own
+                // top-level split), `area` here is
+                // `layout.main_content_bounds`, already offset below whatever
+                // `AppShell::render` painted above it — see that function's
+                // doc comment for why the row math differs between the two
+                // callers. That offset already includes `AppShell`'s
+                // title-bar row whenever the menu bar is visible
+                // (`compute_layout`'s `band_y += h`), so — unlike
+                // `draw_frame`'s `menu_rows + 1` — there is no menu term to
+                // add here; adding one would double-count the row (#635 item
+                // A, and see `build_screen_for_shell_content`'s doc comment).
+                render::EditorOp::TabTooltip => {
+                    if let Some(ref tooltip_text) = screen.tab_tooltip {
+                        render_tab_hover_tooltip(
+                            backend,
+                            area.x,
+                            area.y + 1,
+                            area.width,
+                            tooltip_text,
+                            theme,
+                        );
+                    }
+                }
+            }
+            composed_editor.push(op);
+        }
+        *self.composed_editor_band.borrow_mut() = composed_editor;
+        // Same contract as the chrome/overlay bands: read back through the
+        // field rather than the local, so the *stored* observable is what gets
+        // validated — a frame that recorded one thing and composed another
+        // would be a lie the tests then trusted.
+        if let Err(why) = render::check_editor_band_order(&self.composed_editor_band.borrow()) {
+            debug_assert!(false, "TUI {why}");
+        }
+    }
+
     /// Construct the app, running the engine-only startup work that
     /// `tui_main::run()` currently does before entering raw mode
     /// (`mod.rs:641`-`:678`) — none of it needs a terminal or backend.
@@ -660,6 +815,7 @@ impl TuiShellApp {
             tab_switcher_popup_rect: RefCell::new(None),
             painted_overlay_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             composed_chrome_band: std::rc::Rc::new(RefCell::new(Vec::new())),
+            composed_editor_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
@@ -1438,114 +1594,10 @@ impl ShellApp for TuiShellApp {
 
         let screen = build_screen_for_shell_content(&self.engine, &theme, area);
 
-        // ── Tab bar(s) + breadcrumb bar(s) + editor windows ─────────────
-        // Windows are painted first (matches `draw_frame`'s split-group
-        // order — see its own comment) so window content can't overwrite
-        // an adjacent group's tab bar. `render_all_windows` also paints the
-        // within-group (`:split`/`:vsplit`) divider lines unconditionally
-        // now (#609 routed `render_separators` through
-        // `Backend::draw_status_bar` — see its doc comment — so it no
-        // longer needs the raw `Frame` that `frame: None` used to skip it
-        // for).
-        render_all_windows(backend, None, &screen.windows, &theme);
-        // #35/#722: minimap strips on every window's right edge (one entry
-        // per `WindowId` in `screen.minimap`, not just the active window's)
-        // — one call, the braille rasteriser is quadraui's.
-        render::draw_minimap_strip(backend, &screen);
-
-        let tui_tbh: f64 = if self.engine.settings.breadcrumbs && !self.engine.terminal_maximized {
-            2.0
-        } else {
-            1.0
-        };
-        let tab_bar_targets = render::tab_bar_draw_targets(&self.engine, &screen, 1.0, tui_tbh);
-        {
-            // Reset per-frame: `post_draw_apply_widths` wants this frame's
-            // measurements, not an ever-growing accumulation.
-            let mut counts = self.tab_visible_counts.borrow_mut();
-            counts.clear();
-            for target in &tab_bar_targets {
-                let g_tab = Rect {
-                    x: target.rect.x as u16,
-                    y: target.rect.y as u16,
-                    width: target.rect.width as u16,
-                    height: 1,
-                };
-                let vis = render_tab_bar(backend, g_tab, target.bar, target.icons, &theme);
-                counts.push((target.group_id, vis));
-            }
-        }
-        for t in render::breadcrumb_draw_targets(&screen, self.engine.terminal_maximized) {
-            let bc_rect = Rect {
-                x: t.rect.x as u16,
-                y: t.rect.y as u16,
-                width: t.rect.width as u16,
-                height: 1,
-            };
-            let bc_layout = draw_breadcrumb_bar(backend, bc_rect, t.bar, &theme);
-            *t.draw_layout.borrow_mut() = Some(bc_layout);
-        }
-
-        // ── Group divider lines (#609) ───────────────────────────────────
-        // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed to
-        // `render_all_windows`'s within-group `render_separators` above) —
-        // only present when the editor is split into multiple groups, which
-        // `screen.group_dividers` expresses by simply being empty otherwise,
-        // so no `editor_group_split.is_some()` gate is needed (#551).
-        // Mirrors `draw_frame`'s own divider block, ported to
-        // `Backend::draw_status_bar` via `render_group_dividers` (see its
-        // doc comment, and `group_divider_cells`'s for how the #481
-        // phantom-divider-beside-scrollbar guard became a pure data
-        // computation instead of a `Buffer` read-back).
-        render_group_dividers(
-            backend,
-            &screen.group_dividers,
-            &screen.windows,
-            area,
-            &theme,
-        );
-
-        // ── Tab-drag ghost overlay (#609) ────────────────────────────────
-        // Drag state (the shared `render::TabDragState`) is already live
-        // here — #602 wired `handle_mouse_event` to advance it via
-        // `mouse::handle_mouse` (see `handle()` below) — so painting from
-        // it needs no further sequencing with #602, just the paint call
-        // itself, which is this issue's scope.
-        if self.tab_drag.source().is_some() {
-            render_tab_drag_overlay(
-                backend,
-                &self.engine,
-                &screen,
-                &theme,
-                self.tab_drag.source(),
-                self.tab_drag.cursor(),
-                self.tab_drag.zone(),
-            );
-        }
-
-        // ── Tab-hover tooltip (#609) ─────────────────────────────────────
-        // Mirrors `draw_frame`'s own tooltip block, ported to
-        // `Backend::draw_status_bar` via `render_tab_hover_tooltip`. Unlike
-        // `draw_frame`'s `editor_area` (whose `y` is implicitly 0-based —
-        // it's the live terminal frame's own top-level split), `area` here
-        // is `layout.main_content_bounds`, already offset below whatever
-        // `AppShell::render` painted above it — see that function's doc
-        // comment for why the row math differs between the two callers.
-        // That offset already includes `AppShell`'s title-bar row whenever
-        // the menu bar is visible (`compute_layout`'s `band_y += h`), so —
-        // unlike `draw_frame`'s `menu_rows + 1` — there is no menu term to
-        // add here; adding one would double-count the row (#635 item A, and
-        // see `build_screen_for_shell_content`'s doc comment).
-        if let Some(ref tooltip_text) = screen.tab_tooltip {
-            render_tab_hover_tooltip(
-                backend,
-                area.x,
-                area.y + 1,
-                area.width,
-                tooltip_text,
-                &theme,
-            );
-        }
+        // ══ Editor band (#764, #735 slice 3) ═════════════════════════════
+        // See `paint_editor_band` for the rung ladder and why it is one shared
+        // artefact rather than two hand-kept transcriptions.
+        self.paint_editor_band(backend, &screen, area, &theme);
 
         // ── Editor-anchored popups (completion/hover/editor-hover/
         // diff-peek/signature-help) — same code `draw_frame` calls, all
@@ -6214,6 +6266,192 @@ mod tests {
             render::check_chrome_band_order(&band.borrow()),
             Ok(()),
             "the surviving rungs must still be in canonical order"
+        );
+    }
+
+    // ── Editor band (#764, #735 slice 3) ────────────────────────────────────
+    //
+    // The TUI half of the editor-band acceptance test. `gtk/testing.rs`'s
+    // `mod editor_band_order` carries the GTK half and asserts against the
+    // **same expected `Vec<EditorOp>`** (`render::editor_band_fixture`) for the
+    // same engine state, exactly as the chrome- and overlay-band pairs do.
+
+    /// A two-group `Ctrl+W v` split with breadcrumbs and the minimap on and a
+    /// tab-hover tooltip up: every editor rung live except the tab-drag ghost,
+    /// which needs a live pointer drag.
+    ///
+    /// Every knob is set explicitly rather than inherited from
+    /// `Settings::default()` (#762) — an ambient default that flips would
+    /// silently turn this from a seven-rung assertion into a five-rung one.
+    /// Mirrors `gtk/testing.rs`'s `engine_with_every_editor_rung`.
+    fn app_with_every_editor_rung() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = false;
+        app.engine.settings.breadcrumbs = true;
+        app.engine.settings.minimap = true;
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        app.engine.cwd = cwd.clone();
+        let buf = app.engine.active_buffer_id();
+        if let Some(state) = app.engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(cwd.join("src").join("main.rs"));
+        }
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        // Two editor groups, so `group_dividers` is non-empty.
+        app.engine
+            .open_editor_group(crate::core::window::SplitDirection::Vertical);
+        app.engine.tab_hover_tooltip = Some("ZQXW764TIP".to_string());
+        app
+    }
+
+    /// **RED against unfixed `develop`**, in two independent ways. (1) GTK
+    /// never composed `EditorOp::GroupDividers` at all — it painted only
+    /// `window_dividers` and discarded the group set into `_dividers` — so the
+    /// record came back one rung short of this one and no single expected
+    /// vector could satisfy both backends. (2) TUI composed its tab-drag ghost
+    /// *before* the tooltip and GTK composed it after the editor popups
+    /// entirely; hoisting either arm back out of the `compose_editor_band`
+    /// walk drops its `EditorOp` from the record and trips
+    /// `check_editor_band_order`'s `debug_assert` in `render_content` on the
+    /// way. Both were re-introduced, observed red, and restored before
+    /// committing.
+    #[test]
+    fn editor_band_composes_in_canonical_order_via_shell_app() {
+        let app = app_with_every_editor_rung();
+        let band = app.composed_editor_band.clone();
+        // Wide enough for both panes to still clear `minimap_reserved_width`'s
+        // "want + MINIMAP_MIN_TEXT_COLS" floor after the vertical split, so the
+        // `Minimap` rung is genuinely live rather than silently gated off.
+        let driver = driver_with_shell(app, config(), 160, 40);
+        let screen = driver.screen();
+
+        assert_eq!(
+            *band.borrow(),
+            render::editor_band_fixture(false),
+            "expected editor band differs from the GTK twin's \
+             (`editor_band_composes_in_canonical_order_via_gtk_driver`); \
+             screen:\n{screen}"
+        );
+
+        // Composition, not just bookkeeping (#587/#592): the rungs the record
+        // claims must have reached the cells.
+        assert!(
+            driver.find_bounds("ZQXW764TIP").is_some(),
+            "TabTooltip was composed but the tooltip text never painted; \
+             screen:\n{screen}"
+        );
+        assert!(
+            driver.find_bounds("main.rs").is_some(),
+            "TabBars/Breadcrumbs were composed but the buffer name never \
+             painted; screen:\n{screen}"
+        );
+        assert!(
+            screen
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28FF}').contains(&c)),
+            "Minimap was composed but no braille reached the cells; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// A **live** tab drag composes the ghost rung, and composes it *before*
+    /// the tab tooltip — the one relative ordering the two backends' hand-kept
+    /// ladders disagreed about.
+    ///
+    /// **RED against unfixed `develop`**: GTK composed its drop overlay after
+    /// the editor-anchored popups and the whole chrome band, ~900 lines below
+    /// the editor column, so a popup left open when a drag starts painted over
+    /// the drop-zone highlight that owns the pointer. With the rung hoisted
+    /// back out of the walk this record loses `TabDragOverlay` entirely.
+    ///
+    /// The drag machine is driven directly rather than through synthetic mouse
+    /// events: `begin` is the exact state transition `mouse::handle_mouse`
+    /// performs once the travel threshold is crossed, and going through it
+    /// keeps the test off the pointer-geometry ambient state the mouse route
+    /// would drag in (#762).
+    #[test]
+    fn live_tab_drag_composes_the_ghost_rung_before_the_tooltip_via_shell_app() {
+        let mut app = app_with_every_editor_rung();
+        let gid = app.engine.active_group;
+        app.tab_drag.begin((gid, 0), 12.0, 0.0);
+
+        let band = app.composed_editor_band.clone();
+        let driver = driver_with_shell(app, config(), 160, 40);
+        let screen = driver.screen();
+        let band = band.borrow();
+
+        assert_eq!(
+            *band,
+            render::editor_band_fixture(true),
+            "a drag is live, so every rung including the ghost must be \
+             composed, in canonical order; screen:\n{screen}"
+        );
+        let ghost = band
+            .iter()
+            .position(|op| *op == render::EditorOp::TabDragOverlay)
+            .expect("the ghost rung must be composed while a drag is live");
+        let tooltip = band
+            .iter()
+            .position(|op| *op == render::EditorOp::TabTooltip)
+            .expect("the fixture keeps a tab tooltip up");
+        assert!(
+            ghost < tooltip,
+            "the drag ghost must be composed below the tab tooltip; got \
+             {band:?}; screen:\n{screen}"
+        );
+    }
+
+    /// A single-group frame composes no `GroupDividers` rung — the record is
+    /// not just "whatever `EDITOR_Z_ORDER` contains", and the gate is real.
+    /// The GTK twin is
+    /// `unsplit_editor_composes_no_group_divider_rung_via_gtk_driver`.
+    #[test]
+    fn unsplit_editor_composes_no_group_divider_rung_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        let band = app.composed_editor_band.clone();
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        let band = band.borrow();
+        assert!(
+            !band.contains(&render::EditorOp::GroupDividers),
+            "one editor group means no between-group boundary, so the rung must \
+             not be composed; got {band:?}; screen:\n{screen}"
+        );
+        assert!(
+            !band.contains(&render::EditorOp::TabDragOverlay),
+            "no drag is live, so the ghost rung must not be composed; got \
+             {band:?}; screen:\n{screen}"
+        );
+        assert_eq!(
+            render::check_editor_band_order(&band),
+            Ok(()),
+            "the surviving rungs must still be in canonical order"
+        );
+    }
+
+    /// `:set nominimap` drops the `Minimap` rung from the composed band, and
+    /// no braille reaches the cells — the gate is the *reservation*
+    /// (`screen.minimap` empty), not a second copy of `settings.minimap` in
+    /// `compose_editor_band`, which is what would let the two drift.
+    #[test]
+    fn editor_band_drops_the_minimap_rung_when_the_setting_is_off_via_shell_app() {
+        let mut app = app_with_every_editor_rung();
+        app.engine.settings.minimap = false;
+        let band = app.composed_editor_band.clone();
+        let driver = driver_with_shell(app, config(), 160, 40);
+        let screen = driver.screen();
+        assert!(
+            !band.borrow().contains(&render::EditorOp::Minimap),
+            "`minimap: false` reserves no strip, so the rung must not be \
+             composed; got {:?}; screen:\n{screen}",
+            band.borrow()
+        );
+        assert!(
+            !screen
+                .chars()
+                .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
+            "the rung was not composed, so no braille may reach the cells; \
+             screen:\n{screen}"
         );
     }
 

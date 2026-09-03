@@ -760,6 +760,14 @@ struct App {
     /// every arm that actually composed its rung. `TuiShellApp` keeps the
     /// identical field for the identical reason.
     composed_chrome_band: Rc<RefCell<Vec<render::FrameOp>>>,
+    /// The editor-band twin of [`Self::composed_chrome_band`] (#764): written
+    /// by the [`render::compose_editor_band`] walk, one [`render::EditorOp`]
+    /// pushed by every arm that actually composed its rung. Same `Rc`
+    /// rationale, same role — it is what makes "both backends compose the
+    /// editor column in the same order" assertable rather than promised in
+    /// comments, which is how this backend came to omit the group dividers
+    /// entirely while still hit-testing drags against them.
+    composed_editor_band: Rc<RefCell<Vec<render::EditorOp>>>,
     /// Picker/command-palette popup rect `(x, y, w, h)` **as the last frame
     /// actually painted it** — see [`App::compute_picker_popup_bounds`] for
     /// why the click path must not re-derive it (#555).
@@ -1183,6 +1191,7 @@ impl App {
             tab_switcher_popup_rect: Rc::new(Cell::new(None)),
             painted_overlay_band: Rc::new(RefCell::new(Vec::new())),
             composed_chrome_band: Rc::new(RefCell::new(Vec::new())),
+            composed_editor_band: Rc::new(RefCell::new(Vec::new())),
             picker_popup_rect: Rc::new(Cell::new(None)),
             painted_sidebar_bounds: Rc::new(Cell::new(None)),
             painted_line_height: Rc::new(Cell::new(None)),
@@ -2537,6 +2546,192 @@ impl App {
         let (window_rects, _) = engine.calculate_group_window_rects(content_bounds, tab_bar_h);
         let window_dividers = engine.calculate_window_dividers(&window_rects);
         Some((group_dividers, window_dividers, on_tab_bar))
+    }
+
+    /// The [`render::EditorOp::Windows`] rung: paint every editor window's
+    /// text plus its per-window status line, then the `:split`/`:vsplit`
+    /// divider lines *within* each group.
+    ///
+    /// `window_editors` collects each window's owned `quadraui::Editor` for
+    /// the caller's `FrameHitMap` (#449), so the map hit-tests the SAME
+    /// objects that were painted rather than a second copy that could drift.
+    ///
+    /// TUI's twin is `render_impl::render_all_windows`, which also paints its
+    /// within-group separators (`render_separators`) from the same rung.
+    fn paint_editor_windows_rung(
+        &self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &render::ScreenLayout,
+        lh: f64,
+        window_editors: &mut Vec<quadraui::Editor>,
+    ) {
+        use quadraui::{ScreenLayout as QSL, Surface};
+        for rw in &screen.windows {
+            let editor = render::to_q_editor(rw);
+            let rect = editor.rect;
+            let mut frame = QSL::new();
+            frame.push(Surface::Editor {
+                rect,
+                editor: &editor,
+            });
+            frame.draw(backend);
+            window_editors.push(editor);
+
+            // Per-window status bar (when `window_status_line` is true, which
+            // is the default; `global_status_bar` is None in that mode).
+            let Some(ref status) = rw.status_line else {
+                continue;
+            };
+            let bar_y = rw.rect.y + rw.rect.height - lh;
+            let sb_rect = quadraui::Rect::new(
+                rw.rect.x as f32,
+                bar_y as f32,
+                rw.rect.width as f32,
+                lh as f32,
+            );
+            let win_bar = render::window_status_line_to_status_bar(
+                status,
+                quadraui::WidgetId::new(format!("status:{}", rw.window_id.0)),
+            );
+            // #672: recover segment hit zones the same way the dead
+            // `draw.rs::draw_window_status_bar` did, so `pixel_to_click_target`'s
+            // `WindowZone::StatusBar` arm has a real `status_segment_map` entry
+            // to resolve against instead of an always-empty one.
+            // `draw_status_bar` lays segments out bar-relative from `(0, 0)`
+            // regardless of `sb_rect`'s own origin (see
+            // `route_debug_sidebar_event`'s doc comment for the same
+            // "`StatusBar::layout` always starts at 0,0" contract), which is
+            // exactly the window-relative `local_x` `window_zone_hit_test`
+            // hit-tests with — no coordinate translation needed.
+            //
+            // #764: this is the layout the *paint* resolved, not a second
+            // `status_bar_layout` re-measure of the same bar as it used to be —
+            // same reasoning as `render::PaintedTabBar::hits`.
+            let sb_layout = backend.draw_status_bar(sb_rect, &win_bar, None, None);
+            self.status_segment_map.borrow_mut().insert(
+                rw.window_id.0,
+                render::status_bar_zones_from_layout(&sb_layout),
+            );
+        }
+
+        // `:split`/`:vsplit` boundaries had no visual of their own in GTK
+        // before #582 — nothing told the user where to grab. Painted via
+        // quadraui's `Split` primitive rather than hand-rolled Cairo. Both
+        // axes: the #582 iteration-2 smoke found `:split` only *seemed*
+        // draggable because the per-window status bar happens to sit one line
+        // above the boundary and reads as a divider, which is a coincidence of
+        // an unrelated feature, not a handle.
+        //
+        // These are the *within*-group dividers, hence part of this rung
+        // rather than `EditorOp::GroupDividers` — the same split TUI makes,
+        // where `render_all_windows` paints them via `render_separators`.
+        render::draw_dividers_as_splits(backend, &screen.window_dividers, |div| {
+            quadraui::WidgetId::new(format!("wdiv:{}:{}", div.group_id.0, div.split_index))
+        });
+    }
+
+    /// The [`render::EditorOp::TabBars`] rung: paint one tab bar per editor
+    /// group and recover the pixel hit geometry the rasteriser resolved.
+    ///
+    /// Multi-group (post-split) layouts get a bar per group at the top edge of
+    /// its own bounds; a single group is a split of one and gets one
+    /// full-width bar at the editor top (#515/#551).
+    ///
+    /// Painting goes through `render::paint_tab_bars` →
+    /// `Backend::draw_tab_bar_icons` rather than a `Surface::TabBar` push,
+    /// because quadraui's `Surface` enum carries no icon sidecar (adding a
+    /// field to it would be the same hard break on downstream consumers that
+    /// kept the icons off `TabItem` in the first place). With an empty sidecar
+    /// the two are byte-identical — quadraui's `draw_tab_bar` forwards to
+    /// `draw_tab_bar_icons` with `&[]` — so this is a pure superset of the old
+    /// call (#703). `hit_bars` still collects a `Surface::TabBar` for the
+    /// caller's `FrameHitMap`: that map is only ever consumed via `hit_map()`
+    /// (never drawn) and its zones are whole-bar rects, which icons do not
+    /// move.
+    fn paint_tab_bars_rung<'a>(
+        &self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'a render::ScreenLayout,
+        tab_row_h: f64,
+        tab_bar_h: f64,
+        hit_bars: &mut Vec<(core::window::GroupId, quadraui::Rect, &'a quadraui::TabBar)>,
+    ) {
+        let painted = render::paint_tab_bars(
+            backend,
+            engine,
+            screen,
+            tab_row_h,
+            tab_bar_h,
+            self.tab_close_hover
+                .map(|(gid, i)| (core::window::GroupId(gid), i)),
+        );
+        let mut pixel_hits = self.cached_tab_pixel_hits.borrow_mut();
+        let mut close_abs = self.cached_tab_close_abs.borrow_mut();
+        let mut slots_abs = self.cached_tab_slots_abs.borrow_mut();
+        for bar in painted {
+            // Recover the exact pixel geometry the rasteriser just drew and
+            // cache it (relative to the bar's left edge) for hit-testing.
+            //
+            // #764: `bar.hits` is what the *paint* returned, not the separate
+            // `tab_bar_layout_icons` re-measure this used to make. The icon
+            // reservation widens every decorated tab, so an icon-less or
+            // differently-fonted twin reports slot and close bounds shifted
+            // left of the painted glyphs — i.e. the close × of tab N lands
+            // inside tab N+1's painted slot, and clicking it closes the wrong
+            // tab. Exactly the measure/paint desync of #654; reading the
+            // paint's own answer makes it unreachable rather than merely
+            // fixed (#703).
+            let ph = tab_hits_to_pixel_hits(&bar.hits, bar.bar, bar.rect.x as f64);
+            let bar_top = bar.rect.y as f64;
+            close_abs.insert(
+                bar.group_id.0,
+                abs_close_record(&ph.close, bar.rect.x as f64, bar_top, bar_top + tab_row_h),
+            );
+            slots_abs.insert(bar.group_id.0, abs_visible_slots(&bar.hits));
+            pixel_hits.insert(bar.group_id.0, ph);
+            hit_bars.push((bar.group_id, bar.rect, bar.bar));
+        }
+    }
+
+    /// Recompute the per-group tab-drop geometry from this frame's screen
+    /// layout and stash it in `cached_drop_groups` / `cached_drop_tbh`;
+    /// returns the effective tab-bar height the same call resolved.
+    ///
+    /// One source for two consumers that must never disagree: the drag
+    /// hit-test (`handle_mouse_drag_msg` → `render::compute_tab_drop_zone`)
+    /// and the `EditorOp::TabDragOverlay` rung's own highlight. `render_content`
+    /// calls this unconditionally once per frame — a drag has to be able to
+    /// *start*, so the cache must be current on frames where no drag is live —
+    /// and the rung calls it again rather than carrying a second copy of the
+    /// computation.
+    ///
+    /// Origin convention: `gtb.bounds` are always absolute (built from absolute
+    /// window rects), so there is no origin offset to apply — adding the editor
+    /// column's `(x, y)` again would double-count it and shift the highlight
+    /// off the group (the prior "covers half the group" bug, #515). This used
+    /// to branch on `editor_group_split.is_some()` because the single-group arm
+    /// of `screen_to_drop_group_bounds` derived its rect from a caller-supplied
+    /// origin/size instead; `group_tab_bars` now covers one group too, so both
+    /// the branch and the parameters it fed are gone (#551).
+    fn cache_tab_drop_geometry(
+        &self,
+        screen: &render::ScreenLayout,
+        engine: &Engine,
+        tab_bar_h: f64,
+    ) -> f32 {
+        let bounds = render::screen_to_drop_group_bounds(screen);
+        // Per-tab slot x-positions (absolute) are captured by the `TabBars`
+        // rung while drawing. Feeding them here makes a drag inside a group's
+        // own tab bar resolve to a `TabReorder` (insertion bar) instead of
+        // falling through to a new-split/center overlay. (#515)
+        let slots_abs = self.cached_tab_slots_abs.borrow();
+        let (groups, eff_tbh) =
+            render::build_tab_drop_groups(&bounds, engine, tab_bar_h as f32, &slots_abs);
+        drop(slots_abs);
+        *self.cached_drop_groups.borrow_mut() = groups;
+        self.cached_drop_tbh.set(eff_tbh);
+        eff_tbh
     }
 
     /// Re-resolve a tab-drag press point to `(group, tab index)`, or `None`
@@ -5118,11 +5313,33 @@ impl quadraui::ShellApp for App {
             self.backend.borrow_mut().set_pango_context(click_ctx);
         }
 
-        // ── Draw editor windows ───────────────────────────────────────────────
-        // `window_editors` stashes each window's owned `quadraui::Editor`
-        // past the loop (#449) so the FrameHitMap built just below can
-        // reference the SAME objects just painted, instead of constructing
-        // a second copy that could drift from what's on screen.
+        // ══ Editor band (#764, #735 slice 3) ═════════════════════════════════
+        //
+        // Composed from `render::compose_editor_band` — the single ordered
+        // artefact both backends walk for the editor column, exactly as
+        // `CHROME_Z_ORDER` (further down) is for the surrounding chrome and
+        // `OVERLAY_Z_ORDER` (below that) for the app-level overlays. Geometry
+        // stays here, in pixels; only the *order* and the *gates* moved.
+        //
+        // Two things the walk changed on GTK, both recorded in
+        // `EDITOR_Z_ORDER`'s doc comment: the between-*group* divider lines
+        // are painted at all now (they were populated every frame and
+        // hit-tested for drags, and drawn by nobody — a `Ctrl+W v` boundary
+        // was draggable but invisible, #592's exact shape), and the tab-drag
+        // ghost is composed *here* rather than ~900 lines further down, after
+        // the editor-anchored popups that used to paint over it.
+        //
+        // `window_editors` stashes each window's owned `quadraui::Editor` past
+        // the walk (#449) so the `FrameHitMap` built after it can reference the
+        // SAME objects just painted, instead of constructing a second copy that
+        // could drift from what's on screen; `hit_bars` does the same for the
+        // tab bars. Both are folded into `hit_frame` *after* the walk, editors
+        // first, because `FrameZone::TabBar { idx }` is keyed by the global
+        // surface index — see `cached_tab_bar_zones`'s doc comment for why a
+        // plain `Vec` indexed from 0 was wrong. Accumulating them during the
+        // walk instead would make `hit_frame` hold a borrow of `window_editors`
+        // across loop iterations, which is the borrow the two-phase shape here
+        // exists to avoid.
         //
         // #731: no vertical (or horizontal) scrollbar is painted for the
         // editor on GTK today. quadraui's `gtk::editor::draw_editor` (the
@@ -5155,98 +5372,170 @@ impl quadraui::ShellApp for App {
         // have been visible on screen; it needs re-verifying once this
         // lands there.
         let mut window_editors: Vec<quadraui::Editor> = Vec::with_capacity(screen.windows.len());
-        for rw in &screen.windows {
-            let editor = render::to_q_editor(rw);
-            let rect = editor.rect;
-            let mut frame = QSL::new();
-            frame.push(Surface::Editor {
-                rect,
-                editor: &editor,
-            });
-            frame.draw(backend);
-            window_editors.push(editor);
+        let mut hit_bars: Vec<(core::window::GroupId, quadraui::Rect, &quadraui::TabBar)> =
+            Vec::new();
+        // Reset the pixel-accurate hit caches; repopulated by the `TabBars`
+        // rung below so the click / hover hit-tests use the exact drawn
+        // geometry (#515). Cleared here, before the walk, rather than from an
+        // absent-rung branch: `compose_editor_band` returns only the live
+        // rungs, so a frame with no tab bars has no arm to clear them from.
+        self.cached_tab_pixel_hits.borrow_mut().clear();
+        self.cached_tab_close_abs.borrow_mut().clear();
+        self.cached_tab_slots_abs.borrow_mut().clear();
 
-            // Per-window status bar (when window_status_line=true, which is
-            // the default; global_status_bar is None in that mode).
-            if let Some(ref status) = rw.status_line {
-                let bar_y = rw.rect.y + rw.rect.height - lh;
-                let sb_rect = quadraui::Rect::new(
-                    rw.rect.x as f32,
-                    bar_y as f32,
-                    rw.rect.width as f32,
-                    lh as f32,
-                );
-                let win_bar = render::window_status_line_to_status_bar(
-                    status,
-                    quadraui::WidgetId::new(format!("status:{}", rw.window_id.0)),
-                );
-                let mut frame = QSL::new();
-                frame.push(Surface::StatusBar {
-                    rect: sb_rect,
-                    bar: &win_bar,
-                    hovered: None,
-                    pressed: None,
-                });
-                frame.draw(backend);
-
-                // #672: recover segment hit zones the same way the dead
-                // `draw.rs::draw_window_status_bar` did, so
-                // `pixel_to_click_target`'s `WindowZone::StatusBar` arm has a
-                // real `status_segment_map` entry to resolve against instead
-                // of an always-empty one. `status_bar_layout` lays segments
-                // out bar-relative from `(0, 0)` regardless of `sb_rect`'s own
-                // origin (see `route_debug_sidebar_event`'s doc comment above
-                // for the same "`StatusBar::layout` always starts at 0,0"
-                // contract), which is exactly the window-relative `local_x`
-                // `window_zone_hit_test` hit-tests with — no coordinate
-                // translation needed.
-                let sb_layout = backend.status_bar_layout(sb_rect, &win_bar);
-                self.status_segment_map.borrow_mut().insert(
-                    rw.window_id.0,
-                    render::status_bar_zones_from_layout(&sb_layout),
-                );
+        let mut composed_editor: Vec<render::EditorOp> = Vec::new();
+        for op in render::compose_editor_band(
+            &engine,
+            screen,
+            self.tab_drag.is_dragging(),
+            engine.terminal_maximized,
+        ) {
+            match op {
+                render::EditorOp::Windows => {
+                    self.paint_editor_windows_rung(backend, screen, lh, &mut window_editors)
+                }
+                // #35/#722: minimap strips on every window's right edge (one
+                // entry per `WindowId` in `screen.minimap`, not just the active
+                // window's) — one call, the font-scaling rasteriser is
+                // quadraui's.
+                render::EditorOp::Minimap => {
+                    render::draw_minimap_strip(backend, screen);
+                }
+                // ── Draw tab bar(s) — one per editor group ───────────────────
+                // Multi-group (post-split) layouts have a tab bar per group,
+                // each drawn at the top edge of its own bounds. Single-group
+                // draws one full-width bar at the editor top (#515/#551).
+                render::EditorOp::TabBars => self.paint_tab_bars_rung(
+                    backend,
+                    &engine,
+                    screen,
+                    tab_row_h,
+                    tab_bar_h,
+                    &mut hit_bars,
+                ),
+                // ── Draw breadcrumb bar(s) below tab bar(s) ──────────────────
+                // (#547) `render_content` is the active ShellApp draw path
+                // since the #540 Relm4→ShellApp migration; the legacy
+                // `draw.rs::draw_editor` path that used to draw breadcrumbs is
+                // dead (no callers) and this step was never ported over, so
+                // breadcrumbs stopped rendering even though layout space for
+                // them was still reserved (`tab_bar_h` above) and clicks were
+                // still hit-tested against them.
+                render::EditorOp::Breadcrumbs => {
+                    render::paint_breadcrumb_bars(backend, screen, engine.terminal_maximized);
+                }
+                // ── Group divider lines (#764) ───────────────────────────────
+                // The `Ctrl+W v` / `Ctrl+W s` boundaries *between* editor
+                // groups, as opposed to the `Windows` rung's within-group
+                // `:split` lines. GTK painted nothing here at all before #764
+                // while still resolving drags against the same rects through
+                // `screen_zone_hit_test` — see `ScreenLayout::group_dividers`
+                // for the full verdict.
+                //
+                // Rasterised through the same `Split` primitive the
+                // within-group dividers use. TUI rasterises this rung cell by
+                // cell instead, because it carries the #481 guard that
+                // suppresses a divider column immediately beside a
+                // neighbouring window's scrollbar — a coalescence problem that
+                // exists only in a character grid. See
+                // `render::draw_dividers_as_splits` for why the two
+                // rasterisers legitimately differ while the rung does not.
+                render::EditorOp::GroupDividers => {
+                    render::draw_dividers_as_splits(backend, &screen.group_dividers, |div| {
+                        quadraui::WidgetId::new(format!("gdiv:{}", div.split_index))
+                    });
+                }
+                // ── Tab drag overlay ─────────────────────────────────────────
+                // When a tab drag is in progress, paint the drop-zone
+                // highlight + insertion bar over the editor column.
+                //
+                // The per-group drop geometry is computed here, from the
+                // absolute bounds in the shared screen layout plus the per-tab
+                // slot positions the `TabBars` rung just captured, and stashed
+                // so the drag hit-test (`handle_mouse_drag_msg`) and this
+                // overlay use one identical source.
+                //
+                // Origin convention: `gtb.bounds` are always absolute (built
+                // from absolute window rects), so there is no origin offset to
+                // apply — adding (x,y) again would double-count it and shift
+                // the highlight off the group (the prior "covers half the
+                // group" bug, #515).
+                render::EditorOp::TabDragOverlay => {
+                    let eff_tbh = self.cache_tab_drop_geometry(screen, &engine, tab_bar_h);
+                    let groups = self.cached_drop_groups.borrow();
+                    let (mx, my) = self.mouse_pos_cell.get();
+                    render::paint_tab_drop_overlay(
+                        backend,
+                        self.tab_drag.zone(),
+                        &groups,
+                        (mx as f32, my as f32),
+                        eff_tbh,
+                        2.0,
+                        lh as f32,
+                    );
+                }
+                // ── Tab-hover tooltip (#671) ─────────────────────────────────
+                // Small popup shown when the mouse lingers over a tab, naming
+                // the buffer under the cursor. `screen.tab_tooltip` was
+                // populated by the engine the whole time (#592's root cause)
+                // but had no GTK painter at all — unlike quickfix/panel_hover
+                // (#670) there was no dead `draw.rs` version to port either;
+                // `draw.rs:425` painted it with raw Cairo/Pango, never through
+                // `Backend`. Routed through the shared
+                // `render::tab_hover_tooltip_paint` (TUI calls the same
+                // function with its 1.0/1.0 cell scale instead of GTK's
+                // `cw`/`lh` pixel scale) so paint logic isn't reimplemented per
+                // backend. Positioned one *tab row* below the top of the editor
+                // column — `tab_row_h` (computed above), not `lh` — mirroring
+                // TUI's `area.y + 1`: TUI's tab bar is exactly one *cell row*
+                // tall regardless of the breadcrumbs setting (see `mouse.rs`'s
+                // `tab_bar_rows`), so its `+1` clears only the tab row itself,
+                // same as GTK's `tab_row_h` here (as opposed to `tab_bar_h`,
+                // which also reserves the breadcrumb row when that setting is
+                // on — using `lh` alone landed the tooltip's top edge inside
+                // the tab row's own vertical span, painting over tab labels
+                // instead of below them, since GTK's tab row is `1.6×` a line
+                // height, not `1×` like TUI's).
+                render::EditorOp::TabTooltip => {
+                    if let Some(ref tooltip_text) = screen.tab_tooltip {
+                        render::tab_hover_tooltip_paint(
+                            backend,
+                            x as f32,
+                            (y + tab_row_h) as f32,
+                            w as f32,
+                            tooltip_text,
+                            &theme,
+                            cw as f32,
+                            lh as f32,
+                        );
+                    }
+                }
             }
+            composed_editor.push(op);
         }
-
-        // ── Window-split divider lines (#582 follow-up) ────────────────────────
-        // `:split`/`:vsplit` boundaries had no visual of their own in GTK —
-        // nothing told the user where to grab. Paint one via quadraui's `Split`
-        // primitive (already wired for both backends via `Surface::Split` ->
-        // `Backend::draw_split`) rather than hand-rolling Cairo here.
-        //
-        // Both axes are painted. The iteration-2 smoke found `:split` only
-        // *seemed* draggable because the per-window status bar happens to sit
-        // one line above the boundary and reads as a divider; that is a
-        // coincidence of an unrelated feature, not a handle, and it leaves the
-        // real 6px hit band invisible. A true line on both axes makes what is
-        // grabbable match what is drawn.
-        for div in &screen.window_dividers {
-            let (split, rect) = render::divider_to_split(
-                div,
-                quadraui::WidgetId::new(format!("wdiv:{}:{}", div.group_id.0, div.split_index)),
-            );
-            let mut frame = QSL::new();
-            frame.push(Surface::Split {
-                rect,
-                split: &split,
-            });
-            frame.draw(backend);
+        *self.composed_editor_band.borrow_mut() = composed_editor;
+        // Same contract as the chrome/overlay bands: read back through the
+        // field rather than the local, so the *stored* observable is what gets
+        // validated — a frame that recorded one thing and composed another
+        // would be a lie the tests then trusted.
+        if let Err(why) = render::check_editor_band_order(&self.composed_editor_band.borrow()) {
+            debug_assert!(false, "GTK {why}");
         }
-
-        // #35/#722: minimap strips on every window's right edge (one entry
-        // per `WindowId` in `screen.minimap`, not just the active window's)
-        // — one call, the font-scaling rasteriser is quadraui's.
-        render::draw_minimap_strip(backend, screen);
 
         // ── Recover a FrameHitMap for Editor/TabBar zone detection (#449) ──────
         // Pure `.push()` accumulation into a *separate* `ScreenLayout`, built
-        // from the same `Editor` objects just painted above (`window_editors`,
-        // same order as `screen.windows` so `FrameZone::Editor { idx }` maps
-        // straight back to `cached_layout.windows[idx]`) plus the `TabBar`
-        // surfaces pushed in the loop just below. `ScreenLayout::hit_map()`
-        // (quadraui#425) makes no `backend.draw_*()` calls, so accumulating
-        // into it can never reorder or repeat the real painting done above —
-        // see `click::pixel_to_click_target` for the consumer side.
+        // from the same `Editor` objects painted by the `Windows` rung above
+        // (`window_editors`, same order as `screen.windows` so
+        // `FrameZone::Editor { idx }` maps straight back to
+        // `cached_layout.windows[idx]`) plus the `TabBar` surfaces the
+        // `TabBars` rung recorded. `ScreenLayout::hit_map()` (quadraui#425)
+        // makes no `backend.draw_*()` calls, so accumulating into it can never
+        // reorder or repeat the real painting done above — see
+        // `click::pixel_to_click_target` for the consumer side.
+        //
+        // Editors are pushed first and the tab bars after, so the first tab
+        // bar's `FrameZone::TabBar { idx }` is `window_editors.len()`, not `0`
+        // — the *global* surface index `cached_tab_bar_zones` is keyed by.
         let mut hit_frame = QSL::new();
         for editor in &window_editors {
             hit_frame.push(Surface::Editor {
@@ -5254,131 +5543,27 @@ impl quadraui::ShellApp for App {
                 editor,
             });
         }
-
-        // ── Draw tab bar(s) — one per editor group ────────────────────────────
-        // Multi-group (post-split) layouts have a tab bar per group, each drawn
-        // at the top edge of its own bounds. Single-group draws one full-width
-        // bar at the editor top. Previously only the single-group primitive was
-        // drawn, so split groups rendered with no tab bar at all. (#515)
-        // Reset the pixel-accurate hit caches; repopulated per tab bar below so
-        // the click / hover hit-tests use the exact drawn geometry (#515).
-        let mut pixel_hits = self.cached_tab_pixel_hits.borrow_mut();
-        let mut close_abs = self.cached_tab_close_abs.borrow_mut();
-        let mut slots_abs = self.cached_tab_slots_abs.borrow_mut();
-        pixel_hits.clear();
-        close_abs.clear();
-        slots_abs.clear();
-        // Parallel table for `FrameZone::TabBar { idx }` resolution (#449),
-        // keyed by the *global* surface index — `hit_frame` already has
-        // `window_editors.len()` `Surface::Editor`s pushed into it above, so
-        // the first tab bar's `FrameZone::TabBar { idx }` is
-        // `window_editors.len()`, not `0`. See `cached_tab_bar_zones`'s doc
-        // comment for why a plain `Vec` indexed from 0 was wrong.
         let mut tab_bar_zones: HashMap<usize, (core::window::GroupId, quadraui::Rect)> =
             HashMap::new();
-        for (next_surface_idx, target) in (window_editors.len()..).zip(
-            render::tab_bar_draw_targets(&engine, screen, tab_row_h, tab_bar_h),
-        ) {
-            let tb_rect = target.rect;
-            let hover = self
-                .tab_close_hover
-                .and_then(|(gid, i)| (gid == target.group_id.0).then_some(i));
-            // #703: painted via `Backend::draw_tab_bar_icons` directly rather
-            // than a `Surface::TabBar` push, because quadraui's `Surface` enum
-            // carries no icon sidecar (adding a field to it would be the same
-            // hard break on downstream consumers that kept the icons off
-            // `TabItem` in the first place). With an empty sidecar the two are
-            // byte-identical — quadraui's `draw_tab_bar` forwards to
-            // `draw_tab_bar_icons` with `&[]` — so this is a pure superset of
-            // the old call. `hit_frame` below still gets a `Surface::TabBar`:
-            // it is only ever consumed via `hit_map()` (never drawn) and its
-            // zones are whole-bar rects, which icons do not move.
-            backend.draw_tab_bar_icons(tb_rect, target.bar, target.icons, hover);
-            // `target.bar` borrows from `screen` (function-scoped), so this
-            // can push directly into `hit_frame` without hoisting (#449).
+        for (surface_idx, (group_id, rect, bar)) in (window_editors.len()..).zip(hit_bars) {
             hit_frame.push(Surface::TabBar {
-                rect: tb_rect,
-                bar: target.bar,
-                hovered_close: hover,
+                rect,
+                bar,
+                hovered_close: None,
             });
-            tab_bar_zones.insert(next_surface_idx, (target.group_id, tb_rect));
-            // Recover the exact pixel geometry the rasteriser just drew and
-            // cache it (relative to the bar's left edge) for hit-testing.
-            //
-            // #703: must be the `_icons` twin, with the *same* sidecar the
-            // paint above used. The icon reservation widens every decorated
-            // tab, so the icon-less `tab_bar_layout` reports slot and close
-            // bounds shifted left of the painted glyphs — i.e. the close × of
-            // tab N lands inside tab N+1's painted slot, and clicking it
-            // closes the wrong tab. Exactly the measure/paint desync of #654.
-            let hits = backend.tab_bar_layout_icons(tb_rect, target.bar, target.icons);
-            let ph = tab_hits_to_pixel_hits(&hits, target.bar, tb_rect.x as f64);
-            let bar_top = tb_rect.y as f64;
-            close_abs.insert(
-                target.group_id.0,
-                abs_close_record(&ph.close, tb_rect.x as f64, bar_top, bar_top + tab_row_h),
-            );
-            slots_abs.insert(target.group_id.0, abs_visible_slots(&hits));
-            pixel_hits.insert(target.group_id.0, ph);
+            tab_bar_zones.insert(surface_idx, (group_id, rect));
         }
-        drop(close_abs);
-        drop(slots_abs);
-        drop(pixel_hits);
         *self.cached_frame_hit_map.borrow_mut() = Some(hit_frame.hit_map());
         *self.cached_tab_bar_zones.borrow_mut() = tab_bar_zones;
 
-        // ── Draw breadcrumb bar(s) below tab bar(s) ─────────────────────────────
-        // (#547) `render_content` is the active ShellApp draw path since the
-        // #540 Relm4→ShellApp migration; the legacy `draw.rs::draw_editor`
-        // path that used to draw breadcrumbs is dead (no callers) and this
-        // step was never ported over, so breadcrumbs stopped rendering even
-        // though layout space for them was still reserved (`tab_bar_h`
-        // above) and clicks were still hit-tested against them.
-        for t in render::breadcrumb_draw_targets(screen, engine.terminal_maximized) {
-            let mut frame = QSL::new();
-            frame.push(Surface::StatusBar {
-                rect: t.rect,
-                bar: t.bar,
-                hovered: None,
-                pressed: None,
-            });
-            frame.draw(backend);
-            *t.draw_layout.borrow_mut() = Some(backend.status_bar_layout(t.rect, t.bar));
-        }
-
-        // ── Tab-hover tooltip (#671) ─────────────────────────────────────────
-        // Small popup shown when the mouse lingers over a tab, naming the
-        // buffer under the cursor. `screen.tab_tooltip` was populated by the
-        // engine the whole time (#592's root cause) but had no GTK painter at
-        // all — unlike quickfix/panel_hover (#670) there was no dead
-        // `draw.rs` version to port either; `draw.rs:425` painted it with raw
-        // Cairo/Pango, never through `Backend`. Routed through the new shared
-        // `render::tab_hover_tooltip_paint` (mirrors TUI's
-        // `render_tab_hover_tooltip`, just called with GTK's `cw`/`lh` pixel
-        // scale instead of TUI's 1.0/1.0 cell scale) so paint logic isn't
-        // reimplemented per backend. Positioned one *tab row* below the top
-        // of the editor column — `tab_row_h` (computed above), not `lh` —
-        // mirroring TUI's `area.y + 1`: TUI's tab bar is exactly one
-        // *cell row* tall regardless of the breadcrumbs setting (see
-        // `mouse.rs`'s `tab_bar_rows`), so its `+1` clears only the tab row
-        // itself, same as GTK's `tab_row_h` here (as opposed to
-        // `tab_bar_h`, which also reserves the breadcrumb row when that
-        // setting is on — using `lh` alone landed the tooltip's top edge
-        // inside the tab row's own vertical span, painting over tab labels
-        // instead of below them, since GTK's tab row is `1.6×` a line
-        // height, not `1×` like TUI's).
-        if let Some(ref tooltip_text) = screen.tab_tooltip {
-            render::tab_hover_tooltip_paint(
-                backend,
-                x as f32,
-                (y + tab_row_h) as f32,
-                w as f32,
-                tooltip_text,
-                &theme,
-                cw as f32,
-                lh as f32,
-            );
-        }
+        // Refresh the drop geometry the *drag hit-test* reads
+        // (`handle_mouse_drag_msg` → `compute_tab_drop_zone`), unconditionally
+        // and for every frame — a drag has to be able to *start*, which means
+        // the cache must be current on frames where no drag is live and the
+        // `TabDragOverlay` rung therefore never ran. The rung calls this same
+        // function rather than carrying a second copy of the computation, so
+        // the overlay and the hit-test can only ever agree.
+        self.cache_tab_drop_geometry(screen, &engine, tab_bar_h);
 
         // ── Draw editor-anchored popups (on top of everything else) ────────────
         // Completion menu, LSP hover, editor hover (rich markdown), diff peek,
@@ -6217,56 +6402,6 @@ impl quadraui::ShellApp for App {
         if let Err(why) = render::check_chrome_band_order(&self.composed_chrome_band.borrow()) {
             debug_assert!(false, "GTK {why}");
         }
-        // ── Cache per-group tab-drop geometry ─────────────────────────────────
-        // Compute the absolute drop-group bounds from the shared screen layout and
-        // stash them so the drag hit-test (handle_mouse_drag_msg) and the overlay
-        // below use one identical source.
-        //
-        // Origin convention: `gtb.bounds` are always absolute (built from absolute
-        // window rects), so there is no origin offset to apply — adding (x,y)
-        // again would double-count it and shift the highlight off the group (the
-        // prior "covers half the group" bug, #515). This used to branch on
-        // `editor_group_split.is_some()` because the single-group arm of
-        // `screen_to_drop_group_bounds` derived its rect from a caller-supplied
-        // origin/size instead; `group_tab_bars` now covers one group too, so both
-        // the branch and the parameters it fed are gone (#551).
-        {
-            let bounds = render::screen_to_drop_group_bounds(screen);
-            // Per-tab slot x-positions (absolute) were captured while drawing the
-            // tab bars above. Feeding them here makes a drag inside a group's own
-            // tab bar resolve to a `TabReorder` (insertion bar) instead of falling
-            // through to a new-split/center overlay. (#515)
-            let slots_abs = self.cached_tab_slots_abs.borrow();
-            let (groups, eff_tbh) =
-                render::build_tab_drop_groups(&bounds, &engine, tab_bar_h as f32, &slots_abs);
-            drop(slots_abs);
-            *self.cached_drop_groups.borrow_mut() = groups;
-            self.cached_drop_tbh.set(eff_tbh);
-        }
-
-        // ── Draw tab drag overlay ─────────────────────────────────────────────
-        // When a tab drag is in progress, paint the drop-zone highlight + insertion
-        // bar on top of all other content, using the geometry cached just above.
-        if self.tab_drag.is_dragging() {
-            let groups = self.cached_drop_groups.borrow();
-            let eff_tbh = self.cached_drop_tbh.get();
-            let (mx, my) = self.mouse_pos_cell.get();
-            if let Some(ov) = render::compute_tab_drop_overlay(
-                self.tab_drag.zone(),
-                &groups,
-                (mx as f32, my as f32),
-                eff_tbh,
-                2.0,
-                lh as f32,
-            ) {
-                backend.draw_drop_overlay(&quadraui::DropOverlay {
-                    highlight: ov.highlight,
-                    insertion_bar: ov.insertion_bar,
-                    ghost_position: Some(ov.ghost_position),
-                });
-            }
-        }
-
         // ══ Overlay band (#735 slice 1) ══════════════════════════════════════
         //
         // Everything from here to the end of `render_content` is composed from

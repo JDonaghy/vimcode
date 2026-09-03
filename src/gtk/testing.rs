@@ -130,6 +130,12 @@ pub struct Harness<A: AppLogic> {
     /// `chrome_band_*_via_shell_app` tests assert against the same expected
     /// `Vec<FrameOp>` for the same engine state.
     pub composed_chrome_band: Rc<RefCell<Vec<crate::render::FrameOp>>>,
+    /// The editor rungs the last frame actually composed, in composition order
+    /// (#764). The GTK half of the cross-backend editor-band assertion —
+    /// `TuiShellApp` carries the identical `composed_editor_band` and its
+    /// `editor_band_*_via_shell_app` tests assert against the same expected
+    /// `Vec<EditorOp>` for the same engine state.
+    pub composed_editor_band: Rc<RefCell<Vec<crate::render::EditorOp>>>,
     /// The sidebar content rect the last frame painted the active panel into,
     /// or `None` if the sidebar was hidden. The sidebar twin of
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
@@ -399,6 +405,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
     let painted_overlay_band = Rc::clone(&app.painted_overlay_band);
     let composed_chrome_band = Rc::clone(&app.composed_chrome_band);
+    let composed_editor_band = Rc::clone(&app.composed_editor_band);
     let status_segment_map = Rc::clone(&app.status_segment_map);
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
@@ -423,6 +430,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         tab_switcher_popup_rect,
         painted_overlay_band,
         composed_chrome_band,
+        composed_editor_band,
         status_segment_map,
         separated_status_bar_rect,
         title_bar_rect,
@@ -6199,6 +6207,253 @@ mod chrome_band_order {
         );
         assert_eq!(
             crate::render::check_chrome_band_order(&band),
+            Ok(()),
+            "the surviving rungs must still be in canonical order"
+        );
+    }
+}
+
+#[cfg(test)]
+mod editor_band_order {
+    //! #764 (#735 slice 3): the GTK half of the shared **editor band** — the
+    //! surfaces vimcode stacks inside `main_content_bounds`.
+    //!
+    //! Before #764 both backends walked the same run of rungs in two different
+    //! orders, and GTK was missing one outright: `ScreenLayout::group_dividers`
+    //! was populated every frame and hit-tested for divider drags, and painted
+    //! by nobody, so a `Ctrl+W v` boundary on GTK was draggable but invisible.
+    //! Both backends now walk `render::compose_editor_band` and record what
+    //! they composed into `composed_editor_band`; these tests read that record
+    //! *and* the Cairo surface underneath it.
+    //!
+    //! The TUI half lives in `tui_main/shell_app.rs`
+    //! (`editor_band_*_via_shell_app`) and asserts against the **same expected
+    //! `Vec<EditorOp>`** — `render::editor_band_fixture`, a single
+    //! `#[cfg(test)]` fn compiled into both bin targets — for the same engine
+    //! state, exactly as the chrome- and overlay-band pairs above do.
+    use super::*;
+    use crate::core::window::SplitDirection;
+
+    /// A two-group `Ctrl+W v` split with breadcrumbs and the minimap on and a
+    /// tab-hover tooltip up: every editor rung live except the tab-drag ghost,
+    /// which needs a live pointer drag.
+    ///
+    /// Every knob is set explicitly rather than inherited from `Settings
+    /// ::default()` (#762) — an ambient default that flips would silently turn
+    /// this from a seven-rung assertion into a five-rung one.
+    fn engine_with_every_editor_rung() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine.settings.breadcrumbs = true;
+        engine.settings.minimap = true;
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+        let buf = engine.active_buffer_id();
+        if let Some(state) = engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(cwd.join("src").join("main.rs"));
+        }
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        // Two editor groups, so `group_dividers` is non-empty — the rung GTK
+        // never painted before #764.
+        engine.open_editor_group(SplitDirection::Vertical);
+        engine.tab_hover_tooltip = Some("ZQXW764TIP".to_string());
+        engine
+    }
+
+    /// **RED against unfixed `develop`**, in two independent ways. (1) GTK
+    /// never composed `EditorOp::GroupDividers` at all — it destructured
+    /// `calculate_group_window_rects`'s dividers into `_dividers` and painted
+    /// only `window_dividers` — so the record came back one rung short of the
+    /// TUI twin's and no single expected vector could satisfy both. (2) GTK
+    /// composed its tab-drag ghost ~900 lines further down, after the
+    /// editor-anchored popups and the whole chrome band; hoisting that arm
+    /// back out of the walk drops `TabDragOverlay` from the record and, with a
+    /// drag live, trips `check_editor_band_order`'s `debug_assert` in
+    /// `render_content` on the way. Both were re-introduced, observed red, and
+    /// restored before committing.
+    #[test]
+    fn editor_band_composes_in_canonical_order_via_gtk_driver() {
+        let h = harness(engine_with_every_editor_rung(), 1400, 900);
+
+        assert_eq!(
+            *h.composed_editor_band.borrow(),
+            crate::render::editor_band_fixture(false),
+            "expected editor band differs from the TUI twin's \
+             (`editor_band_composes_in_canonical_order_via_shell_app`)"
+        );
+
+        // Composition, not just bookkeeping (#587/#592): the rungs the record
+        // claims must have reached the Cairo surface.
+        assert!(
+            h.driver.screen_contains("ZQXW764TIP"),
+            "TabTooltip was composed but the tooltip text never painted"
+        );
+        assert!(
+            h.driver.screen_contains("main.rs"),
+            "TabBars/Breadcrumbs were composed but the buffer name never painted"
+        );
+    }
+
+    /// The rung this slice actually restores on GTK: a `Ctrl+W v` group
+    /// boundary must paint a divider line *between* the two groups' painted
+    /// tab labels — not merely be hit-testable there.
+    ///
+    /// Asserts on painted pixels, not on `screen.group_dividers` being
+    /// populated: it was populated the whole time, which is exactly why a
+    /// state assertion would have passed against the bug (`CLAUDE.md` rule 1).
+    /// The divider column is *located* from the two groups' own painted tab
+    /// labels rather than hardcoded.
+    ///
+    /// **RED against unfixed `develop`**: with the `EditorOp::GroupDividers`
+    /// arm removed, nothing paints between the panes and the
+    /// non-background-pixel scan below finds no column at all. Confirmed by
+    /// hand before restoring the arm.
+    #[test]
+    fn group_divider_paints_between_the_two_groups_via_gtk_driver() {
+        let mut h = harness(engine_with_every_editor_rung(), 1400, 900);
+        h.driver.render();
+
+        // Locate the boundary from the geometry the frame actually painted,
+        // never from hardcoded coordinates (`CLAUDE.md` rule 1).
+        let (div_x, mid_y) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have been painted");
+            assert_eq!(
+                layout.group_dividers.len(),
+                1,
+                "fixture must produce exactly one between-group divider"
+            );
+            let div = &layout.group_dividers[0];
+            // The two groups' painted window rects must straddle it — proves
+            // `position` is the boundary we think it is before probing there.
+            let lefts: Vec<f64> = layout.windows.iter().map(|w| w.rect.x).collect();
+            assert!(
+                lefts.iter().any(|&x| x < div.position) && lefts.iter().any(|&x| x >= div.position),
+                "divider at {} should sit between the two groups' windows \
+                 (window lefts: {lefts:?})",
+                div.position
+            );
+            (
+                div.position as i32,
+                (div.cross_start + div.cross_size / 2.0) as i32,
+            )
+        };
+
+        // Both pane backgrounds, sampled well clear of the boundary. Reading
+        // *both* is what makes this test able to fail: the groups sit on
+        // slightly different background tones (an active/inactive pane
+        // distinction), so a probe that only knew the left one would score the
+        // right pane's own first column as "something painted" and pass
+        // against the very bug this asserts is fixed — verified by hand, it
+        // did exactly that on the first draft.
+        let left_bg = h.driver.pixel(div_x - 40, mid_y);
+        let right_bg = h.driver.pixel(div_x + 40, mid_y);
+        let line = (div_x - 8..=div_x + 8)
+            .map(|x| (x, h.driver.pixel(x, mid_y)))
+            .find(|(_, p)| *p != left_bg && *p != right_bg);
+        assert!(
+            line.is_some(),
+            "no group-divider line painted within +/-8px of x={div_x} on row \
+             {mid_y}: every pixel there is one of the two pane backgrounds \
+             ({left_bg:?} / {right_bg:?}). Before #764 GTK painted nothing here \
+             at all while still resolving divider drags against the very same \
+             rect — `ScreenLayout::group_dividers` was populated the whole \
+             time, which is why a state assertion would have passed against \
+             the bug."
+        );
+    }
+
+    /// A **live** tab drag composes the ghost rung *inside* the editor band.
+    ///
+    /// **RED against unfixed `develop`**: GTK painted its drop overlay ~900
+    /// lines below the editor column, after the editor-anchored popups and the
+    /// entire chrome band, so the rung existed nowhere in any walk and the
+    /// record could not contain it. That placement also meant a completion
+    /// menu or hover popup left open when a drag starts painted *over* the
+    /// drop-zone highlight that owns the pointer — see `EDITOR_Z_ORDER`.
+    ///
+    /// Two moves and no `mouse_up`, so the drag is still live when the frame
+    /// under assertion is painted: the first move crosses the travel threshold
+    /// and *starts* the drag (`TabDragMove::Crossed` -> `TabDragState::begin`),
+    /// the second is the first one tracked into a drop zone.
+    #[test]
+    fn live_tab_drag_composes_the_ghost_rung_inside_the_band_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_764_gtk_tab_drag_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("zqa764.txt");
+        let b = dir.join("zqb764.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.new_tab(Some(&a));
+        engine.new_tab(Some(&b));
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // Match the trailing space so `find_bounds` resolves to the *tab*
+        // label rather than the per-window status line 800px lower down (the
+        // same disambiguation `tab_drag_past_a_neighbour_...` documents).
+        let bounds = |h: &Harness<_>, name: &str| {
+            h.driver
+                .find_bounds(&format!("{name}.txt "))
+                .unwrap_or_else(|| panic!("tab label for {name} must be painted"))
+        };
+        let (from, to) = {
+            let (ra, rb) = (bounds(&h, "zqa764"), bounds(&h, "zqb764"));
+            let (l, r) = if ra.x < rb.x { (ra, rb) } else { (rb, ra) };
+            (
+                (l.x + l.width / 2.0, l.y + l.height / 2.0),
+                (r.x + r.width / 2.0, r.y + r.height / 2.0),
+            )
+        };
+        h.driver.mouse_down(from.0, from.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.mouse_move(to.0, to.1);
+        h.driver.render();
+
+        let band = h.composed_editor_band.borrow();
+        assert!(
+            band.contains(&crate::render::EditorOp::TabDragOverlay),
+            "a drag is live, so the ghost rung must be composed inside the \
+             editor band; got {band:?}"
+        );
+        assert_eq!(
+            crate::render::check_editor_band_order(&band),
+            Ok(()),
+            "the ghost rung must land in canonical position, not wherever the \
+             old hoisted-out paint site happened to sit"
+        );
+        drop(band);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single-group frame composes no `GroupDividers` rung — the record is
+    /// not just "whatever `EDITOR_Z_ORDER` contains", and the gate is real.
+    #[test]
+    fn unsplit_editor_composes_no_group_divider_rung_via_gtk_driver() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+
+        let h = harness(engine, 1400, 900);
+        let band = h.composed_editor_band.borrow();
+        assert!(
+            !band.contains(&crate::render::EditorOp::GroupDividers),
+            "one editor group means no between-group boundary, so the rung \
+             must not be composed; got {band:?}"
+        );
+        assert!(
+            !band.contains(&crate::render::EditorOp::TabDragOverlay),
+            "no drag is live, so the ghost rung must not be composed; got {band:?}"
+        );
+        assert_eq!(
+            crate::render::check_editor_band_order(&band),
             Ok(()),
             "the surviving rungs must still be in canonical order"
         );
