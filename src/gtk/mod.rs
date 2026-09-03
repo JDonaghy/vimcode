@@ -4,18 +4,13 @@
 
 use gtk4::pango;
 use pangocairo::functions as pangocairo;
-use std::cell::RefCell;
-use std::fs;
 use std::path::PathBuf;
-use std::rc::Rc;
 
 use crate::core;
 use crate::render;
 
-use core::engine::EngineAction;
 use core::settings::LineNumberMode;
 use core::Engine;
-use render::Theme;
 
 use std::collections::HashMap;
 

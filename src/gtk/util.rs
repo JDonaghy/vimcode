@@ -1,4 +1,5 @@
 use super::*;
+use std::fs;
 
 /// Open a URL in the default browser (only https/http).
 pub(crate) fn open_url(url: &str) {
