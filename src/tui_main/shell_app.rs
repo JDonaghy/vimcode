@@ -446,30 +446,29 @@ pub struct TuiShellApp {
     /// to `render::route_modal_overlay_click`; never recomputed at click
     /// time (#582 / #646).
     tab_switcher_popup_rect: RefCell<Option<quadraui::Rect>>,
-    /// The overlay rungs this frame actually painted, in paint order (#735).
+    /// The frame rungs this frame actually composed, in composition order
+    /// (#735, folded into one sequence by #766).
     ///
-    /// Written by the [`render::OVERLAY_Z_ORDER`] walk at the tail of
+    /// Written by the single [`render::compose_frame`] walk in
     /// `render_content` — every arm that draws pushes its own
-    /// [`render::OverlayOp`], and arms that only clear a stale hit-test cache
-    /// do not. `App` (`gtk/mod.rs`) keeps the identical field for the identical
+    /// [`render::FrameOp`], and arms whose surface turned out to be absent do
+    /// not. `App` (`gtk/mod.rs`) keeps the identical field for the identical
     /// reason: it is the observable that makes "both backends compose the
-    /// overlay band in the same order" a thing a test can assert, rather than
+    /// frame in the same order" a thing a test can assert, rather than
     /// something two hand-kept ladders promise each other in comments (they
-    /// promised, and they had drifted — twice; see `OVERLAY_Z_ORDER`).
+    /// promised, and they had drifted — twice; see `FRAME_Z_ORDER`).
+    ///
+    /// Before #766 this was *two* fields — `painted_overlay_band` and
+    /// `composed_chrome_band` — so "the frame's sequence" was still two
+    /// observables a backend could get individually right and jointly wrong.
     ///
     /// `Rc` because `driver_with_shell` returns `TuiDriver<impl AppLogic>` —
     /// an opaque `ShellAdapter` with no accessor back to the concrete
     /// `TuiShellApp` — so a test has to clone the handle *before* handing the
     /// app over, exactly as `gtk/testing.rs`'s `Harness` does for every one of
     /// its painted-geometry observables.
-    painted_overlay_band: std::rc::Rc<RefCell<Vec<render::OverlayOp>>>,
-    /// The chrome-band twin of [`Self::painted_overlay_band`] (#763): written
-    /// by the [`render::compose_frame`] walk, one [`render::FrameOp`] pushed by
-    /// every arm that actually composed its rung. Same `Rc` rationale, same
-    /// role — it is what makes "both backends compose the chrome band in the
-    /// same order" assertable rather than promised in comments.
-    composed_chrome_band: std::rc::Rc<RefCell<Vec<render::FrameOp>>>,
-    /// The editor-band twin of [`Self::composed_chrome_band`] (#764): written
+    composed_frame: std::rc::Rc<RefCell<Vec<render::FrameOp>>>,
+    /// The editor-band twin of [`Self::composed_frame`] (#764): written
     /// by the [`render::compose_editor_band`] walk, one [`render::EditorOp`]
     /// pushed by every arm that actually composed its rung. Same `Rc`
     /// rationale, same role — it is what makes "both backends compose the
@@ -556,13 +555,37 @@ pub(super) fn to_q_rect(r: Rect) -> quadraui::Rect {
     quadraui::Rect::new(r.x as f32, r.y as f32, r.width as f32, r.height as f32)
 }
 
+/// The inverse of [`to_q_rect`]: a shell-supplied `quadraui::Rect` snapped back
+/// to the whole-cell grid TUI's own painters take.
+///
+/// Rounds rather than truncates, matching every hand-written
+/// `x.round() as u16` this replaces.
+pub(super) fn to_cell_rect(r: quadraui::Rect) -> Rect {
+    Rect {
+        x: r.x.round() as u16,
+        y: r.y.round() as u16,
+        width: r.width.round() as u16,
+        height: r.height.round() as u16,
+    }
+}
+
 impl TuiShellApp {
+    /// The window title stem shown in the Command Center — the workspace
+    /// directory's own name, or `VimCode` when `cwd` has no file name (`/`).
+    fn window_title_stem(&self) -> String {
+        self.engine
+            .cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "VimCode".to_string())
+    }
+
     /// Compose the **editor band** (#764, #735 slice 3) into `backend`.
     ///
     /// Walks `render::compose_editor_band` — the single ordered artefact both
-    /// backends walk for the editor column, exactly as `CHROME_Z_ORDER` is for
-    /// the surrounding chrome and `OVERLAY_Z_ORDER` for the app-level
-    /// overlays. Geometry stays here, in cells; the *order* and the *gates*
+    /// backends walk for the editor column, exactly as `FRAME_Z_ORDER` is for
+    /// the surrounding chrome and the app-level overlays. Geometry stays here, in cells; the *order* and the *gates*
     /// live in `render.rs`. `EDITOR_Z_ORDER`'s doc comment records the two
     /// defects this convergence closed (GTK never painted the group dividers
     /// at all, and painted its tab-drag ghost above the editor popups).
@@ -845,8 +868,7 @@ impl TuiShellApp {
             context_menu_layout: RefCell::new(None),
             dialog_layout: RefCell::new(None),
             tab_switcher_popup_rect: RefCell::new(None),
-            painted_overlay_band: std::rc::Rc::new(RefCell::new(Vec::new())),
-            composed_chrome_band: std::rc::Rc::new(RefCell::new(Vec::new())),
+            composed_frame: std::rc::Rc::new(RefCell::new(Vec::new())),
             composed_editor_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             composed_bottom_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             last_sidebar_refresh: Cell::new(now),
@@ -1810,47 +1832,84 @@ impl ShellApp for TuiShellApp {
             debug_assert!(false, "{why}");
         }
 
-        // ══ Chrome band (#763, #735 slice 2) ═════════════════════════════
+        // ══ Frame sequence (#766, #735 slice 6) ══════════════════════════
         //
         // Composed from `render::compose_frame` — the single ordered artefact
-        // both backends walk for the non-editor bands, exactly as
-        // `OVERLAY_Z_ORDER` (below) is for the app-level overlays. Geometry
-        // stays here, in cells; only the *order* and the *gates* moved.
-        // `CHROME_Z_ORDER`'s doc comment records which three rungs changed
-        // position, why that repaints nothing, and the two gate divergences it
-        // closes.
+        // both backends walk for everything around and on top of the editor
+        // column. Slices 1-4 landed this as *four* ladders (editor, bottom,
+        // chrome, overlay); slice 6 folds the chrome and overlay halves into
+        // one `FrameOp` sequence, so the frame is no longer "a composer plus a
+        // special-cased top band" a backend could get individually right and
+        // jointly wrong. Geometry stays here, in cells; only the *order* and
+        // the *gates* are shared.
         //
-        // The two hit-test caches whose "absent" branch used to live in an
-        // `else` are cleared here instead, before the walk: `compose_frame`
-        // returns only the live rungs, so an absent rung has no arm to run.
-        // Both must reflect exactly what the shell reserved this frame — empty
-        // when nothing was — because `handle()`'s MenuSystem intercept and
+        // Every cache a rung owns is cleared *here*, before the walk, never
+        // from an `else` arm inside it: `compose_frame` returns only the live
+        // rungs, so an absent rung has no arm to run. Both title-bar rects must
+        // reflect exactly what the shell reserved this frame — empty when
+        // nothing was — because `handle()`'s MenuSystem intercept and
         // `mouse.rs`/`route_chrome_click` read them instead of re-deriving the
-        // bands, which is what let paint and hit-test disagree (#695, #752).
+        // bands, which is what let paint and hit-test disagree (#695, #752);
+        // the modal layouts must be cleared for the same reason on the frame
+        // their surface disappears (the #587 class of bug).
+        //
+        // Every arm gates itself on the *value* it needs and, when it composes,
+        // records the rung it composed — naming the variant explicitly
+        // (`push(FrameOp::Dialog)`), never `push(op)`. That distinction is the
+        // difference between a test that can fail and one that cannot: with
+        // `push(op)` the record follows the *pattern* the walk is currently at,
+        // so swapping two arms' bodies composes them in the wrong order while
+        // still recording the right one.
         self.engine
             .menu_bar_rect
             .set(layout.title_bar_bounds.unwrap_or_default());
         self.engine
             .global_status_rect
             .set(quadraui::Rect::default());
+        self.engine.command_center_layout.replace(None);
+        *self.tab_switcher_popup_rect.borrow_mut() = None;
+        *self.context_menu_layout.borrow_mut() = None;
+        *self.dialog_layout.borrow_mut() = None;
+        self.engine.toast_layout.replace(None);
 
-        let mut composed_chrome: Vec<render::FrameOp> = Vec::new();
-        for op in render::compose_frame(&screen, layout, render::FrameMetrics::CELL) {
+        // Screen-anchored overlays (modals, toasts) deliberately use
+        // `layout.window_bounds` — the *whole* terminal — rather than `area`
+        // (`main_content_bounds`, the editor column): anchoring them to the
+        // editor column would shift every modal right by the activity-bar +
+        // sidebar width.
+        let win_q = quadraui::Rect::new(
+            win_area.x as f32,
+            win_area.y as f32,
+            win_area.width as f32,
+            win_area.height as f32,
+        );
+
+        // Built once, before the walk, because its presence gate and its
+        // `ToastStack` arm need the same value and `build_toast_stack` is not
+        // free.
+        let toast_stack = render::build_toast_stack(&self.engine);
+
+        let mut presence =
+            render::FramePresence::from_screen(&screen, layout, render::FrameMetrics::CELL);
+        presence.toast_stack = toast_stack.is_some();
+        presence.folder_picker = self.folder_picker.is_some();
+
+        let mut composed: Vec<render::FrameOp> = Vec::new();
+        for op in render::compose_frame(&presence) {
             match op {
                 // ── Menu row: measure only ───────────────────────────────
-                // `draw_menu_bar` is *not* called here. The dropdown rung of
-                // the overlay band (`OverlayOp::MenuDropdown`) calls
-                // `MenuSystem::render`, which unconditionally repaints
-                // `draw_menu_bar` across the entire reserved band — including
-                // the command centre's columns to the right of the last menu
-                // label — whether or not a dropdown is open. Painting the
-                // command centre before that meant it was wiped every frame,
-                // leaving a populated-but-invisible `command_center_layout`
-                // (paint and hit-test disagreeing, exactly the #695 menu-bar
-                // and #676 GTK command-centre bugs). So this rung only
-                // *measures* (`menu_bar_layout`), and `pending_command_center`
-                // carries the computed rect + descriptor across to the
-                // `OverlayOp::CommandCenter` arm (#712).
+                // `draw_menu_bar` is *not* called here. The `MenuDropdown`
+                // rung calls `MenuSystem::render`, which unconditionally
+                // repaints `draw_menu_bar` across the entire reserved band —
+                // including the command centre's columns to the right of the
+                // last menu label — whether or not a dropdown is open.
+                // Painting the command centre before that meant it was wiped
+                // every frame, leaving a populated-but-invisible
+                // `command_center_layout` (paint and hit-test disagreeing,
+                // exactly the #695 menu-bar and #676 GTK command-centre bugs).
+                // So this rung only *measures* (`menu_bar_layout`), and
+                // `pending_command_center` carries the computed rect +
+                // descriptor across to the `CommandCenter` arm (#712).
                 render::FrameOp::MenuRow => {
                     let band = self.engine.menu_bar_rect.get();
                     backend.set_theme(super::quadraui_tui::q_theme(&theme));
@@ -1861,22 +1920,15 @@ impl ShellApp for TuiShellApp {
                     // takes everything from the last menu label to the right
                     // edge, which is what this computed by hand before #763.
                     let bands = render::measure_title_bar_bands(backend, band, band, &bar, None);
-                    let title = self
-                        .engine
-                        .cwd
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "VimCode".to_string());
                     pending_command_center = Some((
                         bands.command_center,
                         render::build_command_center_view(
                             self.engine.tab_nav_can_go_back(),
                             self.engine.tab_nav_can_go_forward(),
-                            &title,
+                            &self.window_title_stem(),
                         ),
                     ));
-                    composed_chrome.push(render::FrameOp::MenuRow);
+                    composed.push(render::FrameOp::MenuRow);
                 }
 
                 // ── Sidebar panel body (#607) ────────────────────────────
@@ -1889,20 +1941,14 @@ impl ShellApp for TuiShellApp {
                 // panels are ported.
                 render::FrameOp::SidebarPanel => {
                     if let Some(sb) = layout.sidebar_content_bounds {
-                        let sb_area = Rect {
-                            x: sb.x.round() as u16,
-                            y: sb.y.round() as u16,
-                            width: sb.width.round() as u16,
-                            height: sb.height.round() as u16,
-                        };
                         render_sidebar_content(
                             backend,
-                            sb_area,
+                            to_cell_rect(sb),
                             &self.sidebar,
                             &self.engine,
                             &theme,
                         );
-                        composed_chrome.push(render::FrameOp::SidebarPanel);
+                        composed.push(render::FrameOp::SidebarPanel);
                     }
                 }
 
@@ -1910,29 +1956,18 @@ impl ShellApp for TuiShellApp {
                 render::FrameOp::Wildmenu => {
                     if let Some(ref wm) = screen.wildmenu {
                         let bar = render::wildmenu_to_status_bar(wm, &theme);
-                        let q_rect = quadraui::Rect::new(
-                            chrome.wildmenu.x as f32,
-                            chrome.wildmenu.y as f32,
-                            chrome.wildmenu.width as f32,
-                            chrome.wildmenu.height as f32,
-                        );
-                        backend.draw_status_bar(q_rect, &bar, None, None);
-                        composed_chrome.push(render::FrameOp::Wildmenu);
+                        backend.draw_status_bar(to_q_rect(chrome.wildmenu), &bar, None, None);
+                        composed.push(render::FrameOp::Wildmenu);
                     }
                 }
 
                 // ── Global status bar ────────────────────────────────────
                 render::FrameOp::StatusBar => {
                     if let Some(ref bar) = screen.global_status_bar {
-                        let q_rect = quadraui::Rect::new(
-                            chrome.status.x as f32,
-                            chrome.status.y as f32,
-                            chrome.status.width as f32,
-                            chrome.status.height as f32,
-                        );
+                        let q_rect = to_q_rect(chrome.status);
                         self.engine.global_status_rect.set(q_rect);
                         backend.draw_status_bar(q_rect, bar, None, None);
-                        composed_chrome.push(render::FrameOp::StatusBar);
+                        composed.push(render::FrameOp::StatusBar);
                     }
                 }
 
@@ -1945,146 +1980,87 @@ impl ShellApp for TuiShellApp {
                         &theme,
                         self.cmd_sel.get(),
                     );
-                    composed_chrome.push(render::FrameOp::CommandLine);
+                    composed.push(render::FrameOp::CommandLine);
                 }
-            }
-        }
 
-        *self.composed_chrome_band.borrow_mut() = composed_chrome;
-        // Read back through the field rather than the local, so the *stored*
-        // observable is what gets validated — a frame that recorded one thing
-        // and composed another would be a lie the tests then trusted.
-        if let Err(why) = render::check_chrome_band_order(&self.composed_chrome_band.borrow()) {
-            debug_assert!(false, "TUI {why}");
-        }
+                // ── Folder / workspace picker modal (TUI only) ───────────
+                // First rung of the overlay tail — above every chrome rung,
+                // below the title-bar band and the modal stack, which is
+                // exactly where it was composed before #766 made it a named
+                // rung instead of a stray paint between two walks. See
+                // `FrameOp::FolderPicker` for why GTK has no twin.
+                render::FrameOp::FolderPicker => {
+                    if let Some(ref picker) = self.folder_picker {
+                        // Sizing identical to the pre-shell path's: 60% of
+                        // viewport width clamped to >= 50; 55% of viewport
+                        // height clamped to >= 15. `mouse.rs`'s folder-picker
+                        // hit-test recomputes the identical arithmetic.
+                        let width = (win_area.width * 3 / 5).max(50);
+                        let height = (win_area.height * 55 / 100).max(15);
+                        let popup_x = win_area.x + (win_area.width.saturating_sub(width)) / 2;
+                        let popup_y = win_area.y + (win_area.height.saturating_sub(height)) / 2;
+                        let palette = folder_picker_to_palette(picker, width as usize);
+                        backend.draw_palette(
+                            quadraui::Rect::new(
+                                popup_x as f32,
+                                popup_y as f32,
+                                width as f32,
+                                height as f32,
+                            ),
+                            &palette,
+                        );
+                        composed.push(render::FrameOp::FolderPicker);
+                    }
+                }
 
-        // The panel hover popup used to be composed here, after the whole
-        // chrome band. #765 moved it into the `BottomOp::PanelHover` rung
-        // above, matching GTK — see that arm for why the move is z-safe.
-
-        // ── Folder / workspace picker modal ──────────────────────────────
-        if let Some(ref picker) = self.folder_picker {
-            // Sizing identical to `draw_frame`'s: 60% of viewport width
-            // clamped to >= 50; 55% of viewport height clamped to >= 15.
-            let width = (win_area.width * 3 / 5).max(50);
-            let height = (win_area.height * 55 / 100).max(15);
-            let popup_x = win_area.x + (win_area.width.saturating_sub(width)) / 2;
-            let popup_y = win_area.y + (win_area.height.saturating_sub(height)) / 2;
-            let palette = folder_picker_to_palette(picker, width as usize);
-            let q_rect =
-                quadraui::Rect::new(popup_x as f32, popup_y as f32, width as f32, height as f32);
-            backend.draw_palette(q_rect, &palette);
-        }
-
-        // ══ Overlay band (#735 slice 1) ══════════════════════════════════
-        //
-        // Composed from `render::OVERLAY_Z_ORDER` — the single ordered
-        // artefact both backends walk, replacing the two hand-kept
-        // transcriptions that had already inverted twice against each other
-        // (see that constant's own comment for the two inversions and which
-        // order won). Geometry stays here, in cells, because that is the
-        // genuine per-backend difference; only the *order* moved.
-        //
-        // Two rungs of this ladder moved as a result:
-        //
-        //   * the **menu dropdown and command centre** used to paint *last*,
-        //     on top of the modals. They are title-bar chrome, and a modal
-        //     dialog covering them is what "modal" means — GTK already had
-        //     them below, so #735 took GTK's placement.
-        //   * the **dialog** used to paint below the context menu on GTK.
-        //     TUI already had it above, which is the order
-        //     `route_modal_overlay_click` itself arbitrates, so #735 took
-        //     TUI's placement. This side is unchanged.
-        //
-        // Not part of the shared band, and deliberately left above it: TUI's
-        // folder/workspace picker (GTK's equivalent is a *native* GTK file
-        // chooser deferred through `PendingFileDialog` and run from `tick()`,
-        // so it is not a canvas rung at all).
-        //
-        // Every arm gates itself and, when it paints, records the rung it
-        // painted — naming the variant explicitly (`push(OverlayOp::Dialog)`),
-        // never `push(op)`. That distinction is the difference between a test
-        // that can fail and one that cannot: with `push(op)` the record follows
-        // the *pattern* the walk is currently at, so swapping two arms' bodies
-        // paints them in the wrong order while still recording the right one.
-        // Naming the variant makes the record describe what was drawn, so
-        // `check_overlay_band_order` (and the black-box tests reading this
-        // field) catch that swap.
-        //
-        // Arms whose surface is absent still run — several own
-        // a hit-test cache (`tab_switcher_popup_rect`, `context_menu_layout`,
-        // `dialog_layout`, `command_center_layout`, `toast_layout`) that must
-        // be *cleared* on the frame the surface disappears, or the next click
-        // resolves against last frame's geometry (the #587 class of bug).
-        let win_q = quadraui::Rect::new(
-            win_area.x as f32,
-            win_area.y as f32,
-            win_area.width as f32,
-            win_area.height as f32,
-        );
-        let mut painted_band: Vec<render::OverlayOp> = Vec::new();
-
-        for op in render::OVERLAY_Z_ORDER {
-            match op {
                 // ── Menu dropdown (#635, Stage 6b item A) ────────────────
                 // `MenuSystem::render` repaints `draw_menu_bar` across the
                 // whole reserved row, so nothing that wants to survive may be
-                // drawn into that row before it — which is exactly why this is
-                // the *first* rung and `CommandCenter` is the second. #695:
-                // read the same `engine.menu_bar_rect` cache the measure-only
-                // block at the top of this function wrote, rather than
-                // re-reading `layout.title_bar_bounds` a second time — one
-                // write, every reader downstream (paint and hit-test alike)
-                // consumes it verbatim.
-                render::OverlayOp::MenuDropdown => {
-                    if self.engine.menu_bar_visible {
-                        let bar_rect = self.engine.menu_bar_rect.get();
-                        if bar_rect.width >= 1.0 && bar_rect.height >= 1.0 {
-                            self.engine.menu_system.borrow().render(backend, bar_rect);
-                            painted_band.push(render::OverlayOp::MenuDropdown);
-                        }
-                    }
+                // drawn into that row before it — which is exactly why this
+                // comes before `CommandCenter`. #695: read the same
+                // `engine.menu_bar_rect` cache the `MenuRow` rung wrote,
+                // rather than re-reading `layout.title_bar_bounds` a second
+                // time — one write, every reader downstream (paint and
+                // hit-test alike) consumes it verbatim.
+                render::FrameOp::MenuDropdown => {
+                    self.engine
+                        .menu_system
+                        .borrow()
+                        .render(backend, self.engine.menu_bar_rect.get());
+                    composed.push(render::FrameOp::MenuDropdown);
                 }
 
-                // ── Command centre (#635 Stage 6b item A, #712) ───────────
+                // ── Command centre (#635 Stage 6b item A, #712) ──────────
                 // Painted *after* `menu_system.render()` above, which repaints
-                // `draw_menu_bar` across the entire `bar_rect` band and would
-                // erase anything drawn here first — see
-                // `pending_command_center`'s own comment (menu-bar block, top
-                // of this function) for the full story and the matching GTK
-                // ordering (`gtk/mod.rs`'s "#676: painted *after*
-                // `menu_system.render()`"). `None` both when the bar is hidden
-                // and when this frame's reserved row was degenerate (zero
-                // width/height) — either way `command_center_layout` must
+                // `draw_menu_bar` across the entire band and would erase
+                // anything drawn here first. `command_center_layout` must
                 // agree with what actually got painted, not linger with last
                 // frame's stale layout (mouse.rs's hit test reads this cache
-                // directly).
-                render::OverlayOp::CommandCenter => {
-                    let painted = pending_command_center
-                        .take()
-                        .map(|(cc_rect, cc)| backend.draw_command_center(cc_rect, &cc));
-                    if painted.is_some() {
-                        painted_band.push(render::OverlayOp::CommandCenter);
+                // directly) — hence the unconditional clear before the walk.
+                render::FrameOp::CommandCenter => {
+                    if let Some((cc_rect, cc)) = pending_command_center.take() {
+                        let painted = backend.draw_command_center(cc_rect, &cc);
+                        self.engine.command_center_layout.replace(Some(painted));
+                        composed.push(render::FrameOp::CommandCenter);
                     }
-                    self.engine.command_center_layout.replace(painted);
                 }
 
                 // ── Find/replace overlay ─────────────────────────────────
                 // `find_replace.group_bounds` is already absolute
                 // terminal-screen space (#550), so the rect passed here only
                 // supplies the clip viewport.
-                render::OverlayOp::FindReplace => {
+                render::FrameOp::FindReplace => {
                     if let Some(ref find_replace) = screen.find_replace {
                         backend.draw_find_replace(win_q, find_replace);
-                        painted_band.push(render::OverlayOp::FindReplace);
+                        composed.push(render::FrameOp::FindReplace);
                     }
                 }
 
                 // ── Unified picker modal ─────────────────────────────────
-                render::OverlayOp::UnifiedPicker => {
+                render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
                         render_picker_popup(picker, win_area, &theme, backend);
-                        painted_band.push(render::OverlayOp::UnifiedPicker);
+                        composed.push(render::FrameOp::UnifiedPicker);
                     }
                 }
 
@@ -2095,8 +2071,7 @@ impl ShellApp for TuiShellApp {
                 // rung — before this the TUI had no tab-switcher mouse arm at
                 // all, so a click on the popup fell through to the editor
                 // underneath (#733).
-                render::OverlayOp::TabSwitcher => {
-                    *self.tab_switcher_popup_rect.borrow_mut() = None;
+                render::FrameOp::TabSwitcher => {
                     if let Some(ref ts) = screen.tab_switcher {
                         if let Some(geo) = render::TabSwitcherGeometry::compute(
                             win_q,
@@ -2107,7 +2082,7 @@ impl ShellApp for TuiShellApp {
                                 render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
                             backend.draw_list(geo.bounds, &list);
                             *self.tab_switcher_popup_rect.borrow_mut() = Some(geo.bounds);
-                            painted_band.push(render::OverlayOp::TabSwitcher);
+                            composed.push(render::FrameOp::TabSwitcher);
                         }
                     }
                 }
@@ -2118,32 +2093,31 @@ impl ShellApp for TuiShellApp {
                 // from the cell written here, so a click on a menu item now
                 // resolves to that item instead of falling through to "close
                 // the menu".
-                render::OverlayOp::ContextMenu => {
-                    match screen.context_menu.as_ref().filter(|p| !p.items.is_empty()) {
-                        Some(ctx_menu) => {
-                            let inner_viewport = quadraui::Rect::new(
-                                (win_area.x + 1) as f32,
-                                (win_area.y + 1) as f32,
-                                win_area.width.saturating_sub(2) as f32,
-                                win_area.height.saturating_sub(2) as f32,
-                            );
-                            let inset_panel = render::ContextMenuPanel {
-                                screen_col: ctx_menu.screen_col + 1,
-                                screen_row: ctx_menu.screen_row + 1,
-                                ..ctx_menu.clone()
-                            };
-                            let (menu, menu_layout) = render::context_menu_generic_layout(
-                                &inset_panel,
-                                inner_viewport,
-                                1.0,
-                                1.0,
-                                1.0,
-                            );
-                            let _ = backend.draw_context_menu(&menu, &menu_layout);
-                            *self.context_menu_layout.borrow_mut() = Some(menu_layout);
-                            painted_band.push(render::OverlayOp::ContextMenu);
-                        }
-                        None => *self.context_menu_layout.borrow_mut() = None,
+                render::FrameOp::ContextMenu => {
+                    if let Some(ctx_menu) =
+                        screen.context_menu.as_ref().filter(|p| !p.items.is_empty())
+                    {
+                        let inner_viewport = quadraui::Rect::new(
+                            (win_area.x + 1) as f32,
+                            (win_area.y + 1) as f32,
+                            win_area.width.saturating_sub(2) as f32,
+                            win_area.height.saturating_sub(2) as f32,
+                        );
+                        let inset_panel = render::ContextMenuPanel {
+                            screen_col: ctx_menu.screen_col + 1,
+                            screen_row: ctx_menu.screen_row + 1,
+                            ..ctx_menu.clone()
+                        };
+                        let (menu, menu_layout) = render::context_menu_generic_layout(
+                            &inset_panel,
+                            inner_viewport,
+                            1.0,
+                            1.0,
+                            1.0,
+                        );
+                        let _ = backend.draw_context_menu(&menu, &menu_layout);
+                        *self.context_menu_layout.borrow_mut() = Some(menu_layout);
+                        composed.push(render::FrameOp::ContextMenu);
                     }
                 }
 
@@ -2152,36 +2126,32 @@ impl ShellApp for TuiShellApp {
                 // `route_modal_overlay_click`'s own arbitration: once a dialog
                 // is open it takes every event, so it must also be the surface
                 // the user can see. GTK painted it *underneath* until #735.
-                render::OverlayOp::Dialog => {
+                render::FrameOp::Dialog => {
                     if let Some(ref dialog) = screen.dialog {
                         let (q_dialog, dlg_layout) =
                             render::dialog_generic_layout(dialog, win_q, 1.0, 1.0);
                         let _ = backend.draw_dialog(&q_dialog, &dlg_layout);
                         *self.dialog_layout.borrow_mut() = Some(dlg_layout);
-                        painted_band.push(render::OverlayOp::Dialog);
-                    } else {
-                        *self.dialog_layout.borrow_mut() = None;
+                        composed.push(render::FrameOp::Dialog);
                     }
                 }
 
-                // ── Toast overlay (#450) — top of the band ───────────────
-                render::OverlayOp::ToastStack => {
-                    if let Some(stack) = render::build_toast_stack(&self.engine) {
-                        let toast_layout = backend.draw_toast_stack(win_q, &stack);
+                // ── Toast overlay (#450) — top of the sequence ───────────
+                render::FrameOp::ToastStack => {
+                    if let Some(ref stack) = toast_stack {
+                        let toast_layout = backend.draw_toast_stack(win_q, stack);
                         self.engine.toast_layout.replace(Some(toast_layout));
-                        painted_band.push(render::OverlayOp::ToastStack);
-                    } else {
-                        self.engine.toast_layout.replace(None);
+                        composed.push(render::FrameOp::ToastStack);
                     }
                 }
             }
         }
 
-        *self.painted_overlay_band.borrow_mut() = painted_band;
+        *self.composed_frame.borrow_mut() = composed;
         // Read back through the field rather than the local, so the *stored*
         // observable is what gets validated — a frame that recorded one thing
-        // and painted another would be a lie the tests then trusted.
-        if let Err(why) = render::check_overlay_band_order(&self.painted_overlay_band.borrow()) {
+        // and composed another would be a lie the tests then trusted.
+        if let Err(why) = render::check_frame_order(&self.composed_frame.borrow()) {
             debug_assert!(false, "TUI {why}");
         }
 
@@ -6024,8 +5994,8 @@ mod tests {
     }
     //
     // These are the TUI half of the acceptance test. `gtk/testing.rs`'s
-    // `mod overlay_band_z_order` carries the GTK half, asserting against the
-    // **same expected `Vec<OverlayOp>`** for the same engine state. A single
+    // `mod frame_sequence` carries the GTK half, asserting against the
+    // **same expected `Vec<FrameOp>`** for the same engine state. A single
     // test cannot drive both backends (the GTK `App` lives in the `vimcode` bin
     // target, `TuiShellApp` in `vcd`), so "both backends emit the same
     // sequence" is expressed as two tests with one expected value; keep them in
@@ -6037,13 +6007,93 @@ mod tests {
     // on here is what makes the two expected bands literally identical rather
     // than "identical modulo two rungs".
 
+    /// **#735's headline acceptance criterion, TUI half:** the whole frame,
+    /// as one `FrameOp` sequence, must equal what the GTK twin
+    /// (`frame_sequence_matches_across_backends_via_gtk_driver`) records for
+    /// the same state.
+    ///
+    /// Nine rungs live, five absent — the chrome band, the title-bar band and a
+    /// context menu under a modal dialog — so the assertion cannot degenerate
+    /// into "whatever `FRAME_Z_ORDER` contains". Both halves read
+    /// `render::frame_sequence_fixture()`, a single `#[cfg(test)]` fn compiled
+    /// into both bin targets.
+    ///
+    /// **RED-verified against unfixed `develop`**: this test could not be
+    /// written there at all — the chrome and overlay halves were two fields
+    /// (`composed_chrome_band`, `painted_overlay_band`) with two order
+    /// constants, so there was no single sequence to compare. With the fold in
+    /// place, reordering *one rung on one backend* (hoisting `FrameOp::Dialog`'s
+    /// arm body above `FrameOp::ContextMenu`'s, out of the `compose_frame`
+    /// walk) makes this fail with `[.., Dialog, ContextMenu]` while the GTK
+    /// twin still reads `[.., ContextMenu, Dialog]`, and trips
+    /// `check_frame_order`'s `debug_assert` in `render_content` on the way.
+    /// Re-introduced, observed red, restored before committing.
+    #[test]
+    fn frame_sequence_matches_across_backends_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        // The *settings* panel, not the explorer: its body paints fixed chrome,
+        // where the explorer's would be this checkout's own directory listing —
+        // ambient state a test must not depend on (#762).
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app.engine.menu_bar_visible = true;
+        // Explicit, not ambient (#762): a global status bar exists only when
+        // per-window status lines are off, and the default is on.
+        app.engine.settings.window_status_line = false;
+        app.engine.wildmenu_items = vec!["ZQXWwildA".to_string(), "ZQXWwildB".to_string()];
+        app.engine.wildmenu_selected = Some(0);
+        app.engine.open_editor_context_menu(4, 4);
+        assert!(
+            app.engine
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty()),
+            "fixture needs a non-empty context menu — an empty one is not composed"
+        );
+        app.engine.dialog = Some(in_canvas_dialog("ZQXW766DIALOG"));
+
+        let frame = app.composed_frame.clone();
+        // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
+        // is what reserves `layout.title_bar_bounds`, and with no reserved row
+        // the three title-bar rungs are not live at all.
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let screen = driver.screen();
+
+        assert_eq!(
+            *frame.borrow(),
+            render::frame_sequence_fixture(),
+            "expected frame sequence differs from the GTK twin's \
+             (`frame_sequence_matches_across_backends_via_gtk_driver`); \
+             screen:\n{screen}"
+        );
+
+        // Composition, not just bookkeeping (#587/#592): the rungs the record
+        // claims must have reached the cells, and the dialog must land on top
+        // of the context menu it was composed after.
+        assert!(
+            driver.find_bounds("File").is_some(),
+            "MenuDropdown was composed but the menu bar never painted; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ZQXWwildA"),
+            "Wildmenu was composed but no wildmenu entry painted; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ZQXW766DIALOG"),
+            "recorded sequence claims the dialog painted, but its title is not \
+             on screen — the recorder and the rasteriser disagree; screen:\n{screen}"
+        );
+    }
+
     /// Opens a context menu and a modal dialog in the same frame and asserts
-    /// the *painted* band is `[ContextMenu, Dialog]` — the dialog on top.
+    /// the *composed* overlay tail is `[ContextMenu, Dialog]` — the dialog on
+    /// top.
     ///
     /// RED against unfixed `develop`: TUI already painted these two in this
     /// order, but nothing recorded or asserted it, so GTK's inverted copy
     /// (`Dialog` then `ContextMenu`) went unnoticed. Move either backend's arm
-    /// out of the `OVERLAY_Z_ORDER` walk — which is exactly the shape the bug
+    /// out of the `compose_frame` walk — which is exactly the shape the bug
     /// had — and the recorded sequence changes here or in the GTK twin.
     #[test]
     fn overlay_band_paints_dialog_above_context_menu_via_shell_app() {
@@ -6059,7 +6109,7 @@ mod tests {
         );
         app.engine.dialog = Some(in_canvas_dialog("ZQXW735DIALOG"));
 
-        let band = app.painted_overlay_band.clone();
+        let frame = app.composed_frame.clone();
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the menu-dropdown rung has nothing to paint into.
@@ -6067,11 +6117,14 @@ mod tests {
         let screen = driver.screen();
 
         assert_eq!(
-            *band.borrow(),
-            render::overlay_band_dialog_over_context_menu_fixture(),
-            "expected band differs from the GTK twin's \
-             (`overlay_band_paints_dialog_above_context_menu_via_gtk_driver`). \
-             Two orderings are pinned here: the title-bar chrome below the modal \
+            overlay_tail(&frame.borrow()),
+            vec![
+                render::FrameOp::MenuDropdown,
+                render::FrameOp::CommandCenter,
+                render::FrameOp::ContextMenu,
+                render::FrameOp::Dialog,
+            ],
+            "two orderings are pinned here: the title-bar chrome below the modal \
              stack (TUI had that inverted before #735 — it painted the menu row \
              over open dialogs) and the dialog above the context menu (GTK had \
              *that* inverted); screen:\n{screen}"
@@ -6084,34 +6137,58 @@ mod tests {
         );
     }
 
-    /// A frame with no overlays open records an empty band — the recorder is
-    /// not just "whatever `OVERLAY_Z_ORDER` contains".
+    /// A frame with no overlays open records an empty overlay tail — the
+    /// recorder is not just "whatever `FRAME_Z_ORDER` contains".
     ///
-    /// Guards the arms that must run for their *clearing* side-effect (stale
+    /// Guards the caches that must be cleared *before* the walk (stale
     /// `dialog_layout` / `context_menu_layout` / `tab_switcher_popup_rect`
     /// geometry is the #587 class of bug) without that being mistaken for a
-    /// paint.
+    /// paint. Since #766 the absent rungs have no arm to run at all, so the
+    /// clear has to be unconditional — this is the test that would catch it
+    /// being folded back into an `else`.
     #[test]
     fn overlay_band_is_empty_when_no_overlay_is_open_via_shell_app() {
         let app = TuiShellApp::new(None);
-        let band = app.painted_overlay_band.clone();
+        let frame = app.composed_frame.clone();
         let driver = driver_with_shell(app, config(), 80, 24);
         let _ = driver.screen();
         assert_eq!(
-            *band.borrow(),
-            Vec::<render::OverlayOp>::new(),
-            "no overlay was open, so nothing in the band should have painted"
+            overlay_tail(&frame.borrow()),
+            Vec::<render::FrameOp>::new(),
+            "no overlay was open, so nothing in the tail should have composed"
+        );
+        // The chrome half is unaffected: the command-line row is always
+        // composed, so an empty *tail* is not an empty frame.
+        assert!(
+            frame.borrow().contains(&render::FrameOp::CommandLine),
+            "the command line row is composed on every frame"
         );
     }
 
-    // ── Chrome band (#763, #735 slice 2) ────────────────────────────────────
+    // ── Chrome half of the sequence (#763, #735 slice 2) ────────────────────
     //
-    // The TUI half of the chrome-band acceptance test. `gtk/testing.rs`'s
+    // The TUI half of the chrome acceptance test. `gtk/testing.rs`'s
     // `mod chrome_band_order` carries the GTK half and asserts against the
     // **same expected `Vec<FrameOp>`** (`render::chrome_band_fixture`) for the
-    // same engine state, exactly as the overlay-band pair above does.
+    // same engine state, exactly as the pair above does.
 
-    /// Every chrome rung live, composed in `CHROME_Z_ORDER`.
+    /// The chrome rungs of `composed_frame` — everything before the overlay
+    /// tail.
+    fn chrome_half(frame: &[render::FrameOp]) -> Vec<render::FrameOp> {
+        frame
+            .iter()
+            .copied()
+            .filter(|op| !op.is_overlay())
+            .collect()
+    }
+
+    /// The overlay rungs of `composed_frame` — the tail `OverlayOp` used to be
+    /// its own enum for, before #766 folded it in.
+    fn overlay_tail(frame: &[render::FrameOp]) -> Vec<render::FrameOp> {
+        frame.iter().copied().filter(|op| op.is_overlay()).collect()
+    }
+
+    /// Every chrome rung live, composed in `FRAME_Z_ORDER`.
     ///
     /// **RED against unfixed `develop`**, in two independent ways. (1) TUI
     /// composed the wildmenu *before* the global status line and GTK composed
@@ -6119,7 +6196,7 @@ mod tests {
     /// the two arms' bodies back (hoisting `FrameOp::StatusBar`'s body above
     /// `FrameOp::Wildmenu`'s, out of the `compose_frame` walk) makes this fail
     /// with `[.., StatusBar, Wildmenu, ..]` and trips
-    /// `check_chrome_band_order`'s `debug_assert` in `render_content` on the
+    /// `check_frame_order`'s `debug_assert` in `render_content` on the
     /// way. (2) TUI composed the menu row and the sidebar panel body at the
     /// *top* of the frame, ahead of the editor — hoisting either arm back out
     /// of the walk drops its `FrameOp` from the record entirely. Both were
@@ -6143,7 +6220,7 @@ mod tests {
         // per-window status lines are off, and the default is on.
         app.engine.settings.window_status_line = false;
 
-        let band = app.composed_chrome_band.clone();
+        let frame = app.composed_frame.clone();
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the `MenuRow` rung is not live at all.
@@ -6151,7 +6228,7 @@ mod tests {
         let screen = driver.screen();
 
         assert_eq!(
-            *band.borrow(),
+            chrome_half(&frame.borrow()),
             render::chrome_band_fixture(true),
             "expected chrome band differs from the GTK twin's \
              (`chrome_band_composes_in_canonical_order_via_gtk_driver`); \
@@ -6187,7 +6264,7 @@ mod tests {
     }
 
     /// With no wildmenu up, the `Wildmenu` rung drops out — the record is not
-    /// simply "whatever `CHROME_Z_ORDER` contains", and the remaining four
+    /// simply "whatever `FRAME_Z_ORDER` contains", and the remaining four
     /// rungs keep their relative order.
     #[test]
     fn chrome_band_drops_the_wildmenu_rung_when_no_completion_is_up_via_shell_app() {
@@ -6199,11 +6276,11 @@ mod tests {
             "fixture needs no wildmenu"
         );
 
-        let band = app.composed_chrome_band.clone();
+        let frame = app.composed_frame.clone();
         let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
         let screen = driver.screen();
         assert_eq!(
-            *band.borrow(),
+            chrome_half(&frame.borrow()),
             render::chrome_band_fixture(false),
             "no completion was up, so the Wildmenu rung must not be composed; \
              screen:\n{screen}"
@@ -6218,26 +6295,35 @@ mod tests {
     /// This is the paint/hit-test agreement #695 is about, expressed as a
     /// composition fact: a `MenuRow` rung composed against a band the shell
     /// never reserved would publish a `menu_bar_rect` nothing paints into.
+    /// #766: the same gate now also drops `MenuDropdown` and `CommandCenter`,
+    /// which is the divergence the fold closed on the GTK side (its dropdown
+    /// arm checked only `menu_bar_visible`).
     #[test]
     fn chrome_band_drops_the_menu_row_when_the_shell_reserved_no_title_bar_via_shell_app() {
         let mut app = app_with_sidebar_open();
         app.engine.menu_bar_visible = true;
 
-        let band = app.composed_chrome_band.clone();
+        let frame = app.composed_frame.clone();
         let driver = driver_with_shell(app, config(), 80, 24);
         let screen = driver.screen();
-        assert!(
-            !band.borrow().contains(&render::FrameOp::MenuRow),
-            "no title-bar row was reserved, so MenuRow must not be composed; \
-             screen:\n{screen}"
-        );
+        for op in [
+            render::FrameOp::MenuRow,
+            render::FrameOp::MenuDropdown,
+            render::FrameOp::CommandCenter,
+        ] {
+            assert!(
+                !frame.borrow().contains(&op),
+                "no title-bar row was reserved, so {op:?} must not be composed; \
+                 screen:\n{screen}"
+            );
+        }
         assert!(
             driver.find_bounds("File").is_none(),
             "no title-bar row was reserved, so no menu bar should have painted; \
              screen:\n{screen}"
         );
         assert_eq!(
-            render::check_chrome_band_order(&band.borrow()),
+            render::check_frame_order(&frame.borrow()),
             Ok(()),
             "the surviving rungs must still be in canonical order"
         );

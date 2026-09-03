@@ -740,27 +740,27 @@ struct App {
     /// handler. (B.5b Stage 7.)
     #[allow(clippy::type_complexity)]
     tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
-    /// The overlay rungs this frame actually painted, in paint order (#735).
+    /// The frame rungs this frame actually composed, in composition order
+    /// (#735, folded into one sequence by #766).
     ///
-    /// Written by the [`render::OVERLAY_Z_ORDER`] walk at the tail of
+    /// Written by the single [`render::compose_frame`] walk in
     /// `render_content` — every arm that draws pushes its own
-    /// [`render::OverlayOp`], and arms that only clear a stale hit-test cache
-    /// do not. It is the *observable* that makes "both backends compose the
-    /// overlay band in the same order" testable: `TuiShellApp` keeps the
-    /// identical field, and the two backends' recorded sequences are asserted
-    /// equal against the same expected `Vec<OverlayOp>`.
+    /// [`render::FrameOp`], and arms whose surface turned out to be absent do
+    /// not. It is the *observable* that makes "both backends compose the frame
+    /// in the same order" testable: `TuiShellApp` keeps the identical field,
+    /// and the two backends' recorded sequences are asserted equal against the
+    /// same expected `Vec<FrameOp>` (`render::frame_sequence_fixture`).
+    ///
+    /// Before #766 this was *two* fields — `painted_overlay_band` and
+    /// `composed_chrome_band` — so "the frame's sequence" was still two
+    /// observables a backend could get individually right and jointly wrong.
     ///
     /// Cheap enough to keep in release builds (at most
-    /// `OVERLAY_Z_ORDER.len()` pushes into a reused `Vec` per frame) and
-    /// useful there too — `check_overlay_band_order` turns a z-order
+    /// `FRAME_Z_ORDER.len()` pushes into a reused `Vec` per frame) and
+    /// useful there too — `check_frame_order` turns a z-order
     /// inversion into a diagnosable string rather than a visual mystery.
-    painted_overlay_band: Rc<RefCell<Vec<render::OverlayOp>>>,
-    /// The chrome-band twin of [`Self::painted_overlay_band`] (#763): written
-    /// by the [`render::compose_frame`] walk, one [`render::FrameOp`] pushed by
-    /// every arm that actually composed its rung. `TuiShellApp` keeps the
-    /// identical field for the identical reason.
-    composed_chrome_band: Rc<RefCell<Vec<render::FrameOp>>>,
-    /// The editor-band twin of [`Self::composed_chrome_band`] (#764): written
+    composed_frame: Rc<RefCell<Vec<render::FrameOp>>>,
+    /// The editor-band twin of [`Self::composed_frame`] (#764): written
     /// by the [`render::compose_editor_band`] walk, one [`render::EditorOp`]
     /// pushed by every arm that actually composed its rung. Same `Rc`
     /// rationale, same role — it is what makes "both backends compose the
@@ -1197,8 +1197,7 @@ impl App {
             completion_layout: Rc::new(RefCell::new(None)),
             context_menu_layout: Rc::new(RefCell::new(None)),
             tab_switcher_popup_rect: Rc::new(Cell::new(None)),
-            painted_overlay_band: Rc::new(RefCell::new(Vec::new())),
-            composed_chrome_band: Rc::new(RefCell::new(Vec::new())),
+            composed_frame: Rc::new(RefCell::new(Vec::new())),
             composed_editor_band: Rc::new(RefCell::new(Vec::new())),
             composed_bottom_band: Rc::new(RefCell::new(Vec::new())),
             picker_popup_rect: Rc::new(Cell::new(None)),
@@ -3126,7 +3125,7 @@ impl App {
         // applied by `apply_context_menu_route` / `apply_picker_route`. The
         // shared router also fixed their order: this backend arbitrated the
         // context menu *below* find/replace and the picker, while
-        // `render::OVERLAY_Z_ORDER` paints it above both.
+        // `render::FRAME_Z_ORDER` paints it above both.
 
         // ── Chrome rung (#752) ────────────────────────────────────────────
         //
@@ -5014,7 +5013,7 @@ impl App {
     /// `MenuSystem::render` calls `draw_menu_bar` across the whole band, so the
     /// icon slot and the controls must follow it or get erased (the #552
     /// round-2/3 "buttons render blank" regression). Kept off
-    /// [`render::OVERLAY_Z_ORDER`] because TUI has neither an app icon nor
+    /// [`render::FRAME_Z_ORDER`]'s overlay tail because TUI has neither an app icon nor
     /// in-canvas window controls, so they cannot be part of a *shared*
     /// sequence; they ride the `MenuDropdown` rung instead (#735).
     #[allow(clippy::too_many_arguments)]
@@ -5078,7 +5077,7 @@ impl App {
         //
         // #735 moved this from the very end of `render_content` (below the
         // dialog and context menu) to here. It is title-bar chrome, so the
-        // modal rungs of `render::OVERLAY_Z_ORDER` now paint over it — which is
+        // modal rungs of `render::FRAME_Z_ORDER` now paint over it — which is
         // the point: a modal dialog covering the window controls is what
         // "modal" means, and it is what TUI already did with everything it
         // painted into its own title-bar row.
@@ -5327,7 +5326,7 @@ impl quadraui::ShellApp for App {
         // Composed from `render::compose_editor_band` — the single ordered
         // artefact both backends walk for the editor column, exactly as
         // `CHROME_Z_ORDER` (further down) is for the surrounding chrome and
-        // `OVERLAY_Z_ORDER` (below that) for the app-level overlays. Geometry
+        // `FRAME_Z_ORDER`'s overlay tail for the app-level overlays. Geometry
         // stays here, in pixels; only the *order* and the *gates* moved.
         //
         // Two things the walk changed on GTK, both recorded in
@@ -5900,19 +5899,26 @@ impl quadraui::ShellApp for App {
             debug_assert!(false, "{why}");
         }
 
-        // ══ Chrome band (#763, #735 slice 2) ═════════════════════════════════
+        // ══ Frame sequence (#766, #735 slice 6) ══════════════════════════════
         //
         // Composed from `render::compose_frame` — the single ordered artefact
-        // both backends walk for the non-editor bands, exactly as
-        // `OVERLAY_Z_ORDER` (below) is for the app-level overlays. Geometry and
-        // rasterisation stay here, in pixels; only the *order* and the *gates*
-        // moved. `CHROME_Z_ORDER`'s doc comment records which three rungs
-        // changed position, why that repaints nothing, and the two gate
-        // divergences it closes.
+        // both backends walk for everything around and on top of the editor
+        // column. Slices 1-4 landed this as *four* ladders (editor, bottom,
+        // chrome, overlay); slice 6 folds the chrome and overlay halves into
+        // one `FrameOp` sequence, so the frame is no longer "a composer plus a
+        // special-cased top band" a backend could get individually right and
+        // jointly wrong. Geometry and rasterisation stay here, in pixels; only
+        // the *order* and the *gates* are shared. `FRAME_Z_ORDER`'s doc comment
+        // records which rungs changed position and the divergences that closed.
         //
         // Caches whose "absent" branch used to live in an `else` are cleared
         // here, before the walk: `compose_frame` returns only the live rungs,
-        // so an absent rung has no arm left to run.
+        // so an absent rung has no arm left to run. Every arm gates itself on
+        // the *value* it needs and, when it composes, records the rung by name
+        // (`push(FrameOp::Dialog)`, never `push(op)`) — with `push(op)` the
+        // record would follow the pattern the walk is at, so swapping two arms'
+        // bodies would compose them in the wrong order while still recording
+        // the right one.
         let status_y = y + h - status_bar_h;
         self.engine
             .borrow()
@@ -5936,8 +5942,68 @@ impl quadraui::ShellApp for App {
         let mut controls_rect: Option<quadraui::Rect> = None;
         let mut command_center_rect: Option<quadraui::Rect> = None;
 
-        let mut composed_chrome: Vec<render::FrameOp> = Vec::new();
-        for op in render::compose_frame(screen, layout, render::FrameMetrics::px(lh, cw)) {
+        // The overlay tail's caches are cleared here for the same reason
+        // (#766): the tail is part of this one walk now, so a rung whose gate
+        // is off has no arm left to run and cannot clear its own cache from an
+        // `else`. A stale `dialog_layout` / `context_menu_layout` /
+        // `picker_popup_rect` / `tab_switcher_popup_rect` resolves the next
+        // click against last frame's geometry — the #587 class of bug.
+        self.engine.borrow().command_center_layout.replace(None);
+        self.picker_popup_rect.set(None);
+        self.tab_switcher_popup_rect.set(None);
+        *self.context_menu_layout.borrow_mut() = None;
+        *self.dialog_layout.borrow_mut() = None;
+        self.engine.borrow().toast_layout.replace(None);
+        // #727's native-dialog edge trigger, hoisted out of the `Dialog` arm
+        // (#766): a *native* dialog is not a frame rung, so the arm no longer
+        // runs for it. A native dialog must be presented exactly once per open
+        // — `native_dialog_shown` is the edge: the first `render_content` call
+        // to see a given open queues the present (via `pending_native_dialog`,
+        // drained by `tick()` since the blocking `PlatformServices` call can't
+        // run from inside this paint callback, mirroring `PendingFileDialog`
+        // #572) and flips the flag; a *closed* dialog re-arms it.
+        match screen
+            .dialog
+            .as_ref()
+            .map(render::dialog_panel_to_quadraui_dialog)
+            .as_ref()
+            .and_then(quadraui::native_dialog_options)
+        {
+            Some(opts) => {
+                if !self.native_dialog_shown.get() {
+                    self.native_dialog_shown.set(true);
+                    self.pending_native_dialog.set(Some(opts));
+                }
+            }
+            None => {
+                if screen.dialog.is_none() {
+                    self.native_dialog_shown.set(false);
+                }
+            }
+        }
+
+        let popup_vp = backend.viewport();
+        let popup_viewport = quadraui::Rect::new(0.0, 0.0, popup_vp.width, popup_vp.height);
+        // Built once, before the walk, because its presence gate and its
+        // `ToastStack` arm need the same value and `build_toast_stack` is not
+        // free.
+        let toast_stack = render::build_toast_stack(&engine);
+
+        let mut presence =
+            render::FramePresence::from_screen(screen, layout, render::FrameMetrics::px(lh, cw));
+        presence.toast_stack = toast_stack.is_some();
+        // TUI-only rung: GTK's folder chooser is a *native* GTK file dialog
+        // deferred through `PendingFileDialog` and run from `tick()`, so there
+        // is no canvas surface to compose. See `render::FrameOp::FolderPicker`.
+        presence.folder_picker = false;
+        // #727: a natively-expressible dialog is presented by the OS, not
+        // composed into this frame, so the rung is not live. `dialog_layout`
+        // stays cleared above and nothing is recorded — the sequence describes
+        // what reached the canvas.
+        presence.dialog = screen.dialog.is_some() && !self.native_dialog_shown.get();
+
+        let mut composed: Vec<render::FrameOp> = Vec::new();
+        for op in render::compose_frame(&presence) {
             match op {
                 // ── Menu bar row (client-side chrome; #552): measure only ────
                 // quadraui's `run_with_shell` GTK runner (single-DA
@@ -5954,7 +6020,7 @@ impl quadraui::ShellApp for App {
                 //
                 // This is layout-only (`menu_bar_layout`, no draw): the bar
                 // itself — and the whole `menu_row_rect` band — is painted from
-                // the overlay band's `OverlayOp::MenuDropdown` arm below.
+                // the `FrameOp::MenuDropdown` arm below.
                 // Drawing the controls or the Command Center *here* (as this
                 // used to) is pointless because that later `menu_system.render()`
                 // repaints `draw_menu_bar` across the entire band and erases
@@ -5989,7 +6055,7 @@ impl quadraui::ShellApp for App {
                     self.title_bar_rect.set(bands.controls);
                     controls_rect = Some(bands.controls);
                     command_center_rect = Some(bands.command_center);
-                    composed_chrome.push(render::FrameOp::MenuRow);
+                    composed.push(render::FrameOp::MenuRow);
                 }
 
                 // ── Sidebar panel body ───────────────────────────────────────
@@ -6208,7 +6274,7 @@ impl quadraui::ShellApp for App {
                         // value and `handle_mouse_press` went on arbitrating
                         // clicks against a popup that was no longer on screen.
 
-                        composed_chrome.push(render::FrameOp::SidebarPanel);
+                        composed.push(render::FrameOp::SidebarPanel);
                     }
                 }
 
@@ -6226,7 +6292,7 @@ impl quadraui::ShellApp for App {
                         let wm_rect =
                             quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);
                         let _ = backend.draw_status_bar(wm_rect, &wm_bar, None, None);
-                        composed_chrome.push(render::FrameOp::Wildmenu);
+                        composed.push(render::FrameOp::Wildmenu);
                     }
                 }
 
@@ -6248,7 +6314,7 @@ impl quadraui::ShellApp for App {
                                 &backend.status_bar_layout(sb_rect, bar),
                             );
                         let _ = backend.draw_status_bar(sb_rect, bar, None, None);
-                        composed_chrome.push(render::FrameOp::StatusBar);
+                        composed.push(render::FrameOp::StatusBar);
                     }
                 }
 
@@ -6258,54 +6324,20 @@ impl quadraui::ShellApp for App {
                     let cmd = render::command_line_view(&screen.command);
                     let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
                     backend.draw_command_line(cmd_rect, &cmd);
-                    composed_chrome.push(render::FrameOp::CommandLine);
+                    composed.push(render::FrameOp::CommandLine);
                 }
-            }
-        }
 
-        *self.composed_chrome_band.borrow_mut() = composed_chrome;
-        // Read back through the field rather than the local, so the *stored*
-        // observable is what gets validated.
-        if let Err(why) = render::check_chrome_band_order(&self.composed_chrome_band.borrow()) {
-            debug_assert!(false, "GTK {why}");
-        }
-        // ══ Overlay band (#735 slice 1) ══════════════════════════════════════
-        //
-        // Everything from here to the end of `render_content` is composed from
-        // `render::OVERLAY_Z_ORDER` — the single ordered artefact both backends
-        // walk, replacing the two hand-kept transcriptions that had already
-        // inverted twice against each other (see that constant's own comment
-        // for the two inversions and which order won). Geometry and
-        // rasterisation stay here, in pixels, because that is the genuine
-        // per-backend difference; only the *order* moved.
-        //
-        // Every arm gates itself and, when it paints, records the rung it
-        // painted — naming the variant explicitly (`push(OverlayOp::Dialog)`),
-        // never `push(op)`. That distinction is the difference between a test
-        // that can fail and one that cannot: with `push(op)` the record follows
-        // the *pattern* the walk is currently at, so swapping two arms' bodies
-        // paints them in the wrong order while still recording the right one.
-        // Naming the variant makes the record describe what was drawn, so
-        // `check_overlay_band_order` (and the black-box tests reading this
-        // field) catch that swap.
-        //
-        // Arms whose surface is absent still run — several own
-        // a hit-test cache (`picker_popup_rect`, `dialog_layout`,
-        // `context_menu_layout`, `tab_switcher_popup_rect`,
-        // `command_center_layout`, `toast_layout`) that must be *cleared* on
-        // the frame the surface disappears, or the next click resolves against
-        // last frame's geometry (the #587 class of bug).
-        //
-        // Not part of the shared band, and deliberately left above it: the tab
-        // drag overlay (TUI paints its drag ghost in the editor band instead)
-        // and — see the `MenuDropdown` arm — the app-icon slot and inline
-        // window controls, neither of which TUI has at all.
-        let popup_vp = backend.viewport();
-        let popup_viewport = quadraui::Rect::new(0.0, 0.0, popup_vp.width, popup_vp.height);
-        let mut painted_band: Vec<render::OverlayOp> = Vec::new();
+                // ── Folder / workspace picker (TUI only) ─────────────────────
+                // GTK's equivalent is a *native* GTK file chooser, deferred
+                // through `PendingFileDialog` and run from `tick()`, so there
+                // is nothing to compose here — the rung is never live on this
+                // backend. Present as an arm rather than absent from the enum
+                // because the sequence is shared: a rung one backend owns has
+                // to appear in the order, or the order is not the whole frame.
+                // `mouse.rs`'s folder-picker block records the identical
+                // "deliberately one-sided, do not converge" verdict for input.
+                render::FrameOp::FolderPicker => {}
 
-        for op in render::OVERLAY_Z_ORDER {
-            match op {
                 // ── Menu dropdown overlay ────────────────────────────────────
                 // First rung of the band: `MenuSystem::render` repaints
                 // `draw_menu_bar` across the whole title-bar strip, so nothing
@@ -6315,10 +6347,12 @@ impl quadraui::ShellApp for App {
                 // covers an open dropdown on both backends, matching
                 // `route_modal_overlay_click`'s own "a dialog eats everything"
                 // arbitration.
-                render::OverlayOp::MenuDropdown => {
-                    if !engine.menu_bar_visible {
-                        continue;
-                    }
+                // #766: the `engine.menu_bar_visible` check that used to open
+                // this arm is `FramePresence::from_screen`'s now — and stricter,
+                // because it also requires the shell to have reserved a band at
+                // least one text line tall. This arm painted the whole title bar
+                // into a degenerate rect before the fold.
+                render::FrameOp::MenuDropdown => {
                     self.paint_title_bar_band(
                         backend,
                         &engine,
@@ -6328,7 +6362,7 @@ impl quadraui::ShellApp for App {
                         app_icon_rect,
                         controls_rect,
                     );
-                    painted_band.push(render::OverlayOp::MenuDropdown);
+                    composed.push(render::FrameOp::MenuDropdown);
                 }
 
                 // ── Command Center: nav arrows + search box (#676) ────────────
@@ -6344,7 +6378,7 @@ impl quadraui::ShellApp for App {
                 // hit-test, mirroring TUI's `shell_app.rs` (#635 Stage 6b item
                 // A) and `mouse.rs`'s "Menu bar row click — command center
                 // only".
-                render::OverlayOp::CommandCenter => {
+                render::FrameOp::CommandCenter => {
                     if let Some(cc_rect) = command_center_rect.filter(|r| r.width >= 1.0) {
                         let title = engine
                             .cwd
@@ -6359,9 +6393,7 @@ impl quadraui::ShellApp for App {
                         );
                         let cc_layout = backend.draw_command_center(cc_rect, &cc);
                         engine.command_center_layout.replace(Some(cc_layout));
-                        painted_band.push(render::OverlayOp::CommandCenter);
-                    } else {
-                        engine.command_center_layout.replace(None);
+                        composed.push(render::FrameOp::CommandCenter);
                     }
                 }
 
@@ -6382,10 +6414,10 @@ impl quadraui::ShellApp for App {
                 // `rect` argument here is unused by the GTK rasteriser too;
                 // passed for parity with the trait's signature and the TUI call
                 // site.
-                render::OverlayOp::FindReplace => {
+                render::FrameOp::FindReplace => {
                     if let Some(ref find_replace) = screen.find_replace {
                         backend.draw_find_replace(popup_viewport, find_replace);
-                        painted_band.push(render::OverlayOp::FindReplace);
+                        composed.push(render::FrameOp::FindReplace);
                     }
                 }
 
@@ -6399,7 +6431,7 @@ impl quadraui::ShellApp for App {
                 // silently" symptom. Geometry comes from the same generic
                 // helpers the legacy path used (`PickerGeometry` +
                 // `gtk_picker_sizing`), so no Pango/Cairo access is needed here.
-                render::OverlayOp::UnifiedPicker => {
+                render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
                         let has_preview = picker.preview.is_some();
                         let geo = render::PickerGeometry::compute(
@@ -6427,9 +6459,7 @@ impl quadraui::ShellApp for App {
                             geo.popup_w as f64,
                             geo.popup_h as f64,
                         )));
-                        painted_band.push(render::OverlayOp::UnifiedPicker);
-                    } else {
-                        self.picker_popup_rect.set(None);
+                        composed.push(render::FrameOp::UnifiedPicker);
                     }
                 }
 
@@ -6445,8 +6475,7 @@ impl quadraui::ShellApp for App {
                 // `render::tab_switcher_to_quadraui_list_view` adapter TUI's
                 // `TuiShellApp::render_content` uses, through
                 // `Backend::draw_list`.
-                render::OverlayOp::TabSwitcher => {
-                    self.tab_switcher_popup_rect.set(None);
+                render::FrameOp::TabSwitcher => {
                     if let Some(ref ts) = screen.tab_switcher {
                         // #733: geometry comes from the shared
                         // `TabSwitcherGeometry` so the rect handed to
@@ -6467,7 +6496,7 @@ impl quadraui::ShellApp for App {
                                 geo.bounds.width as f64,
                                 geo.bounds.height as f64,
                             )));
-                            painted_band.push(render::OverlayOp::TabSwitcher);
+                            composed.push(render::FrameOp::TabSwitcher);
                         }
                     }
                 }
@@ -6480,26 +6509,20 @@ impl quadraui::ShellApp for App {
                 // menus invisible and unclickable. Drawn with only generic
                 // `Backend` metrics (`render::context_menu_generic_layout`,
                 // shared with TUI) since this fn has no raw Pango/Cairo access.
-                render::OverlayOp::ContextMenu => {
-                    match screen.context_menu.as_ref().filter(|p| !p.items.is_empty()) {
-                        Some(panel) => {
-                            let (menu, mlayout) = render::context_menu_generic_layout(
-                                panel,
-                                popup_viewport,
-                                cw,
-                                lh,
-                                0.0,
-                            );
-                            let mut frame = QSL::new();
-                            frame.push(Surface::ContextMenu {
-                                menu: &menu,
-                                layout: &mlayout,
-                            });
-                            frame.draw(backend);
-                            *self.context_menu_layout.borrow_mut() = Some(mlayout);
-                            painted_band.push(render::OverlayOp::ContextMenu);
-                        }
-                        None => *self.context_menu_layout.borrow_mut() = None,
+                render::FrameOp::ContextMenu => {
+                    if let Some(panel) =
+                        screen.context_menu.as_ref().filter(|p| !p.items.is_empty())
+                    {
+                        let (menu, mlayout) =
+                            render::context_menu_generic_layout(panel, popup_viewport, cw, lh, 0.0);
+                        let mut frame = QSL::new();
+                        frame.push(Surface::ContextMenu {
+                            menu: &menu,
+                            layout: &mlayout,
+                        });
+                        frame.draw(backend);
+                        *self.context_menu_layout.borrow_mut() = Some(mlayout);
+                        composed.push(render::FrameOp::ContextMenu);
                     }
                 }
 
@@ -6515,56 +6538,27 @@ impl quadraui::ShellApp for App {
                 //
                 // #727: a natively-expressible `screen.dialog` (no `DialogTable`,
                 // no text input — `quadraui::native_dialog_options` is the single
-                // source of truth for that split, no hand-maintained tag list
-                // here) goes through a real OS `AlertDialog` instead of this
-                // in-canvas primitive. Unlike this primitive, which is happily
-                // repainted every frame, a native dialog must be presented
-                // exactly once per open — `native_dialog_shown` is the
-                // edge-trigger: the first `render_content` call to see a given
-                // open queues the present (via `pending_native_dialog`, drained
-                // by `tick()` since the blocking `PlatformServices` call can't
-                // run from inside this paint callback, mirroring
-                // `PendingFileDialog` #572) and flips the flag; every subsequent
-                // call before the dialog closes just suppresses the in-canvas
-                // draw without re-queuing. A native dialog is *not* recorded in
-                // `painted_band`: nothing was composed into this frame.
-                render::OverlayOp::Dialog => {
-                    match screen
-                        .dialog
-                        .as_ref()
-                        .map(render::dialog_panel_to_quadraui_dialog)
-                    {
-                        Some(dialog) => match quadraui::native_dialog_options(&dialog) {
-                            Some(opts) => {
-                                if !self.native_dialog_shown.get() {
-                                    self.native_dialog_shown.set(true);
-                                    self.pending_native_dialog.set(Some(opts));
-                                }
-                                *self.dialog_layout.borrow_mut() = None;
-                            }
-                            None => {
-                                // Carries a `DialogTable` or text input (e.g. the
-                                // SSH-passphrase prompt) — no native alert
-                                // facility hosts either, so this stays in-canvas
-                                // exactly as before.
-                                let panel =
-                                    screen.dialog.as_ref().expect("just matched Some above");
-                                let (dialog, dlayout) =
-                                    render::dialog_generic_layout(panel, popup_viewport, cw, lh);
-                                let mut frame = QSL::new();
-                                frame.push(Surface::Dialog {
-                                    dialog: &dialog,
-                                    layout: &dlayout,
-                                });
-                                frame.draw(backend);
-                                *self.dialog_layout.borrow_mut() = Some(dlayout);
-                                painted_band.push(render::OverlayOp::Dialog);
-                            }
-                        },
-                        None => {
-                            self.native_dialog_shown.set(false);
-                            *self.dialog_layout.borrow_mut() = None;
-                        }
+                // source of truth for that split) goes through a real OS
+                // `AlertDialog` instead of this in-canvas primitive, and is
+                // therefore *not* live as a frame rung at all: nothing is
+                // composed into this frame, so nothing is recorded. Both halves
+                // of that split — the presence gate and the once-per-open native
+                // present — are stated before the walk; this arm is the
+                // in-canvas half only. A dialog reaching here carries a
+                // `DialogTable` or a text input (e.g. the SSH-passphrase
+                // prompt), which no native alert facility hosts.
+                render::FrameOp::Dialog => {
+                    if let Some(panel) = screen.dialog.as_ref() {
+                        let (dialog, dlayout) =
+                            render::dialog_generic_layout(panel, popup_viewport, cw, lh);
+                        let mut frame = QSL::new();
+                        frame.push(Surface::Dialog {
+                            dialog: &dialog,
+                            layout: &dlayout,
+                        });
+                        frame.draw(backend);
+                        *self.dialog_layout.borrow_mut() = Some(dlayout);
+                        composed.push(render::FrameOp::Dialog);
                     }
                 }
 
@@ -6579,23 +6573,21 @@ impl quadraui::ShellApp for App {
                 // `handle_mouse_click_msg`'s hit-test → `handle_toast_hit`
                 // dispatch, and the first rung `route_modal_overlay_click`
                 // arbitrates.
-                render::OverlayOp::ToastStack => {
-                    if let Some(stack) = render::build_toast_stack(&engine) {
-                        let toast_layout = backend.draw_toast_stack(popup_viewport, &stack);
+                render::FrameOp::ToastStack => {
+                    if let Some(ref stack) = toast_stack {
+                        let toast_layout = backend.draw_toast_stack(popup_viewport, stack);
                         engine.toast_layout.replace(Some(toast_layout));
-                        painted_band.push(render::OverlayOp::ToastStack);
-                    } else {
-                        engine.toast_layout.replace(None);
+                        composed.push(render::FrameOp::ToastStack);
                     }
                 }
             }
         }
 
-        *self.painted_overlay_band.borrow_mut() = painted_band;
+        *self.composed_frame.borrow_mut() = composed;
         // Read back through the field rather than the local, so the *stored*
         // observable is what gets validated — a frame that recorded one thing
-        // and painted another would be a lie the tests then trusted.
-        if let Err(why) = render::check_overlay_band_order(&self.painted_overlay_band.borrow()) {
+        // and composed another would be a lie the tests then trusted.
+        if let Err(why) = render::check_frame_order(&self.composed_frame.borrow()) {
             debug_assert!(false, "GTK {why}");
         }
     }
