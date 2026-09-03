@@ -97,15 +97,16 @@ is a long way from the north star, and the remaining gap should not be planned a
 
 ### What remains — four items, none of them queued
 
-1. **The irreducible surface is recorded but never aggregated.** The slices did the
-   honest thing and recorded verdicts in code where convergence was rejected on the
-   merits. **Nine anchors** carry a *"one-sided" / "do not converge" / "intrinsic
-   difference"* verdict — four in `src/render.rs`, two in `src/tui_main/mouse.rs`
-   (#751 and #752), one each in `src/gtk/mod.rs`, `src/gtk/testing.rs` and
-   `src/tui_main/shell_app.rs`. Find them with:
-   `grep -rn -iE "do not converge|not converged|one-sided|intrinsic difference" src/`
-   Nobody has turned those into one "this is the per-backend surface that stays"
-   statement, which is what would let anyone judge how far 19,995 is from done.
+1. ~~**The irreducible surface is recorded but never aggregated.**~~ ✅ **Done
+   2026-09-03: [`docs/IRREDUCIBLE_SURFACE.md`](docs/IRREDUCIBLE_SURFACE.md).** The nine
+   verdicts reduce to four facts, three genuinely irreducible. And the sizing answer:
+   **only 246 of 19,429 production lines (1.3%) name a native toolkit type**, so
+   platform-specificity is *not* what keeps the backends large — `src/gtk/mod.rs` and
+   `src/tui_main/shell_app.rs` are two implementations of the same four `ShellApp` entry
+   points. Plan the remainder as duplication, not porting. One verdict
+   (`tui_main/mouse.rs:1620`, command-line selection) turned out to be a **mislabelled
+   supply gap**: `CommandLineLayout::hit_test` does not exist in quadraui and was never
+   filed; **#194** is the open consumer-side symptom.
 2. **The duplication moved down into quadraui and is unqueued.** **quadraui#481**
    (shared runtime core — 1,671 non-trivial lines byte-identical between `gtk/*.rs` and
    `macos/*.rs`, `EventOutcome` declared twice verbatim, the resize debounce written

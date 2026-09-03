@@ -137,22 +137,34 @@ the remaining gap is small.
 
 ## 🔭 What actually remains
 
-### 1. The irreducible surface — recorded, never aggregated
+### 1. The irreducible surface — ✅ aggregated, and it is small
 
-The slices did the honest thing and recorded verdicts in code where convergence was
-rejected on the merits rather than forced. **Nine anchors** carry a
-*"one-sided" / "do not converge" / "intrinsic difference"* verdict — four in
-`src/render.rs`, two in `src/tui_main/mouse.rs` (#751 and #752), one each in
-`src/gtk/mod.rs`, `src/gtk/testing.rs` and `src/tui_main/shell_app.rs`:
+Done: **[`docs/IRREDUCIBLE_SURFACE.md`](docs/IRREDUCIBLE_SURFACE.md)** (2026-09-03).
+The headline, because it changes how the rest of this goal should be planned:
 
-```
-grep -rn -iE "do not converge|not converged|one-sided|intrinsic difference" src/
-```
+- The **nine** recorded verdicts reduce to **four distinct facts**, of which **three are
+  genuinely irreducible** — the TUI-only folder picker (GTK uses a native
+  `GtkFileChooser`), px-vs-cell frame metrics, and GTK's menu bar *being* its CSD
+  titlebar (#552).
+- **Only 1.3% of the two backends names a native toolkit type** — 246 production lines
+  out of 19,429 (`scripts/native_lines.py`; ~25% undercount on the GTK side for stored
+  widget handles, so call it under 4% even pessimistically).
+- **So platform-specificity is not what is keeping 19,995 lines in the backends.**
+  `src/gtk/mod.rs` (7,684) and `src/tui_main/shell_app.rs` (3,989) are two
+  implementations of the same four `ShellApp` entry points. The chain converged the
+  *decisions* those implementations make; it did not converge the implementations.
 
-These are decisions, not debt. **But nobody has aggregated them into a single
-"this is the per-backend surface that stays" statement**, which is what would let
-anyone judge how far 19,995 is from done. That aggregation is the next piece of
-this doc's own work, and it is not issue-shaped yet.
+**Plan accordingly: this is ordinary duplication, not a platform-porting problem.** A
+plan that sizes it as the latter will keep missing its projection the way #751–#766 did.
+
+**The fourth verdict was mislabelled** — `tui_main/mouse.rs:1620` (command-line text
+selection) reads as a decision but its own text says the fix is a
+`CommandLineLayout::hit_test` in quadraui. That is a *blocked* convergence whose blocker
+was never filed; `CommandLineLayout` does not exist in quadraui and **#194** is the
+open consumer-side symptom. Second instance in a week of the #47 failure mode — see the
+milestone-discipline rule at the bottom of this file, which applies to in-code comments
+too: **a comment naming a missing upstream API is an unfiled issue, and grep will not
+find it for you.**
 
 ### 2. The duplication moved down a level, into quadraui — and it is unqueued
 
@@ -236,7 +248,9 @@ oracle-authored test, rather than re-litigating the sequencing.
 - ⚠️ **#47 closed with zero code and its blocker filed nowhere** — the single most
   actionable item on this page.
 - 🔓 **quadraui#481 / #482 hold the remaining duplication** and are unqueued.
-- 📋 **Nothing is in flight and nothing is queued** for vimcode or quadraui.
+- ✅ **The irreducible surface is aggregated** — [`docs/IRREDUCIBLE_SURFACE.md`](docs/IRREDUCIBLE_SURFACE.md).
+  Only **1.3%** of the backends is platform-bound; the rest is duplication, and the goal
+  should be planned as such.
 
 ## How to use this doc
 
