@@ -88,32 +88,42 @@ type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
 /// would make it impossible to tell which change did what.
 const UI_FONT_FAMILY: &str = "Cantarell, Ubuntu, Segoe UI, Droid Sans, Sans";
 
-/// Process-global UI font size (points). Synced from
-/// `settings.ui_font_size` at the start of each frame by
-/// [`sync_ui_font_size`]. Read everywhere a Pango font description
-/// is built — avoids threading `&Settings` through every draw
-/// function for what's effectively one shared knob (#217).
-static UI_FONT_SIZE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(10);
+thread_local! {
+    /// Per-thread UI font size (points). Synced from
+    /// `settings.ui_font_size` at the start of each frame by
+    /// [`sync_ui_font_size`]. Read everywhere a Pango font description
+    /// is built — avoids threading `&Settings` through every draw
+    /// function for what's effectively one shared knob (#217).
+    ///
+    /// **Thread-local, not a process-global `AtomicU8` (#766).** Production is
+    /// unaffected: every writer and reader runs on the GTK main thread, so
+    /// "the current frame's font size" is the same value either way. The test
+    /// suite is not — `#[test]`s each get their own thread and `cargo test`
+    /// runs them in parallel, so a `GtkDriver` test that sets
+    /// `settings.ui_font_size = 8`/`28` (see `testing.rs`'s
+    /// `ui_font_size_changes_the_painted_*` cases) could store its size
+    /// *between* another test's `sync_ui_font_size` and that test's
+    /// `backend.set_ui_font(&UI_FONT())` a few lines later. The victim's frame
+    /// then measured its chrome at the wrong point size, its breadcrumb glyphs
+    /// landed outside the segment rect the hit region reported, and
+    /// `breadcrumb_path_paints_dimmer_than_editor_body_text` read editor body
+    /// text instead — a ~1-in-3 flake that reproduced only under parallel
+    /// `cargo test --lib`, never with `--test-threads=1`.
+    static UI_FONT_SIZE: std::cell::Cell<u8> = const { std::cell::Cell::new(10) };
+}
 
-/// Update the process-global UI font size from `settings`. Called
+/// Update this thread's UI font size from `settings`. Called
 /// once per frame at the top of [`App::render_content`] (#672 —
 /// `draw.rs::draw_editor`'s only live caller before the delete).
 fn sync_ui_font_size(settings: &core::settings::Settings) {
-    UI_FONT_SIZE.store(
-        settings.ui_font_size.max(6),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    UI_FONT_SIZE.with(|s| s.set(settings.ui_font_size.max(6)));
 }
 
 /// Pango font description string for UI chrome at the currently
 /// configured size. Call sites do `FontDescription::from_string(&UI_FONT())`.
 #[allow(non_snake_case)]
 fn UI_FONT() -> String {
-    format!(
-        "{} {}",
-        UI_FONT_FAMILY,
-        UI_FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed)
-    )
+    format!("{} {}", UI_FONT_FAMILY, UI_FONT_SIZE.with(|s| s.get()))
 }
 
 /// Absolute per-group close-glyph hit rects captured during `render_content`.
