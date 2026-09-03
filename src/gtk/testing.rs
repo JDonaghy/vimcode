@@ -6534,6 +6534,19 @@ mod bottom_band_order {
             "expected bottom band differs from the TUI twin's \
              (`bottom_band_composes_in_canonical_order_via_shell_app`)"
         );
+
+        // Composition, not just bookkeeping (#587/#592): the rungs the record
+        // claims must have reached the Cairo surface, mirroring the TUI twin's
+        // `find_bounds("ZQXW765QF")` / `find_bounds("ZQXW765DBG")` checks.
+        assert!(
+            h.driver.screen_contains("ZQXW765QF"),
+            "Quickfix was composed but the quickfix item text never painted"
+        );
+        assert!(
+            h.driver.screen_contains("ZQXW765DBG"),
+            "BottomPanel (Debug Output) was composed but the debug output \
+             line never painted"
+        );
     }
 
     /// The panel-hover popup is composed as the **last** bottom rung, at the

@@ -150,6 +150,16 @@
 //!    `draw_frame` path exactly. See `panels::render_terminal_panel_content`'s
 //!    own doc comment.
 //!
+//!    **Update (#765, #735 slice 4):** the four `panels::` helpers named
+//!    above (`render_quickfix_panel`, `render_bottom_panel_tabs`,
+//!    `render_terminal_toolbar`, `render_terminal_panel_content`) are gone —
+//!    deleted along with GTK's bespoke bottom-band arms and replaced by the
+//!    single shared walk over `render::compose_bottom_band` /
+//!    `render::BOTTOM_Z_ORDER`, calling `render::paint_quickfix_rung` /
+//!    `render::paint_bottom_panel_rung` / `render::paint_separated_status_rung`
+//!    from both backends. See the "Bottom band" section of
+//!    [`Self::render_content`] and the module doc at the top of `render.rs`.
+//!
 //!    The menu bar row used to be reserved in the layout math but not
 //!    painted (out of scope for #601; folded into key dispatch, #603, then
 //!    painting, #635 item A — see the Stage 6b section below). Cursor
