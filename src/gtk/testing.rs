@@ -124,6 +124,12 @@ pub struct Harness<A: AppLogic> {
     /// `overlay_band_*_via_shell_app` tests assert against the same expected
     /// `Vec<OverlayOp>` for the same engine state.
     pub painted_overlay_band: Rc<RefCell<Vec<crate::render::OverlayOp>>>,
+    /// The chrome rungs the last frame actually composed, in composition order
+    /// (#763). The GTK half of the cross-backend chrome-band assertion —
+    /// `TuiShellApp` carries the identical `composed_chrome_band` and its
+    /// `chrome_band_*_via_shell_app` tests assert against the same expected
+    /// `Vec<FrameOp>` for the same engine state.
+    pub composed_chrome_band: Rc<RefCell<Vec<crate::render::FrameOp>>>,
     /// The sidebar content rect the last frame painted the active panel into,
     /// or `None` if the sidebar was hidden. The sidebar twin of
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
@@ -392,6 +398,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let panel_hover_popup_rect = Rc::clone(&app.panel_hover_popup_rect);
     let tab_switcher_popup_rect = Rc::clone(&app.tab_switcher_popup_rect);
     let painted_overlay_band = Rc::clone(&app.painted_overlay_band);
+    let composed_chrome_band = Rc::clone(&app.composed_chrome_band);
     let status_segment_map = Rc::clone(&app.status_segment_map);
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
@@ -415,6 +422,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         panel_hover_popup_rect,
         tab_switcher_popup_rect,
         painted_overlay_band,
+        composed_chrome_band,
         status_segment_map,
         separated_status_bar_rect,
         title_bar_rect,
@@ -6060,6 +6068,131 @@ mod overlay_band_z_order {
 }
 
 #[cfg(test)]
+mod chrome_band_order {
+    //! #763 (#735 slice 2): the GTK half of the shared **chrome band** — the
+    //! non-editor surfaces vimcode itself composes around the editor column.
+    //!
+    //! Before #763 both backends composed the same five rungs in two different
+    //! orders (GTK: menu row → … → status bar → wildmenu → command line →
+    //! sidebar body; TUI: menu row → sidebar body → … → wildmenu → status bar →
+    //! command line), each with its own hand-written gate. Both now walk
+    //! `render::compose_frame` and record what they composed into
+    //! `composed_chrome_band`; these tests read that record.
+    //!
+    //! The TUI half lives in `tui_main/shell_app.rs`
+    //! (`chrome_band_*_via_shell_app`) and asserts against the **same expected
+    //! `Vec<FrameOp>`** — `render::chrome_band_fixture`, a single
+    //! `#[cfg(test)]` fn compiled into both bin targets — for the same engine
+    //! state, exactly as the overlay-band pair above does.
+    use super::*;
+
+    /// A sidebar-open, wildmenu-up, global-status-bar-on frame: every chrome
+    /// rung live, composed in `CHROME_Z_ORDER`.
+    ///
+    /// **RED against unfixed `develop`**, in two independent ways. (1) GTK
+    /// composed the wildmenu *after* the global status line and TUI composed it
+    /// *before*, so no single expected vector could satisfy both; swapping the
+    /// two arms' bodies back (hoisting `FrameOp::StatusBar`'s body above
+    /// `FrameOp::Wildmenu`'s, out of the `compose_frame` walk) makes this fail
+    /// with `[.., StatusBar, Wildmenu, ..]` and trips
+    /// `check_chrome_band_order`'s `debug_assert` in `render_content` on the
+    /// way. (2) GTK composed the sidebar panel body *last*, after the command
+    /// line, and measured the menu row *first*, before the editor — hoisting
+    /// either arm back out of the walk drops its `FrameOp` from the record
+    /// entirely. Both were re-introduced, observed red, and restored before
+    /// committing.
+    #[test]
+    fn chrome_band_composes_in_canonical_order_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        // Explicit, not ambient: a global status bar exists only when
+        // per-window status lines are off, and the default is on.
+        engine.settings.window_status_line = false;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_SETTINGS,
+        ));
+        engine.wildmenu_items = vec!["ZQXWwildA".to_string(), "ZQXWwildB".to_string()];
+        engine.wildmenu_selected = Some(0);
+
+        let h = harness(engine, 1400, 900);
+
+        assert_eq!(
+            *h.composed_chrome_band.borrow(),
+            crate::render::chrome_band_fixture(true),
+            "expected chrome band differs from the TUI twin's \
+             (`chrome_band_composes_in_canonical_order_via_shell_app`)"
+        );
+
+        // Composition, not just bookkeeping (#587/#592): every rung the record
+        // claims must have reached the Cairo surface.
+        assert!(
+            h.driver.screen_contains("File"),
+            "MenuRow was composed but the menu bar never painted"
+        );
+        assert!(
+            h.driver.screen_contains("ZQXWwildA"),
+            "Wildmenu was composed but no wildmenu entry painted"
+        );
+        assert!(
+            h.painted_sidebar_bounds.get().is_some(),
+            "SidebarPanel was composed but no sidebar rect was painted into"
+        );
+    }
+
+    /// With no completion up, the `Wildmenu` rung drops out — the record is not
+    /// simply "whatever `CHROME_Z_ORDER` contains".
+    #[test]
+    fn chrome_band_drops_the_wildmenu_rung_when_no_completion_is_up_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        engine.settings.window_status_line = false;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_SETTINGS,
+        ));
+        assert!(
+            engine.wildmenu_items.is_empty(),
+            "fixture needs no wildmenu"
+        );
+
+        let h = harness(engine, 1400, 900);
+        assert_eq!(
+            *h.composed_chrome_band.borrow(),
+            crate::render::chrome_band_fixture(false),
+            "no completion was up, so the Wildmenu rung must not be composed"
+        );
+    }
+
+    /// Per-window status lines on ⇒ no global status bar ⇒ the `StatusBar` rung
+    /// drops out, and the surviving rungs keep their canonical order.
+    ///
+    /// GTK's gate for this used to be `screen.global_status_bar.is_some()`
+    /// inline; it is `compose_frame`'s now, and TUI's identical gate went with
+    /// it.
+    #[test]
+    fn chrome_band_drops_the_status_bar_rung_with_per_window_status_lines_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = false;
+        engine.settings.window_status_line = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_SETTINGS,
+        ));
+
+        let h = harness(engine, 1400, 900);
+        let band = h.composed_chrome_band.borrow();
+        assert!(
+            !band.contains(&crate::render::FrameOp::StatusBar),
+            "per-window status lines are on, so no global status bar exists and \
+             the StatusBar rung must not be composed; got {band:?}"
+        );
+        assert_eq!(
+            crate::render::check_chrome_band_order(&band),
+            Ok(()),
+            "the surviving rungs must still be in canonical order"
+        );
+    }
+}
+
+#[cfg(test)]
 mod modal_rung {
     use super::*;
 
@@ -6973,9 +7106,9 @@ mod editor_mouse_rungs {
             None,
             None,
         );
-        engine
-            .app_shell
-            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_SETTINGS,
+        ));
         // Deliberately left false: the fixture is "the visible panel
         // disagrees with every *_has_focus flag".
         engine.settings_has_focus = false;
