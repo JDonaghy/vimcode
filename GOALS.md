@@ -83,41 +83,45 @@ closed.
 The previous revision of this file said: *"re-run the sizing audit when #735 lands
 rather than assuming the chain finishes the job."* Done, on `develop @ eedebf8`.
 
-Production lines, `#[cfg(test)]` excluded, all four columns measured with the same
+Production lines, `#[cfg(test)]` excluded, all five columns measured with the same
 script (`scripts/prod_lines.py`) so they are comparable to each other:
 
-| | 2026-05-01 | 2026-07-01 | pre-chain 2026-08-31 | **now 2026-09-03** |
-|---|---|---|---|---|
-| `src/gtk/` | 18,969 | 13,675 | 12,526 | **9,650** |
-| `src/tui_main/` | 14,649 | 10,358 | 11,125 | **10,345** |
-| **both backends** | 33,618 | 24,033 | 23,651 | **19,995** |
-| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | **21,405** |
+| | 2026-05-01 | 2026-07-01 | 08-31 `f867817` | **pre-chain** `6875315` | **now** `eedebf8` |
+|---|---|---|---|---|---|
+| `src/gtk/` | 18,969 | 13,675 | 12,526 | 9,765 | **9,650** |
+| `src/tui_main/` | 14,649 | 10,358 | 11,125 | 10,958 | **10,345** |
+| **both backends** | 33,618 | 24,033 | 23,651 | 20,723 | **19,995** |
+| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | 15,558 | **21,405** |
 
-**Projected vs. actual, over the chain (08-31 → 09-03):**
+The **pre-chain** column is `6875315`, the last #732 commit — the true point before
+#733/#734/#735 and slices #751–#766 began. Everything between the 08-31 and pre-chain
+columns is **#722–#732**, which was dead-code deletion, not convergence.
+
+**Projected vs. actual, over the convergence chain (`6875315` → `eedebf8`):**
 
 | | projected | actual |
 |---|---|---|
-| Backends | −8,700 … −9,500, landing near 14,000–15,000 | **−3,656, landing at 19,995** |
-| `render.rs` | +4,000 … +5,000 | **+6,396** |
-| Net across the three | ≈ −4,000 | **+2,740** |
+| Backends | −8,700 … −9,500, landing near 14,000–15,000 | **−728, landing at 19,995** |
+| `render.rs` | +4,000 … +5,000 | **+5,847** |
+| Net across the three | ≈ −4,000 | **+5,119** |
 
-The chain removed roughly **40% of the low end** of its own estimate, and the
-shared engine grew *more* than projected. Where the reduction actually came from:
+**The chain missed its projection by roughly 12×, not 2.4×.** An earlier revision of
+this file credited it with −3,656; that number silently included **−2,928 from
+#722–#732**, which was dead-code deletion (#731 alone `−1,432/+245`; the #732 tranches
+`−1,837/+83`, `−535/+461`, `−529/+485` in `gtk/mod.rs`). Deleting unreachable code and
+converging duplicated code are different activities and must not be pooled.
 
-| File | pre-chain | now | Δ |
-|---|---|---|---|
-| `src/gtk/mod.rs` | 10,518 | 7,684 | **−2,834** |
-| `src/tui_main/panels.rs` | 1,554 | 1,208 | −346 |
-| `src/tui_main/mouse.rs` | 3,211 | 2,895 | −316 |
-| `src/tui_main/shell_app.rs` | 4,109 | 3,989 | −120 |
-| everything else | | | ≈ −40 net |
-
-`gtk/mod.rs` alone is 78% of the cut. Notably `tui_main/mouse.rs` — the file #733
-was sized against at −3,000…−3,500 — lost **316 lines**.
+**The mechanism, visible in the diff:** moving a *decision* into `render.rs` leaves
+every *apply* body in place at its original size, now preceded by a
+`MouseDragState`/`ModalOverlayState` literal (30–60 lines per call site) and a
+"#NNN moved this" comment. The `FrameOp`/`EditorOp`/`BottomOp` machinery added three
+enums, three order constants, three composers, three validators and ~150 lines of doc.
+A 12-variant `match` is not shorter than 12 `if` blocks.
 
 > **Correcting the record.** The figure this file previously carried as
 > "`src/gtk/` = 12,588 at 2026-09-01" was measured *before* #727/#728/#730 landed;
-> it matches the pre-chain 08-31 column above, not the 09-01 tree. The 05-01 and
+> it matches the 08-31 column above, not the 09-01 tree — and the 09-01 tree is in
+> fact the `6875315` pre-chain column. The 05-01 and
 > 07-01 figures differ from the previously recorded ones by 10–290 lines for the
 > same reason — inconsistent measurement points. **Regenerate with the script, do
 > not trust a number typed into prose.**
@@ -243,8 +247,15 @@ oracle-authored test, rather than re-litigating the sequencing.
 
 - ✅ **Milestone #7 is 0 open.** The 09-01 critical path plus 16 slices all landed.
 - ✅ **The oracle loop is live here** (#657) and `draw_frame` is gone (#766).
-- 📉 **The audit is run and it missed:** backends −3,656 against a −8,700…−9,500
-  projection; the three files net **+2,740** lines.
+- 📉 **The audit is run and the chain missed by ~12×:** the convergence work itself
+  (`6875315`→`eedebf8`) took **−728** off the backends against a −8,700…−9,500
+  projection, while `render.rs` grew **+5,847** — net **+5,119**. The −3,656 this
+  file used to claim pooled in #722–#732's dead-code deletion.
+- 🔎 **And most of what is left is not code.** A function-level audit found **39% of
+  the two backends' 11,673 production lines are comments** — 6,958 are code, of which
+  roughly **2,000 ± 500** are genuinely the same logic written twice. Converging all
+  of it nets **−300 to −1,000** across the three files. **Do not plan a convergence
+  campaign here; the returns are not there.**
 - ⚠️ **#47 closed with zero code and its blocker filed nowhere** — the single most
   actionable item on this page.
 - 🔓 **quadraui#481 / #482 hold the remaining duplication** and are unqueued.
