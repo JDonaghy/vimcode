@@ -15253,7 +15253,7 @@ pub fn build_activity_bar(
     if include_hamburger {
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(HAMBURGER_PANEL_ID),
-            icon: icons::HAMBURGER.s().to_string(),
+            icon: icons::HAMBURGER.s().into(),
             tooltip: "Menu".to_string(),
             is_active: false,
             is_keyboard_selected: kbd_sel(HAMBURGER_PANEL_ID),
@@ -15307,7 +15307,7 @@ pub fn build_activity_bar(
     for (panel_id, icon, tooltip, activity_id) in fixed {
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(activity_id),
-            icon: icon.to_string(),
+            icon: icon.into(),
             tooltip: tooltip.to_string(),
             is_active: sb_visible && !has_ext && active_id == Some(panel_id),
             is_keyboard_selected: kbd_sel(panel_id),
@@ -15322,7 +15322,7 @@ pub fn build_activity_bar(
         let is_active = sb_visible && active_ext_panel == Some(panel.name.as_str());
         top.push(quadraui::ActivityItem {
             id: quadraui::WidgetId::new(format!("activity:ext:{}", panel.name)),
-            icon: panel.resolved_icon().to_string(),
+            icon: panel.resolved_icon().to_string().into(),
             tooltip: panel.title.clone(),
             is_active,
             is_keyboard_selected: kbd_sel(&ext_panel_id(&panel.name)),
@@ -15331,7 +15331,7 @@ pub fn build_activity_bar(
 
     let bottom = vec![quadraui::ActivityItem {
         id: quadraui::WidgetId::new("activity:settings"),
-        icon: icons::SETTINGS.s().to_string(),
+        icon: icons::SETTINGS.s().into(),
         tooltip: "Settings".to_string(),
         is_active: sb_visible && !has_ext && active_id == Some(PANEL_SETTINGS),
         is_keyboard_selected: kbd_sel(PANEL_SETTINGS),
