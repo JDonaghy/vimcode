@@ -2690,7 +2690,7 @@ impl App {
 
         match active_id.as_str() {
             PANEL_EXPLORER => {
-                render::populate_explorer_tree_controller(&engine, &theme);
+                render::populate_explorer_tree_controller(engine, theme);
                 // Capture the exact metrics the tree is drawn with so the
                 // click hit-test (which reads the backend's mutable
                 // current_line_height at a later, possibly-different time) can
@@ -2702,13 +2702,13 @@ impl App {
                 engine.explorer_tree.borrow().render(backend, q_sb);
             }
             PANEL_SEARCH => {
-                render::populate_search_sidebar_system(&engine, &engine.cwd);
+                render::populate_search_sidebar_system(engine, &engine.cwd);
                 engine.search_sidebar_body_rect.set(q_sb);
                 engine.search_sidebar_system.borrow().render(backend, q_sb);
             }
             PANEL_DEBUG => {
                 let (title_bar, action_bar) =
-                    render::debug_sidebar_chrome_to_status_bars(&screen.debug_sidebar, &theme);
+                    render::debug_sidebar_chrome_to_status_bars(&screen.debug_sidebar, theme);
                 let title_rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
                 let action_rect =
                     quadraui::Rect::new(q_sb.x, q_sb.y + lh as f32, q_sb.width, lh as f32);
@@ -2722,7 +2722,7 @@ impl App {
                 // router needs the rect to translate into that space (#544).
                 self.cached_dap_action_rect.set(Some(action_rect));
                 engine.dap_sidebar_body_rect.set(body_rect);
-                render::populate_dap_sidebar_system(&engine);
+                render::populate_dap_sidebar_system(engine);
                 engine
                     .dap_sidebar_system
                     .borrow()
@@ -2755,7 +2755,7 @@ impl App {
                         SC_COMMIT_BORDER_PX,
                     );
                     self.cached_sc_bands.set(Some(bands));
-                    let header_bar = render::sc_header_status_bar(sc, &theme);
+                    let header_bar = render::sc_header_status_bar(sc, theme);
                     let _ = backend.draw_status_bar(bands.header, &header_bar, None, None);
 
                     let ti = render::sc_commit_message_to_text_input(sc);
@@ -2764,7 +2764,7 @@ impl App {
                     // Render the toolbar-slab + section list below the
                     // header + commit input.
                     let slab_rect = bands.slab;
-                    render::draw_sc_sidebar_panel(backend, &engine, sc, slab_rect);
+                    render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
                     let body_rect = engine
                         .sc_panel_layout
                         .borrow()
@@ -2772,7 +2772,7 @@ impl App {
                         .map(|l| l.content_bounds)
                         .unwrap_or(slab_rect);
                     engine.sc_sidebar_body_rect.set(body_rect);
-                    render::populate_sc_sidebar_system(&engine, &theme);
+                    render::populate_sc_sidebar_system(engine, theme);
                     engine.sc_sidebar_system.borrow().render(backend, body_rect);
 
                     // Branch picker / create popup (dual-mode Palette,
@@ -2817,12 +2817,12 @@ impl App {
                 }
             }
             PANEL_EXTENSIONS => {
-                render::populate_ext_sidebar_system(&engine);
+                render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
             }
             PANEL_SETTINGS => {
-                render::populate_settings_form_controller(&engine);
+                render::populate_settings_form_controller(engine);
                 engine
                     .settings_form_controller
                     .borrow_mut()
@@ -2830,7 +2830,7 @@ impl App {
             }
             id if id.starts_with("ext:") => {
                 // Extension panel — render via ext_sidebar_system.
-                render::populate_ext_sidebar_system(&engine);
+                render::populate_ext_sidebar_system(engine);
                 engine.ext_sidebar_body_rect.set(q_sb);
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
             }
@@ -2846,7 +2846,7 @@ impl App {
                 // click and paint derivations cannot drift (#544).
                 if let Some(ref ai) = screen.ai_panel {
                     let bands = render::draw_ai_sidebar_panel(
-                        backend, q_sb, ai, &theme, cw as f32, lh as f32,
+                        backend, q_sb, ai, theme, cw as f32, lh as f32,
                     );
                     self.cached_ai_bands.set(Some(bands));
                 } else {
@@ -2985,7 +2985,7 @@ impl App {
                     anchor_x as f32,
                     anchor_y as f32,
                     main,
-                    &theme,
+                    theme,
                     cw as f32,
                     lh as f32,
                 );
@@ -3007,7 +3007,7 @@ impl App {
                     anchor_x as f32,
                     anchor_y as f32,
                     main,
-                    &theme,
+                    theme,
                     cw as f32,
                     lh as f32,
                 );
@@ -3037,7 +3037,7 @@ impl App {
                     anchor_x as f32,
                     anchor_y as f32,
                     win_viewport,
-                    &theme,
+                    theme,
                     cw as f32,
                     lh as f32,
                 );
@@ -3133,6 +3133,7 @@ impl App {
     /// `band` carries the editor column's origin and width (its height is not
     /// used); `metrics` is `(line_height, char_width)` and `tab_metrics` is
     /// `(tab_row_h, tab_bar_h)`, both in pixels.
+    #[allow(clippy::too_many_arguments)]
     fn compose_editor_band_rungs(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -3219,7 +3220,7 @@ impl App {
 
         let mut composed_editor: Vec<render::EditorOp> = Vec::new();
         for op in render::compose_editor_band(
-            &engine,
+            engine,
             screen,
             self.tab_drag.is_dragging(),
             engine.terminal_maximized,
@@ -3241,7 +3242,7 @@ impl App {
                 // draws one full-width bar at the editor top (#515/#551).
                 render::EditorOp::TabBars => self.paint_tab_bars_rung(
                     backend,
-                    &engine,
+                    engine,
                     screen,
                     tab_row_h,
                     tab_bar_h,
@@ -3338,7 +3339,7 @@ impl App {
                             band.y + tab_row_h as f32,
                             band.width,
                             tooltip_text,
-                            &theme,
+                            theme,
                             cw as f32,
                             lh as f32,
                         );
@@ -3492,9 +3493,9 @@ impl App {
                 render::BottomOp::BottomPanel => {
                     render::paint_bottom_panel_rung(
                         backend,
-                        &engine,
+                        engine,
                         screen,
-                        &theme,
+                        theme,
                         quadraui::Rect::new(
                             main.x,
                             terminal_y as f32,
@@ -3508,7 +3509,7 @@ impl App {
                 render::BottomOp::DebugToolbar => {
                     let rect =
                         quadraui::Rect::new(main.x, debug_toolbar_y as f32, main.width, lh as f32);
-                    render::draw_debug_toolbar(backend, &engine, rect);
+                    render::draw_debug_toolbar(backend, engine, rect);
                     self.debug_toolbar_y_offset.set(debug_toolbar_y);
                     self.debug_toolbar_height.set(lh);
                     composed_bottom.push(render::BottomOp::DebugToolbar);

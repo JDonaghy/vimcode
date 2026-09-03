@@ -10070,6 +10070,30 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
 
 /// The complete, platform-agnostic description of one editor frame.
 /// Build it with [`build_screen_layout`], then hand it to the backend renderer.
+///
+/// # Every field has a composition verdict (#766)
+///
+/// #587 and #592 are both the same defect: a field populated here every frame
+/// and painted by nobody, so the *state* said the surface was open while the
+/// screen said it was not. #766's closing sweep audited all 36 fields against
+/// the three composers ([`compose_frame`], [`compose_editor_band`],
+/// [`compose_bottom_band`]) and the shared painters they call. The verdict:
+///
+/// * **35 are composed** — either directly in a backend's rung arm, or in a
+///   shared painter that arm calls (`bottom_tabs`, for instance, is composed by
+///   [`paint_bottom_panel_rung`] from the `BottomOp::BottomPanel` arm on both
+///   backends, not by either backend itself).
+/// * **1 is deliberately not composed**: [`Self::menu_dropdown_open`]. The
+///   dropdown is painted by `MenuSystem::render` from the
+///   [`FrameOp::MenuDropdown`] rung, which reads the `MenuSystem` directly;
+///   this field is the diagnostic mirror [`visible_ui_elements`] and the
+///   acceptance harnesses read. Its own doc comment carries the full reason,
+///   including why it is *not* a #587/#592 defect (nothing routes input against
+///   it either).
+///
+/// Adding a field means adding its verdict — a rung in [`FRAME_Z_ORDER`] /
+/// [`EDITOR_Z_ORDER`] / [`BOTTOM_Z_ORDER`], or a doc comment saying where it is
+/// consumed instead and why that is not a silent drop.
 #[derive(Debug)]
 pub struct ScreenLayout {
     pub tab_bar: Vec<TabInfo>,
