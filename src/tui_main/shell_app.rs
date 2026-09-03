@@ -5526,6 +5526,30 @@ mod tests {
         app.engine.buffer_mut().insert(0, &text);
         let mut driver = driver_with_shell(app, config(), 100, 24);
 
+        // Settle the layout *before* measuring anything (see below), with an
+        // Escape — a no-op in Normal mode, but still a full `handle()`
+        // dispatch.
+        //
+        // `driver_with_shell` paints its first frame straight from the
+        // `ShellConfig` this fixture hands it, and the test `config()` helper
+        // leaves quadraui's generic 20-column `default_sidebar_width` in
+        // place rather than mirroring `TuiShellApp::shell_config`'s #634
+        // clamp of `SIDEBAR_WIDTH` (30). The end-of-dispatch
+        // `set_sidebar_width(self.sidebar_width)` sync in `handle()` then
+        // widens the sidebar to 30 on the first event of any kind, so every
+        // column measured off frame 1 is 10 cells left of where the same
+        // content sits from frame 2 onwards.
+        //
+        // Measuring first and clicking second therefore probed a *stale*
+        // column. It only actually diverged when the sidebar's own content
+        // differed across those 10 columns, which made it read as a
+        // cwd-dependent flake: the explorer lists whatever
+        // `std::env::current_dir()` holds, and `test_open_folder_resets_cwd`
+        // leaves the process cwd pointing at an empty temp dir, so under that
+        // test order the stale probe landed on blank sidebar background whose
+        // style the drag cannot change.
+        driver.press_named(quadraui::NamedKey::Escape);
+
         let bounds = driver
             .find_bounds("line 5 content")
             .expect("the fixture line should be painted");
