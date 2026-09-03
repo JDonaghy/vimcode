@@ -6171,6 +6171,359 @@ pub fn route_ai_sidebar_click(
     }
 }
 
+// ─── Frame composition: the chrome band (#763, #735 slice 2) ─────────────────
+//
+// Slice 1 (below) landed [`compose_overlay_band`] — the *top* band only.
+// [`OverlayOp`] turned out to be the right shape and the wrong scope, so this
+// slice generalises it downward into [`FrameOp`]/[`compose_frame`] and lands
+// the **chrome band**: the non-editor surfaces vimcode itself paints around
+// the editor column.
+//
+// The divergence this removes, measured on `develop` before #763 — both
+// backends painted the same five rungs, in two different orders, each gated by
+// its own hand-written condition:
+//
+//   GTK  menu-row measure → (editor, popups, panels) → status bar → wildmenu →
+//        command line → sidebar panel body
+//   TUI  menu-row measure → sidebar panel body → (editor, popups, panels) →
+//        wildmenu → status bar → command line
+//
+// Unlike slice 1's band, none of these rungs *overlap* — they occupy disjoint
+// bands of the window — so neither order was painting anything on top of
+// anything else, and #763 is a convergence rather than a bug fix. What the two
+// orders did cost was two independently-drifting sets of *gates*, and those had
+// already diverged:
+//
+//   * **sidebar panel body.** TUI required `sidebar_content_bounds` to be at
+//     least one cell wide *and* tall; GTK required only that it be `Some`, and
+//     so painted a whole panel into a degenerate rect.
+//   * **menu row.** TUI required the reserved band to be at least one cell in
+//     both axes; GTK checked `height > 0.0` and never checked the width at all.
+//
+// [`compose_frame`] states both gates once, for both backends, in the units the
+// caller paints in.
+//
+// **Not in this band, deliberately** — the rungs quadraui already owns:
+//
+//   * the **activity bar** and the **sidebar separator**. On both live paths
+//     `AppShell::render` (quadraui `compose::app_shell`) paints these *before*
+//     `render_content` is entered, out of the same `AppShellLayout` vimcode
+//     consumes verbatim. The only vimcode code that still paints them itself is
+//     the **test-only** `tui_main::render_impl::draw_frame` (raw
+//     `frame.buffer_mut()` — `panels::render_activity_bar` and the `set_cell`
+//     separator column); it has had no production caller since the `TuiShellApp`
+//     cutover. So the "check quadraui first" verdict for these two rungs is
+//     *quadraui already owns them, and vimcode has already adopted it* — there
+//     is nothing to compose and no adoption issue to file.
+//   * the **debug toolbar**, **quickfix panel** and **bottom panel**. These are
+//     vimcode's own stacked bottom chrome, which `AppShellLayout` has no concept
+//     of (its `bottom_panel_bounds` is a single generic drawer, and is `None` for
+//     both vimcode backends). They are chrome, but they are *not* part of this
+//     slice — see #763's "Scope discipline".
+//
+// **Why here and not in quadraui**, for the five rungs that *are* in the band:
+// same verdict slice 1 recorded, re-run. `AppShell` composes the *shell's* own
+// zones and stops there; the menu row's contents, the wildmenu, the global
+// status line and the Vim command line are vimcode's app-level surfaces, and
+// the sidebar *body* is explicitly handed back to the app as
+// `sidebar_content_bounds` for the app to fill. quadraui states no order for
+// any of them, so the ordering is vimcode's to state and `render.rs` is where
+// vimcode states cross-backend contracts.
+
+/// The metrics one frame is composed in — a *unit*, not a geometry.
+///
+/// GTK passes real pixels (`backend.line_height()` / `char_width()`), TUI
+/// passes `1.0`/`1.0` for one terminal cell. [`compose_frame`] uses them only
+/// to answer "is this reserved band at least one line tall / one column wide",
+/// which is the one question whose answer differs between the two unit systems.
+/// It never returns geometry: rect math stays per backend, because Cairo
+/// painter-order and ratatui cell coalescence are the intrinsic difference #735
+/// exists to preserve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameMetrics {
+    pub line_height: f32,
+    pub char_width: f32,
+}
+
+impl FrameMetrics {
+    /// One terminal cell — what `TuiShellApp::render_content` composes in.
+    pub const CELL: Self = Self {
+        line_height: 1.0,
+        char_width: 1.0,
+    };
+
+    /// Real pixels — what `gtk::App::render_content` composes in.
+    pub fn px(line_height: f64, char_width: f64) -> Self {
+        Self {
+            line_height: line_height as f32,
+            char_width: char_width as f32,
+        }
+    }
+
+    /// Is `rect` big enough to hold one line of chrome?
+    fn holds_a_line(&self, rect: quadraui::Rect) -> bool {
+        rect.width >= self.char_width && rect.height >= self.line_height
+    }
+}
+
+/// One rung of the shared **chrome band** — the non-editor surfaces vimcode
+/// paints around the editor column, below the overlay band ([`OverlayOp`]).
+///
+/// Deliberately unit-agnostic, exactly like [`OverlayOp`]: the rung says *what*
+/// is painted and *in what order*, never where or how big.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameOp {
+    /// The reserved title-bar band (`AppShellLayout::title_bar_bounds`):
+    /// measure the menu bar, publish the band's rect for hit-testing, and work
+    /// out where the command centre / window controls go.
+    ///
+    /// Measure-only on **both** backends. The band is actually *painted* from
+    /// the overlay band's [`OverlayOp::MenuDropdown`] arm, because
+    /// `MenuSystem::render` repaints `draw_menu_bar` across the whole band and
+    /// would erase anything laid down first (#676 on GTK, #712 on TUI). It is
+    /// still the first rung of this band: every later rung's gate, and the
+    /// dropdown arm itself, read the rect this one publishes.
+    MenuRow,
+    /// The *active panel's body*, into `AppShellLayout::sidebar_content_bounds`
+    /// — explorer / search / debug / source control / extensions / AI / plugin
+    /// extension panels. The surrounding sidebar chrome (header, activity bar,
+    /// separator) is quadraui's, painted before `render_content` is entered.
+    SidebarPanel,
+    /// The command-line Tab-completion bar (`Backend::draw_status_bar` with
+    /// [`wildmenu_to_status_bar`]).
+    Wildmenu,
+    /// The global status line — drawn only when per-window status lines are
+    /// *off*, which is what makes `ScreenLayout::global_status_bar` `None`.
+    StatusBar,
+    /// The Vim command line (`:`/`/`/`?` and messages). Unconditional on both
+    /// backends: the row is always reserved and always painted, empty or not.
+    CommandLine,
+}
+
+/// The canonical chrome-band order, **lowest z first** (index 0 is composed
+/// first, and everything after it may cover it).
+///
+/// Both backends iterate this array and `match` each rung, so "which order do
+/// we compose the chrome in" is one artefact rather than two transcriptions.
+/// Adding a surface means adding a variant here — a compile error in both
+/// backends' `match` until both handle it, which is what makes "populated but
+/// never composed" (#587/#592) structurally harder to reach.
+///
+/// The whole band sits *below* [`OVERLAY_Z_ORDER`]: every chrome rung is
+/// composed before the first overlay rung, on both backends.
+pub const CHROME_Z_ORDER: [FrameOp; 5] = [
+    FrameOp::MenuRow,
+    FrameOp::SidebarPanel,
+    FrameOp::Wildmenu,
+    FrameOp::StatusBar,
+    FrameOp::CommandLine,
+];
+
+/// Which chrome rungs a frame in this state must compose, in canonical order.
+///
+/// Unlike [`compose_overlay_band`] — whose backends walk the *whole* order
+/// every frame so each arm can clear its own hit-test cache — the chrome rungs
+/// that own a cache (`menu_bar_rect`, `global_status_rect`,
+/// `global_status_zones`) clear it from the *absent* branch of their own gate,
+/// so this returns only the live rungs and the backends walk exactly those.
+///
+/// `layout` supplies the shell-reserved bands (title bar, sidebar content) and
+/// `screen` the app state; `metrics` decides "is this band at least one line
+/// tall", in the caller's own units — see [`FrameMetrics`].
+pub fn compose_frame(
+    screen: &ScreenLayout,
+    layout: &quadraui::AppShellLayout,
+    metrics: FrameMetrics,
+) -> Vec<FrameOp> {
+    CHROME_Z_ORDER
+        .iter()
+        .copied()
+        .filter(|op| match op {
+            // `title_bar_bounds` is `Some` only while
+            // `AppShell::set_title_bar_visible` is set — but the band can still
+            // be degenerate on a window too small to hold it, and a degenerate
+            // band must not be measured (its `menu_bar_layout` would hand the
+            // command centre and the window controls a zero-width strip and
+            // leave `command_center_layout` disagreeing with the paint).
+            FrameOp::MenuRow => {
+                screen.menu_bar_visible
+                    && layout
+                        .title_bar_bounds
+                        .is_some_and(|r| metrics.holds_a_line(r))
+            }
+            FrameOp::SidebarPanel => layout
+                .sidebar_content_bounds
+                .is_some_and(|r| metrics.holds_a_line(r)),
+            FrameOp::Wildmenu => screen.wildmenu.is_some(),
+            FrameOp::StatusBar => screen.global_status_bar.is_some(),
+            FrameOp::CommandLine => true,
+        })
+        .collect()
+}
+
+/// Assert a backend's *actually composed* chrome sequence never runs backwards
+/// against [`CHROME_Z_ORDER`].
+///
+/// The chrome-band twin of [`check_overlay_band_order`], and the same weaker
+/// half of the acceptance test: it does not care which rungs were live, only
+/// that whatever *was* composed came out in canonical order. A rung hoisted out
+/// of the shared walk — which is exactly how the two orders above drifted apart
+/// — fails this even when the exact live set is awkward to pin.
+pub fn check_chrome_band_order(composed: &[FrameOp]) -> Result<(), String> {
+    let mut cursor = 0usize;
+    for op in composed {
+        match CHROME_Z_ORDER[cursor..].iter().position(|c| c == op) {
+            Some(offset) => cursor += offset + 1,
+            None => {
+                return Err(format!(
+                    "chrome band composed out of order: {composed:?}\n\
+                     {op:?} came after a rung that CHROME_Z_ORDER puts above it.\n\
+                     canonical order is {CHROME_Z_ORDER:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where the menu bar's labels end, in absolute coordinates.
+///
+/// `vi.bounds.x` is already absolute — quadraui's `MenuBar::layout` starts its
+/// cursor at the `bounds.x` it was handed — so adding the band's own `x` back
+/// on double-counts it, which is the bug quadraui hit and fixed internally
+/// (quadraui#494). This existed as three separate hand-written copies of the
+/// same `visible_items.last()` fold (GTK, `TuiShellApp`, `draw_frame`), each
+/// carrying its own transcription of that warning; #763 states it once.
+///
+/// `fallback_x` is what an item-less bar returns: the leading edge the items
+/// *would* have started at, so the command centre and the window controls are
+/// not handed back real estate the bar reserved (#720's app-icon slot).
+pub fn menu_bar_items_end(layout: &quadraui::MenuBarLayout, fallback_x: f32) -> f32 {
+    layout
+        .visible_items
+        .last()
+        .map(|vi| vi.bounds.x + vi.bounds.width)
+        .unwrap_or(fallback_x)
+}
+
+/// How the title-bar band divides up to the right of the last menu label.
+///
+/// Both bands are *measured*, never painted — see [`FrameOp::MenuRow`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TitleBarBands {
+    /// The inline window-control buttons (GTK only; zero-width on TUI, which
+    /// has no in-canvas window controls).
+    pub controls: quadraui::Rect,
+    /// The VS Code-style Command Center — everything between the last menu
+    /// label and the window controls.
+    pub command_center: quadraui::Rect,
+}
+
+/// Measure the title-bar band's two right-hand slots, in the caller's units.
+///
+/// The [`FrameOp::MenuRow`] rung's whole body on both backends. `band` is the
+/// shell-reserved row (`AppShellLayout::title_bar_bounds`); `items` is the part
+/// of it the menu labels are laid out in — the same rect, except on GTK where
+/// #720's app-icon slot narrows it.
+///
+/// `controls_bar` is `Some` only on GTK. With `None` the controls band collapses
+/// to zero width at the band's right edge and the Command Center takes
+/// everything from the last menu label onward, which is exactly what TUI
+/// computed by hand before #763 — the two backends' arithmetic agreed, they
+/// just each carried a copy of it.
+pub fn measure_title_bar_bands(
+    backend: &mut dyn quadraui::Backend,
+    band: quadraui::Rect,
+    items: quadraui::Rect,
+    menu_bar: &quadraui::MenuBar,
+    controls_bar: Option<&quadraui::StatusBar>,
+) -> TitleBarBands {
+    let mb_layout = backend.menu_bar_layout(items, menu_bar);
+    // #720: an item-less bar still starts *after* the app-icon slot, so the
+    // Command Center / window controls must not be handed the icon's real
+    // estate back — hence `items.x`, not `band.x`, as the fallback.
+    let menu_end = menu_bar_items_end(&mb_layout, items.x);
+    let full = quadraui::Rect::new(
+        menu_end,
+        band.y,
+        (band.x + band.width - menu_end).max(0.0),
+        band.height,
+    );
+    // #676: narrow the controls band to the buttons' *actual* painted width
+    // instead of handing them the entire menu_end→right-edge strip. That full
+    // strip, background-filled end-to-end by `window_controls_status_bar` (via
+    // `Backend::draw_status_bar`), is exactly what silently ate the Command
+    // Center's real estate after the #540 Relm4→ShellApp cutover dropped it.
+    // `status_bar_layout` mirrors `draw_status_bar`'s own measurement, so this
+    // is the width the buttons paint at.
+    let controls_start = controls_bar
+        .map(|cb| {
+            backend
+                .status_bar_layout(full, cb)
+                .visible_segments
+                .iter()
+                .map(|vs| vs.bounds.x)
+                .fold(f32::INFINITY, f32::min)
+        })
+        .filter(|s| s.is_finite())
+        .unwrap_or(full.width);
+    let controls = quadraui::Rect::new(
+        full.x + controls_start,
+        full.y,
+        (full.width - controls_start).max(0.0),
+        full.height,
+    );
+    TitleBarBands {
+        command_center: quadraui::Rect::new(
+            menu_end,
+            band.y,
+            (controls.x - menu_end).max(0.0),
+            band.height,
+        ),
+        controls,
+    }
+}
+
+/// The expected chrome band for the cross-backend fixture used by
+/// `chrome_band_composes_in_canonical_order_via_gtk_driver` and
+/// `..._via_shell_app`: menu bar visible, sidebar open, per-window status lines
+/// off (so a global status bar exists), and `wildmenu` deciding whether the
+/// Tab-completion bar is up.
+///
+/// Both backend tests call this one function — a single `#[cfg(test)]` fn in
+/// `render.rs`, compiled into both bin targets — rather than each transcribing
+/// its own `Vec<FrameOp>` literal, so the compiler keeps the two expectations
+/// in step. Taking `wildmenu` as a parameter keeps the expectation
+/// *discriminating*: it is not simply "whatever [`CHROME_Z_ORDER`] contains".
+#[cfg(test)]
+pub(crate) fn chrome_band_fixture(wildmenu: bool) -> Vec<FrameOp> {
+    CHROME_Z_ORDER
+        .iter()
+        .copied()
+        .filter(|op| wildmenu || !matches!(op, FrameOp::Wildmenu))
+        .collect()
+}
+
+/// The `quadraui::CommandLine` descriptor for this frame's Vim command line.
+///
+/// GTK's [`FrameOp::CommandLine`] rung built this inline; TUI's rasteriser
+/// composes cells itself (`panels::render_command_line`, which also applies the
+/// `cmd_sel` drag-selection inversion), so only GTK consumes it today — but the
+/// *descriptor* is app state, not geometry, and belongs beside the rest of the
+/// chrome band rather than buried in a backend.
+pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
+    quadraui::CommandLine {
+        id: "cmd".into(),
+        text: command.text.clone(),
+        cursor_offset: if command.show_cursor {
+            Some(command.cursor_anchor_text.len())
+        } else {
+            None
+        },
+        right_align: command.right_align,
+    }
+}
+
 // ─── Overlay-band composition (#735 slice 1) ──────────────────────────────────
 //
 // The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and
@@ -20289,6 +20642,136 @@ mod tests {
 
         // A repeated rung is a double-paint, not a valid band.
         assert!(check_overlay_band_order(&[OverlayOp::Dialog, OverlayOp::Dialog]).is_err());
+    }
+
+    /// A `ScreenLayout` for an untouched engine: no wildmenu, per-window status
+    /// lines on (so no global status bar), menu bar hidden.
+    fn bare_screen_layout() -> ScreenLayout {
+        let engine = crate::core::Engine::new();
+        let theme = Theme::from_name(&engine.settings.colorscheme);
+        build_screen_layout(&engine, &theme, &[], 1.0, 1.0, false)
+    }
+
+    /// An `AppShellLayout` with every optional band absent — the shape a shell
+    /// that reserved nothing hands back.
+    fn bare_shell_layout() -> quadraui::AppShellLayout {
+        quadraui::AppShellLayout {
+            window_bounds: quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
+            title_bar_bounds: None,
+            activity_bar_bounds: quadraui::Rect::default(),
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            main_content_bounds: quadraui::Rect::new(0.0, 0.0, 1400.0, 900.0),
+            bottom_panel_bounds: None,
+            command_line_bounds: None,
+            status_bar_bounds: None,
+        }
+    }
+
+    /// `compose_frame`'s gates, in both unit systems, on the degenerate shapes
+    /// the driver-level tests cannot construct.
+    ///
+    /// The two divergences #763 closes are here as facts: before it, GTK's
+    /// sidebar rung had **no** minimum-size check (it painted a whole panel
+    /// into a zero-height rect) and its menu-row rung checked only
+    /// `height > 0.0` with no width check at all. TUI checked both, in cells.
+    #[test]
+    fn compose_frame_gates_degenerate_bands_in_the_callers_units() {
+        let mut screen = bare_screen_layout();
+        screen.menu_bar_visible = true;
+
+        let full_band = quadraui::Rect::new(0.0, 0.0, 1400.0, 17.0);
+        let mut layout = bare_shell_layout();
+        layout.title_bar_bounds = Some(full_band);
+        layout.sidebar_content_bounds = Some(quadraui::Rect::new(0.0, 17.0, 240.0, 800.0));
+
+        let px = FrameMetrics::px(17.0, 8.0);
+        assert_eq!(
+            compose_frame(&screen, &layout, px),
+            vec![
+                FrameOp::MenuRow,
+                FrameOp::SidebarPanel,
+                FrameOp::CommandLine
+            ],
+            "no wildmenu and no global status bar in a default ScreenLayout"
+        );
+
+        // A band one pixel shorter than a text line is not a band. GTK's own
+        // `height > 0.0` gate accepted this.
+        layout.title_bar_bounds = Some(quadraui::Rect::new(0.0, 0.0, 1400.0, 16.0));
+        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::MenuRow));
+
+        // ... and neither is a zero-width one. GTK never checked the width.
+        layout.title_bar_bounds = Some(quadraui::Rect::new(0.0, 0.0, 0.0, 17.0));
+        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::MenuRow));
+
+        layout.title_bar_bounds = Some(full_band);
+        screen.menu_bar_visible = false;
+        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::MenuRow));
+        screen.menu_bar_visible = true;
+
+        // A collapsed sidebar content rect: `Some`, but nothing fits in it.
+        // This is the shape GTK painted a whole panel into before #763.
+        layout.sidebar_content_bounds = Some(quadraui::Rect::new(0.0, 17.0, 240.0, 0.0));
+        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::SidebarPanel));
+        layout.sidebar_content_bounds = None;
+        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::SidebarPanel));
+
+        // The same rects are all fine in *cells*, which is the whole point of
+        // `FrameMetrics` being a unit rather than a geometry: a 240x0 rect is
+        // still degenerate, but the 1400x16 title bar is 16 rows tall.
+        layout.title_bar_bounds = Some(quadraui::Rect::new(0.0, 0.0, 1400.0, 16.0));
+        layout.sidebar_content_bounds = Some(quadraui::Rect::new(0.0, 17.0, 240.0, 800.0));
+        assert_eq!(
+            compose_frame(&screen, &layout, FrameMetrics::CELL),
+            vec![
+                FrameOp::MenuRow,
+                FrameOp::SidebarPanel,
+                FrameOp::CommandLine
+            ]
+        );
+    }
+
+    /// The command line is composed on every frame — the row is always
+    /// reserved, empty or not — and the wildmenu / status rungs follow their
+    /// `ScreenLayout` fields.
+    #[test]
+    fn compose_frame_always_composes_the_command_line() {
+        let screen = bare_screen_layout();
+        let layout = bare_shell_layout();
+        assert_eq!(
+            compose_frame(&screen, &layout, FrameMetrics::CELL),
+            vec![FrameOp::CommandLine],
+            "nothing else is live in an empty layout, but the command line row \
+             is always painted"
+        );
+        assert_eq!(chrome_band_fixture(true), CHROME_Z_ORDER.to_vec());
+    }
+
+    /// The pre-#763 GTK chrome order, which is what this check exists to
+    /// reject. Keeps the regression legible: if someone hoists a rung back out
+    /// of the shared walk, this is the shape it produces.
+    #[test]
+    fn check_chrome_band_order_rejects_the_gtk_status_wildmenu_inversion() {
+        assert_eq!(
+            check_chrome_band_order(&[FrameOp::MenuRow, FrameOp::CommandLine]),
+            Ok(()),
+            "any canonical subsequence is fine — the check is about order, not \
+             about which rungs were live"
+        );
+
+        let err = check_chrome_band_order(&[FrameOp::StatusBar, FrameOp::Wildmenu])
+            .expect_err("status-then-wildmenu runs backwards against CHROME_Z_ORDER");
+        assert!(err.contains("Wildmenu"), "{err}");
+        assert!(err.contains("out of order"), "{err}");
+
+        // The pre-#763 GTK tail: the sidebar body composed after the command
+        // line.
+        assert!(check_chrome_band_order(&[FrameOp::CommandLine, FrameOp::SidebarPanel]).is_err());
+
+        // A repeated rung is a double-composition, not a valid band.
+        assert!(check_chrome_band_order(&[FrameOp::CommandLine, FrameOp::CommandLine]).is_err());
     }
 
     fn empty_sc_data() -> SourceControlData {

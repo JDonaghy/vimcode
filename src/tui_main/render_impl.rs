@@ -426,13 +426,13 @@ pub(super) fn draw_frame(
         );
         let mb_layout = backend.menu_bar_layout(bar_rect, &bar);
 
-        // `vi.bounds.x` is already absolute — do not add `menu_bar_area.x`
-        // again (quadraui#494; harmless today only because it's always 0).
-        let menu_end: u16 = mb_layout
-            .visible_items
-            .last()
-            .map(|vi| (vi.bounds.x + vi.bounds.width).round() as u16)
-            .unwrap_or(menu_bar_area.x);
+        // #763: the `visible_items.last()` fold — and the quadraui#494
+        // "`vi.bounds.x` is already absolute, do not add the band's own `x`
+        // back on" warning it carries — now lives once in
+        // `render::menu_bar_items_end`, shared with both live `render_content`
+        // paths.
+        let menu_end: u16 =
+            render::menu_bar_items_end(&mb_layout, menu_bar_area.x as f32).round() as u16;
 
         let title = engine
             .cwd

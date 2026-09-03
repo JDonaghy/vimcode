@@ -447,6 +447,12 @@ pub struct TuiShellApp {
     /// app over, exactly as `gtk/testing.rs`'s `Harness` does for every one of
     /// its painted-geometry observables.
     painted_overlay_band: std::rc::Rc<RefCell<Vec<render::OverlayOp>>>,
+    /// The chrome-band twin of [`Self::painted_overlay_band`] (#763): written
+    /// by the [`render::compose_frame`] walk, one [`render::FrameOp`] pushed by
+    /// every arm that actually composed its rung. Same `Rc` rationale, same
+    /// role — it is what makes "both backends compose the chrome band in the
+    /// same order" assertable rather than promised in comments.
+    composed_chrome_band: std::rc::Rc<RefCell<Vec<render::FrameOp>>>,
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
@@ -653,6 +659,7 @@ impl TuiShellApp {
             dialog_layout: RefCell::new(None),
             tab_switcher_popup_rect: RefCell::new(None),
             painted_overlay_band: std::rc::Rc::new(RefCell::new(Vec::new())),
+            composed_chrome_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
@@ -1407,138 +1414,14 @@ impl ShellApp for TuiShellApp {
         // instead of never.
         render::sync_nerd_fonts(backend, &self.engine);
 
-        // ── Menu bar + command centre (#635 Stage 6b item A, #712) ───────
-        // Mirrors `draw_frame`'s own `menu_bar_area` block
-        // (`render_impl.rs`, the `screen.menu_bar_visible` block right
-        // after `top_chunks`). `AppShell::set_title_bar_visible`
-        // (quadraui#532, synced from `engine.menu_bar_visible` by
-        // `handle()`/seeded by `Self::shell_config` — see their doc
-        // comments) is what makes `layout.title_bar_bounds` `Some` in the
-        // first place; when the menu is hidden the shell never reserved
-        // the row, so there's nothing to paint. `draw_menu_bar` and
-        // `draw_command_center` were already trait calls — the gap this
-        // stage closes was purely the missing runtime-toggleable reserved
-        // row, not these calls themselves.
-        //
-        // #712: this block used to *paint* the bar here via
-        // `backend.draw_menu_bar` and immediately follow it with
-        // `backend.draw_command_center` in the same block. That command
-        // centre paint was silently erased every frame: the menu
-        // *dropdown* block further down (`self.engine.menu_system.borrow()
-        // .render(...)`, needed so an open dropdown paints on top of
-        // everything) calls `MenuSystem::render`, which unconditionally
-        // repaints `draw_menu_bar` across the *entire* `bar_rect` band —
-        // including the command-centre's columns to the right of the
-        // last menu label — whether or not a dropdown is actually open.
-        // Painting the command centre *before* that meant it got wiped
-        // the instant the frame reached the dropdown block, leaving a
-        // populated-but-invisible `command_center_layout` (paint and
-        // hit-test disagreeing, exactly like the #695 menu-bar bug and
-        // the #676 GTK command-centre bug this mirrors — see
-        // `gtk/mod.rs`'s identical "#676: painted *after*
-        // `menu_system.render()`" comment). Fixed the same way GTK was:
-        // only *measure* the bar here (`menu_bar_layout`, no paint — the
-        // dropdown block's `render()` call is what actually paints the
-        // bar, once, for real) and defer the command centre's own paint
-        // until after that block runs. `pending_command_center` carries
-        // the computed rect + descriptor across that gap.
-        //
-        // #695: `layout.title_bar_bounds` is cached into
-        // `engine.menu_bar_rect` unconditionally (mirrors GTK's
-        // `self.menu_row_rect.set(...)`, `gtk/mod.rs:8299`-`:8300`) *before*
-        // gating on `menu_bar_visible`, so the cache always reflects exactly
-        // what the shell reserved this frame — empty when nothing was
-        // reserved. `handle()`'s MenuSystem intercept and every `mouse.rs`
-        // hit test now read this one value instead of separately
-        // re-deriving "is there a menu-bar row" from `menu_bar_visible`
-        // alone, which is what let paint and hit-test disagree (#695).
-        let menu_bar_rect = layout.title_bar_bounds.unwrap_or_default();
-        self.engine.menu_bar_rect.set(menu_bar_rect);
+        // The menu row and the sidebar panel body used to be composed here, at
+        // the top of the frame; both are chrome-band rungs now (#763) and are
+        // composed from `render::CHROME_Z_ORDER` further down. The one
+        // observable difference is that a degenerate `main_content_bounds` —
+        // the early `return` just below — now also skips the sidebar *body*,
+        // converging on GTK, whose own guard already sat above its sidebar
+        // block.
         let mut pending_command_center: Option<(quadraui::Rect, quadraui::CommandCenter)> = None;
-        if self.engine.menu_bar_visible && menu_bar_rect.width >= 1.0 && menu_bar_rect.height >= 1.0
-        {
-            let tb_area = Rect {
-                x: menu_bar_rect.x.round() as u16,
-                y: menu_bar_rect.y.round() as u16,
-                width: menu_bar_rect.width.round() as u16,
-                height: menu_bar_rect.height.round() as u16,
-            };
-            backend.set_theme(super::quadraui_tui::q_theme(&theme));
-            let bar = self.engine.menu_system.borrow().menu_bar();
-            let bar_rect = quadraui::Rect::new(
-                tb_area.x as f32,
-                tb_area.y as f32,
-                tb_area.width as f32,
-                tb_area.height as f32,
-            );
-            // Layout only — no paint. The dropdown block below paints the
-            // real bar (see this block's own comment for why painting it
-            // here too would just be redundant work the dropdown block
-            // immediately overwrites).
-            let mb_layout = backend.menu_bar_layout(bar_rect, &bar);
-
-            // `vi.bounds.x` is already absolute (`MenuBar::layout` starts
-            // its cursor at `bar_rect.x`, passed in above) — adding
-            // `tb_area.x` again double-counts it. Harmless today only
-            // because `AppShell::layout` always sets `title_bar_bounds.x`
-            // (hence `tb_area.x`) to `0`; quadraui hit and fixed the
-            // identical double-count internally (quadraui#494). Mirrors
-            // GTK's `mod.rs` comment on its own `menu_end` computation.
-            let menu_end: u16 = mb_layout
-                .visible_items
-                .last()
-                .map(|vi| (vi.bounds.x + vi.bounds.width).round() as u16)
-                .unwrap_or(tb_area.x);
-
-            let title = self
-                .engine
-                .cwd
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "VimCode".to_string());
-            let cc = render::build_command_center_view(
-                self.engine.tab_nav_can_go_back(),
-                self.engine.tab_nav_can_go_forward(),
-                &title,
-            );
-            let cc_area = Rect {
-                x: menu_end,
-                y: tb_area.y,
-                width: tb_area.width.saturating_sub(menu_end - tb_area.x),
-                height: tb_area.height,
-            };
-            let cc_q_rect = quadraui::Rect::new(
-                cc_area.x as f32,
-                cc_area.y as f32,
-                cc_area.width as f32,
-                cc_area.height as f32,
-            );
-            pending_command_center = Some((cc_q_rect, cc));
-        }
-
-        // ── Sidebar panel content (#607) ─────────────────────────────────
-        // `AppShell::render` (quadraui, called by the runner before
-        // `render_content`) already painted the generic sidebar chrome
-        // (activity bar + header) — this paints the *active panel's* body
-        // into `layout.sidebar_content_bounds`. Independent of
-        // `main_content_bounds` below (distinct screen regions), so it
-        // isn't gated on that guard. See `panels::render_sidebar_content`'s
-        // doc comment for exactly which panels are ported (explorer —
-        // the default panel, search, debug) vs. still a documented,
-        // deferred gap for this stage (settings, source control,
-        // extensions, AI, the plugin extension panel).
-        if let Some(sb) = layout.sidebar_content_bounds {
-            if sb.width >= 1.0 && sb.height >= 1.0 {
-                let sb_area = Rect {
-                    x: sb.x.round() as u16,
-                    y: sb.y.round() as u16,
-                    width: sb.width.round() as u16,
-                    height: sb.height.round() as u16,
-                };
-                render_sidebar_content(backend, sb_area, &self.sidebar, &self.engine, &theme);
-            }
-        }
 
         let main = layout.main_content_bounds;
         if main.width < 1.0 || main.height < 1.0 {
@@ -1876,47 +1759,153 @@ impl ShellApp for TuiShellApp {
             render::draw_debug_toolbar(backend, &self.engine, q_rect);
         }
 
-        // ── Wildmenu bar (command Tab completion) ────────────────────────
-        if let Some(ref wm) = screen.wildmenu {
-            let bar = render::wildmenu_to_status_bar(wm, &theme);
-            let q_rect = quadraui::Rect::new(
-                chrome.wildmenu.x as f32,
-                chrome.wildmenu.y as f32,
-                chrome.wildmenu.width as f32,
-                chrome.wildmenu.height as f32,
-            );
-            backend.draw_status_bar(q_rect, &bar, None, None);
+        // ══ Chrome band (#763, #735 slice 2) ═════════════════════════════
+        //
+        // Composed from `render::compose_frame` — the single ordered artefact
+        // both backends walk for the non-editor bands, exactly as
+        // `OVERLAY_Z_ORDER` (below) is for the app-level overlays. Geometry
+        // stays here, in cells; only the *order* and the *gates* moved.
+        // `CHROME_Z_ORDER`'s doc comment records which three rungs changed
+        // position, why that repaints nothing, and the two gate divergences it
+        // closes.
+        //
+        // The two hit-test caches whose "absent" branch used to live in an
+        // `else` are cleared here instead, before the walk: `compose_frame`
+        // returns only the live rungs, so an absent rung has no arm to run.
+        // Both must reflect exactly what the shell reserved this frame — empty
+        // when nothing was — because `handle()`'s MenuSystem intercept and
+        // `mouse.rs`/`route_chrome_click` read them instead of re-deriving the
+        // bands, which is what let paint and hit-test disagree (#695, #752).
+        self.engine
+            .menu_bar_rect
+            .set(layout.title_bar_bounds.unwrap_or_default());
+        self.engine
+            .global_status_rect
+            .set(quadraui::Rect::default());
+
+        let mut composed_chrome: Vec<render::FrameOp> = Vec::new();
+        for op in render::compose_frame(&screen, layout, render::FrameMetrics::CELL) {
+            match op {
+                // ── Menu row: measure only ───────────────────────────────
+                // `draw_menu_bar` is *not* called here. The dropdown rung of
+                // the overlay band (`OverlayOp::MenuDropdown`) calls
+                // `MenuSystem::render`, which unconditionally repaints
+                // `draw_menu_bar` across the entire reserved band — including
+                // the command centre's columns to the right of the last menu
+                // label — whether or not a dropdown is open. Painting the
+                // command centre before that meant it was wiped every frame,
+                // leaving a populated-but-invisible `command_center_layout`
+                // (paint and hit-test disagreeing, exactly the #695 menu-bar
+                // and #676 GTK command-centre bugs). So this rung only
+                // *measures* (`menu_bar_layout`), and `pending_command_center`
+                // carries the computed rect + descriptor across to the
+                // `OverlayOp::CommandCenter` arm (#712).
+                render::FrameOp::MenuRow => {
+                    let band = self.engine.menu_bar_rect.get();
+                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                    let bar = self.engine.menu_system.borrow().menu_bar();
+                    // TUI has no app-icon slot and no in-canvas window
+                    // controls, so the items rect *is* the band and the
+                    // controls band comes back zero-width; the Command Center
+                    // takes everything from the last menu label to the right
+                    // edge, which is what this computed by hand before #763.
+                    let bands = render::measure_title_bar_bands(backend, band, band, &bar, None);
+                    let title = self
+                        .engine
+                        .cwd
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "VimCode".to_string());
+                    pending_command_center = Some((
+                        bands.command_center,
+                        render::build_command_center_view(
+                            self.engine.tab_nav_can_go_back(),
+                            self.engine.tab_nav_can_go_forward(),
+                            &title,
+                        ),
+                    ));
+                    composed_chrome.push(render::FrameOp::MenuRow);
+                }
+
+                // ── Sidebar panel body (#607) ────────────────────────────
+                // `AppShell::render` (quadraui, called by the runner before
+                // `render_content`) already painted the generic sidebar chrome
+                // — activity bar, header and separator — so this paints only
+                // the *active panel's* body into
+                // `layout.sidebar_content_bounds`. See
+                // `panels::render_sidebar_content`'s doc comment for which
+                // panels are ported.
+                render::FrameOp::SidebarPanel => {
+                    if let Some(sb) = layout.sidebar_content_bounds {
+                        let sb_area = Rect {
+                            x: sb.x.round() as u16,
+                            y: sb.y.round() as u16,
+                            width: sb.width.round() as u16,
+                            height: sb.height.round() as u16,
+                        };
+                        render_sidebar_content(
+                            backend,
+                            sb_area,
+                            &self.sidebar,
+                            &self.engine,
+                            &theme,
+                        );
+                        composed_chrome.push(render::FrameOp::SidebarPanel);
+                    }
+                }
+
+                // ── Wildmenu bar (command Tab completion) ────────────────
+                render::FrameOp::Wildmenu => {
+                    if let Some(ref wm) = screen.wildmenu {
+                        let bar = render::wildmenu_to_status_bar(wm, &theme);
+                        let q_rect = quadraui::Rect::new(
+                            chrome.wildmenu.x as f32,
+                            chrome.wildmenu.y as f32,
+                            chrome.wildmenu.width as f32,
+                            chrome.wildmenu.height as f32,
+                        );
+                        backend.draw_status_bar(q_rect, &bar, None, None);
+                        composed_chrome.push(render::FrameOp::Wildmenu);
+                    }
+                }
+
+                // ── Global status bar ────────────────────────────────────
+                render::FrameOp::StatusBar => {
+                    if let Some(ref bar) = screen.global_status_bar {
+                        let q_rect = quadraui::Rect::new(
+                            chrome.status.x as f32,
+                            chrome.status.y as f32,
+                            chrome.status.width as f32,
+                            chrome.status.height as f32,
+                        );
+                        self.engine.global_status_rect.set(q_rect);
+                        backend.draw_status_bar(q_rect, bar, None, None);
+                        composed_chrome.push(render::FrameOp::StatusBar);
+                    }
+                }
+
+                // ── Command line (+ mouse drag-selection inversion) ──────
+                render::FrameOp::CommandLine => {
+                    render_command_line(
+                        backend,
+                        chrome.cmd,
+                        &screen.command,
+                        &theme,
+                        self.cmd_sel.get(),
+                    );
+                    composed_chrome.push(render::FrameOp::CommandLine);
+                }
+            }
         }
 
-        // ── Global status bar ────────────────────────────────────────────
-        // #752: publish the painted rect for `render::route_chrome_click`, the
-        // twin of `render_impl.rs`'s `draw_frame` call site (this backend
-        // still paints the bottom band from two places — module-doc gap 1) and
-        // of GTK's in `App::render_content`. Cleared when no global bar is
-        // drawn, matching `Engine::menu_bar_rect`'s empty-rect convention.
-        if let Some(ref bar) = screen.global_status_bar {
-            let q_rect = quadraui::Rect::new(
-                chrome.status.x as f32,
-                chrome.status.y as f32,
-                chrome.status.width as f32,
-                chrome.status.height as f32,
-            );
-            self.engine.global_status_rect.set(q_rect);
-            backend.draw_status_bar(q_rect, bar, None, None);
-        } else {
-            self.engine
-                .global_status_rect
-                .set(quadraui::Rect::default());
+        *self.composed_chrome_band.borrow_mut() = composed_chrome;
+        // Read back through the field rather than the local, so the *stored*
+        // observable is what gets validated — a frame that recorded one thing
+        // and composed another would be a lie the tests then trusted.
+        if let Err(why) = render::check_chrome_band_order(&self.composed_chrome_band.borrow()) {
+            debug_assert!(false, "TUI {why}");
         }
-
-        // ── Command line (+ mouse drag-selection inversion) ──────────────
-        render_command_line(
-            backend,
-            chrome.cmd,
-            &screen.command,
-            &theme,
-            self.cmd_sel.get(),
-        );
 
         // ── Panel hover popup ────────────────────────────────────────────
         // Anchored just right of the sidebar's own right edge, which in the
@@ -6086,6 +6075,145 @@ mod tests {
             *band.borrow(),
             Vec::<render::OverlayOp>::new(),
             "no overlay was open, so nothing in the band should have painted"
+        );
+    }
+
+    // ── Chrome band (#763, #735 slice 2) ────────────────────────────────────
+    //
+    // The TUI half of the chrome-band acceptance test. `gtk/testing.rs`'s
+    // `mod chrome_band_order` carries the GTK half and asserts against the
+    // **same expected `Vec<FrameOp>`** (`render::chrome_band_fixture`) for the
+    // same engine state, exactly as the overlay-band pair above does.
+
+    /// Every chrome rung live, composed in `CHROME_Z_ORDER`.
+    ///
+    /// **RED against unfixed `develop`**, in two independent ways. (1) TUI
+    /// composed the wildmenu *before* the global status line and GTK composed
+    /// it *after*, so no single expected vector could satisfy both; swapping
+    /// the two arms' bodies back (hoisting `FrameOp::StatusBar`'s body above
+    /// `FrameOp::Wildmenu`'s, out of the `compose_frame` walk) makes this fail
+    /// with `[.., StatusBar, Wildmenu, ..]` and trips
+    /// `check_chrome_band_order`'s `debug_assert` in `render_content` on the
+    /// way. (2) TUI composed the menu row and the sidebar panel body at the
+    /// *top* of the frame, ahead of the editor — hoisting either arm back out
+    /// of the walk drops its `FrameOp` from the record entirely. Both were
+    /// re-introduced, observed red, and restored before committing.
+    #[test]
+    fn chrome_band_composes_in_canonical_order_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        // The *settings* panel, not the explorer: its body paints a fixed
+        // "SETTINGS" heading, where the explorer's would be this checkout's
+        // own directory listing — ambient state a test must not depend on
+        // (#762).
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app.engine.menu_bar_visible = true;
+        app.engine.wildmenu_items = vec!["ZQXWwildA".to_string(), "ZQXWwildB".to_string()];
+        app.engine.wildmenu_selected = Some(0);
+        app.engine.mode = crate::core::Mode::Command;
+        app.engine.command_buffer = "ZQXWcmd".to_string();
+        // Explicit, not ambient (#762): a global status bar exists only when
+        // per-window status lines are off, and the default is on.
+        app.engine.settings.window_status_line = false;
+
+        let band = app.composed_chrome_band.clone();
+        // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
+        // is what reserves `layout.title_bar_bounds`, and with no reserved row
+        // the `MenuRow` rung is not live at all.
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let screen = driver.screen();
+
+        assert_eq!(
+            *band.borrow(),
+            render::chrome_band_fixture(true),
+            "expected chrome band differs from the GTK twin's \
+             (`chrome_band_composes_in_canonical_order_via_gtk_driver`); \
+             screen:\n{screen}"
+        );
+
+        // Composition, not just bookkeeping (#587/#592): every rung the record
+        // claims must have reached the cells, and the three stacked bottom
+        // bands must land in the order the band declares — wildmenu above the
+        // global status line above the command line. Rows are *located*, never
+        // hardcoded (`CLAUDE.md` rule 1).
+        assert!(
+            driver.find_bounds("File").is_some(),
+            "MenuRow was composed but the menu bar never painted; screen:\n{screen}"
+        );
+        assert!(
+            driver.find_bounds("SETTINGS").is_some(),
+            "SidebarPanel was composed but the settings panel never painted; \
+             screen:\n{screen}"
+        );
+        let wm = driver
+            .find_bounds("ZQXWwildA")
+            .expect("Wildmenu was composed but no wildmenu entry painted");
+        let cmd = driver
+            .find_bounds(":ZQXWcmd")
+            .expect("CommandLine was composed but the command line never painted");
+        assert!(
+            wm.y < cmd.y,
+            "wildmenu row ({}) must sit above the command line ({}); screen:\n{screen}",
+            wm.y,
+            cmd.y
+        );
+    }
+
+    /// With no wildmenu up, the `Wildmenu` rung drops out — the record is not
+    /// simply "whatever `CHROME_Z_ORDER` contains", and the remaining four
+    /// rungs keep their relative order.
+    #[test]
+    fn chrome_band_drops_the_wildmenu_rung_when_no_completion_is_up_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        app.engine.menu_bar_visible = true;
+        app.engine.settings.window_status_line = false;
+        assert!(
+            app.engine.wildmenu_items.is_empty(),
+            "fixture needs no wildmenu"
+        );
+
+        let band = app.composed_chrome_band.clone();
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let screen = driver.screen();
+        assert_eq!(
+            *band.borrow(),
+            render::chrome_band_fixture(false),
+            "no completion was up, so the Wildmenu rung must not be composed; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// The `MenuRow` rung is gated on the shell actually reserving a title-bar
+    /// row, not on `engine.menu_bar_visible` alone — `config()` builds a shell
+    /// with no title bar, so `layout.title_bar_bounds` is `None` and
+    /// `compose_frame` must drop the rung even though the engine flag is set.
+    ///
+    /// This is the paint/hit-test agreement #695 is about, expressed as a
+    /// composition fact: a `MenuRow` rung composed against a band the shell
+    /// never reserved would publish a `menu_bar_rect` nothing paints into.
+    #[test]
+    fn chrome_band_drops_the_menu_row_when_the_shell_reserved_no_title_bar_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        app.engine.menu_bar_visible = true;
+
+        let band = app.composed_chrome_band.clone();
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            !band.borrow().contains(&render::FrameOp::MenuRow),
+            "no title-bar row was reserved, so MenuRow must not be composed; \
+             screen:\n{screen}"
+        );
+        assert!(
+            driver.find_bounds("File").is_none(),
+            "no title-bar row was reserved, so no menu bar should have painted; \
+             screen:\n{screen}"
+        );
+        assert_eq!(
+            render::check_chrome_band_order(&band.borrow()),
+            Ok(()),
+            "the surviving rungs must still be in canonical order"
         );
     }
 

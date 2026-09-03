@@ -755,6 +755,11 @@ struct App {
     /// useful there too — `check_overlay_band_order` turns a z-order
     /// inversion into a diagnosable string rather than a visual mystery.
     painted_overlay_band: Rc<RefCell<Vec<render::OverlayOp>>>,
+    /// The chrome-band twin of [`Self::painted_overlay_band`] (#763): written
+    /// by the [`render::compose_frame`] walk, one [`render::FrameOp`] pushed by
+    /// every arm that actually composed its rung. `TuiShellApp` keeps the
+    /// identical field for the identical reason.
+    composed_chrome_band: Rc<RefCell<Vec<render::FrameOp>>>,
     /// Picker/command-palette popup rect `(x, y, w, h)` **as the last frame
     /// actually painted it** — see [`App::compute_picker_popup_bounds`] for
     /// why the click path must not re-derive it (#555).
@@ -1177,6 +1182,7 @@ impl App {
             context_menu_layout: Rc::new(RefCell::new(None)),
             tab_switcher_popup_rect: Rc::new(Cell::new(None)),
             painted_overlay_band: Rc::new(RefCell::new(Vec::new())),
+            composed_chrome_band: Rc::new(RefCell::new(Vec::new())),
             picker_popup_rect: Rc::new(Cell::new(None)),
             painted_sidebar_bounds: Rc::new(Cell::new(None)),
             painted_line_height: Rc::new(Cell::new(None)),
@@ -5024,117 +5030,6 @@ impl quadraui::ShellApp for App {
             return;
         }
 
-        // ── Menu bar row (client-side chrome; #552) ─────────────────────────────
-        // quadraui's `run_with_shell` GTK runner (single-DA architecture, #217)
-        // creates the window undecorated with no native titlebar/menu hosting.
-        // `ShellConfig::with_title_bar()` (set in `run()`) reserves a
-        // full-width band across the top of the *entire* shell — above the
-        // activity bar and sidebar too, not just `main_content_bounds` — so
-        // GTK's drawn menu bar + inline window controls span the whole
-        // window like a real titlebar, and the activity bar/sidebar/main
-        // content the runner hands us below are already shifted down to
-        // make room. Mirrors the pre-#540 Relm4 headerbar and TUI's
-        // identical row (render_impl.rs) via the same shared
-        // `engine.menu_system` / `Backend::draw_menu_bar`.
-        let menu_row_rect = layout.title_bar_bounds.unwrap_or_default();
-        self.menu_row_rect.set(menu_row_rect);
-        // #720: reserve a square, row-height slot at the leading edge of the
-        // band for the VimCode app icon (VS Code puts its logo left of
-        // `File`), and lay the menu items out in what's left. This is the
-        // *only* place the split is computed: `menu_items_rect` is what the
-        // measurement below, `menu_system.render()` and — via
-        // `self.menu_items_rect` — `handle()`'s click routing all use, so the
-        // icon's x-shift can never be applied to the paint but not the
-        // hit-test (quadraui's `MenuBar::layout_with_leading` doc names this
-        // exact hazard; vimcode goes through `MenuSystem`, which owns its own
-        // `MenuBar::layout` call and takes no leading width, so the narrowed
-        // rect is how vimcode expresses the same thing).
-        let (app_icon_rect, menu_items_rect) = if engine.menu_bar_visible {
-            render::split_menu_row_for_app_icon(menu_row_rect)
-        } else {
-            (quadraui::Rect::default(), menu_row_rect)
-        };
-        self.menu_items_rect.set(menu_items_rect);
-        // Compute where the menu labels end so the inline window controls can
-        // sit to their right. This is layout-only (`menu_bar_layout`, no draw):
-        // the menu bar itself — and the whole `menu_row_rect` band — is painted
-        // by `menu_system.render()` near the end of this method. Drawing the
-        // controls *here* (as this used to) is pointless because that later
-        // `render()` repaints `draw_menu_bar` across the entire band and erases
-        // them (#552 round-2/3 "buttons render blank"). So we only stash the
-        // target rect now and paint the buttons *after* `render()` below.
-        let (controls_rect, command_center_rect) =
-            if engine.menu_bar_visible && menu_row_rect.height > 0.0 {
-                let bar = engine.menu_system.borrow().menu_bar();
-                let mb_layout = backend.menu_bar_layout(menu_items_rect, &bar);
-                // `vi.bounds.x` is already absolute (quadraui's `MenuBar::layout`
-                // starts its cursor at `bounds.x`, the rect passed above) — do not
-                // add `menu_row_rect.x` again.
-                let menu_end = mb_layout
-                    .visible_items
-                    .last()
-                    .map(|vi| vi.bounds.x + vi.bounds.width)
-                    // #720: an item-less bar still starts *after* the app-icon
-                    // slot, so the Command Center / window controls must not
-                    // be handed the icon's real estate back.
-                    .unwrap_or(menu_items_rect.x);
-                let full_rect = quadraui::Rect::new(
-                    menu_end,
-                    menu_row_rect.y,
-                    (menu_row_rect.x + menu_row_rect.width - menu_end).max(0.0),
-                    menu_row_rect.height,
-                );
-                // #676: narrow the controls rect to the window-control buttons'
-                // *actual* painted width instead of handing them the entire
-                // menu_end→right-edge band. That full band, background-filled
-                // end-to-end by `window_controls_status_bar` (via
-                // `Backend::draw_status_bar`), is exactly what silently ate the
-                // VS Code-style Command Center's real estate after the #540
-                // Relm4→ShellApp cutover dropped it. `status_bar_layout` mirrors
-                // `draw_status_bar`'s own measurement (its doc comment: "audited
-                // under #552 and ruled out" — paint and no-paint agree), so this
-                // is the same width the buttons paint at, a few hundred lines
-                // below.
-                let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
-                let controls_bar = render::window_controls_status_bar(&theme, maximized);
-                let controls_layout = backend.status_bar_layout(full_rect, &controls_bar);
-                let controls_start = controls_layout
-                    .visible_segments
-                    .iter()
-                    .map(|vs| vs.bounds.x)
-                    .fold(f32::INFINITY, f32::min);
-                let controls_start = if controls_start.is_finite() {
-                    controls_start
-                } else {
-                    full_rect.width
-                };
-                let rect = quadraui::Rect::new(
-                    full_rect.x + controls_start,
-                    full_rect.y,
-                    (full_rect.width - controls_start).max(0.0),
-                    full_rect.height,
-                );
-                self.title_bar_rect.set(rect);
-
-                // The gap freed up between the last menu label and the
-                // now-narrow window controls is exactly where the VS Code-style
-                // Command Center (nav arrows + search box) belongs — painted via
-                // `render::build_command_center_view` / `Backend::draw_command_center`
-                // after `menu_system.render()` below (same ordering constraint
-                // as the window controls: that call repaints the full
-                // `menu_row_rect` band and would erase anything painted first).
-                let cc_rect = quadraui::Rect::new(
-                    menu_end,
-                    menu_row_rect.y,
-                    (rect.x - menu_end).max(0.0),
-                    menu_row_rect.height,
-                );
-                (Some(rect), Some(cc_rect))
-            } else {
-                self.title_bar_rect.set(quadraui::Rect::default());
-                (None, None)
-            };
-
         // ── Layout ────────────────────────────────────────────────────────────
         let tab_row_h = render::tab_row_height_px(lh);
         let tab_bar_h = render::tab_bar_height_px(lh, engine.settings.breadcrumbs);
@@ -5925,300 +5820,402 @@ impl quadraui::ShellApp for App {
             self.separated_status_bar_rect.set(None);
         }
 
-        // ── Draw global status bar / wildmenu ─────────────────────────────────
-        // Simplified to `h - status_bar_h`: quickfix/terminal/debug-toolbar/
-        // separated-status all stack *above* this point now (see the
-        // quickfix/bottom-panel/debug-toolbar block above), so the status
-        // bar's own band no longer needs to re-subtract them.
+        // ══ Chrome band (#763, #735 slice 2) ═════════════════════════════════
+        //
+        // Composed from `render::compose_frame` — the single ordered artefact
+        // both backends walk for the non-editor bands, exactly as
+        // `OVERLAY_Z_ORDER` (below) is for the app-level overlays. Geometry and
+        // rasterisation stay here, in pixels; only the *order* and the *gates*
+        // moved. `CHROME_Z_ORDER`'s doc comment records which three rungs
+        // changed position, why that repaints nothing, and the two gate
+        // divergences it closes.
+        //
+        // Caches whose "absent" branch used to live in an `else` are cleared
+        // here, before the walk: `compose_frame` returns only the live rungs,
+        // so an absent rung has no arm left to run.
         let status_y = y + h - status_bar_h;
-        // #752: publish the painted rect for `route_chrome_click`, the twin of
-        // TUI's `render_impl.rs` call site. The bespoke branch hit-test this
-        // replaces re-derived the band from `height - lh * rows - wildmenu_px`
-        // in the click handler — a second copy of the arithmetic three lines
-        // above, and one that had no way to know what was really drawn.
-        if let Some(ref bar) = screen.global_status_bar {
-            let sb_rect = quadraui::Rect::new(x as f32, status_y as f32, w as f32, lh as f32);
-            self.engine.borrow().global_status_rect.set(sb_rect);
-            // Same zone recovery as the per-window and separated bars above.
-            *self.global_status_zones.borrow_mut() =
-                render::status_bar_zones_from_layout(&backend.status_bar_layout(sb_rect, bar));
-            let mut frame = QSL::new();
-            frame.push(Surface::StatusBar {
-                rect: sb_rect,
-                bar,
-                hovered: None,
-                pressed: None,
-            });
-            frame.draw(backend);
-        } else {
-            self.engine
-                .borrow()
-                .global_status_rect
-                .set(quadraui::Rect::default());
-            self.global_status_zones.borrow_mut().clear();
-        }
-        if let Some(ref wm) = screen.wildmenu {
-            let wm_bar = render::wildmenu_to_status_bar(wm, &theme);
-            let wm_y = if per_window_status {
-                status_y
-            } else {
-                status_y + lh
-            };
-            let wm_rect = quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);
-            let mut frame = QSL::new();
-            frame.push(Surface::StatusBar {
-                rect: wm_rect,
-                bar: &wm_bar,
-                hovered: None,
-                pressed: None,
-            });
-            frame.draw(backend);
-        }
-
-        // ── Draw command line ─────────────────────────────────────────────────
-        let cmd_y = status_y + (status_bar_h - lh);
-        let cmd = quadraui::CommandLine {
-            id: "cmd".into(),
-            text: screen.command.text.clone(),
-            cursor_offset: if screen.command.show_cursor {
-                Some(screen.command.cursor_anchor_text.len())
-            } else {
-                None
-            },
-            right_align: screen.command.right_align,
-        };
-        let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
-        let mut frame = QSL::new();
-        frame.push(Surface::CommandLine {
-            rect: cmd_rect,
-            cmd: &cmd,
-        });
-        frame.draw(backend);
-
-        // ── Draw sidebar panel content ─────────────────────────────────────────
-        // The quadraui AppShell chrome (activity bar + sidebar header) is rendered
-        // by the runner; we fill only the content area it exposes.
+        self.engine
+            .borrow()
+            .global_status_rect
+            .set(quadraui::Rect::default());
+        self.global_status_zones.borrow_mut().clear();
         self.painted_sidebar_bounds
             .set(layout.sidebar_content_bounds);
-        if let Some(q_sb) = layout.sidebar_content_bounds {
-            // Which panel is active?  Extension panels bypass AppShell.
-            let active_id: String = if let Some(ref name) = engine.ext_panel_active {
-                format!("ext:{name}")
-            } else {
-                engine
-                    .app_shell
-                    .active_panel_id()
-                    .map(|id| id.as_str().to_string())
-                    .unwrap_or_else(|| PANEL_EXPLORER.to_string())
-            };
 
-            match active_id.as_str() {
-                PANEL_EXPLORER => {
-                    render::populate_explorer_tree_controller(&engine, &theme);
-                    // Capture the exact metrics the tree is drawn with so the
-                    // click hit-test (which reads the backend's mutable
-                    // current_line_height at a later, possibly-different time) can
-                    // re-apply them and resolve the correct row. (#540)
-                    self.cached_explorer_metrics
-                        .set((backend.line_height() as f64, backend.char_width() as f64));
-                    engine.explorer_tree_rect.set(q_sb);
-                    engine.explorer_viewport_rows.set(q_sb.height as usize);
-                    engine.explorer_tree.borrow().render(backend, q_sb);
+        // The title-bar band's rects are published unconditionally — empty when
+        // the shell reserved nothing this frame — because `handle()`'s click
+        // routing reads them on a *later* frame and must never resolve against
+        // a stale value (the #695 paint/hit-test disagreement in miniature).
+        // The `MenuRow` arm below overwrites them when the rung is live.
+        let menu_row_rect = layout.title_bar_bounds.unwrap_or_default();
+        self.menu_row_rect.set(menu_row_rect);
+        self.menu_items_rect.set(menu_row_rect);
+        self.title_bar_rect.set(quadraui::Rect::default());
+        let mut app_icon_rect = quadraui::Rect::default();
+        let mut menu_items_rect = menu_row_rect;
+        let mut controls_rect: Option<quadraui::Rect> = None;
+        let mut command_center_rect: Option<quadraui::Rect> = None;
+
+        let mut composed_chrome: Vec<render::FrameOp> = Vec::new();
+        for op in render::compose_frame(screen, layout, render::FrameMetrics::px(lh, cw)) {
+            match op {
+                // ── Menu bar row (client-side chrome; #552): measure only ────
+                // quadraui's `run_with_shell` GTK runner (single-DA
+                // architecture, #217) creates the window undecorated with no
+                // native titlebar/menu hosting. `ShellConfig::with_title_bar()`
+                // (set in `run()`) reserves a full-width band across the top of
+                // the *entire* shell — above the activity bar and sidebar too,
+                // not just `main_content_bounds` — so GTK's drawn menu bar +
+                // inline window controls span the whole window like a real
+                // titlebar, and the activity bar/sidebar/main content the runner
+                // hands us are already shifted down to make room. Mirrors the
+                // pre-#540 Relm4 headerbar and TUI's identical row via the same
+                // shared `engine.menu_system` / `Backend::draw_menu_bar`.
+                //
+                // This is layout-only (`menu_bar_layout`, no draw): the bar
+                // itself — and the whole `menu_row_rect` band — is painted from
+                // the overlay band's `OverlayOp::MenuDropdown` arm below.
+                // Drawing the controls or the Command Center *here* (as this
+                // used to) is pointless because that later `menu_system.render()`
+                // repaints `draw_menu_bar` across the entire band and erases
+                // them (#552 round-2/3 "buttons render blank"), so this rung
+                // only stashes their target rects.
+                render::FrameOp::MenuRow => {
+                    // #720: reserve a square, row-height slot at the leading
+                    // edge of the band for the VimCode app icon (VS Code puts
+                    // its logo left of `File`), and lay the menu items out in
+                    // what's left. This is the *only* place the split is
+                    // computed: `menu_items_rect` is what the measurement below,
+                    // `menu_system.render()` and — via `self.menu_items_rect` —
+                    // `handle()`'s click routing all use, so the icon's x-shift
+                    // can never reach the paint but not the hit-test (quadraui's
+                    // `MenuBar::layout_with_leading` doc names this exact hazard).
+                    let (icon_rect, items_rect) =
+                        render::split_menu_row_for_app_icon(menu_row_rect);
+                    app_icon_rect = icon_rect;
+                    menu_items_rect = items_rect;
+                    self.menu_items_rect.set(menu_items_rect);
+
+                    let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+                    let controls_bar = render::window_controls_status_bar(&theme, maximized);
+                    let bar = engine.menu_system.borrow().menu_bar();
+                    let bands = render::measure_title_bar_bands(
+                        backend,
+                        menu_row_rect,
+                        menu_items_rect,
+                        &bar,
+                        Some(&controls_bar),
+                    );
+                    self.title_bar_rect.set(bands.controls);
+                    controls_rect = Some(bands.controls);
+                    command_center_rect = Some(bands.command_center);
+                    composed_chrome.push(render::FrameOp::MenuRow);
                 }
-                PANEL_SEARCH => {
-                    render::populate_search_sidebar_system(&engine, &engine.cwd);
-                    engine.search_sidebar_body_rect.set(q_sb);
-                    engine.search_sidebar_system.borrow().render(backend, q_sb);
-                }
-                PANEL_DEBUG => {
-                    let (title_bar, action_bar) =
-                        render::debug_sidebar_chrome_to_status_bars(&screen.debug_sidebar, &theme);
-                    let title_rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
-                    let action_rect =
-                        quadraui::Rect::new(q_sb.x, q_sb.y + lh as f32, q_sb.width, lh as f32);
-                    let body_y = q_sb.y + 2.0 * lh as f32;
-                    let body_h = (q_sb.height - 2.0 * lh as f32).max(0.0);
-                    let body_rect = quadraui::Rect::new(q_sb.x, body_y, q_sb.width, body_h);
-                    let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
-                    let hits = backend.draw_status_bar(action_rect, &action_bar, None, None);
-                    engine.dap_sidebar_action_hits.replace(Some(hits));
-                    // `hits` are relative to `action_rect`'s origin; the click
-                    // router needs the rect to translate into that space (#544).
-                    self.cached_dap_action_rect.set(Some(action_rect));
-                    engine.dap_sidebar_body_rect.set(body_rect);
-                    render::populate_dap_sidebar_system(&engine);
-                    engine
-                        .dap_sidebar_system
-                        .borrow()
-                        .render(backend, body_rect);
-                }
-                PANEL_GIT => {
-                    if let Some(ref sc) = screen.source_control {
-                        // Header row + commit-input box (#480). Previously
-                        // entirely unpainted under ShellApp — the only place
-                        // that ever drew them was the dead
-                        // `draw.rs::draw_source_control_panel` Cairo painter,
-                        // which has zero live callers (superseded by this
-                        // `render_content` path back when the 14 legacy DAs
-                        // were collapsed into one, #493). Paint them for
-                        // real now that quadraui#222 (TextInput) has landed,
-                        // through the same `render::sc_*` adapters TUI uses
-                        // so the two renderers can't drift.
-                        // Band geometry (header / commit box / slab) comes from
-                        // the shared `render::sc_sidebar_bands` so the click
-                        // router in `try_route_sidebar_mouse_event` resolves a
-                        // press against the *same* derivation that painted it
-                        // (#544). `SC_COMMIT_BORDER_PX` is the primitive's 1px
-                        // border top+bottom — GTK's native unit is pixels,
-                        // unlike TUI's whole-cell border (see
-                        // `render::sc_commit_input_box_height` doc).
-                        let bands = render::sc_sidebar_bands(
-                            &sc.commit_message,
-                            q_sb,
-                            lh as f32,
-                            SC_COMMIT_BORDER_PX,
-                        );
-                        self.cached_sc_bands.set(Some(bands));
-                        let header_bar = render::sc_header_status_bar(sc, &theme);
-                        let _ = backend.draw_status_bar(bands.header, &header_bar, None, None);
 
-                        let ti = render::sc_commit_message_to_text_input(sc);
-                        backend.draw_text_input(bands.commit_input, &ti);
+                // ── Sidebar panel body ───────────────────────────────────────
+                // The quadraui AppShell chrome (activity bar, sidebar header,
+                // separator) is painted by the runner before `render_content`
+                // is entered; this fills only the content area it exposes.
+                render::FrameOp::SidebarPanel => {
+                    if let Some(q_sb) = layout.sidebar_content_bounds {
+                        // Which panel is active?  Extension panels bypass AppShell.
+                        let active_id: String = if let Some(ref name) = engine.ext_panel_active {
+                            format!("ext:{name}")
+                        } else {
+                            engine
+                                .app_shell
+                                .active_panel_id()
+                                .map(|id| id.as_str().to_string())
+                                .unwrap_or_else(|| PANEL_EXPLORER.to_string())
+                        };
 
-                        // Render the toolbar-slab + section list below the
-                        // header + commit input.
-                        let slab_rect = bands.slab;
-                        render::draw_sc_sidebar_panel(backend, &engine, sc, slab_rect);
-                        let body_rect = engine
-                            .sc_panel_layout
-                            .borrow()
-                            .as_ref()
-                            .map(|l| l.content_bounds)
-                            .unwrap_or(slab_rect);
-                        engine.sc_sidebar_body_rect.set(body_rect);
-                        render::populate_sc_sidebar_system(&engine, &theme);
-                        engine.sc_sidebar_system.borrow().render(backend, body_rect);
+                        match active_id.as_str() {
+                            PANEL_EXPLORER => {
+                                render::populate_explorer_tree_controller(&engine, &theme);
+                                // Capture the exact metrics the tree is drawn with so the
+                                // click hit-test (which reads the backend's mutable
+                                // current_line_height at a later, possibly-different time) can
+                                // re-apply them and resolve the correct row. (#540)
+                                self.cached_explorer_metrics.set((
+                                    backend.line_height() as f64,
+                                    backend.char_width() as f64,
+                                ));
+                                engine.explorer_tree_rect.set(q_sb);
+                                engine.explorer_viewport_rows.set(q_sb.height as usize);
+                                engine.explorer_tree.borrow().render(backend, q_sb);
+                            }
+                            PANEL_SEARCH => {
+                                render::populate_search_sidebar_system(&engine, &engine.cwd);
+                                engine.search_sidebar_body_rect.set(q_sb);
+                                engine.search_sidebar_system.borrow().render(backend, q_sb);
+                            }
+                            PANEL_DEBUG => {
+                                let (title_bar, action_bar) =
+                                    render::debug_sidebar_chrome_to_status_bars(
+                                        &screen.debug_sidebar,
+                                        &theme,
+                                    );
+                                let title_rect =
+                                    quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
+                                let action_rect = quadraui::Rect::new(
+                                    q_sb.x,
+                                    q_sb.y + lh as f32,
+                                    q_sb.width,
+                                    lh as f32,
+                                );
+                                let body_y = q_sb.y + 2.0 * lh as f32;
+                                let body_h = (q_sb.height - 2.0 * lh as f32).max(0.0);
+                                let body_rect =
+                                    quadraui::Rect::new(q_sb.x, body_y, q_sb.width, body_h);
+                                let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
+                                let hits =
+                                    backend.draw_status_bar(action_rect, &action_bar, None, None);
+                                engine.dap_sidebar_action_hits.replace(Some(hits));
+                                // `hits` are relative to `action_rect`'s origin; the click
+                                // router needs the rect to translate into that space (#544).
+                                self.cached_dap_action_rect.set(Some(action_rect));
+                                engine.dap_sidebar_body_rect.set(body_rect);
+                                render::populate_dap_sidebar_system(&engine);
+                                engine
+                                    .dap_sidebar_system
+                                    .borrow()
+                                    .render(backend, body_rect);
+                            }
+                            PANEL_GIT => {
+                                if let Some(ref sc) = screen.source_control {
+                                    // Header row + commit-input box (#480). Previously
+                                    // entirely unpainted under ShellApp — the only place
+                                    // that ever drew them was the dead
+                                    // `draw.rs::draw_source_control_panel` Cairo painter,
+                                    // which has zero live callers (superseded by this
+                                    // `render_content` path back when the 14 legacy DAs
+                                    // were collapsed into one, #493). Paint them for
+                                    // real now that quadraui#222 (TextInput) has landed,
+                                    // through the same `render::sc_*` adapters TUI uses
+                                    // so the two renderers can't drift.
+                                    // Band geometry (header / commit box / slab) comes from
+                                    // the shared `render::sc_sidebar_bands` so the click
+                                    // router in `try_route_sidebar_mouse_event` resolves a
+                                    // press against the *same* derivation that painted it
+                                    // (#544). `SC_COMMIT_BORDER_PX` is the primitive's 1px
+                                    // border top+bottom — GTK's native unit is pixels,
+                                    // unlike TUI's whole-cell border (see
+                                    // `render::sc_commit_input_box_height` doc).
+                                    let bands = render::sc_sidebar_bands(
+                                        &sc.commit_message,
+                                        q_sb,
+                                        lh as f32,
+                                        SC_COMMIT_BORDER_PX,
+                                    );
+                                    self.cached_sc_bands.set(Some(bands));
+                                    let header_bar = render::sc_header_status_bar(sc, &theme);
+                                    let _ = backend.draw_status_bar(
+                                        bands.header,
+                                        &header_bar,
+                                        None,
+                                        None,
+                                    );
 
-                        // Branch picker / create popup (dual-mode Palette,
-                        // quadraui#224) and help dialog (Dialog + DialogTable,
-                        // quadraui#225) — both keyboard-reachable via
-                        // `dispatch_sc_sidebar_key_unified` even though the
-                        // git sidebar has no live mouse-click routing yet
-                        // (#449 tracks that separately). Render over the
-                        // whole sidebar content area, same popup-over-panel
-                        // z-order TUI uses.
-                        if let Some(ref bp) = sc.branch_picker {
-                            let palette = render::sc_branch_picker_to_palette(bp);
-                            let popup_w = q_sb.width.min(40.0 * cw as f32);
-                            let popup_h = if bp.create_mode {
-                                4.0 * lh as f32
-                            } else {
-                                (q_sb.height * 0.6).min(15.0 * lh as f32)
-                            };
-                            let popup_x = q_sb.x + (q_sb.width - popup_w) / 2.0;
-                            let popup_y = q_sb.y + 2.0 * lh as f32;
-                            backend.draw_palette(
-                                quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
-                                &palette,
+                                    let ti = render::sc_commit_message_to_text_input(sc);
+                                    backend.draw_text_input(bands.commit_input, &ti);
+
+                                    // Render the toolbar-slab + section list below the
+                                    // header + commit input.
+                                    let slab_rect = bands.slab;
+                                    render::draw_sc_sidebar_panel(backend, &engine, sc, slab_rect);
+                                    let body_rect = engine
+                                        .sc_panel_layout
+                                        .borrow()
+                                        .as_ref()
+                                        .map(|l| l.content_bounds)
+                                        .unwrap_or(slab_rect);
+                                    engine.sc_sidebar_body_rect.set(body_rect);
+                                    render::populate_sc_sidebar_system(&engine, &theme);
+                                    engine.sc_sidebar_system.borrow().render(backend, body_rect);
+
+                                    // Branch picker / create popup (dual-mode Palette,
+                                    // quadraui#224) and help dialog (Dialog + DialogTable,
+                                    // quadraui#225) — both keyboard-reachable via
+                                    // `dispatch_sc_sidebar_key_unified` even though the
+                                    // git sidebar has no live mouse-click routing yet
+                                    // (#449 tracks that separately). Render over the
+                                    // whole sidebar content area, same popup-over-panel
+                                    // z-order TUI uses.
+                                    if let Some(ref bp) = sc.branch_picker {
+                                        let palette = render::sc_branch_picker_to_palette(bp);
+                                        let popup_w = q_sb.width.min(40.0 * cw as f32);
+                                        let popup_h = if bp.create_mode {
+                                            4.0 * lh as f32
+                                        } else {
+                                            (q_sb.height * 0.6).min(15.0 * lh as f32)
+                                        };
+                                        let popup_x = q_sb.x + (q_sb.width - popup_w) / 2.0;
+                                        let popup_y = q_sb.y + 2.0 * lh as f32;
+                                        backend.draw_palette(
+                                            quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
+                                            &palette,
+                                        );
+                                    }
+
+                                    if sc.help_open {
+                                        let viewport = q_sb;
+                                        let (dialog, dlayout) = render::sc_help_dialog_layout(
+                                            viewport, cw as f32, lh as f32,
+                                        );
+                                        backend.draw_dialog(&dialog, &dlayout);
+                                    }
+                                } else {
+                                    // Git panel is the active tab but there's no repo open
+                                    // (e.g. the user closed it, or switched to a non-git
+                                    // folder, without also switching sidebar tabs) — nothing
+                                    // paints this frame. Clear the cached band geometry so a
+                                    // stray click doesn't get resolved against stale
+                                    // coordinates from the last time a repo *was* open
+                                    // (`route_sc_sidebar_event` reads this cache directly).
+                                    self.cached_sc_bands.set(None);
+                                }
+                            }
+                            PANEL_EXTENSIONS => {
+                                render::populate_ext_sidebar_system(&engine);
+                                engine.ext_sidebar_body_rect.set(q_sb);
+                                engine.ext_sidebar_system.borrow().render(backend, q_sb);
+                            }
+                            PANEL_SETTINGS => {
+                                render::populate_settings_form_controller(&engine);
+                                engine
+                                    .settings_form_controller
+                                    .borrow_mut()
+                                    .render_and_cache(backend, q_sb);
+                            }
+                            id if id.starts_with("ext:") => {
+                                // Extension panel — render via ext_sidebar_system.
+                                render::populate_ext_sidebar_system(&engine);
+                                engine.ext_sidebar_body_rect.set(q_sb);
+                                engine.ext_sidebar_system.borrow().render(backend, q_sb);
+                            }
+                            PANEL_AI => {
+                                // #730: the last of #592's 14 `ScreenLayout` fields,
+                                // and the straggler #670 deferred. Paints through the
+                                // same `render::draw_ai_sidebar_panel` builder TUI's
+                                // `render_ai_sidebar` calls — `unit_w`/`unit_h` here are
+                                // the pixel `char_width`/`line_height` GTK's other
+                                // row-based panels (PANEL_GIT, PANEL_DEBUG) already
+                                // convert through, unlike TUI's cell-native `1.0, 1.0`.
+                                // Bands are cached for `route_ai_sidebar_event` so the
+                                // click and paint derivations cannot drift (#544).
+                                if let Some(ref ai) = screen.ai_panel {
+                                    let bands = render::draw_ai_sidebar_panel(
+                                        backend, q_sb, ai, &theme, cw as f32, lh as f32,
+                                    );
+                                    self.cached_ai_bands.set(Some(bands));
+                                } else {
+                                    self.cached_ai_bands.set(None);
+                                }
+                            }
+                            _ => {
+                                // Unknown panel id: nothing painted, nothing to route a
+                                // click to.
+                                self.cached_ai_bands.set(None);
+                            }
+                        }
+
+                        // ── Sidebar-item hover popup (#670) ─────────────────────────────
+                        // Source-control / extension-panel item dwell tooltip, rendered
+                        // markdown. Ported from the dead `draw.rs::draw_panel_hover_popup`
+                        // (raw Cairo/Pango, no live callers) onto the shared
+                        // `quadraui::RichTextPopup` path via `render::panel_hover_popup_
+                        // paint` — the same primitive TUI's `render_panel_hover_popup`
+                        // already uses. Paints after the panel body above (same
+                        // paint-after-content z-order the dead code used), clamped
+                        // against the full content viewport so it can extend rightward
+                        // into the editor area past the sidebar's own bounds.
+                        self.panel_hover_popup_rect.set(None);
+                        self.panel_hover_link_rects.borrow_mut().clear();
+                        if screen.panel_hover.is_some() {
+                            let hover_viewport =
+                                quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
+                            let (links, rect) = render::panel_hover_popup_paint(
+                                backend,
+                                screen,
+                                &theme,
+                                q_sb.x + q_sb.width,
+                                q_sb.y,
+                                hover_viewport,
+                                cw as f32,
+                                lh as f32,
                             );
+                            self.panel_hover_popup_rect
+                                .set(rect.map(|(rx, ry, rw, rh)| {
+                                    (rx as f64, ry as f64, rw as f64, rh as f64)
+                                }));
+                            *self.panel_hover_link_rects.borrow_mut() = links
+                                .into_iter()
+                                .map(|(lx, ly, lw, lh2, url, is_native)| {
+                                    (lx as f64, ly as f64, lw as f64, lh2 as f64, url, is_native)
+                                })
+                                .collect();
                         }
+                    }
+                    composed_chrome.push(render::FrameOp::SidebarPanel);
+                }
 
-                        if sc.help_open {
-                            let viewport = q_sb;
-                            let (dialog, dlayout) =
-                                render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
-                            backend.draw_dialog(&dialog, &dlayout);
-                        }
-                    } else {
-                        // Git panel is the active tab but there's no repo open
-                        // (e.g. the user closed it, or switched to a non-git
-                        // folder, without also switching sidebar tabs) — nothing
-                        // paints this frame. Clear the cached band geometry so a
-                        // stray click doesn't get resolved against stale
-                        // coordinates from the last time a repo *was* open
-                        // (`route_sc_sidebar_event` reads this cache directly).
-                        self.cached_sc_bands.set(None);
+                // ── Wildmenu bar (command Tab completion) ────────────────────
+                render::FrameOp::Wildmenu => {
+                    if let Some(ref wm) = screen.wildmenu {
+                        let wm_bar = render::wildmenu_to_status_bar(wm, &theme);
+                        // Shares the global bar's row when per-window status
+                        // lines are on (there is no global bar to sit under).
+                        let wm_y = if per_window_status {
+                            status_y
+                        } else {
+                            status_y + lh
+                        };
+                        let wm_rect =
+                            quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);
+                        backend.draw_status_bar(wm_rect, &wm_bar, None, None);
+                        composed_chrome.push(render::FrameOp::Wildmenu);
                     }
                 }
-                PANEL_EXTENSIONS => {
-                    render::populate_ext_sidebar_system(&engine);
-                    engine.ext_sidebar_body_rect.set(q_sb);
-                    engine.ext_sidebar_system.borrow().render(backend, q_sb);
-                }
-                PANEL_SETTINGS => {
-                    render::populate_settings_form_controller(&engine);
-                    engine
-                        .settings_form_controller
-                        .borrow_mut()
-                        .render_and_cache(backend, q_sb);
-                }
-                id if id.starts_with("ext:") => {
-                    // Extension panel — render via ext_sidebar_system.
-                    render::populate_ext_sidebar_system(&engine);
-                    engine.ext_sidebar_body_rect.set(q_sb);
-                    engine.ext_sidebar_system.borrow().render(backend, q_sb);
-                }
-                PANEL_AI => {
-                    // #730: the last of #592's 14 `ScreenLayout` fields,
-                    // and the straggler #670 deferred. Paints through the
-                    // same `render::draw_ai_sidebar_panel` builder TUI's
-                    // `render_ai_sidebar` calls — `unit_w`/`unit_h` here are
-                    // the pixel `char_width`/`line_height` GTK's other
-                    // row-based panels (PANEL_GIT, PANEL_DEBUG) already
-                    // convert through, unlike TUI's cell-native `1.0, 1.0`.
-                    // Bands are cached for `route_ai_sidebar_event` so the
-                    // click and paint derivations cannot drift (#544).
-                    if let Some(ref ai) = screen.ai_panel {
-                        let bands = render::draw_ai_sidebar_panel(
-                            backend, q_sb, ai, &theme, cw as f32, lh as f32,
-                        );
-                        self.cached_ai_bands.set(Some(bands));
-                    } else {
-                        self.cached_ai_bands.set(None);
+
+                // ── Global status bar ────────────────────────────────────────
+                // #752: publish the painted rect for `route_chrome_click`, the
+                // twin of TUI's call site. The bespoke branch hit-test this
+                // replaces re-derived the band from
+                // `height - lh * rows - wildmenu_px` in the click handler — a
+                // second copy of the arithmetic, and one that had no way to
+                // know what was really drawn.
+                render::FrameOp::StatusBar => {
+                    if let Some(ref bar) = screen.global_status_bar {
+                        let sb_rect =
+                            quadraui::Rect::new(x as f32, status_y as f32, w as f32, lh as f32);
+                        self.engine.borrow().global_status_rect.set(sb_rect);
+                        // Same zone recovery as the per-window and separated bars above.
+                        *self.global_status_zones.borrow_mut() =
+                            render::status_bar_zones_from_layout(
+                                &backend.status_bar_layout(sb_rect, bar),
+                            );
+                        backend.draw_status_bar(sb_rect, bar, None, None);
+                        composed_chrome.push(render::FrameOp::StatusBar);
                     }
                 }
-                _ => {
-                    // Unknown panel id: nothing painted, nothing to route a
-                    // click to.
-                    self.cached_ai_bands.set(None);
-                }
-            }
 
-            // ── Sidebar-item hover popup (#670) ─────────────────────────────
-            // Source-control / extension-panel item dwell tooltip, rendered
-            // markdown. Ported from the dead `draw.rs::draw_panel_hover_popup`
-            // (raw Cairo/Pango, no live callers) onto the shared
-            // `quadraui::RichTextPopup` path via `render::panel_hover_popup_
-            // paint` — the same primitive TUI's `render_panel_hover_popup`
-            // already uses. Paints after the panel body above (same
-            // paint-after-content z-order the dead code used), clamped
-            // against the full content viewport so it can extend rightward
-            // into the editor area past the sidebar's own bounds.
-            self.panel_hover_popup_rect.set(None);
-            self.panel_hover_link_rects.borrow_mut().clear();
-            if screen.panel_hover.is_some() {
-                let hover_viewport = quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
-                let (links, rect) = render::panel_hover_popup_paint(
-                    backend,
-                    screen,
-                    &theme,
-                    q_sb.x + q_sb.width,
-                    q_sb.y,
-                    hover_viewport,
-                    cw as f32,
-                    lh as f32,
-                );
-                self.panel_hover_popup_rect
-                    .set(rect.map(|(rx, ry, rw, rh)| (rx as f64, ry as f64, rw as f64, rh as f64)));
-                *self.panel_hover_link_rects.borrow_mut() = links
-                    .into_iter()
-                    .map(|(lx, ly, lw, lh2, url, is_native)| {
-                        (lx as f64, ly as f64, lw as f64, lh2 as f64, url, is_native)
-                    })
-                    .collect();
+                // ── Command line ─────────────────────────────────────────────
+                render::FrameOp::CommandLine => {
+                    let cmd_y = status_y + (status_bar_h - lh);
+                    let cmd = render::command_line_view(&screen.command);
+                    let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
+                    backend.draw_command_line(cmd_rect, &cmd);
+                    composed_chrome.push(render::FrameOp::CommandLine);
+                }
             }
         }
 
+        *self.composed_chrome_band.borrow_mut() = composed_chrome;
+        // Read back through the field rather than the local, so the *stored*
+        // observable is what gets validated.
+        if let Err(why) = render::check_chrome_band_order(&self.composed_chrome_band.borrow()) {
+            debug_assert!(false, "GTK {why}");
+        }
         // ── Cache per-group tab-drop geometry ─────────────────────────────────
         // Compute the absolute drop-group bounds from the shared screen layout and
         // stash them so the drag hit-test (handle_mouse_drag_msg) and the overlay
