@@ -1888,6 +1888,11 @@ impl App {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// `ctx` is threaded in solely for the shared Alt rung's
+    /// [`render::AltKeyOutcome::ResizeSidebar`] arm: GTK's authoritative
+    /// sidebar width *is* the runner's `AppShell` (TUI keeps its own copy and
+    /// syncs it out at end of dispatch), and `ShellContext::shell_mut` is the
+    /// only handle to it.
     fn handle_key_press(
         &mut self,
         key_name: String,
@@ -1895,6 +1900,7 @@ impl App {
         ctrl: bool,
         shift: bool,
         alt: bool,
+        ctx: &quadraui::ShellContext<'_>,
     ) {
         // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
         // `render::route_modal_key` states the spell-suggestion → dialog →
@@ -2102,6 +2108,40 @@ impl App {
             self.focus_after_sidebar_key(still_focused);
             self.draw_needed.set(true);
             return;
+        }
+
+        // ── Shared Alt-modifier / VSCode-mode rung (#759 / #734 slice 4) ──
+        // GTK had no Alt tier at all: this method took `alt` and used it only
+        // to feed the terminal router and to suppress the debug F-keys, so
+        // Alt+Left/Right, Alt+M, Alt+,/., Alt+]/[ and every VSCode-mode
+        // `Alt_*` chord fell through to `Engine::handle_key` — which has no
+        // `alt` parameter — and were silently dropped. Placed directly below
+        // the focus owners and above `Engine::handle_key`, the same slot TUI's
+        // deleted block occupied. See the rung's header comment in
+        // `render.rs` for the full divergence list.
+        // Bound to a local first, for the same reason the modal rung at the
+        // top of this method is: a `RefCell::borrow_mut()` temporary in a
+        // `match` scrutinee lives for the whole `match`.
+        let alt_outcome = render::route_alt_key(
+            &mut self.engine.borrow_mut(),
+            &key_name,
+            unicode,
+            shift,
+            alt,
+        );
+        match alt_outcome {
+            render::AltKeyOutcome::ResizeSidebar(delta) => {
+                let current = ctx.shell().sidebar_width().round().max(0.0) as u16;
+                let next = render::alt_resized_sidebar_width(current, delta);
+                ctx.shell_mut().set_sidebar_width(next as f32);
+                self.draw_needed.set(true);
+                return;
+            }
+            render::AltKeyOutcome::Handled => {
+                self.draw_needed.set(true);
+                return;
+            }
+            render::AltKeyOutcome::Fallthrough => {}
         }
 
         // Hover popup copy: intercept y/Ctrl-C when hover is focused so the
@@ -6912,13 +6952,14 @@ impl quadraui::ShellApp for App {
                         modifiers.ctrl,
                         modifiers.shift,
                         modifiers.alt,
+                        ctx,
                     );
                 }
             }
             UiEvent::CharTyped(c) => {
                 // Ctrl-modified characters arrive via KeyPressed; CharTyped is
                 // for IME-composed printable characters only.
-                self.handle_key_press(c.to_string(), Some(c), false, false, false);
+                self.handle_key_press(c.to_string(), Some(c), false, false, false, ctx);
             }
             UiEvent::Accelerator(id, _mods) => {
                 let id_str = id.as_str().to_string();
@@ -7513,7 +7554,7 @@ fn build_shell_config(app: &App) -> quadraui::ShellConfig {
     // centre pill (`quadraui::gtk::command_center::draw_command_center`
     // paints the pill at `band_height - 4`). 1.7 measures ~31px band / 27px
     // pill here — much closer to parity without needing the fixed-px API.
-    quadraui::ShellConfig::new("VimCode", top_panels)
+    let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
         .with_bottom_items(bottom_items)
         .with_title_bar(1.7)
         // #719: quadraui#656 builders — route the WM app id / icon name
@@ -7526,7 +7567,17 @@ fn build_shell_config(app: &App) -> quadraui::ShellConfig {
         // sizing the bar's *width* from the editor font (the old default)
         // made it oblong; pin the width to the same 48px instead of using
         // the font-relative unit form.
-        .with_activity_bar_width_px(48.0)
+        .with_activity_bar_width_px(48.0);
+    // #759: the shared Alt rung's sidebar clamps, so Alt+Left/Right resolve
+    // identically on both backends. TUI has set exactly this pair since #634
+    // (with a comment naming the failure — "Alt+Right would silently stop at
+    // 50"); GTK kept quadraui's generic 8/50 because it had no Alt rung to
+    // stop short in the first place. `default_sidebar_width` is deliberately
+    // left at quadraui's 20: GTK's unit is a line-height, not a column, so
+    // TUI's 30-*column* default is not the same quantity.
+    cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
+    cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
+    cfg
 }
 
 // #731: the `native_scrollbar_placement_tests` module that used to live

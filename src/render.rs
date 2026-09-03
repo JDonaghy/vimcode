@@ -3241,6 +3241,228 @@ pub fn route_terminal_resize(engine: &mut Engine, panel_cols: u16, rows: u16) {
     }
 }
 
+// ─── Alt-modifier / VSCode-mode keyboard rung (#759 / #734 slice 4) ──────────
+//
+// An Alt chord can mean three different things, and the decision between them
+// is a *sequence*, not a lookup: menu accelerator → editor/shell chord →
+// pass-through to `Engine::handle_key`. The first tier is already shared
+// (`quadraui::MenuSystem::handle` + `MenuBar::find_alt_target`, gated
+// identically on both backends by #695). The second tier is what this rung
+// converges.
+//
+// **What diverged.** TUI hand-rolled the whole tier as a ~66-line
+// `if key_event.modifiers.contains(KeyModifiers::ALT) { match key_event.code
+// { … } }` block inside `handle_key_pressed`. GTK had **no Alt tier at all**:
+// `handle_key_press` took an `alt: bool` and used it for exactly two things —
+// forwarding it to the terminal router and suppressing the debug F-keys — and
+// then dropped it on the floor, because `Engine::handle_key` has no `alt`
+// parameter. So since the #540 Relm4→ShellApp cutover, **every chord below was
+// silently dead on GTK**:
+//
+//   Alt+Left / Alt+Right (resize the sidebar), Alt+M (toggle Vim ↔ VSCode
+//   editing mode), Alt+, / Alt+. (resize the editor-group split), Alt+] /
+//   Alt+[ (cycle AI ghost-text alternatives), and — the VSCode-mode half —
+//   Alt+Up / Alt+Down (move line), Alt+Shift+Up / Alt+Shift+Down (add a
+//   cursor above/below) and Alt+Z (toggle word wrap).
+//
+// That is the #499/#484 shape again: `Engine::vscode_move_line_up`,
+// `add_cursor_at_pos` and the `Alt_*` arm of `handle_vscode_key` are all
+// platform-neutral `core` code with a full unit-test suite, reachable from
+// exactly one of the two backends.
+//
+// **The VSCode-mode statement.** The reason the second half diverged is that
+// neither backend wrote down *what VSCode mode means for a keystroke*; each
+// had (or, on GTK, lacked) its own ad-hoc branch. [`vscode_alt_key_name`] is
+// that statement, in one place: in VSCode mode these Alt chords are VS Code
+// editor commands, spelled in the `Alt_*` dialect
+// `Engine::handle_vscode_key` decodes; in Vim mode they are not, and fall
+// through to the vim mapping layer. Both backends now ask that one function.
+//
+// **Shift+Alt+F is deliberately absent from the "GTK gained it" list.** It is
+// in the resolver (LSP format document), but on both backends the menu tier
+// above claims it first whenever the menu bar is live: `find_alt_target`
+// lower-cases the chord and `&File` triggers on `f`. GTK's menu bar is always
+// visible and TUI's is visible in VSCode mode, so the reachable case is TUI in
+// Vim mode. Converging the rung does not change that ordering — it is the same
+// on both backends, which is the point.
+
+/// Lower bound Alt+Left clamps the sidebar width to, in `AppShell` width units
+/// (columns on TUI, line-heights on GTK — see
+/// `quadraui::AppShell::set_sidebar_width`).
+pub const ALT_SIDEBAR_WIDTH_MIN: u16 = 15;
+/// Upper bound Alt+Right clamps the sidebar width to. See
+/// [`ALT_SIDEBAR_WIDTH_MIN`].
+pub const ALT_SIDEBAR_WIDTH_MAX: u16 = 150;
+
+/// Apply an [`AltKeyOutcome::ResizeSidebar`] delta to a backend-owned sidebar
+/// width, clamped to [`ALT_SIDEBAR_WIDTH_MIN`]..=[`ALT_SIDEBAR_WIDTH_MAX`].
+///
+/// The width itself cannot live in the resolver: TUI's authoritative copy is
+/// `TuiShellApp::sidebar_width` (which its end-of-dispatch sync pushes into the
+/// runner's `AppShell`), while GTK's is the runner `AppShell` itself, reached
+/// through `ShellContext::shell_mut`. The *clamp* is shared so the two cannot
+/// drift apart — which is the only part a user can observe.
+///
+/// Both backends additionally configure their `AppShell` with these same two
+/// bounds (`TuiShellApp::shell_config`, `gtk::build_shell_config`), so
+/// `AppShell::set_sidebar_width`'s own internal clamp cannot narrow the rung's
+/// range on one backend and not the other. That was live on GTK before #759:
+/// quadraui's generic default is `8.0..=50.0`, which TUI had already overridden
+/// for exactly this reason (#634) and GTK had not.
+pub fn alt_resized_sidebar_width(current: u16, delta: i32) -> u16 {
+    let next = current as i32 + delta;
+    next.clamp(ALT_SIDEBAR_WIDTH_MIN as i32, ALT_SIDEBAR_WIDTH_MAX as i32) as u16
+}
+
+/// What [`route_alt_key`] decided about an Alt chord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltKeyOutcome {
+    /// No Alt chord claimed the key — keep dispatching down the ladder.
+    Fallthrough,
+    /// The rung applied its effect to the engine; repaint and stop.
+    Handled,
+    /// Resize the backend-owned sidebar width by this many units, then repaint
+    /// and stop. Apply with [`alt_resized_sidebar_width`].
+    ResizeSidebar(i32),
+}
+
+/// The base key of an Alt chord, in a spelling both backends agree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltBase {
+    Left,
+    Right,
+    Up,
+    Down,
+    Char(char),
+}
+
+/// Canonicalise a backend key name + resolved character into an [`AltBase`].
+///
+/// The two backends disagree on both halves. GTK spells a printable key in
+/// *both* `key_name` (`"m"`) and `unicode` (`Some('m')`); TUI's `translate_key`
+/// leaves `key_name` empty for an unmodified printable and puts the character
+/// in `unicode` alone. For shifted navigation keys TUI additionally prefixes
+/// the name (`"Shift_Up"`) — shift is carried separately on this rung, so the
+/// prefix is stripped, exactly as [`canonical_terminal_key_name`] does.
+fn alt_chord_base(key_name: &str, unicode: Option<char>) -> Option<AltBase> {
+    let name = key_name.strip_prefix("Shift_").unwrap_or(key_name);
+    match name {
+        "Left" => return Some(AltBase::Left),
+        "Right" => return Some(AltBase::Right),
+        "Up" => return Some(AltBase::Up),
+        "Down" => return Some(AltBase::Down),
+        _ => {}
+    }
+    // `unicode` first (TUI's only channel for a printable), then a
+    // single-character `key_name` (GTK's). Multi-character names that reach
+    // here are named keys this rung has no chord for.
+    let mut chars = name.chars();
+    let from_name = match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    };
+    unicode.or(from_name).map(AltBase::Char)
+}
+
+/// The single statement of what **VSCode mode** means for an Alt chord: the
+/// `Alt_*` key name `Engine::handle_vscode_key` decodes, or `None` when the
+/// chord is not a VS Code editor command.
+///
+/// In Vim mode this function is not consulted at all — the chord falls through
+/// to the vim mapping layer instead. That asymmetry *is* the mode semantics,
+/// and it now exists once rather than once per backend.
+fn vscode_alt_key_name(base: AltBase, shift: bool) -> Option<&'static str> {
+    Some(match (base, shift) {
+        (AltBase::Up, true) => "Alt_Shift_Up",
+        (AltBase::Down, true) => "Alt_Shift_Down",
+        (AltBase::Up, false) => "Alt_Up",
+        (AltBase::Down, false) => "Alt_Down",
+        (AltBase::Char('z') | AltBase::Char('Z'), false) => "Alt_z",
+        _ => return None,
+    })
+}
+
+/// The shared Alt-modifier / VSCode-mode keyboard rung — one implementation,
+/// both backends (#759 / #734 slice 4).
+///
+/// Call it with the backend's own key spelling (see [`alt_chord_base`]) once
+/// the menu tier above has declined the event. Returns [`AltKeyOutcome`];
+/// `Fallthrough` means nothing here claimed the chord and the caller must keep
+/// dispatching.
+///
+/// `alt == false` is an immediate `Fallthrough`, so a caller may invoke this
+/// unconditionally rather than wrapping it in its own modifier test.
+pub fn route_alt_key(
+    engine: &mut Engine,
+    key_name: &str,
+    unicode: Option<char>,
+    shift: bool,
+    alt: bool,
+) -> AltKeyOutcome {
+    if !alt {
+        return AltKeyOutcome::Fallthrough;
+    }
+    let Some(base) = alt_chord_base(key_name, unicode) else {
+        return AltKeyOutcome::Fallthrough;
+    };
+
+    // ── Mode-independent chords ──────────────────────────────────────────
+    // The shifted spellings (`<`, `>`, `}`, `{`) are listed alongside the
+    // unshifted ones because TUI's old block matched crossterm's raw
+    // `KeyCode::Char(',')` — the *physical* key, before the shift map — while
+    // this rung sees the resolved character. Accepting both keeps Alt+Shift+,
+    // working exactly as it did, and gives GTK (which never had the chord at
+    // all) the same tolerance.
+    match base {
+        AltBase::Left => return AltKeyOutcome::ResizeSidebar(-1),
+        AltBase::Right => return AltKeyOutcome::ResizeSidebar(1),
+        // Shift+Alt+F: LSP format document. Reachable only when the menu tier
+        // above is not live — see this rung's header comment.
+        AltBase::Char('F') if shift => {
+            engine.lsp_format_current();
+            return AltKeyOutcome::Handled;
+        }
+        // Alt+M: toggle Vim ↔ VSCode editing mode.
+        AltBase::Char('m') | AltBase::Char('M') => {
+            engine.toggle_editor_mode();
+            return AltKeyOutcome::Handled;
+        }
+        // Alt+, / Alt+. — resize the editor group split.
+        AltBase::Char(',') | AltBase::Char('<') => {
+            engine.group_resize(-0.05);
+            return AltKeyOutcome::Handled;
+        }
+        AltBase::Char('.') | AltBase::Char('>') => {
+            engine.group_resize(0.05);
+            return AltKeyOutcome::Handled;
+        }
+        // Alt+] / Alt+[ — cycle AI ghost-text alternatives (insert mode only;
+        // outside insert mode there is no ghost text to cycle, so the chord
+        // falls through rather than being swallowed).
+        AltBase::Char(']') | AltBase::Char('}') if engine.mode == crate::core::Mode::Insert => {
+            engine.ai_ghost_next_alt();
+            return AltKeyOutcome::Handled;
+        }
+        AltBase::Char('[') | AltBase::Char('{') if engine.mode == crate::core::Mode::Insert => {
+            engine.ai_ghost_prev_alt();
+            return AltKeyOutcome::Handled;
+        }
+        // Alt+T (tab switcher) is claimed by the accelerator tier above this
+        // one on both backends, so it deliberately has no arm here.
+        _ => {}
+    }
+
+    // ── VSCode-mode chords ───────────────────────────────────────────────
+    if engine.is_vscode_mode() {
+        if let Some(name) = vscode_alt_key_name(base, shift) {
+            engine.handle_key(name, None, false);
+            return AltKeyOutcome::Handled;
+        }
+    }
+
+    AltKeyOutcome::Fallthrough
+}
+
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
 //
 // The rung directly beneath [`route_modal_overlay_click`]: once no modal
@@ -24378,6 +24600,194 @@ mod mouse_drag_router_tests {
             7,
             "applying an `explorer:sb` offset must move the tree, whichever \
              backend's drag emitted it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod alt_key_router_tests {
+    //! #759 / #734 slice 4 — the Alt-modifier / VSCode-mode rung.
+    //!
+    //! The two backends spell the *same physical chord* differently, and that
+    //! is precisely how the old duplicated blocks were able to drift without
+    //! anyone noticing. These tests feed both spellings of one chord into
+    //! [`route_alt_key`] and assert the two resolve identically; the
+    //! rendered-output halves live in `src/tui_main/shell_app.rs`
+    //! (`alt_*_via_shell_app`) and `src/gtk/testing.rs` (`alt_*_on_gtk`).
+    use super::*;
+    use crate::core::Mode;
+
+    fn engine() -> Engine {
+        crate::core::session::suppress_disk_saves();
+        let mut e = Engine::new_for_test();
+        e.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+        e
+    }
+
+    /// The same chord as each backend actually spells it.
+    ///
+    /// TUI's `translate_key` leaves `key_name` empty for an unmodified
+    /// printable and reports the character in `unicode` alone, and prefixes
+    /// shifted navigation keys with `Shift_`. GTK's `ShellApp::handle` puts
+    /// the character in *both* slots and never prefixes.
+    struct Chord {
+        tui: (&'static str, Option<char>),
+        gtk: (&'static str, Option<char>),
+        shift: bool,
+    }
+
+    const ALT_Z: Chord = Chord {
+        tui: ("", Some('z')),
+        gtk: ("z", Some('z')),
+        shift: false,
+    };
+    const ALT_SHIFT_UP: Chord = Chord {
+        tui: ("Shift_Up", None),
+        gtk: ("Up", None),
+        shift: true,
+    };
+    const ALT_DOWN: Chord = Chord {
+        tui: ("Down", None),
+        gtk: ("Down", None),
+        shift: false,
+    };
+    const ALT_RIGHT: Chord = Chord {
+        tui: ("Right", None),
+        gtk: ("Right", None),
+        shift: false,
+    };
+
+    /// Run `chord` through the rung twice — once in each backend's spelling,
+    /// each against its own fresh engine — and return
+    /// `(outcome, resulting buffer text, resulting message)` once, after
+    /// asserting the two runs agreed on all three.
+    fn resolves_identically(chord: &Chord, vscode: bool) -> (AltKeyOutcome, String, String) {
+        let run = |(name, unicode): (&str, Option<char>)| {
+            let mut e = engine();
+            if vscode {
+                e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+                e.mode = Mode::Insert;
+            }
+            let outcome = route_alt_key(&mut e, name, unicode, chord.shift, true);
+            (outcome, e.buffer().to_string(), e.message.clone())
+        };
+        let tui = run(chord.tui);
+        let gtk = run(chord.gtk);
+        assert_eq!(
+            tui, gtk,
+            "the same chord must resolve identically whichever backend spelled \
+             it: TUI said {tui:?}, GTK said {gtk:?}"
+        );
+        tui
+    }
+
+    /// Alt+Z is a VS Code editor command (toggle word wrap) in VSCode mode and
+    /// nothing at all in Vim mode. Before #759 that decision existed only
+    /// inside TUI's `handle_key_pressed`; GTK dropped `alt` on the floor, so
+    /// the chord was inert there in *both* modes.
+    #[test]
+    fn alt_z_is_a_vscode_command_and_a_vim_passthrough() {
+        let (outcome, _, message) = resolves_identically(&ALT_Z, true);
+        assert_eq!(outcome, AltKeyOutcome::Handled);
+        assert!(
+            message.starts_with("Word wrap "),
+            "VSCode-mode Alt+Z must reach `Engine::handle_vscode_key`'s \
+             `Alt_z` arm; message was {message:?}"
+        );
+
+        let (outcome, _, message) = resolves_identically(&ALT_Z, false);
+        assert_eq!(
+            outcome,
+            AltKeyOutcome::Fallthrough,
+            "Vim mode must leave Alt+Z to the vim mapping layer"
+        );
+        assert_eq!(message, "", "Vim-mode Alt+Z must not toggle word wrap");
+    }
+
+    /// Alt+Down moves the current line down in VSCode mode; Alt+Shift+Down
+    /// adds a cursor instead. The shift discrimination is the part TUI wrote
+    /// against crossterm's raw `KeyCode` + modifier flags and GTK never wrote
+    /// at all, so it is the arm most likely to drift again.
+    #[test]
+    fn alt_down_moves_a_line_and_alt_shift_down_adds_a_cursor() {
+        let (outcome, text, _) = resolves_identically(&ALT_DOWN, true);
+        assert_eq!(outcome, AltKeyOutcome::Handled);
+        assert!(
+            text.starts_with("bravo\nalpha\n"),
+            "VSCode-mode Alt+Down must swap the cursor line with the one \
+             below; buffer was {text:?}"
+        );
+
+        // Alt+Shift+Up from line 0 has nowhere to add a cursor, so use it to
+        // prove the *decode* differs from Alt+Up: the line order must be
+        // untouched, where a mis-decoded `Alt_Up` would have moved it.
+        let (outcome, text, _) = resolves_identically(&ALT_SHIFT_UP, true);
+        assert_eq!(outcome, AltKeyOutcome::Handled);
+        assert!(
+            text.starts_with("alpha\nbravo\n"),
+            "Alt+Shift+Up must decode as `Alt_Shift_Up` (add cursor), not \
+             `Alt_Up` (move line); buffer was {text:?}"
+        );
+    }
+
+    /// Alt+Left / Alt+Right are mode-independent and hand the width change
+    /// back to the caller, because the two backends store the sidebar width in
+    /// different places. The *clamp* is shared.
+    #[test]
+    fn alt_arrows_ask_the_caller_to_resize_in_either_mode() {
+        for vscode in [false, true] {
+            let (outcome, ..) = resolves_identically(&ALT_RIGHT, vscode);
+            assert_eq!(
+                outcome,
+                AltKeyOutcome::ResizeSidebar(1),
+                "Alt+Right must widen the sidebar regardless of editor mode"
+            );
+        }
+
+        assert_eq!(alt_resized_sidebar_width(30, 1), 31);
+        assert_eq!(alt_resized_sidebar_width(30, -1), 29);
+        assert_eq!(
+            alt_resized_sidebar_width(ALT_SIDEBAR_WIDTH_MIN, -1),
+            ALT_SIDEBAR_WIDTH_MIN,
+            "Alt+Left must clamp at the shared floor"
+        );
+        assert_eq!(
+            alt_resized_sidebar_width(ALT_SIDEBAR_WIDTH_MAX, 1),
+            ALT_SIDEBAR_WIDTH_MAX,
+            "Alt+Right must clamp at the shared ceiling"
+        );
+    }
+
+    /// A chord with no arm must fall through untouched — the rung is a filter,
+    /// not a sink. `Alt+q` is deliberately not bound to anything.
+    #[test]
+    fn an_unclaimed_alt_chord_falls_through_on_both_spellings() {
+        let unbound = Chord {
+            tui: ("", Some('q')),
+            gtk: ("q", Some('q')),
+            shift: false,
+        };
+        for vscode in [false, true] {
+            let (outcome, ..) = resolves_identically(&unbound, vscode);
+            assert_eq!(outcome, AltKeyOutcome::Fallthrough);
+        }
+    }
+
+    /// Without Alt held the rung must decline immediately, so callers can
+    /// invoke it unconditionally rather than re-testing the modifier
+    /// themselves (which is how the two backends ended up with two different
+    /// gates in the first place).
+    #[test]
+    fn no_alt_modifier_is_an_immediate_fallthrough() {
+        let mut e = engine();
+        e.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        assert_eq!(
+            route_alt_key(&mut e, "Down", None, false, false),
+            AltKeyOutcome::Fallthrough
+        );
+        assert!(
+            e.buffer().to_string().starts_with("alpha\n"),
+            "a plain Down must not have been decoded as `Alt_Down`"
         );
     }
 }
