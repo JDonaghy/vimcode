@@ -581,6 +581,153 @@ impl TuiShellApp {
             .unwrap_or_else(|| "VimCode".to_string())
     }
 
+    /// Compose the **bottom band** (#765, #735 slice 4): the chrome vimcode
+    /// stacks below the editor column — quickfix, the terminal/debug bottom
+    /// panel, the debug toolbar, the separated status line and the sidebar
+    /// hover popup.
+    ///
+    /// Walks `render::compose_bottom_band`; geometry stays here, in cells.
+    /// Extracted out of `render_content` (#766) so that function reads as the
+    /// frame's *order* and nothing else, mirroring `gtk/mod.rs`'s
+    /// `App::compose_bottom_band_rungs`.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_bottom_band_rungs(
+        &self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &render::ScreenLayout,
+        layout: &quadraui::AppShellLayout,
+        theme: &Theme,
+        area: Rect,
+        win_area: Rect,
+        chrome: &BottomChromeRects,
+    ) {
+        // ══ Bottom band (#765, #735 slice 4) ═════════════════════════════
+        //
+        // Composed from `render::compose_bottom_band` — the single ordered
+        // artefact both backends walk for the chrome stacked below the editor
+        // column, exactly as `EDITOR_Z_ORDER` (above) is for the column itself
+        // and `CHROME_Z_ORDER` (below) for the surrounding chrome. Geometry
+        // stays here, in cells; only the *order* and the *gates* moved.
+        // `BOTTOM_Z_ORDER`'s doc comment records the five divergences this
+        // convergence closed — including the two this backend owned: the
+        // separated status line composed two rungs early (contradicting this
+        // file's *own* `bottom_chrome_rects_for_shell_content` constraint
+        // order), and `debug_toolbar_rect` never cleared when the toolbar hid.
+        //
+        // Caches whose owning rung may be gated off are cleared *here*, before
+        // the walk, never from an `else` arm inside it: `compose_bottom_band`
+        // returns only the live rungs, so an absent rung has no arm to run.
+        self.engine.bottom_panel_geometry.replace(None);
+        self.debug_toolbar_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        self.hover_popup_rect.set(None);
+        self.hover_link_rects.borrow_mut().clear();
+
+        let mut composed_bottom: Vec<render::BottomOp> = Vec::new();
+        for op in render::compose_bottom_band(
+            &self.engine,
+            screen,
+            layout.sidebar_content_bounds.is_some(),
+        ) {
+            match op {
+                render::BottomOp::Quickfix => {
+                    let Some(ref qf) = screen.quickfix else {
+                        continue;
+                    };
+                    backend.set_theme(super::quadraui_tui::q_theme(theme));
+                    render::paint_quickfix_rung(
+                        backend,
+                        qf,
+                        to_q_rect(chrome.quickfix),
+                        // Unlike GTK's stateless recompute, this offset is
+                        // carried across frames so `:cnext` can advance it.
+                        self.quickfix_scroll_top,
+                    );
+                    composed_bottom.push(render::BottomOp::Quickfix);
+                }
+                render::BottomOp::BottomPanel => {
+                    backend.set_theme(super::quadraui_tui::q_theme(theme));
+                    render::paint_bottom_panel_rung(
+                        backend,
+                        &self.engine,
+                        screen,
+                        theme,
+                        to_q_rect(chrome.bottom_panel),
+                        render::BottomPanelUnits::CELL,
+                    );
+                    composed_bottom.push(render::BottomOp::BottomPanel);
+                }
+                render::BottomOp::DebugToolbar => {
+                    let q_rect = to_q_rect(chrome.debug_toolbar);
+                    self.debug_toolbar_rect.set(q_rect);
+                    render::draw_debug_toolbar(backend, &self.engine, q_rect);
+                    composed_bottom.push(render::BottomOp::DebugToolbar);
+                }
+                // Shown below the terminal panel when `window_status_line` is
+                // on but `status_line_above_terminal` is off. Composed *after*
+                // the bottom panel and the debug toolbar now, which is where
+                // `bottom_chrome_rects_for_shell_content` has always reserved
+                // its row — this backend used to paint it two rungs earlier.
+                render::BottomOp::SeparatedStatus => {
+                    let Some(ref status) = screen.separated_status_line else {
+                        continue;
+                    };
+                    backend.set_theme(super::quadraui_tui::q_theme(theme));
+                    let _ = render::paint_separated_status_rung(
+                        backend,
+                        status,
+                        to_q_rect(chrome.separated_status),
+                    );
+                    composed_bottom.push(render::BottomOp::SeparatedStatus);
+                }
+                // Anchored just right of the sidebar's own right edge, which in
+                // the shell layout is exactly `main_content_bounds.x`
+                // (`AppShell` puts the resize divider between them and `area.x`
+                // is the first column past it) — the same column `draw_frame`
+                // computes as `sep_x + 1`.
+                //
+                // Composed before the chrome band rather than after it, which
+                // is where this backend used to paint it. Safe, and now
+                // matching GTK, because the popup's width is capped to what
+                // fits *right* of that anchor, so it can never be shifted back
+                // over the sidebar the chrome band paints.
+                //
+                // The rasteriser stays per-backend here — the `EditorOp
+                // ::Windows` precedent. TUI's `hover_popup_rect` /
+                // `hover_link_rects` caches are `u16` cell tuples that the
+                // mouse router reads directly, where GTK's are `f64` pixels
+                // carrying an extra `is_native` flag; converging the two cache
+                // *shapes* is a mouse-routing change, not a composition one,
+                // and belongs with whichever slice owns that. What #765 fixes
+                // is that the rung is now composed — and cleared — at the top
+                // level on both backends.
+                render::BottomOp::PanelHover => {
+                    let Some(sb) = layout.sidebar_content_bounds else {
+                        continue;
+                    };
+                    let (new_rects, popup_rect) = render_panel_hover_popup(
+                        backend,
+                        screen,
+                        theme,
+                        area.x,
+                        sb.y.round() as u16,
+                        sb.height.round() as u16,
+                        win_area,
+                    );
+                    *self.hover_link_rects.borrow_mut() = new_rects;
+                    self.hover_popup_rect.set(popup_rect);
+                    composed_bottom.push(render::BottomOp::PanelHover);
+                }
+            }
+        }
+        *self.composed_bottom_band.borrow_mut() = composed_bottom;
+        // Debug-only: a rung hoisted back out of the walk, or composed early,
+        // shows up here as a diagnosable string rather than a visual mystery.
+        if let Err(why) = render::check_bottom_band_order(&self.composed_bottom_band.borrow()) {
+            debug_assert!(false, "{why}");
+        }
+    }
+
     /// Compose the **editor band** (#764, #735 slice 3) into `backend`.
     ///
     /// Walks `render::compose_editor_band` — the single ordered artefact both
@@ -1707,130 +1854,9 @@ impl ShellApp for TuiShellApp {
         };
 
         // ══ Bottom band (#765, #735 slice 4) ═════════════════════════════
-        //
-        // Composed from `render::compose_bottom_band` — the single ordered
-        // artefact both backends walk for the chrome stacked below the editor
-        // column, exactly as `EDITOR_Z_ORDER` (above) is for the column itself
-        // and `CHROME_Z_ORDER` (below) for the surrounding chrome. Geometry
-        // stays here, in cells; only the *order* and the *gates* moved.
-        // `BOTTOM_Z_ORDER`'s doc comment records the five divergences this
-        // convergence closed — including the two this backend owned: the
-        // separated status line composed two rungs early (contradicting this
-        // file's *own* `bottom_chrome_rects_for_shell_content` constraint
-        // order), and `debug_toolbar_rect` never cleared when the toolbar hid.
-        //
-        // Caches whose owning rung may be gated off are cleared *here*, before
-        // the walk, never from an `else` arm inside it: `compose_bottom_band`
-        // returns only the live rungs, so an absent rung has no arm to run.
-        self.engine.bottom_panel_geometry.replace(None);
-        self.debug_toolbar_rect
-            .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
-        self.hover_popup_rect.set(None);
-        self.hover_link_rects.borrow_mut().clear();
-
-        let mut composed_bottom: Vec<render::BottomOp> = Vec::new();
-        for op in render::compose_bottom_band(
-            &self.engine,
-            &screen,
-            layout.sidebar_content_bounds.is_some(),
-        ) {
-            match op {
-                render::BottomOp::Quickfix => {
-                    let Some(ref qf) = screen.quickfix else {
-                        continue;
-                    };
-                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
-                    render::paint_quickfix_rung(
-                        backend,
-                        qf,
-                        to_q_rect(chrome.quickfix),
-                        // Unlike GTK's stateless recompute, this offset is
-                        // carried across frames so `:cnext` can advance it.
-                        self.quickfix_scroll_top,
-                    );
-                    composed_bottom.push(render::BottomOp::Quickfix);
-                }
-                render::BottomOp::BottomPanel => {
-                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
-                    render::paint_bottom_panel_rung(
-                        backend,
-                        &self.engine,
-                        &screen,
-                        &theme,
-                        to_q_rect(chrome.bottom_panel),
-                        render::BottomPanelUnits::CELL,
-                    );
-                    composed_bottom.push(render::BottomOp::BottomPanel);
-                }
-                render::BottomOp::DebugToolbar => {
-                    let q_rect = to_q_rect(chrome.debug_toolbar);
-                    self.debug_toolbar_rect.set(q_rect);
-                    render::draw_debug_toolbar(backend, &self.engine, q_rect);
-                    composed_bottom.push(render::BottomOp::DebugToolbar);
-                }
-                // Shown below the terminal panel when `window_status_line` is
-                // on but `status_line_above_terminal` is off. Composed *after*
-                // the bottom panel and the debug toolbar now, which is where
-                // `bottom_chrome_rects_for_shell_content` has always reserved
-                // its row — this backend used to paint it two rungs earlier.
-                render::BottomOp::SeparatedStatus => {
-                    let Some(ref status) = screen.separated_status_line else {
-                        continue;
-                    };
-                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
-                    let _ = render::paint_separated_status_rung(
-                        backend,
-                        status,
-                        to_q_rect(chrome.separated_status),
-                    );
-                    composed_bottom.push(render::BottomOp::SeparatedStatus);
-                }
-                // Anchored just right of the sidebar's own right edge, which in
-                // the shell layout is exactly `main_content_bounds.x`
-                // (`AppShell` puts the resize divider between them and `area.x`
-                // is the first column past it) — the same column `draw_frame`
-                // computes as `sep_x + 1`.
-                //
-                // Composed before the chrome band rather than after it, which
-                // is where this backend used to paint it. Safe, and now
-                // matching GTK, because the popup's width is capped to what
-                // fits *right* of that anchor, so it can never be shifted back
-                // over the sidebar the chrome band paints.
-                //
-                // The rasteriser stays per-backend here — the `EditorOp
-                // ::Windows` precedent. TUI's `hover_popup_rect` /
-                // `hover_link_rects` caches are `u16` cell tuples that the
-                // mouse router reads directly, where GTK's are `f64` pixels
-                // carrying an extra `is_native` flag; converging the two cache
-                // *shapes* is a mouse-routing change, not a composition one,
-                // and belongs with whichever slice owns that. What #765 fixes
-                // is that the rung is now composed — and cleared — at the top
-                // level on both backends.
-                render::BottomOp::PanelHover => {
-                    let Some(sb) = layout.sidebar_content_bounds else {
-                        continue;
-                    };
-                    let (new_rects, popup_rect) = render_panel_hover_popup(
-                        backend,
-                        &screen,
-                        &theme,
-                        area.x,
-                        sb.y.round() as u16,
-                        sb.height.round() as u16,
-                        win_area,
-                    );
-                    *self.hover_link_rects.borrow_mut() = new_rects;
-                    self.hover_popup_rect.set(popup_rect);
-                    composed_bottom.push(render::BottomOp::PanelHover);
-                }
-            }
-        }
-        *self.composed_bottom_band.borrow_mut() = composed_bottom;
-        // Debug-only: a rung hoisted back out of the walk, or composed early,
-        // shows up here as a diagnosable string rather than a visual mystery.
-        if let Err(why) = render::check_bottom_band_order(&self.composed_bottom_band.borrow()) {
-            debug_assert!(false, "{why}");
-        }
+        // Composed from `render::compose_bottom_band` — see
+        // `compose_bottom_band_rungs`.
+        self.compose_bottom_band_rungs(backend, &screen, layout, &theme, area, win_area, &chrome);
 
         // ══ Frame sequence (#766, #735 slice 6) ══════════════════════════
         //
