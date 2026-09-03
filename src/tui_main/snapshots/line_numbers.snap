@@ -2,15 +2,14 @@
 source: src/tui_main/render_impl.rs
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜   [No Name] ×                                   󰤲    ⋯
-▎
-     1 alpha                                       ⣿⣿⣿⣿⣿⣿⣿⣿
-     2 beta
-     3 gamma
-     4 delta
-     5 epsilon                                     ⠉⠉⠉⠉⠉⠉⠉⠉
+     [No Name] ×                                   󰤲    ⋯
+
+      1 alpha                                       ⣿⣿⣿⣿⣿⣿⣿⣿
+      2 beta
+      3 gamma
+      4 delta
+      5 epsilon                                     ⠉⠉⠉⠉⠉⠉⠉⠉
 
 
 
      NORMAL  [No Name]   LF Spaces: 4  Ln 1, Col 1
- 

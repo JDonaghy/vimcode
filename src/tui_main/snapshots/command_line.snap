@@ -2,15 +2,15 @@
 source: src/tui_main/render_impl.rs
 expression: "lines.join(\"\\n\")"
 ---
- 󰍜   [No Name] ×                                   󰤲    ⋯
-▎
-    buffer content                                 ⠉⠉⠉⠁⠉⠉⠉⠉
- 
- 
- 
- 
+     [No Name] ×                                   󰤲    ⋯
+
+     buffer content                                 ⠉⠉⠉⠁⠉⠉⠉⠉
+
+
+
+
 
 
 
      COMMAND  [No Name]  LF Spaces: 4  Ln 1, Col 1
-   :set
+    :set

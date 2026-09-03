@@ -280,665 +280,27 @@ pub(super) fn bottom_chrome_rects_for_shell_content(
 
 // ─── Frame rendering ──────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(super) fn draw_frame(
-    frame: &mut ratatui::Frame,
-    screen: &render::ScreenLayout,
-    theme: &Theme,
-    sidebar: &mut TuiSidebar,
-    engine: &Engine,
-    sidebar_width: u16,
-    quickfix_scroll_top: usize,
-    folder_picker: Option<&FolderPickerState>,
-    cmd_sel: Option<(usize, usize)>,
-    explorer_drop_target: Option<usize>,
-    hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
-    hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
-    editor_hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
-    editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
-    editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
-    tab_visible_counts_out: &mut Vec<(GroupId, usize)>,
-    debug_toolbar_rect_out: &mut quadraui::Rect,
-    completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
-    context_menu_layout_out: &mut Option<quadraui::ContextMenuLayout>,
-    dialog_layout_out: &mut Option<quadraui::DialogLayout>,
-    // Phase B.4 Stage 2: backend handle for migrated `draw_*` calls.
-    // Set once per frame by the caller (cached theme); the migrated
-    // call sites wrap their access in `backend.enter_frame_scope`.
-    backend: &mut super::backend::TuiBackend,
-    tab_drag_source: Option<(crate::core::window::GroupId, usize)>,
-    tab_drag_cursor: Option<(f64, f64)>,
-    tab_drop_zone: &crate::core::window::DropZone,
-) {
-    let area = frame.area();
-
-    // #600 Stage 1: `backend` is already inside `with_frame_scope`'s single
-    // frame-scope entry for the whole call (`mod.rs::event_loop`'s two
-    // `terminal.draw` closures each open exactly one), so every
-    // `Backend::draw_*` call below can be made directly — no per-call
-    // `enter_frame_scope`/`set_current_theme` needed. `q_theme` is computed
-    // once here and reused everywhere a quadraui primitive needs it.
-    use quadraui::Backend as _;
-    let q_theme = super::quadraui_tui::q_theme(theme);
-    backend.set_current_theme(q_theme);
-
-    engine.scroll_surfaces.borrow_mut().clear();
-
-    // ── Top-level: [menu] / [content_area] ──
-    let menu_bar_height: u16 = if screen.menu_bar_visible { 1 } else { 0 };
-    let top_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(menu_bar_height), Constraint::Min(0)])
-        .split(area);
-    let menu_bar_area = top_chunks[0];
-    let content_area = top_chunks[1];
-
-    // ── Horizontal split: [activity_bar] [sidebar?] [editor_col] ─
-    // Activity bar and sidebar span full height (like GTK layout).
-    let sv2 = engine.app_shell.sidebar_visible();
-    let ab_width = if engine.settings.autohide_panels && !sv2 {
-        0
-    } else {
-        ACTIVITY_BAR_WIDTH
-    };
-    let sidebar_constraint = if sv2 {
-        Constraint::Length(sidebar_width + 1) // +1 for separator
-    } else {
-        Constraint::Length(0)
-    };
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(ab_width),
-            sidebar_constraint,
-            Constraint::Min(0),
-        ])
-        .split(content_area);
-    let activity_area = h_chunks[0];
-    let sidebar_sep_area = h_chunks[1];
-    let right_col = h_chunks[2];
-
-    // ── Vertical split of editor column: [editor] / [qf?] / [bottom?] / [dbg?] / [wildmenu?] / [status?] / [cmd] ──
-    let qf_height: u16 = if screen.quickfix.is_some() { 6 } else { 0 };
-    let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
-    let bottom_panel_height: u16 = if bottom_panel_open {
-        let target = super::terminal_target_maximize_rows_tui(engine, area.height);
-        engine.effective_terminal_panel_rows(target) + 2
-    } else {
-        0
-    };
-    let debug_toolbar_height: u16 = if screen.debug_toolbar.is_some() { 1 } else { 0 };
-    let wildmenu_height: u16 = if screen.wildmenu.is_some() { 1 } else { 0 };
-    let per_window_status = engine.settings.window_status_line;
-    let global_status_height: u16 = if per_window_status { 0 } else { 1 };
-    let has_separated = screen.separated_status_line.is_some();
-    let separated_status_height: u16 = if has_separated { 1 } else { 0 };
-
-    // Layout: [editor][qf][terminal][debug][sep_status?][wildmenu][global_status][cmd]
-    // When noslat + terminal open, sep_status(1) shows between debug and wildmenu.
-    // When slat (default) or no terminal, sep_status is 0 and per-window bars are inside windows.
-    let v_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),                          // 0: editor
-            Constraint::Length(qf_height),               // 1: quickfix
-            Constraint::Length(bottom_panel_height),     // 2: terminal
-            Constraint::Length(debug_toolbar_height),    // 3: debug toolbar
-            Constraint::Length(separated_status_height), // 4: separated status (0 or 1)
-            Constraint::Length(wildmenu_height),         // 5: wildmenu
-            Constraint::Length(global_status_height),    // 6: global status
-            Constraint::Length(1),                       // 7: cmd
-        ])
-        .split(right_col);
-    let editor_col = v_chunks[0];
-    let quickfix_area = v_chunks[1];
-    let bottom_panel_area = v_chunks[2];
-    let debug_toolbar_area = v_chunks[3];
-    let separated_status_area = v_chunks[4];
-    let wildmenu_area = v_chunks[5];
-    let status_area = v_chunks[6];
-    let cmd_area = v_chunks[7];
-
-    // The editor column includes the tab bar row(s).  Window rects from
-    // calculate_group_window_rects already have y >= 1 (tab_bar_height offset),
-    // so the tab bar occupies row 0 and windows start at row 1 automatically.
-    let editor_area = editor_col;
-
-    // ── Render menu bar strip (if visible) ───────────────────────────────────
-    // #712: only *measure* the bar here (`menu_bar_layout`, no paint) and
-    // defer the command centre's own `draw_command_center` call until after
-    // the "Menu dropdown" block further down, which unconditionally
-    // repaints `draw_menu_bar` across the entire `bar_rect` band (so an
-    // open dropdown paints on top of everything) whether or not a dropdown
-    // is actually open — painting the command centre here, before that
-    // block runs, got it silently erased every frame. Mirrors the fix in
-    // the live `TuiShellApp::render_content` path (`shell_app.rs`'s
-    // `pending_command_center`) and GTK's identical #676 ordering fix.
-    let mut pending_command_center: Option<(quadraui::Rect, quadraui::CommandCenter)> = None;
-    if screen.menu_bar_visible {
-        let bar = engine.menu_system.borrow().menu_bar();
-        let bar_rect = quadraui::Rect::new(
-            menu_bar_area.x as f32,
-            menu_bar_area.y as f32,
-            menu_bar_area.width as f32,
-            menu_bar_area.height as f32,
-        );
-        let mb_layout = backend.menu_bar_layout(bar_rect, &bar);
-
-        // #763: the `visible_items.last()` fold — and the quadraui#494
-        // "`vi.bounds.x` is already absolute, do not add the band's own `x`
-        // back on" warning it carries — now lives once in
-        // `render::menu_bar_items_end`, shared with both live `render_content`
-        // paths.
-        let menu_end: u16 =
-            render::menu_bar_items_end(&mb_layout, menu_bar_area.x as f32).round() as u16;
-
-        let title = engine
-            .cwd
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "VimCode".to_string());
-        let cc = render::build_command_center_view(
-            engine.tab_nav_can_go_back(),
-            engine.tab_nav_can_go_forward(),
-            &title,
-        );
-        let cc_area = Rect {
-            x: menu_end,
-            y: menu_bar_area.y,
-            width: menu_bar_area
-                .width
-                .saturating_sub(menu_end - menu_bar_area.x),
-            height: menu_bar_area.height,
-        };
-        let cc_q_rect = quadraui::Rect::new(
-            cc_area.x as f32,
-            cc_area.y as f32,
-            cc_area.width as f32,
-            cc_area.height as f32,
-        );
-        pending_command_center = Some((cc_q_rect, cc));
-        // Note: dropdown is rendered LAST (after all content) so it draws on top.
-    }
-
-    // ── Render activity bar ───────────────────────────────────────────────────
-    render_activity_bar(
-        frame.buffer_mut(),
-        activity_area,
-        sidebar,
-        theme,
-        engine.menu_bar_visible,
-        engine,
-    );
-
-    // ── Render sidebar + separator ────────────────────────────────────────────
-    if engine.app_shell.sidebar_visible() && sidebar_sep_area.width > 1 {
-        let sidebar_area = Rect {
-            x: sidebar_sep_area.x,
-            y: sidebar_sep_area.y,
-            width: sidebar_sep_area.width - 1,
-            height: sidebar_sep_area.height,
-        };
-        let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
-
-        render_sidebar(
-            backend,
-            sidebar_area,
-            sidebar,
-            engine,
-            theme,
-            explorer_drop_target,
-        );
-        // Note: render_sidebar / render_search_panel write back scroll_top to sidebar
-
-        // Separator column
-        let sep_fg = rc(theme.separator);
-        let sep_bg = rc(theme.background);
-        for y in sidebar_sep_area.y..sidebar_sep_area.y + sidebar_sep_area.height {
-            set_cell(frame.buffer_mut(), sep_x, y, '│', sep_fg, sep_bg);
-        }
-    }
-
-    // ══ Editor band (#764, #735 slice 3) ═════════════════════════════════════
-    //
-    // ONE code path for every editor-group count (#551), and — since #764 —
-    // one *ordered* code path shared with GTK: `render::compose_editor_band`
-    // is the single artefact both this rasteriser and both production
-    // `render_content`s walk. Keeping this test-only rasteriser on the same
-    // walk is the point: it is the thing whose banner-comment-per-rung ladder
-    // was the second transcription #764 exists to delete, and a `match` on
-    // `EditorOp` makes a future rung a compile error here too.
-    //
-    // Window/tab ordering, for the record it used to carry inline: windows
-    // first, then tab bars on top, which prevents window content from
-    // overwriting an adjacent group's tab bar in horizontal splits — see
-    // `EditorOp::Windows`. The pre-#551 single-group arm drew its tab bar
-    // *before* the windows; that ordering was interchangeable because the tab
-    // row and the window rects never overlap (the row is reserved out of the
-    // group's content bounds).
-    let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
-        2.0
-    } else {
-        1.0
-    };
-    debug_log!(
-        "draw_frame: editor_area=({},{},{}x{}) groups={}",
-        editor_area.x,
-        editor_area.y,
-        editor_area.width,
-        editor_area.height,
-        screen.group_tab_bars.len()
-    );
-    for (idx, gtb) in screen.group_tab_bars.iter().enumerate() {
-        debug_log!(
-            "  group[{}] id={:?} bounds=({:.1},{:.1},{:.1}x{:.1}) tabs={}",
-            idx,
-            gtb.group_id,
-            gtb.bounds.x,
-            gtb.bounds.y,
-            gtb.bounds.width,
-            gtb.bounds.height,
-            gtb.tabs.len()
-        );
-    }
-    for op in render::compose_editor_band(
-        engine,
-        screen,
-        tab_drag_source.is_some(),
-        engine.terminal_maximized,
-    ) {
-        match op {
-            render::EditorOp::Windows => {
-                render_all_windows(backend, Some(frame), &screen.windows, theme)
-            }
-            // #35/#722: minimap strips on every window's right edge (one entry
-            // per `WindowId` in `screen.minimap`, not just the active
-            // window's) — one call, the braille rasteriser is quadraui's.
-            render::EditorOp::Minimap => {
-                render::draw_minimap_strip(backend, screen);
-            }
-            // Each group's tab bar sits `tui_tbh` rows above the group's
-            // window content (`bounds.y - tui_tbh`, applied inside
-            // `tab_bar_draw_targets`); with one group that resolves to row 0
-            // of `editor_area`, exactly what the deleted single-group arm
-            // hard-coded.
-            render::EditorOp::TabBars => {
-                backend.set_theme(super::quadraui_tui::q_theme(theme));
-                for bar in render::paint_tab_bars(backend, engine, screen, 1.0, tui_tbh, None) {
-                    tab_visible_counts_out.push((bar.group_id, bar.hits.available_cols));
-                }
-            }
-            // Breadcrumb bars, below each group's tab bar. Hidden while the
-            // terminal panel is maximized so it can claim the row.
-            // `bc.bounds.y` already accounts for a hidden tab bar —
-            // `calculate_group_window_rects` →
-            // `adjust_group_rects_for_hidden_tabs` shifts the window rect (and
-            // therefore the derived breadcrumb bounds) up by one row in that
-            // case.
-            render::EditorOp::Breadcrumbs => {
-                backend.set_theme(super::quadraui_tui::q_theme(theme));
-                render::paint_breadcrumb_bars(backend, screen, engine.terminal_maximized);
-            }
-            // Divider lines between editor groups. `div.position`/
-            // `.cross_start` are already absolute terminal-screen coordinates
-            // (#550), matching `editor_area`'s own coordinate space — no
-            // offset addition needed. #609: routed through
-            // `Backend::draw_status_bar` (via `render_group_dividers`/
-            // `group_divider_cells`) instead of a raw `Buffer` write, so
-            // `TuiShellApp::render_content` — which has no `Buffer`/`Frame` to
-            // write into — paints the exact same dividers; see
-            // `group_divider_cells`'s doc comment for how the old
-            // `frame.buffer_mut()[(div_x - 1, y)]` read-back (the #481
-            // phantom-divider-beside-scrollbar guard) became a pure data
-            // computation both call sites now share.
-            render::EditorOp::GroupDividers => render_group_dividers(
-                backend,
-                &screen.group_dividers,
-                &screen.windows,
-                editor_area,
-                theme,
-            ),
-            render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
-                backend,
-                engine,
-                screen,
-                theme,
-                tab_drag_source,
-                tab_drag_cursor,
-                tab_drop_zone,
-            ),
-            // Rendered on top of the editor, just below the tab bar row.
-            // Unlike `TuiShellApp::render_content`'s `area`
-            // (`main_content_bounds`, already offset below whatever
-            // `AppShell::render` painted above it), `editor_area` here is this
-            // rasteriser's own top-level split with an implicitly 0-based `y`,
-            // so the menu row still has to be added back by hand (#635 item
-            // A).
-            render::EditorOp::TabTooltip => {
-                if let Some(ref tooltip_text) = screen.tab_tooltip {
-                    let menu_rows: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-                    render_tab_hover_tooltip(
-                        backend,
-                        editor_area.x,
-                        menu_rows + 1, // just below the tab bar row
-                        editor_area.width,
-                        tooltip_text,
-                        theme,
-                    );
-                }
-            }
-        }
-    }
-
-    // Register the editor viewport as a scroll surface so dispatch_scroll
-    // routes scroll wheel events to it (per-window routing done in handler).
-    engine
-        .scroll_surfaces
-        .borrow_mut()
-        .push(quadraui::ScrollSurface {
-            id: quadraui::WidgetId::new("tui:editor_viewport"),
-            bounds: quadraui::Rect::new(
-                editor_area.x as f32,
-                editor_area.y as f32,
-                editor_area.width as f32,
-                editor_area.height as f32,
-            ),
-            scrollbar: None,
-        });
-
-    // ── Editor popups: completion / hover / editor-hover / diff-peek /
-    // signature-help — extracted to `paint_editor_popups` (#601) so
-    // `TuiShellApp::render_content` can call the exact same code (these are
-    // all already trait-only, no raw `Frame`/`Buffer` access, so nothing
-    // here needed to change to become reachable from `&mut dyn Backend`).
-    paint_editor_popups(
-        backend,
-        screen,
-        area,
-        theme,
-        completion_layout_out,
-        editor_hover_link_rects_out,
-        editor_hover_popup_rect_out,
-        editor_hover_scrollbar_out,
-    );
-
-    // ══ Bottom band (#765, #735 slice 4) ══════════════════════════════════════
-    //
-    // The same `render::compose_bottom_band` walk `TuiShellApp::render_content`
-    // and GTK's `render_content` run — this parity reference was the *third*
-    // transcription of the run, and the one that made the other two look like
-    // they agreed. Geometry stays here, in cells; only the order and the gates
-    // are shared. Caches are cleared before the walk, never from an `else` arm
-    // inside it (see `BOTTOM_Z_ORDER`).
-    engine.bottom_panel_geometry.replace(None);
-    *debug_toolbar_rect_out = quadraui::Rect::default();
-    hover_link_rects_out.clear();
-    *hover_popup_rect_out = None;
-
-    // `draw_frame` has no `AppShellLayout`, so its stand-in for
-    // `sidebar_content_bounds.is_some()` is the same pair of tests its
-    // hand-rolled hover gate used.
-    let sidebar_open = engine.app_shell.sidebar_visible() && sidebar_sep_area.width > 1;
-    for op in render::compose_bottom_band(engine, screen, sidebar_open) {
-        match op {
-            render::BottomOp::Quickfix => {
-                if let Some(ref qf) = screen.quickfix {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    render::paint_quickfix_rung(
-                        backend,
-                        qf,
-                        super::shell_app::to_q_rect(quickfix_area),
-                        quickfix_scroll_top,
-                    );
-                }
-            }
-            render::BottomOp::BottomPanel => {
-                backend.set_theme(super::quadraui_tui::q_theme(theme));
-                render::paint_bottom_panel_rung(
-                    backend,
-                    engine,
-                    screen,
-                    theme,
-                    super::shell_app::to_q_rect(bottom_panel_area),
-                    render::BottomPanelUnits::CELL,
-                );
-            }
-            render::BottomOp::DebugToolbar => {
-                // Layout is cached on `engine.debug_toolbar_layout` for
-                // click/hover hit-testing (#510).
-                let q_rect = super::shell_app::to_q_rect(debug_toolbar_area);
-                *debug_toolbar_rect_out = q_rect;
-                render::draw_debug_toolbar(backend, engine, q_rect);
-            }
-            render::BottomOp::SeparatedStatus => {
-                if let Some(ref status) = screen.separated_status_line {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    let _ = render::paint_separated_status_rung(
-                        backend,
-                        status,
-                        super::shell_app::to_q_rect(separated_status_area),
-                    );
-                }
-            }
-            render::BottomOp::PanelHover => {
-                // No re-check of "sidebar has a panel with tooltips" here:
-                // this arm only runs when `compose_bottom_band` already
-                // included `PanelHover`, which is gated on
-                // `render::panel_hover_is_drawn` — see that fn's doc comment
-                // for why the old `ext_panel_name`/`PANEL_GIT` restatement
-                // here was redundant with it.
-                let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
-                let (rects, popup_rect) = render_panel_hover_popup(
-                    backend,
-                    screen,
-                    theme,
-                    sep_x + 1,
-                    sidebar_sep_area.y,
-                    sidebar_sep_area.height,
-                    area,
-                );
-                *hover_link_rects_out = rects;
-                *hover_popup_rect_out = popup_rect;
-            }
-        }
-    }
-
-    // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
-    if let Some(ref wm) = screen.wildmenu {
-        let bar = render::wildmenu_to_status_bar(wm, theme);
-        let q_rect = quadraui::Rect::new(
-            wildmenu_area.x as f32,
-            wildmenu_area.y as f32,
-            wildmenu_area.width as f32,
-            wildmenu_area.height as f32,
-        );
-        backend.draw_status_bar(q_rect, &bar, None, None);
-    }
-
-    // ── Status / command ──────────────────────────────────────────────────────
-    // #752: publish the rect actually painted so `route_chrome_click` can hit-
-    // test against it, instead of `mouse.rs` re-deriving the row as
-    // `row + 2 == term_height`. Cleared to the empty rect when no global bar is
-    // drawn (per-window status lines are on), matching `menu_bar_rect`.
-    if let Some(ref bar) = screen.global_status_bar {
-        let q_rect = quadraui::Rect::new(
-            status_area.x as f32,
-            status_area.y as f32,
-            status_area.width as f32,
-            status_area.height as f32,
-        );
-        engine.global_status_rect.set(q_rect);
-        backend.draw_status_bar(q_rect, bar, None, None);
-    } else {
-        engine.global_status_rect.set(quadraui::Rect::default());
-    }
-
-    // `render_command_line` also applies the `cmd_sel` mouse-selection
-    // inversion (#605 folded the separate buffer read-back pass into the
-    // renderer so `TuiShellApp::render_content` gets it for free).
-    render_command_line(backend, cmd_area, &screen.command, theme, cmd_sel);
-
-    // The panel hover popup used to be composed here, after the chrome rungs
-    // above. #765 moved it into the `BottomOp::PanelHover` rung of the band
-    // walk, matching both live backends.
-
-    // ── Folder / workspace picker modal ──────────────────────────────────────
-    if let Some(picker) = folder_picker {
-        // Sizing identical to the legacy popup: 60% of viewport
-        // width clamped to >= 50; 55% of viewport height clamped to >= 15.
-        let term_cols = area.width;
-        let term_rows = area.height;
-        let width = (term_cols * 3 / 5).max(50);
-        let height = (term_rows * 55 / 100).max(15);
-        let popup_x = (term_cols.saturating_sub(width)) / 2;
-        let popup_y = (term_rows.saturating_sub(height)) / 2;
-        let popup_area = Rect {
-            x: popup_x,
-            y: popup_y,
-            width,
-            height,
-        };
-        // Per D6: build quadraui::Palette + draw_palette.
-        // Phase B.4 Stage 2: route through `Backend::draw_palette`.
-        let palette = folder_picker_to_palette(picker, width as usize);
-        let q_rect = quadraui::Rect::new(
-            popup_area.x as f32,
-            popup_area.y as f32,
-            popup_area.width as f32,
-            popup_area.height as f32,
-        );
-        backend.draw_palette(q_rect, &palette);
-    }
-
-    // ── Find/replace overlay (top-right of active group) ───────────────────
-    if let Some(ref find_replace) = screen.find_replace {
-        // #550: `find_replace.group_bounds` is derived from `window_rects`
-        // (render.rs's `active_group_bounds`) and is now absolute
-        // terminal-screen space, not content-relative. quadraui's shared
-        // `draw_find_replace(..., editor_left)` still expects to translate a
-        // content-relative `group_bounds` by `editor_left` internally (it's
-        // TUI-only — GTK never calls this path, so there's no established
-        // absolute-input convention to lean on there); passing `0` here
-        // keeps that internal translation a no-op instead of double-
-        // counting the origin now baked into `group_bounds` itself.
-        let q_area = quadraui::Rect::new(
-            area.x as f32,
-            area.y as f32,
-            area.width as f32,
-            area.height as f32,
-        );
-        backend.draw_find_replace(q_area, find_replace);
-    }
-
-    // ── Unified picker modal (above terminal/status so it's fully visible) ──
-    if let Some(ref picker) = screen.picker {
-        render_picker_popup(picker, area, theme, backend);
-    }
-
-    // ── Tab switcher popup ───────────────────────────────────────────────────
-    if let Some(ref ts) = screen.tab_switcher {
-        // #733: sizing (45% of viewport width clamped to [40, 80];
-        // height = visible_items + 2 border rows) now lives once in
-        // `render::TabSwitcherGeometry`, shared with the GTK painter and
-        // with the modal-overlay mouse router.
-        if let Some(geo) = render::TabSwitcherGeometry::compute(
-            quadraui::Rect::new(
-                area.x as f32,
-                area.y as f32,
-                area.width as f32,
-                area.height as f32,
-            ),
-            ts.items.len(),
-            &render::TUI_TAB_SWITCHER_SIZING,
-        ) {
-            // Per D6: build quadraui::ListView (bordered) + draw_list.
-            // Phase B.4 Stage 2: route through `Backend::draw_list`.
-            let list = render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
-            backend.draw_list(geo.bounds, &list);
-        }
-    }
-
-    // ── Context menu popup (above status/command line) ─────────────────────
-    if let Some(ref ctx_menu) = screen.context_menu {
-        // The layout describes the INNER items region; the rasteriser draws
-        // a 1-cell box border around it, so the anchor/viewport passed to
-        // `context_menu_generic_layout` are inset by (1, 1) and shrunk by 2 —
-        // otherwise the right/bottom border can extend past the screen on
-        // narrow windows. `char_width`/`line_height` are both 1.0 (one
-        // screen cell) on TUI; GTK's ShellApp `render_content` passes its
-        // real pixel metrics through the same shared function (#546).
-        let inner_viewport = quadraui::Rect::new(
-            (area.x + 1) as f32,
-            (area.y + 1) as f32,
-            area.width.saturating_sub(2) as f32,
-            area.height.saturating_sub(2) as f32,
-        );
-        let inset_panel = render::ContextMenuPanel {
-            screen_col: ctx_menu.screen_col + 1,
-            screen_row: ctx_menu.screen_row + 1,
-            ..ctx_menu.clone()
-        };
-        let (menu, layout) =
-            render::context_menu_generic_layout(&inset_panel, inner_viewport, 1.0, 1.0, 1.0);
-        let _ = backend.draw_context_menu(&menu, &layout);
-        *context_menu_layout_out = Some(layout);
-    }
-
-    // ── Modal dialog (highest z-order after quit confirm) ────────────────────
-    if let Some(ref dialog) = screen.dialog {
-        let viewport = quadraui::Rect::new(
-            area.x as f32,
-            area.y as f32,
-            area.width as f32,
-            area.height as f32,
-        );
-        let (q_dialog, layout) = render::dialog_generic_layout(dialog, viewport, 1.0, 1.0);
-        let _ = backend.draw_dialog(&q_dialog, &layout);
-        *dialog_layout_out = Some(layout);
-    } else {
-        *dialog_layout_out = None;
-    }
-
-    // ── Menu dropdown — rendered last so it draws on top of everything ────────
-    if screen.menu_bar_visible {
-        let bar_rect = quadraui::Rect::new(
-            menu_bar_area.x as f32,
-            menu_bar_area.y as f32,
-            menu_bar_area.width as f32,
-            menu_bar_area.height as f32,
-        );
-        engine.menu_system.borrow().render(backend, bar_rect);
-    }
-
-    // ── Command centre (#712) — painted after the dropdown block above, ───────
-    // which repaints `draw_menu_bar` across the entire `bar_rect` band and
-    // would erase anything drawn here first. See `pending_command_center`'s
-    // doc comment above for the full story.
-    engine.command_center_layout.replace(
-        pending_command_center.map(|(cc_rect, cc)| backend.draw_command_center(cc_rect, &cc)),
-    );
-
-    // Toast overlay (#450) — drawn LAST so it sits on top of every other
-    // surface. Bottom-right corner; transient (auto-dismissed after
-    // TOAST_LIFETIME via `engine.prune_toasts()` from poll_idle). The
-    // returned layout is cached on the engine so click handlers can run
-    // hit_test → handle_toast_hit (× close, action buttons).
-    if let Some(stack) = render::build_toast_stack(engine) {
-        let toast_area = frame.area();
-        let q_toast_area = quadraui::Rect::new(
-            toast_area.x as f32,
-            toast_area.y as f32,
-            toast_area.width as f32,
-            toast_area.height as f32,
-        );
-        let layout = backend.draw_toast_stack(q_toast_area, &stack);
-        engine.toast_layout.replace(Some(layout));
-    } else {
-        engine.toast_layout.replace(None);
-    }
-}
+// #766: the legacy full-frame raw-`ratatui::Frame` rasteriser (`draw_frame`)
+// that used to live here is deleted. It was already `#[cfg(test)]`-only —
+// #634 deleted its one production caller (`event_loop`) — so every rung it
+// painted has had a `Backend::draw_*` route on the live `TuiShellApp::
+// render_content` / GTK `render_content` paths since #601-#765; nothing here
+// was "populated but never composed" (the residue check #766 asks for).
+//
+// What replaces it, for the handful of tests below that still need painted
+// pixels rather than just a computed `ScreenLayout`
+// (`build_screen_for_tui`/`build_screen_for_shell_content` alone), is
+// `tests::render_tui_buffer_impl` — a thinner, test-only walk over the exact
+// same shared `render::compose_editor_band` / `render::compose_bottom_band`
+// artefacts both live backends already run (see `TuiShellApp::
+// paint_editor_band` / `compose_bottom_band_rungs` and `gtk::App`'s twins).
+// It deliberately does not paint chrome (activity bar / sidebar body / menu
+// row / overlays): no test in this module asserts on any of it, and painting
+// it needs an *owned* `TuiShellApp` + a real `AppShellLayout` (the
+// `driver_with_shell` path used in `shell_app.rs`), which these tests' bare
+// `&Engine` fixtures — several of which mutate `engine` again immediately
+// after rendering — cannot hand over without moving `engine` out from under
+// its own caller.
 
 /// Paint the editor-anchored popups: completion menu, LSP hover, the rich
 /// "editor hover" markdown popup, diff-peek, and signature-help.
@@ -2002,7 +1364,7 @@ pub(super) fn render_group_dividers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::window::{GroupId, WindowId};
+    use crate::core::window::WindowId;
     use crate::render::WindowStatusLine;
     use ratatui::backend::TestBackend;
 
@@ -2030,72 +1392,202 @@ mod tests {
         e
     }
 
-    /// Render the TUI and return the character buffer as a Vec of lines.
-    fn render_tui(engine: &Engine, width: u16, height: u16) -> Vec<String> {
+    /// Paint `engine`'s editor + bottom bands into a fresh `width`×`height`
+    /// grid and return the painted buffer — the shared implementation behind
+    /// [`render_tui`] / [`render_tui_row_cells`] / [`render_tui_buffer`].
+    ///
+    /// #766: replaces the deleted `draw_frame`. Deliberately paints no chrome
+    /// (activity bar / sidebar body / menu row / overlays): no test in this
+    /// module asserts on any of it, and painting it needs an *owned*
+    /// `TuiShellApp` + a real `AppShellLayout` (the `driver_with_shell` path
+    /// `shell_app.rs` uses), which this helper's bare `&Engine` — several
+    /// callers mutate `engine` again immediately after rendering (see
+    /// `dispatch_tab_bar_left_click`) — cannot hand over without moving
+    /// `engine` out from under its own caller.
+    ///
+    /// What *is* painted is composed from the exact same shared walks both
+    /// live `render_content`s run — `render::compose_editor_band` /
+    /// `render::compose_bottom_band` — via `build_screen_for_shell_content`
+    /// and `bottom_chrome_rects_for_shell_content`, the same two functions
+    /// `TuiShellApp::render_content` calls. The one hand-rolled piece of
+    /// geometry left is the activity-bar/sidebar-separator offset on the x
+    /// axis (`TEST_EDITOR_LEFT`): every fixture in this module renders with
+    /// the sidebar visible-but-0-wide (see `test_engine`'s doc comment), so
+    /// that offset is always exactly `ACTIVITY_BAR_WIDTH + 1`.
+    fn render_tui_buffer_impl(engine: &Engine, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let theme = crate::render::Theme::onedark();
-        let mut sidebar = TuiSidebar::new();
-        let sidebar_width = 0u16;
+
+        let menu_h: u16 = if engine.menu_bar_visible { 1 } else { 0 };
+        let editor_x = ACTIVITY_BAR_WIDTH + 1;
         let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
+            x: editor_x,
+            y: menu_h,
+            width: width.saturating_sub(editor_x),
+            height: height.saturating_sub(menu_h),
         };
-        let screen = build_screen_for_tui(engine, &theme, area, &sidebar, sidebar_width);
+        let screen = build_screen_for_shell_content(engine, &theme, area);
+        let chrome = bottom_chrome_rects_for_shell_content(engine, &screen, area);
+        let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
+            2.0
+        } else {
+            1.0
+        };
 
-        let mut hover_link_rects = Vec::new();
-        let mut hover_popup_rect = None;
-        let mut editor_hover_popup_rect = None;
-        let mut editor_hover_link_rects = Vec::new();
-        let mut editor_hover_scrollbar = None;
-        let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
-        let mut dbg_toolbar_rect = quadraui::Rect::default();
-        let mut completion_layout = None;
-        let mut context_menu_layout = None;
-        let mut dialog_layout = None;
-        let mut backend = super::backend::TuiBackend::new();
-
+        let mut tui_backend = super::backend::TuiBackend::new();
         terminal
             .draw(|frame| {
-                // #600: `draw_frame` calls `Backend::draw_*` trait methods
-                // directly (no per-call `enter_frame_scope`), so this
-                // harness opens the one frame-scope entry itself — mirrors
-                // `event_loop`'s two `terminal.draw` closures in `mod.rs`.
-                super::with_frame_scope(&mut backend, frame, |backend, frame| {
-                    draw_frame(
-                        frame,
-                        &screen,
-                        &theme,
-                        &mut sidebar,
+                super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {
+                    // ══ Editor band (#764, #735 slice 3) ═════════════════
+                    for op in render::compose_editor_band(
                         engine,
-                        sidebar_width,
-                        0,    // quickfix_scroll_top
-                        None, // folder_picker
-                        None, // cmd_sel
-                        None, // explorer_drop_target
-                        &mut hover_link_rects,
-                        &mut hover_popup_rect,
-                        &mut editor_hover_popup_rect,
-                        &mut editor_hover_link_rects,
-                        &mut editor_hover_scrollbar,
-                        &mut tab_visible_counts,
-                        &mut dbg_toolbar_rect,
-                        &mut completion_layout,
-                        &mut context_menu_layout,
-                        &mut dialog_layout,
+                        &screen,
+                        false,
+                        engine.terminal_maximized,
+                    ) {
+                        match op {
+                            render::EditorOp::Windows => {
+                                render_all_windows(backend, None, &screen.windows, &theme)
+                            }
+                            render::EditorOp::Minimap => {
+                                render::draw_minimap_strip(backend, &screen);
+                            }
+                            render::EditorOp::TabBars => {
+                                backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                                let _ = render::paint_tab_bars(
+                                    backend, engine, &screen, 1.0, tui_tbh, None,
+                                );
+                            }
+                            render::EditorOp::Breadcrumbs => {
+                                backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                                render::paint_breadcrumb_bars(
+                                    backend,
+                                    &screen,
+                                    engine.terminal_maximized,
+                                );
+                            }
+                            render::EditorOp::GroupDividers => render_group_dividers(
+                                backend,
+                                &screen.group_dividers,
+                                &screen.windows,
+                                area,
+                                &theme,
+                            ),
+                            render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
+                                backend,
+                                engine,
+                                &screen,
+                                &theme,
+                                None,
+                                None,
+                                &crate::core::window::DropZone::None,
+                            ),
+                            render::EditorOp::TabTooltip => {
+                                if let Some(ref tooltip_text) = screen.tab_tooltip {
+                                    render_tab_hover_tooltip(
+                                        backend,
+                                        area.x,
+                                        area.y + 1,
+                                        area.width,
+                                        tooltip_text,
+                                        &theme,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Editor-anchored popups — same code both live paths
+                    // call (`paint_editor_popups`, #601).
+                    paint_editor_popups(
                         backend,
-                        None,                                 // tab_drag_source
-                        None,                                 // tab_drag_cursor
-                        &crate::core::window::DropZone::None, // tab_drop_zone
+                        &screen,
+                        area,
+                        &theme,
+                        &mut None,
+                        &mut Vec::new(),
+                        &mut None,
+                        &mut None,
                     );
+
+                    // ══ Bottom band (#765, #735 slice 4) ═════════════════
+                    for op in render::compose_bottom_band(engine, &screen, false) {
+                        match op {
+                            render::BottomOp::Quickfix => {
+                                if let Some(ref qf) = screen.quickfix {
+                                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                                    render::paint_quickfix_rung(
+                                        backend,
+                                        qf,
+                                        super::shell_app::to_q_rect(chrome.quickfix),
+                                        0,
+                                    );
+                                }
+                            }
+                            render::BottomOp::BottomPanel => {
+                                backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                                render::paint_bottom_panel_rung(
+                                    backend,
+                                    engine,
+                                    &screen,
+                                    &theme,
+                                    super::shell_app::to_q_rect(chrome.bottom_panel),
+                                    render::BottomPanelUnits::CELL,
+                                );
+                            }
+                            render::BottomOp::DebugToolbar => {
+                                render::draw_debug_toolbar(
+                                    backend,
+                                    engine,
+                                    super::shell_app::to_q_rect(chrome.debug_toolbar),
+                                );
+                            }
+                            render::BottomOp::SeparatedStatus => {
+                                if let Some(ref status) = screen.separated_status_line {
+                                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                                    let _ = render::paint_separated_status_rung(
+                                        backend,
+                                        status,
+                                        super::shell_app::to_q_rect(chrome.separated_status),
+                                    );
+                                }
+                            }
+                            // Never composed: `compose_bottom_band` is called
+                            // with `sidebar_open = false` above (this module
+                            // never renders sidebar chrome).
+                            render::BottomOp::PanelHover => {}
+                        }
+                    }
+
+                    // ── Wildmenu / status / command line ──────────────────
+                    if let Some(ref wm) = screen.wildmenu {
+                        let bar = render::wildmenu_to_status_bar(wm, &theme);
+                        backend.draw_status_bar(
+                            super::shell_app::to_q_rect(chrome.wildmenu),
+                            &bar,
+                            None,
+                            None,
+                        );
+                    }
+                    if let Some(ref bar) = screen.global_status_bar {
+                        backend.draw_status_bar(
+                            super::shell_app::to_q_rect(chrome.status),
+                            bar,
+                            None,
+                            None,
+                        );
+                    }
+                    render_command_line(backend, chrome.cmd, &screen.command, &theme, None);
                 });
             })
             .unwrap();
+        terminal.backend().buffer().clone()
+    }
 
-        // Extract the rendered buffer as lines of text
-        let buf = terminal.backend().buffer();
+    /// Render the TUI and return the character buffer as a Vec of lines.
+    fn render_tui(engine: &Engine, width: u16, height: u16) -> Vec<String> {
+        let buf = render_tui_buffer_impl(engine, width, height);
         let mut lines = Vec::new();
         for y in 0..height {
             let mut line = String::new();
@@ -2163,54 +1655,7 @@ mod tests {
     /// strings this keeps column indices exact even when a cell holds a
     /// wide glyph or ratatui's wide-glyph continuation marker.
     fn render_tui_row_cells(engine: &Engine, width: u16, height: u16, row: u16) -> Vec<String> {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let theme = crate::render::Theme::onedark();
-        let mut sidebar = TuiSidebar::new();
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        let screen = build_screen_for_tui(engine, &theme, area, &sidebar, 0);
-        let mut hover_link_rects = Vec::new();
-        let mut tab_visible_counts: Vec<(GroupId, usize)> = Vec::new();
-        let mut dbg_toolbar_rect = quadraui::Rect::default();
-        let mut backend = super::backend::TuiBackend::new();
-        terminal
-            .draw(|frame| {
-                super::with_frame_scope(&mut backend, frame, |backend, frame| {
-                    draw_frame(
-                        frame,
-                        &screen,
-                        &theme,
-                        &mut sidebar,
-                        engine,
-                        0,
-                        0,
-                        None,
-                        None,
-                        None,
-                        &mut hover_link_rects,
-                        &mut None,
-                        &mut None,
-                        &mut Vec::new(),
-                        &mut None,
-                        &mut tab_visible_counts,
-                        &mut dbg_toolbar_rect,
-                        &mut None,
-                        &mut None,
-                        &mut None,
-                        backend,
-                        None,
-                        None,
-                        &crate::core::window::DropZone::None,
-                    );
-                });
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
+        let buf = render_tui_buffer_impl(engine, width, height);
         (0..width)
             .map(|x| buf[(x, row)].symbol().to_string())
             .collect()
@@ -2584,66 +2029,6 @@ mod tests {
         assert!(has_normal, "status bar should show normal mode");
     }
 
-    /// Render a full frame and return the raw `Buffer` so tests can inspect
-    /// individual cells (symbol / column) at the tab-group boundary.
-    fn render_tui_buffer(engine: &Engine, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let theme = crate::render::Theme::onedark();
-        let mut sidebar = TuiSidebar::new();
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        let screen = build_screen_for_tui(engine, &theme, area, &sidebar, 0);
-        let mut hlr = Vec::new();
-        let mut hpr = None;
-        let mut ehpr = None;
-        let mut ehlr = Vec::new();
-        let mut ehs = None;
-        let mut tvc: Vec<(GroupId, usize)> = Vec::new();
-        let mut dtr = quadraui::Rect::default();
-        let mut cl = None;
-        let mut cml = None;
-        let mut dl = None;
-        let mut backend2 = super::backend::TuiBackend::new();
-        terminal
-            .draw(|frame| {
-                super::with_frame_scope(&mut backend2, frame, |backend2, frame| {
-                    draw_frame(
-                        frame,
-                        &screen,
-                        &theme,
-                        &mut sidebar,
-                        engine,
-                        0,
-                        0,
-                        None,
-                        None,
-                        None,
-                        &mut hlr,
-                        &mut hpr,
-                        &mut ehpr,
-                        &mut ehlr,
-                        &mut ehs,
-                        &mut tvc,
-                        &mut dtr,
-                        &mut cl,
-                        &mut cml,
-                        &mut dl,
-                        backend2,
-                        None,
-                        None,
-                        &crate::core::window::DropZone::None,
-                    );
-                });
-            })
-            .unwrap();
-        terminal.backend().buffer().clone()
-    }
-
     /// #481 iteration 4 regression: two vertically-split tab groups whose
     /// windows both overflow (so each shows a scrollbar) must render exactly
     /// ONE vertical bar at the group boundary — the left window's own
@@ -2671,7 +2056,7 @@ mod tests {
 
         let width = 80u16;
         let height = 24u16;
-        let buf = render_tui_buffer(&e, width, height);
+        let buf = render_tui_buffer_impl(&e, width, height);
 
         // Recover the boundary column: the left window's last column, where
         // `draw_editor` paints its scrollbar. Locate the single boundary by
