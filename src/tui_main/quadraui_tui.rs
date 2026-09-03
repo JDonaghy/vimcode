@@ -92,7 +92,15 @@ pub(super) fn draw_activity_bar(
             set_cell(buf, x, y, ' ', icon_fg, row_bg);
         }
         if area.width >= 3 {
-            let icon_ch = item.icon.chars().next().unwrap_or('?');
+            // quadraui#683: `ActivityItem.icon` is now `Icon { glyph, fallback }`;
+            // which half paints is the same nerd-fonts flag every other TUI icon
+            // resolver in this crate already reads (`crate::icons::nerd_fonts_enabled`).
+            let icon_str = if crate::icons::nerd_fonts_enabled() {
+                &item.icon.glyph
+            } else {
+                &item.icon.fallback
+            };
+            let icon_ch = icon_str.chars().next().unwrap_or('?');
             set_cell(buf, area.x + 1, y, icon_ch, icon_fg, row_bg);
         }
         if item.is_active && !item.is_keyboard_selected {
