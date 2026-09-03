@@ -10386,7 +10386,12 @@ mod tests {
     /// "DAP: starting Debug debug session…" instead, firing both assertions.
     #[test]
     fn shift_f5_stops_the_debug_session_via_shell_app() {
-        let app = TuiShellApp::new(None);
+        // `new_for_test`, not `new`: the production constructor reads the
+        // developer's real `~/.config/vimcode/{settings,session}.json` and
+        // reopens that workspace session's files/splits, either of which can
+        // paint over the command line this test reads. See
+        // `TuiShellApp::new_for_test`'s doc comment.
+        let app = TuiShellApp::new_for_test();
         let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
 
         press_with(
@@ -10427,7 +10432,8 @@ mod tests {
     /// that way before the reorder landed.
     #[test]
     fn shift_f5_reaches_the_debugger_from_a_focused_panel_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        // `new_for_test` for the same ambient-state reason as the test above.
+        let mut app = TuiShellApp::new_for_test();
         // Hidden sidebar, focused search panel: the panel still owns the
         // keyboard (`route_focus_key` keys off the focus flags, not
         // visibility) but the tree does not over-paint the message row this
@@ -10470,12 +10476,46 @@ mod tests {
     /// **Verified RED by removing the rung:** make
     /// `render::is_force_redraw_key` return `false` and the buffer picks up
     /// the fall-through, changing the painted marker.
+    ///
+    /// Two ambient hazards this test learned the hard way (it passed on a
+    /// developer box and failed on CI — #762 CI fix 1), both already
+    /// documented on their owners and both fatal *specifically* because this
+    /// test measures painted editor **geometry**:
+    ///
+    /// 1. `TuiShellApp::new` boots from the developer's real
+    ///    `~/.config/vimcode/{settings,session}.json`, so the sidebar is
+    ///    visible on a machine that has ever opened the explorer and hidden
+    ///    on a fresh checkout or CI runner — a whole `SIDEBAR_WIDTH` of
+    ///    column shift. `new_for_test` pins it to in-memory defaults.
+    /// 2. Frame 1 is painted with quadraui's generic 20-column
+    ///    `default_sidebar_width`, which the end-of-dispatch
+    ///    `set_sidebar_width` sync in `handle()` corrects on the *first event
+    ///    of any kind* — so a column measured off frame 1 is stale from
+    ///    frame 2 onwards, and the Ctrl+L press below would be blamed for the
+    ///    settle. The `Escape` settles it first (same fix as
+    ///    `tui_editor_text_drag_paints_a_selection_through_the_shared_drag_router`);
+    ///    the `i` after it puts the buffer back in Insert mode, which is what
+    ///    makes a fall-through Ctrl+L observable as an edit.
     #[test]
     fn ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.buffer_mut().insert(0, "ZQXW762CTRLL");
-        app.engine.mode = crate::core::Mode::Insert;
         let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+
+        // Settle the sidebar width, then enter Insert mode — in that order,
+        // so nothing but the Ctrl+L under test can move the marker.
+        driver.press_named(quadraui::NamedKey::Escape);
+        press_with(
+            &mut driver,
+            quadraui::Key::Char('i'),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen().contains("INSERT"),
+            "setup sanity: the buffer must be in Insert mode, so a Ctrl+L that \
+             reached the engine would type; screen:\n{}",
+            driver.screen()
+        );
 
         let before = driver
             .find_bounds("ZQXW762CTRLL")
