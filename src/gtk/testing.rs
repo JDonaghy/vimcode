@@ -7263,4 +7263,119 @@ mod slice7_closing_rungs {
     // `ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app` and, for
     // GTK's own key spelling, by
     // `render::slice7_router_tests::ctrl_l_is_a_force_redraw_from_either_backends_spelling`.
+
+    /// #762: `render::post_key_epilogue`'s sidebar-autohide behaviour, wired
+    /// into GTK for the first time by `run_post_key_epilogue`. Before this
+    /// PR `autohide_panels` never fired on GTK when focus returned to the
+    /// editor, so a sidebar panel opened via the activity bar (or a stale
+    /// session) stayed pinned open forever.
+    ///
+    /// Asserts on a unique marker painted by the explorer's in-progress
+    /// rename field (the same technique
+    /// `focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk` uses),
+    /// never on `app_shell.sidebar_visible()` directly — `CLAUDE.md` rule 1.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `run_post_key_epilogue`
+    /// calling only `advance_macro_playback` + the nav-overflow arm (no
+    /// `render::post_key_epilogue` call at all), the marker is still painted
+    /// after the keypress and the final assertion fires.
+    #[test]
+    fn sidebar_autohides_when_focus_returns_to_the_editor_on_gtk() {
+        use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.explorer_rebuild_rows();
+        engine.explorer_tree.borrow_mut().start_editing(
+            vec![0u16],
+            "ZQXWAUTOHIDE757".to_string(),
+            "ZQXWAUTOHIDE757".len(),
+            None,
+            None,
+        );
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        engine.session.explorer_visible = true;
+        engine.settings.autohide_panels = true;
+        // No `*_has_focus` flag is set: the sidebar is merely visible, and
+        // keyboard focus is the editor — exactly the state a user is in
+        // after clicking back into a buffer with the explorer left open.
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("ZQXWAUTOHIDE757"),
+            "precondition: the sidebar starts open with the explorer visible; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Any key that falls through to `Engine::handle_key` drains the
+        // post-key epilogue.
+        press(&mut h.driver, Key::Char('l'), Modifiers::default());
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("ZQXWAUTOHIDE757"),
+            "autohide_panels must close the sidebar once a key reaches the \
+             editor with no panel focused; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #762: the other half of `PostKeyEpilogue` new to GTK — Ctrl-W h/l
+    /// overflowing left with **no** sidebar panel visible must put keyboard
+    /// focus on the activity bar, not silently go nowhere. GTK's overflow
+    /// arm used to call `focus_sidebar_panel` unconditionally, so with the
+    /// sidebar hidden the keypress had no panel to focus and was dropped.
+    ///
+    /// Drives it end to end rather than reading `engine.activity_bar_focused`
+    /// after the first key (`CLAUDE.md` rule 1): a second keypress, `x`
+    /// (delete-char-under-cursor in Normal mode), is bound to nothing in
+    /// `render::activity_bar_key_action` — so it is silently swallowed if
+    /// the activity bar actually holds keyboard focus, and only reaches
+    /// `Engine::handle_key` (deleting a character) if focus never moved
+    /// there. This avoids depending on the *separate* runner ↔ shadow
+    /// visibility sync `ActivityBarKeyAction::Activate` would additionally
+    /// need to actually reveal a panel — orthogonal to the rung this test
+    /// covers.
+    ///
+    /// **Verified RED against unfixed `develop`:** removing
+    /// `PostKeyEpilogue::focus_activity_bar` (and its handling in
+    /// `run_post_key_epilogue`) leaves `activity_bar_focused` false after the
+    /// first keypress, so `x` falls through to `Engine::handle_key`, deletes
+    /// the `f` of `fn`, and the final assertion fires.
+    #[test]
+    fn ctrl_w_overflow_focuses_the_activity_bar_when_no_sidebar_is_open_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.app_shell.hide_sidebar();
+        engine.session.explorer_visible = false;
+        // Simulate Ctrl-W h having just overflowed left with no adjacent
+        // editor group — the signal `Engine::focus_window_direction` leaves
+        // for the backend to consume in its post-key epilogue.
+        engine.window_nav_overflow = Some(false);
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // Drain the epilogue that resolves the overflow signal.
+        press(&mut h.driver, Key::Char('l'), Modifiers::default());
+        h.driver.render();
+
+        // Reveal: `x` must be swallowed by the (unbound) activity-bar action
+        // table rather than deleting a character.
+        press(&mut h.driver, Key::Char('x'), Modifiers::default());
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("fn main() {}"),
+            "Ctrl-W overflow with no sidebar visible must focus the activity \
+             bar so a subsequent key is not spent editing the buffer; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
