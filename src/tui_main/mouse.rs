@@ -917,8 +917,12 @@ pub(super) fn handle_mouse(
                     }
                 }
                 render::MouseDragRoute::CommandLine => {
+                    // #194: mirror the anchor fix above — the selection end
+                    // must be `editor_left`-relative too, or the drag anchor
+                    // and the live end drift apart by that same offset as
+                    // soon as the pointer moves.
                     if let Some(ref mut sel) = *cmd_sel {
-                        sel.1 = col as usize;
+                        sel.1 = col.saturating_sub(editor_left) as usize;
                     }
                 }
                 render::MouseDragRoute::Divider => {
@@ -1615,7 +1619,18 @@ pub(super) fn handle_mouse(
     }
 
     // ── Command line click — start text selection ──────────────────────────────
-    // Skip when click is in the activity bar column (settings button lives there).
+    // Skip when click is in the activity bar / sidebar columns — the command
+    // line (`chrome.cmd`, painted by `render_command_line`) only spans
+    // `main_content_bounds`, i.e. starts at `editor_left`, not `ab_width`.
+    // Gating on `ab_width` alone (pre-#194) let clicks over the sidebar's
+    // portion of the bottom row fall through here, and `char_idx = col`
+    // stored an *absolute* screen column while `render_command_line` indexes
+    // its cell vector from 0 at `area.x == editor_left` — the mismatch is
+    // exactly `editor_left` columns, so the rendered selection highlight
+    // walked off by the activity-bar+sidebar width whenever the sidebar was
+    // visible (#194). Both anchor and guard now use `editor_left`, matching
+    // the `rel_col = col - editor_left` convention used elsewhere in this
+    // file for the same row.
     //
     // #752 verdict, recorded rather than converged: this rung stays one-sided.
     // Sharing it would mean *adding* a command-line text-selection
@@ -1629,10 +1644,10 @@ pub(super) fn handle_mouse(
     {
         use crate::core::Mode;
         if row + 1 == term_height
-            && col >= ab_width
+            && col >= editor_left
             && matches!(engine.mode, Mode::Command | Mode::Search)
         {
-            let char_idx = col as usize;
+            let char_idx = (col - editor_left) as usize;
             let buf_len = engine.command_buffer.chars().count();
             engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
             *cmd_sel = Some((char_idx, char_idx));
@@ -1641,14 +1656,14 @@ pub(super) fn handle_mouse(
         }
         // Also allow selection on the message/command line in Normal mode.
         if row + 1 == term_height
-            && col >= ab_width
+            && col >= editor_left
             && matches!(
                 engine.mode,
                 Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
             )
             && !engine.message.is_empty()
         {
-            let char_idx = col as usize;
+            let char_idx = (col - editor_left) as usize;
             *cmd_sel = Some((char_idx, char_idx));
             *cmd_dragging = true;
             debug_log!(
@@ -3219,6 +3234,120 @@ mod tests {
             None,
             None,
             None,
+        );
+    }
+
+    /// Build a hermetic engine with the sidebar visible and no split — just
+    /// enough to give `handle_mouse` a non-zero `editor_left` for the
+    /// message-row selection tests below, without the extra vertical-split
+    /// machinery `split_engine_with_sidebar_and_menu` carries for the
+    /// divider tests.
+    fn engine_with_sidebar_visible() -> Engine {
+        let mut e = Engine::new();
+        e.settings = crate::core::settings::Settings::default();
+        e.mode = crate::core::Mode::Normal;
+        if !e.app_shell.sidebar_visible() {
+            e.toggle_sidebar();
+        }
+        e
+    }
+
+    /// Like `dispatch_left_click`, but exposes `cmd_sel`/`cmd_dragging` as
+    /// out-params instead of discarding them — needed to assert on the
+    /// command-line/message selection anchor #194 fixes.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_left_click_for_cmd_sel(
+        engine: &mut Engine,
+        col: u16,
+        row: u16,
+        cmd_sel: &mut Option<(usize, usize)>,
+        cmd_dragging: &mut bool,
+    ) {
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut sidebar = TuiSidebar::new();
+        let mut drag_state = quadraui::DragState::default();
+        let mut modal_stack = quadraui::ModalStack::new();
+        let mut last_click_time = Instant::now();
+        let mut last_click_pos: (u16, u16) = (0, 0);
+        let mut should_quit = false;
+
+        handle_mouse(
+            ev,
+            &mut sidebar,
+            engine,
+            &Some(Size {
+                width: 120,
+                height: 40,
+            }),
+            SIDEBAR_WIDTH,
+            &mut false,
+            &mut false,
+            &mut false,
+            &mut None,
+            &mut drag_state,
+            &mut modal_stack,
+            None,
+            &mut last_click_time,
+            &mut last_click_pos,
+            &mut None,
+            cmd_sel,
+            cmd_dragging,
+            &mut should_quit,
+            &mut None,
+            &mut None,
+            &mut render::TabDragState::default(),
+            &[],
+            None,
+            None,
+            &[],
+            None,
+            &mut false,
+            &mut false,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// #194: clicking on the status/command-line row where `engine.message`
+    /// is displayed must anchor `cmd_sel` at the column *relative to
+    /// `editor_left`* — where `render_command_line` starts indexing its cell
+    /// vector (`chrome.cmd.x == main_content_bounds.x == editor_left`) — not
+    /// the raw absolute screen column. Before the fix `char_idx = col`
+    /// stored the absolute column while the paint side indexed from 0 at
+    /// `editor_left`, so with the sidebar (30 cols) + activity bar (3 cols)
+    /// visible, the rendered selection highlight walked off by exactly that
+    /// 34-column offset from where the mouse actually dragged.
+    #[test]
+    fn message_row_click_anchors_selection_relative_to_editor_left() {
+        let mut engine = engine_with_sidebar_visible();
+        engine.message = "Use :%s/old/new/g for find & replace".to_string();
+        let mut cmd_sel = None;
+        let mut cmd_dragging = false;
+        let editor_left = ACTIVITY_BAR_WIDTH + SIDEBAR_WIDTH + 1;
+        let click_col = editor_left + 5; // 5th character of the message text
+        dispatch_left_click_for_cmd_sel(
+            &mut engine,
+            click_col,
+            39, // term_height (40) - 1, the message/command-line row
+            &mut cmd_sel,
+            &mut cmd_dragging,
+        );
+        assert_eq!(
+            cmd_sel,
+            Some((5, 5)),
+            "selection anchor must be editor_left-relative (5), not the raw \
+             absolute screen column ({click_col})"
+        );
+        assert!(
+            cmd_dragging,
+            "click on the message row must arm cmd_dragging"
         );
     }
 
