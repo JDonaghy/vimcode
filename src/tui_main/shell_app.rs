@@ -516,7 +516,7 @@ impl TuiShellApp {
     /// `tui_main::run()` currently does before entering raw mode
     /// (`mod.rs:641`-`:678`) — none of it needs a terminal or backend.
     pub fn new(file_path: Option<PathBuf>) -> Self {
-        Self::from_engine(Engine::new(), file_path)
+        Self::from_engine(Engine::new(), file_path, true)
     }
 
     /// Test-only deterministic twin of [`TuiShellApp::new`].
@@ -534,24 +534,46 @@ impl TuiShellApp {
     ///    fresh checkout or CI runner boots it *hidden*, shifting every
     ///    editor column by `SIDEBAR_WIDTH`.
     /// 2. `Engine::startup(None)` then calls `restore_session_files()`, which
-    ///    reopens whatever files/splits that same ambient `session.json`
-    ///    happens to list — so even the number of editor *windows* is
-    ///    machine-dependent.
+    ///    reopens whatever files/splits are listed in the *per-workspace*
+    ///    session file for the process's `current_dir()` — so even the number
+    ///    of editor *windows* is machine-dependent.
     ///
     /// Any test that measures painted editor geometry (`find_bounds` on a
     /// fixture line, `style_at` on a specific column) must therefore build the
     /// app from in-memory defaults instead of inheriting the developer's box.
-    /// `Engine::new_for_test()` is the engine-level half of exactly this; this
-    /// is the shell-level half, and it runs the *same* `from_engine` body as
-    /// the production constructor so the two cannot drift.
+    ///
+    /// Both halves need an explicit fix, and swapping the engine constructor
+    /// alone only fixes (1):
+    ///
+    /// * (1) is `Engine::new_for_test()`, which substitutes in-memory
+    ///   `Settings::default()` / `SessionState::default()` for the two global
+    ///   config reads.
+    /// * (2) is **not** covered by that. `restore_session_files()` performs its
+    ///   own independent `SessionState::load_for_workspace(&self.cwd)` disk
+    ///   read, keyed on `current_dir()` rather than on whatever state the
+    ///   engine was built from, and unlike its `save_for_workspace` counterpart
+    ///   it has no `cfg(test)` stub (some tests legitimately assert a written
+    ///   workspace session *is* restored). Running the test binary from a
+    ///   checkout that has a real `~/.config/vimcode/sessions/<hash>.json` —
+    ///   entirely plausible for a self-hosting editor — would therefore restore
+    ///   that session's files and splits, pushing `windows.len()` past 1. So
+    ///   this constructor routes through
+    ///   [`Engine::startup_without_session_restore`] instead.
+    ///
+    /// Everything else runs the *same* `from_engine` body as the production
+    /// constructor, so the two cannot drift.
     #[cfg(test)]
     pub fn new_for_test() -> Self {
-        Self::from_engine(Engine::new_for_test(), None)
+        Self::from_engine(Engine::new_for_test(), None, false)
     }
 
     /// Shared body of [`TuiShellApp::new`] and [`TuiShellApp::new_for_test`] —
     /// everything except *where the engine's initial state came from*.
-    fn from_engine(mut engine: Engine, file_path: Option<PathBuf>) -> Self {
+    ///
+    /// `restore_session` is `true` for the production constructor and `false`
+    /// for [`TuiShellApp::new_for_test`]; see that method for why skipping the
+    /// per-workspace session restore is required for determinism.
+    fn from_engine(mut engine: Engine, file_path: Option<PathBuf>, restore_session: bool) -> Self {
         let msv_metrics = quadraui::MsvLayoutMetrics {
             header_size: 1.0,
             divider_size: 0.0,
@@ -577,7 +599,11 @@ impl TuiShellApp {
             engine.settings.use_nerd_fonts = false;
         }
         icons::set_nerd_fonts(engine.settings.use_nerd_fonts);
-        engine.startup(file_path.as_deref());
+        if restore_session {
+            engine.startup(file_path.as_deref());
+        } else {
+            engine.startup_without_session_restore(file_path.as_deref());
+        }
         setup_tui_clipboard(&mut engine);
 
         let pending_startup_msg = if nerd_font_missing {
