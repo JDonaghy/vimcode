@@ -3859,42 +3859,15 @@ fn handle_key_pressed(
         render::AltKeyOutcome::Fallthrough => {}
     }
 
-    // ── Pre-load the system clipboard for paste keys (mirrors
-    // mod.rs:2609-:2615) ─────────────────────────────────────────────────
-    // `p`/`P` in normal/visual, Ctrl+V in VSCode mode. Detection and
-    // register loading are shared engine methods (#381).
-    if engine.needs_clipboard_for_paste(&key_name, unicode, ctrl) {
-        let text = engine.clipboard_read.as_ref().and_then(|cb| cb().ok());
-        engine.prepare_paste_clipboard(text);
-    }
-
-    // ── Ctrl+Shift+V: paste the system clipboard into the buffer (mirrors
-    // mod.rs:2617-:2660) ─────────────────────────────────────────────────
-    // With keyboard enhancement this event reaches the app instead of being
-    // eaten by the terminal emulator. In Vim mode, load the clipboard into
-    // the registers and replay `p`; in insert mode, insert the text.
-    if ctrl && key_name == "V" && !engine.is_vscode_mode() {
-        use crate::core::Mode;
-        if let Some(ref cb_read) = engine.clipboard_read {
-            if let Ok(text) = cb_read() {
-                if !text.is_empty() {
-                    engine.load_clipboard_for_paste(text);
-                    match engine.mode {
-                        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-                            engine.handle_key("", Some('p'), false);
-                        }
-                        Mode::Insert | Mode::Replace => {
-                            if let Some((content, _)) = engine.get_register_content('"') {
-                                for ch in content.chars() {
-                                    engine.handle_key(&ch.to_string(), Some(ch), false);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+    // ── Shared clipboard-paste pre-load / Ctrl+Shift+V rung (#760 / #734
+    // slice 5) ───────────────────────────────────────────────────────────
+    // `render::preload_paste_clipboard` / `render::route_ctrl_shift_v_paste`
+    // state both tiers once for both backends — see the rung's header
+    // comment above `preload_paste_clipboard` in `render.rs` for the full
+    // divergence this replaced (TUI used to hand-roll Ctrl+Shift+V instead of
+    // reaching `Engine::route_paste` like every other paste destination).
+    render::preload_paste_clipboard(engine, &key_name, unicode, ctrl);
+    if render::route_ctrl_shift_v_paste(engine, &key_name, ctrl) {
         return Reaction::Redraw;
     }
 
@@ -8486,6 +8459,43 @@ mod tests {
         assert!(
             driver.screen_contains("ZQXW_PASTE_MARKER"),
             "UiEvent::ClipboardPaste must route through Engine::route_paste; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #760 / #734 slice 5: Ctrl+Shift+V used to hand-roll its own paste path
+    /// (read the clipboard, `load_clipboard_for_paste`, then either replay
+    /// `p` or splice characters into insert mode) instead of calling
+    /// `Engine::route_paste` the way plain Ctrl+V and bracketed paste
+    /// (`bracketed_paste_reaches_the_buffer_via_shell_app` above) already do.
+    /// That hand-rolled path only matched `Mode::{Normal,Visual,VisualLine,
+    /// VisualBlock,Insert,Replace}` — `Mode::Command` fell into its `_ => {}`
+    /// arm, so Ctrl+Shift+V while typing a `:command` silently did nothing
+    /// but still consumed the keypress. `route_paste`'s `Mode::Command |
+    /// Mode::Search` arm pastes into the command-line buffer instead, so this
+    /// is RED against the pre-#760 code: the command line stays empty there.
+    #[test]
+    fn ctrl_shift_v_pastes_into_the_command_line_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.mode = crate::core::Mode::Command;
+        app.engine.clipboard_read = Some(Box::new(|| Ok("ZQXW_SHIFT_PASTE_MARKER".to_string())));
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('V'),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        driver.render();
+
+        assert!(
+            driver.screen_contains(":ZQXW_SHIFT_PASTE_MARKER"),
+            "Ctrl+Shift+V must route through Engine::route_paste into the \
+             command line; screen:\n{}",
             driver.screen()
         );
     }
