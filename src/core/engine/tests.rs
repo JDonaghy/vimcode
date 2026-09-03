@@ -8397,7 +8397,15 @@ fn test_lsp_flush_clears_diagnostics_by_canonical_path() {
     let canonical = abs_path.canonicalize().unwrap();
 
     // Open the file via a relative path so state.file_path != canonical.
-    let prev_cwd = std::env::current_dir().ok();
+    //
+    // That needs the process working directory, which is shared by the whole
+    // test binary, so this is a CWD *writer* and takes the same guard the
+    // `open_folder` tests do (#785). Without it this test both leaks its
+    // temp directory into every later test and — reproducibly, 15 runs out
+    // of 15 when raced against `test_open_folder_resets_cwd` — fails itself
+    // on `canonical_path`, because the relative path resolved against
+    // whichever directory the *other* test had chdir'd to.
+    let _cwd = CwdGuard::new();
     std::env::set_current_dir(&dir).unwrap();
     let rel_path = PathBuf::from("file.rs");
     assert_ne!(
@@ -8462,9 +8470,8 @@ fn test_lsp_flush_clears_diagnostics_by_canonical_path() {
          not the original file_path key (#208)",
     );
 
-    if let Some(cwd) = prev_cwd {
-        let _ = std::env::set_current_dir(cwd);
-    }
+    // The working directory goes back when `_cwd` drops, which also happens
+    // on a panicking assert above — hence no manual restore here.
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -13807,43 +13814,30 @@ fn test_dap_var_ref_at_flat_index_with_scope_groups() {
 
 // ── Workspace / open-folder tests ─────────────────────────────────────────
 
-/// Restores the **process** working directory on drop.
+/// Exclusive claim on the **process** working directory, restored on drop.
 ///
 /// `Engine::open_folder` / `open_workspace` deliberately call
 /// `std::env::set_current_dir` (see `buffers.rs`) — that is production
 /// behaviour, not a bug. But the process CWD is one of the few pieces of
 /// genuinely global state a `#[cfg(test)]` run has, and `cargo test` runs
-/// every test in the same process: leaving it pointing at
-/// `$TMPDIR/vimcode_test_*` leaks into every test that starts afterwards, on
-/// any thread.
+/// every test in the same process, on many threads at once.
 ///
 /// That is not hypothetical (#785). The GTK harness paints a real file
-/// explorer whose root row is the process CWD, so with the directory leaked
+/// explorer whose root row is the process CWD, so with the directory moved
 /// the sidebar renders `VIMCODE_TEST_OPEN_FOLDER` and an empty tree instead
-/// of the repo's name and file list. `vscode_dimming`'s breadcrumb probe
-/// reads pixels out of the frame next to it, and the change of chrome
-/// content moved what landed under its probe — a failure that reproduced
-/// only when the scheduler happened to run the two in the wrong order, i.e.
-/// as an intermittent, load-dependent red on an unrelated PR.
+/// of the repo's name and file list — a different frame around whatever
+/// pixels the test next to it was probing.
 ///
-/// Restoring on `Drop` rather than at the end of the test body means a
-/// panicking assertion can't skip the cleanup and turn one red test into
-/// many.
-struct CwdGuard(Option<std::path::PathBuf>);
-
-impl CwdGuard {
-    fn new() -> Self {
-        Self(std::env::current_dir().ok())
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        if let Some(dir) = self.0.take() {
-            let _ = std::env::set_current_dir(dir);
-        }
-    }
-}
+/// The first #785 round made this guard restore-on-`Drop`, which closed the
+/// *leak* (tests starting after a writer finished) but not the *overlap*
+/// (tests running while it holds the directory) — the same bug, reached by a
+/// different scheduling order, and the one that took
+/// `tab_hover_tooltip_paints_below_tab_row_not_inside_it` red. It now also
+/// takes [`crate::test_cwd::CWD_LOCK`] exclusively, which the GTK harness
+/// holds shared for its whole lifetime, so a writer and a painting harness
+/// can no longer overlap at all. See `src/test_cwd.rs` for the mechanism and
+/// its one rule (never take both on one thread).
+use crate::test_cwd::CwdGuard;
 
 #[test]
 fn test_open_folder_resets_cwd() {

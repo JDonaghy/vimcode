@@ -183,6 +183,26 @@ pub struct Harness<A: AppLogic> {
     /// with no display / no user to click it) to observe *that* a present
     /// was queued without running the blocking call itself.
     pub pending_native_dialog: Rc<Cell<Option<quadraui::MessageDialogOptions>>>,
+    /// Shared claim on the process working directory, held for as long as
+    /// this harness can paint (#785).
+    ///
+    /// Frames painted here are CWD-dependent whether the test knows it or
+    /// not: `Engine` roots the file explorer at `std::env::current_dir()`,
+    /// and `ext_panel` shows paths relative to it. Meanwhile
+    /// `Engine::open_folder` chdirs the *process* by design, and `cargo
+    /// test` runs every test in one process across many threads — so a
+    /// workspace test on another thread can swap the sidebar's entire
+    /// contents out from under a pixel probe here, mid-test. That is what
+    /// took `tab_hover_tooltip_paints_below_tab_row_not_inside_it` red: two
+    /// frames it compares for equality were painted either side of another
+    /// test's `chdir`.
+    ///
+    /// This guard makes the two mutually exclusive. It is private and
+    /// deliberately unnamed by any test — construct a harness through
+    /// [`harness`] and the protection comes with it. See `src/test_cwd.rs`
+    /// for the mechanism, including the "never take a `CwdGuard` on a thread
+    /// holding a harness" rule.
+    _cwd: crate::test_cwd::CwdReadGuard,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -390,6 +410,10 @@ impl<A: AppLogic> Harness<A> {
 /// buffers, tabs and groups it asserts on — no `Engine::startup`, hence no
 /// dependence on the developer's real session (see [`App::new_headless`]).
 pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic> {
+    // Taken *before* the first frame is painted (`driver_with_shell` paints
+    // one immediately) and released only when the harness drops — see
+    // `Harness::_cwd` (#785).
+    let cwd = crate::test_cwd::CwdReadGuard::acquire();
     let engine = Rc::new(RefCell::new(engine));
     let app = App::new_headless(Rc::clone(&engine));
     let config = super::build_shell_config(&app);
@@ -440,6 +464,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         context_menu_layout,
         native_dialog_shown,
         pending_native_dialog,
+        _cwd: cwd,
     }
 }
 
@@ -452,6 +477,43 @@ mod tests {
     use super::*;
     use crate::core::window::SplitDirection;
     use quadraui::{Point, ScrollDelta, UiEvent};
+
+    /// A live harness must hold the process-CWD claim for its whole
+    /// lifetime, so no `chdir`-ing test on another thread can repaint its
+    /// sidebar mid-probe (#785).
+    ///
+    /// Asserted on the lock rather than by racing threads — a timing test
+    /// for a timing bug is just a second flake. RED-first: delete the `_cwd`
+    /// field from `Harness` (the state this branch's Test-stage failure was
+    /// reported against) and `try_write` succeeds here, failing the first
+    /// assertion.
+    #[test]
+    fn harness_holds_the_cwd_claim_while_it_can_paint() {
+        let h = harness(Engine::new(), 800, 600);
+        assert!(
+            crate::test_cwd::CWD_LOCK.try_write().is_err(),
+            "a live harness must exclude CwdGuard — every frame it paints \
+             roots the file explorer at the process CWD (#785)"
+        );
+
+        // Two at once is a normal pattern here (compare frame A with frame
+        // B); the claim must be reentrant rather than deadlocking, and must
+        // survive the inner one dropping.
+        let inner = harness(Engine::new(), 800, 600);
+        drop(inner);
+        assert!(
+            crate::test_cwd::CWD_LOCK.try_write().is_err(),
+            "dropping one of two live harnesses must not release the claim"
+        );
+        drop(h);
+
+        // Deliberately no "and now it is released" assertion: another
+        // thread's harness may legitimately hold the shared claim at any
+        // moment, so `try_write().is_ok()` here would itself be a flake. A
+        // claim that were never released would instead hang every workspace
+        // test in the suite — impossible to miss, and not something an
+        // assertion has to catch.
+    }
 
     /// Buffer long enough that a viewport scroll cannot be clamped away.
     fn engine_with_long_buffer() -> Engine {
