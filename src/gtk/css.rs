@@ -1,7 +1,7 @@
 use super::*;
 
 /// Generate the full CSS string with colors taken from the active theme.
-pub(super) fn make_theme_css(theme: &Theme) -> String {
+pub(crate) fn make_theme_css(theme: &Theme) -> String {
     let bar_bg = theme.tab_bar_bg.to_hex();
     // For light themes, use foreground color for active icons (status_fg is white).
     let bar_fg = if theme.is_light() {
@@ -295,7 +295,7 @@ pub(super) fn make_theme_css(theme: &Theme) -> String {
 
 /// Static structural CSS that never changes with the theme.
 /// Theme-specific colours live in `make_theme_css()` and are appended after this.
-pub(super) const STATIC_CSS: &str = "
+pub(crate) const STATIC_CSS: &str = "
         /* Custom titlebar — matches status bar color.
            CSD provides edge resize handles; WindowHandle enables drag-to-move. */
         .custom-titlebar {
@@ -493,7 +493,7 @@ pub(super) const STATIC_CSS: &str = "
         }
         ";
 
-pub(super) fn load_css(theme: &Theme) -> gtk4::CssProvider {
+pub(crate) fn load_css(theme: &Theme) -> gtk4::CssProvider {
     let provider = gtk4::CssProvider::new();
     let combined = format!("{STATIC_CSS}\n{}", make_theme_css(theme));
     provider.load_from_data(&combined);

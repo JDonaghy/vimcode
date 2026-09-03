@@ -1,7 +1,7 @@
 use super::*;
 
 /// Open a URL in the default browser (only https/http).
-pub(super) fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
     crate::core::engine::open_url_in_browser(url);
 }
 
@@ -9,7 +9,7 @@ pub(super) fn open_url(url: &str) {
 /// GTK/Pango can resolve the Nerd Font glyphs without a user-installed Nerd Font.
 /// The font file is embedded in the binary via `include_bytes!` and only written
 /// to disk if it's missing or has the wrong size.
-pub(super) fn install_bundled_icon_font() {
+pub(crate) fn install_bundled_icon_font() {
     static FONT_BYTES: &[u8] = include_bytes!("../../data/fonts/vimcode-icons.ttf");
 
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -76,7 +76,7 @@ const APP_ICON_RASTER_PX: u32 = 64;
 /// `Unsupported` and paints nothing (the icon's `fallback_text` is empty by
 /// design — see [`crate::render::app_icon_image`]), which is the same visible
 /// outcome as skipping the call, but keeps the "why" in one place.
-pub(super) fn app_icon_image() -> quadraui::Image {
+pub(crate) fn app_icon_image() -> quadraui::Image {
     match cached_app_icon_png() {
         Some(png) => quadraui::Image {
             source: quadraui::ImageSource::Bytes(png),

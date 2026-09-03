@@ -34,6 +34,17 @@ pub mod tui_main;
 #[cfg(feature = "gui")]
 pub mod gtk;
 
+/// `struct App` — the editor shell application, hoisted out of
+/// `src/gtk/mod.rs` by #785 (stage 1 of #47) so a second native backend can
+/// reuse it instead of re-implementing ~6,900 lines of portable shell logic.
+///
+/// Still `gui`-gated: `App` retains four platform-typed fields, ~11 platform
+/// hook call sites and a dependency on `crate::gtk::{click, css, util}`. The
+/// module doc in `src/app.rs` enumerates all three so the next stage does not
+/// have to re-derive them.
+#[cfg(feature = "gui")]
+pub mod app;
+
 // Re-export quadraui so integration tests + downstream consumers pin to the
 // same version vimcode is built against.
 pub use quadraui;

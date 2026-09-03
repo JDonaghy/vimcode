@@ -115,6 +115,19 @@ shared engine grew *more* than projected. Where the reduction actually came from
 `gtk/mod.rs` alone is 78% of the cut. Notably `tui_main/mouse.rs` — the file #733
 was sized against at −3,000…−3,500 — lost **316 lines**.
 
+> **#785 (stage 1 of #47) moved the mass, it did not delete it.** `struct App`,
+> its `impl` blocks and `impl quadraui::ShellApp for App` were hoisted verbatim
+> out of `src/gtk/mod.rs` into a new top-level `src/app.rs`. `src/gtk/`
+> therefore reads **2,584** against the 9,650 column above and `src/app.rs`
+> reads 7,131 — but the *total* is unchanged (+65, all of it module doc and
+> re-stated imports). Nothing here got smaller; a ~6,900-line block that was
+> filed under "GTK backend" is now filed under "shell application", where a
+> second native backend can reach it. `src/app.rs` is still `gui`-gated: its
+> module doc enumerates the four platform-typed fields, ~11 platform hook call
+> sites and the `crate::gtk::{click, css, util}` dependency that have to go
+> before the gate can. Read the backend columns above as *pre-#785* until they
+> are regenerated.
+
 > **Correcting the record.** The figure this file previously carried as
 > "`src/gtk/` = 12,588 at 2026-09-01" was measured *before* #727/#728/#730 landed;
 > it matches the pre-chain 08-31 column above, not the 09-01 tree. The 05-01 and
