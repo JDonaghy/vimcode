@@ -2197,34 +2197,28 @@ impl ShellApp for TuiShellApp {
         // bare `return`s) is what keeps the title-bar sync that follows
         // reachable on *every* one of them, including any arm added later.
         let reaction = 'dispatch: {
-            // ── Panel-key accelerators (mirrors `mod.rs:1259`-`:1273`) ──────────
-            // Mouse-affecting accelerators (none today) would need gap (2)
-            // first; the current set (`dispatch_panel_accelerator`) only
-            // touches `engine`/`sidebar`, so it's fully portable as-is except
-            // for its `terminal: &Terminal<...>` parameter, which every arm
-            // uses only for `.size()` — satisfied here by `backend.viewport()`,
-            // threading both `width` and `height` through (the
-            // `ACC_TERMINAL_TOGGLE_MAX` arm needs both — see
-            // `dispatch_panel_accelerator_sizeless`'s doc comment).
+            // ── Panel-key accelerators (shared with GTK — #761 / #734 slice 6) ──
+            // `render::dispatch_panel_accelerator` needs a screen size for its
+            // `TerminalToggleMax`/`OpenTerminal` hooks (`TuiAccelHost` below);
+            // `backend.viewport()` is this backend's source for it.
             if let UiEvent::Accelerator(ref acc_id, acc_mods) = event {
                 if self.engine.dialog.is_none() {
                     let viewport = backend.viewport();
-                    let mut needs_redraw = false;
-                    if dispatch_panel_accelerator_sizeless(
+                    let mut host = TuiAccelHost {
+                        sidebar: &mut self.sidebar,
+                        screen_w: viewport.width as u16,
+                        screen_h: viewport.height as u16,
+                        sidebar_width: self.sidebar_width,
+                        mods: acc_mods,
+                    };
+                    if render::dispatch_panel_accelerator(
                         acc_id.as_str(),
-                        acc_mods,
                         &mut self.engine,
-                        &mut self.sidebar,
-                        viewport.width as u16,
-                        viewport.height as u16,
-                        self.sidebar_width,
-                        &mut needs_redraw,
-                    ) {
-                        break 'dispatch if needs_redraw {
-                            Reaction::Redraw
-                        } else {
-                            Reaction::Continue
-                        };
+                        &mut host,
+                    )
+                    .is_some()
+                    {
+                        break 'dispatch Reaction::Redraw;
                     }
                 }
             }
@@ -2476,7 +2470,7 @@ impl ShellApp for TuiShellApp {
         // computed by the shell runner from the *real*, `ShellAdapter`-owned
         // `AppShell` — not from anything on `self` — so toggling
         // `engine.menu_bar_visible` (the Alt+menu-letter shim above,
-        // `dispatch_panel_accelerator_sizeless`, `:set menu`, ...) has no
+        // `render::dispatch_panel_accelerator`, `:set menu`, ...) has no
         // effect on the painted layout unless it's also pushed through
         // `ShellContext::shell_mut()`. Doing this unconditionally — rather
         // than only in the specific arms that change the flag — is what
@@ -2512,7 +2506,7 @@ impl ShellApp for TuiShellApp {
         // owns the width that carves `main_content_bounds` (and therefore
         // everything `render_content` paints), while `self.sidebar_width` is
         // what `mouse::handle_mouse`'s column math, `tick`'s viewport
-        // approximation and `dispatch_panel_accelerator_sizeless` all read.
+        // approximation and `TuiAccelHost` all read.
         // `event_loop` had one variable for both. Without this push, Alt+Left
         // / Alt+Right and a sidebar-divider drag would move vimcode's copy
         // and leave the painted layout unchanged, so hit tests would land a
@@ -2999,136 +2993,76 @@ impl ShellApp for TuiShellApp {
     }
 }
 
-/// [`dispatch_panel_accelerator`] minus the `terminal: &Terminal<...>`
-/// parameter, replaced with plain `screen_w: u16` / `screen_h: u16` —
-/// every call site in the original only used `terminal` for `.size()`,
-/// which returns both dimensions (`ACC_TERMINAL_TOGGLE_MAX` needs both:
-/// `screen_w` for `terminal_cols`, `screen_h` for
-/// `terminal_target_maximize_rows_tui`'s `screen_h` parameter — see
-/// `mod.rs:225`-`:239`). Kept as a separate wrapper (rather than changing
-/// the original's signature) so the still-live `event_loop()` call site is
-/// untouched; the next stage that actually deletes `event_loop()` should
-/// collapse these back into one function.
-///
-#[allow(clippy::too_many_arguments)]
-fn dispatch_panel_accelerator_sizeless(
-    id: &str,
-    mods: quadraui::Modifiers,
-    engine: &mut Engine,
-    sidebar: &mut TuiSidebar,
+/// [`render::PanelAcceleratorHost`] impl for TUI: the five hooks that need
+/// TUI-local state — `TuiSidebar::has_focus` (the single input-focus token a
+/// terminal has to track by hand where GTK gets real widget focus from the
+/// toolkit) and the screen-size-derived terminal column/row counts GTK's
+/// stubbed `terminal_cols`/`terminal_target_maximize_rows` (#731) don't need.
+/// See the rung's header comment in `render.rs` for why these five can't
+/// share a body with GTK's [`crate::gtk`] equivalent.
+struct TuiAccelHost<'a> {
+    sidebar: &'a mut TuiSidebar,
     screen_w: u16,
     screen_h: u16,
     sidebar_width: u16,
-    needs_redraw: &mut bool,
-) -> bool {
-    match id {
-        ACC_TOGGLE_SIDEBAR => {
-            engine.toggle_sidebar();
-            if !engine.app_shell.sidebar_visible() {
-                sidebar.has_focus = false;
-            }
-            *needs_redraw = true;
-            true
+    mods: quadraui::Modifiers,
+}
+
+impl render::PanelAcceleratorHost for TuiAccelHost<'_> {
+    fn toggle_sidebar(&mut self, engine: &mut Engine) {
+        engine.toggle_sidebar();
+        if !engine.app_shell.sidebar_visible() {
+            self.sidebar.has_focus = false;
         }
-        ACC_FOCUS_EXPLORER => {
-            if sidebar.has_focus && engine.explorer_has_focus {
-                sidebar.has_focus = false;
-                engine.clear_sidebar_focus();
+    }
+
+    fn focus_explorer(&mut self, engine: &mut Engine) {
+        if self.sidebar.has_focus && engine.explorer_has_focus {
+            self.sidebar.has_focus = false;
+            engine.clear_sidebar_focus();
+        } else {
+            engine.toggle_sidebar_panel(PANEL_EXPLORER);
+            self.sidebar.has_focus = true;
+        }
+    }
+
+    fn focus_search(&mut self, engine: &mut Engine) {
+        if self.sidebar.has_focus && engine.search_has_focus {
+            self.sidebar.has_focus = false;
+            engine.clear_sidebar_focus();
+        } else {
+            engine.toggle_sidebar_panel(PANEL_SEARCH);
+            self.sidebar.has_focus = true;
+        }
+    }
+
+    fn open_terminal(&mut self, engine: &mut Engine) {
+        if engine.terminal_open && engine.terminal_has_focus {
+            engine.close_terminal();
+        } else if engine.terminal_open {
+            engine.terminal_has_focus = true;
+        } else {
+            let cols = terminal_panel_cols(engine, self.screen_w, self.sidebar_width);
+            if engine.terminal_panes.is_empty() {
+                engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
             } else {
-                engine.toggle_sidebar_panel(PANEL_EXPLORER);
-                sidebar.has_focus = true;
+                engine.open_terminal(cols, engine.session.terminal_panel_rows);
             }
-            *needs_redraw = true;
-            true
         }
-        ACC_FOCUS_SEARCH => {
-            if sidebar.has_focus && engine.search_has_focus {
-                sidebar.has_focus = false;
-                engine.clear_sidebar_focus();
-            } else {
-                engine.toggle_sidebar_panel(PANEL_SEARCH);
-                sidebar.has_focus = true;
-            }
-            *needs_redraw = true;
-            true
-        }
-        ACC_FUZZY_FINDER => {
-            engine.open_picker(crate::core::engine::PickerSource::Files);
-            *needs_redraw = true;
-            true
-        }
-        ACC_LIVE_GREP => {
-            engine.open_picker(crate::core::engine::PickerSource::Grep);
-            *needs_redraw = true;
-            true
-        }
-        ACC_COMMAND_PALETTE => {
-            engine.open_picker(crate::core::engine::PickerSource::Commands);
-            *needs_redraw = true;
-            true
-        }
-        ACC_OPEN_TERMINAL => {
-            if engine.terminal_open && engine.terminal_has_focus {
-                engine.close_terminal();
-            } else if engine.terminal_open {
-                engine.terminal_has_focus = true;
-            } else {
-                let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
-                if engine.terminal_panes.is_empty() {
-                    engine.terminal_new_tab(cols, engine.session.terminal_panel_rows);
-                } else {
-                    engine.open_terminal(cols, engine.session.terminal_panel_rows);
-                }
-            }
-            *needs_redraw = true;
-            true
-        }
-        ACC_TERMINAL_TOGGLE_MAX => {
-            let ctx = crate::core::engine::UiEventContext {
-                terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
-                terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_h),
-            };
-            engine.handle_ui_event(
-                crate::core::engine::UiEvent::Accelerator(
-                    quadraui::AcceleratorId::new(ACC_TERMINAL_TOGGLE_MAX),
-                    mods,
-                ),
-                ctx,
-            );
-            *needs_redraw = true;
-            true
-        }
-        ACC_ADD_CURSOR => {
-            engine.add_cursor_at_next_match();
-            *needs_redraw = true;
-            true
-        }
-        ACC_SELECT_ALL_MATCHES => {
-            engine.select_all_occurrences();
-            *needs_redraw = true;
-            true
-        }
-        ACC_SPLIT_EDITOR_RIGHT => {
-            engine.open_editor_group(SplitDirection::Vertical);
-            *needs_redraw = true;
-            true
-        }
-        ACC_SPLIT_EDITOR_DOWN => {
-            engine.open_editor_group(SplitDirection::Horizontal);
-            *needs_redraw = true;
-            true
-        }
-        ACC_NAV_BACK => {
-            engine.tab_nav_back();
-            *needs_redraw = true;
-            true
-        }
-        ACC_NAV_FORWARD => {
-            engine.tab_nav_forward();
-            *needs_redraw = true;
-            true
-        }
-        _ => false,
+    }
+
+    fn terminal_toggle_max(&mut self, engine: &mut Engine) {
+        let ctx = crate::core::engine::UiEventContext {
+            terminal_cols: terminal_panel_cols(engine, self.screen_w, self.sidebar_width),
+            terminal_max_rows: terminal_target_maximize_rows_tui(engine, self.screen_h),
+        };
+        engine.handle_ui_event(
+            crate::core::engine::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(render::ACC_TERMINAL_TOGGLE_MAX),
+                self.mods,
+            ),
+            ctx,
+        );
     }
 }
 
@@ -3198,7 +3132,7 @@ fn handle_activity_bar_focused_key(
 /// resolver's fallback rather than a guarded arm, so a key reaching here never
 /// falls through to the editor tier.
 ///
-/// A free function (mirrors [`dispatch_panel_accelerator_sizeless`]) because
+/// A free function (mirrors [`TuiAccelHost`]'s hooks) because
 /// `TuiShellApp::handle()` is only reachable through `driver_with_shell`,
 /// which has no accessor back to the concrete app's fields; over borrowed
 /// pieces it stays directly unit-testable against a bare `Engine`. `ui_event`
@@ -3959,7 +3893,7 @@ fn handle_key_pressed(
         };
         engine.handle_ui_event(
             crate::core::engine::UiEvent::Accelerator(
-                quadraui::AcceleratorId::new(ACC_TERMINAL_TOGGLE_MAX),
+                quadraui::AcceleratorId::new(render::ACC_TERMINAL_TOGGLE_MAX),
                 quadraui::Modifiers::default(),
             ),
             ctx,
@@ -6798,35 +6732,33 @@ mod tests {
         );
     }
 
-    /// `dispatch_panel_accelerator_sizeless`'s `ACC_TERMINAL_TOGGLE_MAX` arm
-    /// must derive `terminal_max_rows` from `screen_h` (the terminal's row
-    /// count), not `screen_w` — the bug review iteration 1 of vimcode#595
-    /// caught: the wrapper silently fed `screen_w` into
-    /// `terminal_target_maximize_rows_tui`, whose parameter is documented
-    /// `screen_h`. Uses a screen far wider than it is tall so swapping the
-    /// two arguments would produce a visibly different (larger) row count,
-    /// making the regression this guards against actually detectable.
+    /// `TuiAccelHost::terminal_toggle_max` must derive `terminal_max_rows`
+    /// from `screen_h` (the terminal's row count), not `screen_w` — the bug
+    /// review iteration 1 of vimcode#595 caught: the wrapper silently fed
+    /// `screen_w` into `terminal_target_maximize_rows_tui`, whose parameter
+    /// is documented `screen_h`. Uses a screen far wider than it is tall so
+    /// swapping the two arguments would produce a visibly different (larger)
+    /// row count, making the regression this guards against actually
+    /// detectable.
     #[test]
     fn terminal_toggle_max_uses_screen_height_not_width() {
         let mut engine = Engine::new();
         let mut sidebar = TuiSidebar::new();
-        let mut needs_redraw = false;
 
         let screen_w: u16 = 200;
         let screen_h: u16 = 24;
 
         // `terminal_target_maximize_rows_tui` only returns a nonzero target
         // once the terminal panel is considered open (`bp_open` in
-        // `compute_editor_layout`). In `dispatch_panel_accelerator_sizeless`,
-        // the `ACC_TERMINAL_TOGGLE_MAX` arm builds `ctx` (which is where the
-        // screen_w/screen_h bug lives) *before* calling
-        // `Engine::handle_ui_event` — and it's that call that flips
-        // `terminal_open` via `toggle_terminal_maximize`. So the bug is only
-        // observable when the terminal panel is *already* open and just not
-        // yet maximized (e.g. the user has a terminal open and presses
-        // "maximize") — pre-seed that precondition so `bp_open` is already
-        // true when `ctx` is built, matching the live-usage scenario this
-        // regression test guards.
+        // `compute_editor_layout`). In `TuiAccelHost::terminal_toggle_max`,
+        // the arm builds `ctx` (which is where the screen_w/screen_h bug
+        // lives) *before* calling `Engine::handle_ui_event` — and it's that
+        // call that flips `terminal_open` via `toggle_terminal_maximize`. So
+        // the bug is only observable when the terminal panel is *already*
+        // open and just not yet maximized (e.g. the user has a terminal open
+        // and presses "maximize") — pre-seed that precondition so `bp_open`
+        // is already true when `ctx` is built, matching the live-usage
+        // scenario this regression test guards.
         engine.terminal_open = true;
         let expected_target = terminal_target_maximize_rows_tui(&engine, screen_h);
         // Sanity check: if width and height produced the same target, this
@@ -6838,19 +6770,20 @@ mod tests {
             "fixture must pick w/h whose targets diverge, or this test proves nothing"
         );
 
-        let dispatched = dispatch_panel_accelerator_sizeless(
-            ACC_TERMINAL_TOGGLE_MAX,
-            quadraui::Modifiers::default(),
-            &mut engine,
-            &mut sidebar,
+        let mut host = TuiAccelHost {
+            sidebar: &mut sidebar,
             screen_w,
             screen_h,
-            SIDEBAR_WIDTH,
-            &mut needs_redraw,
+            sidebar_width: SIDEBAR_WIDTH,
+            mods: quadraui::Modifiers::default(),
+        };
+        let dispatched = render::dispatch_panel_accelerator(
+            render::ACC_TERMINAL_TOGGLE_MAX,
+            &mut engine,
+            &mut host,
         );
 
-        assert!(dispatched);
-        assert!(needs_redraw);
+        assert!(dispatched.is_some());
         assert!(engine.terminal_maximized);
         assert_eq!(engine.terminal_panes.len(), 1);
         let expected_rows = engine.effective_terminal_panel_rows(expected_target);
@@ -7745,14 +7678,20 @@ mod tests {
     /// in `key_press_inserts_text_via_shell_app_general_fallback` above
     /// must instead feed the picker's query and never reach the buffer.
     /// Opens the palette via the already-wired (Stage 0) `ACC_COMMAND_PALETTE`
-    /// accelerator, exactly how a real keybinding would.
+    /// accelerator, exactly how a real keybinding would. #761 / #734 slice 6:
+    /// this is the TUI half of the cross-backend parity pair — GTK's
+    /// `panel_accelerator_opens_command_palette_via_gtk_driver`
+    /// (`gtk/testing.rs`) dispatches the identical `render::ACC_COMMAND_PALETTE`
+    /// id and asserts the same `PickerSource::Commands` outcome, proving the
+    /// shared `render::dispatch_panel_accelerator` resolves one accelerator to
+    /// one action on both backends.
     #[test]
     fn command_palette_open_intercepts_keys_via_shell_app() {
         let app = TuiShellApp::new(None);
         let mut driver = driver_with_shell(app, config(), 80, 24);
 
         let opened = driver.dispatch(quadraui::UiEvent::Accelerator(
-            quadraui::AcceleratorId::new(ACC_COMMAND_PALETTE),
+            quadraui::AcceleratorId::new(render::ACC_COMMAND_PALETTE),
             quadraui::Modifiers::default(),
         ));
         assert_eq!(

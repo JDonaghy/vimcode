@@ -309,27 +309,12 @@ type StatusSegmentMap = HashMap<usize, Vec<(f64, f64, crate::core::engine::Statu
 
 // ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
-// Stable accelerator IDs for the `panel_keys` settings, registered on
-// `GtkBackend` at App startup. Mirrors the TUI's `tui.panel.*`
-// registry. As of Phase B.5b Stage 2 the editor key handler runs a
-// single `match_keypress` lookup against this registry and routes
-// matches through `dispatch_gtk_panel_accelerator` — replacing 13
-// inline `matches_gtk_key` arms that used to scan the bindings linearly.
-
-pub(super) const ACC_TOGGLE_SIDEBAR: &str = "gtk.panel.toggle_sidebar";
-pub(super) const ACC_FOCUS_EXPLORER: &str = "gtk.panel.focus_explorer";
-pub(super) const ACC_FOCUS_SEARCH: &str = "gtk.panel.focus_search";
-pub(super) const ACC_FUZZY_FINDER: &str = "gtk.panel.fuzzy_finder";
-pub(super) const ACC_LIVE_GREP: &str = "gtk.panel.live_grep";
-pub(super) const ACC_COMMAND_PALETTE: &str = "gtk.panel.command_palette";
-pub(super) const ACC_OPEN_TERMINAL: &str = "gtk.panel.open_terminal";
-pub(super) const ACC_TERMINAL_TOGGLE_MAX: &str = "terminal.toggle_maximize";
-pub(super) const ACC_ADD_CURSOR: &str = "gtk.panel.add_cursor";
-pub(super) const ACC_SELECT_ALL_MATCHES: &str = "gtk.panel.select_all_matches";
-pub(super) const ACC_SPLIT_EDITOR_RIGHT: &str = "gtk.panel.split_editor_right";
-pub(super) const ACC_SPLIT_EDITOR_DOWN: &str = "gtk.panel.split_editor_down";
-pub(super) const ACC_NAV_BACK: &str = "gtk.panel.nav_back";
-pub(super) const ACC_NAV_FORWARD: &str = "gtk.panel.nav_forward";
+// The 14-entry `PanelAccelerator` id table (`render::ACC_*`) and the
+// dispatcher itself (`render::dispatch_panel_accelerator`) are shared with
+// TUI (#761 / #734 slice 6) — see the rung's header comment in `render.rs`.
+// What's left here is registration (this backend's own `quadraui::Backend`
+// instance) and [`GtkAccelHost`], the five-hook impl for the actions that
+// need GTK's `DeferredQueue` seam.
 
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
@@ -347,20 +332,23 @@ fn register_panel_accelerators(
     pk: &crate::core::settings::PanelKeys,
 ) {
     let entries: [(&str, &str); 14] = [
-        (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
-        (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
-        (ACC_FOCUS_SEARCH, &pk.focus_search),
-        (ACC_FUZZY_FINDER, &pk.fuzzy_finder),
-        (ACC_LIVE_GREP, &pk.live_grep),
-        (ACC_COMMAND_PALETTE, &pk.command_palette),
-        (ACC_OPEN_TERMINAL, &pk.open_terminal),
-        (ACC_TERMINAL_TOGGLE_MAX, &pk.toggle_terminal_maximize),
-        (ACC_ADD_CURSOR, &pk.add_cursor),
-        (ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
-        (ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
-        (ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
-        (ACC_NAV_BACK, &pk.nav_back),
-        (ACC_NAV_FORWARD, &pk.nav_forward),
+        (render::ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
+        (render::ACC_FOCUS_EXPLORER, &pk.focus_explorer),
+        (render::ACC_FOCUS_SEARCH, &pk.focus_search),
+        (render::ACC_FUZZY_FINDER, &pk.fuzzy_finder),
+        (render::ACC_LIVE_GREP, &pk.live_grep),
+        (render::ACC_COMMAND_PALETTE, &pk.command_palette),
+        (render::ACC_OPEN_TERMINAL, &pk.open_terminal),
+        (
+            render::ACC_TERMINAL_TOGGLE_MAX,
+            &pk.toggle_terminal_maximize,
+        ),
+        (render::ACC_ADD_CURSOR, &pk.add_cursor),
+        (render::ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
+        (render::ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
+        (render::ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
+        (render::ACC_NAV_BACK, &pk.nav_back),
+        (render::ACC_NAV_FORWARD, &pk.nav_forward),
     ];
     for (id, binding) in entries {
         let acc_id = quadraui::AcceleratorId::new(id);
@@ -377,100 +365,31 @@ fn register_panel_accelerators(
     }
 }
 
-// ─── Phase B.5b Stage 2: panel-key accelerator dispatcher ───────────────────
-//
-// Mirrors `tui_main::dispatch_panel_accelerator`. Replaces 13 inline
-// `if matches_gtk_key(&pk.X, ...)` arms in the editor key handler with
-// a single registry lookup → match-on-id dispatcher. The action set
-// matches what the legacy arms did (Msg dispatch where the existing
-// update() handler runs the side effect; direct engine mutation where
-// the legacy arms also called engine directly).
-//
-// Returns `true` if the id was handled — caller should `return Stop`.
-// Returns `false` for unknown ids so the caller can fall through.
-//
-// `ACC_TERMINAL_TOGGLE_MAX` is included for completeness; the engine's
-// own `match_accelerator` block handles the same key first and
-// returns Stop, so this arm is only reachable if the engine's
-// registration is removed.
-fn dispatch_gtk_panel_accelerator(
-    id: &str,
-    deferred: &DeferredQueue,
-    engine: &Rc<RefCell<Engine>>,
-) -> bool {
-    match id {
-        ACC_OPEN_TERMINAL => {
-            deferred.send(DeferredAction::ToggleTerminal);
-            true
-        }
-        ACC_TOGGLE_SIDEBAR => {
-            deferred.send(DeferredAction::ToggleSidebar);
-            true
-        }
-        ACC_FOCUS_EXPLORER => {
-            deferred.send(DeferredAction::ToggleFocusExplorer);
-            true
-        }
-        ACC_FOCUS_SEARCH => {
-            deferred.send(DeferredAction::ToggleFocusSearch);
-            true
-        }
-        ACC_FUZZY_FINDER => {
-            engine
-                .borrow_mut()
-                .open_picker(core::engine::PickerSource::Files);
-            deferred.send(DeferredAction::Resize);
-            true
-        }
-        ACC_LIVE_GREP => {
-            engine
-                .borrow_mut()
-                .open_picker(core::engine::PickerSource::Grep);
-            deferred.send(DeferredAction::Resize);
-            true
-        }
-        ACC_COMMAND_PALETTE => {
-            engine
-                .borrow_mut()
-                .open_picker(core::engine::PickerSource::Commands);
-            deferred.send(DeferredAction::Resize);
-            true
-        }
-        ACC_TERMINAL_TOGGLE_MAX => {
-            deferred.send(DeferredAction::ToggleTerminalMaximize);
-            true
-        }
-        ACC_ADD_CURSOR => {
-            engine.borrow_mut().add_cursor_at_next_match();
-            deferred.send(DeferredAction::Resize);
-            true
-        }
-        ACC_SELECT_ALL_MATCHES => {
-            engine.borrow_mut().select_all_occurrences();
-            deferred.send(DeferredAction::Resize);
-            true
-        }
-        ACC_SPLIT_EDITOR_RIGHT => {
-            engine
-                .borrow_mut()
-                .open_editor_group(crate::core::window::SplitDirection::Vertical);
-            true
-        }
-        ACC_SPLIT_EDITOR_DOWN => {
-            engine
-                .borrow_mut()
-                .open_editor_group(crate::core::window::SplitDirection::Horizontal);
-            true
-        }
-        ACC_NAV_BACK => {
-            engine.borrow_mut().tab_nav_back();
-            true
-        }
-        ACC_NAV_FORWARD => {
-            engine.borrow_mut().tab_nav_forward();
-            true
-        }
-        _ => false,
+/// [`render::PanelAcceleratorHost`] impl for GTK: each hook just queues the
+/// matching [`DeferredAction`] — GTK's `UiEvent::Accelerator` arm has no
+/// engine-mutation seam of its own for these five actions (see the rung's
+/// header comment in `render.rs`), so the real work happens in `tick()`
+/// (which does have `&mut App`) on the next frame, same as every other
+/// App-only GTK callback.
+struct GtkAccelHost<'a> {
+    deferred: &'a DeferredQueue,
+}
+
+impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
+    fn toggle_sidebar(&mut self, _engine: &mut Engine) {
+        self.deferred.send(DeferredAction::ToggleSidebar);
+    }
+    fn focus_explorer(&mut self, _engine: &mut Engine) {
+        self.deferred.send(DeferredAction::ToggleFocusExplorer);
+    }
+    fn focus_search(&mut self, _engine: &mut Engine) {
+        self.deferred.send(DeferredAction::ToggleFocusSearch);
+    }
+    fn open_terminal(&mut self, _engine: &mut Engine) {
+        self.deferred.send(DeferredAction::ToggleTerminal);
+    }
+    fn terminal_toggle_max(&mut self, _engine: &mut Engine) {
+        self.deferred.send(DeferredAction::ToggleTerminalMaximize);
     }
 }
 
@@ -481,8 +400,7 @@ fn dispatch_gtk_panel_accelerator(
 /// Relm4-era `Msg` bus. They are genuine deferrals, not translations — each
 /// originates somewhere that cannot call an `&mut self` method at all: a
 /// `gio::FileMonitor` signal, a `glib::timeout_add_local_once` closure, or
-/// `dispatch_gtk_panel_accelerator`, which is a free function holding only a
-/// clone of the queue.
+/// [`GtkAccelHost`], which holds only a clone of the queue.
 ///
 /// quadraui has no deferral seam of its own to move onto — `ShellApp::tick`
 /// *is* the seam (its doc names "draining channels" as the intended use), and
@@ -6955,8 +6873,27 @@ impl quadraui::ShellApp for App {
                 self.handle_key_press(c.to_string(), Some(c), false, false, false, ctx);
             }
             UiEvent::Accelerator(id, _mods) => {
-                let id_str = id.as_str().to_string();
-                dispatch_gtk_panel_accelerator(&id_str, &self.deferred, &self.engine);
+                let mut host = GtkAccelHost {
+                    deferred: &self.deferred,
+                };
+                if let Some(action) = render::dispatch_panel_accelerator(
+                    id.as_str(),
+                    &mut self.engine.borrow_mut(),
+                    &mut host,
+                ) {
+                    // `dispatch_panel_accelerator` already mutated `engine`
+                    // directly for these five (no `GtkAccelHost` hook — see
+                    // `render.rs`), but they still need geometry recomputed
+                    // before the next paint — matches the pre-#761 per-arm
+                    // `deferred.send(DeferredAction::Resize)`.
+                    use render::PanelAccelerator::*;
+                    if matches!(
+                        action,
+                        FuzzyFinder | LiveGrep | CommandPalette | AddCursor | SelectAllMatches
+                    ) {
+                        self.deferred.send(DeferredAction::Resize);
+                    }
+                }
                 self.draw_needed.set(true);
             }
             UiEvent::MouseDown {

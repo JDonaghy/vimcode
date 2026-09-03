@@ -148,7 +148,7 @@ pub(super) fn render_explorer_sidebar_content(
 /// how `render_content` itself already has its own parallel entry points for
 /// editor content (`build_screen_for_shell_content` + `paint_editor_popups`
 /// in `render_impl.rs`, #601) and key dispatch
-/// (`dispatch_panel_accelerator_sizeless`, `handle_key_pressed`, above in
+/// (`render::dispatch_panel_accelerator`, `handle_key_pressed`, above in
 /// `shell_app.rs`).
 ///
 /// Ported: explorer (default panel, via [`render_explorer_sidebar_content`]),

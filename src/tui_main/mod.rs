@@ -147,24 +147,11 @@ pub(super) fn terminal_panel_cols(engine: &Engine, screen_w: u16, sidebar_width:
 
 // ─── Phase B.4 Stage 6: panel-key accelerator registry ──────────────────────
 //
-// Stable accelerator IDs for the `panel_keys` settings. The TUI event loop
-// matches on these IDs in its `UiEvent::Accelerator` arm so the dispatch
-// is decoupled from the user's chosen key strings.
-
-pub(super) const ACC_TOGGLE_SIDEBAR: &str = "tui.panel.toggle_sidebar";
-pub(super) const ACC_FOCUS_EXPLORER: &str = "tui.panel.focus_explorer";
-pub(super) const ACC_FOCUS_SEARCH: &str = "tui.panel.focus_search";
-pub(super) const ACC_FUZZY_FINDER: &str = "tui.panel.fuzzy_finder";
-pub(super) const ACC_LIVE_GREP: &str = "tui.panel.live_grep";
-pub(super) const ACC_COMMAND_PALETTE: &str = "tui.panel.command_palette";
-pub(super) const ACC_OPEN_TERMINAL: &str = "tui.panel.open_terminal";
-pub(super) const ACC_TERMINAL_TOGGLE_MAX: &str = "terminal.toggle_maximize";
-pub(super) const ACC_ADD_CURSOR: &str = "tui.panel.add_cursor";
-pub(super) const ACC_SELECT_ALL_MATCHES: &str = "tui.panel.select_all_matches";
-pub(super) const ACC_SPLIT_EDITOR_RIGHT: &str = "tui.panel.split_editor_right";
-pub(super) const ACC_SPLIT_EDITOR_DOWN: &str = "tui.panel.split_editor_down";
-pub(super) const ACC_NAV_BACK: &str = "tui.panel.nav_back";
-pub(super) const ACC_NAV_FORWARD: &str = "tui.panel.nav_forward";
+// The 14-entry `PanelAccelerator` id table (`render::ACC_*`) and the
+// dispatcher itself (`render::dispatch_panel_accelerator`) are shared with
+// GTK (#761 / #734 slice 6) — see the rung's header comment in `render.rs`.
+// `TuiAccelHost` (in `shell_app.rs`, next to its call sites) is the five-hook
+// impl for the actions that need TUI-local state.
 
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
@@ -173,20 +160,23 @@ fn register_panel_accelerators(
     pk: &crate::core::settings::PanelKeys,
 ) {
     let entries: [(&str, &str); 14] = [
-        (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
-        (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
-        (ACC_FOCUS_SEARCH, &pk.focus_search),
-        (ACC_FUZZY_FINDER, &pk.fuzzy_finder),
-        (ACC_LIVE_GREP, &pk.live_grep),
-        (ACC_COMMAND_PALETTE, &pk.command_palette),
-        (ACC_OPEN_TERMINAL, &pk.open_terminal),
-        (ACC_TERMINAL_TOGGLE_MAX, &pk.toggle_terminal_maximize),
-        (ACC_ADD_CURSOR, &pk.add_cursor),
-        (ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
-        (ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
-        (ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
-        (ACC_NAV_BACK, &pk.nav_back),
-        (ACC_NAV_FORWARD, &pk.nav_forward),
+        (render::ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
+        (render::ACC_FOCUS_EXPLORER, &pk.focus_explorer),
+        (render::ACC_FOCUS_SEARCH, &pk.focus_search),
+        (render::ACC_FUZZY_FINDER, &pk.fuzzy_finder),
+        (render::ACC_LIVE_GREP, &pk.live_grep),
+        (render::ACC_COMMAND_PALETTE, &pk.command_palette),
+        (render::ACC_OPEN_TERMINAL, &pk.open_terminal),
+        (
+            render::ACC_TERMINAL_TOGGLE_MAX,
+            &pk.toggle_terminal_maximize,
+        ),
+        (render::ACC_ADD_CURSOR, &pk.add_cursor),
+        (render::ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
+        (render::ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
+        (render::ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
+        (render::ACC_NAV_BACK, &pk.nav_back),
+        (render::ACC_NAV_FORWARD, &pk.nav_forward),
     ];
     for (id, binding) in entries {
         let acc_id = quadraui::AcceleratorId::new(id);

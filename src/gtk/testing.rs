@@ -5727,6 +5727,50 @@ mod clipboard_paste {
             h.driver.painted_texts()
         );
     }
+
+    /// #761 / #734 slice 6: `UiEvent::Accelerator` now resolves through the
+    /// shared `render::dispatch_panel_accelerator` (with `GtkAccelHost`
+    /// supplying GTK's hooks) instead of the deleted, GTK-only
+    /// `dispatch_gtk_panel_accelerator` match statement. Dispatches the same
+    /// id constant (`render::ACC_COMMAND_PALETTE`) that TUI's
+    /// `command_palette_open_intercepts_keys_via_shell_app`
+    /// (`tui_main/shell_app.rs`) dispatches through `TuiAccelHost` — the two
+    /// tests together are the "same accelerator resolves to the same panel
+    /// action on both backends" coverage #761 asks for.
+    #[test]
+    fn panel_accelerator_opens_command_palette_via_gtk_driver() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1200, 800);
+
+        assert!(
+            h.picker_popup().is_none(),
+            "no picker popup should have painted before the accelerator fires"
+        );
+
+        h.driver.dispatch(UiEvent::Accelerator(
+            quadraui::AcceleratorId::new(crate::render::ACC_COMMAND_PALETTE),
+            quadraui::Modifiers::default(),
+        ));
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().picker_source,
+            crate::core::engine::PickerSource::Commands,
+            "render::ACC_COMMAND_PALETTE must open the Commands picker \
+             (the same action id TUI resolves via TuiAccelHost)"
+        );
+        // `picker_popup()` is written only inside `render_content`'s picker
+        // draw branch, so this proves the popup actually painted — not
+        // merely that engine state flipped (mirrors
+        // `status_bar_segment_click_opens_go_to_line_picker`, #555/#672).
+        let (_, _, pw, ph) = h
+            .picker_popup()
+            .expect("the command palette must actually paint, not just flip engine state");
+        assert!(
+            pw > 0.0 && ph > 0.0,
+            "the painted picker popup must have a non-degenerate rect, got {pw}x{ph}"
+        );
+    }
 }
 
 #[cfg(test)]
