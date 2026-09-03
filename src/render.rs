@@ -3463,6 +3463,83 @@ pub fn route_alt_key(
     AltKeyOutcome::Fallthrough
 }
 
+// ─── Clipboard-paste pre-load / Ctrl+Shift+V rung (#760 / #734 slice 5) ─────
+//
+// Two small tiers that sit directly below the Alt rung above and directly
+// above `Engine::handle_key` on both backends.
+//
+// **Pre-load.** Before a `p`/`P` (Vim mode) or Ctrl+V (VSCode mode) keypress
+// reaches `Engine::handle_key`, the system clipboard has to be read and
+// copied into the paste registers first — `handle_key`'s `p` has no clipboard
+// access of its own. Both backends called the same two engine methods
+// (`needs_clipboard_for_paste` / `prepare_paste_clipboard`, shared since
+// #381) but each restated the four-line "if it needs it, read it, load it"
+// glue around them; [`preload_paste_clipboard`] is that glue, once.
+//
+// **Ctrl+Shift+V.** #593 wired GTK's Ctrl+V (and, incidentally, Ctrl+Shift+V —
+// quadraui's GTK runner intercepts both and redelivers them as
+// `UiEvent::ClipboardPaste`, per its own `ctrl_shift_v_delivers_the_clipboard_
+// selection_as_a_paste` / `ctrl_shift_v_is_intercepted_not_forwarded_as_raw_v`
+// tests at the pinned rev) straight through `Engine::route_paste` — the same
+// arm this crate's `ClipboardPaste` handler already uses for TUI's bracketed
+// paste. TUI's terminal side never got the same treatment: quadraui's TUI
+// runner only synthesizes `ClipboardPaste` for a real bracketed-paste escape
+// sequence (`CtEvent::Paste`), not for a Ctrl+Shift+V keypress, so that chord
+// arrives as an ordinary `KeyEvent` and TUI hand-rolled a second paste path —
+// read the clipboard, `load_clipboard_for_paste`, then either replay `p` or
+// splice characters into insert mode one at a time — instead of calling
+// `route_paste` like every other paste destination does. That hand-rolled
+// path covered only Normal/Visual/Insert/Replace, so a Ctrl+Shift+V while the
+// terminal, picker, explorer rename, search box, SC commit message, extension
+// sidebar or AI chat had focus fell through to whatever `handle_key` does
+// with a bare `V`, instead of pasting into that context the way plain Ctrl+V
+// (via `prepare_paste_clipboard` + `p`) already does.
+// [`route_ctrl_shift_v_paste`] replaces it with the one-line call the other
+// destinations use, so the whole `route_paste` priority chain (terminal →
+// picker → explorer rename → search → SC commit → ext sidebar → AI chat →
+// mode dispatch) applies to Ctrl+Shift+V too. It has no GTK caller — GTK
+// never sees the raw keystroke to route in the first place — which is the
+// point: both backends now reach `Engine::route_paste`, GTK via quadraui's
+// `ClipboardPaste` interception and TUI via this function, rather than one
+// going through `UiEvent::ClipboardPaste` and the other through a bespoke key
+// branch that duplicated (and under-covered) what `route_paste` already does.
+
+/// Pre-load the system clipboard into the paste registers before a paste
+/// keystroke reaches `Engine::handle_key` — shared by both backends (#381
+/// gave them the two engine methods; this states the glue between them once).
+///
+/// `key_name`/`unicode`/`ctrl` are the backend's own spelling of the key about
+/// to be dispatched; this is a no-op unless [`Engine::needs_clipboard_for_paste`]
+/// says that key is a paste.
+pub fn preload_paste_clipboard(
+    engine: &mut Engine,
+    key_name: &str,
+    unicode: Option<char>,
+    ctrl: bool,
+) {
+    if engine.needs_clipboard_for_paste(key_name, unicode, ctrl) {
+        let text = engine.clipboard_read.as_ref().and_then(|cb| cb().ok());
+        engine.prepare_paste_clipboard(text);
+    }
+}
+
+/// Ctrl+Shift+V: paste the system clipboard verbatim through
+/// `Engine::route_paste`'s priority chain. TUI-only — see this rung's header
+/// comment above for why GTK never calls it. Returns `true` when the chord
+/// matched (and was therefore consumed) regardless of whether the clipboard
+/// actually produced text, matching the pre-#760 behaviour this replaces.
+pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool) -> bool {
+    if !ctrl || key_name != "V" || engine.is_vscode_mode() {
+        return false;
+    }
+    if let Some(text) = engine.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
+        if !text.is_empty() {
+            engine.route_paste(&text);
+        }
+    }
+    true
+}
+
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
 //
 // The rung directly beneath [`route_modal_overlay_click`]: once no modal

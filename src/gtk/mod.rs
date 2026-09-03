@@ -1937,22 +1937,15 @@ impl App {
         // Dismiss any panel hover popup on key press.
         self.engine.borrow_mut().dismiss_panel_hover_now();
 
-        // Pre-load system clipboard into engine registers for paste keys
-        // (p/P in normal/visual, Ctrl+V in VSCode mode). Detection and
-        // register loading are shared via engine methods (#381).
-        if self
-            .engine
-            .borrow()
-            .needs_clipboard_for_paste(&key_name, unicode, ctrl)
-        {
-            let text = self
-                .engine
-                .borrow()
-                .clipboard_read
-                .as_ref()
-                .and_then(|cb| cb().ok());
-            self.engine.borrow_mut().prepare_paste_clipboard(text);
-        }
+        // ── Shared clipboard-paste pre-load rung (#760 / #734 slice 5) ─────
+        // `render::preload_paste_clipboard` states the "if it needs it, read
+        // it, load it" glue once for both backends — see its header comment
+        // in `render.rs`. GTK has no Ctrl+Shift+V arm to converge here:
+        // quadraui's runner intercepts that chord (and plain Ctrl+V) before
+        // it ever reaches this method and redelivers it as
+        // `UiEvent::ClipboardPaste`, handled by the arm further down this
+        // file that already calls `Engine::route_paste` directly.
+        render::preload_paste_clipboard(&mut self.engine.borrow_mut(), &key_name, unicode, ctrl);
 
         // ── Shared focus-owner keyboard rung (#757 / #734 slice 2) ─────
         // `render::route_focus_key` states the activity-bar → sidebar-panel
