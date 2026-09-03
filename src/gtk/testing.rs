@@ -4684,14 +4684,29 @@ mod command_center {
 /// file's header prescribes: locate the target through the layout the frame
 /// published, then read pixels.
 ///
-/// RED-first (run, not assumed): with both values reverted on this same
-/// tree, `inactive_line_numbers_dim_while_the_cursor_line_stays_bright`
-/// fails its inactive-gutter assertion — the probe reads `(177, 176, 176)`
-/// instead of `#858585` — and
-/// `breadcrumb_path_paints_dimmer_than_editor_body_text` fails its
-/// segment-colour assertion, reading `(126, 130, 137)` instead of `#6c7079`
-/// (a 0.566 body-text luminance ratio, also over the 0.55 ceiling the
-/// second assertion enforces).
+/// RED-first (re-run on the #785 tree, not assumed): with both values
+/// reverted on this same tree,
+/// `inactive_line_numbers_dim_while_the_cursor_line_stays_bright` fails its
+/// inactive-gutter assertion — the probe reads `(177, 176, 176)` instead of
+/// `#858585` — and `breadcrumb_path_paints_dimmer_than_editor_body_text`
+/// fails its segment-colour assertion, reading `(117, 123, 132)` instead of
+/// `#6c7079`.
+///
+/// Two corrections to what #701 recorded here, both from re-measuring rather
+/// than from any behaviour change:
+///
+/// - The breadcrumb figure was `(126, 130, 137)`; it is `(117, 123, 132)`
+///   now because that probe reads a per-channel ceiling instead of a single
+///   brightest pixel (see [`channel_ceiling`], and #785 for the flake that
+///   forced the switch).
+/// - #701 also recorded the reverted colour as failing the body-text ratio
+///   assertion at 0.566 against a 0.55 ceiling. It does not: `#7f848e`
+///   measures ≈0.535 here and slips under. The *colour* assertion is what
+///   rejects it, at every possible coverage. The ratio assertion is still
+///   worth its place — it is the only one that would catch `breadcrumb_fg`
+///   staying dim while the editor's own text darkened to meet it — but it
+///   is not a second line of defence for this particular regression, and
+///   should not be relied on as one.
 #[cfg(test)]
 mod vscode_dimming {
     use super::*;
@@ -4725,6 +4740,51 @@ mod vscode_dimming {
                 if luma(p) > luma(best) {
                     best = p;
                 }
+            }
+        }
+        best
+    }
+
+    /// Per-channel maximum over the half-open box `[x0, x1) × [y0, y1)` —
+    /// the subpixel-antialiasing-correct twin of [`brightest`] (#785).
+    ///
+    /// [`brightest`]'s "the max-luminance pixel carries the unblended pen"
+    /// argument silently assumes *grayscale* antialiasing, where a single
+    /// coverage fraction drives all three channels, so the brightest pixel is
+    /// the one closest to full coverage on every channel at once. Under
+    /// subpixel (RGB) antialiasing — which fontconfig turns on by default on
+    /// many Linux desktops, including the machine #785's Test stage ran on —
+    /// each channel gets its *own* coverage out of a 3-tap LCD filter. For a
+    /// stem narrower than that kernel no single pixel saturates all three at
+    /// once, and which channels the brightest pixel favours depends on the
+    /// glyph's subpixel phase. Measured on the breadcrumb's `#6c7079` "src"
+    /// across runs of the same suite on the same machine, same painted rect:
+    /// `(100, 104, 113)`, `(80, 112, 121)` and `(108, 112, 98)` — the same
+    /// pen, spread up to 23/255 apart, against a [`near`] tolerance of 10.
+    /// That is the ~1-run-in-40 flake #785's Test stage hit.
+    ///
+    /// Maximising each channel independently restores the invariant
+    /// [`brightest`]'s doc leans on. A blend over a darker background can
+    /// never overshoot the pen in *any* channel, so every component here is
+    /// still an upper bound that no amount of antialiasing can inflate — a
+    /// brighter pen therefore still fails the comparison — but each component
+    /// now converges on the pen as soon as *some* pixel in the box saturates
+    /// *that* channel, which no longer has to be the same pixel for all
+    /// three. Use this whenever the probed glyphs are UI-chrome sized; the
+    /// editor's own (larger, monospace) text saturates readily enough that
+    /// [`brightest`] is still fine for the gutter and body-text probes.
+    fn channel_ceiling(
+        h: &mut Harness<impl AppLogic>,
+        x0: i32,
+        x1: i32,
+        y0: i32,
+        y1: i32,
+    ) -> (u8, u8, u8) {
+        let mut best = (0u8, 0u8, 0u8);
+        for x in x0..x1 {
+            for y in y0..y1 {
+                let p = h.driver.pixel(x, y);
+                best = (best.0.max(p.0), best.1.max(p.1), best.2.max(p.2));
             }
         }
         best
@@ -4851,8 +4911,10 @@ mod vscode_dimming {
         // The dimmed `breadcrumb_fg` #701 adopts (a 15% dim of #7f848e).
         const BREADCRUMB_FG: (u8, u8, u8) = (0x6c, 0x70, 0x79);
         // Ratio ceiling: the crumb must sit at most a little over half of
-        // body-text luminance. Measured 0.483 with #6c7079; the pre-#701
-        // #7f848e measures 0.566 and fails this too.
+        // body-text luminance. Measured 0.453 with #6c7079 (#785 re-measured
+        // it after switching the probe to `channel_ceiling`; #701 recorded
+        // 0.483 off the old single-pixel probe). See this module's doc for
+        // why the pre-#701 #7f848e does *not* also fail this one.
         const MAX_RATIO: f64 = 0.55;
 
         let mut engine = Engine::new_for_test();
@@ -4915,19 +4977,60 @@ mod vscode_dimming {
             "segment 0 must have painted a non-degenerate rect, got {seg:?}"
         );
 
-        let crumb = brightest(
+        // `channel_ceiling`, not `brightest` (#785): breadcrumb labels are
+        // UI-chrome sized, and under subpixel antialiasing no single pixel of
+        // a 10pt stem is fully covered on all three channels at once. See
+        // that helper's doc for the three different readings the same painted
+        // frame produced across runs, and why per-channel maxima keep the
+        // "a blend can never overshoot the pen" guarantee intact.
+        let crumb = channel_ceiling(
             &mut h,
             seg.x as i32,
             (seg.x + seg.width) as i32,
             seg.y as i32,
             (seg.y + seg.height) as i32,
         );
+        // Asymmetric, and deliberately not [`near`]: the two directions carry
+        // different physics (#785).
+        //
+        // *Above* the pen is the load-bearing half. Compositing text over the
+        // darker bar background can only ever move a channel from the
+        // background *towards* the pen, so no coverage, phase or filter can
+        // push a channel past the pen it was drawn with — a reading above
+        // `#6c7079` means the renderer was handed a brighter colour, full
+        // stop. `OVERSHOOT` is therefore just rasteriser rounding.
+        //
+        // *Below* the pen is only ever coverage loss, and says nothing about
+        // which pen was used, so it can be generous. It still has to be
+        // bounded: without a floor a heavily-blended brighter pen would slip
+        // under the ceiling. The two together pin the pen from both sides —
+        // the pre-#701 `#7f848e` would have to paint at ≤85% coverage to
+        // duck `OVERSHOOT` and at ≥85% to clear `UNDERSHOOT`, which is
+        // impossible, so it is rejected at *every* coverage rather than only
+        // at the one this machine's fontconfig happens to produce.
+        //
+        // Measured here: `#6c7079` reads (100, 104, 113) (≈90% coverage —
+        // subpixel antialiasing never saturates a 10pt stem, see
+        // `channel_ceiling`) and `#7f848e` reads (117, 123, 132). Under the
+        // old symmetric ±10 the wrong colour was being rejected by 1/255 on
+        // two channels; here it misses by 5 while the right one keeps 4 in
+        // hand at both ends.
+        const OVERSHOOT: i32 = 4;
+        const UNDERSHOOT: i32 = 12;
+        let pen_matches = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let ok = |x: u8, y: u8| {
+                let d = x as i32 - y as i32;
+                d <= OVERSHOOT && d >= -UNDERSHOOT
+            };
+            ok(a.0, b.0) && ok(a.1, b.1) && ok(a.2, b.2)
+        };
         assert!(
-            near(crumb, BREADCRUMB_FG),
+            pen_matches(crumb, BREADCRUMB_FG),
             "a non-trailing breadcrumb segment must paint at the dimmed \
-             breadcrumb_fg {BREADCRUMB_FG:?} (#701); brightest pixel in the \
-             painted segment rect was {crumb:?} — the pre-#701 #7f848e reads \
-             (126, 130, 137) here"
+             breadcrumb_fg {BREADCRUMB_FG:?} (#701) — every channel within \
+             +{OVERSHOOT}/-{UNDERSHOOT}; the painted segment rect's \
+             per-channel ceiling was {crumb:?}. The pre-#701 #7f848e reads \
+             (117, 123, 132) here."
         );
 
         // Body text from the *same* frame: row 2 of the pane, past the
