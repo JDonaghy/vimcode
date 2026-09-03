@@ -1821,16 +1821,6 @@ impl App {
         ctx: &quadraui::ShellContext<'_>,
     ) {
         // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
-        // `render::route_modal_key` states the spell-suggestion → dialog →
-        // context-menu ladder once for both backends. GTK used to hand-roll
-        // the context-menu rung here (and a second copy in the now-deleted
-        // `handle_explorer_ctx_menu_key`), diverging from
-        // `Engine::handle_context_menu_key` in three ways: `l` did not
-        // confirm, `q`/`h` did not close, j/k did not skip disabled items,
-        // and every other key both closed the menu *and* fell through to the
-        // editor. It also had no top-level dialog rung at all, so a dialog
-        // opened while the activity bar / explorer / an extension panel held
-        // focus lost its keys to that panel.
         // Bound to a local first: a `RefCell::borrow()` temporary in a `match`
         // scrutinee lives for the whole `match`, and the arms `borrow_mut()`.
         let modal_route = render::route_modal_key(&self.engine.borrow());
@@ -1855,25 +1845,23 @@ impl App {
         // Dismiss any panel hover popup on key press.
         self.engine.borrow_mut().dismiss_panel_hover_now();
 
+        // ── Shared Ctrl+L force-redraw rung (#762 / #734 slice 7) ──────
+        // New on GTK: there was no Ctrl+L tier here at all, so the chord fell
+        // through to whichever tier came next instead of being consumed.
+        if render::is_force_redraw_key(&key_name, unicode, ctrl) {
+            self.draw_needed.set(true);
+            return;
+        }
+
         // ── Shared clipboard-paste pre-load rung (#760 / #734 slice 5) ─────
-        // `render::preload_paste_clipboard` states the "if it needs it, read
-        // it, load it" glue once for both backends — see its header comment
-        // in `render.rs`. GTK has no Ctrl+Shift+V arm to converge here:
-        // quadraui's runner intercepts that chord (and plain Ctrl+V) before
-        // it ever reaches this method and redelivers it as
-        // `UiEvent::ClipboardPaste`, handled by the arm further down this
-        // file that already calls `Engine::route_paste` directly.
+        // No Ctrl+Shift+V arm to converge here: quadraui's runner intercepts
+        // that chord and redelivers it as `UiEvent::ClipboardPaste`.
         render::preload_paste_clipboard(&mut self.engine.borrow_mut(), &key_name, unicode, ctrl);
 
         // ── Shared focus-owner keyboard rung (#757 / #734 slice 2) ─────
-        // `render::route_focus_key` states the activity-bar → sidebar-panel
-        // ladder once for both backends; GTK used to hand-roll it as a chain
-        // of `if engine.*_has_focus` blocks that disagreed with TUI's chain in
-        // four ways, all enumerated (with the resolution) at `route_focus_key`.
         // GTK keeps no "the sidebar band holds the keyboard" latch of its own,
         // so it passes `Engine::sidebar_has_focus()` — the disjunction of the
-        // very flags the resolver's arms test, making that gate a no-op here
-        // and preserving GTK's per-flag behaviour exactly.
+        // very flags the resolver's arms test, making that gate a no-op here.
         let focus_route = {
             let engine = self.engine.borrow();
             let band = engine.sidebar_has_focus();
@@ -1887,16 +1875,8 @@ impl App {
         }
 
         // ── Shared terminal (PTY) keyboard rung (#758 / #734 slice 3) ──
-        // GTK had no terminal rung at all between #540 and this change: the
-        // block that forwarded keys to the PTY lived in the Relm4 `view!`'s
-        // `EventControllerKey` closure and was deleted with it, so every key
-        // typed into a focused terminal fell through to `Engine::handle_key`
-        // and ran vim commands on the *editor buffer* (#471). It sits here,
-        // directly below the focus owners and above the debug F-keys, so the
-        // ladder matches TUI's exactly: `route_focus_key` already returns
-        // `FocusKeyRoute::None` while the terminal holds focus, and a focused
-        // terminal must take F5/F9/F10/F11 to the PTY rather than the
-        // debugger — which is what `vim`/`htop` running inside it expect.
+        // Above the debug F-keys, the same slot TUI uses: a focused terminal
+        // takes F5/F9/F10/F11 to the PTY, as vim/htop expect.
         if render::route_terminal_key(
             &mut self.engine.borrow_mut(),
             &key_name,
@@ -1910,110 +1890,60 @@ impl App {
             return;
         }
 
-        // Debug F-keys must reach the engine regardless of which panel
-        // has focus — F5 (continue), F9 (breakpoint), F10 (step over),
-        // F11 (step in) are global debugger commands.
-        if !ctrl && !alt {
-            match key_name.as_str() {
-                "F5" | "F9" | "F10" | "F11" => {
-                    let mapped = map_gtk_key_name(&key_name);
-                    let action = self.engine.borrow_mut().handle_key(mapped, None, false);
-                    self.dispatch_engine_action(action, false);
-                    self.draw_needed.set(true);
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        // GTK focus on sidebar DrawingAreas is unreliable (grab_focus does not
-        // stick), so the engine focus flags the resolver read above are the
-        // only truth — the same approach the TUI backend uses. Each arm yields
-        // `Some(panel_still_focused)` for the shared epilogue below, replacing
-        // seven verbatim copies of it. The `if engine.dialog.is_some()`
-        // patch-up the Debug and AI arms used to open with is gone: it
-        // re-stated the dialog rung `render::route_modal_key` now resolves at
-        // the top of this function, so it was unreachable.
-        let panel_still_focused: Option<bool> = match focus_route {
-            render::FocusKeyRoute::ExtPanel => {
-                let mut engine = self.engine.borrow_mut();
-                let mapped = map_gtk_key_name(key_name.as_str());
-                if engine.ext_panel_input_active {
-                    engine.handle_ext_panel_input_key(mapped, false, unicode);
-                } else {
-                    engine.handle_ext_panel_key(mapped, false, unicode);
-                }
-                // h/Left moves focus to the activity bar; other exits go to the editor.
-                let outcome = engine.ext_panel_has_focus && engine.dialog.is_none();
-                drop(engine);
-                self.sync_plus_register_to_clipboard();
-                Some(outcome)
-            }
-            render::FocusKeyRoute::ExtSidebar => {
-                let mut engine = self.engine.borrow_mut();
-                let mapped = map_gtk_key_name(key_name.as_str());
-                engine.dispatch_ext_sidebar_key_unified(mapped, unicode);
-                Some(engine.ext_sidebar_has_focus && engine.dialog.is_none())
-            }
-            render::FocusKeyRoute::Settings => {
-                let mut engine = self.engine.borrow_mut();
-                let mapped = map_gtk_key_name(key_name.as_str());
-                engine.handle_settings_key(mapped, ctrl, unicode);
-                Some(engine.settings_has_focus && engine.dialog.is_none())
-            }
-            render::FocusKeyRoute::Search => {
-                let mut engine = self.engine.borrow_mut();
-                let mapped = map_gtk_key_name(key_name.as_str());
-                // Ctrl+V no longer reaches here: quadraui's runner intercepts
-                // it and delivers `UiEvent::ClipboardPaste` straight to
-                // `ShellApp::handle`, which routes through
-                // `Engine::route_paste` (covering the search/replace fields)
-                // before any key event is dispatched (#593).
-                engine.dispatch_search_sidebar_key_unified(mapped, ctrl, alt, unicode);
-                Some(engine.search_has_focus)
-            }
-            render::FocusKeyRoute::SourceControl => {
-                let mut engine = self.engine.borrow_mut();
-                let (mapped, sc_unicode) = map_gtk_key_with_unicode(key_name.as_str());
-                engine.dispatch_sc_sidebar_key_unified(mapped, ctrl, sc_unicode);
-                Some(engine.sc_has_focus)
-            }
-            render::FocusKeyRoute::Debug => {
-                let mut engine = self.engine.borrow_mut();
-                let mapped = map_gtk_key_name(key_name.as_str());
-                let rect = engine.dap_sidebar_body_rect.get();
-                render::populate_dap_sidebar_system(&engine);
-                let consumed = if let Some(ui_event) = gtk_key_name_to_quadraui(mapped, ctrl) {
-                    let backend_rc = self.backend.clone();
-                    let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
-                        &ui_event,
-                        &mut *backend_rc.borrow_mut(),
-                        rect,
-                    );
-                    engine.dispatch_dap_sidebar_event(sidebar_event)
-                } else {
-                    false
-                };
-                if !consumed {
-                    engine.dispatch_dap_sidebar_action_key(mapped);
-                }
-                Some(engine.dap_sidebar_has_focus)
-            }
-            render::FocusKeyRoute::Ai => {
-                let mut engine = self.engine.borrow_mut();
-                engine.handle_ai_panel_key(&key_name, ctrl, unicode);
-                Some(engine.ai_has_focus)
-            }
-            render::FocusKeyRoute::Explorer => {
-                // Explorer keys used to be routed through a per-DrawingArea
-                // key controller when the DA had focus (#732 retired the
-                // `Msg` variant it sent; nothing has produced it since #540).
-                let key_mapped = map_gtk_key_name(key_name.as_str()).to_string();
-                self.handle_explorer_da_key(key_mapped, unicode, ctrl);
+        // ── Shared debugger F-key rung (#762 / #734 slice 7) ───────────
+        // Global, above the sidebar panels. The `shift` half is new here:
+        // this block used to test only `!ctrl && !alt`, so Shift+F5 ran
+        // *continue* instead of *stop*.
+        match render::route_debug_fkey(&key_name, ctrl, shift, alt) {
+            Some(render::DebugFKey::Command(cmd)) => {
+                let _ = self.engine.borrow_mut().execute_command(cmd);
                 self.draw_needed.set(true);
                 return;
             }
-            render::FocusKeyRoute::ActivityBar | render::FocusKeyRoute::None => None,
+            Some(render::DebugFKey::EngineKey(name)) => {
+                let action = self.engine.borrow_mut().handle_key(name, None, false);
+                self.dispatch_engine_action(action, false);
+                self.draw_needed.set(true);
+                return;
+            }
+            None => {}
+        }
+
+        // ── Shared focus-owner *dispatch* rung (#762 / #734 slice 7) ───
+        // Slice 2 shared only the *routing*; `render::dispatch_sidebar_panel_key`
+        // now states the six pure-`Engine` arms too. It hands back `None` for
+        // the two it cannot own — Debug needs a live `Backend`, Explorer is a
+        // backend widget — which the fallback match below still spells out.
+        let (sc_mapped, sc_unicode) = map_gtk_key_with_unicode(key_name.as_str());
+        let mapped = map_gtk_key_name(key_name.as_str());
+        let panel_key = match focus_route {
+            render::FocusKeyRoute::SourceControl => sc_mapped,
+            // The AI panel's key table reads GDK spellings directly.
+            render::FocusKeyRoute::Ai => key_name.as_str(),
+            _ => mapped,
+        };
+        let shared = render::dispatch_sidebar_panel_key(
+            &mut self.engine.borrow_mut(),
+            focus_route,
+            panel_key,
+            unicode,
+            sc_unicode,
+            ctrl,
+            alt,
+        );
+        if shared.is_some() && focus_route == render::FocusKeyRoute::ExtPanel {
+            self.sync_plus_register_to_clipboard();
+        }
+        let panel_still_focused: Option<bool> = match shared {
+            Some(still_focused) => Some(still_focused),
+            None => match self.dispatch_focus_owner_residual(focus_route, &key_name, unicode, ctrl)
+            {
+                Some(outcome) => match outcome {
+                    Some(still_focused) => Some(still_focused),
+                    None => return,
+                },
+                None => None,
+            },
         };
         if let Some(still_focused) = panel_still_focused {
             self.focus_after_sidebar_key(still_focused);
@@ -2022,14 +1952,6 @@ impl App {
         }
 
         // ── Shared Alt-modifier / VSCode-mode rung (#759 / #734 slice 4) ──
-        // GTK had no Alt tier at all: this method took `alt` and used it only
-        // to feed the terminal router and to suppress the debug F-keys, so
-        // Alt+Left/Right, Alt+M, Alt+,/., Alt+]/[ and every VSCode-mode
-        // `Alt_*` chord fell through to `Engine::handle_key` — which has no
-        // `alt` parameter — and were silently dropped. Placed directly below
-        // the focus owners and above `Engine::handle_key`, the same slot TUI's
-        // deleted block occupied. See the rung's header comment in
-        // `render.rs` for the full divergence list.
         // Bound to a local first, for the same reason the modal rung at the
         // top of this method is: a `RefCell::borrow_mut()` temporary in a
         // `match` scrutinee lives for the whole `match`.
@@ -2055,24 +1977,17 @@ impl App {
             render::AltKeyOutcome::Fallthrough => {}
         }
 
-        // Hover popup copy: intercept y/Ctrl-C when hover is focused so the
-        // engine's clipboard_write callback is invoked with the hover selection.
-        {
-            let engine = self.engine.borrow();
-            let is_hover_copy = engine.editor_hover_has_focus
-                && (key_name == "y" || key_name == "Y" || (ctrl && key_name == "c"));
-            if is_hover_copy {
-                if let Some(text) = engine.hover_selection_text() {
-                    if let Some(ref cb) = engine.clipboard_write {
-                        let _ = cb(text.as_str());
-                    }
-                    drop(engine);
-                    let mut engine = self.engine.borrow_mut();
-                    engine.message = "Hover text copied".to_string();
-                    self.draw_needed.set(true);
-                    return;
-                }
+        // ── Shared hover-popup copy rung (#762 / #734 slice 7) ─────────
+        let hover_copy = render::route_hover_popup_copy(&self.engine.borrow(), &key_name, ctrl);
+        if let Some(text) = hover_copy {
+            let mut engine = self.engine.borrow_mut();
+            if let Some(ref cb) = engine.clipboard_write {
+                let _ = cb(text.as_str());
             }
+            engine.message = "Hover text copied".to_string();
+            drop(engine);
+            self.draw_needed.set(true);
+            return;
         }
 
         let action = {
@@ -2089,33 +2004,95 @@ impl App {
         self.dispatch_engine_action(action, false);
         self.draw_needed.set(true);
 
-        // Process macro playback queue if active
+        // ── Shared post-key epilogue (#762 / #734 slice 7) ─────────────
+        self.run_post_key_epilogue();
+        self.draw_needed.set(true);
+    }
+
+    /// The Debug and Explorer halves of the focus-owner dispatch — the two
+    /// arms [`render::dispatch_sidebar_panel_key`] hands back as `None`
+    /// because they need state this backend owns (a live `Backend` for the
+    /// DAP `SidebarSystem`; the explorer `DrawingArea`).
+    ///
+    /// `None` — not one of these two, keep dispatching.
+    /// `Some(Some(still_focused))` — handled; run the focus epilogue.
+    /// `Some(None)` — handled completely; the caller must return.
+    fn dispatch_focus_owner_residual(
+        &mut self,
+        route: render::FocusKeyRoute,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> Option<Option<bool>> {
+        let mapped = map_gtk_key_name(key_name);
+        match route {
+            render::FocusKeyRoute::Debug => {
+                let mut engine = self.engine.borrow_mut();
+                let rect = engine.dap_sidebar_body_rect.get();
+                render::populate_dap_sidebar_system(&engine);
+                let consumed = if let Some(ui_event) = gtk_key_name_to_quadraui(mapped, ctrl) {
+                    let backend_rc = self.backend.clone();
+                    let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                        &ui_event,
+                        &mut *backend_rc.borrow_mut(),
+                        rect,
+                    );
+                    engine.dispatch_dap_sidebar_event(sidebar_event)
+                } else {
+                    false
+                };
+                if !consumed {
+                    engine.dispatch_dap_sidebar_action_key(mapped);
+                }
+                Some(Some(engine.dap_sidebar_has_focus))
+            }
+            render::FocusKeyRoute::Explorer => {
+                // Explorer keys used to be routed through a per-DrawingArea
+                // key controller when the DA had focus (#732 retired the
+                // `Msg` variant it sent; nothing has produced it since #540).
+                self.handle_explorer_da_key(mapped.to_string(), unicode, ctrl);
+                self.draw_needed.set(true);
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+
+    /// GTK's half of the shared after-every-editor-keypress epilogue.
+    /// [`render::post_key_epilogue`] applies everything `Engine` owns; this
+    /// applies the three residues that need GTK: macro playback (whose
+    /// `EngineAction`s only `dispatch_engine_action` can run), the deferred
+    /// clipboard write, and the GLib one-shot behind the yank highlight.
+    fn run_post_key_epilogue(&mut self) {
         loop {
             let (has_more, action) = {
                 let mut engine = self.engine.borrow_mut();
                 engine.advance_macro_playback()
             };
-
             self.dispatch_engine_action(action, true);
-
             if !has_more {
                 break;
             }
         }
 
-        // Ctrl-W h/l overflow: show sidebar and focus the active panel.
-        {
-            let overflow = self.engine.borrow_mut().window_nav_overflow.take();
-            if let Some(false) = overflow {
-                let current = self.current_active_panel_id();
-                let panel_id = if is_ext_panel_id(&current) {
-                    PANEL_EXPLORER.to_string()
-                } else {
-                    current
-                };
-                self.engine.borrow_mut().focus_sidebar_panel(&panel_id);
-                self.sync_sidebar_from_engine();
-            }
+        // GTK recomputes the quickfix scroll offset statelessly each frame
+        // (`draw_bottom_chrome`), so it hands the rung no scroll field.
+        let epilogue = render::post_key_epilogue(&mut self.engine.borrow_mut(), None);
+        if epilogue.focus_sidebar {
+            let current = self.current_active_panel_id();
+            let panel_id = if is_ext_panel_id(&current) {
+                PANEL_EXPLORER.to_string()
+            } else {
+                current
+            };
+            self.engine.borrow_mut().focus_sidebar_panel(&panel_id);
+            self.sync_sidebar_from_engine();
+        } else if epilogue.focus_activity_bar {
+            // New on GTK (#762): the overflow arm used to call
+            // `focus_sidebar_panel` unconditionally, so with no sidebar
+            // visible the keypress went nowhere. The shared rung has already
+            // put the cursor on the activity bar; this just re-syncs.
+            self.sync_sidebar_from_engine();
         }
 
         // Sync the unnamed register to the system clipboard if it changed.
@@ -2123,14 +2100,12 @@ impl App {
         self.sync_plus_register_to_clipboard();
 
         // If a yank just happened, schedule a 200 ms one-shot to clear the highlight.
-        if self.engine.borrow().yank_highlight.is_some() {
+        if epilogue.arm_yank_highlight {
             let q = self.deferred.clone();
             gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
                 q.send(DeferredAction::ClearYankHighlight);
             });
         }
-
-        self.draw_needed.set(true);
     }
 
     fn handle_poll_tick(&mut self) {

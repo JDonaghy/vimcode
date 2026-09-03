@@ -7153,3 +7153,114 @@ mod alt_rung {
         }
     }
 }
+
+#[cfg(test)]
+mod slice7_closing_rungs {
+    //! #762 / #734 slice 7 — the closing rungs, black-box on GTK.
+    //!
+    //! The behavioural half of the cross-backend parity assertion. Each test
+    //! here has a mirror in `src/tui_main/shell_app.rs` that drives the *same*
+    //! chord against the *same* engine state and asserts the *same* rendered
+    //! string, so "both backends resolve this key + state to the same route"
+    //! is checked end to end. The spelling-identity tier — both backends' key
+    //! names fed into one resolver call — is `render::slice7_router_tests`.
+    use super::*;
+    use quadraui::{Key, Modifiers, UiEvent};
+
+    fn press<A: AppLogic>(driver: &mut GtkDriver<A>, key: Key, modifiers: Modifiers) {
+        driver.dispatch(UiEvent::KeyPressed {
+            key,
+            modifiers,
+            repeat: false,
+        });
+    }
+
+    /// #762: Shift+F5 is `stop`, not a shifted spelling of F5's `continue`.
+    ///
+    /// GTK's debug F-key block tested only `!ctrl && !alt` and never `shift`,
+    /// so Shift+F5 ran *continue* and Shift+F11 ran *step-in* — the exact
+    /// opposite of the intent. `render::route_debug_fkey` now states both
+    /// tiers once, and TUI's
+    /// `shift_f5_stops_the_debug_session_via_shell_app` asserts the identical
+    /// string; that pair is the parity check.
+    ///
+    /// Asserts on the painted command line (where `engine.message` renders),
+    /// never on a DAP field — `CLAUDE.md` rule 1.
+    ///
+    /// **Verified RED against unfixed `develop`:** with no `shift` branch the
+    /// chord runs `continue` and the command line reads "DAP: starting Debug
+    /// debug session…", so both assertions fire. Equivalently on this branch:
+    /// delete the `if shift { ... }` block from `route_debug_fkey`.
+    #[test]
+    fn shift_f5_stops_instead_of_continuing_on_gtk() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        press(
+            &mut h.driver,
+            Key::Named(quadraui::NamedKey::F(5)),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("DAP: session stopped"),
+            "Shift+F5 must run `stop`; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("starting"),
+            "Shift+F5 must NOT run `continue`; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #762: the debugger F-keys are global — a focused sidebar panel must
+    /// not swallow them. GTK already resolved them above the panel arms; this
+    /// pins that against the TUI mirror
+    /// (`shift_f5_reaches_the_debugger_from_a_focused_panel_via_shell_app`),
+    /// which is the backend the reorder actually fixed.
+    #[test]
+    fn shift_f5_reaches_the_debugger_from_a_focused_panel_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.search_has_focus = true;
+        assert_eq!(
+            crate::render::route_focus_key(&engine, engine.sidebar_has_focus()),
+            crate::render::FocusKeyRoute::Search,
+            "precondition: the search panel must own the keyboard"
+        );
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        press(
+            &mut h.driver,
+            Key::Named(quadraui::NamedKey::F(5)),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("DAP: session stopped"),
+            "Shift+F5 must reach the debugger past a focused sidebar panel; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    // No GTK black-box test for the Ctrl+L rung: with the rung removed the
+    // GtkDriver renders byte-identically, because GTK's spelling of the chord
+    // (`key_name = "l"`, `ctrl = true`) is not a cursor motion in
+    // `Engine::handle_key` either. A test here could not fail, and
+    // `CLAUDE.md` rule 2 says a test that cannot fail is not coverage. The
+    // rung is covered by TUI's RED-verified
+    // `ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app` and, for
+    // GTK's own key spelling, by
+    // `render::slice7_router_tests::ctrl_l_is_a_force_redraw_from_either_backends_spelling`.
+}
