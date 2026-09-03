@@ -664,156 +664,81 @@ pub(super) fn draw_frame(
         editor_hover_scrollbar_out,
     );
 
-    // ── Quickfix panel (persistent bottom strip) ──────────────────────────────
-    if let Some(ref qf) = screen.quickfix {
-        render_quickfix_panel(quickfix_area, qf, quickfix_scroll_top, theme, backend);
-    }
+    // ══ Bottom band (#765, #735 slice 4) ══════════════════════════════════════
+    //
+    // The same `render::compose_bottom_band` walk `TuiShellApp::render_content`
+    // and GTK's `render_content` run — this parity reference was the *third*
+    // transcription of the run, and the one that made the other two look like
+    // they agreed. Geometry stays here, in cells; only the order and the gates
+    // are shared. Caches are cleared before the walk, never from an `else` arm
+    // inside it (see `BOTTOM_Z_ORDER`).
+    engine.bottom_panel_geometry.replace(None);
+    *debug_toolbar_rect_out = quadraui::Rect::default();
+    hover_link_rects_out.clear();
+    *hover_popup_rect_out = None;
 
-    // ── Separated status line (above terminal, when status_line_above_terminal is active) ──
-    if let Some(ref status) = screen.separated_status_line {
-        render_window_status_line(
-            backend,
-            separated_status_area.x,
-            separated_status_area.y,
-            separated_status_area.width,
-            status,
-            theme,
-        );
-    }
-
-    // ── Bottom panel (tab bar + terminal or debug output) ────────────────────
-    if bottom_panel_area.height > 0 {
-        engine
-            .bottom_panel_geometry
-            .replace(Some(crate::core::engine::BottomPanelGeometry {
-                top_y: bottom_panel_area.y as f64,
-                height: bottom_panel_area.height as f64,
-                toolbar_y: 1.0,
-                content_y: 2.0,
-                content_row_h: 1.0,
-            }));
-        // Tab bar (first row)
-        let tab_bar_area = Rect {
-            x: bottom_panel_area.x,
-            y: bottom_panel_area.y,
-            width: bottom_panel_area.width,
-            height: 1,
-        };
-        let content_area = Rect {
-            x: bottom_panel_area.x,
-            y: bottom_panel_area.y + 1,
-            width: bottom_panel_area.width,
-            height: bottom_panel_area.height.saturating_sub(1),
-        };
-        let hits = render_bottom_panel_tabs(
-            backend,
-            tab_bar_area,
-            &engine.bottom_panel_kind,
-            engine.terminal_open,
-            !screen.bottom_tabs.output_lines.is_empty(),
-            theme,
-        );
-        engine.bottom_tab_bar_hits.replace(Some(hits));
-        match engine.bottom_panel_kind {
-            render::BottomPanelKind::Terminal => {
-                if let Some(ref term) = screen.bottom_tabs.terminal {
-                    let toolbar_area = Rect {
-                        x: content_area.x,
-                        y: content_area.y,
-                        width: content_area.width,
-                        height: 1,
-                    };
-                    let hits = render_terminal_toolbar(backend, toolbar_area, term, theme);
-                    engine.terminal_toolbar_hits.replace(Some(hits));
-                    let term_content = Rect {
-                        x: content_area.x,
-                        y: content_area.y + 1,
-                        width: content_area.width,
-                        height: content_area.height.saturating_sub(1),
-                    };
-                    render_terminal_panel(frame, backend, term_content, term, theme, engine);
-                    // Register terminal content area as a scroll surface.
-                    engine
-                        .scroll_surfaces
-                        .borrow_mut()
-                        .push(quadraui::ScrollSurface {
-                            id: quadraui::WidgetId::new("terminal_scrollback"),
-                            bounds: quadraui::Rect::new(
-                                term_content.x as f32,
-                                term_content.y as f32,
-                                term_content.width as f32,
-                                term_content.height as f32,
-                            ),
-                            scrollbar: None,
-                        });
+    // `draw_frame` has no `AppShellLayout`, so its stand-in for
+    // `sidebar_content_bounds.is_some()` is the same pair of tests its
+    // hand-rolled hover gate used.
+    let sidebar_open = engine.app_shell.sidebar_visible() && sidebar_sep_area.width > 1;
+    for op in render::compose_bottom_band(engine, screen, sidebar_open) {
+        match op {
+            render::BottomOp::Quickfix => {
+                if let Some(ref qf) = screen.quickfix {
+                    backend.set_theme(super::quadraui_tui::q_theme(theme));
+                    render::paint_quickfix_rung(
+                        backend,
+                        qf,
+                        super::shell_app::to_q_rect(quickfix_area),
+                        quickfix_scroll_top,
+                    );
                 }
             }
-            render::BottomPanelKind::DebugOutput => {
-                let td = render::debug_output_to_text_display(
-                    &screen.bottom_tabs.output_lines,
-                    engine.debug_output_scroll,
-                    engine.debug_output_auto_scroll,
+            render::BottomOp::BottomPanel => {
+                backend.set_theme(super::quadraui_tui::q_theme(theme));
+                render::paint_bottom_panel_rung(
+                    backend,
+                    engine,
+                    screen,
+                    theme,
+                    super::shell_app::to_q_rect(bottom_panel_area),
+                    render::BottomPanelUnits::CELL,
                 );
-                let q_rect = quadraui::Rect::new(
-                    content_area.x as f32,
-                    content_area.y as f32,
-                    content_area.width as f32,
-                    content_area.height as f32,
-                );
-                let td_layout = backend.text_display_layout(q_rect, &td);
-                backend.draw_text_display(q_rect, &td);
-                let scrollbar =
-                    td_layout
-                        .scrollbar_bounds
-                        .zip(td_layout.thumb_bounds)
-                        .map(|(track, thumb)| {
-                            let offset_y = q_rect.y;
-                            quadraui::SurfaceScrollbar {
-                                axis: quadraui::ScrollAxis::Vertical,
-                                track_bounds: quadraui::Rect::new(
-                                    q_rect.x + track.x,
-                                    offset_y + track.y,
-                                    track.width,
-                                    track.height,
-                                ),
-                                thumb_bounds: quadraui::Rect::new(
-                                    q_rect.x + thumb.x,
-                                    offset_y + thumb.y,
-                                    thumb.width,
-                                    thumb.height,
-                                ),
-                                total_items: td.lines.len(),
-                                visible_items: td_layout.visible_lines.len(),
-                                scroll_offset: td_layout.resolved_scroll_offset,
-                                inverted: false,
-                            }
-                        });
-                engine
-                    .scroll_surfaces
-                    .borrow_mut()
-                    .push(quadraui::ScrollSurface {
-                        id: quadraui::WidgetId::new("debug_output"),
-                        bounds: q_rect,
-                        scrollbar,
-                    });
+            }
+            render::BottomOp::DebugToolbar => {
+                // Layout is cached on `engine.debug_toolbar_layout` for
+                // click/hover hit-testing (#510).
+                let q_rect = super::shell_app::to_q_rect(debug_toolbar_area);
+                *debug_toolbar_rect_out = q_rect;
+                render::draw_debug_toolbar(backend, engine, q_rect);
+            }
+            render::BottomOp::SeparatedStatus => {
+                if let Some(ref status) = screen.separated_status_line {
+                    backend.set_theme(super::quadraui_tui::q_theme(theme));
+                    let _ = render::paint_separated_status_rung(
+                        backend,
+                        status,
+                        super::shell_app::to_q_rect(separated_status_area),
+                    );
+                }
+            }
+            render::BottomOp::PanelHover => {
+                if sidebar.ext_panel_name.is_some() || engine.active_panel_is(PANEL_GIT) {
+                    let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
+                    let (rects, popup_rect) = render_panel_hover_popup(
+                        backend,
+                        screen,
+                        theme,
+                        sep_x + 1,
+                        sidebar_sep_area.y,
+                        sidebar_sep_area.height,
+                        area,
+                    );
+                    *hover_link_rects_out = rects;
+                    *hover_popup_rect_out = popup_rect;
+                }
             }
         }
-    } else {
-        engine.bottom_panel_geometry.replace(None);
-    }
-
-    // ── Debug toolbar strip (if visible) ────────────────────────────────────
-    if screen.debug_toolbar.is_some() {
-        // Route through `Backend::draw_toolbar` (#510). Layout is cached on
-        // `engine.debug_toolbar_layout` for click/hover hit-testing.
-        let q_rect = quadraui::Rect::new(
-            debug_toolbar_area.x as f32,
-            debug_toolbar_area.y as f32,
-            debug_toolbar_area.width as f32,
-            debug_toolbar_area.height as f32,
-        );
-        *debug_toolbar_rect_out = q_rect;
-        render::draw_debug_toolbar(backend, engine, q_rect);
     }
 
     // ── Wildmenu bar (command Tab completion) ─────────────────────────────────
@@ -851,25 +776,9 @@ pub(super) fn draw_frame(
     // renderer so `TuiShellApp::render_content` gets it for free).
     render_command_line(backend, cmd_area, &screen.command, theme, cmd_sel);
 
-    // ── Panel hover popup (drawn after editor so it's not overwritten) ─────
-    hover_link_rects_out.clear();
-    *hover_popup_rect_out = None;
-    if engine.app_shell.sidebar_visible() && sidebar_sep_area.width > 1 {
-        let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
-        if sidebar.ext_panel_name.is_some() || engine.active_panel_is(PANEL_GIT) {
-            let (rects, popup_rect) = render_panel_hover_popup(
-                backend,
-                screen,
-                theme,
-                sep_x + 1,
-                sidebar_sep_area.y,
-                sidebar_sep_area.height,
-                area,
-            );
-            *hover_link_rects_out = rects;
-            *hover_popup_rect_out = popup_rect;
-        }
-    }
+    // The panel hover popup used to be composed here, after the chrome rungs
+    // above. #765 moved it into the `BottomOp::PanelHover` rung of the band
+    // walk, matching both live backends.
 
     // ── Folder / workspace picker modal ──────────────────────────────────────
     if let Some(picker) = folder_picker {

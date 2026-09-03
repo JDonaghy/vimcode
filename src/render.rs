@@ -6401,6 +6401,556 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
         .collect()
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Bottom band (#765, #735 slice 4)
+// ══════════════════════════════════════════════════════════════════════════
+//
+// The fourth and last of #735's *ordered runs*. Below the editor column
+// ([`EDITOR_Z_ORDER`]) and above the surrounding chrome ([`CHROME_Z_ORDER`])
+// sits a stack of bands vimcode carves out of the main content area by hand:
+// quickfix, the bottom panel (terminal / debug output), the debug toolbar, the
+// separated status line, and the sidebar-item hover popup that overhangs them.
+//
+// Before this slice that run was transcribed **three** times — GTK's
+// `render_content`, TUI's `render_content`, and TUI's `#[cfg(test)]`
+// `draw_frame` parity twin — and the three transcriptions had drifted in four
+// separate ways, three of them real defects rather than cosmetic ordering:
+//
+//   * **GTK's panel-hover popup could not clear its own click-routing cache.**
+//     The rung lived *inside* the [`FrameOp::SidebarPanel`] arm, nested under
+//     `if let Some(q_sb) = layout.sidebar_content_bounds`, and so were its two
+//     cache resets. Collapse the sidebar while a source-control / extension
+//     item tooltip was up and `App::panel_hover_popup_rect` kept the last
+//     painted rect **forever**: `handle_mouse_press` went on arbitrating
+//     clicks against a popup that was no longer on screen, swallowing them
+//     before the editor ever saw them. Input and paint disagreeing about a
+//     surface that is not painted — the #587/#592 failure shape verbatim, and
+//     precisely what a band walk makes structurally hard to reach, since
+//     [`BottomOp::PanelHover`] is now composed (or not) at the top level where
+//     the absent branch is reachable.
+//   * **TUI's debug toolbar had the mirror-image bug.** Its rung had no `else`
+//     at all, so `TuiShellApp::debug_toolbar_rect` kept its last value when
+//     the toolbar hid — while GTK's `else` zeroed the equivalent two caches.
+//     Two backends, two different halves of the same cache-clearing rule.
+//   * **the separated status line was composed in two different places.** TUI
+//     painted it *second*, before the bottom panel; GTK painted it *fourth*,
+//     after the debug toolbar. Both backends' *geometry* agrees it belongs
+//     last (GTK's `separated_status_y` y-cursor chain, TUI's own
+//     `bottom_chrome_rects_for_shell_content` constraint array, which orders
+//     `[editor, quickfix, bottom, debug, separated_status]`), so TUI's paint
+//     order contradicted TUI's own layout order. Benign only for as long as no
+//     rung in the band ever overdraws its neighbour. [`BOTTOM_Z_ORDER`] takes
+//     the geometry order, which both backends already reserved space in.
+//   * the two gates for the bottom panel itself were spelled differently —
+//     GTK tested `el.terminal_h > 0.0` (a *height*, downstream of the rule),
+//     TUI `chrome.bottom_panel.height > 0`. [`bottom_panel_is_drawn`] is now
+//     the rule itself, stated once.
+//
+// **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"): the
+// same verdict slices 1–3 recorded, re-run for this band. quadraui *does* ship
+// a `BottomPanelController` — and `AppShellLayout::bottom_panel_bounds` with
+// it — but it models a single generic drawer, not vimcode's stack of five
+// independently-gated bands with a hover popup overhanging them; it is `None`
+// for `TuiShellApp` and unwired on GTK for exactly that reason (see
+// `bottom_chrome_rects_for_shell_content`'s doc comment). What vimcode stacks
+// below its editor column, and in what order, is vimcode's own app-level
+// composition. The *rasterisers* underneath every rung are already quadraui's
+// (`draw_list`, `draw_tab_bar`, `draw_terminal`, `draw_terminal_divider`,
+// `draw_text_display`, `draw_status_bar`, `draw_rich_text_popup`) — there is
+// no per-backend painting left to lift, only per-backend *sequencing*, which
+// is what this slice deletes.
+
+/// One rung of the shared **bottom band** — the stack of chrome vimcode carves
+/// out of the bottom of `AppShellLayout::main_content_bounds`.
+///
+/// Deliberately unit-agnostic, exactly like [`OverlayOp`], [`FrameOp`] and
+/// [`EditorOp`]: the rung says *what* is painted and *in what order*, never
+/// where or how big. GTK composes it in pixels and TUI in cells, from the same
+/// vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BottomOp {
+    /// The quickfix result list (`ScreenLayout::quickfix`), directly below the
+    /// editor column.
+    Quickfix,
+    /// The bottom panel: its tab strip plus whichever of the terminal or the
+    /// debug output is active (`ScreenLayout::bottom_tabs`).
+    BottomPanel,
+    /// The debug toolbar strip (`ScreenLayout::debug_toolbar`).
+    DebugToolbar,
+    /// The extracted per-window status line, shown when `window_status_line`
+    /// is on but `status_line_above_terminal` is off
+    /// (`ScreenLayout::separated_status_line`).
+    ///
+    /// Last of the four stacked bands, because that is where *both* backends
+    /// already reserve its row — see the module note above for the paint-order
+    /// contradiction this fixes on TUI.
+    SeparatedStatus,
+    /// The sidebar-item dwell tooltip (`ScreenLayout::panel_hover`).
+    ///
+    /// In the band rather than beside the sidebar body it describes, because
+    /// it is clamped against the *whole* content viewport and deliberately
+    /// overhangs rightward past the sidebar's own bounds — so it must be
+    /// composed after everything it can overhang, which is the entire stack
+    /// above. GTK used to nest it inside the sidebar rung instead; see the
+    /// module note for the stale-cache bug that caused.
+    PanelHover,
+}
+
+/// The canonical bottom-band order, **lowest z first** (index 0 is composed
+/// first, and everything after it may cover it).
+///
+/// The first four rungs are also, and not coincidentally, in top-to-bottom
+/// *geometric* order: each one's y-cursor is the previous one's bottom edge on
+/// GTK, and its successor in `bottom_chrome_rects_for_shell_content`'s
+/// constraint array on TUI. Only [`BottomOp::PanelHover`] genuinely floats.
+///
+/// Both backends iterate this array and `match` each rung, so "which order do
+/// we stack the bottom chrome in" is one artefact rather than three
+/// transcriptions. Adding a surface means adding a variant here — a compile
+/// error in both backends' `match` until both handle it.
+///
+/// The whole band sits *below* [`CHROME_Z_ORDER`] and *above*
+/// [`EDITOR_Z_ORDER`]: every bottom rung is composed after the last editor
+/// rung and before the first chrome rung, on both backends.
+pub const BOTTOM_Z_ORDER: [BottomOp; 5] = [
+    BottomOp::Quickfix,
+    BottomOp::BottomPanel,
+    BottomOp::DebugToolbar,
+    BottomOp::SeparatedStatus,
+    BottomOp::PanelHover,
+];
+
+/// Is the bottom panel painted this frame?
+///
+/// The rule itself, rather than either backend's downstream restatement of it:
+/// GTK gated on `compute_editor_layout`'s `el.terminal_h > 0.0` and TUI on
+/// `bottom_chrome_rects_for_shell_content`'s `chrome.bottom_panel.height > 0`.
+/// Both are *heights computed from this predicate*, so both were free to drift
+/// from it — and from each other — the moment either layout function changed.
+pub fn bottom_panel_is_drawn(engine: &Engine) -> bool {
+    engine.terminal_open || engine.bottom_panel_open
+}
+
+/// Is the sidebar-item hover popup painted this frame?
+///
+/// `screen.panel_hover` is populated only while the pointer is dwelling on an
+/// item of a sidebar panel that has tooltips, so it already implies the
+/// "source control or extension panel" test TUI's call site used to spell out
+/// a second time — `render_panel_hover_popup` and [`panel_hover_popup_paint`]
+/// both return early on `None` regardless.
+///
+/// `sidebar_open` is the one input that is not derivable from `screen` — the
+/// same shape as [`compose_editor_band`]'s `drag_active`. Both live backends
+/// pass `layout.sidebar_content_bounds.is_some()`: the popup is anchored to
+/// the sidebar's *right edge*, so an open sidebar is what gives it an anchor
+/// at all. Note this is deliberately **not** `app_shell.sidebar_visible()`,
+/// which the two backends disagreed about — TUI tested both, GTK only the
+/// bounds — and which is `false` for a default engine whose sidebar band the
+/// shell has nonetheless reserved.
+pub fn panel_hover_is_drawn(screen: &ScreenLayout, sidebar_open: bool) -> bool {
+    sidebar_open && screen.panel_hover.is_some()
+}
+
+/// Which bottom rungs a frame in this state must compose, in canonical order.
+///
+/// Like [`compose_frame`] / [`compose_editor_band`] and unlike
+/// [`compose_overlay_band`], this returns only the *live* rungs. Two rungs in
+/// this band own hit-test caches that must be cleared when they are absent —
+/// the bottom panel's `Engine::bottom_panel_geometry` and the hover popup's
+/// popup/link rects — and both backends now clear them **before** the walk
+/// rather than from an `else` arm inside it. That is deliberate: an `else`
+/// that only runs when the walk reaches the rung cannot run when the rung is
+/// gated off upstream, which is exactly how GTK's popup rect went stale (see
+/// the module note above).
+pub fn compose_bottom_band(
+    engine: &Engine,
+    screen: &ScreenLayout,
+    sidebar_open: bool,
+) -> Vec<BottomOp> {
+    BOTTOM_Z_ORDER
+        .iter()
+        .copied()
+        .filter(|op| match op {
+            // Already `None` unless `quickfix_open && !quickfix_items
+            // .is_empty()` (`build_screen_layout`), the same rule
+            // `quickfix_panel_rows` reserves height by — so no second copy of
+            // that gate here.
+            BottomOp::Quickfix => screen.quickfix.is_some(),
+            BottomOp::BottomPanel => bottom_panel_is_drawn(engine),
+            BottomOp::DebugToolbar => screen.debug_toolbar.is_some(),
+            BottomOp::SeparatedStatus => screen.separated_status_line.is_some(),
+            BottomOp::PanelHover => panel_hover_is_drawn(screen, sidebar_open),
+        })
+        .collect()
+}
+
+/// Assert a backend's *actually composed* bottom sequence never runs backwards
+/// against [`BOTTOM_Z_ORDER`].
+///
+/// The bottom-band twin of [`check_chrome_band_order`] /
+/// [`check_editor_band_order`] / [`check_overlay_band_order`], and the same
+/// weaker half of the acceptance test: it does not care which rungs were live,
+/// only that whatever *was* composed came out in canonical order. A rung
+/// hoisted out of the shared walk — which is exactly how TUI's separated
+/// status line drifted two places up the ladder — fails this even when the
+/// exact live set is awkward to pin.
+pub fn check_bottom_band_order(composed: &[BottomOp]) -> Result<(), String> {
+    let mut cursor = 0usize;
+    for op in composed {
+        match BOTTOM_Z_ORDER[cursor..].iter().position(|c| c == op) {
+            Some(rel) => cursor += rel + 1,
+            None => {
+                return Err(format!(
+                    "bottom band composed out of order: {op:?} came after \
+                     {:?}, but BOTTOM_Z_ORDER puts it before",
+                    &BOTTOM_Z_ORDER[..cursor]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The expected bottom band for the cross-backend fixture used by
+/// `bottom_band_composes_in_canonical_order_via_gtk_driver` and
+/// `..._via_shell_app`: quickfix open with items, the bottom panel up, the
+/// debug toolbar visible and the separated status line extracted — every rung
+/// live except the sidebar hover popup, which needs a live pointer dwell.
+///
+/// Both backend tests call this one function — a single `#[cfg(test)]` fn in
+/// `render.rs`, compiled into both bin targets — rather than each transcribing
+/// its own `Vec<BottomOp>` literal, so the compiler keeps the two expectations
+/// in step. Taking `panel_hover` as a parameter keeps the expectation
+/// *discriminating*: it is not simply "whatever [`BOTTOM_Z_ORDER`] contains".
+#[cfg(test)]
+pub(crate) fn bottom_band_fixture(panel_hover: bool) -> Vec<BottomOp> {
+    BOTTOM_Z_ORDER
+        .iter()
+        .copied()
+        .filter(|op| panel_hover || !matches!(op, BottomOp::PanelHover))
+        .collect()
+}
+
+/// How far down the quickfix list must be scrolled to keep the selected item
+/// on screen, given `visible_rows` rows of body (i.e. the panel height minus
+/// its one header row).
+///
+/// GTK recomputes this statelessly every frame — it has no persistent
+/// `quickfix_scroll_top` to advance from key events, the way `TuiShellApp`
+/// does — so it lived inline in `render_content` as eight lines of arithmetic.
+/// Shared here so the two backends cannot disagree about what "keep the
+/// selection visible" means.
+pub fn quickfix_scroll_top(qf: &QuickfixPanel, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        0
+    } else {
+        (qf.selected_idx + 1).saturating_sub(visible_rows)
+    }
+}
+
+/// The [`BottomOp::Quickfix`] rung's whole body on both backends.
+///
+/// One `quickfix_to_list_view` adapter call and one `Backend::draw_list`; the
+/// only thing the two call sites ever differed on was where `scroll_offset`
+/// came from, which stays the caller's (GTK recomputes it via
+/// [`quickfix_scroll_top`], TUI carries `TuiShellApp::quickfix_scroll_top`
+/// across frames so `:cnext` can advance it).
+pub fn paint_quickfix_rung(
+    b: &mut dyn quadraui::Backend,
+    qf: &QuickfixPanel,
+    rect: quadraui::Rect,
+    scroll_top: usize,
+) {
+    if rect.height <= 0.0 {
+        return;
+    }
+    let mut list = quickfix_to_list_view(qf);
+    list.scroll_offset = scroll_top;
+    b.draw_list(rect, &list);
+}
+
+/// The [`BottomOp::SeparatedStatus`] rung's whole body on both backends.
+///
+/// Returns the `StatusBarLayout` the paint resolved, so the caller can record
+/// its segment hit zones (#672) without a second no-paint measurement of the
+/// same bar — the #654/#703 desync shape [`PaintedTabBar`]'s doc comment
+/// describes. GTK used to `draw` and then call `backend.status_bar_layout` on
+/// the same rect, laying the row out twice per frame; that second call is what
+/// this returns instead.
+pub fn paint_separated_status_rung(
+    b: &mut dyn quadraui::Backend,
+    status: &WindowStatusLine,
+    rect: quadraui::Rect,
+) -> quadraui::StatusBarLayout {
+    let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:separated"));
+    let _ = b.draw_status_bar(rect, &bar, None, None);
+    b.status_bar_layout(rect, &bar)
+}
+
+/// The unit system one backend composes [`paint_bottom_panel_rung`] in.
+///
+/// Everything here is a genuine rasteriser difference #735 exists to preserve,
+/// not a behaviour knob: Cairo repaints the whole surface every frame so GTK
+/// needs no background pass, while ratatui coalesces cells and must blank the
+/// terminal body itself; and a scrollbar gutter is six *pixels* on GTK and
+/// nothing at all in a cell grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BottomPanelUnits {
+    /// One line / one column, in the caller's units.
+    pub metrics: FrameMetrics,
+    /// Width of the gutter `build_terminal_draw_data` reserves for the
+    /// scrollbar, in the caller's units, or `None` for a cell grid that has no
+    /// room for one.
+    pub terminal_scrollbar: Option<u16>,
+    /// Blank the terminal body before painting into it. `false` on GTK (Cairo
+    /// already cleared the surface), `true` on TUI.
+    pub clear_terminal_bg: bool,
+}
+
+impl BottomPanelUnits {
+    /// One terminal cell — what `TuiShellApp::render_content` composes in.
+    pub const CELL: Self = Self {
+        metrics: FrameMetrics::CELL,
+        terminal_scrollbar: None,
+        clear_terminal_bg: true,
+    };
+
+    /// Real pixels — what `gtk::App::render_content` composes in.
+    pub fn px(line_height: f64, char_width: f64) -> Self {
+        Self {
+            metrics: FrameMetrics::px(line_height, char_width),
+            terminal_scrollbar: Some(6),
+            clear_terminal_bg: false,
+        }
+    }
+}
+
+/// The [`BottomOp::BottomPanel`] rung's whole body on both backends: the tab
+/// strip, then whichever of the terminal or the debug output is active,
+/// including the toolbar row, the split divider and both scroll surfaces.
+///
+/// `rect` is the whole panel band in the caller's units, tab strip included.
+/// The three transcriptions of this that existed before #765 ran to ~170 lines
+/// on GTK and ~120 apiece in TUI's two composers, and the debug-output arm's
+/// scrollbar mapping was duplicated character-for-character between them.
+pub fn paint_bottom_panel_rung(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    screen: &ScreenLayout,
+    theme: &Theme,
+    rect: quadraui::Rect,
+    units: BottomPanelUnits,
+) {
+    let lh = units.metrics.line_height;
+    let cw = units.metrics.char_width;
+    engine
+        .bottom_panel_geometry
+        .replace(Some(crate::core::engine::BottomPanelGeometry {
+            top_y: rect.y as f64,
+            height: rect.height as f64,
+            toolbar_y: lh as f64,
+            content_y: 2.0 * lh as f64,
+            content_row_h: lh as f64,
+        }));
+
+    // Row 1: the Terminal / Debug Output tab strip.
+    let tab_bar = build_bottom_panel_tab_bar(
+        &screen.bottom_tabs.active,
+        engine.terminal_open,
+        !screen.bottom_tabs.output_lines.is_empty(),
+    );
+    let hits = b.draw_tab_bar(
+        quadraui::Rect::new(rect.x, rect.y, rect.width, lh),
+        &tab_bar,
+        None,
+    );
+    engine.bottom_tab_bar_hits.replace(Some(hits));
+
+    // Rows 2..: the active panel's own toolbar row and body.
+    let content_y = rect.y + 2.0 * lh;
+    let content_h = (rect.height - 2.0 * lh).max(0.0);
+    match screen.bottom_tabs.active {
+        BottomPanelKind::Terminal => {
+            let Some(ref term) = screen.bottom_tabs.terminal else {
+                return;
+            };
+            let toolbar_rect = quadraui::Rect::new(rect.x, rect.y + lh, rect.width, lh);
+            let toolbar_hits = match build_terminal_toolbar(term, theme) {
+                TerminalToolbar::FindBar(bar) => {
+                    let _ = b.draw_status_bar(toolbar_rect, &bar, None, None);
+                    // No raw `pango::Layout` is reachable from a `&mut dyn
+                    // Backend`-only signature (the #669 gap), so segment widths
+                    // are approximated by char count * `cw` rather than exact
+                    // glyph measurement — affects hit-region precision only,
+                    // not paint.
+                    // The two call sites spelled this gap `16.0` (GTK px) and
+                    // `2.0` (TUI cells); at GTK's ~8px char width those are the
+                    // same two-character gap, so it is `2.0 * cw` in both.
+                    let layout = bar.layout(rect.width, lh, 2.0 * cw, |seg| {
+                        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32 * cw)
+                    });
+                    crate::core::engine::TerminalToolbarHits::FindBar {
+                        layout,
+                        origin_x: rect.x as f64,
+                    }
+                }
+                TerminalToolbar::TabStrip(bar) => {
+                    crate::core::engine::TerminalToolbarHits::TabStrip(b.draw_tab_bar(
+                        toolbar_rect,
+                        &bar,
+                        None,
+                    ))
+                }
+            };
+            engine.terminal_toolbar_hits.replace(Some(toolbar_hits));
+            if content_h <= 0.0 {
+                return;
+            }
+            let body = quadraui::Rect::new(rect.x, content_y, rect.width, content_h);
+            let visible_rows = (content_h / lh) as usize;
+
+            // ratatui coalesces cells, so the body has to be blanked before
+            // the grid lands on it; Cairo has already cleared the surface.
+            // `draw_status_bar`'s TUI rasteriser fills the *entire* row with
+            // the first segment's `bg` before painting text, so an empty-text
+            // segment reproduces a solid fill exactly (the #607 trick).
+            if units.clear_terminal_bg {
+                let bg_bar = quadraui::StatusBar {
+                    id: quadraui::WidgetId::new("terminal:bg"),
+                    left_segments: vec![quadraui::StatusBarSegment {
+                        text: String::new(),
+                        fg: to_quadraui_color(theme.status_fg),
+                        bg: to_quadraui_color(theme.terminal_bg),
+                        bold: false,
+                        action_id: None,
+                    }],
+                    right_segments: vec![],
+                };
+                for i in 0..visible_rows {
+                    let row =
+                        quadraui::Rect::new(rect.x, content_y + i as f32 * lh, rect.width, lh);
+                    let _ = b.draw_status_bar(row, &bg_bar, None, None);
+                }
+            }
+
+            let td = build_terminal_draw_data(
+                term,
+                body,
+                cw,
+                lh,
+                visible_rows,
+                units.terminal_scrollbar,
+            );
+            engine.terminal_split_layout.replace(td.split);
+            if let Some(split) = &td.split {
+                // #635 (Stage 6b): `Backend::draw_terminal_divider`
+                // (JDonaghy/quadraui#533) closed the gap that used to keep the
+                // trait-only signature from painting a split at all.
+                let left = td.left.as_ref().unwrap();
+                let right = td.right.as_ref().unwrap();
+                b.draw_terminal(split.left, left);
+                b.draw_terminal(split.right, right);
+                // Width stays a literal `1.0` in *both* unit systems, as both
+                // call sites had it: one hairline pixel on GTK, one cell on
+                // TUI. Scaling it by `cw` would fatten GTK's divider to a full
+                // character width.
+                b.draw_terminal_divider(quadraui::Rect::new(
+                    split.divider_x,
+                    content_y,
+                    1.0,
+                    content_h,
+                ));
+            } else if let Some(ref single) = td.single {
+                b.draw_terminal(body, single);
+            }
+
+            let scrollbar = units.terminal_scrollbar.and_then(|gutter| {
+                let g = terminal_scrollbar_geometry(term, visible_rows)?;
+                let sb_w = gutter as f32;
+                let sb_x = rect.x + rect.width - sb_w;
+                // `terminal_scrollbar_geometry` reports fractions in `f64`;
+                // every quadraui rect is `f32`.
+                let thumb_t = g.thumb_top_frac as f32 * content_h;
+                let thumb_h = (g.thumb_height_frac as f32 * content_h).max(4.0);
+                Some(quadraui::SurfaceScrollbar {
+                    axis: quadraui::ScrollAxis::Vertical,
+                    track_bounds: quadraui::Rect::new(sb_x, content_y, sb_w, content_h),
+                    thumb_bounds: quadraui::Rect::new(
+                        sb_x + 1.0,
+                        content_y + thumb_t,
+                        sb_w - 2.0,
+                        thumb_h,
+                    ),
+                    total_items: g.total_items,
+                    visible_items: g.visible_items,
+                    scroll_offset: term.scroll_offset,
+                    inverted: true,
+                })
+            });
+            engine
+                .scroll_surfaces
+                .borrow_mut()
+                .push(quadraui::ScrollSurface {
+                    id: quadraui::WidgetId::new("terminal_scrollback"),
+                    bounds: body,
+                    scrollbar,
+                });
+        }
+        BottomPanelKind::DebugOutput => {
+            if content_h <= 0.0 {
+                return;
+            }
+            // A **fifth** divergence, and the one with a visible symptom: the
+            // debug output has no toolbar row of its own, so its body starts
+            // one line below the tab strip, not two. TUI had this right
+            // (`content_area`, `rect.y + 1`); GTK reused the terminal arm's
+            // `content_y` (`rect.y + 2 * lh`) and so left a blank line under
+            // the tab strip and clipped one line off the bottom of the output.
+            // TUI's geometry is the correct one and is what both compose now.
+            let body =
+                quadraui::Rect::new(rect.x, rect.y + lh, rect.width, (rect.height - lh).max(0.0));
+            let td = debug_output_to_text_display(
+                &screen.bottom_tabs.output_lines,
+                engine.debug_output_scroll,
+                engine.debug_output_auto_scroll,
+            );
+            let layout = b.text_display_layout(body, &td);
+            b.draw_text_display(body, &td);
+            let scrollbar =
+                layout
+                    .scrollbar_bounds
+                    .zip(layout.thumb_bounds)
+                    .map(|(track, thumb)| quadraui::SurfaceScrollbar {
+                        axis: quadraui::ScrollAxis::Vertical,
+                        track_bounds: quadraui::Rect::new(
+                            body.x + track.x,
+                            body.y + track.y,
+                            track.width,
+                            track.height,
+                        ),
+                        thumb_bounds: quadraui::Rect::new(
+                            body.x + thumb.x,
+                            body.y + thumb.y,
+                            thumb.width,
+                            thumb.height,
+                        ),
+                        total_items: td.lines.len(),
+                        visible_items: layout.visible_lines.len(),
+                        scroll_offset: layout.resolved_scroll_offset,
+                        inverted: false,
+                    });
+            engine
+                .scroll_surfaces
+                .borrow_mut()
+                .push(quadraui::ScrollSurface {
+                    id: quadraui::WidgetId::new("debug_output"),
+                    bounds: body,
+                    scrollbar,
+                });
+        }
+    }
+}
+
 /// One tab bar as [`paint_tab_bars`] left it.
 ///
 /// `hits` is the geometry the rasteriser *actually resolved while painting*,
@@ -9057,18 +9607,16 @@ pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
         elems.push(UiElement::TabBar);
     }
 
-    // Diff toolbar (single-group)
-    if layout.diff_toolbar.is_some() {
+    // Diff toolbar. One branch, not two: `group_tab_bars` is populated for
+    // every group count (#551), so the `editor_group_split.is_some()` split
+    // that used to guard a single-group mirror beside this loop was only ever
+    // asking "how many groups", never "is a toolbar drawn" (#765).
+    if layout
+        .group_tab_bars
+        .iter()
+        .any(|gtb| gtb.diff_toolbar.is_some())
+    {
         elems.push(UiElement::DiffToolbar);
-    }
-    // Diff toolbar (per-group)
-    if layout.editor_group_split.is_some() {
-        for gtb in &layout.group_tab_bars {
-            if gtb.diff_toolbar.is_some() {
-                elems.push(UiElement::DiffToolbar);
-                break; // one element is enough to flag presence
-            }
-        }
     }
 
     // Breadcrumbs
@@ -9306,17 +9854,14 @@ pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
         elems.push(UiElement::MenuDropdown);
     }
 
-    // draw_tab_bar() / draw_group_tab_bar(): diff toolbar
-    if layout.diff_toolbar.is_some() {
+    // draw_tab_bar() / draw_group_tab_bar(): diff toolbar. One branch — see
+    // `collect_expected_ui_elements` above (#765).
+    if layout
+        .group_tab_bars
+        .iter()
+        .any(|gtb| gtb.diff_toolbar.is_some())
+    {
         elems.push(UiElement::DiffToolbar);
-    }
-    if layout.editor_group_split.is_some() {
-        for gtb in &layout.group_tab_bars {
-            if gtb.diff_toolbar.is_some() {
-                elems.push(UiElement::DiffToolbar);
-                break;
-            }
-        }
     }
 
     elems.sort();
@@ -9356,18 +9901,14 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
         elems.push(UiElement::TabBar);
     }
 
-    // Diff toolbar (single-group, rendered as part of tab bar)
-    if layout.diff_toolbar.is_some() {
+    // Diff toolbar (rendered as part of the tab bar). One branch — see
+    // `collect_expected_ui_elements` above (#765).
+    if layout
+        .group_tab_bars
+        .iter()
+        .any(|gtb| gtb.diff_toolbar.is_some())
+    {
         elems.push(UiElement::DiffToolbar);
-    }
-    // Diff toolbar (per-group)
-    if layout.editor_group_split.is_some() {
-        for gtb in &layout.group_tab_bars {
-            if gtb.diff_toolbar.is_some() {
-                elems.push(UiElement::DiffToolbar);
-                break;
-            }
-        }
     }
 
     // Breadcrumbs
@@ -9509,14 +10050,22 @@ pub struct ScreenLayout {
     pub signature_help: Option<SignatureHelp>,
     /// Menu bar strip data, or `None` when the bar is hidden.
     pub menu_bar_visible: bool,
-    /// **#735 audit verdict: deliberately not composed.** Zero paint readers
-    /// on either backend, and that is correct — `MenuSystem` owns its own
-    /// `open_item`, and both backends' `OverlayOp::MenuDropdown` rung just
-    /// calls `MenuSystem::render`, which decides for itself whether a dropdown
-    /// body is open. This field's only consumers are the
+    /// **#765 audit verdict (#735 slice 4): deliberately not composed — kept.**
+    /// Re-run and confirmed unchanged from slice 1's finding, and this closes
+    /// the #592 field table: `diff_toolbar`, the other field slice 1 left open,
+    /// was deleted by this slice (see the note where it used to sit, above).
+    ///
+    /// Zero paint readers on either backend, and that is correct — `MenuSystem`
+    /// owns its own `open_item`, and both backends' `OverlayOp::MenuDropdown`
+    /// rung just calls `MenuSystem::render`, which decides for itself whether a
+    /// dropdown body is open. This field's only consumers are the
     /// `collect_*_ui_elements` parity harnesses below, which need the flag as
     /// *state* to declare the expected element set. Keeping it is what lets
-    /// those harnesses assert on a dropdown without reaching into `MenuSystem`.
+    /// those harnesses assert on a dropdown without reaching into `MenuSystem`
+    /// — deleting it would mean each harness re-deriving `menu_system
+    /// .borrow().is_open()`, which is a *worse* coupling, not a better one.
+    /// This is therefore a "populated but not painted" field that is **not** a
+    /// #587/#592 defect: nothing routes input against it either.
     pub menu_dropdown_open: bool,
     /// Debug toolbar strip data, or `None` when hidden and no active session.
     pub debug_toolbar: Option<DebugToolbarData>,
@@ -9571,17 +10120,20 @@ pub struct ScreenLayout {
     pub editor_hover: Option<EditorHoverPopupData>,
     /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
     pub diff_peek: Option<DiffPeekPopup>,
-    /// Diff toolbar data for the single-group tab bar.
-    ///
-    /// **#735 audit verdict: superseded, never composed.** Zero readers on
-    /// either backend. #551 made `group_tab_bars` populated for *every* group
-    /// count (a single group is a split of one), and both backends paint from
-    /// the per-group [`GroupTabBar::diff_toolbar`] via `tab_bar_draw_targets`.
-    /// This single-group mirror survives only as input to
-    /// `collect_expected_ui_elements` / `collect_ui_elements_tui` below, and to
-    /// TUI's `mouse.rs` hit-test. Fold those onto `group_tab_bars` and it can
-    /// go.
-    pub diff_toolbar: Option<DiffToolbarData>,
+    // `diff_toolbar` used to sit here — the single-group mirror of
+    // `GroupTabBar::diff_toolbar`.
+    //
+    // **#765 audit verdict (#735 slice 4): superseded, deleted.** Slice 1
+    // recorded it as "never composed" and left the removal to whichever slice
+    // could fold its last readers away; this is that slice. #551 made
+    // `group_tab_bars` populated for *every* group count (a single group is a
+    // split of one), and both backends have painted from the per-group
+    // `gtb.diff_toolbar` via `tab_bar_draw_targets` ever since. Its only
+    // remaining readers were the three `collect_*_ui_elements` parity
+    // harnesses, each of which already carried a per-group branch immediately
+    // beside the single-group one; those two branches are now the one
+    // unconditional loop over `group_tab_bars` that the paint itself uses.
+    // (TUI's `mouse.rs` never read this field — it reads `gtb.diff_toolbar`.)
     /// Modal dialog popup — `Some` when a dialog is open.
     pub dialog: Option<DialogPanel>,
     /// Inline find/replace overlay — `Some` when the find/replace popup is open.
@@ -12952,21 +13504,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         vec![]
     };
 
-    // Compute diff toolbar for single-group mode (multi-group has it on GroupTabBar).
-    let diff_toolbar = if n < 2 && engine.is_in_diff_view() {
-        let (_, total) = engine.diff_unified_regions();
-        let change_label = engine
-            .diff_current_change_index()
-            .map(|(c, t)| format!("{c} of {t}"));
-        Some(DiffToolbarData {
-            change_label,
-            total_changes: total,
-            unchanged_hidden: engine.diff_unchanged_hidden,
-        })
-    } else {
-        None
-    };
-
     let tab_scroll_offset_single = engine
         .editor_groups
         .get(&engine.active_group)
@@ -12990,8 +13527,14 @@ pub fn build_screen_layout_with_breadcrumb_row(
             .map(|(_, r)| r.x + r.width)
             .fold(f64::MIN, f64::max);
         let bar_width_cells = ((max_r - min_x) / char_width).round().max(0.0) as u16;
+        // Sourced from the group's *own* `GroupTabBar` rather than from a
+        // parallel single-group `ScreenLayout::diff_toolbar` mirror, which
+        // #765 deleted. This arm only runs when `n < 2`, so `group_tab_bars`
+        // holds exactly the one bar these regions describe — and it is the
+        // same `diff_toolbar` the paint reads, so the hit regions cannot
+        // disagree with the buttons they are meant to cover.
+        let diff_toolbar = group_tab_bars.first().and_then(|g| g.diff_toolbar.as_ref());
         let diff_label_cols = diff_toolbar
-            .as_ref()
             .and_then(|dt| dt.change_label.as_ref())
             .map(|l| l.len() as u16 + 1)
             .unwrap_or(0);
@@ -13078,7 +13621,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
             anchor_line: dp.anchor_line,
             hunk_lines: dp.hunk_lines.clone(),
         }),
-        diff_toolbar,
         panel_hover: engine.panel_hover.as_ref().map(|ph| PanelHoverPopupData {
             rendered: ph.rendered.clone(),
             links: ph.links.clone(),

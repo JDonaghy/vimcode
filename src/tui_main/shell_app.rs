@@ -401,7 +401,13 @@ pub struct TuiShellApp {
     /// here and `tick()` applies them on the next pass — see `tick`'s own
     /// comment for why a one-frame lag replaces the legacy two-pass repaint.
     tab_visible_counts: RefCell<Vec<(GroupId, usize)>>,
-    debug_toolbar_rect: Cell<quadraui::Rect>,
+    /// Rect the last frame painted the debug toolbar into, or the zero rect
+    /// when that frame composed no `BottomOp::DebugToolbar` — the cache
+    /// `route_chrome_click` hit-tests button clicks against. An `Rc` so the
+    /// `TuiDriver` harness can observe it across frames: quadraui's
+    /// `driver_with_shell` wraps the app in a shell adapter, so `driver.app()`
+    /// cannot reach `TuiShellApp`'s own fields (#765).
+    debug_toolbar_rect: std::rc::Rc<Cell<quadraui::Rect>>,
     last_click_time: Cell<Instant>,
     last_click_pos: Cell<(u16, u16)>,
     cmd_sel: Cell<Option<(usize, usize)>>,
@@ -460,6 +466,13 @@ pub struct TuiShellApp {
     /// editor column in the same order" assertable rather than promised in
     /// comments, which is how GTK came to omit the group dividers entirely.
     composed_editor_band: std::rc::Rc<RefCell<Vec<render::EditorOp>>>,
+    /// The bottom-band twin of [`Self::composed_editor_band`] (#765): written
+    /// by the [`render::compose_bottom_band`] walk, one [`render::BottomOp`]
+    /// pushed by every arm that actually composed its rung. Same `Rc`
+    /// rationale, same role — and this backend had its own share of what it
+    /// catches: the separated status line was composed two rungs early, and
+    /// `debug_toolbar_rect` was never cleared when the toolbar hid.
+    composed_bottom_band: std::rc::Rc<RefCell<Vec<render::BottomOp>>>,
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
@@ -522,6 +535,15 @@ pub struct TuiShellApp {
     ///   That's a genuine soundness bug, not just a slowdown, so this must
     ///   never run under test.
     live: bool,
+}
+
+/// A ratatui cell rect as the quadraui `Rect` every shared painter takes.
+///
+/// TUI composes in whole cells and quadraui's primitives are `f32`-based, so
+/// this conversion sat inline at every bottom-band call site — four times in
+/// `render_content` alone, and again in `draw_frame`.
+pub(super) fn to_q_rect(r: Rect) -> quadraui::Rect {
+    quadraui::Rect::new(r.x as f32, r.y as f32, r.width as f32, r.height as f32)
 }
 
 impl TuiShellApp {
@@ -792,7 +814,7 @@ impl TuiShellApp {
             fr_input_dragging: false,
             last_layout: RefCell::new(None),
             tab_visible_counts: RefCell::new(Vec::new()),
-            debug_toolbar_rect: Cell::new(quadraui::Rect::default()),
+            debug_toolbar_rect: std::rc::Rc::new(Cell::new(quadraui::Rect::default())),
             last_click_time: Cell::new(now.checked_sub(Duration::from_secs(1)).unwrap_or(now)),
             last_click_pos: Cell::new((0, 0)),
             cmd_sel: Cell::new(None),
@@ -816,6 +838,7 @@ impl TuiShellApp {
             painted_overlay_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             composed_chrome_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             composed_editor_band: std::rc::Rc::new(RefCell::new(Vec::new())),
+            composed_bottom_band: std::rc::Rc::new(RefCell::new(Vec::new())),
             last_sidebar_refresh: Cell::new(now),
             yank_hl_deadline: Cell::new(None),
             tab_switcher_last_cycle: Cell::new(None),
@@ -1629,154 +1652,6 @@ impl ShellApp for TuiShellApp {
         // regardless — always `None` here).
         let chrome = bottom_chrome_rects_for_shell_content(&self.engine, &screen, area);
 
-        if let Some(ref qf) = screen.quickfix {
-            render_quickfix_panel(
-                chrome.quickfix,
-                qf,
-                self.quickfix_scroll_top,
-                &theme,
-                backend,
-            );
-        }
-
-        // ── Separated status line (#605) ─────────────────────────────────
-        // Shown above the terminal panel when `window_status_line` is on but
-        // `status_line_above_terminal` is off — `render_window_status_line`
-        // was already trait-pure (#601 widened it), so this is a straight
-        // port of `draw_frame`'s own block.
-        if let Some(ref status) = screen.separated_status_line {
-            render_window_status_line(
-                backend,
-                chrome.separated_status.x,
-                chrome.separated_status.y,
-                chrome.separated_status.width,
-                status,
-                &theme,
-            );
-        }
-
-        if chrome.bottom_panel.height > 0 {
-            self.engine.bottom_panel_geometry.replace(Some(
-                crate::core::engine::BottomPanelGeometry {
-                    top_y: chrome.bottom_panel.y as f64,
-                    height: chrome.bottom_panel.height as f64,
-                    toolbar_y: 1.0,
-                    content_y: 2.0,
-                    content_row_h: 1.0,
-                },
-            ));
-            let tab_bar_area = Rect {
-                x: chrome.bottom_panel.x,
-                y: chrome.bottom_panel.y,
-                width: chrome.bottom_panel.width,
-                height: 1,
-            };
-            let content_area = Rect {
-                x: chrome.bottom_panel.x,
-                y: chrome.bottom_panel.y + 1,
-                width: chrome.bottom_panel.width,
-                height: chrome.bottom_panel.height.saturating_sub(1),
-            };
-            let hits = render_bottom_panel_tabs(
-                backend,
-                tab_bar_area,
-                &self.engine.bottom_panel_kind,
-                self.engine.terminal_open,
-                !screen.bottom_tabs.output_lines.is_empty(),
-                &theme,
-            );
-            self.engine.bottom_tab_bar_hits.replace(Some(hits));
-            match self.engine.bottom_panel_kind {
-                render::BottomPanelKind::Terminal => {
-                    if let Some(ref term) = screen.bottom_tabs.terminal {
-                        let toolbar_area = Rect {
-                            x: content_area.x,
-                            y: content_area.y,
-                            width: content_area.width,
-                            height: 1,
-                        };
-                        let hits = render_terminal_toolbar(backend, toolbar_area, term, &theme);
-                        self.engine.terminal_toolbar_hits.replace(Some(hits));
-                        let term_content = Rect {
-                            x: content_area.x,
-                            y: content_area.y + 1,
-                            width: content_area.width,
-                            height: content_area.height.saturating_sub(1),
-                        };
-                        render_terminal_panel_content(
-                            backend,
-                            term_content,
-                            term,
-                            &theme,
-                            &self.engine,
-                        );
-                        self.engine
-                            .scroll_surfaces
-                            .borrow_mut()
-                            .push(quadraui::ScrollSurface {
-                                id: quadraui::WidgetId::new("terminal_scrollback"),
-                                bounds: quadraui::Rect::new(
-                                    term_content.x as f32,
-                                    term_content.y as f32,
-                                    term_content.width as f32,
-                                    term_content.height as f32,
-                                ),
-                                scrollbar: None,
-                            });
-                    }
-                }
-                render::BottomPanelKind::DebugOutput => {
-                    let td = render::debug_output_to_text_display(
-                        &screen.bottom_tabs.output_lines,
-                        self.engine.debug_output_scroll,
-                        self.engine.debug_output_auto_scroll,
-                    );
-                    let q_rect = quadraui::Rect::new(
-                        content_area.x as f32,
-                        content_area.y as f32,
-                        content_area.width as f32,
-                        content_area.height as f32,
-                    );
-                    let td_layout = backend.text_display_layout(q_rect, &td);
-                    backend.draw_text_display(q_rect, &td);
-                    let scrollbar = td_layout.scrollbar_bounds.zip(td_layout.thumb_bounds).map(
-                        |(track, thumb)| {
-                            let offset_y = q_rect.y;
-                            quadraui::SurfaceScrollbar {
-                                axis: quadraui::ScrollAxis::Vertical,
-                                track_bounds: quadraui::Rect::new(
-                                    q_rect.x + track.x,
-                                    offset_y + track.y,
-                                    track.width,
-                                    track.height,
-                                ),
-                                thumb_bounds: quadraui::Rect::new(
-                                    q_rect.x + thumb.x,
-                                    offset_y + thumb.y,
-                                    thumb.width,
-                                    thumb.height,
-                                ),
-                                total_items: td.lines.len(),
-                                visible_items: td_layout.visible_lines.len(),
-                                scroll_offset: td_layout.resolved_scroll_offset,
-                                inverted: false,
-                            }
-                        },
-                    );
-                    self.engine
-                        .scroll_surfaces
-                        .borrow_mut()
-                        .push(quadraui::ScrollSurface {
-                            id: quadraui::WidgetId::new("debug_output"),
-                            bounds: q_rect,
-                            scrollbar,
-                        });
-                }
-            }
-        } else {
-            self.engine.bottom_panel_geometry.replace(None);
-        }
-
         // ─────────────────────────────────────────────────────────────────
         // #605 (Stage 6 parity sweep): the rest of `draw_frame`'s tail, in
         // its exact paint order. Everything below was already a
@@ -1799,16 +1674,130 @@ impl ShellApp for TuiShellApp {
             height: win.height.round() as u16,
         };
 
-        // ── Debug toolbar strip ──────────────────────────────────────────
-        if screen.debug_toolbar.is_some() {
-            let q_rect = quadraui::Rect::new(
-                chrome.debug_toolbar.x as f32,
-                chrome.debug_toolbar.y as f32,
-                chrome.debug_toolbar.width as f32,
-                chrome.debug_toolbar.height as f32,
-            );
-            self.debug_toolbar_rect.set(q_rect);
-            render::draw_debug_toolbar(backend, &self.engine, q_rect);
+        // ══ Bottom band (#765, #735 slice 4) ═════════════════════════════
+        //
+        // Composed from `render::compose_bottom_band` — the single ordered
+        // artefact both backends walk for the chrome stacked below the editor
+        // column, exactly as `EDITOR_Z_ORDER` (above) is for the column itself
+        // and `CHROME_Z_ORDER` (below) for the surrounding chrome. Geometry
+        // stays here, in cells; only the *order* and the *gates* moved.
+        // `BOTTOM_Z_ORDER`'s doc comment records the five divergences this
+        // convergence closed — including the two this backend owned: the
+        // separated status line composed two rungs early (contradicting this
+        // file's *own* `bottom_chrome_rects_for_shell_content` constraint
+        // order), and `debug_toolbar_rect` never cleared when the toolbar hid.
+        //
+        // Caches whose owning rung may be gated off are cleared *here*, before
+        // the walk, never from an `else` arm inside it: `compose_bottom_band`
+        // returns only the live rungs, so an absent rung has no arm to run.
+        self.engine.bottom_panel_geometry.replace(None);
+        self.debug_toolbar_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        self.hover_popup_rect.set(None);
+        self.hover_link_rects.borrow_mut().clear();
+
+        let mut composed_bottom: Vec<render::BottomOp> = Vec::new();
+        for op in render::compose_bottom_band(
+            &self.engine,
+            &screen,
+            layout.sidebar_content_bounds.is_some(),
+        ) {
+            match op {
+                render::BottomOp::Quickfix => {
+                    let Some(ref qf) = screen.quickfix else {
+                        continue;
+                    };
+                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                    render::paint_quickfix_rung(
+                        backend,
+                        qf,
+                        to_q_rect(chrome.quickfix),
+                        // Unlike GTK's stateless recompute, this offset is
+                        // carried across frames so `:cnext` can advance it.
+                        self.quickfix_scroll_top,
+                    );
+                    composed_bottom.push(render::BottomOp::Quickfix);
+                }
+                render::BottomOp::BottomPanel => {
+                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                    render::paint_bottom_panel_rung(
+                        backend,
+                        &self.engine,
+                        &screen,
+                        &theme,
+                        to_q_rect(chrome.bottom_panel),
+                        render::BottomPanelUnits::CELL,
+                    );
+                    composed_bottom.push(render::BottomOp::BottomPanel);
+                }
+                render::BottomOp::DebugToolbar => {
+                    let q_rect = to_q_rect(chrome.debug_toolbar);
+                    self.debug_toolbar_rect.set(q_rect);
+                    render::draw_debug_toolbar(backend, &self.engine, q_rect);
+                    composed_bottom.push(render::BottomOp::DebugToolbar);
+                }
+                // Shown below the terminal panel when `window_status_line` is
+                // on but `status_line_above_terminal` is off. Composed *after*
+                // the bottom panel and the debug toolbar now, which is where
+                // `bottom_chrome_rects_for_shell_content` has always reserved
+                // its row — this backend used to paint it two rungs earlier.
+                render::BottomOp::SeparatedStatus => {
+                    let Some(ref status) = screen.separated_status_line else {
+                        continue;
+                    };
+                    backend.set_theme(super::quadraui_tui::q_theme(&theme));
+                    let _ = render::paint_separated_status_rung(
+                        backend,
+                        status,
+                        to_q_rect(chrome.separated_status),
+                    );
+                    composed_bottom.push(render::BottomOp::SeparatedStatus);
+                }
+                // Anchored just right of the sidebar's own right edge, which in
+                // the shell layout is exactly `main_content_bounds.x`
+                // (`AppShell` puts the resize divider between them and `area.x`
+                // is the first column past it) — the same column `draw_frame`
+                // computes as `sep_x + 1`.
+                //
+                // Composed before the chrome band rather than after it, which
+                // is where this backend used to paint it. Safe, and now
+                // matching GTK, because the popup's width is capped to what
+                // fits *right* of that anchor, so it can never be shifted back
+                // over the sidebar the chrome band paints.
+                //
+                // The rasteriser stays per-backend here — the `EditorOp
+                // ::Windows` precedent. TUI's `hover_popup_rect` /
+                // `hover_link_rects` caches are `u16` cell tuples that the
+                // mouse router reads directly, where GTK's are `f64` pixels
+                // carrying an extra `is_native` flag; converging the two cache
+                // *shapes* is a mouse-routing change, not a composition one,
+                // and belongs with whichever slice owns that. What #765 fixes
+                // is that the rung is now composed — and cleared — at the top
+                // level on both backends.
+                render::BottomOp::PanelHover => {
+                    let Some(sb) = layout.sidebar_content_bounds else {
+                        continue;
+                    };
+                    let (new_rects, popup_rect) = render_panel_hover_popup(
+                        backend,
+                        &screen,
+                        &theme,
+                        area.x,
+                        sb.y.round() as u16,
+                        sb.height.round() as u16,
+                        win_area,
+                    );
+                    *self.hover_link_rects.borrow_mut() = new_rects;
+                    self.hover_popup_rect.set(popup_rect);
+                    composed_bottom.push(render::BottomOp::PanelHover);
+                }
+            }
+        }
+        *self.composed_bottom_band.borrow_mut() = composed_bottom;
+        // Debug-only: a rung hoisted back out of the walk, or composed early,
+        // shows up here as a diagnosable string rather than a visual mystery.
+        if let Err(why) = render::check_bottom_band_order(&self.composed_bottom_band.borrow()) {
+            debug_assert!(false, "{why}");
         }
 
         // ══ Chrome band (#763, #735 slice 2) ═════════════════════════════
@@ -1959,34 +1948,9 @@ impl ShellApp for TuiShellApp {
             debug_assert!(false, "TUI {why}");
         }
 
-        // ── Panel hover popup ────────────────────────────────────────────
-        // Anchored just right of the sidebar's own right edge, which in the
-        // shell layout is exactly `main_content_bounds.x` (`AppShell` puts
-        // the resize divider between them and `area.x` is the first column
-        // past it) — the same column `draw_frame` computes as `sep_x + 1`.
-        {
-            let mut rects = self.hover_link_rects.borrow_mut();
-            rects.clear();
-            self.hover_popup_rect.set(None);
-            if let Some(sb) = layout.sidebar_content_bounds {
-                if self.engine.app_shell.sidebar_visible()
-                    && (self.sidebar.ext_panel_name.is_some()
-                        || self.engine.active_panel_is(PANEL_GIT))
-                {
-                    let (new_rects, popup_rect) = render_panel_hover_popup(
-                        backend,
-                        &screen,
-                        &theme,
-                        area.x,
-                        sb.y.round() as u16,
-                        sb.height.round() as u16,
-                        win_area,
-                    );
-                    *rects = new_rects;
-                    self.hover_popup_rect.set(popup_rect);
-                }
-            }
-        }
+        // The panel hover popup used to be composed here, after the whole
+        // chrome band. #765 moved it into the `BottomOp::PanelHover` rung
+        // above, matching GTK — see that arm for why the move is z-safe.
 
         // ── Folder / workspace picker modal ──────────────────────────────
         if let Some(ref picker) = self.folder_picker {
@@ -6452,6 +6416,184 @@ mod tests {
                 .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c)),
             "the rung was not composed, so no braille may reach the cells; \
              screen:\n{screen}"
+        );
+    }
+
+    // ── #765 / #735 slice 4: the shared bottom band ────────────────────────
+    //
+    // `gtk/testing.rs`'s `mod bottom_band_order` carries the GTK half and
+    // asserts against the **same expected `Vec<BottomOp>`**
+    // (`render::bottom_band_fixture`) for the same engine state, exactly as
+    // the chrome-, editor- and overlay-band pairs do.
+
+    /// Quickfix open with an item, the bottom panel up on Debug Output, the
+    /// debug toolbar visible and the per-window status line extracted: every
+    /// stacked bottom rung live. The hover popup needs a live sidebar dwell
+    /// and is covered separately.
+    ///
+    /// Every knob is set explicitly rather than inherited from
+    /// `Settings::default()` (#762) — an ambient default that flips would
+    /// silently turn this from a four-rung assertion into a three-rung one.
+    /// Mirrors `gtk/testing.rs`'s `engine_with_every_bottom_rung`.
+    fn app_with_every_bottom_rung() -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = false;
+        // `separated_status_line` is `Some` only for
+        // `window_status_line && !status_line_above_terminal && panel open`.
+        app.engine.settings.window_status_line = true;
+        app.engine.settings.status_line_above_terminal = false;
+        app.engine
+            .quickfix_items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("zqxw765.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW765QF".to_string(),
+            });
+        app.engine.quickfix_open = true;
+        app.engine.bottom_panel_open = true;
+        app.engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
+        app.engine.dap_output_lines.push("ZQXW765DBG".to_string());
+        app.engine.debug_toolbar_visible = true;
+        app
+    }
+
+    /// **RED against unfixed `develop`** in two independent ways. (1) This
+    /// backend composed `SeparatedStatus` *second*, before `BottomPanel` and
+    /// `DebugToolbar` — contradicting its own
+    /// `bottom_chrome_rects_for_shell_content`, whose constraint array has
+    /// always reserved that row *after* the debug toolbar. Against the unfixed
+    /// order the record comes back
+    /// `[Quickfix, SeparatedStatus, BottomPanel, DebugToolbar]`, which is not
+    /// `bottom_band_fixture(false)` and additionally trips
+    /// `check_bottom_band_order`'s `debug_assert` in `render_content` on the
+    /// way past. (2) GTK composed the same four in yet another order, so no
+    /// single expected vector could satisfy both backends at once. Both were
+    /// re-introduced, observed red, and restored before committing.
+    #[test]
+    fn bottom_band_composes_in_canonical_order_via_shell_app() {
+        let app = app_with_every_bottom_rung();
+        let band = app.composed_bottom_band.clone();
+        let driver = driver_with_shell(app, config(), 100, 40);
+        let screen = driver.screen();
+
+        assert_eq!(
+            *band.borrow(),
+            render::bottom_band_fixture(false),
+            "expected bottom band differs from the GTK twin's \
+             (`bottom_band_composes_in_canonical_order_via_gtk_driver`); \
+             screen:\n{screen}"
+        );
+
+        // Composition, not just bookkeeping (#587/#592): the rungs the record
+        // claims must have reached the cells.
+        assert!(
+            driver.find_bounds("ZQXW765QF").is_some(),
+            "Quickfix was composed but its item never painted; screen:\n{screen}"
+        );
+        assert!(
+            driver.find_bounds("ZQXW765DBG").is_some(),
+            "BottomPanel was composed but the debug output never painted; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// The separated status line is composed **after** the bottom panel and
+    /// the debug toolbar, and lands on the row
+    /// `bottom_chrome_rects_for_shell_content` reserved for it — below both.
+    ///
+    /// **RED against unfixed `develop`**: this is the ordering half of the
+    /// divergence above, stated as *geometry* rather than as a record, so it
+    /// fails even if someone "fixes" the record without moving the paint. The
+    /// unfixed backend painted this rung two rungs early.
+    #[test]
+    fn separated_status_paints_below_the_bottom_panel_via_shell_app() {
+        let app = app_with_every_bottom_rung();
+        let band = app.composed_bottom_band.clone();
+        let driver = driver_with_shell(app, config(), 100, 40);
+        let screen = driver.screen();
+
+        let composed = band.borrow().clone();
+        let pos = |op: render::BottomOp| composed.iter().position(|o| *o == op);
+        assert!(
+            pos(render::BottomOp::SeparatedStatus) > pos(render::BottomOp::BottomPanel),
+            "SeparatedStatus must be composed after BottomPanel; got {composed:?}"
+        );
+        assert!(
+            pos(render::BottomOp::SeparatedStatus) > pos(render::BottomOp::DebugToolbar),
+            "SeparatedStatus must be composed after DebugToolbar; got {composed:?}"
+        );
+
+        // …and the paint agrees with the record, top to bottom: the quickfix
+        // item is painted strictly above the bottom panel's debug output,
+        // which is the geometric order `BOTTOM_Z_ORDER` encodes. A record that
+        // said one thing while the rects said another would fail here.
+        let qf = driver
+            .find_bounds("ZQXW765QF")
+            .unwrap_or_else(|| panic!("quickfix must have painted; screen:\n{screen}"));
+        let dbg = driver
+            .find_bounds("ZQXW765DBG")
+            .unwrap_or_else(|| panic!("bottom panel must have painted; screen:\n{screen}"));
+        assert!(
+            qf.y < dbg.y,
+            "the quickfix panel must paint above the bottom panel \
+             (quickfix at row {}, debug output at row {}); screen:\n{screen}",
+            qf.y,
+            dbg.y
+        );
+    }
+
+    /// The debug toolbar's cached rect must be **cleared** when the toolbar is
+    /// not composed.
+    ///
+    /// **RED against unfixed `develop`**: this backend's debug-toolbar rung had
+    /// no `else` at all — GTK's zeroed its two equivalent caches, TUI's zeroed
+    /// nothing — so `debug_toolbar_rect` kept the last frame's rect forever
+    /// once the toolbar hid. `route_chrome_click` hit-tests against that rect,
+    /// so clicks on the row the toolbar *used to* occupy kept resolving to
+    /// toolbar buttons. Re-introduce the missing clear (drop the pre-walk
+    /// `debug_toolbar_rect.set(default)`) and this fails on the second frame.
+    #[test]
+    fn hiding_the_debug_toolbar_clears_its_cached_rect_via_shell_app() {
+        let app = app_with_every_bottom_rung();
+        let band = app.composed_bottom_band.clone();
+        let rect = app.debug_toolbar_rect.clone();
+        let mut driver = driver_with_shell(app, config(), 100, 40);
+        driver.render();
+        assert!(
+            band.borrow().contains(&render::BottomOp::DebugToolbar),
+            "precondition: the toolbar rung is composed while visible"
+        );
+        assert!(
+            rect.get().height > 0.0,
+            "precondition: a visible toolbar caches a non-degenerate rect, got {:?}",
+            rect.get()
+        );
+
+        // Hide it the way a user does — Shift+F5 is `stop`, and `dap_stop`
+        // clears `debug_toolbar_visible` (#762's shared debugger F-key rung).
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::F(5)),
+            quadraui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        driver.render();
+
+        assert!(
+            !band.borrow().contains(&render::BottomOp::DebugToolbar),
+            "hiding the toolbar must drop its rung from the band; got {:?}",
+            band.borrow()
+        );
+        assert_eq!(
+            rect.get().height,
+            0.0,
+            "hiding the toolbar must clear the rect `route_chrome_click` \
+             hit-tests against, or clicks keep resolving to buttons that are \
+             no longer painted; got {:?}",
+            rect.get()
         );
     }
 

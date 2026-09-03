@@ -136,6 +136,12 @@ pub struct Harness<A: AppLogic> {
     /// `editor_band_*_via_shell_app` tests assert against the same expected
     /// `Vec<EditorOp>` for the same engine state.
     pub composed_editor_band: Rc<RefCell<Vec<crate::render::EditorOp>>>,
+    /// The bottom rungs the last frame actually composed, in composition order
+    /// (#765). The GTK half of the cross-backend bottom-band assertion —
+    /// `TuiShellApp` carries the identical `composed_bottom_band` and its
+    /// `bottom_band_*_via_shell_app` tests assert against the same expected
+    /// `Vec<BottomOp>` for the same engine state.
+    pub composed_bottom_band: Rc<RefCell<Vec<crate::render::BottomOp>>>,
     /// The sidebar content rect the last frame painted the active panel into,
     /// or `None` if the sidebar was hidden. The sidebar twin of
     /// [`Self::screen_layout`]'s window rects — aim panel clicks at this rather
@@ -406,6 +412,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let painted_overlay_band = Rc::clone(&app.painted_overlay_band);
     let composed_chrome_band = Rc::clone(&app.composed_chrome_band);
     let composed_editor_band = Rc::clone(&app.composed_editor_band);
+    let composed_bottom_band = Rc::clone(&app.composed_bottom_band);
     let status_segment_map = Rc::clone(&app.status_segment_map);
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
@@ -431,6 +438,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         painted_overlay_band,
         composed_chrome_band,
         composed_editor_band,
+        composed_bottom_band,
         status_segment_map,
         separated_status_bar_rect,
         title_bar_rect,
@@ -6456,6 +6464,128 @@ mod editor_band_order {
             crate::render::check_editor_band_order(&band),
             Ok(()),
             "the surviving rungs must still be in canonical order"
+        );
+    }
+}
+
+/// #765 / #735 slice 4: the shared **bottom band**.
+///
+/// Both backends now walk `render::compose_bottom_band` and record what they
+/// composed into `composed_bottom_band`; these tests read that record and the
+/// pixels behind it.
+///
+/// The TUI half lives in `tui_main/shell_app.rs` (`bottom_band_*_via_shell_app`)
+/// and asserts against the **same expected `Vec<BottomOp>`** —
+/// `render::bottom_band_fixture`, a single `#[cfg(test)]` fn compiled into both
+/// bin targets — for the same engine state, exactly as the chrome-, editor- and
+/// overlay-band pairs above do.
+#[cfg(test)]
+mod bottom_band_order {
+    use super::*;
+
+    /// Quickfix open with an item, the bottom panel up on Debug Output, the
+    /// debug toolbar visible and the per-window status line extracted: every
+    /// stacked bottom rung live. The hover popup needs a live sidebar dwell and
+    /// is covered separately below.
+    ///
+    /// Every knob is set explicitly rather than inherited from `Settings
+    /// ::default()` (#762). Mirrors `shell_app.rs`'s
+    /// `app_with_every_bottom_rung`.
+    fn engine_with_every_bottom_rung() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        // `separated_status_line` is `Some` only for
+        // `window_status_line && !status_line_above_terminal && panel open`.
+        engine.settings.window_status_line = true;
+        engine.settings.status_line_above_terminal = false;
+        engine
+            .quickfix_items
+            .push(crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zqxw765.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW765QF".to_string(),
+            });
+        engine.quickfix_open = true;
+        engine.bottom_panel_open = true;
+        engine.bottom_panel_kind = crate::render::BottomPanelKind::DebugOutput;
+        engine.dap_output_lines.push("ZQXW765DBG".to_string());
+        engine.debug_toolbar_visible = true;
+        engine
+    }
+
+    /// **RED against unfixed `develop`**, in two independent ways. (1) This
+    /// backend composed `SeparatedStatus` *fourth* while TUI composed it
+    /// *second*, so no single expected vector could satisfy both backends at
+    /// once — the record here and the record in the TUI twin disagreed. (2) The
+    /// gate for `BottomPanel` was `el.terminal_h > 0.0` here and
+    /// `chrome.bottom_panel.height > 0` there, two restatements of
+    /// `bottom_panel_is_drawn` free to drift from it and from each other.
+    /// Hoisting any arm back out of the walk drops its `BottomOp` from this
+    /// record and trips `check_bottom_band_order`'s `debug_assert` in
+    /// `render_content` on the way. Re-introduced, observed red, restored.
+    #[test]
+    fn bottom_band_composes_in_canonical_order_via_gtk_driver() {
+        let h = harness(engine_with_every_bottom_rung(), 1400, 900);
+
+        assert_eq!(
+            *h.composed_bottom_band.borrow(),
+            crate::render::bottom_band_fixture(false),
+            "expected bottom band differs from the TUI twin's \
+             (`bottom_band_composes_in_canonical_order_via_shell_app`)"
+        );
+    }
+
+    /// The panel-hover popup is composed as the **last** bottom rung, at the
+    /// top level of the band walk — not nested inside the sidebar's own chrome
+    /// rung, which is where this backend used to keep it.
+    ///
+    /// **RED against unfixed `develop`**: there was no top-level hover rung to
+    /// record at all. The paint lived inside the `FrameOp::SidebarPanel` arm,
+    /// under `if let Some(q_sb) = layout.sidebar_content_bounds`, so nothing
+    /// observable said whether it had run — and, more to the point, **its two
+    /// cache resets lived there too**. `panel_hover_popup_rect` is what
+    /// `handle_mouse_press`'s modal arbitration hit-tests clicks against, so
+    /// any frame that skipped the sidebar rung left the router pointed at a
+    /// popup the frame had not painted — the #587/#592 input-vs-paint shape.
+    /// Hoisting the clears to before the walk (where `compose_bottom_band`
+    /// cannot gate them off) is the structural half of the fix; this test
+    /// pins the composition half.
+    ///
+    /// Note the reachability limit this test does *not* cover: the GTK shell's
+    /// sidebar visibility lives in the shell adapter's own `AppShell`, not in
+    /// `engine.app_shell`, so `GtkDriver` cannot collapse the sidebar mid-run
+    /// to exercise the stale-cache path end to end. The clear is therefore
+    /// covered structurally rather than by a failing-then-passing assertion.
+    #[test]
+    fn panel_hover_composes_as_the_last_bottom_rung_via_gtk_driver() {
+        let mut engine = engine_with_every_bottom_rung();
+        engine.show_panel_hover(
+            "source_control",
+            "item0",
+            0,
+            "**M** `src/main.rs` — modified",
+        );
+        let h = harness(engine, 1400, 900);
+
+        assert_eq!(
+            *h.composed_bottom_band.borrow(),
+            crate::render::bottom_band_fixture(true),
+            "a live sidebar dwell must add `PanelHover` to the band, after \
+             every stacked rung"
+        );
+
+        // Composition, not just bookkeeping (#587/#592): the rung the record
+        // claims must have reached the surface. `panel_hover_popup_rect` is
+        // the rect the *paint* published, and the same cache the click router
+        // reads.
+        let rect = h
+            .panel_hover_popup_rect
+            .get()
+            .expect("the composed hover rung must publish the rect it painted");
+        assert!(
+            rect.2 > 0.0 && rect.3 > 0.0,
+            "the popup must paint a non-degenerate box, got {rect:?}"
         );
     }
 }
