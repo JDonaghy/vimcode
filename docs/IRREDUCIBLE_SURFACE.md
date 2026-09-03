@@ -106,8 +106,11 @@ the actual remaining work.
    naming a missing upstream API is an unfiled issue.
 3. **Stop sizing this goal in backend line count.** The remaining ~19,200 lines are not a
    platform-porting problem, and a plan that treats them as one will keep missing its
-   projection the way the #751–#766 chain did (−3,656 against −8,700…−9,500). Size it as
-   what it is: two implementations of four entry points.
+   projection the way the #751–#766 chain did (**−728** against −8,700…−9,500 — see
+   `GOALS.md`; the −3,656 originally recorded pooled in #722–#732's dead-code
+   deletion). Size it as what it is: two implementations of four entry points — and
+   note a function-level audit puts the genuinely-duplicated part of that at only
+   ~2,000 ± 500 code lines, with 39% of the surrounding mass being comments.
 
 ## 6. Regenerating this
 
