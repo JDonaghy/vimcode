@@ -516,7 +516,42 @@ impl TuiShellApp {
     /// `tui_main::run()` currently does before entering raw mode
     /// (`mod.rs:641`-`:678`) — none of it needs a terminal or backend.
     pub fn new(file_path: Option<PathBuf>) -> Self {
-        let mut engine = Engine::new();
+        Self::from_engine(Engine::new(), file_path)
+    }
+
+    /// Test-only deterministic twin of [`TuiShellApp::new`].
+    ///
+    /// [`TuiShellApp::new`] is **ambient in two places at once**, and both of
+    /// them move the editor pane's geometry:
+    ///
+    /// 1. `Engine::new()` reads the developer's real
+    ///    `~/.config/vimcode/{settings,session}.json` off disk, and uses
+    ///    `session.explorer_visible || settings.explorer_visible_on_startup`
+    ///    to decide whether to `app_shell.hide_sidebar()` before it returns
+    ///    (#615/#634 — see [`tests::app_with_sidebar_open`]'s doc comment for
+    ///    the five tests that already learned this the hard way). A machine
+    ///    that has ever opened the explorer boots the sidebar *visible*; a
+    ///    fresh checkout or CI runner boots it *hidden*, shifting every
+    ///    editor column by `SIDEBAR_WIDTH`.
+    /// 2. `Engine::startup(None)` then calls `restore_session_files()`, which
+    ///    reopens whatever files/splits that same ambient `session.json`
+    ///    happens to list — so even the number of editor *windows* is
+    ///    machine-dependent.
+    ///
+    /// Any test that measures painted editor geometry (`find_bounds` on a
+    /// fixture line, `style_at` on a specific column) must therefore build the
+    /// app from in-memory defaults instead of inheriting the developer's box.
+    /// `Engine::new_for_test()` is the engine-level half of exactly this; this
+    /// is the shell-level half, and it runs the *same* `from_engine` body as
+    /// the production constructor so the two cannot drift.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::from_engine(Engine::new_for_test(), None)
+    }
+
+    /// Shared body of [`TuiShellApp::new`] and [`TuiShellApp::new_for_test`] —
+    /// everything except *where the engine's initial state came from*.
+    fn from_engine(mut engine: Engine, file_path: Option<PathBuf>) -> Self {
         let msv_metrics = quadraui::MsvLayoutMetrics {
             header_size: 1.0,
             divider_size: 0.0,
@@ -5516,67 +5551,106 @@ mod tests {
     ///
     /// Same probe-a-swept-cell's-*style* technique as the GTK twin (`CLAUDE.md`
     /// testing rule 1: assert on rendered output, not on state).
+    ///
+    /// # Why this test is built the way it is
+    ///
+    /// It measures painted *editor geometry*, which puts it squarely in the
+    /// #615/#634 blast radius, and the first two attempts at it were red on
+    /// other machines while green here. Three separate ambient inputs had to
+    /// go before it was reproducible anywhere:
+    ///
+    /// 1. **Ambient engine state.** `TuiShellApp::new(None)` runs the real
+    ///    `Engine::new()` (reads `~/.config/vimcode/{settings,session}.json`,
+    ///    and hides the sidebar unless that session says otherwise) *and*
+    ///    `Engine::startup(None)` → `restore_session_files()` (reopens the
+    ///    developer's own files and splits). Sidebar visible vs hidden alone
+    ///    moves every editor column by `SIDEBAR_WIDTH`; a restored split moves
+    ///    the pane outright. [`TuiShellApp::new_for_test`] is the fix — see
+    ///    its doc comment.
+    /// 2. **The sidebar-width settle.** `driver_with_shell` paints frame 1
+    ///    straight from the [`config`] helper, which leaves quadraui's generic
+    ///    20-column `default_sidebar_width` in place rather than mirroring
+    ///    `TuiShellApp::shell_config`'s #634 clamp to `SIDEBAR_WIDTH`. The
+    ///    end-of-dispatch `set_sidebar_width(self.sidebar_width)` sync in
+    ///    `handle()` re-widens it on the first event of *any* kind, so a
+    ///    column measured off frame 1 is stale from frame 2 onwards. The
+    ///    `Escape` below settles it before anything is measured.
+    /// 3. **Wall-clock double-click detection.** `TuiDriver::click` is a bare
+    ///    `MouseDown` (no release), and `mouse.rs`'s editor arm promotes a
+    ///    second `MouseDown` to `engine.mouse_double_click` when it lands on
+    ///    the *same cell* within `Duration::from_millis(400)` of the first.
+    ///    Parking the cursor and then pressing on that same cell therefore
+    ///    raced real time: fast machine → word-select-then-extend, loaded
+    ///    machine → two plain clicks. The park click below is deliberately one
+    ///    cell left of the drag press so `last_click_pos` differs and
+    ///    `is_double` is `false` regardless of how long the two dispatches
+    ///    take (the same "don't race the 400ms detector" lesson quadraui#592
+    ///    baked into `TuiDriver::double_click`).
+    ///
+    /// The assertion sweeps the whole dragged span rather than one hardcoded
+    /// probe column, so it states the property under test ("some cell the drag
+    /// swept changed how it paints") instead of a guess about which cell the
+    /// selection lands on.
     #[test]
     fn tui_editor_text_drag_paints_a_selection_through_the_shared_drag_router() {
-        let mut app = TuiShellApp::new(None);
+        // (1) Deterministic engine state — no ambient settings/session.
+        let mut app = TuiShellApp::new_for_test();
         let mut text = String::new();
         for i in 0..40 {
             text.push_str(&format!("line {i} content that is reasonably long\n"));
         }
         app.engine.buffer_mut().insert(0, &text);
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window — `new_for_test` must not have restored \
+             an ambient session's splits"
+        );
         let mut driver = driver_with_shell(app, config(), 100, 24);
 
-        // Settle the layout *before* measuring anything (see below), with an
-        // Escape — a no-op in Normal mode, but still a full `handle()`
-        // dispatch.
-        //
-        // `driver_with_shell` paints its first frame straight from the
-        // `ShellConfig` this fixture hands it, and the test `config()` helper
-        // leaves quadraui's generic 20-column `default_sidebar_width` in
-        // place rather than mirroring `TuiShellApp::shell_config`'s #634
-        // clamp of `SIDEBAR_WIDTH` (30). The end-of-dispatch
-        // `set_sidebar_width(self.sidebar_width)` sync in `handle()` then
-        // widens the sidebar to 30 on the first event of any kind, so every
-        // column measured off frame 1 is 10 cells left of where the same
-        // content sits from frame 2 onwards.
-        //
-        // Measuring first and clicking second therefore probed a *stale*
-        // column. It only actually diverged when the sidebar's own content
-        // differed across those 10 columns, which made it read as a
-        // cwd-dependent flake: the explorer lists whatever
-        // `std::env::current_dir()` holds, and `test_open_folder_resets_cwd`
-        // leaves the process cwd pointing at an empty temp dir, so under that
-        // test order the stale probe landed on blank sidebar background whose
-        // style the drag cannot change.
+        // (2) Settle the sidebar width before measuring anything.
         driver.press_named(quadraui::NamedKey::Escape);
 
         let bounds = driver
             .find_bounds("line 5 content")
             .expect("the fixture line should be painted");
+        let row = bounds.y as u16;
         let row_y = bounds.y + bounds.height / 2.0;
+        let park_x = bounds.x;
         let start_x = bounds.x + 1.0;
-        let probe_x = (bounds.x + 6.0) as u16;
         let end_x = bounds.x + 12.0;
+        let swept: Vec<u16> = (start_x as u16 + 1..=end_x as u16).collect();
+        assert!(
+            !swept.is_empty(),
+            "setup sanity: the drag must sweep at least one cell"
+        );
 
-        // Park the cursor on the row first (a plain click, not a drag) so the
-        // "before" sample already includes any cursor-line highlight — the
-        // only thing left for the gesture below to change is the selection.
-        driver.click(start_x, row_y);
-        let before = driver.style_at(probe_x, row_y as u16);
+        // (3) Park the cursor on the row first — one cell *left* of the drag
+        // press, so the press below can never be promoted to a double-click.
+        // The "before" sample then already includes any cursor-line highlight,
+        // leaving the selection as the only thing the gesture can change.
+        driver.click(park_x, row_y);
+        let before: Vec<_> = swept.iter().map(|&x| driver.style_at(x, row)).collect();
 
-        // Press to the left of the probe and drag past it while held — the
-        // press arms `DragTarget::TextSelection` on the shared `DragState`,
-        // and the very next `Drag` event is the one the regression swallowed.
+        // Press to the left of the swept span and drag across it while held —
+        // the press arms `DragTarget::TextSelection` on the shared
+        // `DragState`, and the very next `Drag` event is the one the
+        // regression swallowed.
         driver.mouse_down(start_x, row_y);
         driver.mouse_move(end_x, row_y);
         driver.mouse_up(end_x, row_y);
 
-        let after = driver.style_at(probe_x, row_y as u16);
+        let after: Vec<_> = swept.iter().map(|&x| driver.style_at(x, row)).collect();
         assert_ne!(
-            before, after,
-            "a held drag across the editor text must repaint the swept cell \
-             with the selection style; both probes read {before:?} at \
-             column {probe_x}, row {row_y}"
+            before,
+            after,
+            "a held drag across the editor text must repaint at least one \
+             swept cell with the selection style, but columns {:?} of row \
+             {row} paint identically before and after the drag ({before:?}); \
+             screen:\n{}",
+            swept,
+            driver.screen()
         );
     }
 
