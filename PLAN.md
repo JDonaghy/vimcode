@@ -6,15 +6,30 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-09-02 — **#47 re-audited, NOT started.** The chain
-> (#730→#657) is fully landed and #47 is unblocked per the dependency graph,
-> but the re-audit the issue itself mandates at pickup found the real blocker
-> is a `Backend`-trait ergonomics mismatch the issue text didn't anticipate.
-> See "#47 re-audit findings" below before attempting Stage 1.
+> **Last updated:** 2026-09-03 — **#47 re-audited, never started, and now
+> CLOSED with no code.** The chain (#730→#657) plus slices #751–#766 are fully
+> landed and milestone #7 is 0 open, but the re-audit #47 mandates at pickup
+> found the real blocker is a `Backend`-trait ergonomics mismatch the issue text
+> didn't anticipate. **The quadraui issue that re-audit told us to file was never
+> filed, and #47 was closed anyway** — so this section is the only surviving
+> record of the blocker. Read it before attempting Stage 1, and file the gap
+> upstream first.
 
 ---
 
-## 🧭 Current wave — **#47 (macOS wrapper), Stage 1 blocked on a design question — no code changed**
+## ⚠️ Live blocker — **#47 (macOS wrapper): closed with no code, blocker unfiled**
+
+**Read this first.** #47 is *closed*, but nothing was built and the design question
+below is still open. No open quadraui issue mentions `modal_stack_handle` or
+`drag_state_handle`; `git show 44882e9` is a documentation-only diff. Before any
+macOS work starts:
+
+1. File the `Backend`/`GtkBackend` symmetry gap on `JDonaghy/quadraui` (or fold it
+   into **quadraui#482**, "Backend API integrity", its natural home).
+2. Re-open quadraui milestone **#9 "vimcode Platform-Neutral blockers"** to hold it.
+3. Re-open **vimcode#47** behind that blocker rather than leaving it closed —
+   `GOALS.md` now states the rule this violated: *a #7 issue that turns out to be
+   supply-blocked stays open behind its blocker.*
 
 _As of 2026-09-02._ Picked up #47 (native macOS GUI, thin wrapper over
 `quadraui::macos::shell_runner::run_with_shell`). The issue's own body flags
@@ -114,7 +129,8 @@ an API shape here risks the same "three attempts, three reverts" outcome
 `CLAUDE.md`'s #319 negative example documents for exactly this kind of
 per-backend improvisation.
 
-**What did NOT happen this session:** no code was moved. `struct App` and
+**What did NOT happen this session — and has not happened since:** no code was
+moved, and the upstream issue was never filed. `struct App` and
 `impl quadraui::ShellApp for App` are untouched in `src/gtk/mod.rs`. The three
 other platform fields (`window`, `css_provider`, `settings_monitor`) and the
 key-mapping helpers are confirmed low-risk and ready to move once the
@@ -122,6 +138,9 @@ key-mapping helpers are confirmed low-risk and ready to move once the
 since nothing here has landed to keep them stable.
 
 ### Stage ordering once unblocked
+
+**Step 1 has still not happened** (verified 2026-09-03: no open quadraui issue
+references either accessor). Nothing below is startable until it does.
 
 1. File/resolve the quadraui `Backend`/`GtkBackend` symmetry gap above.
 2. Move `struct App` + its three `impl App` blocks + `impl ShellApp for App`

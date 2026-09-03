@@ -105,7 +105,7 @@ All non-trivial work should be tracked via GitHub Issues.
 
 **VimCode**: Vim-like code editor in Rust. Clean separation: `src/core/` (platform-agnostic logic) vs `src/gtk/` (GTK UI) vs `src/tui_main/` (TUI). `src/main.rs` is a thin CLI dispatcher. A native Windows backend will be re-added as a thin wrapper when the quadraui Win backend ships (quadraui#19–#31).
 
-**Tech Stack:** Rust 2021, GTK4+Relm4, Ropey, Tree-sitter, Pango+Cairo, ratatui+crossterm
+**Tech Stack:** Rust 2021, GTK4 (Relm4 removed in #540), quadraui, Ropey, Tree-sitter, Pango+Cairo, ratatui+crossterm
 
 **Critical Rule:** `src/core/` must NEVER depend on `gtk4`, `relm4`, or `pangocairo`. Must be testable in isolation.
 

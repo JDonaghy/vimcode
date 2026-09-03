@@ -29,33 +29,57 @@ headless `GtkDriver` wrapper) and `tui_main::testing::TuiShellApp` (for
 quadraui's `driver_with_shell`). See `tests/acceptance.rs` and
 `tests/acceptance/ms-example/contract.md`.
 
+### The two backends, and what is left in them
+
+Both backends are `quadraui::ShellApp` impls driven by `run_with_shell`; neither
+owns a main loop (`fn event_loop` was deleted by #634). Since #751–#766 they route
+every routing/composition *decision* through `render.rs` — `src/gtk/mod.rs` alone
+makes 424 `render::` calls — so when you are looking for "where is X decided", the
+answer is almost always `render.rs`, not here.
+
+**Do not add feature logic to either directory** (`CLAUDE.md`, Platform-Neutrality
+Rule). Current production size and the north-star target are tracked in
+[`GOALS.md`](../GOALS.md); regenerate with
+`python3 scripts/prod_lines.py src/gtk src/tui_main src/render.rs`.
+
 ### GTK directory (`src/gtk/`)
 
 | File | What goes here |
 |------|---------------|
-| `mod.rs` | `App` struct, `quadraui::ShellApp` impl (`setup`/`render_content`/`handle`/`tick`), `impl App` event handlers, `DeferredAction` queue, geometry helpers |
-| `draw.rs` | All `draw_*` free functions (editor, panels, popups, sidebars) |
-| `click.rs` | `ClickTarget` enum, `pixel_to_click_target()`, mouse click/drag/double-click handlers |
-| `css.rs` | `make_theme_css()`, `STATIC_CSS`, `load_css()` |
-| `util.rs` | `matches_gtk_key()`, settings form builders, GTK utilities, icon install |
-| `tree.rs` | File tree building/expansion/indicators, name prompt/validation |
+| `mod.rs` | `App` struct, `impl quadraui::ShellApp for App` (`setup`/`render_content`/`handle`/`tick`), `impl App` event handlers, `DeferredQueue`, geometry helpers. By far the largest file here. |
+| `click.rs` | `pixel_to_click_target()`, tab-bar hit resolution (Pango vs char-cell), gutter actions, mouse click/double-click/drag entry points |
+| `css.rs` | `make_theme_css()`, `STATIC_CSS`, `load_css()` — genuinely GTK-only |
+| `util.rs` | `open_url()`, bundled Nerd Font install, GTK utilities |
+| `testing.rs` | The headless `GtkDriver` black-box harness (#646), behind `test-support` |
+| `backend.rs`, `events.rs`, `services.rs`, `explorer.rs` | Re-export / placeholder shims only — the real implementations were lifted into `quadraui::gtk::*` (#270) and `engine/explorer_ops.rs` |
+
+> `draw.rs` and `tree.rs` no longer exist. `draw.rs` (all the `draw_*` free
+> functions) was deleted by #669–#672 once GTK's live path painted every
+> `ScreenLayout` field; explorer state moved to the engine.
 
 ### TUI directory (`src/tui_main/`)
 
 | File | What goes here |
 |------|---------------|
-| `mod.rs` | Structs, `run()`, `event_loop()`, clipboard, key translation, cell helpers |
-| `render_impl.rs` | `draw_frame()`, `build_screen_for_tui()`, tab bar, editor/popup rendering |
+| `shell_app.rs` | `TuiShellApp` — `impl ShellApp for TuiShellApp`, the live TUI. The largest file here. |
+| `mouse.rs` | `handle_mouse()` — click/drag/scroll routing into the shared `render::` routers |
+| `render_impl.rs` | `build_screen_for_shell_content()`, window/separator/divider painting, tab drag overlay + tooltip, picker popup |
 | `panels.rs` | Sidebar panel rendering (activity bar, explorer, git, debug, extensions, AI, search, terminal) |
-| `mouse.rs` | `handle_mouse()` — all click/drag/scroll interactions |
+| `mod.rs` | `run()`, module wiring, clipboard, key translation, cell helpers |
+| `quadraui_tui.rs` | The few remaining `draw_*` wrappers not yet routed through a `Backend::draw_*` trait method |
+| `backend.rs`, `events.rs`, `services.rs` | Re-export / placeholder shims — real implementations live in `quadraui::tui::*` (#268) |
 
-### Win-GUI directory (`src/win_gui/`)
+> `draw_frame()` no longer exists — #766 deleted it as the last
+> raw-`ratatui::Frame` path, along with its three test-only helpers.
+> `build_screen_for_tui()` survives only under `#[cfg(test)]`.
 
-Native Windows backend using `windows-rs` + Direct2D + DirectWrite. Behind `win-gui` Cargo feature. Consumes `ScreenLayout` from `render.rs` — same pattern as GTK/TUI. Some features are still missing (see BUGS.md for known Win-GUI gaps).
+### Win-GUI
 
-| File | What goes here |
-|------|---------------|
-| `mod.rs` | Win32 window creation, D2D/DWrite setup, event loop, keyboard/mouse handling, rendering |
+**There is no `src/win_gui/` directory.** The Direct2D/Win32 backend was removed
+from this repo on 2026-05-11 (`3e4bcff`). It will be re-added as a thin wrapper
+once quadraui ships its Windows backend (quadraui#19–#31, quadraui#580). Open
+`Win-GUI:` issues on *this* tracker describe the deleted backend and belong
+upstream — see `PROJECT_STATE.md`, "Milestone hygiene".
 
 ### Engine directory (`src/core/engine/`)
 

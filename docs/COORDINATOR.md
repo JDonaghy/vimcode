@@ -23,8 +23,8 @@ Before assigning work, check file-level overlap:
 - Two agents must NEVER touch the same file concurrently.
 - `src/core/engine/` is large — sub-module granularity matters (e.g., `keys.rs` vs `motions.rs` vs `terminal_ops.rs` are safe to parallelize).
 - `src/render.rs` is a single large file — only one agent at a time.
-- `src/gtk/mod.rs`, `src/gtk/click.rs`, `src/gtk/draw.rs` — treat as one unit; assign together.
-- `src/tui_main/mod.rs`, `src/tui_main/mouse.rs` — treat as one unit.
+- `src/gtk/mod.rs`, `src/gtk/click.rs` — treat as one unit; assign together. (`src/gtk/draw.rs` no longer exists — deleted by #669–#672.)
+- `src/tui_main/shell_app.rs`, `src/tui_main/mouse.rs`, `src/tui_main/render_impl.rs` — treat as one unit; `shell_app.rs` is the live TUI since #634.
 
 ### 2. Constraint Awareness
 
@@ -92,5 +92,5 @@ Use these to keep agents oriented:
 
 - "Your files: `X`, `Y`, `Z`. Do NOT touch `A` or `B` (other agent is there)."
 - "Blocked until quadraui#N lands. Park this and take #M instead."
-- "Desktop A finished — you're clear to touch `src/gtk/draw.rs` now."
+- "Desktop A finished — you're clear to touch `src/gtk/mod.rs` now."
 - "Before starting: `cd ~/src/quadraui && git pull` — new API landed."
