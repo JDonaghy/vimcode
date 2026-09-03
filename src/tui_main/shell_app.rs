@@ -3130,11 +3130,22 @@ fn handle_activity_bar_focused_key(
 /// The focus-owner keyboard *sink*: TUI's half of the rung
 /// [`render::route_focus_key`] resolves (#757 / #734 slice 2), which is where
 /// the ladder — and the four cross-backend divergences it used to hide — is
-/// now stated. This function only performs the per-panel dispatch, which stays
-/// backend-side because every arm needs TUI plumbing (the crossterm `KeyCode`
-/// → engine-key-name tables, `TuiSidebar`, the `&mut dyn Backend` the DAP
-/// panel's `SidebarSystem::handle` re-dispatch takes) — the same split
-/// `route_modal_key` made for `ModalKeyRoute::ContextMenu`.
+/// stated. Only the crossterm `KeyEvent` → key-name/unicode *translation*
+/// stays backend-side (TUI's key spellings differ from GTK's — see
+/// `tui_key_to_engine_name` vs `map_gtk_key_name` — and only TUI needs the
+/// Ctrl+V clipboard pre-read, since quadraui's runner delivers Ctrl+V to GTK
+/// as `UiEvent::ClipboardPaste` before any key event reaches this rung, per
+/// `render::dispatch_sidebar_panel_key`'s `Search` arm doc comment).
+///
+/// The *mutation* — the six pure-`Engine` panel arms (Search, ExtPanel,
+/// ExtSidebar, Settings, Ai, SourceControl) — is stated exactly once, in
+/// [`render::dispatch_sidebar_panel_key`], which this function calls with
+/// the translated key just as GTK's `handle_key_press` does (#762 / #734
+/// slice 7). Debug and Explorer stay TUI-specific residue for the same
+/// reason GTK keeps its own `dispatch_focus_owner_residual`: Debug needs the
+/// live `&mut dyn Backend` the DAP panel's `SidebarSystem::handle`
+/// re-dispatch takes, and Explorer's key table predates — and is entangled
+/// with — TUI's own folder-rename/new-entry editing state.
 ///
 /// **Unconditionally terminal:** every arm returns, and `Explorer` is the
 /// resolver's fallback rather than a guarded arm, so a key reaching here never
@@ -3220,9 +3231,12 @@ fn handle_focus_owner_key(
         } else {
             key_name.to_string()
         };
-        use crate::core::engine::SearchKeyResult;
-        let result = engine.dispatch_search_sidebar_key_unified(&key_str, ctrl, alt, unicode);
-        if matches!(result, SearchKeyResult::Unfocused) {
+        // Shared dispatch (#762 / #734 slice 7): the same pure-`Engine` arm
+        // `render::dispatch_sidebar_panel_key` states for GTK.
+        let still_focused =
+            render::dispatch_sidebar_panel_key(engine, route, &key_str, unicode, None, ctrl, alt)
+                .unwrap_or(true);
+        if !still_focused {
             sidebar.has_focus = false;
         }
         return Reaction::Redraw;
@@ -3274,56 +3288,31 @@ fn handle_focus_owner_key(
 
     // ── Plugin-provided extension panel ─────────────────────────────────
     if route == render::FocusKeyRoute::ExtPanel {
-        // When the input field is active, characters are input text rather
-        // than navigation commands.
-        if engine.ext_panel_input_active {
-            let (ikey, ich): (&str, Option<char>) = match key_event.code {
-                KeyCode::Esc => ("Escape", None),
-                KeyCode::Enter => ("Return", None),
-                KeyCode::Backspace => ("BackSpace", None),
-                KeyCode::Char(ch) => ("char", Some(ch)),
-                _ => ("", None),
-            };
-            if !ikey.is_empty() {
-                let name = if ikey == "char" {
-                    ich.map(|c| c.to_string()).unwrap_or_default()
-                } else {
-                    ikey.to_string()
-                };
-                engine.handle_ext_panel_input_key(&name, ctrl, ich);
-            }
-            return Reaction::Redraw;
-        }
-        // h/Left: the engine sets `activity_bar_focused` inside
-        // `handle_ext_panel_key`.
-        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
-            KeyCode::Char('j') | KeyCode::Down => ("j", None),
-            KeyCode::Char('k') | KeyCode::Up => ("k", None),
-            KeyCode::Char('h') => ("h", None),
-            KeyCode::Left => ("Left", None),
-            KeyCode::Char('g') => ("g", None),
-            KeyCode::Char('G') => ("G", None),
-            KeyCode::Tab => ("Tab", None),
-            KeyCode::Enter => ("Return", None),
-            KeyCode::Char('q') | KeyCode::Esc => ("Escape", None),
-            KeyCode::Char(ch) => ("char", Some(ch)),
-            _ => ("", None),
+        // One spelling for both sub-modes: `render::dispatch_sidebar_panel_key`
+        // (and, under it, `Engine::handle_ext_panel_key`/`handle_ext_panel_input_key`)
+        // branches on `ext_panel_input_active` itself, the same way GTK's
+        // caller (`map_gtk_key_name`) never special-cases it either — neither
+        // engine method reads `ctrl`, and both accept a raw named key or a
+        // literal character.
+        let (key_name, unicode) = match key_event.code {
+            KeyCode::Char(c) => (c.to_string(), Some(c)),
+            code => (
+                tui_key_to_engine_name(code)
+                    .map(str::to_string)
+                    .unwrap_or_default(),
+                None,
+            ),
         };
-        if !key_name.is_empty() {
-            let ch = if key_name == "char" { unicode } else { None };
-            let name = if key_name == "char" {
-                ch.map(|c| c.to_string()).unwrap_or_default()
-            } else {
-                key_name.to_string()
-            };
-            engine.handle_ext_panel_key(&name, ctrl, ch);
-            if !engine.ext_panel_has_focus {
-                sidebar.has_focus = false;
-                // Keep `ext_panel_name` when focus moved to the activity bar
-                // (the panel stays visible while the toolbar cursor shows).
-                if !engine.activity_bar_focused {
-                    sidebar.ext_panel_name = None;
-                }
+        let still_focused = render::dispatch_sidebar_panel_key(
+            engine, route, &key_name, unicode, None, ctrl, false,
+        )
+        .unwrap_or(true);
+        if !still_focused {
+            sidebar.has_focus = false;
+            // Keep `ext_panel_name` when focus moved to the activity bar
+            // (the panel stays visible while the toolbar cursor shows).
+            if !engine.activity_bar_focused {
+                sidebar.ext_panel_name = None;
             }
         }
         return Reaction::Redraw;
@@ -3340,12 +3329,12 @@ fn handle_focus_owner_key(
                 None,
             ),
         };
-        use crate::core::engine::ExtSidebarKeyResult;
-        match engine.dispatch_ext_sidebar_key_unified(&key_name, unicode) {
-            ExtSidebarKeyResult::Unfocused | ExtSidebarKeyResult::FocusActivityBar => {
-                sidebar.has_focus = false;
-            }
-            ExtSidebarKeyResult::Consumed => {}
+        let still_focused = render::dispatch_sidebar_panel_key(
+            engine, route, &key_name, unicode, None, ctrl, false,
+        )
+        .unwrap_or(true);
+        if !still_focused {
+            sidebar.has_focus = false;
         }
         return Reaction::Redraw;
     }
@@ -3381,8 +3370,11 @@ fn handle_focus_owner_key(
         };
         if !key_name.is_empty() {
             let ch = if key_name == "char" { unicode } else { None };
-            engine.handle_settings_key(if key_name == "char" { "" } else { key_name }, ctrl, ch);
-            if !engine.settings_has_focus {
+            let mapped = if key_name == "char" { "" } else { key_name };
+            let still_focused =
+                render::dispatch_sidebar_panel_key(engine, route, mapped, ch, None, ctrl, false)
+                    .unwrap_or(true);
+            if !still_focused {
                 sidebar.has_focus = false;
             }
             // Keep the selected item visible after j/k navigation.
@@ -3443,8 +3435,10 @@ fn handle_focus_owner_key(
             } else {
                 (key_name, None)
             };
-            engine.handle_ai_panel_key(mapped, ctrl, uni);
-            if !engine.ai_has_focus {
+            let still_focused =
+                render::dispatch_sidebar_panel_key(engine, route, mapped, uni, None, ctrl, false)
+                    .unwrap_or(true);
+            if !still_focused {
                 sidebar.has_focus = false;
             }
         }
@@ -3501,12 +3495,14 @@ fn handle_focus_owner_key(
             code => (tui_key_to_engine_name(code).unwrap_or(""), None),
         };
         if !key_str.is_empty() || unicode.is_some() {
-            use crate::core::engine::ScKeyResult;
-            let result = engine.dispatch_sc_sidebar_key_unified(key_str, ctrl, unicode);
-            if matches!(
-                result,
-                ScKeyResult::Unfocused | ScKeyResult::FocusActivityBar
-            ) {
+            // `sc_unicode` (not `unicode`) is the slot
+            // `render::dispatch_sidebar_panel_key`'s `SourceControl` arm reads —
+            // the shift-resolved character computed above.
+            let still_focused = render::dispatch_sidebar_panel_key(
+                engine, route, key_str, None, unicode, ctrl, false,
+            )
+            .unwrap_or(true);
+            if !still_focused {
                 sidebar.has_focus = false;
             }
         }

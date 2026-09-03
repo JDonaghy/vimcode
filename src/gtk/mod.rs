@@ -1911,9 +1911,12 @@ impl App {
 
         // ── Shared focus-owner *dispatch* rung (#762 / #734 slice 7) ───
         // Slice 2 shared only the *routing*; `render::dispatch_sidebar_panel_key`
-        // now states the six pure-`Engine` arms too. It hands back `None` for
-        // the two it cannot own — Debug needs a live `Backend`, Explorer is a
-        // backend widget — which the fallback match below still spells out.
+        // now states the six pure-`Engine` arms too, and TUI's
+        // `handle_focus_owner_key` calls the same function (after its own
+        // crossterm-spelling translation) — this is no longer GTK-only. It
+        // hands back `None` for the two it cannot own — Debug needs a live
+        // `Backend`, Explorer is a backend widget — which the fallback match
+        // below still spells out.
         let (sc_mapped, sc_unicode) = map_gtk_key_with_unicode(key_name.as_str());
         let mapped = map_gtk_key_name(key_name.as_str());
         let panel_key = match focus_route {
@@ -2005,7 +2008,7 @@ impl App {
         self.draw_needed.set(true);
 
         // ── Shared post-key epilogue (#762 / #734 slice 7) ─────────────
-        self.run_post_key_epilogue();
+        self.run_post_key_epilogue(ctx);
         self.draw_needed.set(true);
     }
 
@@ -2060,10 +2063,22 @@ impl App {
 
     /// GTK's half of the shared after-every-editor-keypress epilogue.
     /// [`render::post_key_epilogue`] applies everything `Engine` owns; this
-    /// applies the three residues that need GTK: macro playback (whose
-    /// `EngineAction`s only `dispatch_engine_action` can run), the deferred
-    /// clipboard write, and the GLib one-shot behind the yank highlight.
-    fn run_post_key_epilogue(&mut self) {
+    /// applies the residues that need GTK: macro playback (whose
+    /// `EngineAction`s only `dispatch_engine_action` can run), the runner ↔
+    /// shadow sidebar-visibility sync (below), the deferred clipboard write,
+    /// and the GLib one-shot behind the yank highlight.
+    ///
+    /// `ctx` is threaded in for that visibility sync: `render::post_key_epilogue`'s
+    /// autohide arm calls `engine.app_shell.hide_sidebar()`, but
+    /// `engine.app_shell` is only the "shadow" copy of shell state — GTK's
+    /// actual painted layout (whether the sidebar column exists at all) comes
+    /// from the runner's own `AppShell`, reachable solely through
+    /// `ShellContext::shell_mut` (see `handle_key_press`'s doc comment on
+    /// `ctx`, and TUI's identical shadow/runner split documented on
+    /// `TuiShellApp::on_shell_event`). Without pushing the change through,
+    /// `should_autohide_sidebar` flips a flag nothing paints from and the
+    /// sidebar visually stays open.
+    fn run_post_key_epilogue(&mut self, ctx: &quadraui::ShellContext<'_>) {
         loop {
             let (has_more, action) = {
                 let mut engine = self.engine.borrow_mut();
@@ -2098,6 +2113,23 @@ impl App {
         // Sync the unnamed register to the system clipboard if it changed.
         // The comparison is O(1); actual write is deferred to the background thread.
         self.sync_plus_register_to_clipboard();
+
+        // ── Runner ↔ shadow sidebar-visibility sync (#762) ──────────────
+        // The only place above that flips *visibility* (as opposed to which
+        // panel/focus owns an already-visible sidebar) is the autohide arm
+        // inside `render::post_key_epilogue`, which has no field of its own
+        // to report through — so this just reconciles the two copies
+        // unconditionally, the same way TUI's `on_shell_event` tail does.
+        let shadow_visible = self.engine.borrow().app_shell.sidebar_visible();
+        if ctx.shell().sidebar_visible() != shadow_visible {
+            if shadow_visible {
+                if let Some(id) = self.engine.borrow().app_shell.active_panel_id().cloned() {
+                    ctx.shell_mut().show_panel(&id);
+                }
+            } else {
+                ctx.shell_mut().hide_sidebar();
+            }
+        }
 
         // If a yank just happened, schedule a 200 ms one-shot to clear the highlight.
         if epilogue.arm_yank_highlight {

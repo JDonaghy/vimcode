@@ -3876,16 +3876,23 @@ pub struct PostKeyEpilogue {
 ///
 /// Seven behaviours ran after each key that reached `Engine::handle_key`.
 /// TUI ran all seven inline; GTK ran three (nav overflow, clipboard sync,
-/// yank timer) and was missing four outright:
+/// yank timer). Of the rest, two are genuinely new GTK behaviour and two are
+/// not:
 ///
-/// - **sidebar autohide** — `autohide_panels` never fired on GTK when focus
-///   returned to the editor, so the panel stayed pinned open.
-/// - **explorer refresh** — `explorer_needs_refresh`, set by a completed file
-///   move/rename/create, was never drained on GTK, so the tree kept showing
-///   the pre-move layout until something else rebuilt it.
-/// - **quickfix scroll clamp** — the selected quickfix entry could scroll out
-///   of the six-row window with no way to bring it back.
-/// - **activity-bar overflow** — see [`PostKeyEpilogue::focus_activity_bar`].
+/// - **sidebar autohide** (new) — `autohide_panels` never fired on GTK when
+///   focus returned to the editor, so the panel stayed pinned open.
+/// - **activity-bar overflow** (new) — see
+///   [`PostKeyEpilogue::focus_activity_bar`].
+/// - **explorer refresh** (latency, not new) — `explorer_needs_refresh`, set
+///   by a completed file move/rename/create, was already drained on GTK from
+///   at least four other call sites, including `handle_poll_tick`, which runs
+///   independently of key presses. Routing it through this rung too just
+///   closes the window between a move completing and the next poll tick —
+///   it was never simply missing.
+/// - **quickfix scroll clamp** (inapplicable on GTK) — GTK never carried
+///   `quickfix_scroll_top` as per-keypress state to begin with (see that
+///   parameter's doc below), so this arm is a no-op there; it exists here
+///   purely for TUI, which does carry the field.
 ///
 /// Macro playback and the unnamed-register→clipboard sync stay with the
 /// caller: draining `advance_macro_playback` yields `EngineAction`s that only
