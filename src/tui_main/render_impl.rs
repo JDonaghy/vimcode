@@ -723,20 +723,24 @@ pub(super) fn draw_frame(
                 }
             }
             render::BottomOp::PanelHover => {
-                if sidebar.ext_panel_name.is_some() || engine.active_panel_is(PANEL_GIT) {
-                    let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
-                    let (rects, popup_rect) = render_panel_hover_popup(
-                        backend,
-                        screen,
-                        theme,
-                        sep_x + 1,
-                        sidebar_sep_area.y,
-                        sidebar_sep_area.height,
-                        area,
-                    );
-                    *hover_link_rects_out = rects;
-                    *hover_popup_rect_out = popup_rect;
-                }
+                // No re-check of "sidebar has a panel with tooltips" here:
+                // this arm only runs when `compose_bottom_band` already
+                // included `PanelHover`, which is gated on
+                // `render::panel_hover_is_drawn` — see that fn's doc comment
+                // for why the old `ext_panel_name`/`PANEL_GIT` restatement
+                // here was redundant with it.
+                let sep_x = sidebar_sep_area.x + sidebar_sep_area.width - 1;
+                let (rects, popup_rect) = render_panel_hover_popup(
+                    backend,
+                    screen,
+                    theme,
+                    sep_x + 1,
+                    sidebar_sep_area.y,
+                    sidebar_sep_area.height,
+                    area,
+                );
+                *hover_link_rects_out = rects;
+                *hover_popup_rect_out = popup_rect;
             }
         }
     }
