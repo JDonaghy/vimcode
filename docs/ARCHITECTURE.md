@@ -42,6 +42,12 @@ Rule). Current production size and the north-star target are tracked in
 [`GOALS.md`](../GOALS.md); regenerate with
 `python3 scripts/prod_lines.py src/gtk src/tui_main src/render.rs`.
 
+**What genuinely has to stay per-backend is enumerated in
+[`IRREDUCIBLE_SURFACE.md`](IRREDUCIBLE_SURFACE.md)** — three facts plus ~246 lines
+(1.3%) that name a toolkit type. If you are about to write per-backend code because
+"the backends just differ here", check that list first: the answer is usually that
+they don't.
+
 ### GTK directory (`src/gtk/`)
 
 | File | What goes here |

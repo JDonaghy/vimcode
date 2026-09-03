@@ -74,6 +74,7 @@ Do not "fix" vimcode to match a stale local quadraui checkout — with the git d
 | `docs/ARCHITECTURE.md` | Working on code structure, adding files, navigating unfamiliar modules |
 | `docs/QUADRAUI_GUIDE.md` | Quadraui migrations, cross-backend rendering, paint↔click integration |
 | `docs/PATTERNS.md` | Adding new keys, commands, settings, theme colors, or clickable UI |
+| `docs/IRREDUCIBLE_SURFACE.md` | Planning platform-neutrality work — what genuinely stays per-backend, and why the rest is duplication not porting |
 | `docs/DOC_MAINTENANCE.md` | After completing any feature — lists all files to update |
 | `docs/COORDINATOR.md` | Designated as coordinator for multi-machine parallel work |
 
