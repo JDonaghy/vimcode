@@ -18,66 +18,17 @@ pub(super) fn render_activity_bar(
 
 // ─── Sidebar rendering ────────────────────────────────────────────────────────
 
-#[cfg(test)]
-pub(super) fn render_sidebar(
-    backend: &mut super::backend::TuiBackend,
-    area: Rect,
-    sidebar: &mut TuiSidebar,
-    engine: &Engine,
-    theme: &Theme,
-    _explorer_drop_target: Option<usize>,
-) {
-    // Extension panel (plugin-provided)
-    if sidebar.ext_panel_name.is_some() {
-        render_ext_panel(backend, area, engine, theme);
-        return;
-    }
-
-    let active_id = engine.app_shell.active_panel_id().map(|w| w.as_str());
-    match active_id {
-        Some(PANEL_SETTINGS) => {
-            render_settings_panel(backend, area, theme, engine);
-            return;
-        }
-        Some(PANEL_SEARCH) => {
-            render_search_panel(backend, area, engine, theme);
-            return;
-        }
-        Some(PANEL_DEBUG) => {
-            render_debug_sidebar(backend, area, engine, theme);
-            return;
-        }
-        Some(PANEL_GIT) => {
-            render_source_control(backend, area, engine, theme);
-            return;
-        }
-        Some(PANEL_EXTENSIONS) => {
-            render_ext_sidebar(backend, area, engine, theme);
-            return;
-        }
-        Some(PANEL_AI) => {
-            render_ai_sidebar(backend, area, engine, theme);
-            return;
-        }
-        _ => {}
-    }
-
-    // Do NOT open a nested `enter_frame_scope` here — `render_sidebar` is
-    // called from `draw_frame`, which already runs inside the caller's
-    // single `with_frame_scope` (see mod.rs's `terminal.draw` closures).
-    // Re-entering would just be a no-op round trip on `current_frame_ptr`,
-    // but it contradicts the "entered once per draw closure" invariant.
-    render_explorer_sidebar_content(backend, area, engine, theme);
-}
-
 /// Render the explorer tree panel's body: background fill + the
 /// `TreeController` itself + its scroll-surface registration.
 ///
-/// Extracted from `render_sidebar`'s default (explorer) branch (#607) so
-/// both the live `draw_frame` path (via `render_sidebar` above) and
+/// #766: used to be reached two ways — the (now-deleted) `draw_frame`'s test
+/// harness via a `render_sidebar` dispatcher that lived here, and
 /// `TuiShellApp::render_content` (`shell_app.rs`, which never has a raw
-/// `Frame`/`Buffer` — see that module's doc comment) share one
-/// implementation instead of two copies that could drift. The background
+/// `Frame`/`Buffer` — see that module's doc comment) via `render_sidebar_content`
+/// (below). `draw_frame`'s test suite never asserted on sidebar content, so
+/// `render_sidebar` and its panel-dispatch `match` were dead weight once it
+/// was gone; `render_sidebar_content` still falls through to this function
+/// for the explorer panel. The background
 /// fill that used to be a raw `set_cell` loop over `frame.buffer_mut()` is
 /// now painted via `Backend::draw_status_bar` with a single blank segment
 /// per row — `draw_status_bar`'s TUI rasteriser always fills the *entire*
@@ -141,13 +92,14 @@ pub(super) fn render_explorer_sidebar_content(
 }
 
 /// Sidebar panel content for [`super::shell_app::TuiShellApp::render_content`]
-/// (#607). `render_sidebar` above stays the live `draw_frame` entry point
-/// (unchanged behavior, still frame-having); this is a parallel, narrower
-/// dispatcher over the subset of panels whose renderers need nothing but
-/// `Backend::draw_*` trait calls — no raw `Frame`/`Buffer` access — mirroring
-/// how `render_content` itself already has its own parallel entry points for
-/// editor content (`build_screen_for_shell_content` + `paint_editor_popups`
-/// in `render_impl.rs`, #601) and key dispatch
+/// (#607). Before #766 this was a parallel, narrower dispatcher next to a
+/// `render_sidebar` used only by `draw_frame`'s test harness, over the
+/// subset of panels whose renderers need nothing but `Backend::draw_*` trait
+/// calls — no raw `Frame`/`Buffer` access. `draw_frame` and its `render_sidebar`
+/// dispatcher are gone now (#766), so this is the one dispatcher, mirroring
+/// how `render_content` itself has its own entry points for editor content
+/// (`build_screen_for_shell_content` + `paint_editor_popups` in
+/// `render_impl.rs`, #601) and key dispatch
 /// (`render::dispatch_panel_accelerator`, `handle_key_pressed`, above in
 /// `shell_app.rs`).
 ///
@@ -344,8 +296,7 @@ pub(super) fn render_settings_panel(
 /// so #607 widened the parameter the same way #601 did for
 /// `render_tab_bar`/`draw_breadcrumb_bar`, letting
 /// `TuiShellApp::render_content` call it via [`render_sidebar_content`]
-/// without a concrete backend. `render_sidebar`'s own call site keeps compiling
-/// unchanged: `&mut TuiBackend` coerces to `&mut dyn Backend` at the call.
+/// without a concrete backend.
 pub(super) fn render_search_panel(
     backend: &mut dyn quadraui::Backend,
     area: Rect,

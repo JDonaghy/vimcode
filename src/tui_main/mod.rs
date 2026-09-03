@@ -99,9 +99,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 // helpers (`set_cell`, `rc`) now that `event_loop` is gone.
 #[cfg(test)]
 use ratatui::style::{Color as RColor, Modifier};
-// The legacy full-frame paint path (`render_impl::draw_frame` and friends) is
-// `#[cfg(test)]` now that #634 deleted `event_loop`, and `render_impl`'s test
-// module reaches `Terminal` through this module's `use super::*`.
+// The legacy full-frame paint path (`render_impl::draw_frame` and friends) was
+// `#[cfg(test)]` from #634 (which deleted `event_loop`, its only production
+// caller) until #766 deleted `draw_frame` itself; `with_frame_scope` below is
+// what remains of that scaffolding, still used by `render_impl`'s test
+// module, which reaches `Terminal` through this module's `use super::*`.
 //
 // (#657) The `CrosstermBackend` import that used to sit alongside it is gone:
 // nothing has referenced it since #634, and promoting `tui_main` into
@@ -612,14 +614,15 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
 
 // ─── Event loop ───────────────────────────────────────────────────────────────
 
-/// Enter `backend`'s frame scope exactly once for the whole `draw_frame`
-/// call, while still handing `draw_frame` (and everything it calls) a
-/// genuine `&mut ratatui::Frame` for the handful of raw buffer writes
-/// (separators, cursor placement, ...) that have no `Backend::draw_*`
-/// trait equivalent and are interleaved with trait calls in a
-/// z-order-sensitive sequence (#600 Stage 1 — collapsing the ~30
-/// `enter_frame_scope` sites `draw_frame`/`panels.rs` used to open
-/// individually down to the one this function makes).
+/// Enter `backend`'s frame scope exactly once for the whole test-harness
+/// paint call, while still handing the closure a genuine
+/// `&mut ratatui::Frame` for the handful of raw buffer writes (separators,
+/// cursor placement, ...) that have no `Backend::draw_*` trait equivalent
+/// and are interleaved with trait calls in a z-order-sensitive sequence
+/// (#600 Stage 1 — collapsing the ~30 `enter_frame_scope` sites the
+/// now-deleted `draw_frame`/`panels.rs` used to open individually down to
+/// the one this function makes). #766 deleted `draw_frame`; this helper's
+/// one remaining caller is `render_impl::tests::render_tui_buffer_impl`.
 ///
 /// Rust's borrow checker won't let a single closure passed to
 /// `TuiBackend::enter_frame_scope(frame, |b| ...)` also capture the
@@ -630,15 +633,29 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
 /// `TuiBackend::enter_frame_scope` already uses internally to smuggle
 /// `&mut Frame<'_>` past its own `Cell<*mut ()>` field, just applied one
 /// layer higher so `f` can reach both `backend` and `frame` at once.
-// #634: legacy full-frame paint path. `event_loop()` was its only production
-// caller; with that gone this is reachable *only* from the `#[cfg(test)]`
-// snapshot/assertion suite in `render_impl.rs`, so it is compiled out of
-// shipping binaries rather than muted with `#[allow(dead_code)]` — the
-// failure mode `src/gtk/draw.rs::draw_editor` demonstrated after the #540
-// GTK cutover (a zero-caller painter kept alive behind an `allow`, silently
-// dropping every overlay it drew). Retargeting that suite at
-// `TuiShellApp::render_content` and deleting this outright is follow-up work,
-// tracked in #634's hand-off notes.
+// #634: legacy full-frame paint scaffolding. `event_loop()` was its only
+// production caller; with that gone this is reachable *only* from the
+// `#[cfg(test)]` snapshot/assertion suite in `render_impl.rs`, so it is
+// compiled out of shipping binaries rather than muted with
+// `#[allow(dead_code)]` — the failure mode `src/gtk/draw.rs::draw_editor`
+// demonstrated after the #540 GTK cutover (a zero-caller painter kept alive
+// behind an `allow`, silently dropping every overlay it drew).
+//
+// #766 did the first half of #634's hand-off note: `draw_frame` itself —
+// the raw-`ratatui::Frame` rasteriser this function used to scope for — is
+// deleted, and the test suite that drove it now paints through
+// `render_impl::tests::render_tui_buffer_impl`, a thinner walk over the
+// same `render::compose_editor_band` / `render::compose_bottom_band`
+// artefacts both live `render_content`s run. `with_frame_scope` itself
+// survives because that walk still needs *some* `&mut ratatui::Frame` to
+// bind `TuiBackend` to (the handful of raw writes noted above have no
+// `Backend::draw_*` route either way) — retargeting it at
+// `TuiShellApp::render_content` proper (an owned `TuiShellApp` +
+// `driver_with_shell`, matching `shell_app.rs`'s own test style) is the
+// remaining half, deferred because several of the tests that call
+// `render_tui_buffer_impl` mutate `&Engine` again immediately after
+// rendering and a `driver_with_shell`-based caller cannot get the engine
+// back out to do that (see `render_tui_buffer_impl`'s own doc comment).
 #[cfg(test)]
 fn with_frame_scope<R>(
     backend: &mut backend::TuiBackend,
