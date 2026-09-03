@@ -12,7 +12,7 @@ binaries are thin shims that parse argv and call in:
 
 | Target | File | Role |
 |---|---|---|
-| `[lib] vimcode_core` | `src/lib.rs` | every module; `pub mod gtk` is `#[cfg(feature = "gui")]` |
+| `[lib] vimcode_core` | `src/lib.rs` | every module; `pub mod gtk` and `pub mod app` are `#[cfg(feature = "gui")]` |
 | `[[bin]] vimcode` | `src/main.rs` | `required-features = ["gui"]`; `use vimcode_core::{gtk, tui_main}` |
 | `[[bin]] vcd` | `src/tui_bin.rs` | TUI-only; `use vimcode_core::tui_main` |
 
@@ -48,11 +48,25 @@ Rule). Current production size and the north-star target are tracked in
 "the backends just differ here", check that list first: the answer is usually that
 they don't.
 
+### The shell application (`src/app.rs`)
+
+`struct App`, its inherent `impl` blocks and `impl quadraui::ShellApp for App`
+(`setup`/`render_content`/`handle`/`tick`), plus `DeferredQueue` /
+`DeferredAction` / `GtkAccelHost` and the GDK-key → `quadraui::UiEvent`
+mappers. #785 (stage 1 of #47, the native macOS GUI) hoisted all ~6,900 lines
+out of `src/gtk/mod.rs`, which shrank from 9,650 to ~2,580 production lines.
+
+The module is **still `#[cfg(feature = "gui")]`** — the move is the mechanical
+half of the split, not the end of it. `src/app.rs`'s own module doc enumerates
+the three things that still tie it to GTK (four platform-typed fields, ~11
+platform hook call sites, and the `crate::gtk::{click, css, util}` dependency)
+so the next stage does not have to re-derive them.
+
 ### GTK directory (`src/gtk/`)
 
 | File | What goes here |
 |------|---------------|
-| `mod.rs` | `App` struct, `impl quadraui::ShellApp for App` (`setup`/`render_content`/`handle`/`tick`), `impl App` event handlers, `DeferredQueue`, geometry helpers. By far the largest file here. |
+| `mod.rs` | `run()`, `build_shell_config()`, tab-bar/scrollbar geometry helpers, GTK font + close-glyph metrics. `App` itself moved to `src/app.rs` (#785) and is re-exported here as `crate::gtk::App` so the submodules keep resolving `super::App`. |
 | `click.rs` | `pixel_to_click_target()`, tab-bar hit resolution (Pango vs char-cell), gutter actions, mouse click/double-click/drag entry points |
 | `css.rs` | `make_theme_css()`, `STATIC_CSS`, `load_css()` — genuinely GTK-only |
 | `util.rs` | `open_url()`, bundled Nerd Font install, GTK utilities |

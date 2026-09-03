@@ -4,7 +4,7 @@ use crate::core::WindowId;
 use crate::render::{self as render_mod, GutterAction, ScreenZone, WindowZone};
 
 /// Re-export the shared ClickTarget enum.
-pub(super) use render_mod::ClickTarget;
+pub(crate) use render_mod::ClickTarget;
 
 /// Convert pixel (x, y) to a click target using the cached ScreenLayout from
 /// the last paint pass (#344). Zone detection delegates to the shared
@@ -32,7 +32,7 @@ pub(super) use render_mod::ClickTarget;
 /// during a drag, matching how TUI's drag path (`src/tui_main/mouse.rs`)
 /// never mutates engine focus state either.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn pixel_to_click_target(
+pub(crate) fn pixel_to_click_target(
     engine: &mut Engine,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
@@ -257,7 +257,7 @@ fn frame_zone_to_screen_zone(
 /// size: measure a probe `'0'` advance and scale until it equals the painted
 /// `char_width`. Because it is the same family at the reproduced size, *all*
 /// glyph advances — including emoji/CJK fallback — line up with the paint.
-pub(super) fn build_editor_click_context(paint_char_width: f64) -> Option<pango::Context> {
+pub(crate) fn build_editor_click_context(paint_char_width: f64) -> Option<pango::Context> {
     let surface = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 1, 1).ok()?;
     let cr = gtk4::cairo::Context::new(&surface).ok()?;
     let ctx = pangocairo::create_context(&cr);
@@ -378,7 +378,7 @@ fn resolve_charcell_tab_click(
 /// caller can tell a tab-bar right-click apart from an editor right-click
 /// before deciding which `Msg` to dispatch.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn resolve_tab_right_click(
+pub(crate) fn resolve_tab_right_click(
     engine: &Engine,
     x: f64,
     y: f64,
@@ -502,7 +502,7 @@ fn execute_gutter_action(
 /// `Some(true)` = close-tab on dirty buffer, `Some(false)` = normal buffer click;
 /// `engine_action` is an optional action the caller must dispatch (e.g. sidebar toggle).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn handle_mouse_click(
+pub(crate) fn handle_mouse_click(
     engine: &mut Engine,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
@@ -601,7 +601,7 @@ pub(super) fn handle_mouse_click(
 
 /// Handle mouse double-click — select word at position.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn handle_mouse_double_click(
+pub(crate) fn handle_mouse_double_click(
     engine: &mut Engine,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
@@ -654,7 +654,7 @@ pub(super) fn handle_mouse_double_click(
 /// editor text area by the shared drag router, so this function is only
 /// reached once that router has already ruled the point out.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn handle_mouse_drag(
+pub(crate) fn handle_mouse_drag(
     engine: &mut Engine,
     backend: &Rc<RefCell<super::backend::GtkBackend>>,
     x: f64,
@@ -716,6 +716,7 @@ mod emoji_click_column_tests {
     //! span byte-offset pipeline feeding Pango's attributes) fails a
     //! `cargo test`, not just a manual click in the running app.
     use super::*;
+    use crate::core::WindowRect;
     use crate::render::build_screen_layout;
     use ::pangocairo::cairo::{Context, Format, ImageSurface};
 
@@ -1214,6 +1215,7 @@ mod frame_hit_map_tests {
     //! pre-existing `screen_zone_hit_test` fallback (as the two tests in
     //! `cross_split_drag_focus_tests` above do by passing `None, &[]`).
     use super::*;
+    use crate::core::WindowRect;
     use crate::render::build_screen_layout;
     use quadraui::{ScreenLayout as QSL, Surface};
 
