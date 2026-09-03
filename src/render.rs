@@ -2056,10 +2056,10 @@ impl TabSwitcherGeometry {
 //  1. **Precedence.** TUI arbitrated the unified picker and the
 //     find/replace overlay ~1,100 lines *before* the context menu, and GTK
 //     arbitrated the context menu *after* find/replace and the picker —
-//     while [`OVERLAY_Z_ORDER`] paints the menu above both. Input and
+//     while [`FRAME_Z_ORDER`] paints the menu above both. Input and
 //     paint disagreeing is the #587/#592 failure shape.
 //     [`MOUSE_ARBITRATION_ORDER`] is now the router's own declared order,
-//     asserted against `OVERLAY_Z_ORDER` reversed.
+//     asserted against `FRAME_Z_ORDER` reversed.
 //  2. **Missing rungs.** GTK had no context-menu *hover* arm at all — its
 //     `MouseMoved` handler did nothing unless the left button was held —
 //     so a menu's highlight never followed the pointer (#373). GTK also
@@ -2084,7 +2084,7 @@ impl TabSwitcherGeometry {
 // **Not a rung, deliberately:** the TUI folder/workspace picker. GTK opens
 // a *native* GTK file chooser deferred through `PendingFileDialog` and run
 // from `tick()`, so there is no GTK canvas surface to arbitrate against —
-// the same verdict [`OVERLAY_Z_ORDER`] records for the paint side. See the
+// the same verdict [`FRAME_Z_ORDER`] records for the paint side. See the
 // comment on `tui_main::mouse`'s folder-picker arm.
 
 /// The subset of mouse actions this rung distinguishes.
@@ -2546,8 +2546,8 @@ pub enum ModalOverlayRoute {
 }
 
 /// The overlay rungs [`route_modal_overlay_click`] arbitrates, **highest z
-/// first** — the exact inverse of [`OVERLAY_Z_ORDER`], restricted to the rungs
-/// that take mouse input.
+/// first** — the exact inverse of [`FRAME_Z_ORDER`]'s overlay tail, restricted
+/// to the rungs that take mouse input.
 ///
 /// Input precedence and paint order are the same fact stated twice, and #587 /
 /// #592 are what happens when the two disagree: whatever is painted on top is
@@ -2555,16 +2555,16 @@ pub enum ModalOverlayRoute {
 /// lets `mouse_arbitration_matches_paint_z_order` assert the relationship
 /// instead of asking reviewers to eyeball it.
 ///
-/// The completion popup is deliberately absent: it is editor-anchored, painted
-/// outside the shared overlay band (see [`OVERLAY_Z_ORDER`]'s doc), so it has
+/// The completion popup is deliberately absent: it is editor-anchored, composed
+/// outside the shared frame sequence (see [`FRAME_Z_ORDER`]'s doc), so it has
 /// no paint rung to agree with.
-pub const MOUSE_ARBITRATION_ORDER: [OverlayOp; 6] = [
-    OverlayOp::ToastStack,
-    OverlayOp::Dialog,
-    OverlayOp::ContextMenu,
-    OverlayOp::TabSwitcher,
-    OverlayOp::UnifiedPicker,
-    OverlayOp::FindReplace,
+pub const MOUSE_ARBITRATION_ORDER: [FrameOp; 6] = [
+    FrameOp::ToastStack,
+    FrameOp::Dialog,
+    FrameOp::ContextMenu,
+    FrameOp::TabSwitcher,
+    FrameOp::UnifiedPicker,
+    FrameOp::FindReplace,
 ];
 
 /// Resolve the top rung of the mouse ladder against the painted overlays.
@@ -2610,7 +2610,7 @@ pub fn route_modal_overlay_click(
     // Modal for clicks *and* hovers, which is why it sits above the tab
     // switcher / picker / find-replace rather than ~1,100 lines below
     // them as it did on TUI. Painted directly under the dialog
-    // (`OVERLAY_Z_ORDER`), so it is arbitrated directly after it.
+    // (`FRAME_Z_ORDER`), so it is arbitrated directly after it.
     if state.context_menu_open {
         if action.is_menu_click() {
             let Some(cl) = state.context_menu else {
@@ -6224,7 +6224,7 @@ pub fn route_ai_sidebar_click(
 /// One rung of the shared **editor band** — the surfaces vimcode stacks
 /// inside `AppShellLayout::main_content_bounds`.
 ///
-/// Deliberately unit-agnostic, exactly like [`OverlayOp`] and [`FrameOp`]:
+/// Deliberately unit-agnostic, exactly like [`FrameOp`]:
 /// the rung says *what* is painted and *in what order*, never where or how
 /// big. GTK composes it in pixels and TUI in cells, from the same vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -6275,8 +6275,8 @@ pub enum EditorOp {
 /// "populated but never composed" (#587/#592) structurally harder to reach,
 /// and is precisely the guard [`EditorOp::GroupDividers`] did not have.
 ///
-/// The whole band sits *below* [`CHROME_Z_ORDER`], which in turn sits below
-/// [`OVERLAY_Z_ORDER`]: every editor rung is composed before the first chrome
+/// The whole band sits *below* [`FRAME_Z_ORDER`]: every editor rung is
+/// composed before the first chrome
 /// rung, on both backends. The editor-anchored popups (completion / hover /
 /// signature help / diff peek) are **not** in this band — they are anchored to
 /// the *cursor*, not to the editor column's own structure, and both backends
@@ -6311,7 +6311,7 @@ fn breadcrumb_is_drawn(bc: &BreadcrumbBar) -> bool {
 
 /// Which editor rungs a frame in this state must compose, in canonical order.
 ///
-/// Like [`compose_frame`] and unlike [`compose_overlay_band`], this returns
+/// Like [`compose_frame`], this returns
 /// only the *live* rungs: no editor rung owns a hit-test cache that has to be
 /// cleared from an absent branch (the two that come closest — GTK's tab pixel
 /// hit maps and the breadcrumb draw layouts — are cleared wholesale at the top
@@ -6357,8 +6357,8 @@ pub fn compose_editor_band(
 /// Assert a backend's *actually composed* editor sequence never runs backwards
 /// against [`EDITOR_Z_ORDER`].
 ///
-/// The editor-band twin of [`check_chrome_band_order`] /
-/// [`check_overlay_band_order`], and the same weaker half of the acceptance
+/// The editor-band twin of [`check_frame_order`], and the same weaker half of
+/// the acceptance
 /// test: it does not care which rungs were live, only that whatever *was*
 /// composed came out in canonical order. A rung hoisted out of the shared walk
 /// — which is exactly how GTK's tab-drag ghost drifted past the editor popups
@@ -6406,7 +6406,7 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
 // ══════════════════════════════════════════════════════════════════════════
 //
 // The fourth and last of #735's *ordered runs*. Below the editor column
-// ([`EDITOR_Z_ORDER`]) and above the surrounding chrome ([`CHROME_Z_ORDER`])
+// ([`EDITOR_Z_ORDER`]) and above the surrounding chrome ([`FRAME_Z_ORDER`])
 // sits a stack of bands vimcode carves out of the main content area by hand:
 // quickfix, the bottom panel (terminal / debug output), the debug toolbar, the
 // separated status line, and the sidebar-item hover popup that overhangs them.
@@ -6463,7 +6463,7 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
 /// One rung of the shared **bottom band** — the stack of chrome vimcode carves
 /// out of the bottom of `AppShellLayout::main_content_bounds`.
 ///
-/// Deliberately unit-agnostic, exactly like [`OverlayOp`], [`FrameOp`] and
+/// Deliberately unit-agnostic, exactly like [`FrameOp`] and
 /// [`EditorOp`]: the rung says *what* is painted and *in what order*, never
 /// where or how big. GTK composes it in pixels and TUI in cells, from the same
 /// vector.
@@ -6509,7 +6509,7 @@ pub enum BottomOp {
 /// transcriptions. Adding a surface means adding a variant here — a compile
 /// error in both backends' `match` until both handle it.
 ///
-/// The whole band sits *below* [`CHROME_Z_ORDER`] and *above*
+/// The whole band sits *below* [`FRAME_Z_ORDER`] and *above*
 /// [`EDITOR_Z_ORDER`]: every bottom rung is composed after the last editor
 /// rung and before the first chrome rung, on both backends.
 pub const BOTTOM_Z_ORDER: [BottomOp; 5] = [
@@ -6553,8 +6553,8 @@ pub fn panel_hover_is_drawn(screen: &ScreenLayout, sidebar_open: bool) -> bool {
 
 /// Which bottom rungs a frame in this state must compose, in canonical order.
 ///
-/// Like [`compose_frame`] / [`compose_editor_band`] and unlike
-/// [`compose_overlay_band`], this returns only the *live* rungs. Two rungs in
+/// Like [`compose_frame`] / [`compose_editor_band`], this returns only the
+/// *live* rungs. Two rungs in
 /// this band own hit-test caches that must be cleared when they are absent —
 /// the bottom panel's `Engine::bottom_panel_geometry` and the hover popup's
 /// popup/link rects — and both backends now clear them **before** the walk
@@ -6587,8 +6587,8 @@ pub fn compose_bottom_band(
 /// Assert a backend's *actually composed* bottom sequence never runs backwards
 /// against [`BOTTOM_Z_ORDER`].
 ///
-/// The bottom-band twin of [`check_chrome_band_order`] /
-/// [`check_editor_band_order`] / [`check_overlay_band_order`], and the same
+/// The bottom-band twin of [`check_frame_order`] /
+/// [`check_editor_band_order`], and the same
 /// weaker half of the acceptance test: it does not care which rungs were live,
 /// only that whatever *was* composed came out in canonical order. A rung
 /// hoisted out of the shared walk — which is exactly how TUI's separated
@@ -7095,8 +7095,8 @@ pub fn paint_tab_drop_overlay(
 
 // ─── Frame composition: the chrome band (#763, #735 slice 2) ─────────────────
 //
-// Slice 1 (below) landed [`compose_overlay_band`] — the *top* band only.
-// [`OverlayOp`] turned out to be the right shape and the wrong scope, so this
+// Slice 1 landed the overlay band only. `OverlayOp` turned out to be the right
+// shape and the wrong scope, so this
 // slice generalises it downward into [`FrameOp`]/[`compose_frame`] and lands
 // the **chrome band**: the non-editor surfaces vimcode itself paints around
 // the editor column.
@@ -7188,11 +7188,22 @@ impl FrameMetrics {
     }
 }
 
-/// One rung of the shared **chrome band** — the non-editor surfaces vimcode
-/// paints around the editor column, below the overlay band ([`OverlayOp`]).
+/// One rung of the shared **frame sequence** — every non-editor surface
+/// vimcode composes around and on top of the editor column, chrome first and
+/// app-level overlays last.
 ///
-/// Deliberately unit-agnostic, exactly like [`OverlayOp`]: the rung says *what*
-/// is painted and *in what order*, never where or how big.
+/// #766 folded the old `OverlayOp` in here: the top band was the first rung
+/// ladder to be stated once (#735 slice 1) and stayed a *separate* enum with
+/// its own order constant, its own composer and its own order check for four
+/// slices, so "the frame" was still two artefacts a backend could walk in two
+/// places. It is one enum now, and the overlay rungs are simply the tail of
+/// [`FRAME_Z_ORDER`].
+///
+/// Deliberately unit-agnostic: the rung says *what* is composed and *in what
+/// order*, never where or how big. Geometry stays per backend (GTK composes in
+/// pixels, TUI in cells) and rasterisation stays per backend (Cairo
+/// painter-order vs. ratatui cell coalescence) — those are the intrinsic
+/// differences #735 exists to *preserve* while removing the accidental one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameOp {
     /// The reserved title-bar band (`AppShellLayout::title_bar_bounds`):
@@ -7200,11 +7211,11 @@ pub enum FrameOp {
     /// out where the command centre / window controls go.
     ///
     /// Measure-only on **both** backends. The band is actually *painted* from
-    /// the overlay band's [`OverlayOp::MenuDropdown`] arm, because
-    /// `MenuSystem::render` repaints `draw_menu_bar` across the whole band and
-    /// would erase anything laid down first (#676 on GTK, #712 on TUI). It is
-    /// still the first rung of this band: every later rung's gate, and the
-    /// dropdown arm itself, read the rect this one publishes.
+    /// [`FrameOp::MenuDropdown`], because `MenuSystem::render` repaints
+    /// `draw_menu_bar` across the whole band and would erase anything laid down
+    /// first (#676 on GTK, #712 on TUI). It is still the first rung of the
+    /// sequence: every later rung's gate, and the dropdown arm itself, read the
+    /// rect this one publishes.
     MenuRow,
     /// The *active panel's body*, into `AppShellLayout::sidebar_content_bounds`
     /// — explorer / search / debug / source control / extensions / AI / plugin
@@ -7220,87 +7231,259 @@ pub enum FrameOp {
     /// The Vim command line (`:`/`/`/`?` and messages). Unconditional on both
     /// backends: the row is always reserved and always painted, empty or not.
     CommandLine,
+    /// TUI's folder / workspace picker modal — the first rung of the overlay
+    /// tail, and the one rung of the sequence that exists on **one backend
+    /// only**.
+    ///
+    /// GTK's equivalent is a *native* GTK file chooser, deferred through
+    /// `PendingFileDialog` and run from `tick()`, so it is not a canvas rung
+    /// there at all: GTK's `FramePresence` never marks it live and its `match`
+    /// arm is a documented no-op. `mouse.rs`'s folder-picker block records the
+    /// identical "deliberately one-sided, do not converge" verdict for the
+    /// input side — inventing a GTK canvas picker purely to make the two
+    /// sequences match would *add* per-backend code, the opposite of
+    /// `GOALS.md` milestone #7.
+    ///
+    /// It is a rung rather than a stray paint between two walks because #766
+    /// folds the frame into one sequence: a surface composed between the chrome
+    /// and the overlays has to say so in the order, or it is exactly the
+    /// "populated but never composed" blind spot the sequence exists to close.
+    FolderPicker,
+    /// `MenuSystem::render` — repaints the whole title-bar band, so it must
+    /// come before anything else that draws into that band. On GTK this arm
+    /// also paints the app-icon slot and the inline window controls.
+    ///
+    /// First rung of the overlay tail, and gated identically to
+    /// [`Self::MenuRow`] — the band it paints is the band that rung measured.
+    MenuDropdown,
+    /// `Backend::draw_command_center`. Must follow [`Self::MenuDropdown`]:
+    /// `MenuSystem::render` repaints `draw_menu_bar` across the entire band,
+    /// including the command centre's columns, and painting the centre first
+    /// left a populated-but-invisible `command_center_layout` on both backends
+    /// (#676 on GTK, #712 on TUI).
+    CommandCenter,
+    /// `Backend::draw_find_replace`.
+    FindReplace,
+    /// The unified picker / command palette (`Surface::Palette` on GTK,
+    /// `render_picker_popup` on TUI).
+    UnifiedPicker,
+    /// The Ctrl+Tab MRU popup (`Backend::draw_list`).
+    TabSwitcher,
+    /// `Backend::draw_context_menu`.
+    ContextMenu,
+    /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
+    /// matching [`route_modal_overlay_click`]'s own arbitration.
+    Dialog,
+    /// `Backend::draw_toast_stack` — top of the sequence on both backends, and
+    /// the first rung [`route_modal_overlay_click`] arbitrates.
+    ToastStack,
 }
 
-/// The canonical chrome-band order, **lowest z first** (index 0 is composed
-/// first, and everything after it may cover it).
+impl FrameOp {
+    /// Is this rung part of the **overlay tail** — the app-level surfaces laid
+    /// on top of the chrome, which is what `OverlayOp` used to be its own enum
+    /// for?
+    ///
+    /// Only two callers need the distinction (the mouse-arbitration agreement
+    /// test, and the doc-level "chrome vs. overlay" split); production code
+    /// walks the whole sequence.
+    pub fn is_overlay(self) -> bool {
+        matches!(
+            self,
+            FrameOp::FolderPicker
+                | FrameOp::MenuDropdown
+                | FrameOp::CommandCenter
+                | FrameOp::FindReplace
+                | FrameOp::UnifiedPicker
+                | FrameOp::TabSwitcher
+                | FrameOp::ContextMenu
+                | FrameOp::Dialog
+                | FrameOp::ToastStack
+        )
+    }
+}
+
+/// The canonical frame order, **lowest z first** (index 0 is composed first,
+/// and everything after it may cover it).
 ///
-/// Both backends iterate this array and `match` each rung, so "which order do
-/// we compose the chrome in" is one artefact rather than two transcriptions.
-/// Adding a surface means adding a variant here — a compile error in both
-/// backends' `match` until both handle it, which is what makes "populated but
-/// never composed" (#587/#592) structurally harder to reach.
+/// Both backends iterate this one array and `match` each rung, so "which order
+/// do we compose the frame in" is one artefact rather than two transcriptions
+/// — and, since #766, *one* artefact rather than a chrome order plus a
+/// special-cased overlay order. Adding a surface means adding a variant here: a
+/// compile error in both backends' `match` until both handle it, which is what
+/// makes "populated but never composed" (#587/#592) structurally harder to
+/// reach.
 ///
-/// The whole band sits *below* [`OVERLAY_Z_ORDER`]: every chrome rung is
-/// composed before the first overlay rung, on both backends.
-pub const CHROME_Z_ORDER: [FrameOp; 5] = [
+/// The five chrome rungs come first, the eight overlay rungs
+/// ([`FrameOp::is_overlay`]) are the tail: every chrome rung is composed before
+/// the first overlay rung, on both backends.
+pub const FRAME_Z_ORDER: [FrameOp; 14] = [
+    // ── chrome ───────────────────────────────────────────────────────────
     FrameOp::MenuRow,
     FrameOp::SidebarPanel,
     FrameOp::Wildmenu,
     FrameOp::StatusBar,
     FrameOp::CommandLine,
+    // ── overlay tail ─────────────────────────────────────────────────────
+    FrameOp::FolderPicker,
+    FrameOp::MenuDropdown,
+    FrameOp::CommandCenter,
+    FrameOp::FindReplace,
+    FrameOp::UnifiedPicker,
+    FrameOp::TabSwitcher,
+    FrameOp::ContextMenu,
+    FrameOp::Dialog,
+    FrameOp::ToastStack,
 ];
 
-/// Which chrome rungs a frame in this state must compose, in canonical order.
+/// Which frame rungs are live this frame, as a (near-)pure function of state.
 ///
-/// Unlike [`compose_overlay_band`] — whose backends walk the *whole* order
-/// every frame so each arm can clear its own hit-test cache — the chrome rungs
-/// that own a cache (`menu_bar_rect`, `global_status_rect`,
-/// `global_status_zones`) clear it from the *absent* branch of their own gate,
-/// so this returns only the live rungs and the backends walk exactly those.
+/// Separate from [`FRAME_Z_ORDER`] because the order is a constant and the
+/// *live set* is not. This type is what lets a test say "given this state,
+/// exactly these rungs must have been composed, in this order" — the #735
+/// headline acceptance criterion.
 ///
-/// `layout` supplies the shell-reserved bands (title bar, sidebar content) and
-/// `screen` the app state; `metrics` decides "is this band at least one line
-/// tall", in the caller's own units — see [`FrameMetrics`].
-pub fn compose_frame(
-    screen: &ScreenLayout,
-    layout: &quadraui::AppShellLayout,
-    metrics: FrameMetrics,
-) -> Vec<FrameOp> {
-    CHROME_Z_ORDER
-        .iter()
-        .copied()
-        .filter(|op| match op {
-            // `title_bar_bounds` is `Some` only while
-            // `AppShell::set_title_bar_visible` is set — but the band can still
-            // be degenerate on a window too small to hold it, and a degenerate
-            // band must not be measured (its `menu_bar_layout` would hand the
-            // command centre and the window controls a zero-width strip and
-            // leave `command_center_layout` disagreeing with the paint).
-            FrameOp::MenuRow => {
-                screen.menu_bar_visible
-                    && layout
-                        .title_bar_bounds
-                        .is_some_and(|r| metrics.holds_a_line(r))
-            }
-            FrameOp::SidebarPanel => layout
+/// Eleven of the thirteen fields are derived from `ScreenLayout` +
+/// `AppShellLayout` by [`Self::from_screen`]. The two that are not
+/// (`toast_stack`, and any backend-specific suppression) are left to the
+/// caller, because they are engine/geometry state rather than screen state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FramePresence {
+    pub menu_row: bool,
+    pub sidebar_panel: bool,
+    pub wildmenu: bool,
+    pub status_bar: bool,
+    pub command_line: bool,
+    /// TUI only — see [`FrameOp::FolderPicker`]. Not derivable from
+    /// `ScreenLayout` (the picker lives on `TuiShellApp`), so
+    /// [`Self::from_screen`] leaves it `false` and the caller sets it.
+    pub folder_picker: bool,
+    pub menu_dropdown: bool,
+    pub command_center: bool,
+    pub find_replace: bool,
+    pub unified_picker: bool,
+    pub tab_switcher: bool,
+    pub context_menu: bool,
+    pub dialog: bool,
+    pub toast_stack: bool,
+}
+
+impl FramePresence {
+    /// The eleven rungs whose gate is a `ScreenLayout` / `AppShellLayout`
+    /// field, so a caller only has to supply `toast_stack` (engine state).
+    ///
+    /// `layout` supplies the shell-reserved bands (title bar, sidebar content)
+    /// and `screen` the app state; `metrics` decides "is this band at least one
+    /// line tall", in the caller's own units — see [`FrameMetrics`].
+    pub fn from_screen(
+        screen: &ScreenLayout,
+        layout: &quadraui::AppShellLayout,
+        metrics: FrameMetrics,
+    ) -> Self {
+        // `title_bar_bounds` is `Some` only while
+        // `AppShell::set_title_bar_visible` is set — but the band can still be
+        // degenerate on a window too small to hold it, and a degenerate band
+        // must not be measured (its `menu_bar_layout` would hand the command
+        // centre and the window controls a zero-width strip and leave
+        // `command_center_layout` disagreeing with the paint).
+        //
+        // #766: this single gate now drives all three title-bar rungs. Before
+        // the fold GTK's `MenuDropdown` arm checked only `menu_bar_visible` and
+        // painted into a degenerate band; the measure rung's stricter gate is
+        // the one that survives, which is the same direction #763 converged the
+        // measure rung itself.
+        let title_bar = screen.menu_bar_visible
+            && layout
+                .title_bar_bounds
+                .is_some_and(|r| metrics.holds_a_line(r));
+        Self {
+            menu_row: title_bar,
+            sidebar_panel: layout
                 .sidebar_content_bounds
                 .is_some_and(|r| metrics.holds_a_line(r)),
-            FrameOp::Wildmenu => screen.wildmenu.is_some(),
-            FrameOp::StatusBar => screen.global_status_bar.is_some(),
-            FrameOp::CommandLine => true,
-        })
+            wildmenu: screen.wildmenu.is_some(),
+            status_bar: screen.global_status_bar.is_some(),
+            command_line: true,
+            folder_picker: false,
+            menu_dropdown: title_bar,
+            command_center: title_bar,
+            find_replace: screen.find_replace.is_some(),
+            unified_picker: screen.picker.is_some(),
+            tab_switcher: screen.tab_switcher.is_some(),
+            // Matches both backends' own gate: an items-less context menu is
+            // not painted (GTK skips it and clears `context_menu_layout`).
+            context_menu: screen
+                .context_menu
+                .as_ref()
+                .is_some_and(|p| !p.items.is_empty()),
+            dialog: screen.dialog.is_some(),
+            toast_stack: false,
+        }
+    }
+
+    /// Is this rung live?
+    pub fn is_live(&self, op: FrameOp) -> bool {
+        match op {
+            FrameOp::MenuRow => self.menu_row,
+            FrameOp::SidebarPanel => self.sidebar_panel,
+            FrameOp::Wildmenu => self.wildmenu,
+            FrameOp::StatusBar => self.status_bar,
+            FrameOp::CommandLine => self.command_line,
+            FrameOp::FolderPicker => self.folder_picker,
+            FrameOp::MenuDropdown => self.menu_dropdown,
+            FrameOp::CommandCenter => self.command_center,
+            FrameOp::FindReplace => self.find_replace,
+            FrameOp::UnifiedPicker => self.unified_picker,
+            FrameOp::TabSwitcher => self.tab_switcher,
+            FrameOp::ContextMenu => self.context_menu,
+            FrameOp::Dialog => self.dialog,
+            FrameOp::ToastStack => self.toast_stack,
+        }
+    }
+}
+
+/// The ordered list of frame rungs a frame with this `presence` must compose.
+///
+/// This is both what the backends *walk* and the expected value their
+/// *recorded* sequence is compared against (see `composed_frame` on each shell
+/// app, and the `frame_sequence_*` black-box tests).
+///
+/// Every rung an absent gate drops has no arm left to run, so any hit-test
+/// cache a rung owns (`command_center_layout`, `dialog_layout`,
+/// `context_menu_layout`, `tab_switcher_popup_rect`, `picker_popup_rect`,
+/// `toast_layout`, `menu_bar_rect`, `global_status_rect`) must be cleared by
+/// the caller *before* the walk, never from an `else` arm inside it. A stale
+/// `dialog_layout` is the #587 class of bug in miniature.
+pub fn compose_frame(presence: &FramePresence) -> Vec<FrameOp> {
+    FRAME_Z_ORDER
+        .iter()
+        .copied()
+        .filter(|op| presence.is_live(*op))
         .collect()
 }
 
-/// Assert a backend's *actually composed* chrome sequence never runs backwards
-/// against [`CHROME_Z_ORDER`].
+/// Assert a backend's *actually composed* frame sequence never runs backwards
+/// against [`FRAME_Z_ORDER`].
 ///
-/// The chrome-band twin of [`check_overlay_band_order`], and the same weaker
-/// half of the acceptance test: it does not care which rungs were live, only
+/// The weaker half of the #735 acceptance test, and the one every black-box
+/// render test can afford to call: it does not care which rungs were live, only
 /// that whatever *was* composed came out in canonical order. A rung hoisted out
-/// of the shared walk — which is exactly how the two orders above drifted apart
-/// — fails this even when the exact live set is awkward to pin.
-pub fn check_chrome_band_order(composed: &[FrameOp]) -> Result<(), String> {
+/// of the shared walk — which is exactly how the chrome and overlay orders
+/// drifted apart in the first place — fails this even when the exact live set
+/// is awkward to pin.
+///
+/// Returns `Err` with a human-readable diagnosis rather than panicking, so
+/// callers on either backend can attach their own context.
+pub fn check_frame_order(composed: &[FrameOp]) -> Result<(), String> {
     let mut cursor = 0usize;
     for op in composed {
-        match CHROME_Z_ORDER[cursor..].iter().position(|c| c == op) {
+        match FRAME_Z_ORDER[cursor..].iter().position(|c| c == op) {
             Some(offset) => cursor += offset + 1,
             None => {
                 return Err(format!(
-                    "chrome band composed out of order: {composed:?}\n\
-                     {op:?} came after a rung that CHROME_Z_ORDER puts above it.\n\
-                     canonical order is {CHROME_Z_ORDER:?}"
+                    "frame composed out of order: {composed:?}\n\
+                     {op:?} came after a rung that FRAME_Z_ORDER puts above it.\n\
+                     canonical order is {FRAME_Z_ORDER:?}"
                 ));
             }
         }
@@ -7406,7 +7589,7 @@ pub fn measure_title_bar_bands(
     }
 }
 
-/// The expected chrome band for the cross-backend fixture used by
+/// The expected chrome rungs for the cross-backend fixture used by
 /// `chrome_band_composes_in_canonical_order_via_gtk_driver` and
 /// `..._via_shell_app`: menu bar visible, sidebar open, per-window status lines
 /// off (so a global status bar exists), and `wildmenu` deciding whether the
@@ -7416,12 +7599,17 @@ pub fn measure_title_bar_bands(
 /// `render.rs`, compiled into both bin targets — rather than each transcribing
 /// its own `Vec<FrameOp>` literal, so the compiler keeps the two expectations
 /// in step. Taking `wildmenu` as a parameter keeps the expectation
-/// *discriminating*: it is not simply "whatever [`CHROME_Z_ORDER`] contains".
+/// *discriminating*: it is not simply "whatever [`FRAME_Z_ORDER`] contains".
+///
+/// Chrome rungs only — the overlay tail is filtered out, because these two
+/// tests pin the chrome half and leave the overlay half to
+/// [`frame_sequence_fixture`].
 #[cfg(test)]
 pub(crate) fn chrome_band_fixture(wildmenu: bool) -> Vec<FrameOp> {
-    CHROME_Z_ORDER
+    FRAME_Z_ORDER
         .iter()
         .copied()
+        .filter(|op| !op.is_overlay())
         .filter(|op| wildmenu || !matches!(op, FrameOp::Wildmenu))
         .collect()
 }
@@ -7446,10 +7634,10 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
     }
 }
 
-// ─── Overlay-band composition (#735 slice 1) ──────────────────────────────────
+// ─── Overlay tail: the history the fold preserves (#735 slice 1, #766) ───────
 //
 // The paint twin of `route_modal_overlay_click` / `route_modal_key` above, and
-// the first rung of #735 to be stated once instead of twice.
+// the first rung ladder of #735 to be stated once instead of twice.
 //
 // Frame *content* has been shared for a long time (`build_screen_layout` and
 // the ~30 builders around it); frame *composition* — which surface is laid
@@ -7473,20 +7661,20 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 //  2. **menu dropdown / command centre vs. the modal stack.** TUI painted the
 //     title-bar band on top of every modal; GTK painted it underneath.
 //
-// [`OVERLAY_Z_ORDER`] is now the single artefact both backends walk, so the
-// order is no longer a property either one can hold an opinion about. The
-// canonical order below takes GTK's placement for the title-bar chrome (it is
-// chrome, and modals should cover it) and TUI's placement for the modal stack
-// (it is the one that agrees with `route_modal_overlay_click`'s own
+// The overlay tail of [`FRAME_Z_ORDER`] is now the single artefact both
+// backends walk, so the order is no longer a property either one can hold an
+// opinion about. The canonical order takes GTK's placement for the title-bar
+// chrome (it is chrome, and modals should cover it) and TUI's placement for the
+// modal stack (it is the one that agrees with `route_modal_overlay_click`'s own
 // arbitration: tab switcher below dialog below toasts).
 //
-// **Not in this band, deliberately** — the two rungs that exist on one backend
-// only, and therefore cannot be part of a shared *sequence*:
+// **Not in the shared sequence, deliberately** — the rungs that exist on one
+// backend only, and therefore cannot be part of a shared *sequence*:
 //
 //   * GTK's tab-drag drop overlay, app-icon slot and inline window controls.
 //     TUI paints its tab-drag ghost in the editor band and has neither an app
 //     icon nor in-canvas window controls. The app icon and window controls are
-//     painted from the [`OverlayOp::MenuDropdown`] arm, because
+//     painted from the [`FrameOp::MenuDropdown`] arm, because
 //     `MenuSystem::render` repaints the whole title-bar band and would erase
 //     anything laid down before it (#676/#712).
 //   * TUI's folder/workspace picker. GTK's equivalent is a *native* GTK file
@@ -7497,184 +7685,43 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 // quadraui already owns the *shell* composition — `compose::app_shell::AppShell`
 // hands both backends `AppShellLayout` (title-bar / activity-bar / sidebar /
 // bottom-panel / main-content bounds), and vimcode consumes it verbatim. The
-// overlay band is a different thing: it is vimcode's own set of app-level
+// overlay tail is a different thing: it is vimcode's own set of app-level
 // surfaces, and quadraui's nearest neighbour — `ModalStack` — explicitly
 // disclaims it ("**Painting**: the stack has no opinions on draw order. Apps
 // still paint modals last (highest z); the stack is queried only when *events*
 // arrive"). So the ordering is vimcode's to state, and `render.rs` is where
 // vimcode states cross-backend contracts.
 
-/// One rung of the shared overlay band — the app-level surfaces both backends
-/// lay down on top of the editor and chrome, once the shell's own zones are
-/// painted.
+/// The expected frame sequence for the cross-backend **equality fixture**:
+/// title bar visible, sidebar open on the settings panel, a wildmenu up, global
+/// status lines on, and a context menu + an in-canvas modal dialog open
+/// together.
 ///
-/// Deliberately unit-agnostic: the rung says *what* is painted and *in what
-/// order*, never where or how big. Geometry stays per backend (GTK composes in
-/// pixels, TUI in cells) and rasterisation stays per backend (Cairo
-/// painter-order vs. ratatui cell coalescence) — those are the intrinsic
-/// differences #735 exists to *preserve* while removing the accidental one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OverlayOp {
-    /// `MenuSystem::render` — repaints the whole title-bar band, so it must
-    /// come before anything else that draws into that band. On GTK this arm
-    /// also paints the app-icon slot and the inline window controls.
-    MenuDropdown,
-    /// `Backend::draw_command_center`. Must follow [`Self::MenuDropdown`]:
-    /// `MenuSystem::render` repaints `draw_menu_bar` across the entire band,
-    /// including the command centre's columns, and painting the centre first
-    /// left a populated-but-invisible `command_center_layout` on both backends
-    /// (#676 on GTK, #712 on TUI).
-    CommandCenter,
-    /// `Backend::draw_find_replace`.
-    FindReplace,
-    /// The unified picker / command palette (`Surface::Palette` on GTK,
-    /// `render_picker_popup` on TUI).
-    UnifiedPicker,
-    /// The Ctrl+Tab MRU popup (`Backend::draw_list`).
-    TabSwitcher,
-    /// `Backend::draw_context_menu`.
-    ContextMenu,
-    /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
-    /// matching `route_modal_overlay_click`'s own arbitration.
-    Dialog,
-    /// `Backend::draw_toast_stack` — top of the stack on both backends, and
-    /// the first rung `route_modal_overlay_click` arbitrates.
-    ToastStack,
-}
-
-/// The canonical overlay z-order, **lowest z first** (index 0 is painted
-/// first, and everything after it may cover it).
+/// **This is #735's headline acceptance criterion made runnable.** Both
+/// backends drive an equivalent engine state and assert their recorded
+/// `composed_frame` equals *this* value, so the two sequences are equal to each
+/// other by construction. A single test cannot drive both backends (the GTK
+/// `App` lives in the `vimcode` bin target, `TuiShellApp` in `vcd`), so "both
+/// backends emit the same `FrameOp` sequence for a given `ScreenLayout`" is
+/// expressed as two tests sharing one expected value — a single `#[cfg(test)]`
+/// fn compiled into both bin targets, so the compiler keeps them in step
+/// instead of comment discipline.
 ///
-/// Both backends iterate this array unconditionally and `match` each rung, so
-/// "which order do we paint the overlays in" is one artefact rather than two
-/// hand-kept transcriptions. Adding a surface means adding a variant here —
-/// which is a compile error in both backends' `match` until both paint it,
-/// making "populated but never composed" (#587/#592) structurally harder to
-/// reach.
-pub const OVERLAY_Z_ORDER: [OverlayOp; 8] = [
-    OverlayOp::MenuDropdown,
-    OverlayOp::CommandCenter,
-    OverlayOp::FindReplace,
-    OverlayOp::UnifiedPicker,
-    OverlayOp::TabSwitcher,
-    OverlayOp::ContextMenu,
-    OverlayOp::Dialog,
-    OverlayOp::ToastStack,
-];
-
-/// Which overlay rungs are live this frame, as a pure function of state.
-///
-/// Separate from [`OVERLAY_Z_ORDER`] because the backends walk the *whole*
-/// order every frame (each arm still has to clear its own hit-test cache when
-/// its surface is absent — a stale `dialog_layout` is the #587 bug in
-/// miniature). This type is what lets a test say "given this state, exactly
-/// these rungs should have been painted, in this order".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OverlayPresence {
-    pub menu_dropdown: bool,
-    pub command_center: bool,
-    pub find_replace: bool,
-    pub unified_picker: bool,
-    pub tab_switcher: bool,
-    pub context_menu: bool,
-    pub dialog: bool,
-    pub toast_stack: bool,
-}
-
-impl OverlayPresence {
-    /// The five rungs whose gate is a `ScreenLayout` field, so a caller only
-    /// has to supply the three that come from engine/geometry state
-    /// (`menu_dropdown`, `command_center`, `toast_stack`).
-    pub fn from_screen(screen: &ScreenLayout) -> Self {
-        Self {
-            menu_dropdown: false,
-            command_center: false,
-            find_replace: screen.find_replace.is_some(),
-            unified_picker: screen.picker.is_some(),
-            tab_switcher: screen.tab_switcher.is_some(),
-            // Matches both backends' own gate: an items-less context menu is
-            // not painted (GTK skips it and clears `context_menu_layout`).
-            context_menu: screen
-                .context_menu
-                .as_ref()
-                .is_some_and(|p| !p.items.is_empty()),
-            dialog: screen.dialog.is_some(),
-            toast_stack: false,
-        }
-    }
-
-    /// Is this rung live?
-    pub fn is_live(&self, op: OverlayOp) -> bool {
-        match op {
-            OverlayOp::MenuDropdown => self.menu_dropdown,
-            OverlayOp::CommandCenter => self.command_center,
-            OverlayOp::FindReplace => self.find_replace,
-            OverlayOp::UnifiedPicker => self.unified_picker,
-            OverlayOp::TabSwitcher => self.tab_switcher,
-            OverlayOp::ContextMenu => self.context_menu,
-            OverlayOp::Dialog => self.dialog,
-            OverlayOp::ToastStack => self.toast_stack,
-        }
-    }
-}
-
-/// The ordered list of overlay rungs a frame with this `presence` must paint.
-///
-/// This is the expected value a backend's *recorded* band is compared against
-/// (see `OverlayBandRecorder` on each shell app, and the
-/// `overlay_band_*_via_shell_app` / `overlay_band_*_via_gtk_driver` tests).
-pub fn compose_overlay_band(presence: &OverlayPresence) -> Vec<OverlayOp> {
-    OVERLAY_Z_ORDER
-        .iter()
-        .copied()
-        .filter(|op| presence.is_live(*op))
-        .collect()
-}
-
-/// Assert a backend's *actually painted* overlay sequence never runs backwards
-/// against [`OVERLAY_Z_ORDER`].
-///
-/// The weaker half of the #735 acceptance test, and the one every black-box
-/// render test can afford to call: it does not care which rungs were live, only
-/// that whatever *was* painted came out in canonical order. A rung hoisted out
-/// of the shared walk — which is exactly how both of the inversions above got
-/// in — fails this even when the exact live set is awkward to pin.
-///
-/// Returns `Err` with a human-readable diagnosis rather than panicking, so
-/// callers on either backend can attach their own context.
-pub fn check_overlay_band_order(painted: &[OverlayOp]) -> Result<(), String> {
-    let mut cursor = 0usize;
-    for op in painted {
-        match OVERLAY_Z_ORDER[cursor..].iter().position(|c| c == op) {
-            Some(offset) => cursor += offset + 1,
-            None => {
-                return Err(format!(
-                    "overlay band painted out of z-order: {painted:?}\n\
-                     {op:?} came after a rung that OVERLAY_Z_ORDER puts above it.\n\
-                     canonical order is {OVERLAY_Z_ORDER:?}"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The expected band for the "context menu + in-canvas dialog open together"
-/// cross-backend fixture (`overlay_band_paints_dialog_above_context_menu_via_gtk_driver`
-/// / `..._via_shell_app`), computed from [`compose_overlay_band`] rather than
-/// hand-copied as a `Vec` literal into each test.
-///
-/// Both backend tests call this one function, so a rung added to
-/// [`OVERLAY_Z_ORDER`] or reordered there updates both expectations from a
-/// single edit — the compiler keeps them in sync instead of the "keep them in
-/// step" comment discipline this issue exists to remove from the *production*
-/// code (#735 review). `menu_dropdown`/`command_center` are hardcoded `true`
-/// here because both fixtures pin the title bar visible (GTK forces it via
-/// `App::setup`, TUI via `shell_config(true)`) — they are not derivable from
-/// `ScreenLayout` alone, see [`OverlayPresence::from_screen`]'s doc comment.
+/// It could not be written before #766: until the chrome and overlay halves
+/// were one sequence there was no single artefact to compare, only two that a
+/// backend could get individually right and jointly wrong. Nine of the fourteen
+/// rungs are live and five are not, which is what keeps it *discriminating* —
+/// it must never degenerate into "whatever [`FRAME_Z_ORDER`] contains".
 #[cfg(test)]
-pub(crate) fn overlay_band_dialog_over_context_menu_fixture() -> Vec<OverlayOp> {
-    compose_overlay_band(&OverlayPresence {
+pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
+    compose_frame(&FramePresence {
+        menu_row: true,
+        sidebar_panel: true,
+        wildmenu: true,
+        status_bar: true,
+        command_line: true,
+        // TUI-only, and not open in the fixture — see `FrameOp::FolderPicker`.
+        folder_picker: false,
         menu_dropdown: true,
         command_center: true,
         find_replace: false,
@@ -7686,26 +7733,21 @@ pub(crate) fn overlay_band_dialog_over_context_menu_fixture() -> Vec<OverlayOp> 
     })
 }
 
-/// The expected band for the "no app-level overlay open, only title-bar
-/// chrome" cross-backend fixture (`overlay_band_holds_only_the_title_bar_when_no_overlay_is_open_via_gtk_driver`
+/// The expected **overlay tail** for the "no app-level overlay open, only
+/// title-bar chrome" cross-backend fixture
+/// (`overlay_band_holds_only_the_title_bar_when_no_overlay_is_open_via_gtk_driver`
 /// / `overlay_band_is_empty_when_no_overlay_is_open_via_shell_app`'s GTK twin).
 ///
-/// GTK pins the title bar visible unconditionally (#552), so its "nothing
-/// open" band still has `MenuDropdown`/`CommandCenter` live; see
-/// [`overlay_band_dialog_over_context_menu_fixture`]'s doc comment for why
-/// this is a separate literal `OverlayPresence` rather than derived from
-/// `ScreenLayout`.
+/// GTK pins the title bar visible unconditionally (#552), so its "nothing open"
+/// tail still has `MenuDropdown`/`CommandCenter` live; TUI's, with no title bar
+/// reserved, is empty. Both are read off the same `composed_frame` field,
+/// filtered to [`FrameOp::is_overlay`].
 #[cfg(test)]
-pub(crate) fn overlay_band_title_bar_only_fixture() -> Vec<OverlayOp> {
-    compose_overlay_band(&OverlayPresence {
+pub(crate) fn overlay_band_title_bar_only_fixture() -> Vec<FrameOp> {
+    compose_frame(&FramePresence {
         menu_dropdown: true,
         command_center: true,
-        find_replace: false,
-        unified_picker: false,
-        tab_switcher: false,
-        context_menu: false,
-        dialog: false,
-        toast_stack: false,
+        ..FramePresence::default()
     })
 }
 
@@ -10056,7 +10098,7 @@ pub struct ScreenLayout {
     /// was deleted by this slice (see the note where it used to sit, above).
     ///
     /// Zero paint readers on either backend, and that is correct — `MenuSystem`
-    /// owns its own `open_item`, and both backends' `OverlayOp::MenuDropdown`
+    /// owns its own `open_item`, and both backends' `FrameOp::MenuDropdown`
     /// rung just calls `MenuSystem::render`, which decides for itself whether a
     /// dropdown body is open. This field's only consumers are the
     /// `collect_*_ui_elements` parity harnesses below, which need the flag as
@@ -21378,64 +21420,96 @@ pub fn matches_key_binding(
 mod tests {
     use super::*;
 
-    // ─── Overlay-band composition (#735 slice 1) ──────────────────────────
+    // ─── Frame composition (#735 slices 1-6, folded by #766) ──────────────
 
     /// Pins the canonical z-order itself. Not a tautology: this is the *only*
     /// place the order is written down now, so the assertion is what a reviewer
     /// reads to see it, and reordering the constant to "fix" a backend fails
     /// here first with a diff that names both rungs.
     #[test]
-    fn overlay_z_order_is_the_single_shared_ladder() {
+    fn frame_z_order_is_the_single_shared_ladder() {
         assert_eq!(
-            OVERLAY_Z_ORDER,
+            FRAME_Z_ORDER,
             [
-                OverlayOp::MenuDropdown,
-                OverlayOp::CommandCenter,
-                OverlayOp::FindReplace,
-                OverlayOp::UnifiedPicker,
-                OverlayOp::TabSwitcher,
-                OverlayOp::ContextMenu,
-                OverlayOp::Dialog,
-                OverlayOp::ToastStack,
+                FrameOp::MenuRow,
+                FrameOp::SidebarPanel,
+                FrameOp::Wildmenu,
+                FrameOp::StatusBar,
+                FrameOp::CommandLine,
+                FrameOp::FolderPicker,
+                FrameOp::MenuDropdown,
+                FrameOp::CommandCenter,
+                FrameOp::FindReplace,
+                FrameOp::UnifiedPicker,
+                FrameOp::TabSwitcher,
+                FrameOp::ContextMenu,
+                FrameOp::Dialog,
+                FrameOp::ToastStack,
             ],
-            "the shared overlay z-order changed — both backends walk this array, \
+            "the shared frame z-order changed — both backends walk this array, \
              so a reorder here moves both. Confirm the new order against \
              `route_modal_overlay_click`'s arbitration before accepting."
         );
 
+        let pos = |op: FrameOp| FRAME_Z_ORDER.iter().position(|c| *c == op).unwrap();
+
+        // #766: the whole chrome half precedes the whole overlay half. This is
+        // the invariant the fold has to preserve — before it, the two halves
+        // were separate constants and "chrome below overlays" was only a
+        // sentence in a doc comment.
+        let first_overlay = FRAME_Z_ORDER
+            .iter()
+            .position(|op| op.is_overlay())
+            .expect("the overlay tail exists");
+        assert!(
+            FRAME_Z_ORDER[..first_overlay]
+                .iter()
+                .all(|op| !op.is_overlay())
+                && FRAME_Z_ORDER[first_overlay..]
+                    .iter()
+                    .all(|op| op.is_overlay()),
+            "the overlay rungs must be a contiguous *tail* of FRAME_Z_ORDER — \
+             a chrome rung composed after an overlay rung would be painted on \
+             top of a modal"
+        );
+
         // The two placements #735 had to *pick* between, called out so a future
         // edit that quietly reverts either one fails with the reason attached.
-        let pos = |op: OverlayOp| OVERLAY_Z_ORDER.iter().position(|c| *c == op).unwrap();
         assert!(
-            pos(OverlayOp::Dialog) > pos(OverlayOp::ContextMenu),
+            pos(FrameOp::Dialog) > pos(FrameOp::ContextMenu),
             "a modal dialog takes every event ahead of the context menu \
              (`route_modal_key` / `route_modal_overlay_click`), so it must also \
              paint above it — GTK had this inverted before #735"
         );
         assert!(
-            pos(OverlayOp::Dialog) > pos(OverlayOp::MenuDropdown),
+            pos(FrameOp::Dialog) > pos(FrameOp::MenuDropdown),
             "title-bar chrome is chrome: a modal covers it — TUI had this \
              inverted before #735"
         );
         assert!(
-            pos(OverlayOp::CommandCenter) > pos(OverlayOp::MenuDropdown),
+            pos(FrameOp::CommandCenter) > pos(FrameOp::MenuDropdown),
             "`MenuSystem::render` repaints `draw_menu_bar` across the whole \
              band, erasing a command centre drawn first (#676 on GTK, #712 on \
              TUI)"
         );
         assert!(
-            pos(OverlayOp::ToastStack) == OVERLAY_Z_ORDER.len() - 1,
+            pos(FrameOp::MenuDropdown) > pos(FrameOp::MenuRow),
+            "the dropdown arm paints the band the measure rung published, so it \
+             must come after it (#712)"
+        );
+        assert!(
+            pos(FrameOp::ToastStack) == FRAME_Z_ORDER.len() - 1,
             "toasts sit on top of everything, and are the first rung \
              `route_modal_overlay_click` arbitrates"
         );
     }
 
     /// #751 acceptance: the order the *mouse* router arbitrates in must be the
-    /// exact inverse of the order the *paint* band composes in.
+    /// exact inverse of the order the *paint* sequence composes in.
     ///
     /// They are the same fact stated twice — whatever paints on top is what the
     /// user is aiming at — and #587/#592 are what happens when the two
-    /// disagree. Before #751 the two halves genuinely did: `OVERLAY_Z_ORDER`
+    /// disagree. Before #751 the two halves genuinely did: the paint order
     /// put the context menu above the picker and find/replace, while TUI's
     /// `handle_mouse` arbitrated the picker and find/replace ~1,100 lines
     /// *before* it. Nothing could catch that because the mouse ladder was
@@ -21443,7 +21517,7 @@ mod tests {
     /// makes it one.
     #[test]
     fn mouse_arbitration_is_the_inverse_of_the_paint_z_order() {
-        let expected: Vec<OverlayOp> = OVERLAY_Z_ORDER
+        let expected: Vec<FrameOp> = FRAME_Z_ORDER
             .iter()
             .rev()
             .copied()
@@ -21453,7 +21527,7 @@ mod tests {
             MOUSE_ARBITRATION_ORDER.to_vec(),
             expected,
             "`route_modal_overlay_click` arbitrates in a different order than \
-             `OVERLAY_Z_ORDER` paints in — an overlay would be painted on top \
+             `FRAME_Z_ORDER` paints in — an overlay would be painted on top \
              of the one that actually owns the click underneath it"
         );
 
@@ -21462,42 +21536,69 @@ mod tests {
         // which is the tab-switcher bug #733 found. `MenuDropdown` /
         // `CommandCenter` are the deliberate exceptions — `MenuSystem::handle`
         // owns the title-bar band's own events before this router runs.
-        for op in OVERLAY_Z_ORDER {
+        for op in FRAME_Z_ORDER.into_iter().filter(|op| op.is_overlay()) {
             let arbitrated = MOUSE_ARBITRATION_ORDER.contains(&op);
-            let title_bar_chrome = matches!(op, OverlayOp::MenuDropdown | OverlayOp::CommandCenter);
+            // `MenuDropdown` / `CommandCenter`: `MenuSystem::handle` owns the
+            // title-bar band's own events before this router runs.
+            // `FolderPicker`: TUI-only, so there is no *shared* router rung to
+            // agree with — `mouse.rs` routes it directly and records the
+            // "deliberately one-sided" verdict.
+            let routed_elsewhere = matches!(
+                op,
+                FrameOp::MenuDropdown | FrameOp::CommandCenter | FrameOp::FolderPicker
+            );
             assert_eq!(
-                arbitrated, !title_bar_chrome,
+                arbitrated, !routed_elsewhere,
                 "{op:?} is painted but not arbitrated (or vice versa) — add it \
                  to `MOUSE_ARBITRATION_ORDER` and to \
                  `route_modal_overlay_click`, or state why it is chrome"
             );
         }
+
+        // Chrome rungs are never arbitrated here: they route through
+        // `route_chrome_click` / `MenuSystem::handle`, not the modal ladder.
+        for op in FRAME_Z_ORDER.into_iter().filter(|op| !op.is_overlay()) {
+            assert!(
+                !MOUSE_ARBITRATION_ORDER.contains(&op),
+                "{op:?} is chrome — it must not be in the modal-overlay ladder"
+            );
+        }
     }
 
     #[test]
-    fn compose_overlay_band_filters_to_live_rungs_in_canonical_order() {
-        let none = OverlayPresence::default();
-        assert!(compose_overlay_band(&none).is_empty());
+    fn compose_frame_filters_to_live_rungs_in_canonical_order() {
+        let none = FramePresence::default();
+        assert!(compose_frame(&none).is_empty());
 
         // Deliberately set in an order that is *not* the paint order, to prove
-        // the output order comes from `OVERLAY_Z_ORDER` and not from the
+        // the output order comes from `FRAME_Z_ORDER` and not from the
         // struct's field order or the caller's.
-        let mut p = OverlayPresence::default();
+        let mut p = FramePresence::default();
         p.toast_stack = true;
         p.context_menu = true;
         p.menu_dropdown = true;
         p.dialog = true;
+        p.command_line = true;
+        p.menu_row = true;
         assert_eq!(
-            compose_overlay_band(&p),
+            compose_frame(&p),
             vec![
-                OverlayOp::MenuDropdown,
-                OverlayOp::ContextMenu,
-                OverlayOp::Dialog,
-                OverlayOp::ToastStack,
+                FrameOp::MenuRow,
+                FrameOp::CommandLine,
+                FrameOp::MenuDropdown,
+                FrameOp::ContextMenu,
+                FrameOp::Dialog,
+                FrameOp::ToastStack,
             ]
         );
 
-        let all = OverlayPresence {
+        let all = FramePresence {
+            menu_row: true,
+            sidebar_panel: true,
+            wildmenu: true,
+            status_bar: true,
+            command_line: true,
+            folder_picker: true,
             menu_dropdown: true,
             command_center: true,
             find_replace: true,
@@ -21507,18 +21608,19 @@ mod tests {
             dialog: true,
             toast_stack: true,
         };
-        assert_eq!(compose_overlay_band(&all), OVERLAY_Z_ORDER.to_vec());
+        assert_eq!(compose_frame(&all), FRAME_Z_ORDER.to_vec());
     }
 
     #[test]
-    fn check_overlay_band_order_accepts_any_canonical_subsequence() {
-        assert!(check_overlay_band_order(&[]).is_ok());
-        assert!(check_overlay_band_order(&OVERLAY_Z_ORDER).is_ok());
-        assert!(check_overlay_band_order(&[OverlayOp::ContextMenu, OverlayOp::Dialog]).is_ok());
-        assert!(check_overlay_band_order(&[
-            OverlayOp::MenuDropdown,
-            OverlayOp::UnifiedPicker,
-            OverlayOp::ToastStack
+    fn check_frame_order_accepts_any_canonical_subsequence() {
+        assert!(check_frame_order(&[]).is_ok());
+        assert!(check_frame_order(&FRAME_Z_ORDER).is_ok());
+        assert!(check_frame_order(&[FrameOp::ContextMenu, FrameOp::Dialog]).is_ok());
+        assert!(check_frame_order(&[
+            FrameOp::MenuRow,
+            FrameOp::MenuDropdown,
+            FrameOp::UnifiedPicker,
+            FrameOp::ToastStack
         ])
         .is_ok());
     }
@@ -21527,23 +21629,28 @@ mod tests {
     /// reject. Keeps the regression legible: if someone hoists a rung back out
     /// of the shared walk, this is the shape it produces.
     #[test]
-    fn check_overlay_band_order_rejects_the_gtk_dialog_context_menu_inversion() {
-        let err = check_overlay_band_order(&[OverlayOp::Dialog, OverlayOp::ContextMenu])
-            .expect_err("dialog-then-context-menu runs backwards against OVERLAY_Z_ORDER");
+    fn check_frame_order_rejects_the_gtk_dialog_context_menu_inversion() {
+        let err = check_frame_order(&[FrameOp::Dialog, FrameOp::ContextMenu])
+            .expect_err("dialog-then-context-menu runs backwards against FRAME_Z_ORDER");
         assert!(err.contains("ContextMenu"), "{err}");
-        assert!(err.contains("out of z-order"), "{err}");
+        assert!(err.contains("out of order"), "{err}");
 
         // And the pre-#735 TUI one: title-bar chrome after the modal stack.
-        assert!(check_overlay_band_order(&[
-            OverlayOp::Dialog,
-            OverlayOp::MenuDropdown,
-            OverlayOp::CommandCenter,
-            OverlayOp::ToastStack,
+        assert!(check_frame_order(&[
+            FrameOp::Dialog,
+            FrameOp::MenuDropdown,
+            FrameOp::CommandCenter,
+            FrameOp::ToastStack,
         ])
         .is_err());
 
-        // A repeated rung is a double-paint, not a valid band.
-        assert!(check_overlay_band_order(&[OverlayOp::Dialog, OverlayOp::Dialog]).is_err());
+        // #766: chrome hoisted below the overlay tail is now the *same* check —
+        // before the fold these were two independent orders and this sequence
+        // was accepted by both of them.
+        assert!(check_frame_order(&[FrameOp::Dialog, FrameOp::CommandLine]).is_err());
+
+        // A repeated rung is a double-paint, not a valid sequence.
+        assert!(check_frame_order(&[FrameOp::Dialog, FrameOp::Dialog]).is_err());
     }
 
     /// A `ScreenLayout` for an untouched engine: no wildmenu, per-window status
@@ -21571,8 +21678,8 @@ mod tests {
         }
     }
 
-    /// `compose_frame`'s gates, in both unit systems, on the degenerate shapes
-    /// the driver-level tests cannot construct.
+    /// `FramePresence::from_screen`'s gates, in both unit systems, on the
+    /// degenerate shapes the driver-level tests cannot construct.
     ///
     /// The two divergences #763 closes are here as facts: before it, GTK's
     /// sidebar rung had **no** minimum-size check (it painted a whole panel
@@ -21580,6 +21687,9 @@ mod tests {
     /// `height > 0.0` with no width check at all. TUI checked both, in cells.
     #[test]
     fn compose_frame_gates_degenerate_bands_in_the_callers_units() {
+        let compose = |screen: &ScreenLayout, layout: &quadraui::AppShellLayout, m| {
+            compose_frame(&FramePresence::from_screen(screen, layout, m))
+        };
         let mut screen = bare_screen_layout();
         screen.menu_bar_visible = true;
 
@@ -21590,35 +21700,46 @@ mod tests {
 
         let px = FrameMetrics::px(17.0, 8.0);
         assert_eq!(
-            compose_frame(&screen, &layout, px),
+            compose(&screen, &layout, px),
             vec![
                 FrameOp::MenuRow,
                 FrameOp::SidebarPanel,
-                FrameOp::CommandLine
+                FrameOp::CommandLine,
+                FrameOp::MenuDropdown,
+                FrameOp::CommandCenter,
             ],
-            "no wildmenu and no global status bar in a default ScreenLayout"
+            "no wildmenu and no global status bar in a default ScreenLayout; \
+             the title bar drives all three of its rungs"
         );
 
         // A band one pixel shorter than a text line is not a band. GTK's own
-        // `height > 0.0` gate accepted this.
+        // `height > 0.0` gate accepted this. #766: this now also gates the
+        // *dropdown*, whose GTK arm checked nothing but `menu_bar_visible`.
         layout.title_bar_bounds = Some(quadraui::Rect::new(0.0, 0.0, 1400.0, 16.0));
-        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::MenuRow));
+        for op in [
+            FrameOp::MenuRow,
+            FrameOp::MenuDropdown,
+            FrameOp::CommandCenter,
+        ] {
+            assert!(!compose(&screen, &layout, px).contains(&op), "{op:?}");
+        }
 
         // ... and neither is a zero-width one. GTK never checked the width.
         layout.title_bar_bounds = Some(quadraui::Rect::new(0.0, 0.0, 0.0, 17.0));
-        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::MenuRow));
+        assert!(!compose(&screen, &layout, px).contains(&FrameOp::MenuRow));
 
         layout.title_bar_bounds = Some(full_band);
         screen.menu_bar_visible = false;
-        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::MenuRow));
+        assert!(!compose(&screen, &layout, px).contains(&FrameOp::MenuRow));
+        assert!(!compose(&screen, &layout, px).contains(&FrameOp::MenuDropdown));
         screen.menu_bar_visible = true;
 
         // A collapsed sidebar content rect: `Some`, but nothing fits in it.
         // This is the shape GTK painted a whole panel into before #763.
         layout.sidebar_content_bounds = Some(quadraui::Rect::new(0.0, 17.0, 240.0, 0.0));
-        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::SidebarPanel));
+        assert!(!compose(&screen, &layout, px).contains(&FrameOp::SidebarPanel));
         layout.sidebar_content_bounds = None;
-        assert!(!compose_frame(&screen, &layout, px).contains(&FrameOp::SidebarPanel));
+        assert!(!compose(&screen, &layout, px).contains(&FrameOp::SidebarPanel));
 
         // The same rects are all fine in *cells*, which is the whole point of
         // `FrameMetrics` being a unit rather than a geometry: a 240x0 rect is
@@ -21626,11 +21747,13 @@ mod tests {
         layout.title_bar_bounds = Some(quadraui::Rect::new(0.0, 0.0, 1400.0, 16.0));
         layout.sidebar_content_bounds = Some(quadraui::Rect::new(0.0, 17.0, 240.0, 800.0));
         assert_eq!(
-            compose_frame(&screen, &layout, FrameMetrics::CELL),
+            compose(&screen, &layout, FrameMetrics::CELL),
             vec![
                 FrameOp::MenuRow,
                 FrameOp::SidebarPanel,
-                FrameOp::CommandLine
+                FrameOp::CommandLine,
+                FrameOp::MenuDropdown,
+                FrameOp::CommandCenter,
             ]
         );
     }
@@ -21643,37 +21766,48 @@ mod tests {
         let screen = bare_screen_layout();
         let layout = bare_shell_layout();
         assert_eq!(
-            compose_frame(&screen, &layout, FrameMetrics::CELL),
+            compose_frame(&FramePresence::from_screen(
+                &screen,
+                &layout,
+                FrameMetrics::CELL
+            )),
             vec![FrameOp::CommandLine],
             "nothing else is live in an empty layout, but the command line row \
              is always painted"
         );
-        assert_eq!(chrome_band_fixture(true), CHROME_Z_ORDER.to_vec());
+        assert_eq!(
+            chrome_band_fixture(true),
+            FRAME_Z_ORDER
+                .iter()
+                .copied()
+                .filter(|op| !op.is_overlay())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The pre-#763 GTK chrome order, which is what this check exists to
     /// reject. Keeps the regression legible: if someone hoists a rung back out
     /// of the shared walk, this is the shape it produces.
     #[test]
-    fn check_chrome_band_order_rejects_the_gtk_status_wildmenu_inversion() {
+    fn check_frame_order_rejects_the_gtk_status_wildmenu_inversion() {
         assert_eq!(
-            check_chrome_band_order(&[FrameOp::MenuRow, FrameOp::CommandLine]),
+            check_frame_order(&[FrameOp::MenuRow, FrameOp::CommandLine]),
             Ok(()),
             "any canonical subsequence is fine — the check is about order, not \
              about which rungs were live"
         );
 
-        let err = check_chrome_band_order(&[FrameOp::StatusBar, FrameOp::Wildmenu])
-            .expect_err("status-then-wildmenu runs backwards against CHROME_Z_ORDER");
+        let err = check_frame_order(&[FrameOp::StatusBar, FrameOp::Wildmenu])
+            .expect_err("status-then-wildmenu runs backwards against FRAME_Z_ORDER");
         assert!(err.contains("Wildmenu"), "{err}");
         assert!(err.contains("out of order"), "{err}");
 
         // The pre-#763 GTK tail: the sidebar body composed after the command
         // line.
-        assert!(check_chrome_band_order(&[FrameOp::CommandLine, FrameOp::SidebarPanel]).is_err());
+        assert!(check_frame_order(&[FrameOp::CommandLine, FrameOp::SidebarPanel]).is_err());
 
-        // A repeated rung is a double-composition, not a valid band.
-        assert!(check_chrome_band_order(&[FrameOp::CommandLine, FrameOp::CommandLine]).is_err());
+        // A repeated rung is a double-composition, not a valid sequence.
+        assert!(check_frame_order(&[FrameOp::CommandLine, FrameOp::CommandLine]).is_err());
     }
 
     fn empty_sc_data() -> SourceControlData {
