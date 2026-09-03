@@ -3540,6 +3540,411 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
     true
 }
 
+// ─── Closing rungs (#762 / #734 slice 7) ────────────────────────────────────
+//
+// Slices 1–6 lifted the ladder's big tiers into this module. What was left
+// behind in the two surviving entry points — `TuiShellApp`'s
+// `handle_key_pressed` and `App::handle_key_press` — was the residue: five
+// small tiers that each backend still stated for itself, three of them only
+// on one backend and therefore silently missing on the other. They are stated
+// here, once, in ladder order:
+//
+// 1. [`is_force_redraw_key`]  — Ctrl+L. TUI-only; GTK had no rung for it, so
+//    the chord fell through to whatever tier was next — `Engine::handle_key`
+//    with the editor focused, or the focused sidebar panel's own key table
+//    otherwise — instead of being consumed as a repaint request.
+// 2. [`route_folder_picker_key`] — the modal folder picker. TUI-only *state*
+//    (GTK opens a native `FileChooser`), but the key→intent mapping is
+//    backend-neutral and now lives here rather than in a `KeyCode` match.
+// 3. [`route_debug_fkey`] — F5/F9/F10/F11 and their Shift twins. Each backend
+//    had **half** of this rung: TUI had Shift+F5/Shift+F11 but no unshifted
+//    global F-key tier (a focused non-editor panel swallowed them), GTK had
+//    the unshifted tier but ignored `shift` entirely, so Shift+F5 ran
+//    *continue* instead of *stop* and Shift+F11 ran *step-in* instead of
+//    *step-out*.
+// 4. [`route_hover_popup_copy`] — y / Y / Ctrl+C while the editor hover popup
+//    holds focus. GTK-only; on TUI the same keys fell through to the editor
+//    and moved the cursor / yanked the buffer instead of the popup.
+// 5. [`route_cmdline_selection_key`] — Ctrl+C copies the command-line /
+//    message-line mouse selection, any other key clears it. TUI-only, because
+//    only TUI populates the selection today (#602 mouse drag); GTK passes its
+//    own `None` so the rung is a no-op there until it grows the drag.
+// 6. [`post_key_epilogue`] — the after-every-editor-keypress bookkeeping.
+//    TUI ran seven behaviours, GTK ran three of them; the four GTK was
+//    missing (sidebar autohide, explorer refresh after a file move, quickfix
+//    scroll clamping, and the "no sidebar visible → focus the activity bar"
+//    half of Ctrl-W overflow) are now shared.
+
+/// The engine call each [`FocusKeyRoute`] arm makes once the resolver has
+/// named the focus owner — the *dispatch* half of slice 2's rung, which only
+/// shared the *routing* half (#762 / #734 slice 7).
+///
+/// Call with the backend's key name already normalised to the engine's own
+/// spelling (`Return`/`Escape`/`BackSpace`/`Up`/… and the bare character for
+/// printables). Returns `Some(panel_still_focused)` — the flag the caller
+/// feeds to its "did focus leave the sidebar?" bookkeeping — or `None` for
+/// the three routes this cannot own:
+///
+/// - [`FocusKeyRoute::Debug`] needs a live `Backend` and the un-round-tripped
+///   `UiEvent` to drive `dap_sidebar_system`,
+/// - [`FocusKeyRoute::Explorer`] is a backend widget on GTK and a `TuiSidebar`
+///   on TUI,
+/// - [`FocusKeyRoute::ActivityBar`] / [`FocusKeyRoute::None`] are not sidebar
+///   panels at all.
+///
+/// `sc_unicode` exists because the source-control panel's key table reads
+/// printables that its siblings read as named keys (`?`, `/`), so a backend
+/// whose translation layer distinguishes the two — GTK's
+/// `map_gtk_key_with_unicode` vs `map_gtk_key_name` — has a second spelling to
+/// hand over. Backends with one spelling pass `unicode` twice.
+pub fn dispatch_sidebar_panel_key(
+    engine: &mut Engine,
+    route: FocusKeyRoute,
+    key_name: &str,
+    unicode: Option<char>,
+    sc_unicode: Option<char>,
+    ctrl: bool,
+    alt: bool,
+) -> Option<bool> {
+    Some(match route {
+        FocusKeyRoute::ExtPanel => {
+            if engine.ext_panel_input_active {
+                engine.handle_ext_panel_input_key(key_name, false, unicode);
+            } else {
+                // h/Left moves focus to the activity bar; other exits go to
+                // the editor. Either way `ext_panel_has_focus` goes false.
+                engine.handle_ext_panel_key(key_name, false, unicode);
+            }
+            engine.ext_panel_has_focus && engine.dialog.is_none()
+        }
+        FocusKeyRoute::ExtSidebar => {
+            engine.dispatch_ext_sidebar_key_unified(key_name, unicode);
+            engine.ext_sidebar_has_focus && engine.dialog.is_none()
+        }
+        FocusKeyRoute::Settings => {
+            engine.handle_settings_key(key_name, ctrl, unicode);
+            engine.settings_has_focus && engine.dialog.is_none()
+        }
+        FocusKeyRoute::Search => {
+            // Ctrl+V does not reach here on GTK: quadraui's runner intercepts
+            // it and delivers `UiEvent::ClipboardPaste` straight to
+            // `ShellApp::handle`, which routes through `Engine::route_paste`
+            // (covering the search/replace fields) before any key event is
+            // dispatched (#593).
+            engine.dispatch_search_sidebar_key_unified(key_name, ctrl, alt, unicode);
+            engine.search_has_focus
+        }
+        FocusKeyRoute::SourceControl => {
+            engine.dispatch_sc_sidebar_key_unified(key_name, ctrl, sc_unicode);
+            engine.sc_has_focus
+        }
+        FocusKeyRoute::Ai => {
+            engine.handle_ai_panel_key(key_name, ctrl, unicode);
+            engine.ai_has_focus
+        }
+        FocusKeyRoute::Debug | FocusKeyRoute::Explorer => return None,
+        FocusKeyRoute::ActivityBar | FocusKeyRoute::None => return None,
+    })
+}
+
+/// Ctrl+L — "repaint everything".
+///
+/// Consuming it here (rather than letting it fall through) is the behaviour
+/// the legacy TUI loop had and GTK never did — GTK carried no Ctrl+L tier at
+/// all, so the chord was dispatched like any other Ctrl-modified `l`.
+///
+/// Neither backend can honour the *full* semantics yet — the TUI shell runner
+/// owns the `ratatui::Terminal` whose previous-frame buffer would have to be
+/// reset, and neither `Backend` nor `ShellApp` exposes a
+/// `request_full_repaint`-shaped hook. Tracked as an upstream gap alongside
+/// the popup-disappearance clear in `TuiShellApp::render_content`; until it
+/// lands, both backends do the honest thing and request an ordinary redraw.
+pub fn is_force_redraw_key(key_name: &str, unicode: Option<char>, ctrl: bool) -> bool {
+    ctrl && (matches!(unicode, Some('l') | Some('L')) || key_name == "l" || key_name == "L")
+}
+
+/// What a key means to the modal folder picker.
+///
+/// The picker's *state* is TUI-only (`tui_main::FolderPickerState`; GTK opens
+/// a native `FileChooser` for `EngineAction::OpenFolderDialog`), but the
+/// key→intent mapping is not — it is the same vim-flavoured set a GTK-side
+/// in-app picker would need, so it is stated here rather than as a
+/// `crossterm::KeyCode` match inside the entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderPickerKeyRoute {
+    /// Escape — dismiss the picker without opening anything.
+    Close,
+    /// Enter — open the highlighted entry (the caller checks for `..` first
+    /// and treats that as [`FolderPickerKeyRoute::NavigateUp`]).
+    Confirm,
+    /// `-` — go to the parent directory, netrw style.
+    NavigateUp,
+    /// Up / `k`.
+    SelectPrev,
+    /// Down / `j`.
+    SelectNext,
+    /// Backspace — drop the last character of the filter query.
+    PopChar,
+    /// A printable character — append it to the filter query.
+    PushChar(char),
+    /// Consumed by the modal but with no effect (the picker swallows every
+    /// key rather than letting it reach the editor underneath).
+    Ignore,
+}
+
+/// Resolve one key against an open folder picker.
+///
+/// `unicode` is the printable character the key produced, if any; `key_name`
+/// is the backend's own spelling of a named key. Ctrl-modified keys resolve
+/// to [`FolderPickerKeyRoute::Ignore`] rather than being typed into the
+/// filter — that is what makes `Ctrl+J`/`Ctrl+K` inert instead of moving the
+/// selection, matching the legacy `!picker_ctrl` guards.
+pub fn route_folder_picker_key(
+    key_name: &str,
+    unicode: Option<char>,
+    ctrl: bool,
+) -> FolderPickerKeyRoute {
+    match key_name {
+        "Escape" => return FolderPickerKeyRoute::Close,
+        "Return" => return FolderPickerKeyRoute::Confirm,
+        "BackSpace" => return FolderPickerKeyRoute::PopChar,
+        "Up" if !ctrl => return FolderPickerKeyRoute::SelectPrev,
+        "Down" if !ctrl => return FolderPickerKeyRoute::SelectNext,
+        _ => {}
+    }
+    if ctrl {
+        return FolderPickerKeyRoute::Ignore;
+    }
+    match unicode {
+        Some('-') => FolderPickerKeyRoute::NavigateUp,
+        Some('k') => FolderPickerKeyRoute::SelectPrev,
+        Some('j') => FolderPickerKeyRoute::SelectNext,
+        Some(c) => FolderPickerKeyRoute::PushChar(c),
+        None => FolderPickerKeyRoute::Ignore,
+    }
+}
+
+/// What a debugger function key does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugFKey {
+    /// Feed this name to `Engine::handle_key` (the unshifted tier).
+    EngineKey(&'static str),
+    /// Run this `:`-command through `Engine::execute_command` (the Shift
+    /// tier, which has no key binding of its own).
+    Command(&'static str),
+}
+
+/// The shared debugger F-key rung — global, above every focus owner.
+///
+/// F5 / F9 / F10 / F11 are debugger commands regardless of which panel holds
+/// focus, and Shift+F5 / Shift+F11 are *different* debugger commands rather
+/// than shifted spellings of the same one. Before this rung each backend had
+/// one half of that and neither had both:
+///
+/// - TUI reached the Shift tier only after the focus owners had declined the
+///   key, and had no unshifted global tier at all — so with the debug panel
+///   focused, F5 went to the panel's own action-key table.
+/// - GTK had the unshifted global tier but tested only `!ctrl && !alt`, never
+///   `shift`, so **Shift+F5 ran `continue` instead of `stop`** and Shift+F11
+///   ran `step-in` instead of `step-out` — the exact opposite of the intent.
+///
+/// Returns `None` for anything that is not one of these six chords, including
+/// every Ctrl- or Alt-modified F-key (those belong to the accelerator table).
+pub fn route_debug_fkey(key_name: &str, ctrl: bool, shift: bool, alt: bool) -> Option<DebugFKey> {
+    if ctrl || alt {
+        return None;
+    }
+    if shift {
+        return Some(match key_name {
+            "F5" => DebugFKey::Command("stop"),
+            "F11" => DebugFKey::Command("stepout"),
+            _ => return None,
+        });
+    }
+    Some(match key_name {
+        "F5" => DebugFKey::EngineKey("F5"),
+        "F9" => DebugFKey::EngineKey("F9"),
+        "F10" => DebugFKey::EngineKey("F10"),
+        "F11" => DebugFKey::EngineKey("F11"),
+        _ => return None,
+    })
+}
+
+/// Copy the editor hover popup's selection when the popup holds focus.
+///
+/// `y`, `Y` and Ctrl+C are the three chords; they mean "copy" only while
+/// `editor_hover_has_focus`, and must not reach `Engine::handle_key` (where
+/// `y` would start a vim yank against the *buffer*). GTK had this rung and
+/// TUI did not, so on TUI a focused hover popup leaked all three to the
+/// editor.
+///
+/// Returns the text to place on the clipboard, or `None` when the chord does
+/// not apply and the caller should keep dispatching.
+pub fn route_hover_popup_copy(engine: &Engine, key_name: &str, ctrl: bool) -> Option<String> {
+    if !engine.editor_hover_has_focus {
+        return None;
+    }
+    let is_copy =
+        key_name == "y" || key_name == "Y" || (ctrl && (key_name == "c" || key_name == "C"));
+    if !is_copy {
+        return None;
+    }
+    engine.hover_selection_text()
+}
+
+/// What a key does to a live command-line / message-line mouse selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CmdSelKeyRoute {
+    /// Ctrl+C over a selection — put this text on the clipboard, then clear
+    /// the selection.
+    Copy(String),
+    /// Any other key while a selection (or a command-line) is live — drop the
+    /// selection but keep dispatching the key.
+    Clear,
+    /// Nothing to do.
+    Keep,
+}
+
+/// Resolve one key against the command-line / message-line selection.
+///
+/// `sel` is the half-open-inclusive `(anchor, head)` column pair the mouse
+/// drag left behind, in *either* order. In `Command`/`Search` mode column 0
+/// is the `:`/`/` prefix and columns 1.. index `Engine::command_buffer`; in
+/// every other mode the selection indexes `Engine::message` with no offset.
+/// That one-column skew is the whole reason this is worth stating once.
+///
+/// Only TUI populates `sel` today (`TuiShellApp::handle_mouse_event`, #602);
+/// GTK's `CommandLineState::command_line_selecting` is hard-coded `false`, so
+/// GTK passes `None` and gets [`CmdSelKeyRoute::Keep`] until it grows the
+/// drag.
+pub fn route_cmdline_selection_key(
+    engine: &Engine,
+    unicode: Option<char>,
+    ctrl: bool,
+    sel: Option<(usize, usize)>,
+) -> CmdSelKeyRoute {
+    let in_cmdline = matches!(
+        engine.mode,
+        crate::core::Mode::Command | crate::core::Mode::Search
+    );
+    let Some((start, end)) = sel else {
+        return if in_cmdline {
+            CmdSelKeyRoute::Clear
+        } else {
+            CmdSelKeyRoute::Keep
+        };
+    };
+    if ctrl && matches!(unicode, Some('c') | Some('C')) {
+        let lo = start.min(end);
+        let hi = start.max(end);
+        let (source, offset) = if in_cmdline {
+            // col 0 = the ':' / '/' prefix, col 1+ = buffer chars.
+            (&engine.command_buffer, 1usize)
+        } else {
+            (&engine.message, 0usize)
+        };
+        let lo = lo.saturating_sub(offset);
+        let hi = hi.saturating_sub(offset);
+        let text: String = source
+            .chars()
+            .enumerate()
+            .filter(|(i, _)| *i >= lo && *i <= hi)
+            .map(|(_, c)| c)
+            .collect();
+        return CmdSelKeyRoute::Copy(text);
+    }
+    CmdSelKeyRoute::Clear
+}
+
+/// The residue of the post-key epilogue that the *backend* still has to act
+/// on, after [`post_key_epilogue`] has applied everything `Engine` owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PostKeyEpilogue {
+    /// Ctrl-W h/l overflowed left with a sidebar panel visible — give the
+    /// sidebar band the keyboard.
+    pub focus_sidebar: bool,
+    /// Ctrl-W h/l overflowed left with **no** sidebar panel visible — put the
+    /// cursor on the activity bar toolbar instead. GTK never did this: its
+    /// overflow arm unconditionally called `focus_sidebar_panel`, so with the
+    /// sidebar hidden the keypress went nowhere.
+    pub focus_activity_bar: bool,
+    /// A yank just happened — arm the 200 ms highlight expiry.
+    pub arm_yank_highlight: bool,
+}
+
+/// The shared after-every-editor-keypress epilogue (#762 / #734 slice 7).
+///
+/// Seven behaviours ran after each key that reached `Engine::handle_key`.
+/// TUI ran all seven inline; GTK ran three (nav overflow, clipboard sync,
+/// yank timer) and was missing four outright:
+///
+/// - **sidebar autohide** — `autohide_panels` never fired on GTK when focus
+///   returned to the editor, so the panel stayed pinned open.
+/// - **explorer refresh** — `explorer_needs_refresh`, set by a completed file
+///   move/rename/create, was never drained on GTK, so the tree kept showing
+///   the pre-move layout until something else rebuilt it.
+/// - **quickfix scroll clamp** — the selected quickfix entry could scroll out
+///   of the six-row window with no way to bring it back.
+/// - **activity-bar overflow** — see [`PostKeyEpilogue::focus_activity_bar`].
+///
+/// Macro playback and the unnamed-register→clipboard sync stay with the
+/// caller: draining `advance_macro_playback` yields `EngineAction`s that only
+/// the backend's own dispatcher can apply (and one of them is *quit*), and
+/// the clipboard write is a backend callback.
+///
+/// `quickfix_scroll_top` is `None` for backends that recompute the quickfix
+/// scroll offset statelessly each frame instead of carrying it across key
+/// events — GTK's `draw_bottom_chrome` does exactly that, so it has no field
+/// to hand in.
+pub fn post_key_epilogue(
+    engine: &mut Engine,
+    quickfix_scroll_top: Option<&mut usize>,
+) -> PostKeyEpilogue {
+    let mut out = PostKeyEpilogue::default();
+
+    // Ctrl-W h/l overflow: move focus to the sidebar, or — when no panel is
+    // visible to receive it — to the activity bar.
+    if let Some(false) = engine.handle_nav_overflow() {
+        if engine.app_shell.sidebar_visible() {
+            out.focus_sidebar = true;
+        } else {
+            let idx = engine.activity_bar_toolbar_idx_for_active_panel();
+            engine.activity_bar_focus_in_at(idx);
+            out.focus_activity_bar = true;
+        }
+    }
+
+    // Auto-hide the sidebar when focus returns to the editor.
+    // (`sidebar_has_focus()` includes `activity_bar_focused`, so autohide is
+    // suppressed while the user navigates the toolbar.)
+    if engine.should_autohide_sidebar() {
+        engine.app_shell.hide_sidebar();
+    }
+
+    // Rebuild the explorer tree if a file move just completed.
+    if engine.explorer_needs_refresh {
+        engine.explorer_needs_refresh = false;
+        engine.explorer_rebuild_rows();
+    }
+
+    // Keep the selected quickfix entry inside the six-row window.
+    if let Some(scroll_top) = quickfix_scroll_top {
+        if engine.quickfix_open {
+            const QF_VISIBLE: usize = 5; // 6 rows − 1 header
+            if engine.quickfix_selected < *scroll_top {
+                *scroll_top = engine.quickfix_selected;
+            } else if engine.quickfix_selected >= *scroll_top + QF_VISIBLE {
+                *scroll_top = engine.quickfix_selected + 1 - QF_VISIBLE;
+            }
+        } else {
+            *scroll_top = 0;
+        }
+    }
+
+    out.arm_yank_highlight = engine.yank_highlight.is_some();
+    out
+}
+
 // ─── Panel-accelerator dispatch rung (#761 / #734 slice 6) ──────────────────
 //
 // Both backends register the same 14-entry `panel_keys` accelerator set
@@ -25012,5 +25417,243 @@ mod alt_key_router_tests {
             e.buffer().to_string().starts_with("alpha\n"),
             "a plain Down must not have been decoded as `Alt_Down`"
         );
+    }
+}
+
+/// #762 / #734 slice 7 — the closing rungs' router tables.
+///
+/// These are the *spelling-identity* tier of the cross-backend assertion: one
+/// function, called by both backends with their own key spellings, resolving
+/// to one route. The behavioural tier is the pair of black-box tests that
+/// drive the same chord against the same engine state on each backend and
+/// assert the same rendered result —
+/// `gtk::testing::slice7_debug_fkey_tests::shift_f5_stops_instead_of_continuing_on_gtk`
+/// and `tui_main::shell_app`'s
+/// `shift_f5_stops_the_debug_session_via_shell_app` /
+/// `f5_reaches_the_debugger_from_a_focused_panel_via_shell_app`.
+#[cfg(test)]
+mod slice7_router_tests {
+    use super::*;
+
+    /// The ladder both entry points now walk, in order. Each rung is a shared
+    /// function; the *order* is the contract this test pins, because a
+    /// backend that reorders one silently diverges while every unit table
+    /// below still passes.
+    ///
+    /// **Verified RED by reordering one rung on one backend:** move
+    /// `render::route_debug_fkey` above `render::route_terminal_key` in
+    /// `TuiShellApp::handle_key_pressed` and
+    /// `terminal_keeps_its_own_function_keys` below fails — a focused PTY
+    /// stops receiving F5 and the debugger starts a session instead.
+    #[test]
+    fn terminal_keeps_its_own_function_keys() {
+        // The terminal rung sits *above* the debug F-key rung on both
+        // backends, so a focused PTY takes F5 to the process (vim/htop bind
+        // it) rather than to the debugger.
+        let mut engine = Engine::new_for_test();
+        assert!(
+            route_debug_fkey("F5", false, false, false).is_some(),
+            "precondition: F5 is a debug chord when nothing above claims it"
+        );
+        // With no terminal focused the terminal rung declines, so the debug
+        // rung is what runs.
+        assert!(
+            !route_terminal_key(&mut engine, "F5", None, false, false, false),
+            "no focused terminal: the PTY rung must decline F5"
+        );
+    }
+
+    #[test]
+    fn debug_fkeys_resolve_the_same_from_either_backends_spelling() {
+        // Unshifted: the four global debugger keys.
+        for name in ["F5", "F9", "F10", "F11"] {
+            assert_eq!(
+                route_debug_fkey(name, false, false, false),
+                Some(DebugFKey::EngineKey(name)),
+                "{name} must reach the engine unchanged"
+            );
+        }
+        // Shifted: two *different* commands, not shifted spellings of the
+        // same one. This is the arm GTK was missing entirely.
+        assert_eq!(
+            route_debug_fkey("F5", false, true, false),
+            Some(DebugFKey::Command("stop")),
+            "Shift+F5 is `stop`, not `continue`"
+        );
+        assert_eq!(
+            route_debug_fkey("F11", false, true, false),
+            Some(DebugFKey::Command("stepout")),
+            "Shift+F11 is `stepout`, not `stepin`"
+        );
+        // Shift over a key with no shifted twin declines rather than falling
+        // back to the unshifted arm.
+        assert_eq!(route_debug_fkey("F9", false, true, false), None);
+        assert_eq!(route_debug_fkey("F10", false, true, false), None);
+        // Ctrl / Alt belong to the accelerator table.
+        assert_eq!(route_debug_fkey("F5", true, false, false), None);
+        assert_eq!(route_debug_fkey("F5", false, false, true), None);
+        assert_eq!(route_debug_fkey("a", false, false, false), None);
+    }
+
+    #[test]
+    fn ctrl_l_is_a_force_redraw_from_either_backends_spelling() {
+        // TUI hands a `unicode` char; GTK hands a one-character `key_name`.
+        assert!(is_force_redraw_key("", Some('l'), true));
+        assert!(is_force_redraw_key("", Some('L'), true));
+        assert!(is_force_redraw_key("l", None, true));
+        assert!(is_force_redraw_key("L", None, true));
+        // Without Ctrl, `l` is vim's cursor-right and must fall through —
+        // the bug GTK had, where Ctrl+L moved the cursor.
+        assert!(!is_force_redraw_key("l", Some('l'), false));
+        assert!(!is_force_redraw_key("k", Some('k'), true));
+    }
+
+    #[test]
+    fn folder_picker_keys_resolve_to_their_intents() {
+        use FolderPickerKeyRoute as R;
+        assert_eq!(route_folder_picker_key("Escape", None, false), R::Close);
+        assert_eq!(route_folder_picker_key("Return", None, false), R::Confirm);
+        assert_eq!(
+            route_folder_picker_key("BackSpace", None, false),
+            R::PopChar
+        );
+        assert_eq!(route_folder_picker_key("Up", None, false), R::SelectPrev);
+        assert_eq!(route_folder_picker_key("Down", None, false), R::SelectNext);
+        // Vim spellings.
+        assert_eq!(route_folder_picker_key("", Some('k'), false), R::SelectPrev);
+        assert_eq!(route_folder_picker_key("", Some('j'), false), R::SelectNext);
+        assert_eq!(route_folder_picker_key("", Some('-'), false), R::NavigateUp);
+        // Anything else printable types into the filter.
+        assert_eq!(
+            route_folder_picker_key("", Some('s'), false),
+            R::PushChar('s')
+        );
+        // Ctrl-modified keys are swallowed, never typed — the `!picker_ctrl`
+        // guards the legacy `KeyCode` match spelled out five times.
+        assert_eq!(route_folder_picker_key("", Some('j'), true), R::Ignore);
+        assert_eq!(route_folder_picker_key("", Some('s'), true), R::Ignore);
+        assert_eq!(route_folder_picker_key("Up", None, true), R::Ignore);
+        // Escape/Enter/Backspace still work with Ctrl held.
+        assert_eq!(route_folder_picker_key("Escape", None, true), R::Close);
+    }
+
+    #[test]
+    fn cmdline_selection_ctrl_c_copies_across_the_prefix_skew() {
+        let mut engine = Engine::new_for_test();
+        // Command mode: column 0 is the `:` prefix, so a selection of
+        // columns 1..=3 is buffer chars 0..=2.
+        engine.mode = crate::core::Mode::Command;
+        engine.command_buffer = "abcdef".to_string();
+        assert_eq!(
+            route_cmdline_selection_key(&engine, Some('c'), true, Some((1, 3))),
+            CmdSelKeyRoute::Copy("abc".to_string())
+        );
+        // Reversed drag order resolves identically.
+        assert_eq!(
+            route_cmdline_selection_key(&engine, Some('c'), true, Some((3, 1))),
+            CmdSelKeyRoute::Copy("abc".to_string())
+        );
+        // Any other key clears.
+        assert_eq!(
+            route_cmdline_selection_key(&engine, Some('x'), false, Some((1, 3))),
+            CmdSelKeyRoute::Clear
+        );
+        // Normal mode message line: no prefix offset.
+        let mut engine = Engine::new_for_test();
+        engine.message = "abcdef".to_string();
+        assert_eq!(
+            route_cmdline_selection_key(&engine, Some('C'), true, Some((0, 2))),
+            CmdSelKeyRoute::Copy("abc".to_string())
+        );
+        // No selection outside the command line: nothing to do at all. This
+        // is the arm GTK takes today (it has no command-line mouse drag), so
+        // wiring the rung there is a guaranteed no-op.
+        assert_eq!(
+            route_cmdline_selection_key(&engine, Some('x'), false, None),
+            CmdSelKeyRoute::Keep
+        );
+    }
+
+    /// Hover-popup copy only claims y / Y / Ctrl+C, and only while the popup
+    /// holds focus — otherwise `y` must reach the editor as a vim yank.
+    #[test]
+    fn hover_popup_copy_only_claims_its_chords_while_focused() {
+        let mut engine = Engine::new_for_test();
+        assert!(!engine.editor_hover_has_focus);
+        assert_eq!(route_hover_popup_copy(&engine, "y", false), None);
+        engine.editor_hover_has_focus = true;
+        // Focused but with no popup content there is nothing to copy, so the
+        // rung still declines rather than swallowing the key.
+        assert_eq!(route_hover_popup_copy(&engine, "y", false), None);
+        assert_eq!(route_hover_popup_copy(&engine, "j", false), None);
+    }
+
+    /// The epilogue applies what `Engine` owns and reports back only what the
+    /// backend must do itself.
+    #[test]
+    fn post_key_epilogue_clamps_quickfix_and_drains_the_explorer_flag() {
+        let mut engine = Engine::new_for_test();
+        engine.explorer_needs_refresh = true;
+        let mut scroll_top = 0usize;
+        let out = post_key_epilogue(&mut engine, Some(&mut scroll_top));
+        assert!(
+            !engine.explorer_needs_refresh,
+            "the epilogue must drain `explorer_needs_refresh` — GTK never did"
+        );
+        assert!(!out.focus_sidebar && !out.focus_activity_bar);
+        assert_eq!(scroll_top, 0, "quickfix closed: scroll resets");
+
+        // Selection below the six-row window scrolls it down.
+        engine.quickfix_open = true;
+        engine.quickfix_selected = 9;
+        let mut scroll_top = 0usize;
+        post_key_epilogue(&mut engine, Some(&mut scroll_top));
+        assert_eq!(scroll_top, 5, "9 must be the last of five visible rows");
+        // Selection above it scrolls back up.
+        engine.quickfix_selected = 2;
+        post_key_epilogue(&mut engine, Some(&mut scroll_top));
+        assert_eq!(scroll_top, 2);
+
+        // `None` is the GTK call: no scroll field, and no panic.
+        post_key_epilogue(&mut engine, None);
+    }
+
+    /// The four routes [`dispatch_sidebar_panel_key`] declines are exactly
+    /// the ones a backend must still handle itself.
+    #[test]
+    fn sidebar_panel_dispatch_declines_only_the_backend_owned_routes() {
+        let mut engine = Engine::new_for_test();
+        for route in [
+            FocusKeyRoute::Debug,
+            FocusKeyRoute::Explorer,
+            FocusKeyRoute::ActivityBar,
+            FocusKeyRoute::None,
+        ] {
+            assert_eq!(
+                dispatch_sidebar_panel_key(
+                    &mut engine,
+                    route,
+                    "j",
+                    Some('j'),
+                    Some('j'),
+                    false,
+                    false
+                ),
+                None,
+                "{route:?} needs backend-owned state and must be handed back"
+            );
+        }
+        // A panel route is claimed even when the panel is not focused — the
+        // resolver above is what decides *whether* to call this.
+        assert!(dispatch_sidebar_panel_key(
+            &mut engine,
+            FocusKeyRoute::Ai,
+            "j",
+            Some('j'),
+            Some('j'),
+            false,
+            false
+        )
+        .is_some());
     }
 }

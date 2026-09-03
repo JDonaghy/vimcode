@@ -1397,10 +1397,14 @@ impl ShellApp for TuiShellApp {
         // #609, cursor placement #604) and why.
         let theme = self.theme();
 
-        // ── Per-frame nerd-font sync (mirrors mod.rs:1131) ───────────────
-        // `setup()` pushes the flag once; the legacy loop re-pushed it every
-        // frame so a runtime `:set nerdfonts` / `:set nonerdfonts` reaches
-        // the rasterisers on the very next paint instead of never.
+        // ── Per-frame nerd-font sync ─────────────────────────────────────
+        // Not a keyboard rung and never was — it is already one shared call
+        // (`render::sync_nerd_fonts`), so #762 only drops the stale
+        // cross-file line-number citation it used to carry. `setup()`
+        // pushes the flag once;
+        // re-pushing it every frame is what makes a runtime `:set nerdfonts`
+        // / `:set nonerdfonts` reach the rasterisers on the very next paint
+        // instead of never.
         render::sync_nerd_fonts(backend, &self.engine);
 
         // ── Menu bar + command centre (#635 Stage 6b item A, #712) ───────
@@ -2889,7 +2893,11 @@ impl ShellApp for TuiShellApp {
             }
         }
 
-        // ── Terminal chrome the runner doesn't own (mirrors mod.rs:1268-:1286)
+        // ── Terminal chrome the runner doesn't own ───────────────────────
+        // Not a keyboard rung; #762 only drops the stale cross-file
+        // line-number citation it used to carry (the GTK loop it named is
+        // gone, and this has no GTK counterpart — GTK4 owns cursor shape
+        // and window title).
         // Cursor shape per mode and the emulator window title. Both are plain
         // escape sequences rather than anything ratatui buffers, so writing
         // them to the shared process stdout between frames is exactly what
@@ -3599,191 +3607,105 @@ fn handle_key_pressed(
     };
 
     // ── Shared modal keyboard rung (#734 slice 1) ──────────────────────
-    // Spell suggestions → modal dialog → context menu, stated once in
-    // `render::route_modal_key` and matched identically by both backends.
-    // Replaces the hand-transcribed dialog tier that used to open this
-    // function *and* the context-menu tier that used to sit near the
-    // bottom of it (below the sidebar tier, which carried its own second
-    // copy — see `handle_focus_owner_key`). Both are gone; the ladder
-    // now has one statement, and the spell-suggestion rung — previously
-    // reachable only if nothing else claimed the key first — is genuinely
-    // modal on both backends.
-    match render::route_modal_key(engine) {
-        render::ModalKeyRoute::Engine => {
-            if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) {
-                let action = engine.handle_key(&key_name, unicode, ctrl);
-                if handle_action(engine, action) {
-                    return Reaction::Exit;
-                }
-            } else if key_event.kind != KeyEventKind::Release {
-                match key_event.code {
-                    KeyCode::Tab => {
-                        engine.handle_key("Tab", None, false);
-                    }
-                    KeyCode::BackTab => {
-                        engine.handle_key("Shift_Tab", None, false);
-                    }
-                    _ => {}
-                }
-            }
-            return Reaction::Redraw;
-        }
-        render::ModalKeyRoute::ContextMenu => {
-            if key_event.kind == KeyEventKind::Release {
-                return Reaction::Continue;
-            }
-            // `handle_context_menu_key` consumes every key while the menu is
-            // open (its `_` arm closes it), so an untranslatable key is
-            // swallowed rather than falling through to the tier below — the
-            // modal semantics the two old copies only approximated.
-            if let Some((key_name, unicode, _ctrl)) = translate_key(key_event, keyboard_enhanced) {
-                let effective_key = if key_name.is_empty() {
-                    unicode.map(|c| c.to_string()).unwrap_or_default()
-                } else {
-                    key_name
-                };
-                let ctx = engine.context_menu_target_path();
-                let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
-                if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
-                    handle_explorer_context_action(
-                        &act,
-                        engine,
-                        sidebar,
-                        Some(Size::new(screen_w, screen_h)),
-                        ctx_path,
-                        ctx_is_dir,
-                    );
-                }
-            }
-            return Reaction::Redraw;
-        }
-        render::ModalKeyRoute::None => {}
+    let modal_route = render::route_modal_key(engine);
+    if modal_route != render::ModalKeyRoute::None {
+        return apply_modal_key_route(
+            modal_route,
+            key_event,
+            keyboard_enhanced,
+            engine,
+            sidebar,
+            screen_w,
+            screen_h,
+        );
     }
 
-    // ── Folder picker modal (mirrors mod.rs:1653-:1708) ─────────────────
-    // Checked ahead of the context-menu/general-fallback tiers, exactly
-    // like the legacy loop, so that once `EngineAction::OpenFolderDialog`
-    // (below) populates `folder_picker`, every subsequent key — type-to-
-    // filter, Up/Down/j/k, Enter, Esc, `-`, Backspace — goes to the picker
-    // instead of falling through to `Engine::handle_key` and being
-    // misinterpreted as Normal/Insert-mode editor input.
+    // ── Shared folder-picker rung (#762 / #734 slice 7) ─────────────────
+    // Above every non-modal tier: once `EngineAction::OpenFolderDialog`
+    // (below) populates `folder_picker`, every key belongs to the picker.
     if folder_picker.is_some() && key_event.kind != KeyEventKind::Release {
-        let picker_ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
-        let picker = folder_picker.as_mut().unwrap();
-        match key_event.code {
-            KeyCode::Esc => {
-                *folder_picker = None;
-            }
-            KeyCode::Enter => {
-                // Check if ".." was selected — navigate up instead of opening.
-                let is_dotdot = picker
-                    .filtered
-                    .get(picker.selected)
-                    .map(|p| p.as_os_str() == "..")
-                    .unwrap_or(false);
-                if is_dotdot {
-                    picker.navigate_up();
-                } else if let Some(path) = picker.selected_path() {
-                    *folder_picker = None;
-                    engine.open_folder(&path);
-                    *sidebar = TuiSidebar::new();
-                    engine.explorer_rebuild_rows();
-                    if let Some(path) = engine.file_path().cloned() {
-                        engine.explorer_reveal_path(&path);
-                    }
-                }
-            }
-            // '-' navigates up to the parent directory (like vim netrw).
-            KeyCode::Char('-') if !picker_ctrl => {
-                picker.navigate_up();
-            }
-            KeyCode::Up | KeyCode::Char('k') if !picker_ctrl => {
-                picker.move_up();
-            }
-            KeyCode::Down | KeyCode::Char('j') if !picker_ctrl => {
-                picker.move_down();
-            }
-            KeyCode::Backspace => {
-                picker.pop_char();
-            }
-            KeyCode::Char(c) if !picker_ctrl => {
-                picker.push_char(c);
-            }
-            _ => {}
-        }
-        // Keep scroll in sync with selection.
-        if let Some(ref mut picker) = folder_picker {
-            let popup_h = ((screen_h as usize) * 55 / 100).max(15);
-            let visible_rows = popup_h.saturating_sub(4);
-            picker.sync_scroll(visible_rows);
-        }
+        let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+        let (name, unicode) = picker_key_spelling(key_event.code);
+        apply_folder_picker_key(
+            render::route_folder_picker_key(name, unicode, ctrl),
+            folder_picker,
+            engine,
+            sidebar,
+            screen_h,
+        );
         return Reaction::Redraw;
     }
 
-    // ── Focus owners: activity bar + sidebar panels (#757) ─────────────
-    // One shared resolver, `render::route_focus_key`, replaces the two
-    // hand-transcribed ladders this tier used to carry (the activity-bar
-    // `if` that lived here, and `handle_focus_owner_key`'s if-chain over
-    // `active_panel_is`). The picker and terminal gates that used to be
-    // spelled out on the sidebar guard below now live in the resolver, where
-    // GTK gets them too.
-    if key_event.kind != KeyEventKind::Release {
-        let route = render::route_focus_key(engine, sidebar.has_focus);
-        if route != render::FocusKeyRoute::None {
-            return handle_focus_owner_key(
-                route,
+    if key_event.kind == KeyEventKind::Release {
+        return Reaction::Continue;
+    }
+
+    // ── Focus owners: activity bar + sidebar panels (#757 / slice 2) ────
+    // Slice 7 converges the resolver's *position*: the activity bar outranks
+    // the global debugger F-keys on both backends, a sidebar panel does not.
+    // TUI used to resolve the whole ladder here, so a focused search panel
+    // swallowed F5/F9/F10/F11 that GTK sent to the debugger.
+    let focus_route = render::route_focus_key(engine, sidebar.has_focus);
+    let dispatch_focus_owner =
+        |engine: &mut Engine, sidebar: &mut TuiSidebar, backend: &mut dyn quadraui::Backend| {
+            handle_focus_owner_key(
+                focus_route,
                 key_event,
                 engine,
                 sidebar,
                 screen_h,
                 backend,
                 state.ui_event,
-            );
-        }
+            )
+        };
+    if focus_route == render::FocusKeyRoute::ActivityBar {
+        return dispatch_focus_owner(engine, sidebar, backend);
     }
 
-    if key_event.kind == KeyEventKind::Release {
-        return Reaction::Continue;
-    }
     let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) else {
+        // Untranslatable (Tab/BackTab and friends) — no rung below can read
+        // them, but a focused panel navigates with them.
+        if focus_route != render::FocusKeyRoute::None {
+            return dispatch_focus_owner(engine, sidebar, backend);
+        }
         return Reaction::Continue;
     };
 
-    // ── Ctrl+L: force a full screen redraw (mirrors mod.rs:2429-:2435) ──
-    // The legacy loop called `ratatui::Terminal::clear()`, which resets
-    // ratatui's previous-frame buffer so the next draw re-emits every cell.
-    // The shell runner owns the `Terminal`, and neither `Backend` nor
-    // `ShellApp` exposes a "repaint everything" escape hatch, so all this
-    // can do today is request an ordinary redraw. Tracked as an upstream
-    // gap (a `Backend::request_full_repaint`-shaped hook) alongside the
-    // popup-disappearance clear in `Self::render_content`; see #634's
-    // hand-off notes. Consuming the key here rather than letting it fall
-    // through preserves the legacy behaviour of Ctrl+L *not* reaching
-    // `Engine::handle_key`.
-    if ctrl && matches!(key_event.code, KeyCode::Char('l') | KeyCode::Char('L')) {
+    // ── Shared Ctrl+L force-redraw rung (#762 / #734 slice 7) ───────────
+    if render::is_force_redraw_key(&key_name, unicode, ctrl) {
         return Reaction::Redraw;
     }
 
-    // ── Terminal (PTY) key routing (#758 / #734 slice 3, #351) ─────────
-    // One shared rung, `render::route_terminal_key`, replaces the ~75-line
-    // block that used to live here (and the GTK twin the #540 cutover had
-    // deleted outright). It also lets `translate_key`'s own `key_name` reach
-    // the PTY encoder: the old block bypassed it and re-derived names from
-    // the raw `KeyCode`, because `translate_key` spells shifted navigation
-    // keys `Shift_Up`/`Shift_Return` — `canonical_terminal_key_name` strips
-    // that prefix (shift is passed separately) so the bypass is unnecessary.
+    // ── Shared terminal (PTY) rung (#758 / #734 slice 3, #351) ──────────
     let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key_event.modifiers.contains(KeyModifiers::ALT);
     if render::route_terminal_key(engine, &key_name, unicode, ctrl, shift, alt) {
         return Reaction::Redraw;
     }
 
+    // ── Shared debugger F-key rung (#762 / #734 slice 7) ────────────────
+    // Global. Below the terminal rung (a focused PTY keeps its own F-keys —
+    // vim/htop bind them) and above the sidebar panels.
+    match render::route_debug_fkey(&key_name, ctrl, shift, alt) {
+        Some(render::DebugFKey::Command(cmd)) => {
+            let _ = engine.execute_command(cmd);
+            return Reaction::Redraw;
+        }
+        Some(render::DebugFKey::EngineKey(name)) => {
+            let action = engine.handle_key(name, None, false);
+            if handle_action(engine, action) {
+                return Reaction::Exit;
+            }
+            return Reaction::Redraw;
+        }
+        None => {}
+    }
+
+    if focus_route != render::FocusKeyRoute::None {
+        return dispatch_focus_owner(engine, sidebar, backend);
+    }
+
     // ── Shared Alt-modifier / VSCode-mode rung (#759 / #734 slice 4) ────
-    // `render::route_alt_key` states this tier once for both backends. The
-    // ~66-line `match key_event.code` block that used to live here had no GTK
-    // twin at all — GTK took an `alt: bool` and dropped it, so Alt+Left/Right,
-    // Alt+M, Alt+,/., Alt+]/[ and the whole VSCode-mode `Alt_*` encoding were
-    // dead there. See the rung's header comment in `render.rs`.
     match render::route_alt_key(engine, &key_name, unicode, shift, alt) {
         render::AltKeyOutcome::ResizeSidebar(delta) => {
             *state.sidebar_width = render::alt_resized_sidebar_width(*state.sidebar_width, delta);
@@ -3793,102 +3715,105 @@ fn handle_key_pressed(
         render::AltKeyOutcome::Fallthrough => {}
     }
 
-    // ── Shared clipboard-paste pre-load / Ctrl+Shift+V rung (#760 / #734
-    // slice 5) ───────────────────────────────────────────────────────────
-    // `render::preload_paste_clipboard` / `render::route_ctrl_shift_v_paste`
-    // state both tiers once for both backends — see the rung's header
-    // comment above `preload_paste_clipboard` in `render.rs` for the full
-    // divergence this replaced (TUI used to hand-roll Ctrl+Shift+V instead of
-    // reaching `Engine::route_paste` like every other paste destination).
+    // ── Shared clipboard-paste pre-load / Ctrl+Shift+V rung (#760 / slice 5)
     render::preload_paste_clipboard(engine, &key_name, unicode, ctrl);
     if render::route_ctrl_shift_v_paste(engine, &key_name, ctrl) {
         return Reaction::Redraw;
     }
 
-    // ── Shift+F5 → stop, Shift+F11 → stepout (mirrors mod.rs:2662-:2679) ─
-    if key_event.modifiers.contains(KeyModifiers::SHIFT) {
-        match key_event.code {
-            KeyCode::F(5) => {
-                let _ = engine.execute_command("stop");
-                return Reaction::Redraw;
-            }
-            KeyCode::F(11) => {
-                let _ = engine.execute_command("stepout");
-                return Reaction::Redraw;
-            }
-            _ => {}
-        }
+    // ── Shared hover-popup copy rung (#762 / #734 slice 7) ──────────────
+    if let Some(text) = render::route_hover_popup_copy(engine, &key_name, ctrl) {
+        tui_copy_to_clipboard(&text, engine);
+        engine.message = "Hover text copied".to_string();
+        return Reaction::Redraw;
     }
 
-    // ── Command-line selection: Ctrl-C copies, any other key clears
-    // (mirrors mod.rs:2651-:2701) ─────────────────────────────────────────
-    // #635 (Stage 6b item D): `cmd_sel` itself is already populated by
-    // mouse drag (`TuiShellApp::handle_mouse_event`, #602) and painted by
-    // `panels::render_command_line` (#605) — this closes the keyboard
-    // side, the last of item D's three named tiers.
-    {
-        use crate::core::Mode;
-        let sel = cmd_sel.get();
-        if ctrl && matches!(unicode, Some('c') | Some('C')) && sel.is_some() {
-            if let Some((start, end)) = sel {
-                let lo = start.min(end);
-                let hi = start.max(end);
-                // Determine the source text for the selection.
-                let source = if matches!(engine.mode, Mode::Command | Mode::Search) {
-                    // col 0 = ':' prefix, col 1+ = buffer chars
-                    let buf_lo = lo.saturating_sub(1);
-                    let buf_hi = hi.saturating_sub(1);
-                    engine
-                        .command_buffer
-                        .chars()
-                        .enumerate()
-                        .filter(|(i, _)| *i >= buf_lo && *i <= buf_hi)
-                        .map(|(_, c)| c)
-                        .collect::<String>()
-                } else {
-                    // Normal mode message line — no prefix offset.
-                    engine
-                        .message
-                        .chars()
-                        .enumerate()
-                        .filter(|(i, _)| *i >= lo && *i <= hi)
-                        .map(|(_, c)| c)
-                        .collect::<String>()
-                };
-                if !source.is_empty() {
-                    tui_copy_to_clipboard(&source, engine);
-                }
+    // ── Shared command-line selection rung (#762 / #734 slice 7) ────────
+    // `cmd_sel` is mouse-populated (#602); this is its keyboard side.
+    // `Clear` deliberately falls through to the editor below.
+    match render::route_cmdline_selection_key(engine, unicode, ctrl, cmd_sel.get()) {
+        render::CmdSelKeyRoute::Copy(text) => {
+            if !text.is_empty() {
+                tui_copy_to_clipboard(&text, engine);
             }
             cmd_sel.set(None);
             return Reaction::Redraw;
         }
-        if matches!(engine.mode, Mode::Command | Mode::Search) {
-            // Any other key clears the selection.
-            cmd_sel.set(None);
-        } else if sel.is_some() {
-            // In normal mode, any non-Ctrl-C key clears message selection.
-            cmd_sel.set(None);
-        }
+        render::CmdSelKeyRoute::Clear => cmd_sel.set(None),
+        render::CmdSelKeyRoute::Keep => {}
     }
 
-    // #734 slice 1: the context-menu intercept that used to sit here is
-    // gone — `render::route_modal_key` resolves it at the top of this
-    // function, above every focus tier, instead of below all of them.
-
-    // ── General fallback: `Engine::handle_key` (mirrors
-    // mod.rs:2637-:2737) ─────────────────────────────────────────────────
+    // ── General fallback: `Engine::handle_key` ──────────────────────────
     let action = engine.handle_key(&key_name, unicode, ctrl);
     if engine.mode == crate::core::Mode::Insert && engine.settings.ai_completions {
         engine.ai_completion_reset_timer();
     }
 
+    if dispatch_post_key_action(
+        action,
+        engine,
+        sidebar,
+        folder_picker,
+        screen_w,
+        screen_h,
+        *state.sidebar_width,
+    ) {
+        return Reaction::Exit;
+    }
+
+    // ── Shared post-key epilogue (#762 / #734 slice 7) ──────────────────
+    // Macro playback (`@q`) drains first: it can request a quit, and only
+    // `handle_action` can apply the `EngineAction`s it yields.
+    loop {
+        let (has_more, action) = engine.advance_macro_playback();
+        if handle_action(engine, action) {
+            return Reaction::Exit;
+        }
+        if !has_more {
+            break;
+        }
+    }
+
+    let epilogue = render::post_key_epilogue(engine, Some(state.quickfix_scroll_top));
+    if epilogue.focus_sidebar {
+        sidebar.has_focus = true;
+    }
+    // Sync the unnamed register → system clipboard (`clipboard=unnamedplus`).
+    sync_tui_clipboard(engine, state.last_clipboard_content);
+    if epilogue.arm_yank_highlight {
+        state
+            .yank_hl_deadline
+            .set(Some(Instant::now() + Duration::from_millis(200)));
+    }
+
+    Reaction::Redraw
+}
+
+/// TUI's counterpart to GTK's `App::dispatch_engine_action`: apply the
+/// [`EngineAction`] the general keyboard fallback produced. Returns `true`
+/// when the app should exit.
+///
+/// The eight named arms are the ones whose effect needs TUI-only state — the
+/// terminal panel's column/row geometry, the in-app `FolderPickerState` (GTK
+/// opens a native `FileChooser` instead), and `TuiSidebar`. Everything else
+/// falls through to `handle_action`.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_post_key_action(
+    action: EngineAction,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    folder_picker: &mut Option<FolderPickerState>,
+    screen_w: u16,
+    screen_h: u16,
+    sidebar_width: u16,
+) -> bool {
     if action == EngineAction::OpenTerminal {
-        let cols = terminal_panel_cols(engine, screen_w, *state.sidebar_width);
+        let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
         let rows = engine.session.terminal_panel_rows;
         engine.terminal_new_tab(cols, rows);
     } else if action == EngineAction::ToggleTerminalMaximize {
         let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: terminal_panel_cols(engine, screen_w, *state.sidebar_width),
+            terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
             terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_h),
         };
         engine.handle_ui_event(
@@ -3922,70 +3847,141 @@ fn handle_key_pressed(
     } else if action == EngineAction::QuitWithUnsaved {
         engine.show_quit_confirm();
     } else if handle_action(engine, action) {
-        return Reaction::Exit;
+        return true;
     }
+    false
+}
 
-    // ── Post-key epilogue (mirrors mod.rs:2863-:2915) ───────────────────
-    // Seven behaviours the legacy loop ran after *every* editor keypress.
-
-    // Ctrl-W h/l overflow: move focus to the sidebar or the activity bar.
-    if let Some(false) = engine.handle_nav_overflow() {
-        if engine.app_shell.sidebar_visible() {
-            sidebar.has_focus = true;
-        } else {
-            // No sidebar panel visible — focus the activity bar instead.
-            let idx = engine.activity_bar_toolbar_idx_for_active_panel();
-            engine.activity_bar_focus_in_at(idx);
+/// Apply a resolved [`render::ModalKeyRoute`] on the TUI side.
+///
+/// The decision — spell suggestions → modal dialog → context menu — is shared
+/// (`render::route_modal_key`); this is the `crossterm`-flavoured application
+/// of it. Both arms consume the key unconditionally: that is what makes the
+/// tier genuinely *modal* rather than a best-effort intercept.
+fn apply_modal_key_route(
+    route: render::ModalKeyRoute,
+    key_event: KeyEvent,
+    keyboard_enhanced: bool,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    screen_w: u16,
+    screen_h: u16,
+) -> Reaction {
+    match route {
+        render::ModalKeyRoute::Engine => {
+            if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) {
+                let action = engine.handle_key(&key_name, unicode, ctrl);
+                if handle_action(engine, action) {
+                    return Reaction::Exit;
+                }
+            } else if key_event.kind != KeyEventKind::Release {
+                match key_event.code {
+                    KeyCode::Tab => {
+                        engine.handle_key("Tab", None, false);
+                    }
+                    KeyCode::BackTab => {
+                        engine.handle_key("Shift_Tab", None, false);
+                    }
+                    _ => {}
+                }
+            }
+            Reaction::Redraw
         }
-    }
-
-    // Auto-hide the sidebar when focus returns to the editor.
-    // (`sidebar_has_focus()` includes `activity_bar_focused`, so autohide is
-    // suppressed while the user navigates the toolbar.)
-    if engine.should_autohide_sidebar() {
-        engine.app_shell.hide_sidebar();
-    }
-
-    // Drain macro playback (`@q`), which can itself request a quit.
-    loop {
-        let (has_more, action) = engine.advance_macro_playback();
-        if handle_action(engine, action) {
-            return Reaction::Exit;
+        render::ModalKeyRoute::ContextMenu => {
+            if key_event.kind == KeyEventKind::Release {
+                return Reaction::Continue;
+            }
+            // `handle_context_menu_key` consumes every key while the menu is
+            // open (its `_` arm closes it), so an untranslatable key is
+            // swallowed rather than falling through to the tier below.
+            if let Some((key_name, unicode, _ctrl)) = translate_key(key_event, keyboard_enhanced) {
+                let effective_key = if key_name.is_empty() {
+                    unicode.map(|c| c.to_string()).unwrap_or_default()
+                } else {
+                    key_name
+                };
+                let ctx = engine.context_menu_target_path();
+                let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
+                if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
+                    handle_explorer_context_action(
+                        &act,
+                        engine,
+                        sidebar,
+                        Some(Size::new(screen_w, screen_h)),
+                        ctx_path,
+                        ctx_is_dir,
+                    );
+                }
+            }
+            Reaction::Redraw
         }
-        if !has_more {
-            break;
+        render::ModalKeyRoute::None => Reaction::Continue,
+    }
+}
+
+/// Spell one `crossterm::KeyCode` the way [`render::route_folder_picker_key`]
+/// expects: a `(named_key, printable)` pair, exactly one of which is
+/// meaningful. Named keys use the engine's own spelling so the shared rung
+/// never has to know crossterm exists.
+fn picker_key_spelling(code: KeyCode) -> (&'static str, Option<char>) {
+    match code {
+        KeyCode::Esc => ("Escape", None),
+        KeyCode::Enter => ("Return", None),
+        KeyCode::Backspace => ("BackSpace", None),
+        KeyCode::Up => ("Up", None),
+        KeyCode::Down => ("Down", None),
+        KeyCode::Char(c) => ("", Some(c)),
+        _ => ("", None),
+    }
+}
+
+/// Apply a resolved [`render::FolderPickerKeyRoute`] to the TUI's picker
+/// state. The decision is shared; only this application is TUI-side, because
+/// `FolderPickerState` is TUI-only (GTK opens a native `FileChooser`).
+fn apply_folder_picker_key(
+    route: render::FolderPickerKeyRoute,
+    folder_picker: &mut Option<FolderPickerState>,
+    engine: &mut Engine,
+    sidebar: &mut TuiSidebar,
+    screen_h: u16,
+) {
+    use render::FolderPickerKeyRoute as R;
+    let Some(picker) = folder_picker.as_mut() else {
+        return;
+    };
+    match route {
+        R::Close => *folder_picker = None,
+        R::Confirm => {
+            // ".." confirms as a navigate-up rather than an open.
+            let is_dotdot = picker
+                .filtered
+                .get(picker.selected)
+                .map(|p| p.as_os_str() == "..")
+                .unwrap_or(false);
+            if is_dotdot {
+                picker.navigate_up();
+            } else if let Some(path) = picker.selected_path() {
+                *folder_picker = None;
+                engine.open_folder(&path);
+                *sidebar = TuiSidebar::new();
+                engine.explorer_rebuild_rows();
+                if let Some(path) = engine.file_path().cloned() {
+                    engine.explorer_reveal_path(&path);
+                }
+            }
         }
+        R::NavigateUp => picker.navigate_up(),
+        R::SelectPrev => picker.move_up(),
+        R::SelectNext => picker.move_down(),
+        R::PopChar => picker.pop_char(),
+        R::PushChar(c) => picker.push_char(c),
+        R::Ignore => {}
     }
-
-    // Sync the unnamed register → system clipboard (`clipboard=unnamedplus`).
-    sync_tui_clipboard(engine, state.last_clipboard_content);
-
-    // Rebuild the explorer tree if a file move just completed.
-    if engine.explorer_needs_refresh {
-        engine.explorer_needs_refresh = false;
-        engine.explorer_rebuild_rows();
+    // Keep scroll in sync with selection.
+    if let Some(picker) = folder_picker.as_mut() {
+        let popup_h = ((screen_h as usize) * 55 / 100).max(15);
+        picker.sync_scroll(popup_h.saturating_sub(4));
     }
-
-    // Arm the 200 ms yank-highlight expiry (`tick` clears it).
-    if engine.yank_highlight.is_some() {
-        state
-            .yank_hl_deadline
-            .set(Some(Instant::now() + Duration::from_millis(200)));
-    }
-
-    // Keep the selected quickfix entry visible.
-    if engine.quickfix_open {
-        const QF_VISIBLE: usize = 5; // 6 rows − 1 header
-        if engine.quickfix_selected < *state.quickfix_scroll_top {
-            *state.quickfix_scroll_top = engine.quickfix_selected;
-        } else if engine.quickfix_selected >= *state.quickfix_scroll_top + QF_VISIBLE {
-            *state.quickfix_scroll_top = engine.quickfix_selected + 1 - QF_VISIBLE;
-        }
-    } else {
-        *state.quickfix_scroll_top = 0;
-    }
-
-    Reaction::Redraw
 }
 
 #[cfg(test)]
@@ -10354,5 +10350,157 @@ mod tests {
                  Vim mode (vscode = {vscode}); screen:\n{screen}"
             );
         }
+    }
+
+    // ── #762 / #734 slice 7: the closing rungs, black-box ───────────────
+    //
+    // The behavioural half of the cross-backend parity assertion. Each test
+    // below has a mirror in `src/gtk/testing.rs` that drives the *same* chord
+    // against the *same* engine state and asserts the *same* rendered string,
+    // so "both backends resolve this key + state to the same route" is
+    // checked end to end rather than only at the resolver
+    // (`render::slice7_router_tests` is that spelling-identity tier).
+
+    /// Press `key` with the given modifiers, exactly as `TuiShellApp::handle`
+    /// receives it from the live runner.
+    fn press_with<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        key: quadraui::Key,
+        modifiers: quadraui::Modifiers,
+    ) {
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key,
+            modifiers,
+            repeat: false,
+        });
+    }
+
+    /// #762: Shift+F5 is `stop`, not a shifted spelling of F5's `continue`.
+    ///
+    /// Asserts on the painted command line (where `engine.message` renders on
+    /// both backends) rather than on any DAP field, per `CLAUDE.md` rule 1.
+    /// The GTK mirror is
+    /// `gtk::testing::slice7_debug_fkey_tests::shift_f5_stops_instead_of_continuing_on_gtk`,
+    /// which asserts the identical string — that pair *is* the parity check.
+    ///
+    /// **Verified RED by reordering/removing the rung:** make
+    /// `render::route_debug_fkey` return `DebugFKey::EngineKey("F5")` for the
+    /// shifted case (i.e. drop the `shift` branch, which is exactly what GTK
+    /// did on unfixed `develop`) and the command line reads
+    /// "DAP: starting Debug debug session…" instead, firing both assertions.
+    #[test]
+    fn shift_f5_stops_the_debug_session_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::F(5)),
+            quadraui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("DAP: session stopped"),
+            "Shift+F5 must run `stop`; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("starting"),
+            "Shift+F5 must NOT run `continue`; screen:\n{screen}"
+        );
+    }
+
+    /// #762: the debugger F-keys are *global* — they must reach the debugger
+    /// even while a sidebar panel holds the keyboard.
+    ///
+    /// This is the half TUI was missing: its debug F-key tier sat *below* the
+    /// focus owners, so with the search panel focused the chord went to that
+    /// panel's own key table and the debugger never saw it. GTK already
+    /// resolved these above the panels; now both backends do, which is
+    /// exactly the ladder-order parity this slice's acceptance asks for.
+    ///
+    /// **Verified RED by reordering one rung on one backend:** move the
+    /// `render::route_debug_fkey` match in `handle_key_pressed` back below
+    /// the `focus_route` dispatch (its pre-#762 position, and the position
+    /// this test was first written against) and the focused search panel
+    /// swallows the chord — the command line stays blank and the `contains`
+    /// assertion fires. That is not hypothetical: this test failed exactly
+    /// that way before the reorder landed.
+    #[test]
+    fn shift_f5_reaches_the_debugger_from_a_focused_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        // Hidden sidebar, focused search panel: the panel still owns the
+        // keyboard (`route_focus_key` keys off the focus flags, not
+        // visibility) but the tree does not over-paint the message row this
+        // test reads.
+        app.engine.app_shell.hide_sidebar();
+        app.engine.search_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert_eq!(
+            render::route_focus_key(&app.engine, app.sidebar.has_focus),
+            render::FocusKeyRoute::Search,
+            "precondition: the search panel must own the keyboard"
+        );
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::F(5)),
+            quadraui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("DAP: session stopped"),
+            "Shift+F5 must reach the debugger past a focused sidebar panel; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #762: Ctrl+L is consumed as "repaint", never handed to the editor.
+    ///
+    /// Asserted through the painted editor text: an insert-mode `Ctrl+L` that
+    /// reached the engine would type or move; a consumed one leaves the
+    /// buffer byte-identical. (GTK gains the rung in this slice too, but its
+    /// spelling of the chord is inert in `Engine::handle_key`, so only TUI
+    /// has an observable to assert on — see the note in `gtk/testing.rs`.)
+    ///
+    /// **Verified RED by removing the rung:** make
+    /// `render::is_force_redraw_key` return `false` and the buffer picks up
+    /// the fall-through, changing the painted marker.
+    #[test]
+    fn ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "ZQXW762CTRLL");
+        app.engine.mode = crate::core::Mode::Insert;
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+
+        let before = driver
+            .find_bounds("ZQXW762CTRLL")
+            .expect("the editor marker must paint before Ctrl+L");
+        press_with(
+            &mut driver,
+            quadraui::Key::Char('l'),
+            quadraui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        let after = driver
+            .find_bounds("ZQXW762CTRLL")
+            .expect("Ctrl+L must not disturb the painted buffer");
+        assert_eq!(
+            (after.x, after.y),
+            (before.x, before.y),
+            "Ctrl+L must be consumed as a repaint request, not typed; \
+             screen:\n{}",
+            driver.screen()
+        );
     }
 }
