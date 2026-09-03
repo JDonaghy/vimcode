@@ -45,6 +45,13 @@ pub mod gtk;
 #[cfg(feature = "gui")]
 pub mod app;
 
+/// Process-wide working-directory arbitration for the test run (#785) — the
+/// lock that keeps a `chdir`-ing test from moving the ground under a
+/// concurrently painting harness. Test-only; never compiled into a release
+/// binary.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_cwd;
+
 // Re-export quadraui so integration tests + downstream consumers pin to the
 // same version vimcode is built against.
 pub use quadraui;
