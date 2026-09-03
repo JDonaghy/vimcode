@@ -4080,6 +4080,39 @@ impl Engine {
     /// registry, then either open the CLI-supplied path or restore the
     /// previous session.  Both TUI and GTK call this identically.
     pub fn startup(&mut self, file_path: Option<&Path>) {
+        self.startup_inner(file_path, true);
+    }
+
+    /// [`Engine::startup`] minus the per-workspace session restore — the
+    /// constructor deterministic-geometry tests must use.
+    ///
+    /// [`Engine::new_for_test`] is **not** sufficient on its own.  It builds
+    /// the engine from in-memory `Settings::default()` / `SessionState::default()`,
+    /// but `startup(None)` then calls `restore_session_files()`, which performs
+    /// a *second, independent* disk read —
+    /// `SessionState::load_for_workspace(&self.cwd)` — keyed on the process's
+    /// `current_dir()` at construction time and entirely unrelated to whichever
+    /// `Settings`/`SessionState` the engine was built with.
+    /// `SessionState::save_for_workspace` is stubbed out under `cfg(test)`, but
+    /// `load_for_workspace` deliberately is not (several tests write a workspace
+    /// session file and assert it is restored).  So on a machine that happens to
+    /// have a real `~/.config/vimcode/sessions/<hash>.json` for the checkout the
+    /// test binary runs in — entirely plausible for a self-hosting editor whose
+    /// developers edit it with itself — `startup(None)` reopens that session's
+    /// files and splits, `new_tab()` allocates a fresh `WindowId` per extra
+    /// file, and `windows.len()` stops being 1.  Geometry measured against that
+    /// layout is then machine-dependent.
+    ///
+    /// This entry point skips the restore entirely, so the resulting engine
+    /// depends on nothing but its in-memory defaults and the explicit
+    /// `file_path` argument.
+    pub fn startup_without_session_restore(&mut self, file_path: Option<&Path>) {
+        self.startup_inner(file_path, false);
+    }
+
+    /// Shared body of [`Engine::startup`] and
+    /// [`Engine::startup_without_session_restore`].
+    fn startup_inner(&mut self, file_path: Option<&Path>, restore_session: bool) {
         self.plugin_init();
         self.ext_refresh();
         if let Some(path) = file_path {
@@ -4088,7 +4121,7 @@ impl Engine {
             } else {
                 let _ = self.open_file_with_mode(path, OpenMode::Permanent);
             }
-        } else {
+        } else if restore_session {
             self.restore_session_files();
         }
     }

@@ -348,6 +348,90 @@ fn test_qa_bang_force_quits() {
     assert_eq!(action, EngineAction::Quit);
 }
 
+/// `Engine::startup_without_session_restore` must ignore a per-workspace
+/// session file that `Engine::startup` would have honoured.
+///
+/// This is the ambient-input class `TuiShellApp::new_for_test` exists to close:
+/// `Engine::new_for_test()` only replaces the two *global* config reads
+/// (`settings.json` / `session.json`), while `restore_session_files()` does a
+/// second, independent `SessionState::load_for_workspace(&self.cwd)` read keyed
+/// on the process's cwd. On a machine that has ever saved a session for the
+/// checkout the test binary runs in, that read reopens real files and splits
+/// and `windows.len()` stops being 1 — which is exactly what the TUI drag test's
+/// setup-sanity assertion trips on.
+///
+/// The first half of this test is the control: it proves the fixture session
+/// file on disk really is restorable, so a green second half means the restore
+/// was *skipped*, not that the fixture was inert.
+#[test]
+fn test_startup_without_session_restore_ignores_workspace_session() {
+    use crate::core::session::SessionState;
+    let dir = std::env::temp_dir();
+    let p1 = dir.join("vimcode_no_restore_a.txt");
+    let p2 = dir.join("vimcode_no_restore_b.txt");
+    std::fs::write(&p1, "aaa").unwrap();
+    std::fs::write(&p2, "bbb").unwrap();
+
+    let workspace_dir = dir.join("vimcode_no_restore_test_ws");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    let mut ws_session = SessionState::default();
+    ws_session.open_files = vec![p1.clone(), p2.clone()];
+    ws_session.active_file = Some(p2.clone());
+    // save_for_workspace is a no-op under #[cfg(test)], so write directly.
+    let session_path = SessionState::session_path_for_workspace(&workspace_dir);
+    if let Some(parent) = session_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(
+        &session_path,
+        serde_json::to_string_pretty(&ws_session).unwrap(),
+    )
+    .unwrap();
+
+    // Control: the on-disk session really does restore two tabs.
+    let mut restoring = Engine::new_for_test();
+    restoring.cwd = workspace_dir.clone();
+    restoring.settings.swap_file = false;
+    restoring.restore_session_files();
+    assert_eq!(
+        restoring.active_group().tabs.len(),
+        2,
+        "control: the fixture workspace session must be restorable, otherwise \
+         the assertion below proves nothing"
+    );
+
+    // Subject: the deterministic startup path must not touch it at all.
+    let mut deterministic = Engine::new_for_test();
+    deterministic.cwd = workspace_dir.clone();
+    deterministic.settings.swap_file = false;
+    let tabs_before = deterministic.active_group().tabs.len();
+    let windows_before = deterministic.windows.len();
+    deterministic.startup_without_session_restore(None);
+    assert_eq!(
+        deterministic.active_group().tabs.len(),
+        tabs_before,
+        "startup_without_session_restore must not reopen the workspace session's files"
+    );
+    assert_eq!(
+        deterministic.windows.len(),
+        windows_before,
+        "startup_without_session_restore must not allocate windows for restored files"
+    );
+    assert!(
+        !deterministic
+            .buffer_manager
+            .iter()
+            .any(|(_, s)| s.file_path.as_deref() == Some(p1.as_path())
+                || s.file_path.as_deref() == Some(p2.as_path())),
+        "no buffer should have been created for a session-listed file"
+    );
+
+    let _ = std::fs::remove_file(&p1);
+    let _ = std::fs::remove_file(&p2);
+    let _ = std::fs::remove_file(&session_path);
+    let _ = std::fs::remove_dir(&workspace_dir);
+}
+
 #[test]
 fn test_restore_session_files_opens_separate_tabs() {
     use crate::core::session::SessionState;
