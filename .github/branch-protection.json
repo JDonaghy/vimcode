@@ -42,10 +42,10 @@
         "and a full re-run each time another one landed, serialising the merge",
         "queue for no real safety gain.",
         "",
-        "enforce_admins:false is decision (c) from #796 — the gate binds the PR",
-        "merge button and any non-admin push, while the repo owner keeps a",
-        "deliberate escape hatch (CLAUDE.md 'Path A'). See CLAUDE.md",
-        "'Branch protection' for what that does and does not buy."
+        "enforce_admins:false is #796's recommended option (c), pending the repo",
+        "owner's sign-off: the gate binds the PR merge button and any non-admin",
+        "push, while the owner keeps a deliberate escape hatch — a direct push",
+        "using CLAUDE.md's 'Path A' merge-locally-and-push path."
       ],
       "strict": false,
       "enforce_admins": false
