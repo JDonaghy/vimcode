@@ -1176,35 +1176,7 @@ impl Engine {
     // --- g* / g#: partial word search ---
 
     pub(crate) fn search_word_under_cursor_partial(&mut self, forward: bool) {
-        let word = match self.word_under_cursor() {
-            Some(w) => w,
-            None => {
-                self.message = "No word under cursor".to_string();
-                return;
-            }
-        };
-
-        self.search_query = word.clone();
-        self.search_direction = if forward {
-            SearchDirection::Forward
-        } else {
-            SearchDirection::Backward
-        };
-        self.search_word_bounded = false;
-
-        // Use plain text search (no word boundaries)
-        self.run_search();
-
-        if self.search_matches.is_empty() {
-            self.message = format!("Pattern not found: {}", word);
-            return;
-        }
-
-        if forward {
-            self.search_next();
-        } else {
-            self.search_prev();
-        }
+        self.search_word_under_cursor_generic(forward, false);
     }
 
     // --- ]p / [p: paste with indent adjustment ---
@@ -5095,11 +5067,9 @@ impl Engine {
 
     /// Indent `count` lines starting at `start_line` by shift_width.
     pub(crate) fn indent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
-        let indent_str = if self.settings.expand_tab {
-            " ".repeat(self.effective_shift_width())
-        } else {
-            "\t".to_string()
-        };
+        let sw = self.effective_shift_width();
+        let ts = (self.settings.tabstop as usize).max(1);
+        let expand = self.settings.expand_tab;
 
         self.start_undo_group();
         let total = self.buffer().len_lines();
@@ -5108,8 +5078,45 @@ impl Engine {
             if line_idx >= total {
                 break;
             }
+            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
+            let body = line_content.trim_end_matches(['\n', '\r']);
+
+            // Measure the existing indent in *display columns* — a tab advances
+            // to the next 'tabstop', which is not the same as 'shiftwidth'.
+            let mut cols = 0usize;
+            let mut ws_chars = 0usize;
+            for ch in body.chars() {
+                match ch {
+                    ' ' => {
+                        cols += 1;
+                        ws_chars += 1;
+                    }
+                    '\t' => {
+                        cols += ts - (cols % ts);
+                        ws_chars += 1;
+                    }
+                    _ => break,
+                }
+            }
+
+            let new_cols = cols + sw;
+            // `noet` only uses a tab where a *whole* tabstop fits, so with
+            // ts=8 / sw=4 Vim indents with four spaces, not a tab.
+            let new_indent = if expand {
+                " ".repeat(new_cols)
+            } else {
+                format!(
+                    "{}{}",
+                    "\t".repeat(new_cols / ts),
+                    " ".repeat(new_cols % ts)
+                )
+            };
+
             let line_start = self.buffer().line_to_char(line_idx);
-            self.insert_with_undo(line_start, &indent_str);
+            if ws_chars > 0 {
+                self.delete_with_undo(line_start, line_start + ws_chars);
+            }
+            self.insert_with_undo(line_start, &new_indent);
         }
         self.finish_undo_group();
         *changed = true;

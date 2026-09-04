@@ -1124,6 +1124,33 @@ impl Engine {
                 return EngineAction::None;
             }
 
+            // Vim's `:set` takes several options at once (`:set ic scs`,
+            // `:set noet ts=4`). Apply each in turn; a backslash escapes a
+            // space inside a value (`:h :set`).
+            if split_set_args(trimmed).len() > 1 {
+                let mut last_err = None;
+                for opt in split_set_args(trimmed) {
+                    if let Err(e) = self.settings.parse_set_option(&opt) {
+                        last_err = Some(e);
+                    }
+                }
+                let _ = self.settings.save();
+                if self.settings.spell {
+                    self.ensure_spell_checker();
+                }
+                self.update_syntax();
+                return match last_err {
+                    Some(e) => {
+                        self.message = e;
+                        EngineAction::Error
+                    }
+                    None => {
+                        self.message = trimmed.to_string();
+                        EngineAction::None
+                    }
+                };
+            }
+
             let prev_syntax_max_lines = self.settings.syntax_max_lines;
             // Queries (`:set foo?`) don't mutate, so skip the disk save —
             // both to avoid the unnecessary I/O and so the TUI mtime watcher
@@ -3012,6 +3039,38 @@ impl Engine {
 
     // --- Search ---
 
+    /// Compile a Vim pattern against the current `'ignorecase'` / `'smartcase'`
+    /// settings, or return the Vim-style error message.
+    ///
+    /// #801: a pattern that fails to translate is **rejected**, never silently
+    /// downgraded to a literal substring match.
+    pub(crate) fn compile_vim_pattern(
+        &self,
+        pattern: &str,
+        smartcase_applies: bool,
+    ) -> Result<vim_regex::Compiled, String> {
+        vim_regex::compile(
+            pattern,
+            self.settings.ignorecase,
+            self.settings.smartcase,
+            smartcase_applies,
+            &self.last_sub_replacement,
+        )
+    }
+
+    /// Collect every match of `re` in `text`.
+    ///
+    /// Vim enumerates matches **non-overlapping**: `searchit()` restarts its
+    /// scan at `endpos.col`, so `/o\+` over `fooo` is one match, not three
+    /// (`[1/1]` in the search-count indicator). `captures_iter` has exactly
+    /// that semantics, including the advance-one-char rule for empty matches.
+    pub(crate) fn collect_match_spans(re: &vim_regex::Compiled, text: &str) -> Vec<(usize, usize)> {
+        re.regex
+            .captures_iter(text)
+            .map(|caps| re.span(&caps))
+            .collect()
+    }
+
     pub fn run_search(&mut self) {
         self.search_matches.clear();
         self.search_index = None;
@@ -3020,35 +3079,20 @@ impl Engine {
             return;
         }
 
-        let text = self.buffer().to_string();
         let query_orig = self.search_query.clone();
-
-        // Apply ignorecase / smartcase
-        let case_insensitive = self.settings.ignorecase
-            && !(self.settings.smartcase && query_orig.chars().any(|c| c.is_uppercase()));
-
-        if case_insensitive {
-            let text_lower = text.to_lowercase();
-            let query_lower = query_orig.to_lowercase();
-            let mut byte_pos = 0;
-            while let Some(found) = text_lower[byte_pos..].find(&query_lower) {
-                let start_byte = byte_pos + found;
-                let end_byte = start_byte + query_lower.len();
-                let start_char = self.buffer().content.byte_to_char(start_byte);
-                let end_char = self.buffer().content.byte_to_char(end_byte);
-                self.search_matches.push((start_char, end_char));
-                byte_pos = start_byte + 1;
+        let compiled = match self.compile_vim_pattern(&query_orig, self.search_smartcase_applies) {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = e;
+                return;
             }
-        } else {
-            let mut byte_pos = 0;
-            while let Some(found) = text[byte_pos..].find(query_orig.as_str()) {
-                let start_byte = byte_pos + found;
-                let end_byte = start_byte + query_orig.len();
-                let start_char = self.buffer().content.byte_to_char(start_byte);
-                let end_char = self.buffer().content.byte_to_char(end_byte);
-                self.search_matches.push((start_char, end_char));
-                byte_pos = start_byte + 1;
-            }
+        };
+
+        let text = self.buffer().to_string();
+        for (start_byte, end_byte) in Self::collect_match_spans(&compiled, &text) {
+            let start_char = self.buffer().content.byte_to_char(start_byte);
+            let end_char = self.buffer().content.byte_to_char(end_byte);
+            self.search_matches.push((start_char, end_char));
         }
 
         if self.search_matches.is_empty() {
@@ -3112,13 +3156,82 @@ impl Engine {
         self.jump_to_search_match(idx);
     }
 
+    /// Is the active search offset a *line* offset (`/pat/+1`, `/pat/-1`,
+    /// `/pat/0`)? Those make the search linewise for an operator (`:h
+    /// search-offset`).
+    /// (Seam for the operator-pending `d/pat` work in the next issue of the
+    /// #801 chain — an operator over a search motion is linewise exactly when
+    /// the offset is a line offset.)
+    pub fn search_offset_is_linewise(&self) -> bool {
+        let off = self.search_offset.trim();
+        !off.is_empty() && !off.starts_with(['e', 's', 'b'])
+    }
+
+    /// Resolve `self.search_offset` against a match span into a final cursor.
+    ///
+    /// Returns `None` when there is no offset, so the caller lands on the match
+    /// start as usual.
+    fn offset_cursor(&self, start_char: usize, end_char: usize) -> Option<Cursor> {
+        let off = self.search_offset.trim();
+        if off.is_empty() {
+            return None;
+        }
+        let (kind, num_str) = match off.chars().next() {
+            Some(c @ ('e' | 's' | 'b')) => (c, &off[1..]),
+            _ => ('l', off),
+        };
+        let num: isize = if num_str.is_empty() {
+            0
+        } else if num_str == "+" {
+            1
+        } else if num_str == "-" {
+            -1
+        } else {
+            let cleaned = num_str.strip_prefix('+').unwrap_or(num_str);
+            cleaned.parse::<isize>().unwrap_or(0)
+        };
+
+        if kind == 'l' {
+            // Line offset: N lines from the match start, first non-blank.
+            let base = self.buffer().content.char_to_line(start_char) as isize;
+            let max = self.buffer().len_lines().saturating_sub(1) as isize;
+            let line = (base + num).clamp(0, max.max(0)) as usize;
+            return Some(Cursor {
+                line,
+                col: self.first_non_blank_col(line),
+            });
+        }
+
+        let base = if kind == 'e' {
+            end_char.saturating_sub(1).max(start_char)
+        } else {
+            start_char
+        };
+        let total = self.buffer().len_chars();
+        let target = (base as isize + num).clamp(0, total as isize) as usize;
+        let line = self.buffer().content.char_to_line(target);
+        let line_start = self.buffer().line_to_char(line);
+        Some(Cursor {
+            line,
+            col: target - line_start,
+        })
+    }
+
     pub(crate) fn jump_to_search_match(&mut self, idx: usize) {
-        if let Some(&(start_char, _)) = self.search_matches.get(idx) {
-            let line = self.buffer().content.char_to_line(start_char);
-            let line_start = self.buffer().line_to_char(line);
-            let col = start_char - line_start;
+        if let Some(&(start_char, end_char)) = self.search_matches.get(idx) {
+            let (line, col) = match self.offset_cursor(start_char, end_char) {
+                Some(c) => (c.line, c.col),
+                None => {
+                    let line = self.buffer().content.char_to_line(start_char);
+                    let line_start = self.buffer().line_to_char(line);
+                    (line, start_char - line_start)
+                }
+            };
             self.view_mut().cursor.line = line;
             self.view_mut().cursor.col = col;
+            // `/$` and `/\n` match *past* the last character; normal mode keeps
+            // the cursor on the last character instead.
+            self.clamp_cursor_col();
             self.ensure_cursor_visible();
             // If the match landed in the bottom quarter of the viewport,
             // center it so it's not barely visible at the edge (Vim-like behavior).
@@ -3134,10 +3247,66 @@ impl Engine {
         }
     }
 
+    /// Run the search the user just typed on the `/` or `?` command line.
+    ///
+    /// `raw` is everything after the leading `/` / `?`, so it may carry a
+    /// closing delimiter, a search offset and a `;`-chained second search
+    /// (`:h search-offset`, `:h //;`).
+    pub fn submit_search(&mut self, raw: &str, count: usize) {
+        let delim = match self.search_direction {
+            SearchDirection::Forward => '/',
+            SearchDirection::Backward => '?',
+        };
+        let parsed = split_search_cmdline(raw, delim);
+
+        let pattern = if parsed.pattern.is_empty() {
+            // `//` and a bare `/<CR>` reuse the last pattern.
+            self.search_query.clone()
+        } else {
+            parsed.pattern
+        };
+        if pattern.is_empty() {
+            self.message = "E35: No previous regular expression".to_string();
+            return;
+        }
+
+        self.search_query = pattern;
+        self.search_offset = parsed.offset;
+        self.search_smartcase_applies = true;
+        self.run_search();
+        if self.search_matches.is_empty() {
+            return;
+        }
+        for _ in 0..count.max(1) {
+            match self.search_direction {
+                SearchDirection::Forward => self.search_next(),
+                SearchDirection::Backward => self.search_prev(),
+            }
+        }
+
+        if let Some((dir, rest)) = parsed.chained {
+            self.search_direction = dir;
+            self.submit_search(&rest, 1);
+        }
+    }
+
     /// Perform incremental search as user types
     pub fn perform_incremental_search(&mut self) {
-        // Update search query from command buffer
-        self.search_query = self.command_buffer.clone();
+        // Update search query from command buffer. Strip any offset / chained
+        // search so that typing `/foo/e` still highlights `foo` as you type.
+        let delim = match self.search_direction {
+            SearchDirection::Forward => '/',
+            SearchDirection::Backward => '?',
+        };
+        let typed = split_search_cmdline(&self.command_buffer, delim).pattern;
+        if self.command_buffer.is_empty() {
+            self.search_query.clear();
+        } else if !typed.is_empty() {
+            // An empty `typed` with a non-empty command line is `//` — Vim
+            // reuses the previous pattern, so leave `search_query` alone.
+            self.search_query = typed;
+            self.search_smartcase_applies = true;
+        }
 
         if self.search_query.is_empty() {
             // Restore to start position if search is empty
@@ -3468,6 +3637,99 @@ impl Engine {
                 None
             }
         }
+    }
+}
+
+/// Split a `:set` argument list into individual options.
+///
+/// Vim allows several options per `:set` (`:set ic scs`, `:set noet ts=4`); a
+/// backslash escapes a space that belongs to a value.
+pub(crate) fn split_set_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = args.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// One parsed `/` or `?` command line.
+pub(crate) struct SearchCmdline {
+    /// The Vim pattern, empty when the user typed `//` or a bare `/`.
+    pub pattern: String,
+    /// Search offset (`e`, `e+1`, `b+2`, `+1`, `-1`, `0`), empty when absent.
+    pub offset: String,
+    /// A `;`-chained follow-up search: its direction and its own raw command line.
+    pub chained: Option<(SearchDirection, String)>,
+}
+
+/// Split a search command line into pattern, offset and `;`-chained follow-up.
+///
+/// `raw` is the text after the leading `/` or `?`; `delim` is that same
+/// character, which terminates the pattern unless backslash-escaped.
+pub(crate) fn split_search_cmdline(raw: &str, delim: char) -> SearchCmdline {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut pattern = String::new();
+    let mut i = 0;
+    let mut closed = false;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            pattern.push(chars[i]);
+            pattern.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if chars[i] == delim {
+            closed = true;
+            i += 1;
+            break;
+        }
+        pattern.push(chars[i]);
+        i += 1;
+    }
+
+    let mut offset = String::new();
+    if closed {
+        while i < chars.len() && matches!(chars[i], 'e' | 's' | 'b' | '+' | '-' | '0'..='9') {
+            offset.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    let mut chained = None;
+    if i < chars.len() && chars[i] == ';' {
+        if let Some(&next) = chars.get(i + 1) {
+            let dir = match next {
+                '/' => Some(SearchDirection::Forward),
+                '?' => Some(SearchDirection::Backward),
+                _ => None,
+            };
+            if let Some(dir) = dir {
+                chained = Some((dir, chars[i + 2..].iter().collect::<String>()));
+            }
+        }
+    }
+
+    SearchCmdline {
+        pattern,
+        offset,
+        chained,
     }
 }
 
