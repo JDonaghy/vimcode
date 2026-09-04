@@ -49,3 +49,42 @@ pub fn onedark() -> Self {
 }
 ```
 **Why:** Hardcoded hex values don't adapt to custom themes or VSCode theme imports. Only foundational colors (background, foreground, keyword, string, etc.) should have hex literals.
+
+## Vim-behaviour Changes: the Neovim Oracle Is the Acceptance Bar (#799)
+
+**Any PR that changes how VimCode responds to Vim keystrokes must add cases to
+`tests/nvim_conformance.rs`.** Hand-written expectations are second-class: a test
+that asserts `assert_eq!(buf, "expected")` encodes *the author's belief* about
+what Vim does, and a shared misconception passes such a test forever. The repo
+has ~1,300 such tests and a live example of the failure mode —
+`tests/operator_motions.rs::test_dj_at_last_line_noop_or_delete_last`, whose
+comment states the wrong Vim behaviour and whose assertion is too weak to catch
+either answer.
+
+`tests/nvim_conformance.rs` is the only suite where nothing is hand-authored: the
+same keystrokes run through `nvim --headless` and through `Engine`, and buffer +
+cursor are compared. It carries 1,432 cases across 16 areas. Add yours to the
+relevant `CASES_*` array with `c(label, lines, line, col, keys)`, or `cs(..)` when
+you need a line of Lua `setup` to pin a Vim-vs-Neovim option default
+(`startofline`, `joinspaces`, `nrformats`, `smarttab`, …) — without that you
+cannot tell "VimCode differs from Vim" apart from "Neovim differs from Vim".
+
+`KNOWN_DEVIATIONS` in that file lists the labels that currently differ. The gate
+is **bidirectional and the list may only ever shrink**:
+
+* an unlisted label that fails → regression, the test fails;
+* a listed label that starts passing → the fix must delete its entry, or the test
+  fails.
+
+So a Vim-compat fix proves itself by *deleting lines from `KNOWN_DEVIATIONS`*,
+not by adding an assertion. Regenerate the list only after a deliberate change:
+
+```sh
+CONFORMANCE_DUMP_DEVIATIONS=/tmp/dev.txt \
+  cargo test --no-default-features --test nvim_conformance -- --nocapture
+PROBE_FILTER=<label-substring> cargo test --test nvim_conformance -- --nocapture
+```
+
+Never regenerate to paper over a regression — the list not growing is the whole
+point. Requires `nvim` on PATH; CI installs it (#795) and hard-fails if it's
+missing, so a skip locally is not a green light.
