@@ -49,7 +49,7 @@ table:
 |---|---|---|
 | `ctrl_f_action` | `page_down` (traditional Vim Ctrl+F) | `find` (opens find/replace) |
 | `auto_pairs` | `false` (strict — no auto-closing brackets/quotes) | `true` |
-| `completion_keys.accept` | `<C-y>` (leaves `<Tab>` alone) | `Tab` |
+| `completion_keys.accept` | `<C-y>` (leaves `<Tab>` alone; accepts when the popup is visible, matching Vim's own `i_CTRL-Y`, and otherwise falls through to the pre-existing "insert char from line above" binding) | `Tab` |
 
 ### The mechanism
 

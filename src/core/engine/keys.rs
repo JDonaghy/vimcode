@@ -4619,6 +4619,22 @@ impl Engine {
         }
     }
 
+    /// Does the currently pressed key match a configured key-binding string?
+    ///
+    /// Handles both forms used by mode-derived key settings (see
+    /// `CompletionKeys::accept`): bracketed Vim-style bindings like `<C-y>`
+    /// (parsed via [`crate::core::settings::parse_key_binding_named`]) and
+    /// bare named keys like `Tab` (matched literally, no modifier).
+    pub(crate) fn key_matches_binding(binding: &str, ctrl: bool, key_name: &str) -> bool {
+        if let Some((b_ctrl, _b_shift, _b_alt, b_key)) =
+            crate::core::settings::parse_key_binding_named(binding)
+        {
+            ctrl == b_ctrl && key_name.eq_ignore_ascii_case(&b_key)
+        } else {
+            !ctrl && key_name == binding
+        }
+    }
+
     pub(crate) fn handle_insert_key(
         &mut self,
         key_name: &str,
@@ -4734,16 +4750,30 @@ impl Engine {
             }
         }
 
-        // ── Tab: accept display-only popup OR fall through ────────────────────
-        if !ctrl && key_name == "Tab" && self.completion_display_only {
+        // ── Configured accept key: accept display-only popup OR fall through ──
+        // The accept key is mode-derived (`completion_keys.accept(editor_mode)`
+        // — see the field doc comment): Vim mode defaults to `<C-y>` so `<Tab>`
+        // is left alone for indentation, matching Vim's own ins-completion-menu
+        // where `i_CTRL-Y` accepts when the menu is visible and otherwise falls
+        // through to its unrelated "insert char from line above" binding
+        // (handled further down). Vscode mode defaults to `Tab`.
+        if self.completion_display_only {
             if let Some(idx) = self.completion_idx {
-                self.apply_completion_candidate(idx);
-                self.dismiss_completion();
-                *changed = true;
-                return;
+                let accept_key = self
+                    .settings
+                    .completion_keys
+                    .accept(self.settings.editor_mode);
+                if Self::key_matches_binding(&accept_key, ctrl, key_name) {
+                    self.apply_completion_candidate(idx);
+                    self.dismiss_completion();
+                    *changed = true;
+                    return;
+                }
             }
         }
-        // No display-only popup — fall through to regular Tab handling in match below.
+        // No display-only popup, or key doesn't match the accept binding —
+        // fall through to regular key handling (e.g. Tab indentation, or the
+        // Ctrl+Y "insert char from line above" binding further down).
 
         // ── Down/Up: navigate completion popup if active ──────────────────────
         if !ctrl

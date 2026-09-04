@@ -5796,6 +5796,92 @@ mod tests {
         );
     }
 
+    /// #800 review fix: `completion_keys.accept` is mode-derived at the
+    /// settings layer, but `handle_insert_key` didn't actually consult it —
+    /// `<Tab>` unconditionally accepted the display-only completion popup
+    /// regardless of `editor_mode`. This wires the Tab/accept-key check to
+    /// `self.settings.completion_keys.accept(self.settings.editor_mode)` via
+    /// `Engine::key_matches_binding`, so default (Vim) mode's `<C-y>` default
+    /// accepts and `<Tab>` falls through to plain indentation — matching
+    /// Vim's own `i_CTRL-Y` (accepts when the completion menu is visible,
+    /// otherwise its unrelated "insert char from line above" binding).
+    ///
+    /// Builds one real word-completion popup per driver (via actual typing —
+    /// not by poking `engine.completion_idx` directly) from a shared fixture,
+    /// then presses the one key under test on each independent instance.
+    ///
+    /// Asserts on rendered output — how many times the dictionary word
+    /// `"ZQXWFOOBAR"` appears on screen — never on internal completion state
+    /// (the #587/#592 failure shape): before either key it appears twice
+    /// (once in the dictionary line, once as the popup's own candidate
+    /// label); the popup dismisses either way, so afterward the count is the
+    /// only thing that can tell accept from no-accept — 1 (just the
+    /// dictionary line) if `<Tab>` correctly did *not* accept, 2 (dictionary
+    /// line + the newly completed second line) if `<C-y>` correctly did.
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix,
+    /// `handle_insert_key`'s Tab branch checked `key_name == "Tab"`
+    /// unconditionally, so `<Tab>` accepted the popup even in default Vim
+    /// mode — the `after_tab` assertion below (expected count 1) observes 2
+    /// instead against that code.
+    #[test]
+    fn ctrl_y_accepts_tab_falls_through_for_completion_popup_in_default_vim_mode_via_shell_app() {
+        let build = || {
+            let mut app = TuiShellApp::new(None);
+            assert_eq!(
+                app.engine.settings.editor_mode,
+                crate::core::settings::EditorMode::Vim,
+                "precondition: nothing set editor_mode away from its Vim default"
+            );
+            app.engine.buffer_mut().insert(0, "ZQXWFOOBAR\n");
+
+            let mut driver = driver_with_shell(app, config(), 80, 24);
+            driver.render();
+            // Go to the last line, open a new line below, and type a prefix
+            // that matches the dictionary word above — triggers the real
+            // word-completion auto-popup (not hand-set engine state).
+            driver.type_char('G');
+            driver.type_char('o');
+            for c in "ZQXWFOO".chars() {
+                driver.type_char(c);
+            }
+            driver.render();
+            driver
+        };
+
+        let mut tab_driver = build();
+        let before = tab_driver.screen();
+        assert_eq!(
+            before.matches("ZQXWFOOBAR").count(),
+            2,
+            "precondition: the popup must be showing the \"ZQXWFOOBAR\" \
+             candidate (once in the dictionary line, once in the popup) \
+             before either key is pressed; screen:\n{before}"
+        );
+
+        tab_driver.press_named(quadraui::NamedKey::Tab);
+        tab_driver.render();
+        let after_tab = tab_driver.screen();
+        assert_eq!(
+            after_tab.matches("ZQXWFOOBAR").count(),
+            1,
+            "<Tab> must NOT accept the completion popup in default (Vim) \
+             mode — only the dictionary line's occurrence should remain; \
+             screen:\n{after_tab}"
+        );
+
+        let mut ctrl_y_driver = build();
+        ctrl_y_driver.ctrl_char('y');
+        ctrl_y_driver.render();
+        let after_ctrl_y = ctrl_y_driver.screen();
+        assert_eq!(
+            after_ctrl_y.matches("ZQXWFOOBAR").count(),
+            2,
+            "<C-y> must accept the completion popup in default (Vim) mode, \
+             completing the new line to \"ZQXWFOOBAR\" too; screen:\n{after_ctrl_y}"
+        );
+    }
+
     /// A focused terminal must swallow ordinary keys so they never reach the
     /// editor buffer — the divergence that made GTK unusable (there, `x` ran
     /// vim's delete-char on the file while the user thought they were typing
