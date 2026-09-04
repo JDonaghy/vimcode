@@ -5736,6 +5736,66 @@ mod tests {
         );
     }
 
+    /// #800: `ctrl_f_action` is now mode-derived instead of an unconditional
+    /// `"find"` constant — Vim mode (the default, nothing set in
+    /// `settings.json`) resolves to Vim's traditional Ctrl+F page-down, not
+    /// the find/replace overlay `EditorMode::Vscode` still gets. With the
+    /// editor (not the terminal) focused, Ctrl+F must scroll the viewport.
+    ///
+    /// Asserts on rendered output per `CLAUDE.md`'s black-box rule: the
+    /// top-of-file marker line scrolling out of the painted screen, and the
+    /// find/replace panel's always-drawn `"Aa"` case-sensitivity toggle
+    /// staying absent — not on `engine.ctrl_f_action`/`find_replace_open`
+    /// state, which could stay right while nothing painted (the #587/#592
+    /// failure shape).
+    ///
+    /// **Verified RED against unfixed `develop`:** before #800,
+    /// `default_ctrl_f_action()` unconditionally returned `"find"`, so this
+    /// same Ctrl+F press opened the find/replace overlay (the `"Aa"` toggle
+    /// appears) instead of paging the viewport.
+    #[test]
+    fn ctrl_f_pages_down_the_viewport_in_default_vim_mode_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        assert_eq!(
+            app.engine.settings.editor_mode,
+            crate::core::settings::EditorMode::Vim,
+            "precondition: nothing set editor_mode away from its Vim default"
+        );
+        let mut text = String::new();
+        for i in 0..80 {
+            text.push_str(&format!("ZQXW_LINE_{i:03}\n"));
+        }
+        app.engine.buffer_mut().insert(0, &text);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        assert!(
+            driver.screen_contains("ZQXW_LINE_000"),
+            "precondition: the top of the file must be visible before Ctrl+F; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.find_bounds("Aa").is_none(),
+            "precondition: the find/replace overlay must start closed; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('f');
+        driver.render();
+
+        assert!(
+            driver.find_bounds("Aa").is_none(),
+            "default (Vim) mode Ctrl+F must page the viewport down, not open \
+             the find/replace overlay; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("ZQXW_LINE_000"),
+            "Ctrl+F must scroll the top-of-file marker line off the rendered \
+             viewport; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// A focused terminal must swallow ordinary keys so they never reach the
     /// editor buffer — the divergence that made GTK unusable (there, `x` ran
     /// vim's delete-char on the file while the user thought they were typing

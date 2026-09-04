@@ -2857,7 +2857,7 @@ fn test_count_scroll_commands() {
     assert_eq!(engine.view().cursor.line, 10);
 
     // Test 3 Ctrl-F (3 full pages down = 60 lines) — requires page_down mode
-    engine.settings.ctrl_f_action = "page_down".to_string();
+    engine.settings.ctrl_f_action = Some("page_down".to_string());
     press_char(&mut engine, '3');
     press_ctrl(&mut engine, 'f');
     assert_eq!(engine.view().cursor.line, 70);
@@ -20693,6 +20693,9 @@ fn test_multi_group_window_rects_cover_all_groups() {
 fn test_find_replace_open_close() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello world hello");
+    // #800: default (Vim mode, unset) ctrl_f_action is "page_down", not
+    // "find" — opt in explicitly to exercise Ctrl+F opening find/replace.
+    engine.settings.ctrl_f_action = Some("find".to_string());
 
     // Ctrl+F opens find/replace
     press_ctrl(&mut engine, 'f');
@@ -20901,15 +20904,14 @@ fn test_ctrl_f_setting() {
     engine.update_syntax();
     engine.set_viewport_lines(10);
 
-    // Default: ctrl_f_action = "find" → opens find/replace
-    press_ctrl(&mut engine, 'f');
-    assert!(engine.find_replace_open);
-    press_special(&mut engine, "Escape");
-
-    // Change setting → Ctrl+F does page down
-    engine.settings.ctrl_f_action = "page_down".to_string();
+    // Default (Vim mode, unset): ctrl_f_action resolves to "page_down" → no find overlay
     press_ctrl(&mut engine, 'f');
     assert!(!engine.find_replace_open);
+
+    // Explicit override → Ctrl+F opens find/replace
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    press_ctrl(&mut engine, 'f');
+    assert!(engine.find_replace_open);
 }
 
 #[test]
@@ -22888,7 +22890,7 @@ fn test_set_option_auto_pairs_behavior() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "");
     engine.update_syntax();
-    engine.settings.auto_pairs = true;
+    engine.settings.auto_pairs = Some(true);
 
     send_keys(&mut engine, "i(<Esc>");
     let content = engine.buffer().to_string();
@@ -22900,7 +22902,7 @@ fn test_set_option_auto_pairs_disabled() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "");
     engine.update_syntax();
-    engine.settings.auto_pairs = false;
+    engine.settings.auto_pairs = Some(false);
 
     send_keys(&mut engine, "i(<Esc>");
     let content = engine.buffer().to_string();

@@ -1330,7 +1330,7 @@ impl Engine {
                         if col > 0 {
                             // Auto-pair backspace: delete both opener and closer
                             let prev_char = self.buffer().content.char(char_idx - 1);
-                            let next_char_matches = if self.settings.auto_pairs
+                            let next_char_matches = if self.settings.auto_pairs()
                                 && char_idx < self.buffer().len_chars()
                             {
                                 let next = self.buffer().content.char(char_idx);
@@ -1524,14 +1524,14 @@ impl Engine {
                             let col = self.view().cursor.col;
                             let char_idx = self.buffer().line_to_char(line) + col;
                             let closing_pair = auto_pair_closer(ch);
-                            if self.settings.auto_pairs
+                            if self.settings.auto_pairs()
                                 && is_closing_pair(ch)
                                 && char_idx < self.buffer().len_chars()
                                 && self.buffer().content.char(char_idx) == ch
                             {
                                 self.view_mut().cursor.col += 1;
                                 changed = true;
-                            } else if self.settings.auto_pairs && closing_pair.is_some() {
+                            } else if self.settings.auto_pairs() && closing_pair.is_some() {
                                 let closer = closing_pair.unwrap();
                                 let should_pair = if is_quote_char(ch) {
                                     if char_idx == 0 {
