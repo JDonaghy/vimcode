@@ -2726,7 +2726,24 @@ impl Engine {
             None => return, // No matching text object found
         };
 
-        let (start_pos, end_pos) = range;
+        let (mut start_pos, end_pos) = range;
+
+        // `ip`/`ap` are *linewise* objects, so `dip`/`dap` must remove whole
+        // lines — including one line separator per deleted line. The range
+        // normally carries the deleted lines' trailing newlines, but the final
+        // paragraph of a buffer with no trailing newline has none to carry: the
+        // separator that has to go is the one *before* it. Without absorbing
+        // it, `dip` on the last line of "a\n\nb" leaves "a\n\n" (an extra blank
+        // line) with the cursor on a line Vim has already removed (#803).
+        if operator == 'd'
+            && obj_type == 'p'
+            && end_pos == self.buffer().len_chars()
+            && start_pos > 0
+            && self.buffer().content.char(start_pos - 1) == '\n'
+        {
+            start_pos -= 1;
+        }
+
         if start_pos >= end_pos {
             // Empty inner range (e.g. ci( on "()"). For 'c' operator,
             // still enter insert mode at the position between the delimiters.

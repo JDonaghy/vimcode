@@ -2398,6 +2398,11 @@ pub struct Engine {
     /// empty — decides whether the in-progress candidate gets finalized (as
     /// the new `.` target) or discarded when we return to neutral.
     dot_scratch_any_change: bool,
+    /// Set while an `@`-triggered execution (`@x`, `@@`, `@:`) is being keyed
+    /// in, so those keystrokes are dropped from the dot-repeat candidate
+    /// instead of becoming the `.` target themselves. Cleared on the return to
+    /// neutral that ends the `@…` command.
+    dot_skip_command: bool,
     /// The last dot-repeatable command's keystrokes, with any leading count
     /// digits stripped out into `last_dot_count`. `.` replays this verbatim
     /// (optionally prefixed by a new count) through the same key dispatcher
@@ -3573,6 +3578,7 @@ impl Engine {
             pending_text_object: None,
             dot_scratch: Vec::new(),
             dot_scratch_any_change: false,
+            dot_skip_command: false,
             last_dot_keys: None,
             last_dot_count: None,
             insert_text_buffer: String::new(),

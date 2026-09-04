@@ -440,6 +440,11 @@ impl Engine {
             if matches!(self.mode, Mode::Command | Mode::Search) {
                 self.dot_scratch.clear();
                 self.dot_scratch_any_change = false;
+                // `record_dot_keystroke` — which normally clears this on the
+                // return to neutral — is skipped on this path, so an `@…`
+                // span that ends by opening `:`/`/` must release the flag here
+                // or every later command would be dropped from the candidate.
+                self.dot_skip_command = false;
             } else {
                 let dot_did_change = self.active_buffer_state().undo_stack.len() > dot_pre_undo_len;
                 self.record_dot_keystroke(key_name, unicode, ctrl, dot_was_neutral, dot_did_change);
@@ -4950,6 +4955,14 @@ impl Engine {
         }
     }
 
+    /// Vim abandons a count-prefixed insert (`3ix`) as soon as the cursor is
+    /// moved with an arrow/Home/End key during that insert: `3ix<Left>y<Esc>`
+    /// yields `yxa`, not `yxyxyxa` (`:h i_<Left>` — "the count is not used
+    /// after a cursor key"). Called from every insert-mode cursor movement.
+    fn cancel_insert_repeat_count(&mut self) {
+        self.insert_repeat_count = 0;
+    }
+
     pub(crate) fn handle_insert_key(
         &mut self,
         key_name: &str,
@@ -5632,23 +5645,35 @@ impl Engine {
                     *changed = true;
                 }
             }
-            "Left" => self.move_left(),
-            "Right" => self.move_right_insert(),
+            "Left" => {
+                self.cancel_insert_repeat_count();
+                self.move_left()
+            }
+            "Right" => {
+                self.cancel_insert_repeat_count();
+                self.move_right_insert()
+            }
             "Up" => {
+                self.cancel_insert_repeat_count();
                 if self.view().cursor.line > 0 {
                     self.view_mut().cursor.line -= 1;
                     self.clamp_cursor_col_insert();
                 }
             }
             "Down" => {
+                self.cancel_insert_repeat_count();
                 let max_line = self.buffer().len_lines().saturating_sub(1);
                 if self.view().cursor.line < max_line {
                     self.view_mut().cursor.line += 1;
                     self.clamp_cursor_col_insert();
                 }
             }
-            "Home" => self.view_mut().cursor.col = 0,
+            "Home" => {
+                self.cancel_insert_repeat_count();
+                self.view_mut().cursor.col = 0
+            }
             "End" => {
+                self.cancel_insert_repeat_count();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
             }
@@ -7189,6 +7214,12 @@ impl Engine {
     /// interleave with — or be mistaken for — an in-progress macro recording
     /// or playback.
     pub(crate) fn replay_dot_keys(&mut self, keys: &str) {
+        // A macro records the keys the *user* typed. `.` is one such key, and
+        // `handle_key` has already appended it to `recording_buffer` by the
+        // time we get here — so the keys this replay synthesizes must not be
+        // appended as well, or `qax.jq` records `x.xj` instead of `x.j` and
+        // `@a` then performs one edit too many (#803).
+        let saved_recording = self.macro_recording.take();
         let mut queue: VecDeque<char> = keys.chars().collect();
         while let Some((key_name, unicode, ctrl, consume)) = self.decode_key_from_queue(&queue) {
             for _ in 0..consume {
@@ -7200,6 +7231,12 @@ impl Engine {
             if self.macro_recursion_depth >= MAX_MACRO_RECURSION {
                 break;
             }
+        }
+        // Only restore if the replay didn't itself start a recording (it
+        // cannot in practice — `q` is not dot-repeatable — but never clobber
+        // live state on the way out).
+        if self.macro_recording.is_none() {
+            self.macro_recording = saved_recording;
         }
     }
 
@@ -7240,6 +7277,25 @@ impl Engine {
         did_change: bool,
     ) {
         let now_neutral = self.is_dot_repeat_neutral();
+
+        // `@x` / `@@` / `@:` runs *other* keys; per `:h .` the repeat target is
+        // whatever change those keys make, never the `@` command itself. For a
+        // register macro that falls out for free (`play_macro` only queues the
+        // keys, which are recorded when `macro_playback_queue` is later pumped
+        // through `handle_key`), but `@:` re-runs the ex command inline — and
+        // an ex command is not dot-repeatable at all — so `.` after `:d<CR>@:`
+        // must not delete a third line (#803). Drop the whole `@…` span.
+        if self.pending_key == Some('@') {
+            self.dot_skip_command = true;
+        }
+        if self.dot_skip_command {
+            if now_neutral {
+                self.dot_skip_command = false;
+                self.dot_scratch.clear();
+                self.dot_scratch_any_change = false;
+            }
+            return;
+        }
 
         if was_neutral && self.dot_scratch.is_empty() && !did_change && now_neutral {
             let is_count_digit =

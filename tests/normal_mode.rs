@@ -753,3 +753,117 @@ fn test_dot_repeat_count_override_dd_then_bare_dot_uses_override_not_stale_prefi
     // remaining line in the buffer).
     assert_buf(&e, "i\nj\nk\n");
 }
+
+// ── #803 CI follow-up: regressions the first cut of the keystroke-replay
+// dot-repeat introduced, each caught by the nvim conformance oracle. These
+// pin the behaviour with plain engine-level assertions so a re-break fails
+// even on a machine without `nvim` installed.
+
+#[test]
+fn test_insert_count_is_abandoned_when_an_arrow_key_moves_the_cursor() {
+    // `:h i_<Left>`: moving the cursor during a count-prefixed insert drops
+    // the repeat. Vim yields "yxa" for `3ix<Left>y<Esc>`, not "yxyxyxa".
+    let mut e = engine_with("a\n");
+    press(&mut e, '3');
+    press(&mut e, 'i');
+    press(&mut e, 'x');
+    press_key(&mut e, "Left");
+    press(&mut e, 'y');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "yxa\n");
+}
+
+#[test]
+fn test_insert_count_still_repeats_without_a_cursor_key() {
+    // Guard the other side of the fix: an undisturbed `3ix<Esc>` still
+    // repeats, so the cancellation above isn't just disabling the feature.
+    let mut e = engine_with("a\n");
+    press(&mut e, '3');
+    press(&mut e, 'i');
+    press(&mut e, 'x');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xxxa\n");
+}
+
+#[test]
+fn test_dot_inside_a_recorded_macro_does_not_pollute_the_register() {
+    // `qax.jq` records exactly "x.j". Before the fix, the keys `.` replayed
+    // were themselves appended to the recording buffer ("x.xj"), so `@a`
+    // deleted one character too many on every line it ran over.
+    let mut e = engine_with("abc\ndef\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, 'x');
+    press(&mut e, '.');
+    press(&mut e, 'j');
+    press(&mut e, 'q');
+    assert_buf(&e, "c\ndef\n");
+    assert_register(&e, 'a', "x.j", false);
+
+    press(&mut e, '@');
+    press(&mut e, 'a');
+    drain_macro_queue(&mut e);
+    assert_buf(&e, "c\nf\n");
+}
+
+#[test]
+fn test_dot_after_at_colon_does_not_repeat_the_ex_command() {
+    // `@:` re-runs the last ex command; `.` repeats the last *change*, and an
+    // ex command is not one. `:d<CR>@:.` deletes exactly two lines in Vim.
+    let mut e = engine_with("a\nb\nc\nd\n");
+    exec(&mut e, "d");
+    assert_buf(&e, "b\nc\nd\n");
+    press(&mut e, '@');
+    press(&mut e, ':');
+    assert_buf(&e, "c\nd\n");
+    press(&mut e, '.');
+    assert_buf(&e, "c\nd\n");
+}
+
+#[test]
+fn test_dot_after_at_register_repeats_the_macros_own_change() {
+    // The `@a` keystrokes are dropped from the dot candidate, but the macro's
+    // *contents* still record normally as they are pumped — so `.` after `@a`
+    // repeats the macro's last change (`x`), exactly as Vim does.
+    let mut e = engine_with("abcd\nefgh\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, 'x');
+    press(&mut e, 'q');
+    assert_buf(&e, "bcd\nefgh\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '@');
+    press(&mut e, 'a');
+    drain_macro_queue(&mut e);
+    assert_buf(&e, "bcd\nfgh\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "bcd\ngh\n");
+}
+
+#[test]
+fn test_dip_on_final_paragraph_removes_the_preceding_line_separator() {
+    // `ip`/`ap` are linewise: deleting the buffer's last paragraph must take
+    // a line separator with it. Leaving the one *before* it behind produced a
+    // stray blank line and parked the cursor on a line Vim had removed.
+    let mut e = engine_with("a\n\nb");
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'd');
+    press(&mut e, 'i');
+    press(&mut e, 'p');
+    assert_buf(&e, "a\n");
+    assert_cursor(&e, 1, 0);
+}
+
+#[test]
+fn test_dip_on_a_middle_paragraph_is_unaffected() {
+    // The EOF-only rule must not fire when a following separator exists.
+    let mut e = engine_with("a\n\nb\n");
+    press(&mut e, 'd');
+    press(&mut e, 'i');
+    press(&mut e, 'p');
+    assert_buf(&e, "\nb\n");
+    assert_cursor(&e, 0, 0);
+}
