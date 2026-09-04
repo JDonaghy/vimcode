@@ -348,6 +348,27 @@ impl Engine {
         // can't be missed by a handler that forgets to set the out-param.
         let dot_pre_undo_len = self.active_buffer_state().undo_stack.len();
 
+        // A count typed immediately before this `.` (the "2" of "2.") was
+        // buffered into `dot_scratch` as a *pending* count-prefix — by
+        // design, since at digit-typing time the recorder can't yet know
+        // whether a real command or a `.` trigger follows (see
+        // `record_dot_keystroke`). If a `.` trigger follows, that count is
+        // consumed below as `.`'s override count (`self.count`/
+        // `take_count()`), not as part of a new dot-repeat candidate — but
+        // because `.` itself skips `record_dot_keystroke` (see the call site
+        // below), that stale prefix would otherwise survive untouched and
+        // get folded into the *nested* `handle_key` calls that
+        // `repeat_last_change`'s replay performs (`replay_dot_keys`),
+        // corrupting `last_dot_count` for every later bare `.` (#803 review:
+        // `3x` `2.` would leave `last_dot_count = Some(22)` instead of
+        // `Some(2)`). Discard it here: a `.` keystroke never itself
+        // contributes to a new dot-repeat candidate, so whatever was pending
+        // before it is fully spent once `.` has consumed it as an override.
+        if dot_is_repeat_trigger {
+            self.dot_scratch.clear();
+            self.dot_scratch_any_change = false;
+        }
+
         match self.mode {
             Mode::Normal => {
                 action = self.handle_normal_key(key_name, unicode, ctrl, &mut changed);
@@ -510,11 +531,8 @@ impl Engine {
 
     /// Decode a sequence from the macro playback queue.
     /// Returns (key_name, unicode, ctrl) tuple and the number of characters consumed.
-    pub(crate) fn decode_macro_sequence(&mut self) -> Option<(String, Option<char>, bool, usize)> {
-        // Cloning is cheap here — a handful of chars at most in the common
-        // case, and macros/dot-recordings aren't hot loops.
-        let queue = self.macro_playback_queue.clone();
-        self.decode_key_from_queue(&queue)
+    pub(crate) fn decode_macro_sequence(&self) -> Option<(String, Option<char>, bool, usize)> {
+        self.decode_key_from_queue(&self.macro_playback_queue)
     }
 
     /// Decode the *next* keystroke at the front of an encoded key-notation
