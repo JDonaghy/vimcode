@@ -662,6 +662,28 @@ fn test_dot_repeat_visual_block_insert() {
 }
 
 #[test]
+fn test_dot_repeat_visual_block_change() {
+    // Named exact-buffer coverage for `vb:c then .` (previously covered only
+    // implicitly via its removal from KNOWN_DEVIATIONS in
+    // nvim_conformance.rs — see #803 review nits). Blockwise `c` is a
+    // blockwise delete followed by a blockwise insert at the same column
+    // (reusing `visual_block_insert_info`, the same mechanism block `I`/`A`
+    // use), so it should repeat the same way block `I` does.
+    let mut e = engine_with("abc\nabc\nabc\nabc\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'c');
+    press(&mut e, 'Z');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "Zbc\nZbc\nabc\nabc\n");
+
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "Zbc\nZbc\nZbc\nZbc\n");
+}
+
+#[test]
 fn test_dot_repeat_count_override_replaces_not_multiplies() {
     // `:h .`: a count given to `.` *replaces* the original count.
     let mut e = engine_with("abcdefghij\n");
@@ -686,4 +708,48 @@ fn test_dot_repeat_count_override_dd() {
     press(&mut e, '3');
     press(&mut e, '.');
     assert_buf(&e, "f\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_then_bare_dot_uses_override_not_stale_prefix() {
+    // Regression for #803 review: a count-override repeat (`2.`) must not
+    // corrupt the remembered dot-count for a *later* bare `.`. Before the
+    // fix, the "2" typed just before `.` leaked into the nested replay's own
+    // dot-recording and got concatenated onto the replayed "2", leaving the
+    // remembered count as 22 instead of 2 — so this third `.` would delete
+    // far more than the 2 characters Vim's `:h .` promises ("Count ... [is]
+    // remembered ... Use "4." ... Use "." to [repeat] again").
+    let mut e = engine_with("abcdefghij\n");
+    press(&mut e, '3');
+    press(&mut e, 'x');
+    assert_buf(&e, "defghij\n");
+
+    press(&mut e, '2');
+    press(&mut e, '.');
+    assert_buf(&e, "fghij\n");
+
+    press(&mut e, '.');
+    // Exactly 2 more characters deleted (matching the "2." override that's
+    // now remembered), not 22 (which would wipe the rest of the line).
+    assert_buf(&e, "hij\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_dd_then_bare_dot_uses_override_not_stale_prefix() {
+    // Same regression as above, for the linewise `dd` family: `2dd` then
+    // `3.` must leave `3` (not `33`) as the count a further bare `.` uses.
+    let mut e = engine_with("a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\n");
+    press(&mut e, '2');
+    press(&mut e, 'd');
+    press(&mut e, 'd');
+    assert_buf(&e, "c\nd\ne\nf\ng\nh\ni\nj\nk\n");
+
+    press(&mut e, '3');
+    press(&mut e, '.');
+    assert_buf(&e, "f\ng\nh\ni\nj\nk\n");
+
+    press(&mut e, '.');
+    // Exactly 3 more lines deleted, not 33 (which would wipe every
+    // remaining line in the buffer).
+    assert_buf(&e, "i\nj\nk\n");
 }
