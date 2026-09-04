@@ -31,6 +31,89 @@ Update ALL of these:
 6. Settings are automatically merged: new fields are added to existing settings files without overwriting user values
 7. Document the setting name and purpose in comments
 
+**If the setting's sensible default genuinely differs between `EditorMode::Vim` and
+`EditorMode::Vscode`** (a "contested default" — see below), skip step 1/2's flat
+`#[serde(default = "default_fn_name")]` and follow the mode-derived recipe instead.
+
+## Mode-Derived Contested Defaults (#800)
+
+`editor_mode` (`EditorMode::Vim` | `EditorMode::Vscode`, `settings.rs`) is the editor's
+paradigm switch, and it defaults to `Vim` — but before #800 a handful of settings had a
+single unconditional default that happened to match VSCode's behaviour regardless of
+`editor_mode`, so "Vim mode" didn't actually mean Vim for anything they controlled. A
+**contested default** is any setting whose "sensible default" genuinely differs between
+the two paradigms (Vim's traditional behaviour vs. today's IDE convention). The current
+table:
+
+| Setting | Vim default | Vscode default |
+|---|---|---|
+| `ctrl_f_action` | `page_down` (traditional Vim Ctrl+F) | `find` (opens find/replace) |
+| `auto_pairs` | `false` (strict — no auto-closing brackets/quotes) | `true` |
+| `completion_keys.accept` | `<C-y>` (leaves `<Tab>` alone) | `Tab` |
+
+### The mechanism
+
+Serde's `#[serde(default = "...")]` can't see sibling fields, so a contested field can't
+compute its default from `editor_mode` at deserialize time. Instead:
+
+1. **Store the field as `Option<T>`**, not `T`:
+   ```rust
+   /// Mode-derived (see `EditorMode`): `None` means "inherit from
+   /// `editor_mode`", resolved live by the accessor method below. `Some(_)`
+   /// is an explicit user override that always wins. Never read this field
+   /// directly — call the accessor method.
+   #[serde(default, skip_serializing_if = "Option::is_none")]
+   pub my_contested_field: Option<T>,
+   ```
+   `skip_serializing_if` is required: without it, `Settings::save()` (which
+   `Settings::load()` calls on every startup to backfill new fields) would bake a
+   resolved concrete value into `settings.json` the first time the app runs, and an
+   unset field would stop being mode-reactive after a single restart.
+2. **Parameterize the default function by `EditorMode`** instead of taking no
+   arguments: `fn default_my_contested_field(mode: EditorMode) -> T`.
+3. **Add an accessor method with the *same name* as the field** — Rust disambiguates
+   `self.my_contested_field` (field access) from `self.my_contested_field()` (method
+   call), so existing call sites only need parentheses added, not a rename:
+   ```rust
+   impl Settings {
+       pub fn my_contested_field(&self) -> T {
+           self.my_contested_field
+               .unwrap_or_else(|| default_my_contested_field(self.editor_mode))
+       }
+   }
+   ```
+4. **Update every read site** (`grep` the field name) to call the accessor instead of
+   reading the field directly. Update every *write* site (`set_bool_option` /
+   `set_value_option` / `set_value_str` / `:set` handlers) to assign `Some(value)`,
+   never a bare value.
+5. **Do not** add a mutating "resolve defaults" pass that fills `None` → `Some(default)`
+   anywhere (on load, on mode switch, or otherwise). Resolution is intentionally
+   **lazy** — computed fresh on every accessor call from the live `editor_mode` — which
+   is what makes both of these true for free, with no extra code:
+   - An explicit override always wins, *including after a later `:set mode=...`
+     switch* — there is no "filled" `Some` sitting in the field for a mode switch to
+     mistake for a real override.
+   - `:set mode=vim` / `:set mode=vscode` re-resolves every unset contested field
+     immediately, because the very next accessor call reads the new `editor_mode`. No
+     restart, no explicit re-resolve step to remember to call.
+6. For a contested field nested inside a sub-struct that doesn't itself carry
+   `editor_mode` (like `CompletionKeys`), give the accessor a `mode: EditorMode`
+   parameter instead of reading `self.editor_mode`, and have callers pass
+   `settings.editor_mode` through: `settings.completion_keys.accept(settings.editor_mode)`.
+
+### Testing
+
+Unit-test each contested field × two modes × (unset, explicitly set) in `settings.rs`
+— see `ctrl_f_action_unset_is_page_down_in_vim_mode` and its siblings for the pattern.
+Cover the JSON round trip too (`contested_fields_omitted_from_json_when_unset` /
+`contested_fields_round_trip_when_explicitly_set`): an unset field must not appear in
+serialized JSON, and an explicit override must survive a save/load round trip. If the
+field is wired into actual key-handling behaviour (unlike, say, a purely descriptive
+setting), add a `TuiDriver` black-box test asserting on *rendered output* that the
+Vim-mode default takes effect with nothing set — see
+`ctrl_f_pages_down_the_viewport_in_default_vim_mode_via_shell_app` in
+`src/tui_main/shell_app.rs`.
+
 ## Hermetic Engine Construction in Tests
 
 **Any new hermetic/rendering/snapshot-style test that needs an `Engine` should call `Engine::new_for_test()`, not `Engine::new()`.** `new_for_test()` builds settings/session/history/`git_branch` from in-memory defaults instead of loading ambient disk/git state, so tests stay reproducible regardless of the machine, `$HOME`, or git branch they run on (#439, #615, #617). Don't call `Engine::new()` and overwrite fields afterward — some ambient state (e.g. `session.explorer_visible`) is consumed inside construction to drive `app_shell.hide_sidebar()` before a post-hoc field reset can run, so overwrite-after doesn't reliably undo it. See `src/tui_main/render_impl.rs`'s `test_engine()` for the reference pattern, including how to reset `extension_state`/`ext_registry` (still loaded from disk/cache unconditionally) and how to flip sidebar visibility through `app_shell`'s own API rather than reassigning `session` directly.

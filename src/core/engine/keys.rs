@@ -324,7 +324,7 @@ impl Engine {
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
         if ctrl
             && key_name == "f"
-            && self.settings.ctrl_f_action == "find"
+            && self.settings.ctrl_f_action() == "find"
             && matches!(
                 self.mode,
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::Insert
@@ -672,7 +672,7 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "f" => {
-                    if self.settings.ctrl_f_action == "find" {
+                    if self.settings.ctrl_f_action() == "find" {
                         // Open find/replace overlay
                         self.open_find_replace();
                         return EngineAction::None;
@@ -5201,7 +5201,7 @@ impl Engine {
                         // Auto-pair backspace: delete both opener and closer
                         let prev_char = self.buffer().content.char(char_idx - 1);
                         let next_char_matches =
-                            if self.settings.auto_pairs && char_idx < self.buffer().len_chars() {
+                            if self.settings.auto_pairs() && char_idx < self.buffer().len_chars() {
                                 let next = self.buffer().content.char(char_idx);
                                 auto_pair_closer(prev_char) == Some(next)
                             } else {
@@ -5333,7 +5333,7 @@ impl Engine {
 
                         // Auto-pairs: skip-over closing bracket/quote
                         let closing_pair = auto_pair_closer(ch);
-                        if self.settings.auto_pairs
+                        if self.settings.auto_pairs()
                             && is_closing_pair(ch)
                             && char_idx < self.buffer().len_chars()
                             && self.buffer().content.char(char_idx) == ch
@@ -5342,7 +5342,7 @@ impl Engine {
                             self.view_mut().cursor.col += 1;
                             self.insert_text_buffer.push(ch);
                             *changed = true;
-                        } else if self.settings.auto_pairs && closing_pair.is_some() {
+                        } else if self.settings.auto_pairs() && closing_pair.is_some() {
                             let closer = closing_pair.unwrap();
                             // Smart context for quotes: only auto-pair if preceded by
                             // whitespace, bracket, or BOL

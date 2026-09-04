@@ -15,7 +15,7 @@ pub fn save_revision() -> u64 {
 }
 
 /// Which editing paradigm the editor uses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EditorMode {
     /// Classic modal Vim key-bindings (default).
@@ -305,8 +305,15 @@ pub struct Settings {
     pub match_brackets: bool,
 
     /// Auto-close brackets and quotes in Insert mode.
-    #[serde(default = "default_auto_pairs")]
-    pub auto_pairs: bool,
+    ///
+    /// Mode-derived (see `EditorMode`): `None` means "inherit from
+    /// `editor_mode`" and is resolved live by the [`Settings::auto_pairs`]
+    /// accessor method — Vim mode is strict-off, Vscode mode is on. `Some(_)`
+    /// is an explicit user override that always wins, including across a
+    /// later `:set mode=...` switch. Never read this field directly; call
+    /// the accessor method (`self.settings.auto_pairs()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pairs: Option<bool>,
 
     /// Mouse dwell delay (ms) before auto-showing hover popups. 0 = disabled.
     #[serde(default = "default_hover_delay")]
@@ -317,10 +324,18 @@ pub struct Settings {
     #[serde(default = "default_use_nerd_fonts")]
     pub use_nerd_fonts: bool,
 
-    /// What Ctrl+F does: "find" opens the find/replace overlay (default),
-    /// "page_down" preserves traditional Vim Ctrl+F page-down behavior.
-    #[serde(default = "default_ctrl_f_action")]
-    pub ctrl_f_action: String,
+    /// What Ctrl+F does: "find" opens the find/replace overlay, "page_down"
+    /// is traditional Vim Ctrl+F page-down behavior.
+    ///
+    /// Mode-derived (see `EditorMode`): `None` means "inherit from
+    /// `editor_mode`" and is resolved live by the
+    /// [`Settings::ctrl_f_action`] accessor method — Vim mode is
+    /// `page_down`, Vscode mode is `find`. `Some(_)` is an explicit user
+    /// override that always wins, including across a later `:set
+    /// mode=...` switch. Never read this field directly; call the
+    /// accessor method (`self.settings.ctrl_f_action()`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctrl_f_action: Option<String>,
 
     /// Maximum buffer line count for tree-sitter syntax highlighting.
     /// Files with more lines than this render as plain text. Default 20_000
@@ -332,8 +347,14 @@ pub struct Settings {
     pub syntax_max_lines: usize,
 }
 
-fn default_ctrl_f_action() -> String {
-    "find".to_string()
+/// Mode-derived default for `ctrl_f_action` — see the field doc comment on
+/// [`Settings::ctrl_f_action`]. Vim mode pages down (traditional Vim
+/// behavior); Vscode mode opens find/replace (today's IDE default).
+fn default_ctrl_f_action(mode: EditorMode) -> String {
+    match mode {
+        EditorMode::Vim => "page_down".to_string(),
+        EditorMode::Vscode => "find".to_string(),
+    }
 }
 
 fn default_syntax_max_lines() -> usize {
@@ -352,8 +373,14 @@ fn default_match_brackets() -> bool {
     true
 }
 
-fn default_auto_pairs() -> bool {
-    true
+/// Mode-derived default for `auto_pairs` — see the field doc comment on
+/// [`Settings::auto_pairs`]. Vim mode is strict (no auto-pairing); Vscode
+/// mode auto-closes brackets/quotes (today's IDE default).
+fn default_auto_pairs(mode: EditorMode) -> bool {
+    match mode {
+        EditorMode::Vim => false,
+        EditorMode::Vscode => true,
+    }
 }
 
 fn default_hover_delay() -> u32 {
@@ -655,8 +682,16 @@ impl Default for PanelKeys {
 fn default_completion_trigger() -> String {
     "<C-Space>".to_string()
 }
-fn default_completion_accept() -> String {
-    "Tab".to_string()
+
+/// Mode-derived default for `completion_keys.accept` — see the field doc
+/// comment on [`CompletionKeys::accept`]. Vim mode leaves `<Tab>` alone
+/// (`<C-y>` accepts, matching Vim's native completion menu); Vscode mode
+/// uses `Tab` (today's IDE default).
+fn default_completion_accept(mode: EditorMode) -> String {
+    match mode {
+        EditorMode::Vim => "<C-y>".to_string(),
+        EditorMode::Vscode => "Tab".to_string(),
+    }
 }
 
 /// Key bindings for the auto-popup completion menu.
@@ -665,16 +700,34 @@ pub struct CompletionKeys {
     /// Key to manually trigger completion popup. Default: `<C-Space>`
     #[serde(default = "default_completion_trigger")]
     pub trigger: String,
-    /// Key to accept the highlighted completion item. Default: `Tab`
-    #[serde(default = "default_completion_accept")]
-    pub accept: String,
+    /// Key to accept the highlighted completion item.
+    ///
+    /// Mode-derived (see `EditorMode`): `None` means "inherit from
+    /// `editor_mode`" and is resolved live by the
+    /// [`CompletionKeys::accept`] accessor method — Vim mode is `<C-y>`,
+    /// Vscode mode is `Tab`. `Some(_)` is an explicit user override that
+    /// always wins, including across a later `:set mode=...` switch. Never
+    /// read this field directly; call the accessor method
+    /// (`self.settings.completion_keys.accept(self.settings.editor_mode)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept: Option<String>,
+}
+
+impl CompletionKeys {
+    /// Resolve the effective accept key: an explicit override if set,
+    /// otherwise the mode-derived default for `mode`.
+    pub fn accept(&self, mode: EditorMode) -> String {
+        self.accept
+            .clone()
+            .unwrap_or_else(|| default_completion_accept(mode))
+    }
 }
 
 impl Default for CompletionKeys {
     fn default() -> Self {
         Self {
             trigger: default_completion_trigger(),
-            accept: default_completion_accept(),
+            accept: None,
         }
     }
 }
@@ -796,16 +849,52 @@ impl Default for Settings {
             indent_guides: default_indent_guides(),
             minimap: default_minimap(),
             match_brackets: default_match_brackets(),
-            auto_pairs: default_auto_pairs(),
+            auto_pairs: None, // mode-derived — see Settings::auto_pairs()
             hover_delay: default_hover_delay(),
             use_nerd_fonts: default_use_nerd_fonts(),
-            ctrl_f_action: default_ctrl_f_action(),
+            ctrl_f_action: None, // mode-derived — see Settings::ctrl_f_action()
             syntax_max_lines: default_syntax_max_lines(),
         }
     }
 }
 
 impl Settings {
+    // ── Mode-derived contested defaults ─────────────────────────────────────
+    //
+    // These three settings (`ctrl_f_action`, `auto_pairs`,
+    // `completion_keys.accept`) are stored as `Option<T>`: `None` means
+    // "not explicitly set, inherit from `editor_mode`"; `Some(_)` is an
+    // explicit user override. Resolution is intentionally *lazy* — done on
+    // every read via these accessor methods rather than baked into the
+    // field at load time — so that:
+    //   1. An explicit override always wins, even after a later
+    //      `:set mode=...` switch (there is no stale "filled" state to
+    //      accidentally clobber).
+    //   2. `:set mode=vim` / `:set mode=vscode` re-resolves every unset
+    //      field immediately, with no extra step and no restart, because
+    //      the next read naturally uses the new `self.editor_mode`.
+    //   3. `Settings::save()` never persists a resolved value for a field
+    //      the user never touched (`skip_serializing_if = "Option::is_none"`),
+    //      so a fresh settings.json stays mode-reactive across restarts too.
+    //
+    // See `docs/PATTERNS.md` ("Mode-derived contested defaults") for the
+    // full table and the recipe for adding a fourth one.
+
+    /// Resolve the effective `ctrl_f_action`: an explicit override if set,
+    /// otherwise the default for the current `editor_mode`.
+    pub fn ctrl_f_action(&self) -> String {
+        self.ctrl_f_action
+            .clone()
+            .unwrap_or_else(|| default_ctrl_f_action(self.editor_mode))
+    }
+
+    /// Resolve the effective `auto_pairs`: an explicit override if set,
+    /// otherwise the default for the current `editor_mode`.
+    pub fn auto_pairs(&self) -> bool {
+        self.auto_pairs
+            .unwrap_or_else(|| default_auto_pairs(self.editor_mode))
+    }
+
     /// Load settings from ~/.config/vimcode/settings.json
     /// Falls back to defaults if file doesn't exist or is invalid
     ///
@@ -1091,7 +1180,7 @@ impl Settings {
             "indentguides" => self.indent_guides = enable,
             "minimap" => self.minimap = enable,
             "matchbrackets" => self.match_brackets = enable,
-            "autopairs" => self.auto_pairs = enable,
+            "autopairs" => self.auto_pairs = Some(enable),
             "nerdfonts" | "nf" => {
                 self.use_nerd_fonts = enable;
                 crate::icons::set_nerd_fonts(enable);
@@ -1364,7 +1453,7 @@ impl Settings {
             } else {
                 "nomatchbrackets".to_string()
             }),
-            "autopairs" => Ok(if self.auto_pairs {
+            "autopairs" => Ok(if self.auto_pairs() {
                 "autopairs".to_string()
             } else {
                 "noautopairs".to_string()
@@ -1490,10 +1579,10 @@ impl Settings {
             "indent_guides" | "indentguides" => self.indent_guides.to_string(),
             "minimap" => self.minimap.to_string(),
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
-            "auto_pairs" | "autopairs" => self.auto_pairs.to_string(),
+            "auto_pairs" | "autopairs" => self.auto_pairs().to_string(),
             "hover_delay" => self.hover_delay.to_string(),
             "use_nerd_fonts" | "nerdfonts" | "nf" => self.use_nerd_fonts.to_string(),
-            "ctrl_f_action" => self.ctrl_f_action.clone(),
+            "ctrl_f_action" => self.ctrl_f_action(),
             "extension_registries" => self.extension_registries.join(", "),
             "syntax_max_lines" | "syntaxmaxlines" => self.syntax_max_lines.to_string(),
             _ => String::new(),
@@ -1605,7 +1694,7 @@ impl Settings {
             "indent_guides" | "indentguides" => self.indent_guides = value == "true",
             "minimap" => self.minimap = value == "true",
             "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
-            "auto_pairs" | "autopairs" => self.auto_pairs = value == "true",
+            "auto_pairs" | "autopairs" => self.auto_pairs = Some(value == "true"),
             "hover_delay" => {
                 self.hover_delay = value
                     .parse()
@@ -1616,7 +1705,7 @@ impl Settings {
                 crate::icons::set_nerd_fonts(self.use_nerd_fonts);
             }
             "ctrl_f_action" => match value {
-                "find" | "page_down" => self.ctrl_f_action = value.to_string(),
+                "find" | "page_down" => self.ctrl_f_action = Some(value.to_string()),
                 _ => {
                     return Err(format!(
                         "Invalid ctrl_f_action: {value} (expected 'find' or 'page_down')"
@@ -2698,5 +2787,187 @@ mod tests {
         let s: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(s.panel_keys.live_grep, "<C-A-g>");
         assert_eq!(s.panel_keys.toggle_sidebar, "<C-b>");
+    }
+
+    // ── Mode-derived contested defaults (#800) ──────────────────────────────
+    // `ctrl_f_action`, `auto_pairs`, `completion_keys.accept` derive their
+    // default from `editor_mode` when unset (`None`), but an explicit
+    // `Some(_)` override always wins — including across a later mode
+    // switch. Each field gets: unset×Vim, unset×Vscode, explicit-survives-
+    // mode-switch, plus the two acceptance scenarios (no config file /
+    // `mode=vscode` with nothing else set).
+
+    #[test]
+    fn ctrl_f_action_unset_is_page_down_in_vim_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        assert!(s.ctrl_f_action.is_none(), "must start unset");
+        assert_eq!(s.ctrl_f_action(), "page_down");
+    }
+
+    #[test]
+    fn ctrl_f_action_unset_is_find_in_vscode_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vscode;
+        assert!(s.ctrl_f_action.is_none(), "must start unset");
+        assert_eq!(s.ctrl_f_action(), "find");
+    }
+
+    #[test]
+    fn ctrl_f_action_explicit_override_survives_mode_switch() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        s.ctrl_f_action = Some("find".to_string());
+        assert_eq!(s.ctrl_f_action(), "find");
+        // A later mode switch must not clobber the explicit override.
+        s.editor_mode = EditorMode::Vscode;
+        assert_eq!(
+            s.ctrl_f_action(),
+            "find",
+            "explicit override must survive a mode switch"
+        );
+    }
+
+    #[test]
+    fn auto_pairs_unset_is_false_in_vim_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        assert!(s.auto_pairs.is_none(), "must start unset");
+        assert!(!s.auto_pairs());
+    }
+
+    #[test]
+    fn auto_pairs_unset_is_true_in_vscode_mode() {
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vscode;
+        assert!(s.auto_pairs.is_none(), "must start unset");
+        assert!(s.auto_pairs());
+    }
+
+    #[test]
+    fn auto_pairs_explicit_override_survives_mode_switch() {
+        // The scenario called out by #800: `:set mode=vim` + `:set
+        // auto_pairs=true` keeps autopairs on; a later `:set mode=vscode`
+        // must not clobber that explicit `true` (nor, symmetrically, an
+        // explicit `false`).
+        let mut s = Settings::default();
+        s.editor_mode = EditorMode::Vim;
+        s.auto_pairs = Some(true);
+        assert!(s.auto_pairs());
+        s.editor_mode = EditorMode::Vscode;
+        assert!(
+            s.auto_pairs(),
+            "explicit auto_pairs=true must survive mode=vscode"
+        );
+
+        let mut s2 = Settings::default();
+        s2.editor_mode = EditorMode::Vscode;
+        s2.auto_pairs = Some(false);
+        assert!(!s2.auto_pairs());
+        s2.editor_mode = EditorMode::Vim;
+        assert!(
+            !s2.auto_pairs(),
+            "explicit auto_pairs=false must survive mode=vim"
+        );
+    }
+
+    #[test]
+    fn completion_accept_unset_is_c_y_in_vim_mode() {
+        let ck = CompletionKeys::default();
+        assert!(ck.accept.is_none(), "must start unset");
+        assert_eq!(ck.accept(EditorMode::Vim), "<C-y>");
+        assert_ne!(
+            ck.accept(EditorMode::Vim),
+            "Tab",
+            "Vim mode must not capture <Tab> for completion accept"
+        );
+    }
+
+    #[test]
+    fn completion_accept_unset_is_tab_in_vscode_mode() {
+        let ck = CompletionKeys::default();
+        assert!(ck.accept.is_none(), "must start unset");
+        assert_eq!(ck.accept(EditorMode::Vscode), "Tab");
+    }
+
+    #[test]
+    fn completion_accept_explicit_override_survives_mode_switch() {
+        let mut ck = CompletionKeys::default();
+        ck.accept = Some("<C-Space>".to_string());
+        assert_eq!(ck.accept(EditorMode::Vim), "<C-Space>");
+        assert_eq!(
+            ck.accept(EditorMode::Vscode),
+            "<C-Space>",
+            "explicit override must survive a mode switch"
+        );
+    }
+
+    #[test]
+    fn no_config_file_defaults_are_strict_vim() {
+        // Acceptance: with no config file (Settings::default(), nothing
+        // ever set), mode=vim and all three contested defaults are the
+        // strict Vim values.
+        let s = Settings::default();
+        assert_eq!(s.editor_mode, EditorMode::Vim);
+        assert_eq!(s.ctrl_f_action(), "page_down");
+        assert!(!s.auto_pairs());
+        assert_ne!(
+            s.completion_keys.accept(s.editor_mode),
+            "Tab",
+            "the completion popup must not eat <Tab> in default (Vim) mode"
+        );
+    }
+
+    #[test]
+    fn mode_vscode_with_nothing_else_set_reverts_to_ide_defaults() {
+        // Acceptance: `mode=vscode` with nothing else set reverts all
+        // three contested defaults to today's IDE values.
+        let mut s = Settings::default();
+        s.parse_set_option("mode=vscode").unwrap();
+        assert_eq!(s.editor_mode, EditorMode::Vscode);
+        assert_eq!(s.ctrl_f_action(), "find");
+        assert!(s.auto_pairs());
+        assert_eq!(s.completion_keys.accept(s.editor_mode), "Tab");
+    }
+
+    #[test]
+    fn contested_fields_omitted_from_json_when_unset() {
+        // Unset contested fields must not be baked into a fresh
+        // settings.json — otherwise a fresh install would stop being
+        // mode-reactive after the very first save/load round trip.
+        let s = Settings::default();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("\"ctrl_f_action\""),
+            "unset ctrl_f_action must be omitted from serialized settings"
+        );
+        assert!(
+            !json.contains("\"auto_pairs\""),
+            "unset auto_pairs must be omitted from serialized settings"
+        );
+        assert!(
+            !json.contains("\"accept\""),
+            "unset completion_keys.accept must be omitted from serialized settings"
+        );
+
+        // Round-trip: deserializing that JSON must still resolve unset.
+        let s2: Settings = serde_json::from_str(&json).unwrap();
+        assert!(s2.ctrl_f_action.is_none());
+        assert!(s2.auto_pairs.is_none());
+        assert!(s2.completion_keys.accept.is_none());
+    }
+
+    #[test]
+    fn contested_fields_round_trip_when_explicitly_set() {
+        let mut s = Settings::default();
+        s.ctrl_f_action = Some("find".to_string());
+        s.auto_pairs = Some(true);
+        s.completion_keys.accept = Some("<C-y>".to_string());
+
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.ctrl_f_action, Some("find".to_string()));
+        assert_eq!(s2.auto_pairs, Some(true));
+        assert_eq!(s2.completion_keys.accept, Some("<C-y>".to_string()));
     }
 }
