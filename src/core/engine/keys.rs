@@ -7960,7 +7960,7 @@ impl Engine {
     }
 
     /// Drain the macro playback queue, executing each queued keystroke.
-    fn drain_macro_queue(&mut self) {
+    pub(crate) fn drain_macro_queue(&mut self) {
         // Guard against infinite recursion from self-referencing macros
         let max_iterations = 100_000;
         let mut iterations = 0;

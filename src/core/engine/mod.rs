@@ -4643,53 +4643,6 @@ fn engine_visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> us
     }
     line_char_len.div_ceil(viewport_cols).max(1)
 }
-
-/// Try to parse a `:norm[al][!] {keys}` command with an optional range prefix.
-/// Returns `(range_str, keys)` if recognized, `None` otherwise.
-/// Supported ranges: `""` (current line), `"%"` (all), `"'<,'>"` (visual), `"N,M"` (numeric, 1-based).
-fn try_parse_norm(cmd: &str) -> Option<(&str, &str)> {
-    // Strip optional range prefix
-    let (range_str, rest) = if let Some(r) = cmd.strip_prefix("'<,'>") {
-        ("'<,'>", r)
-    } else if let Some(r) = cmd.strip_prefix('%') {
-        ("%", r)
-    } else if let Some(idx) = norm_numeric_range_end(cmd) {
-        (&cmd[..idx], &cmd[idx..])
-    } else {
-        ("", cmd)
-    };
-
-    // Strip "norm[al][!] " keyword — trailing space is required; keys must follow
-    let keys = rest
-        .strip_prefix("normal! ")
-        .or_else(|| rest.strip_prefix("normal "))
-        .or_else(|| rest.strip_prefix("norm! "))
-        .or_else(|| rest.strip_prefix("norm "))?;
-
-    Some((range_str, keys))
-}
-
-/// Returns the byte index right after a `"N,M"` numeric range prefix, or `None`.
-fn norm_numeric_range_end(cmd: &str) -> Option<usize> {
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == 0 || i >= bytes.len() || bytes[i] != b',' {
-        return None;
-    }
-    i += 1; // skip ','
-    let j = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == j {
-        return None;
-    }
-    Some(i)
-}
-
 // =============================================================================
 // DAP helpers
 
