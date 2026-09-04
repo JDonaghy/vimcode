@@ -1551,8 +1551,49 @@ impl Engine {
             } else {
                 motion_type
             };
-            self.find_char(actual_motion, target);
+            if actual_motion == 't' || actual_motion == 'T' {
+                self.repeat_till(actual_motion, target);
+            } else {
+                self.find_char(actual_motion, target);
+            }
         }
+    }
+
+    /// Repeat a `t`/`T` "till" search via `;`/`,` (Vim's default `cpoptions`
+    /// behavior). Because `t`/`T` park the cursor one character short of the
+    /// target, a naive repeat immediately re-finds that same adjacent target
+    /// and "gets stuck" (zero movement). Vim's default `;`/`,` skip that
+    /// immediately-adjacent occurrence and advance to the next one instead —
+    /// which is always safe to do unconditionally: if the adjacent character
+    /// isn't the target, starting one position further finds the exact same
+    /// first match a plain search would have.
+    fn repeat_till(&mut self, motion_type: char, target: char) -> bool {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        match motion_type {
+            't' => {
+                for i in (col + 2)..line_len {
+                    let ch = self.buffer().content.char(line_start + i);
+                    if ch == target && ch != '\n' {
+                        self.view_mut().cursor.col = i - 1;
+                        return true;
+                    }
+                }
+            }
+            'T' if col > 1 => {
+                for i in (0..col - 1).rev() {
+                    let ch = self.buffer().content.char(line_start + i);
+                    if ch == target {
+                        self.view_mut().cursor.col = i + 1;
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     // --- Bracket matching (%) ---
