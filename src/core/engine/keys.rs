@@ -365,7 +365,7 @@ impl Engine {
                 action = self.handle_command_key(key_name, unicode, ctrl);
             }
             Mode::Search => {
-                self.handle_search_key(key_name, unicode, ctrl);
+                self.handle_search_key(key_name, unicode, ctrl, &mut changed);
             }
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                 // Save pre-call visual state for 'gv' support
@@ -1065,12 +1065,22 @@ impl Engine {
                 let count = self.take_count();
                 let line = self.view().cursor.line;
                 let col = self.view().cursor.col;
-                let max_col = self.get_max_cursor_col(line);
-                if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
+                // `line_len_chars` counts the trailing '\n' as part of the line,
+                // so an empty line (content just "\n") reports len 1 — exclude
+                // the newline itself so `x` on an empty line is a no-op instead
+                // of deleting the newline and joining with the next line.
+                let raw_line_len = self.buffer().line_len_chars(line);
+                let has_newline =
+                    raw_line_len > 0 && self.buffer().content.line(line).chars().last() == Some('\n');
+                let content_len = if has_newline {
+                    raw_line_len - 1
+                } else {
+                    raw_line_len
+                };
+                if content_len > col {
                     let char_idx = self.buffer().line_to_char(line) + col;
                     // Calculate how many chars we can actually delete
-                    let line_end =
-                        self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
+                    let line_end = self.buffer().line_to_char(line) + content_len;
                     let available = line_end - char_idx;
                     let to_delete = count.min(available);
 
@@ -2666,6 +2676,54 @@ impl Engine {
                 }
             }
             '`' => {
+                // d`{mark} / y`{mark} / c`{mark}: charwise (exclusive) operator
+                // to the exact mark position.
+                if let Some(op) = self.pending_operator.take() {
+                    if let Some(ch) = unicode {
+                        let target: Option<(usize, usize)> = match ch {
+                            '`' => self.last_jump_pos,
+                            '.' => self.last_edit_pos,
+                            '<' => self.visual_mark_start,
+                            '>' => self.visual_mark_end,
+                            _ if ch.is_ascii_lowercase() => {
+                                let buffer_id = self.active_window().buffer_id;
+                                self.marks
+                                    .get(&buffer_id)
+                                    .and_then(|m| m.get(&ch))
+                                    .map(|c| (c.line, c.col))
+                            }
+                            _ if ch.is_ascii_uppercase() => self
+                                .global_marks
+                                .get(&ch)
+                                .map(|&(_, line, col)| (line, col)),
+                            _ => None,
+                        };
+                        if let Some((target_line, target_col)) = target {
+                            let max_line = self.buffer().len_lines().saturating_sub(1);
+                            let target_line = target_line.min(max_line);
+                            let target_col =
+                                target_col.min(self.buffer().line_len_chars(target_line));
+                            let cur = self.view().cursor;
+                            let cur_pos = self.buffer().line_to_char(cur.line) + cur.col;
+                            let tgt_pos = self.buffer().line_to_char(target_line) + target_col;
+                            if cur_pos > tgt_pos {
+                                self.view_mut().cursor = Cursor {
+                                    line: target_line,
+                                    col: target_col,
+                                };
+                            }
+                            let (lo, hi) = if cur_pos <= tgt_pos {
+                                (cur_pos, tgt_pos)
+                            } else {
+                                (tgt_pos, cur_pos)
+                            };
+                            self.apply_operator_exclusive_range(op, lo, hi, changed);
+                        } else {
+                            self.message = format!("Mark `{}` not set", ch);
+                        }
+                    }
+                    return EngineAction::None;
+                }
                 // Jump to exact mark position: `{a-z|A-Z|`|.|<|>}
                 if let Some(ch) = unicode {
                     match ch {
@@ -3012,7 +3070,10 @@ impl Engine {
             } else if unicode.is_some() {
                 // Fall through to common motion dispatch below
             } else {
-                self.count = None; // Cancel
+                // Cancel (e.g. <Esc>) — a pending count must not survive to
+                // leak into the next, unrelated command (misc:2d then Esc).
+                self.count = None;
+                self.operator_count = None;
                 return EngineAction::None;
             }
             if is_doubled
@@ -3249,9 +3310,16 @@ impl Engine {
                 });
             }
             Some('c') if operator == 'c' => {
-                // cc: change line (like S)
+                // cc: change line (like S). With 'autoindent' on, Vim preserves
+                // the leading indent of the first line instead of dropping it.
                 let count = self.take_count();
                 let start_line = self.view().cursor.line;
+
+                let indent = if self.settings.auto_indent {
+                    self.get_line_indent_str(start_line)
+                } else {
+                    String::new()
+                };
 
                 self.start_undo_group();
 
@@ -3289,7 +3357,13 @@ impl Engine {
                     }
                 }
 
-                self.view_mut().cursor.col = 0;
+                // Re-insert preserved indent
+                if !indent.is_empty() {
+                    let line_start = self.buffer().line_to_char(start_line);
+                    self.insert_with_undo(line_start, &indent);
+                }
+
+                self.view_mut().cursor.col = indent.chars().count();
                 self.insert_text_buffer.clear();
                 self.mode = Mode::Insert;
                 self.count = None;
@@ -3474,17 +3548,30 @@ impl Engine {
                 self.apply_charwise_operator(operator, start, end, changed);
             }
             Some('j') => {
-                // dj: delete current line + count lines below (linewise)
+                // dj: delete current line + count lines below (linewise).
+                // Vim: if `j` cannot move at all (already on the last line), the
+                // motion fails and the whole operator is a no-op — it does NOT
+                // fall back to operating on just the current line.
                 let count = self.take_count();
                 let current_line = self.view().cursor.line;
                 let last_line = self.buffer().len_lines().saturating_sub(1);
+                if current_line >= last_line {
+                    self.count = None;
+                    return EngineAction::None;
+                }
                 let end_line = (current_line + count).min(last_line);
                 self.apply_linewise_operator(operator, current_line, end_line, changed);
             }
             Some('k') => {
-                // dk: delete current line + count lines above (linewise)
+                // dk: delete current line + count lines above (linewise).
+                // Vim: if `k` cannot move at all (already on the first line), the
+                // motion fails and the whole operator is a no-op.
                 let count = self.take_count();
                 let current_line = self.view().cursor.line;
+                if current_line == 0 {
+                    self.count = None;
+                    return EngineAction::None;
+                }
                 let start_line = current_line.saturating_sub(count);
                 self.apply_linewise_operator(operator, start_line, current_line, changed);
             }
@@ -3700,9 +3787,54 @@ impl Engine {
                 self.pending_key = Some('\'');
                 self.pending_operator = Some(operator);
             }
+            Some('`') => {
+                // d`{mark}: charwise (exclusive) delete to exact mark position —
+                // wait for mark char.
+                self.pending_key = Some('`');
+                self.pending_operator = Some(operator);
+            }
+            Some('/') | Some('?') => {
+                // d/pat<CR>, c/pat, y/pat, d?pat, ...: enter Search mode but keep
+                // the operator armed so `submit_search` can apply it once the
+                // pattern is confirmed (see handle_search_key's "Return" arm).
+                let count = self.take_count();
+                self.pending_operator = Some(operator);
+                self.mode = Mode::Search;
+                self.command_buffer.clear();
+                self.command_cursor = 0;
+                self.search_direction = if unicode == Some('/') {
+                    SearchDirection::Forward
+                } else {
+                    SearchDirection::Backward
+                };
+                self.search_start_cursor = Some(self.view().cursor);
+                self.search_pending_count = count;
+            }
+            Some('n') | Some('N') => {
+                // dn/dN, cn/cN, yn/yN: repeat the last search and operate over
+                // the jump, the same way a fresh d/pat<CR> would.
+                let count = self.take_count();
+                let start_cursor = self.view().cursor;
+                let forward = unicode == Some('n');
+                for _ in 0..count {
+                    let go_forward = if forward {
+                        self.search_direction == SearchDirection::Forward
+                    } else {
+                        self.search_direction != SearchDirection::Forward
+                    };
+                    if go_forward {
+                        self.search_next();
+                    } else {
+                        self.search_prev();
+                    }
+                }
+                self.apply_operator_over_search_motion(operator, start_cursor, changed);
+            }
             _ => {
-                // Invalid motion - cancel operator
+                // Invalid motion - cancel operator. A pending count must not
+                // survive to leak into the next, unrelated command.
                 self.count = None;
+                self.operator_count = None;
             }
         }
         EngineAction::None
@@ -4327,37 +4459,73 @@ impl Engine {
         let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
         let total = self.buffer().len_chars();
 
-        // Check if cursor is on a word char — if not, fall back to ce.
+        // On whitespace, `cw`/`cW` do NOT get the "like ce" special case —
+        // they behave like a plain `dw`/`dW` (Vim: ":help cw" only special-cases
+        // a start on a non-blank). That means only the whitespace run up to the
+        // next word is consumed, not a jump into/through that next word.
         if start_pos < total {
             let ch = self.buffer().content.char(start_pos);
-            let on_word = if bigword {
-                !ch.is_whitespace()
-            } else {
-                is_word_char(ch)
-            };
-            if !on_word {
-                // Not on a word char: cw behaves like ce
-                self.apply_operator_with_motion(
-                    'c',
-                    if bigword { 'E' } else { 'e' },
-                    count,
-                    changed,
-                );
+            if ch.is_whitespace() {
+                if bigword {
+                    let start_cursor = self.view().cursor;
+                    let start_pos =
+                        self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                    for _ in 0..count {
+                        self.move_bigword_forward();
+                    }
+                    let end_cursor = self.view().cursor;
+                    let mut end_pos =
+                        self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                    self.view_mut().cursor = start_cursor;
+                    if end_cursor.line > start_cursor.line {
+                        let line_char_start = self.buffer().line_to_char(start_cursor.line);
+                        let line_len = self.buffer().line_len_chars(start_cursor.line);
+                        let has_nl = self.buffer().content.line(start_cursor.line).chars().last()
+                            == Some('\n');
+                        end_pos = if has_nl {
+                            (line_char_start + line_len - 1).min(end_pos)
+                        } else {
+                            (line_char_start + line_len).min(end_pos)
+                        };
+                    }
+                    if start_pos < end_pos {
+                        self.pending_change_motion = Some(('W', count));
+                        self.apply_charwise_operator('c', start_pos, end_pos, changed);
+                    }
+                } else {
+                    self.pending_change_motion = Some(('w', count));
+                    self.apply_operator_with_motion('c', 'w', count, changed);
+                }
                 return;
             }
         }
 
-        // Find end of Nth word. For count=1, stop at end of current word.
-        // For count>1, skip whitespace between words but NOT after the last.
+        // On a non-blank (word char or punctuation run): change up through the
+        // end of the Nth run under the cursor, WITHOUT extending into trailing
+        // whitespace or hopping onto a following word.  This deliberately does
+        // NOT reuse the `e`/`E` motion (move_word_end) — that motion's "already
+        // at the end of a word" rule jumps forward onto the *next* word when the
+        // cursor sits on a short/lone punctuation run, which is wrong for `cw`.
         let mut end = start_pos;
         for i in 0..count {
-            // Skip to end of current word
+            if end >= total {
+                break;
+            }
             if bigword {
                 while end < total && !self.buffer().content.char(end).is_whitespace() {
                     end += 1;
                 }
-            } else {
+            } else if is_word_char(self.buffer().content.char(end)) {
                 while end < total && is_word_char(self.buffer().content.char(end)) {
+                    end += 1;
+                }
+            } else {
+                // Punctuation run: scan to its end (stop at a word char or whitespace).
+                while end < total {
+                    let c = self.buffer().content.char(end);
+                    if is_word_char(c) || c.is_whitespace() {
+                        break;
+                    }
                     end += 1;
                 }
             }
@@ -4390,8 +4558,18 @@ impl Engine {
         let start_cursor = self.view().cursor;
         let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
 
-        // Execute motion to find end position
-        for _ in 0..count {
+        // Execute motion to find end position.  Track the cursor as it stood
+        // just before the FINAL step of a multi-count motion (`pre_final_cursor`)
+        // — Vim's line-boundary clamp below only fires when that last single
+        // word-step is the one that crosses onto a new line, not whenever the
+        // motion crossed a line boundary at any point during a multi-count `2dw`
+        // (":help word-motions": "the *last* word moved over is at the end of
+        // a line").
+        let mut pre_final_cursor = start_cursor;
+        for i in 0..count {
+            if i == count - 1 {
+                pre_final_cursor = self.view().cursor;
+            }
             match motion {
                 'w' => self.move_word_forward(),
                 'b' => self.move_word_backward(),
@@ -4407,13 +4585,16 @@ impl Engine {
         self.view_mut().cursor = start_cursor;
 
         // Vim rule: 'w' operator motion does not cross line boundaries.
-        // When the motion lands on the next line (col 0), clamp the end to
-        // just before the newline on the start line, so dw/yw on the last word
-        // of a line does not delete/yank the newline character.
+        // When the *final* word-step lands on the next line (col 0), clamp the
+        // end to just before the newline on the line that step started from, so
+        // dw/yw on the last word of a line does not delete/yank the newline
+        // character.  A `2dw`/`3dw` whose final step stays on the same line
+        // (even though earlier steps crossed a line boundary) is NOT clamped —
+        // it continues across the line end, joining lines, as Vim does.
         // Exception: on an empty line (only '\n'), dw should delete the newline
         // and join with the next line (Neovim behavior).
-        let end_pos = if motion == 'w' && end_cursor.line > start_cursor.line {
-            let line = start_cursor.line;
+        let end_pos = if motion == 'w' && end_cursor.line > pre_final_cursor.line {
+            let line = pre_final_cursor.line;
             let line_char_start = self.buffer().line_to_char(line);
             let line_len = self.buffer().line_len_chars(line);
             let is_empty_line =
@@ -4513,6 +4694,105 @@ impl Engine {
         }
     }
 
+    /// Apply `operator` over an *exclusive* charwise range `[lo, hi)`,
+    /// applying Vim's `:help exclusive-linewise` adjustment: an exclusive
+    /// motion whose end lands exactly at column 1 of a line either becomes
+    /// linewise (when the start was at or before the first non-blank of its
+    /// line) or has its end pulled back to the end of the previous line
+    /// (motion becomes inclusive of that line's last character).
+    ///
+    /// Shared by the operator-pending search motion (`d/pat`, `dn`) and mark
+    /// motion (`` d`a ``) paths, both of which resolve to "delete everything
+    /// between the original cursor and wherever the motion landed."
+    pub(crate) fn apply_operator_exclusive_range(
+        &mut self,
+        operator: char,
+        lo: usize,
+        hi: usize,
+        changed: &mut bool,
+    ) {
+        if lo >= hi {
+            return;
+        }
+        let hi_line = self.buffer().content.char_to_line(hi);
+        let hi_line_start = self.buffer().line_to_char(hi_line);
+        if hi == hi_line_start && hi_line > 0 {
+            let lo_line = self.buffer().content.char_to_line(lo);
+            let lo_col = lo - self.buffer().line_to_char(lo_line);
+            let lo_fnb_col = self.first_non_blank_col(lo_line);
+            if lo_col <= lo_fnb_col {
+                // Becomes linewise; the line the end landed on (col 1) is excluded.
+                let end_line = (hi_line - 1).max(lo_line);
+                self.apply_linewise_operator(operator, lo_line, end_line, changed);
+                return;
+            }
+            // Stays charwise, but the end is pulled back to the end of the
+            // previous line (inclusive of its last character).
+            let prev_line = hi_line - 1;
+            let prev_line_start = self.buffer().line_to_char(prev_line);
+            let prev_line_len = self.buffer().line_len_chars(prev_line);
+            let prev_has_nl =
+                self.buffer().content.line(prev_line).chars().last() == Some('\n');
+            let prev_content_end = prev_line_start
+                + if prev_has_nl {
+                    prev_line_len.saturating_sub(1)
+                } else {
+                    prev_line_len
+                };
+            let new_hi = (prev_content_end + 1).min(self.buffer().len_chars()).max(lo + 1);
+            self.apply_charwise_operator(operator, lo, new_hi, changed);
+            return;
+        }
+        self.apply_charwise_operator(operator, lo, hi, changed);
+    }
+
+    /// Apply `operator` over the motion from `start_cursor` (the cursor
+    /// position before a search) to wherever the engine's *current* cursor
+    /// now sits (after `submit_search`/`search_next`/`search_prev` jumped it
+    /// there) — the shared tail for `d/pat<CR>`, `c/pat`, `y/pat`, `dn`, `dN`.
+    ///
+    /// Linewise exactly when the active search offset is a line offset
+    /// (`/pat/+1`, see `search_offset_is_linewise`); otherwise an exclusive
+    /// charwise motion (see `apply_operator_exclusive_range`).
+    pub(crate) fn apply_operator_over_search_motion(
+        &mut self,
+        operator: char,
+        start_cursor: Cursor,
+        changed: &mut bool,
+    ) {
+        let end_cursor = self.view().cursor;
+        self.view_mut().cursor = start_cursor;
+
+        if start_cursor.line == end_cursor.line && start_cursor.col == end_cursor.col {
+            return;
+        }
+
+        let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+
+        if self.search_offset_is_linewise() {
+            let (start_line, end_line) = if start_cursor.line <= end_cursor.line {
+                (start_cursor.line, end_cursor.line)
+            } else {
+                (end_cursor.line, start_cursor.line)
+            };
+            self.apply_linewise_operator(operator, start_line, end_line, changed);
+            return;
+        }
+
+        // A backward motion (`?`) puts the cursor at the earlier position
+        // once the operator range is applied.
+        if end_pos < start_pos {
+            self.view_mut().cursor = end_cursor;
+        }
+        let (lo, hi) = if start_pos <= end_pos {
+            (start_pos, end_pos)
+        } else {
+            (end_pos, start_pos)
+        };
+        self.apply_operator_exclusive_range(operator, lo, hi, changed);
+    }
+
     pub(crate) fn apply_operator_bracket_motion(&mut self, operator: char, changed: &mut bool) {
         let start_line = self.view().cursor.line;
         let start_col = self.view().cursor.col;
@@ -4522,7 +4802,42 @@ impl Engine {
             return;
         }
 
-        let current_char = self.buffer().content.char(start_pos);
+        let mut bracket_pos = start_pos;
+        let mut current_char = self.buffer().content.char(bracket_pos);
+
+        // Like plain `%` (see `search_forward_for_bracket`): if the cursor isn't
+        // on a bracket, scan forward on the current line for the first one
+        // before giving up.  The operated range still starts at the ORIGINAL
+        // cursor position (`start_pos`), not at the found bracket — `%` is an
+        // inclusive motion, so `d%` deletes from wherever the cursor was
+        // through the matched bracket.
+        if !matches!(current_char, '(' | ')' | '{' | '}' | '[' | ']') {
+            let line_start = self.buffer().line_to_char(start_line);
+            let line_len = self.buffer().line_len_chars(start_line);
+            let total_chars = self.buffer().len_chars();
+            let mut found = None;
+            for i in start_col..line_len {
+                let pos = line_start + i;
+                if pos >= total_chars {
+                    break;
+                }
+                let ch = self.buffer().content.char(pos);
+                if ch == '\n' {
+                    break;
+                }
+                if matches!(ch, '(' | ')' | '{' | '}' | '[' | ']') {
+                    found = Some(pos);
+                    break;
+                }
+            }
+            match found {
+                Some(pos) => {
+                    bracket_pos = pos;
+                    current_char = self.buffer().content.char(pos);
+                }
+                None => return,
+            }
+        }
 
         // Find matching bracket and determine search parameters
         let (is_opening, open_char, close_char) = match current_char {
@@ -4532,15 +4847,12 @@ impl Engine {
             '}' => (false, '{', '}'),
             '[' => (true, '[', ']'),
             ']' => (false, '[', ']'),
-            _ => {
-                // Not on a bracket - cancel operation
-                return;
-            }
+            _ => unreachable!("current_char is guaranteed to be a bracket above"),
         };
 
         // Find the matching bracket position
         if let Some(match_pos) =
-            self.find_matching_bracket(start_pos, open_char, close_char, is_opening)
+            self.find_matching_bracket(bracket_pos, open_char, close_char, is_opening)
         {
             // Determine range to delete (inclusive of both brackets)
             let (delete_start, delete_end) = if is_opening {
@@ -5892,7 +6204,13 @@ impl Engine {
         }
     }
 
-    pub(crate) fn handle_search_key(&mut self, key_name: &str, unicode: Option<char>, ctrl: bool) {
+    pub(crate) fn handle_search_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        changed: &mut bool,
+    ) {
         // Ctrl-A / Ctrl-E: move cursor to start/end
         if ctrl && key_name == "a" {
             self.command_cursor = 0;
@@ -5934,6 +6252,10 @@ impl Engine {
                 self.command_buffer.clear();
                 self.search_history_index = None;
                 self.search_typing_buffer.clear();
+                // Cancel any operator waiting on this search (d/pat<Esc>): a
+                // pending count must not survive to leak into the next command.
+                self.pending_operator = None;
+                self.operator_count = None;
 
                 // Restore cursor to original position (incremental search)
                 if let Some(start_cursor) = self.search_start_cursor.take() {
@@ -5953,10 +6275,13 @@ impl Engine {
                 // from where the user typed `/`, not from wherever incremental
                 // search parked the cursor. `submit_search` then does all the
                 // positioning (offset + `;` chaining + count), which keeps the
-                // incsearch-on and incsearch-off paths identical.
+                // incsearch-on and incsearch-off paths identical.  Also doubles
+                // as the operator's start position for `d/pat<CR>` etc.
+                let mut operator_start = None;
                 if let Some(start) = self.search_start_cursor.take() {
                     self.view_mut().cursor = start;
                     self.push_jump_location();
+                    operator_start = Some(start);
                 }
 
                 if !query.is_empty() {
@@ -5972,6 +6297,18 @@ impl Engine {
                 let count = self.search_pending_count.max(1);
                 self.search_pending_count = 1;
                 self.submit_search(&query, count);
+
+                // d/pat<CR>, c/pat, y/pat: apply the armed operator over the
+                // motion from the pre-search cursor to wherever the search
+                // landed.  No match found → the operator fails (no-op), same
+                // as Vim's "E486: Pattern not found" aborting the operator.
+                if let Some(op) = self.pending_operator.take() {
+                    if let Some(start) = operator_start {
+                        if !self.search_matches.is_empty() {
+                            self.apply_operator_over_search_motion(op, start, changed);
+                        }
+                    }
+                }
             }
             "Up" => {
                 // Cycle to previous search

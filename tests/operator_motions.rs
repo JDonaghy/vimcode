@@ -1044,23 +1044,26 @@ fn test_gu_dollar_lowercase_to_eol() {
 // ── Edge cases ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_dj_at_last_line_noop_or_delete_last() {
+fn test_dj_at_last_line_is_noop() {
     let mut e = engine_with("aaa\nbbb\n");
     press(&mut e, 'j'); // line 1 (last line)
     press(&mut e, 'd');
     press(&mut e, 'j');
-    // dj at last line: no line below, deletes just current line
-    let b = buf(&e);
-    assert!(b.contains("aaa"), "aaa should survive");
+    // Vim: `j` cannot move (already on the last line), so the whole `dj`
+    // motion fails and the operator is a complete no-op — nothing is deleted.
+    assert_buf(&e, "aaa\nbbb\n");
+    assert_cursor(&e, 1, 0);
 }
 
 #[test]
-fn test_dk_at_first_line() {
+fn test_dk_at_first_line_is_noop() {
     let mut e = engine_with("aaa\nbbb\n");
     press(&mut e, 'd');
     press(&mut e, 'k');
-    // dk at first line: no line above, deletes just current line
-    assert_buf(&e, "bbb\n");
+    // Vim: `k` cannot move (already on the first line), so the whole `dk`
+    // motion fails and the operator is a complete no-op — nothing is deleted.
+    assert_buf(&e, "aaa\nbbb\n");
+    assert_cursor(&e, 0, 0);
 }
 
 #[test]
