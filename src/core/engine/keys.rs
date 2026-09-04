@@ -1058,7 +1058,12 @@ impl Engine {
                 }
             }
             Some('$') => {
-                let line = self.view().cursor.line;
+                // Vim: a count moves down (count - 1) lines first, THEN to the
+                // end of THAT line — `2$` is not "end of the current line".
+                let count = self.take_count();
+                let max_line = self.buffer().len_lines().saturating_sub(1);
+                let line = (self.view().cursor.line + count - 1).min(max_line);
+                self.view_mut().cursor.line = line;
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
             }
             Some('x') => {
@@ -1070,8 +1075,8 @@ impl Engine {
                 // the newline itself so `x` on an empty line is a no-op instead
                 // of deleting the newline and joining with the next line.
                 let raw_line_len = self.buffer().line_len_chars(line);
-                let has_newline =
-                    raw_line_len > 0 && self.buffer().content.line(line).chars().last() == Some('\n');
+                let has_newline = raw_line_len > 0
+                    && self.buffer().content.line(line).chars().last() == Some('\n');
                 let content_len = if has_newline {
                     raw_line_len - 1
                 } else {
@@ -1657,6 +1662,15 @@ impl Engine {
                         self.search_matches.clear();
                         self.search_index = None;
                     }
+                }
+                "Return" | "KP_Enter" => {
+                    // <CR> as a motion: identical to `+` — first non-blank of
+                    // the line `count` lines down (:help <CR>).
+                    let count = self.take_count();
+                    let max_line = self.buffer().len_lines().saturating_sub(1);
+                    let target = (self.view().cursor.line + count).min(max_line);
+                    self.view_mut().cursor.line = target;
+                    self.view_mut().cursor.col = self.first_non_blank_col(target);
                 }
                 "Left" => {
                     let count = self.take_count();
@@ -4474,8 +4488,7 @@ impl Engine {
                         self.move_bigword_forward();
                     }
                     let end_cursor = self.view().cursor;
-                    let mut end_pos =
-                        self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+                    let mut end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
                     self.view_mut().cursor = start_cursor;
                     if end_cursor.line > start_cursor.line {
                         let line_char_start = self.buffer().line_to_char(start_cursor.line);
@@ -4629,11 +4642,21 @@ impl Engine {
                     // [start, end_pos) would then miss that final character.
                     // Detect this by checking that end_pos is the last char and it
                     // is not a newline (if it were '\n', the existing line-boundary
-                    // clamping has already handled things correctly).
+                    // clamping has already handled things correctly) — AND that it
+                    // was actually reached via that clamp rather than landing
+                    // cleanly on the start of a fresh word/WORD (a genuine next-word
+                    // landing is always immediately preceded by whitespace; a
+                    // clamped position is not, since it's still inside the run the
+                    // motion was scanning when it ran out of buffer — this matters
+                    // for a multi-count `2dw`/`3dw` whose earlier steps already
+                    // landed cleanly on a later line's word, e.g. "a b"/"c d").
                     let total = self.buffer().len_chars();
+                    let landed_mid_run =
+                        end_pos > 0 && !self.buffer().content.char(end_pos - 1).is_whitespace();
                     let end = if end_pos + 1 == total
                         && total > 0
                         && self.buffer().content.char(end_pos) != '\n'
+                        && landed_mid_run
                     {
                         total
                     } else {
@@ -4731,15 +4754,17 @@ impl Engine {
             let prev_line = hi_line - 1;
             let prev_line_start = self.buffer().line_to_char(prev_line);
             let prev_line_len = self.buffer().line_len_chars(prev_line);
-            let prev_has_nl =
-                self.buffer().content.line(prev_line).chars().last() == Some('\n');
+            let prev_has_nl = self.buffer().content.line(prev_line).chars().last() == Some('\n');
+            // One past the last REAL character of `prev_line` — already the
+            // correct exclusive-range end, since dropping the trailing
+            // newline from the length lands exactly there.
             let prev_content_end = prev_line_start
                 + if prev_has_nl {
                     prev_line_len.saturating_sub(1)
                 } else {
                     prev_line_len
                 };
-            let new_hi = (prev_content_end + 1).min(self.buffer().len_chars()).max(lo + 1);
+            let new_hi = prev_content_end.min(self.buffer().len_chars()).max(lo + 1);
             self.apply_charwise_operator(operator, lo, new_hi, changed);
             return;
         }
@@ -4790,7 +4815,16 @@ impl Engine {
         } else {
             (end_pos, start_pos)
         };
-        self.apply_operator_exclusive_range(operator, lo, hi, changed);
+
+        // `:help search-offset`: an `e[+-N]` offset (`/pat/e`) makes the
+        // search motion INCLUSIVE of the last matched character — bypass the
+        // exclusive-linewise adjustment entirely and just extend the range.
+        if self.search_offset.trim().starts_with('e') {
+            let hi = (hi + 1).min(self.buffer().len_chars());
+            self.apply_charwise_operator(operator, lo, hi, changed);
+        } else {
+            self.apply_operator_exclusive_range(operator, lo, hi, changed);
+        }
     }
 
     pub(crate) fn apply_operator_bracket_motion(&mut self, operator: char, changed: &mut bool) {
@@ -6248,7 +6282,9 @@ impl Engine {
         }
         match key_name {
             "Escape" => {
-                self.mode = Mode::Normal;
+                // v/pat<Esc>: return to the visual sub-mode we came from
+                // (selection anchor intact) instead of dropping to Normal.
+                self.mode = self.visual_search_return.take().unwrap_or(Mode::Normal);
                 self.command_buffer.clear();
                 self.search_history_index = None;
                 self.search_typing_buffer.clear();
@@ -6267,7 +6303,8 @@ impl Engine {
                 }
             }
             "Return" => {
-                self.mode = Mode::Normal;
+                let visual_return = self.visual_search_return.take();
+                self.mode = visual_return.unwrap_or(Mode::Normal);
                 let query = self.command_buffer.clone();
                 self.command_buffer.clear();
 
@@ -7049,6 +7086,39 @@ impl Engine {
             }
             Some('%') => {
                 self.move_to_matching_bracket();
+            }
+            Some('/') | Some('?') => {
+                // v/pat<CR>, V/pat<CR>: enter Search mode, returning to this
+                // visual sub-mode (selection anchor intact) once resolved.
+                let count = self.take_count();
+                self.visual_search_return = Some(self.mode);
+                self.mode = Mode::Search;
+                self.command_buffer.clear();
+                self.command_cursor = 0;
+                self.search_direction = if unicode == Some('/') {
+                    SearchDirection::Forward
+                } else {
+                    SearchDirection::Backward
+                };
+                self.search_start_cursor = Some(self.view().cursor);
+                self.search_pending_count = count;
+            }
+            Some('n') | Some('N') => {
+                // vn/vN: extend the selection by repeating the last search.
+                let count = self.take_count();
+                let forward = unicode == Some('n');
+                for _ in 0..count {
+                    let go_forward = if forward {
+                        self.search_direction == SearchDirection::Forward
+                    } else {
+                        self.search_direction != SearchDirection::Forward
+                    };
+                    if go_forward {
+                        self.search_next();
+                    } else {
+                        self.search_prev();
+                    }
+                }
             }
             _ => match key_name {
                 "Left" => {
