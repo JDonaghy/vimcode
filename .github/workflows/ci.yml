@@ -24,6 +24,16 @@ jobs:
     # dep pinned out-of-band via `quadraui-pin.txt`; see git history / #638 /
     # #625 for why that existed and why it was retired.)
 
+    # #795: tests/nvim_conformance.rs is the only test that validates VimCode
+    # against real Vim behaviour. It's a default integration test compiled in
+    # this (`--no-default-features`) lane too, and it hard-fails under CI (the
+    # `CI` env var GitHub Actions always sets) if nvim is missing rather than
+    # silently skipping — so this install step is load-bearing, not optional.
+    - name: Install Neovim (oracle for tests/nvim_conformance.rs)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends neovim
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
@@ -86,7 +96,12 @@ jobs:
         # the app-icon SVG (src/gtk/util.rs) fails, and the two #720 icon
         # tests (src/gtk/testing.rs, src/gtk/util.rs) hard-fail rather than
         # exercising real rasterised pixels.
-        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common
+        #
+        # #795: neovim is the oracle for tests/nvim_conformance.rs, a default
+        # integration test this (default-features) lane also compiles and
+        # runs. It hard-fails under CI (the `CI` env var GitHub Actions always
+        # sets) if nvim is missing, so this install is load-bearing.
+        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common neovim
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable

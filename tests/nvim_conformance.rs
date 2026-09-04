@@ -11,7 +11,16 @@
 //! To add a new conformance test, just add an entry to the `CASES` array.
 //! No manual testing needed — Neovim is the oracle.
 //!
-//! Requires `nvim` on PATH. Tests are skipped (not failed) if nvim is missing.
+//! Requires `nvim` on PATH. Locally, tests are skipped (not failed) if nvim is
+//! missing — that ergonomics choice is intentional so contributors without
+//! Neovim installed aren't blocked. **CI is the enforcing lane** (#795): both
+//! `.github/workflows/ci.yml` jobs install `neovim` via apt, and the runner
+//! below treats a missing/broken `nvim` as a hard failure whenever the `CI`
+//! env var is set (GitHub Actions sets it on every job) rather than silently
+//! skipping. Before #795, CI never installed nvim, so this suite's "SKIP" was
+//! reported as `ok` on every PR — a regression in `d}`, `ciw`, `da"`, etc.
+//! would have sailed through with a green check. Do not remove the CI install
+//! step or loosen the `CI` guard below without re-reading that issue.
 
 mod common;
 
@@ -452,7 +461,15 @@ fn nvim_conformance() {
         .map(|o| o.status.success())
         .unwrap_or(false);
 
+    let in_ci = std::env::var_os("CI").is_some();
+
     if !nvim_ok {
+        if in_ci {
+            panic!(
+                "nvim not found on PATH. The conformance oracle must run in CI \
+                 — install Neovim in the workflow rather than letting this skip."
+            );
+        }
         eprintln!("SKIP: nvim not found on PATH");
         return;
     }
@@ -466,7 +483,15 @@ fn nvim_conformance() {
         let nvim = match nvim {
             Some(r) => r,
             None => {
-                eprintln!("  SKIP [{}]: nvim execution failed", case.label);
+                if in_ci {
+                    failed += 1;
+                    failures.push(format!(
+                        "FAIL [{}]: nvim execution failed (treated as failure under CI)\n",
+                        case.label
+                    ));
+                } else {
+                    eprintln!("  SKIP [{}]: nvim execution failed", case.label);
+                }
                 continue;
             }
         };
