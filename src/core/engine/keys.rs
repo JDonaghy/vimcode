@@ -1048,25 +1048,13 @@ impl Engine {
                 self.view_mut().cursor.col = target_col.min(max_col);
             }
             Some('&') => {
-                // & : repeat last :s on current line
-                if let Some((pattern, replacement, flags)) = self.last_substitute.clone() {
-                    let line = self.view().cursor.line;
-                    match self.replace_in_range(Some((line, line)), &pattern, &replacement, &flags)
-                    {
-                        Ok(count) => {
-                            self.message = format!(
-                                "{} substitution{}",
-                                count,
-                                if count == 1 { "" } else { "s" }
-                            );
-                        }
-                        Err(e) => {
-                            self.message = e;
-                        }
-                    }
+                // & : repeat last :s on the current line, without its flags
+                if let Some((pattern, replacement, _flags)) = self.last_substitute.clone() {
+                    let line = self.view().cursor.line as isize;
+                    self.run_substitute(Some((line, line)), &pattern, Some(&replacement), "");
                     *changed = true;
                 } else {
-                    self.message = "No previous substitute command".to_string();
+                    self.message = "E33: No previous substitute regular expression".to_string();
                 }
             }
             Some('$') => {
@@ -2130,13 +2118,13 @@ impl Engine {
                     self.start_undo_group();
                 }
                 Some('&') => {
-                    // g&: repeat last substitution on all lines
+                    // g&: repeat last substitution on all lines, keeping flags
                     if let Some((pat, rep, flags)) = self.last_substitute.clone() {
-                        let cmd = format!("%s/{}/{}/{}", pat, rep, flags);
-                        self.execute_substitute_command(&cmd);
+                        let last = self.buffer().len_lines().saturating_sub(1) as isize;
+                        self.run_substitute(Some((0, last)), &pat, Some(&rep), &flags);
                         *changed = true;
                     } else {
-                        self.message = "No previous substitute command".to_string();
+                        self.message = "E33: No previous substitute regular expression".to_string();
                     }
                 }
                 Some('+') => {

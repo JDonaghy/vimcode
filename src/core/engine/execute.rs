@@ -17,8 +17,14 @@ impl Engine {
         let normalized = normalize_ex_command(cmd);
         let cmd: &str = &normalized;
 
-        // Handle :{range}{cmd} — commands with line number prefixes (e.g. :2d, :3,5d)
-        if cmd.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+        // Handle `:{range}{cmd}` — the line-oriented ex commands that take a
+        // general address range (`:2d`, `:'a,'by`, `:.,+1j`, `:2,3>`, `:/foo/`).
+        if cmd
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit() || b".$'%+-/?<>,;".contains(b))
+            || matches!(cmd, "d" | "delete" | "y" | "yank" | "j" | "join")
+        {
             if let Some(action) = self.try_execute_ranged_command(cmd) {
                 return action;
             }
@@ -1381,18 +1387,14 @@ impl Engine {
             return self.cmd_help(topic.trim());
         }
 
-        // Substitute command: :s/pattern/replacement/flags or :%s/...
-        if cmd.starts_with("s/") || cmd.starts_with("%s/") || cmd.starts_with("'<,'>s/") {
-            return self.execute_substitute_command(cmd);
+        // `[range]:g[!]/pat/cmd` and `[range]:v/pat/cmd` — global commands.
+        if let Some(action) = self.try_execute_global(cmd) {
+            return action;
         }
 
-        // :g/pat/cmd — global command (run ex cmd on lines matching pattern)
-        if let Some(rest) = cmd.strip_prefix("g/") {
-            return self.execute_global_command(rest, false);
-        }
-        // :v/pat/cmd — inverse global (run ex cmd on lines NOT matching pattern)
-        if let Some(rest) = cmd.strip_prefix("v/") {
-            return self.execute_global_command(rest, true);
+        // `[range]s/pattern/replacement/flags`, `:&`, `:&&`, `:~`.
+        if let Some(action) = self.try_execute_substitute(cmd) {
+            return action;
         }
 
         // :sort [flags] — sort lines in buffer.
@@ -2533,50 +2535,153 @@ impl Engine {
     }
 
     /// :g/pat/cmd or :v/pat/cmd — run ex cmd on matching (or non-matching) lines.
-    pub(crate) fn execute_global_command(&mut self, rest: &str, invert: bool) -> EngineAction {
-        // rest is "pat/cmd" — find the closing '/' after pattern
-        let sep_pos = match rest.find('/') {
-            Some(p) => p,
-            None => {
-                self.message = "Usage: :g/pattern/command".to_string();
-                return EngineAction::None;
+    /// Try to run `cmd` as `[range]g[!]/pat/cmd` or `[range]v/pat/cmd`.
+    ///
+    /// Returns `None` when `cmd` is not a global command at all.
+    pub(crate) fn try_execute_global(&mut self, cmd: &str) -> Option<EngineAction> {
+        let chars: Vec<char> = cmd.chars().collect();
+        let (range, consumed) = self.parse_ex_range(&chars);
+        let rest: String = chars[consumed..].iter().collect();
+
+        // `g`, `gl`, ... `global` (with an optional `!`), or `v` / `vglobal`.
+        let (invert, after) = match rest.strip_prefix("g!") {
+            Some(a) => (true, a),
+            None => match strip_command_name(&rest, "global") {
+                Some(a) => (false, a),
+                None => (true, strip_command_name(&rest, "vglobal")?),
+            },
+        };
+
+        let delim = after.chars().next()?;
+        if delim.is_alphanumeric() || matches!(delim, '\\' | '"' | '|' | ' ') {
+            return None;
+        }
+        Some(self.execute_global_command(range, after, delim, invert))
+    }
+
+    /// `:[range]g/pat/cmd` — run an ex command on every matching line.
+    ///
+    /// Vim marks the matching lines first and then executes in **forward**
+    /// order, which is what makes `:g/^/m0` reverse the buffer. Because we have
+    /// no per-line marks that survive edits, the remaining line numbers are
+    /// shifted by the net line-count delta of each sub-command — enough for
+    /// `d`, `m`, `t`, `j`, `s` and `normal`, which is what `:g` is used for.
+    pub(crate) fn execute_global_command(
+        &mut self,
+        range: Option<(isize, isize)>,
+        after: &str,
+        delim: char,
+        invert: bool,
+    ) -> EngineAction {
+        // Split `/pat/cmd` on the first unescaped delimiter after the pattern.
+        let chars: Vec<char> = after.chars().collect();
+        let mut i = 1;
+        let mut pattern = String::new();
+        while i < chars.len() {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                pattern.push(chars[i]);
+                pattern.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if chars[i] == delim {
+                i += 1;
+                break;
+            }
+            pattern.push(chars[i]);
+            i += 1;
+        }
+        let subcmd: String = chars[i.min(chars.len())..].iter().collect();
+        let subcmd = subcmd.trim().to_string();
+        let subcmd = if subcmd.is_empty() {
+            "p".to_string()
+        } else {
+            subcmd
+        };
+
+        // An empty pattern reuses the last search pattern; a non-empty one
+        // *becomes* it, so `:g/a/s//x/` works.
+        let pattern = if pattern.is_empty() {
+            self.search_query.clone()
+        } else {
+            self.search_query = pattern.clone();
+            self.search_smartcase_applies = true;
+            pattern
+        };
+        if pattern.is_empty() {
+            self.message = "E35: No previous regular expression".to_string();
+            return EngineAction::Error;
+        }
+        let compiled = match self.compile_vim_pattern(&pattern, true) {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = e;
+                return EngineAction::Error;
             }
         };
-        let pattern = &rest[..sep_pos];
-        let subcmd = rest[sep_pos + 1..].trim().to_string();
-        if pattern.is_empty() {
-            self.message = "Empty pattern".to_string();
-            return EngineAction::None;
-        }
 
-        // Collect matching line indices BEFORE executing (avoid borrow issues)
         let num_lines = self.buffer().len_lines();
+        let (first, last) = match range {
+            Some((a, b)) => (
+                a.max(0) as usize,
+                (b.max(0) as usize).min(num_lines.saturating_sub(1)),
+            ),
+            None => (0, num_lines.saturating_sub(1)),
+        };
+
         let mut matching: Vec<usize> = Vec::new();
-        for line_idx in 0..num_lines {
+        for line_idx in first..=last {
+            if line_idx >= num_lines {
+                break;
+            }
             let line_text: String = self.buffer().content.line(line_idx).chars().collect();
-            let matches = line_text.contains(pattern);
+            let line_text = line_text.trim_end_matches('\n');
+            let matches = compiled.regex.is_match(line_text);
             if matches != invert {
                 matching.push(line_idx);
             }
         }
 
         if matching.is_empty() {
-            self.message = format!("Pattern not found: {}", pattern);
-            return EngineAction::None;
+            self.message = format!("E486: Pattern not found: {pattern}");
+            return EngineAction::Error;
         }
 
-        // Execute subcommand on each matching line in REVERSE order (preserves line numbers)
         let mut executed = 0usize;
-        for &line_idx in matching.iter().rev() {
-            let current_lines = self.buffer().len_lines();
-            if line_idx >= current_lines {
+        let mut pending: Vec<isize> = matching.iter().map(|&l| l as isize).collect();
+        let mut idx = 0usize;
+        self.start_undo_group();
+        while idx < pending.len() {
+            let line = pending[idx];
+            idx += 1;
+            if line < 0 {
                 continue;
             }
-            self.view_mut().cursor.line = line_idx;
+            let line = line as usize;
+            let before = self.buffer().len_lines();
+            if line >= before {
+                continue;
+            }
+            self.view_mut().cursor.line = line;
             self.view_mut().cursor.col = 0;
-            self.execute_command(&subcmd.clone());
+            self.execute_command(&subcmd);
             executed += 1;
+            let delta = self.buffer().len_lines() as isize - before as isize;
+            if delta != 0 {
+                for l in pending[idx..].iter_mut() {
+                    if *l > line as isize {
+                        *l += delta;
+                    }
+                }
+            }
         }
+        self.finish_undo_group();
+
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        if self.view().cursor.line > max_line {
+            self.view_mut().cursor.line = max_line;
+        }
+        self.clamp_cursor_col();
 
         self.message = format!(
             "{} line{} affected",
@@ -2965,76 +3070,572 @@ impl Engine {
         current
     }
 
-    pub(crate) fn execute_substitute_command(&mut self, cmd: &str) -> EngineAction {
-        // Parse: [range]s/pattern/replacement/[flags]
-        // Supported ranges: none (current line), % (all lines), '<,'> (visual selection)
+    // --- Ex address / range parsing (`:h :range`) -------------------------
 
-        // Determine if this is :%s (all lines) or :s (current line/visual selection)
-        let (range_str, rest) = if cmd.starts_with("%s/") {
-            ("%", &cmd[2..]) // Skip "%s"
-        } else if cmd.starts_with("s/") {
-            ("", &cmd[1..]) // Skip "s"
-        } else if cmd.starts_with("'<,'>s/") {
-            // Visual selection range (set when entering command mode from visual)
-            ("'<,'>", &cmd[6..]) // Skip "'<,'>s"
-        } else {
-            self.message = "Invalid substitute command".to_string();
-            return EngineAction::Error;
+    /// Parse one ex address starting at `*i`, returning a **0-based** line.
+    ///
+    /// `-1` is Vim's line `0` ("before the first line"), which `:m` / `:t` /
+    /// `:put` treat as "insert at the very top".
+    ///
+    /// Handles `N`, `.`, `$`, `'m`, `'<`, `'>`, `/pat[/]`, `?pat[?]`, `\/`,
+    /// `\?`, each optionally followed by any number of `+N` / `-N` offsets.
+    /// Returns `None` when there is no address here at all.
+    pub(crate) fn parse_ex_address(
+        &self,
+        chars: &[char],
+        i: &mut usize,
+        current: usize,
+    ) -> Option<isize> {
+        let last = self.buffer().len_lines().saturating_sub(1) as isize;
+        let skip_ws = |i: &mut usize| {
+            while chars.get(*i) == Some(&' ') {
+                *i += 1;
+            }
+        };
+        skip_ws(i);
+
+        let mut base: Option<isize> = match chars.get(*i) {
+            Some(c) if c.is_ascii_digit() => {
+                let mut n = 0usize;
+                while let Some(d) = chars.get(*i).and_then(|c| c.to_digit(10)) {
+                    n = n * 10 + d as usize;
+                    *i += 1;
+                }
+                Some(n as isize - 1)
+            }
+            Some('.') => {
+                *i += 1;
+                Some(current as isize)
+            }
+            Some('$') => {
+                *i += 1;
+                Some(last)
+            }
+            Some('\'') => {
+                let m = *chars.get(*i + 1)?;
+                let line = self.ex_mark_line(m)?;
+                *i += 2;
+                Some(line as isize)
+            }
+            Some('/') | Some('?') => {
+                let delim = chars[*i];
+                *i += 1;
+                let mut pat = String::new();
+                while *i < chars.len() {
+                    if chars[*i] == '\\' && *i + 1 < chars.len() {
+                        pat.push(chars[*i]);
+                        pat.push(chars[*i + 1]);
+                        *i += 2;
+                        continue;
+                    }
+                    if chars[*i] == delim {
+                        *i += 1;
+                        break;
+                    }
+                    pat.push(chars[*i]);
+                    *i += 1;
+                }
+                Some(self.ex_search_address(&pat, delim == '/', current)? as isize)
+            }
+            Some('\\') if matches!(chars.get(*i + 1), Some('/') | Some('?')) => {
+                let forward = chars[*i + 1] == '/';
+                *i += 2;
+                Some(self.ex_search_address("", forward, current)? as isize)
+            }
+            _ => None,
         };
 
-        // Parse /pattern/replacement/flags
-        // rest is like "/foo/baz/" or "/foo/baz/g"
-        // Splitting by '/' gives: ["", "foo", "baz", ""] or ["", "foo", "baz", "g"]
-        let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() < 3 {
-            self.message = "Usage: :s/pattern/replacement/[flags]".to_string();
-            return EngineAction::Error;
+        // Trailing `+N` / `-N` offsets, which may appear with no base at all
+        // (`:+2`, `:-1`) in which case they are relative to the current line.
+        loop {
+            skip_ws(i);
+            match chars.get(*i) {
+                Some(&sign @ ('+' | '-')) => {
+                    *i += 1;
+                    let mut n = 0usize;
+                    let mut saw_digit = false;
+                    while let Some(d) = chars.get(*i).and_then(|c| c.to_digit(10)) {
+                        n = n * 10 + d as usize;
+                        saw_digit = true;
+                        *i += 1;
+                    }
+                    let step = if saw_digit { n as isize } else { 1 };
+                    let from = base.unwrap_or(current as isize);
+                    base = Some(if sign == '+' {
+                        from + step
+                    } else {
+                        from - step
+                    });
+                }
+                _ => break,
+            }
         }
 
-        let pattern = parts[1];
-        let replacement = parts.get(2).unwrap_or(&"");
-        let flags = parts.get(3).unwrap_or(&"");
+        base.map(|b| b.clamp(-1, last.max(0)))
+    }
 
-        // Save for & repeat
-        self.last_substitute = Some((
-            pattern.to_string(),
-            replacement.to_string(),
-            flags.to_string(),
-        ));
+    /// Line of an ex mark reference (`'a`, `'<`, `'>`), 0-based.
+    fn ex_mark_line(&self, m: char) -> Option<usize> {
+        match m {
+            '<' => self
+                .visual_mark_start
+                .map(|(l, _)| l)
+                .or_else(|| self.get_visual_selection_range().map(|(s, _)| s.line)),
+            '>' => self
+                .visual_mark_end
+                .map(|(l, _)| l)
+                .or_else(|| self.get_visual_selection_range().map(|(_, e)| e.line)),
+            '\'' => self.last_jump_pos.map(|(l, _)| l),
+            c if c.is_ascii_uppercase() => self.global_marks.get(&c).map(|&(_, l, _)| l),
+            c => self
+                .marks
+                .get(&self.active_window().buffer_id)
+                .and_then(|m| m.get(&c))
+                .map(|c| c.line),
+        }
+        .map(|l| l.min(self.buffer().len_lines().saturating_sub(1)))
+    }
 
-        // Determine line range
-        let range = if range_str == "%" {
-            // All lines
-            let last = self.buffer().len_lines().saturating_sub(1);
-            Some((0, last))
-        } else if range_str == "'<,'>" {
-            // Visual selection (if we have one)
-            if let Some((start, end)) = self.get_visual_selection_range() {
-                Some((start.line, end.line))
-            } else {
-                self.message = "No visual selection".to_string();
-                return EngineAction::Error;
-            }
+    /// Resolve a `/pat/` or `?pat?` ex address to a 0-based line, wrapping.
+    fn ex_search_address(&self, pat: &str, forward: bool, current: usize) -> Option<usize> {
+        let pat = if pat.is_empty() {
+            self.search_query.clone()
         } else {
-            // Current line only
-            None
+            pat.to_string()
         };
+        let compiled = self.compile_vim_pattern(&pat, true).ok()?;
+        let text = self.buffer().to_string();
+        let spans = Self::collect_match_spans(&compiled, &text);
+        let lines: Vec<usize> = spans
+            .iter()
+            .map(|&(b, _)| {
+                self.buffer()
+                    .content
+                    .char_to_line(self.buffer().content.byte_to_char(b))
+            })
+            .collect();
+        if forward {
+            lines
+                .iter()
+                .find(|&&l| l > current)
+                .copied()
+                .or_else(|| lines.first().copied())
+        } else {
+            lines
+                .iter()
+                .rev()
+                .find(|&&l| l < current)
+                .copied()
+                .or_else(|| lines.last().copied())
+        }
+    }
 
-        // Execute replacement
-        match self.replace_in_range(range, pattern, replacement, flags) {
-            Ok(count) => {
-                self.message = format!(
-                    "{} substitution{}",
-                    count,
-                    if count == 1 { "" } else { "s" }
-                );
-                EngineAction::None
+    /// Parse a leading ex range, returning the 0-based inclusive line range and
+    /// the number of characters consumed.
+    ///
+    /// `%` is the whole buffer; `a,b` and `a;b` are two addresses (with `;`
+    /// moving the current line to `a` before `b` is parsed, per `:h :;`).
+    pub(crate) fn parse_ex_range(&self, chars: &[char]) -> (Option<(isize, isize)>, usize) {
+        let mut i = 0usize;
+        while chars.get(i) == Some(&' ') {
+            i += 1;
+        }
+        if chars.get(i) == Some(&'%') {
+            let last = self.buffer().len_lines().saturating_sub(1) as isize;
+            return (Some((0, last)), i + 1);
+        }
+        let current = self.view().cursor.line;
+        let Some(first) = self.parse_ex_address(chars, &mut i, current) else {
+            return (None, 0);
+        };
+        let mut start = first;
+        let mut end = first;
+        while matches!(chars.get(i), Some(',') | Some(';')) {
+            let semi = chars[i] == ';';
+            i += 1;
+            let base = if semi {
+                end.max(0) as usize
+            } else {
+                self.view().cursor.line
+            };
+            match self.parse_ex_address(chars, &mut i, base) {
+                Some(next) => {
+                    start = end;
+                    end = next;
+                }
+                None => {
+                    start = end;
+                    end = base as isize;
+                }
             }
+        }
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        (Some((start, end)), i)
+    }
+
+    // --- :substitute ------------------------------------------------------
+
+    /// Try to run `cmd` as `[range]s/pat/repl/[flags] [count]`, `:&`, `:&&` or
+    /// `:~`. Returns `None` when `cmd` is some other ex command entirely, so
+    /// the caller can keep dispatching.
+    pub(crate) fn try_execute_substitute(&mut self, cmd: &str) -> Option<EngineAction> {
+        let chars: Vec<char> = cmd.chars().collect();
+        let (range, consumed) = self.parse_ex_range(&chars);
+        let rest: String = chars[consumed..].iter().collect();
+
+        // `:&`, `:&&` and `:~` repeat the previous substitution.
+        if let Some(tail) = rest.strip_prefix('&') {
+            let (keep_flags, tail) = match tail.strip_prefix('&') {
+                Some(t) => (true, t),
+                None => (false, tail),
+            };
+            return Some(self.repeat_last_substitute(range, keep_flags, tail.trim()));
+        }
+        if let Some(tail) = rest.strip_prefix('~') {
+            return Some(self.repeat_last_substitute(range, false, tail.trim()));
+        }
+
+        // Longest prefix of `rest` that is also a prefix of "substitute".
+        let name_len = "substitute"
+            .char_indices()
+            .take_while(|&(k, c)| rest.chars().nth(k) == Some(c))
+            .count();
+        if name_len == 0 {
+            return None;
+        }
+        let after: String = rest.chars().skip(name_len).collect();
+        let delim = after.chars().next();
+
+        match delim {
+            // `:s` / `:s 3` / `:s g` — repeat with the previous pattern.
+            None => Some(self.repeat_last_substitute(range, false, "")),
+            Some(' ') => Some(self.repeat_last_substitute(range, false, after.trim())),
+            // A delimiter is any non-alphanumeric char except `\`, `"` and `|`.
+            Some(d) if !d.is_alphanumeric() && !matches!(d, '\\' | '"' | '|') => {
+                let (pattern, replacement, flags) = split_substitute_args(&after, d);
+                Some(self.run_substitute(range, &pattern, Some(&replacement), &flags))
+            }
+            _ => None,
+        }
+    }
+
+    /// `:&`, `:&&`, `:~` and normal-mode `&` / `g&`.
+    fn repeat_last_substitute(
+        &mut self,
+        range: Option<(isize, isize)>,
+        keep_flags: bool,
+        extra_flags: &str,
+    ) -> EngineAction {
+        let Some((pattern, replacement, flags)) = self.last_substitute.clone() else {
+            self.message = "E33: No previous substitute regular expression".to_string();
+            return EngineAction::Error;
+        };
+        let mut f = if keep_flags { flags } else { String::new() };
+        if !extra_flags.is_empty() {
+            f.push_str(extra_flags);
+        }
+        self.run_substitute(range, &pattern, Some(&replacement), &f)
+    }
+
+    /// The `:substitute` implementation.
+    ///
+    /// `replacement` is `None` only when the caller has no replacement text at
+    /// all (`:s/pat`), which Vim treats as an empty replacement.
+    pub(crate) fn run_substitute(
+        &mut self,
+        range: Option<(isize, isize)>,
+        pattern: &str,
+        replacement: Option<&str>,
+        flags_and_count: &str,
+    ) -> EngineAction {
+        // --- flags + trailing count (+ a `|`-chained follow-up command) ---
+        let mut flags = String::new();
+        let mut count: Option<usize> = None;
+        let chained: Option<String>;
+        {
+            let mut it = flags_and_count.chars().peekable();
+            while let Some(&c) = it.peek() {
+                if c.is_ascii_digit() || c == ' ' || c == '|' {
+                    break;
+                }
+                flags.push(c);
+                it.next();
+            }
+            let tail: String = it.collect();
+            // `:s/a/x/|s/b/y/` — an unescaped `|` separates ex commands.
+            let (tail, rest) = match tail.split_once('|') {
+                Some((t, r)) => (t.to_string(), Some(r.to_string())),
+                None => (tail, None),
+            };
+            chained = rest;
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                match tail.parse::<usize>() {
+                    Ok(n) if n > 0 => count = Some(n),
+                    _ => {
+                        self.message = format!("E488: Trailing characters: {tail}");
+                        return EngineAction::Error;
+                    }
+                }
+            }
+        }
+        // The `&` flag means "reuse the flags of the previous :s".
+        if flags.contains('&') {
+            if let Some((_, _, prev)) = self.last_substitute.clone() {
+                for c in prev.chars() {
+                    if c != '&' && !flags.contains(c) {
+                        flags.push(c);
+                    }
+                }
+            }
+        }
+        if flags.contains('c') {
+            // #801 acceptance: never *silently* discard the confirm flag.
+            self.message = "E-vimcode: the :s 'c' (confirm) flag is not implemented".to_string();
+            return EngineAction::Error;
+        }
+        let global = flags.contains('g');
+        let report_only = flags.contains('n');
+        let quiet = flags.contains('e');
+
+        // --- pattern ---
+        let pattern = if pattern.is_empty() {
+            self.search_query.clone()
+        } else {
+            self.search_query = pattern.to_string();
+            self.search_smartcase_applies = true;
+            pattern.to_string()
+        };
+        if pattern.is_empty() {
+            self.message = "E35: No previous regular expression".to_string();
+            return EngineAction::Error;
+        }
+        let effective_pattern = if flags.contains('I') {
+            format!("\\C{pattern}")
+        } else if flags.contains('i') {
+            format!("\\c{pattern}")
+        } else {
+            pattern.clone()
+        };
+        let compiled = match self.compile_vim_pattern(&effective_pattern, true) {
+            Ok(c) => c,
             Err(e) => {
                 self.message = e;
-                EngineAction::Error
+                return EngineAction::Error;
+            }
+        };
+
+        // --- replacement ---
+        let raw_repl = replacement.unwrap_or("");
+        if raw_repl.starts_with("\\=") {
+            self.message =
+                "E-vimcode: \\= (Vimscript expression) in :s is not implemented".to_string();
+            return EngineAction::Error;
+        }
+        let repl = expand_replacement_tilde(raw_repl, &self.last_sub_replacement);
+
+        self.last_substitute = Some((pattern.clone(), raw_repl.to_string(), flags.clone()));
+        self.last_sub_replacement = repl.clone();
+
+        // --- resolve the line range ---
+        let full = self.buffer().to_string();
+        let (body, trailing) = match full.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (full.as_str(), ""),
+        };
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(body.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let n_lines = line_starts.len();
+        let line_of = |b: usize| match line_starts.binary_search(&b) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+
+        let cur = self.view().cursor.line;
+        let (mut first_line, mut last_line) = match range {
+            Some((a, b)) => (a.max(0) as usize, b.max(0) as usize),
+            None => (cur, cur),
+        };
+        if let Some(n) = count {
+            // `:s/a/b/ N` acts on N lines starting at the range's last line.
+            first_line = last_line;
+            last_line = last_line + n - 1;
+        }
+        first_line = first_line.min(n_lines.saturating_sub(1));
+        last_line = last_line.min(n_lines.saturating_sub(1));
+
+        // --- single left-to-right pass over the buffer text ---
+        let mut out = String::new();
+        let mut copied = 0usize;
+        let mut at = line_starts[first_line];
+        let mut done_lines: Vec<usize> = Vec::new();
+        let mut n_subs = 0usize;
+        let mut last_end_in_out: Option<usize> = None;
+
+        while at <= body.len() {
+            let Some(caps) = compiled.regex.captures_at(body, at) else {
+                break;
+            };
+            let whole = caps.get(0).expect("group 0 always matches");
+            // `\zs` / `\ze` trim the *replaced* span without changing where the
+            // scan resumes, so `:s/foo\zsbar/X/` on "foobar" yields "fooX".
+            let (mstart, mend) = compiled.span(&caps);
+            let sline = line_of(mstart);
+            if sline > last_line {
+                break;
+            }
+            let skip_to_next_line = |at: &mut usize| -> bool {
+                match line_starts.get(sline + 1) {
+                    Some(&next) => {
+                        *at = next;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if !global && done_lines.last() == Some(&sline) {
+                // Only the first match on each line without the `g` flag.
+                if skip_to_next_line(&mut at) {
+                    continue;
+                }
+                break;
+            }
+            // Vim stops the `g` loop when a *subsequent* empty match lands on
+            // the end of the line (ex_cmds.c: `sub_firstline[matchcol] == NUL`),
+            // so `:s/x*/-/g` on "abc" gives "-a-b-c", not "-a-b-c-".
+            let at_eol = mend == body.len() || body.as_bytes()[mend] == b'\n';
+            if mstart == mend && at_eol && done_lines.last() == Some(&sline) {
+                if skip_to_next_line(&mut at) {
+                    continue;
+                }
+                break;
+            }
+
+            let rendered =
+                expand_replacement(&repl, &caps, &compiled.group_map, &body[mstart..mend]);
+            out.push_str(&body[copied..mstart]);
+            out.push_str(&rendered);
+            last_end_in_out = Some(out.len());
+            copied = mend;
+            n_subs += 1;
+
+            let eline = line_of(mend);
+            if eline > sline {
+                // A match that swallowed a line break merges those lines, and
+                // Vim re-scans the merged line (`lnum -= nmatch_tl`) — which is
+                // why `:%s/\n//` collapses the whole buffer into one line.
+                last_line = last_line.saturating_sub(eline - sline);
+            } else if done_lines.last() != Some(&sline) {
+                done_lines.push(sline);
+            }
+
+            at = if whole.end() > whole.start() {
+                whole.end().max(mend)
+            } else {
+                let from = whole.end().max(mend);
+                match body[from..].chars().next() {
+                    Some(c) => from + c.len_utf8(),
+                    None => from + 1,
+                }
+            };
+            if !global && eline == sline {
+                if let Some(&next) = line_starts.get(eline + 1) {
+                    at = at.max(next);
+                } else {
+                    break;
+                }
             }
         }
+        out.push_str(&body[copied..]);
+
+        if n_subs == 0 {
+            if !quiet {
+                self.message = format!("E486: Pattern not found: {pattern}");
+                return EngineAction::Error;
+            }
+            self.message.clear();
+            if let Some(next) = chained {
+                let next = next.trim().to_string();
+                if !next.is_empty() {
+                    return self.execute_command(&next);
+                }
+            }
+            return EngineAction::None;
+        }
+
+        if report_only {
+            self.message = format!(
+                "{} match{} on {} line{}",
+                n_subs,
+                if n_subs == 1 { "" } else { "es" },
+                done_lines.len(),
+                if done_lines.len() == 1 { "" } else { "s" }
+            );
+            return EngineAction::None;
+        }
+
+        // Cursor lands on the line holding the end of the *last* substitution,
+        // at its first non-blank column (`:h :s`).
+        let target_line = last_end_in_out
+            .map(|b| out[..b].matches('\n').count())
+            .unwrap_or(cur);
+
+        let new_full = format!("{out}{trailing}");
+        self.splice_buffer_text(&new_full);
+
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let target_line = target_line.min(max_line);
+        self.view_mut().cursor.line = target_line;
+        self.view_mut().cursor.col = self.first_non_blank_col(target_line);
+        self.clamp_cursor_col();
+
+        self.message = format!(
+            "{} substitution{} on {} line{}",
+            n_subs,
+            if n_subs == 1 { "" } else { "s" },
+            done_lines.len(),
+            if done_lines.len() == 1 { "" } else { "s" }
+        );
+        if let Some(next) = chained {
+            let next = next.trim().to_string();
+            if !next.is_empty() {
+                return self.execute_command(&next);
+            }
+        }
+        EngineAction::None
+    }
+
+    /// Replace the buffer's text with `new_text` as a single undo step,
+    /// touching only the region that actually differs so undo stays tight.
+    pub(crate) fn splice_buffer_text(&mut self, new_text: &str) {
+        let old: Vec<char> = self.buffer().to_string().chars().collect();
+        let new: Vec<char> = new_text.chars().collect();
+        if old == new {
+            return;
+        }
+        let mut prefix = 0usize;
+        while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+            prefix += 1;
+        }
+        let mut suffix = 0usize;
+        while suffix < old.len() - prefix
+            && suffix < new.len() - prefix
+            && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        let inserted: String = new[prefix..new.len() - suffix].iter().collect();
+        self.start_undo_group();
+        if old.len() - suffix > prefix {
+            self.delete_with_undo(prefix, old.len() - suffix);
+        }
+        if !inserted.is_empty() {
+            self.insert_with_undo(prefix, &inserted);
+        }
+        self.finish_undo_group();
     }
 
     // --- Search ---
@@ -3536,108 +4137,395 @@ impl Engine {
 
     /// Try to parse and execute a ranged ex command like `:2d`, `:3,5d`, `:10y`.
     /// Returns `Some(action)` if it handled the command, `None` otherwise.
+    /// `:[range]{cmd}` for the line-oriented ex commands that take a general
+    /// address range: `:d`, `:y`, `:j`, `:>`, `:<`, `:t` / `:co`, `:m`, plus a
+    /// bare range (`:5`, `:$`, `:/foo/`) which just moves the cursor.
+    ///
+    /// Returns `None` for anything it does not recognise so the rest of
+    /// `execute_command`'s dispatch is unaffected.
     fn try_execute_ranged_command(&mut self, cmd: &str) -> Option<EngineAction> {
-        // Parse leading range: N or N,M
-        let bytes = cmd.as_bytes();
-        let mut i = 0;
+        let chars: Vec<char> = cmd.chars().collect();
+        let (range, consumed) = self.parse_ex_range(&chars);
+        let rest: String = chars[consumed..].iter().collect();
+        let rest = rest.trim().to_string();
+        let last_line = self.buffer().len_lines().saturating_sub(1);
 
-        // Parse first number
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
+        // A range on its own moves the cursor to its last line.
+        if rest.is_empty() {
+            let (_, end) = range?;
+            let target = (end.max(0) as usize).min(last_line);
+            // Neovim leaves the cursor in column 1 and does *not* push a jump
+            // for a bare `:{address}` (`jump:C-o after :5` pins both).
+            self.view_mut().cursor.line = target;
+            self.view_mut().cursor.col = 0;
+            self.clamp_cursor_col();
+            return Some(EngineAction::None);
         }
-        if i == 0 {
-            return None;
-        }
-        let first_num: usize = cmd[..i].parse().ok()?;
 
-        let (start_line, end_line, rest) = if i < bytes.len() && bytes[i] == b',' {
-            // Range: N,M
-            let comma = i;
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
+        // `>`, `>>`, `<<` … — one shift level per repeated character.
+        if rest.starts_with('>') || rest.starts_with('<') {
+            let shift_char = rest.chars().next()?;
+            let levels = rest.chars().take_while(|&c| c == shift_char).count();
+            let args = rest[levels..].trim();
+            let count = if args.is_empty() {
+                None
+            } else {
+                Some(args.parse::<usize>().ok()?)
+            };
+            let (start, end) = self.range_with_count(range, count, last_line);
+            let n = end - start + 1;
+            let mut changed = false;
+            self.view_mut().cursor.line = start;
+            for _ in 0..levels {
+                if shift_char == '>' {
+                    self.indent_lines(start, n, &mut changed);
+                } else {
+                    self.dedent_lines(start, n, &mut changed);
+                }
             }
-            let second_num: usize = cmd[comma + 1..i].parse().ok()?;
-            (first_num, second_num, &cmd[i..])
-        } else {
-            // Single line: N
-            (first_num, first_num, &cmd[i..])
+            self.view_mut().cursor.line = end.min(self.buffer().len_lines().saturating_sub(1));
+            let line = self.view().cursor.line;
+            self.view_mut().cursor.col = self.first_non_blank_col(line);
+            self.clamp_cursor_col();
+            return Some(EngineAction::None);
+        }
+
+        let (name, args) = split_ex_name(&rest);
+        let (name, bang) = match name.strip_suffix('!') {
+            Some(n) => (n, true),
+            None => (name, false),
+        };
+        let is = |canonical: &str, min: usize| {
+            name.len() >= min && name.len() <= canonical.len() && canonical.starts_with(name)
         };
 
-        let rest = rest.trim();
-        let max_line = self.buffer().len_lines();
-        let start = start_line.min(max_line);
-        let end = end_line.min(max_line);
+        if is("delete", 1) {
+            let (reg, count) = parse_reg_and_count(args)?;
+            let (start, end) = self.range_with_count(range, count, last_line);
+            self.view_mut().cursor.line = start;
+            self.view_mut().cursor.col = 0;
+            let mut changed = false;
+            self.start_undo_group();
+            self.delete_lines(end - start + 1, &mut changed);
+            self.finish_undo_group();
+            if let Some(r) = reg {
+                if let Some(v) = self.registers.get(&'"').cloned() {
+                    self.registers.insert(r, v);
+                }
+            }
+            let line = self.view().cursor.line;
+            self.view_mut().cursor.col = self.first_non_blank_col(line);
+            self.clamp_cursor_col();
+            return Some(EngineAction::None);
+        }
 
-        match rest {
-            "d" | "delete" => {
-                // :Nd or :N,Md — delete lines (1-indexed)
-                if start == 0 || end == 0 || start > end {
-                    self.message = "Invalid range".to_string();
-                    return Some(EngineAction::None);
+        if is("yank", 1) {
+            let (reg, count) = parse_reg_and_count(args)?;
+            let (start, end) = self.range_with_count(range, count, last_line);
+            let saved = self.view().cursor;
+            self.view_mut().cursor.line = start;
+            self.yank_lines(end - start + 1);
+            if let Some(r) = reg {
+                if let Some(v) = self.registers.get(&'"').cloned() {
+                    self.registers.insert(r, v);
                 }
-                let start_0 = start - 1;
-                let end_0 = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
-                let count = end_0 - start_0 + 1;
-                self.view_mut().cursor.line = start_0;
-                self.view_mut().cursor.col = 0;
-                let mut changed = false;
-                self.start_undo_group();
-                self.delete_lines(count, &mut changed);
-                self.finish_undo_group();
-                Some(EngineAction::None)
             }
-            "y" | "yank" => {
-                // :Ny or :N,My — yank lines (1-indexed)
-                if start == 0 || end == 0 || start > end {
-                    self.message = "Invalid range".to_string();
-                    return Some(EngineAction::None);
-                }
-                let start_0 = start - 1;
-                let end_0 = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
-                let saved = self.view().cursor;
-                self.view_mut().cursor.line = start_0;
-                let count = end_0 - start_0 + 1;
-                self.yank_lines(count);
-                self.view_mut().cursor = saved;
-                Some(EngineAction::None)
-            }
-            _ if rest.is_empty() && first_num > 0 => {
-                // :N alone — go to line N (1-indexed)
-                let target = (first_num - 1).min(self.buffer().len_lines().saturating_sub(1));
-                self.view_mut().cursor.line = target;
-                self.view_mut().cursor.col = 0;
-                self.clamp_cursor_col();
-                Some(EngineAction::None)
-            }
-            _ => {
-                // Try :[range]m[ove]{dest} / :[range]co[py]{dest} / :[range]t{dest}.
-                // After range parse, `rest` looks like "m3", "move 3", "co3", "copy 3", "t3".
-                let move_dest =
-                    split_cmd_and_arg(rest, "move").or_else(|| split_cmd_and_arg(rest, "m"));
-                let copy_dest = split_cmd_and_arg(rest, "copy")
-                    .or_else(|| split_cmd_and_arg(rest, "co"))
-                    .or_else(|| split_cmd_and_arg(rest, "t"));
-                if move_dest.is_none() && copy_dest.is_none() {
-                    // Unknown ranged command — fall through to other dispatchers.
-                    return None;
-                }
-                if start == 0 || end == 0 || start > end {
-                    self.message = "Invalid range".to_string();
-                    return Some(EngineAction::None);
-                }
-                let src_start = start - 1;
-                let src_end = (end - 1).min(self.buffer().len_lines().saturating_sub(1));
-                if let Some(dest) = move_dest {
-                    return Some(self.execute_move_range(src_start, src_end, dest));
-                }
-                if let Some(dest) = copy_dest {
-                    return Some(self.execute_copy_range(src_start, src_end, dest));
-                }
+            self.view_mut().cursor = saved;
+            return Some(EngineAction::None);
+        }
+
+        if is("join", 1) {
+            let count = if args.is_empty() {
                 None
+            } else {
+                Some(args.parse::<usize>().ok()?)
+            };
+            let (start, end) = match (range, count) {
+                // `:j 3` joins 3 lines starting at the range's last line.
+                (_, Some(n)) => {
+                    let base = range
+                        .map(|(_, e)| e.max(0) as usize)
+                        .unwrap_or(self.view().cursor.line);
+                    (base, (base + n - 1).min(last_line))
+                }
+                // A single-line range joins that line with the next one.
+                (Some((a, b)), None) if a == b => {
+                    let a = a.max(0) as usize;
+                    (a, (a + 1).min(last_line))
+                }
+                (Some((a, b)), None) => (a.max(0) as usize, (b.max(0) as usize).min(last_line)),
+                (None, None) => {
+                    let c = self.view().cursor.line;
+                    (c, (c + 1).min(last_line))
+                }
+            };
+            self.view_mut().cursor.line = start;
+            let mut changed = false;
+            self.start_undo_group();
+            if bang {
+                self.join_lines_no_space(end - start + 1, &mut changed);
+            } else {
+                self.join_lines(end - start + 1, &mut changed);
             }
+            self.finish_undo_group();
+            return Some(EngineAction::None);
+        }
+
+        // `:t`, `:co[py]` and `:m[ove]` take a destination address.
+        let dest_kind = if name == "t" || is("copy", 2) {
+            Some(false)
+        } else if is("move", 1) {
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(is_move) = dest_kind {
+            if args.is_empty() {
+                return None;
+            }
+            let (start, end) = self.range_with_count(range, None, last_line);
+            return Some(if is_move {
+                self.execute_move_range(start, end, args)
+            } else {
+                self.execute_copy_range(start, end, args)
+            });
+        }
+
+        None
+    }
+
+    /// Resolve a parsed range plus an optional trailing count into 0-based
+    /// inclusive line bounds. A count makes the range "N lines starting at the
+    /// range's last line", which is Vim's rule for `:d 2`, `:y 3`, `:> 2`.
+    fn range_with_count(
+        &self,
+        range: Option<(isize, isize)>,
+        count: Option<usize>,
+        last_line: usize,
+    ) -> (usize, usize) {
+        let cur = self.view().cursor.line;
+        let (a, b) = match range {
+            Some((a, b)) => (a.max(0) as usize, b.max(0) as usize),
+            None => (cur, cur),
+        };
+        match count {
+            Some(n) if n > 0 => (b.min(last_line), (b + n - 1).min(last_line)),
+            _ => (a.min(last_line), b.min(last_line)),
         }
     }
+}
+
+/// Split `after` — everything from the `:s` delimiter onwards — into
+/// `(pattern, replacement, flags)`.
+///
+/// The delimiter may be any character Vim allows (`:s#a#b#`), and a
+/// backslash-escaped delimiter (`\/`) does not terminate a field, which is what
+/// made the old `cmd.split('/')` parse wrong for `:s/\//-/`.
+pub(crate) fn split_substitute_args(after: &str, delim: char) -> (String, String, String) {
+    let chars: Vec<char> = after.chars().collect();
+    let mut i = 1; // skip the opening delimiter
+    let mut fields: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            cur.push(chars[i]);
+            cur.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if chars[i] == delim {
+            fields.push(std::mem::take(&mut cur));
+            i += 1;
+            if fields.len() == 2 {
+                break;
+            }
+            continue;
+        }
+        cur.push(chars[i]);
+        i += 1;
+    }
+    if fields.len() < 2 {
+        fields.push(std::mem::take(&mut cur));
+    }
+    let pattern = fields.first().cloned().unwrap_or_default();
+    let replacement = fields.get(1).cloned().unwrap_or_default();
+    let flags: String = chars[i.min(chars.len())..].iter().collect();
+    (pattern, replacement, flags)
+}
+
+/// Expand an unescaped `~` in a `:s` replacement to the previous replacement
+/// string (`:h sub-replace-special`). `\~` stays literal for the per-match pass.
+pub(crate) fn expand_replacement_tilde(repl: &str, previous: &str) -> String {
+    let chars: Vec<char> = repl.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            out.push(chars[i]);
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        if chars[i] == '~' {
+            out.push_str(previous);
+            i += 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Case-folding state driven by `\u`, `\l`, `\U`, `\L`, `\E` and `\e`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseMode {
+    None,
+    Upper,
+    Lower,
+}
+
+/// Expand one match's replacement text per `:h sub-replace-special`.
+///
+/// `group_map` maps a Vim group number (`\1`) onto the Rust group number, which
+/// differs when `\zs` / `\ze` injected a capture group ahead of it.
+pub(crate) fn expand_replacement<'a>(
+    repl: &str,
+    caps: &regex::Captures<'a>,
+    group_map: &[usize],
+    whole: &'a str,
+) -> String {
+    let group = |vim_n: usize| -> &str {
+        if vim_n == 0 {
+            // `&` and `\0` are the *reported* match, i.e. the `\zs`/`\ze` span.
+            return whole;
+        }
+        let rust_n = group_map.get(vim_n).copied().unwrap_or(vim_n);
+        caps.get(rust_n).map(|m| m.as_str()).unwrap_or("")
+    };
+
+    let mut out = String::new();
+    let mut run = CaseMode::None;
+    let mut one = CaseMode::None;
+    let push = |out: &mut String, s: &str, run: &mut CaseMode, one: &mut CaseMode| {
+        for c in s.chars() {
+            let mapped = match (*one, *run) {
+                (CaseMode::Upper, _) => {
+                    *one = CaseMode::None;
+                    c.to_uppercase().collect::<String>()
+                }
+                (CaseMode::Lower, _) => {
+                    *one = CaseMode::None;
+                    c.to_lowercase().collect::<String>()
+                }
+                (_, CaseMode::Upper) => c.to_uppercase().collect::<String>(),
+                (_, CaseMode::Lower) => c.to_lowercase().collect::<String>(),
+                _ => c.to_string(),
+            };
+            out.push_str(&mapped);
+        }
+    };
+
+    let chars: Vec<char> = repl.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c == '&' {
+            push(&mut out, group(0), &mut run, &mut one);
+            continue;
+        }
+        if c != '\\' {
+            push(&mut out, &c.to_string(), &mut run, &mut one);
+            continue;
+        }
+        let Some(&n) = chars.get(i) else {
+            out.push('\\');
+            break;
+        };
+        i += 1;
+        match n {
+            '0'..='9' => {
+                let idx = n as usize - '0' as usize;
+                push(&mut out, group(idx), &mut run, &mut one);
+            }
+            'u' => one = CaseMode::Upper,
+            'l' => one = CaseMode::Lower,
+            'U' => run = CaseMode::Upper,
+            'L' => run = CaseMode::Lower,
+            'e' | 'E' => {
+                run = CaseMode::None;
+                one = CaseMode::None;
+            }
+            'r' => out.push('\n'),
+            // Vim's `\n` in a replacement inserts a <NUL>, not a line break.
+            'n' => out.push('\0'),
+            't' => out.push('\t'),
+            '\\' => push(&mut out, "\\", &mut run, &mut one),
+            other => push(&mut out, &other.to_string(), &mut run, &mut one),
+        }
+    }
+    out
+}
+
+/// Split `rest` into an ex command name and its argument.
+///
+/// The name runs to the first character that cannot be part of one — a space,
+/// a digit, or one of the address characters `. $ ' + - / ?` that start a
+/// destination (`:t$`, `:m+1`, `:co0`). A trailing `!` stays with the name.
+pub(crate) fn split_ex_name(rest: &str) -> (&str, &str) {
+    let mut end = 0usize;
+    for (i, c) in rest.char_indices() {
+        if c.is_ascii_alphabetic() {
+            end = i + c.len_utf8();
+            continue;
+        }
+        if c == '!' && i > 0 {
+            end = i + c.len_utf8();
+        }
+        break;
+    }
+    (&rest[..end], rest[end..].trim())
+}
+
+/// Parse the optional `[register] [count]` argument shared by `:d` and `:y`.
+///
+/// Returns `None` when the argument is neither, so the caller can decline the
+/// command rather than silently doing the wrong thing.
+#[allow(clippy::type_complexity)]
+pub(crate) fn parse_reg_and_count(args: &str) -> Option<(Option<char>, Option<usize>)> {
+    let mut reg = None;
+    let mut count = None;
+    for tok in args.split_whitespace() {
+        if let Ok(n) = tok.parse::<usize>() {
+            if n == 0 {
+                return None;
+            }
+            count = Some(n);
+        } else if tok.chars().count() == 1 && tok.chars().next()?.is_ascii_alphabetic() {
+            reg = Some(tok.chars().next()?);
+        } else {
+            return None;
+        }
+    }
+    Some((reg, count))
+}
+
+/// Strip an abbreviated ex command name from `rest`.
+///
+/// Vim lets any unambiguous prefix stand in for the full name (`:g`, `:gl`,
+/// `:global`), optionally followed by `!`. Returns the remainder after the name
+/// (and after the `!`), or `None` when `rest` does not start with the command.
+pub(crate) fn strip_command_name<'a>(rest: &'a str, full: &str) -> Option<&'a str> {
+    let matched = full
+        .char_indices()
+        .take_while(|&(k, c)| rest.chars().nth(k) == Some(c))
+        .count();
+    if matched == 0 {
+        return None;
+    }
+    let after = &rest[matched..];
+    Some(after.strip_prefix('!').unwrap_or(after))
 }
 
 /// Split a `:set` argument list into individual options.
