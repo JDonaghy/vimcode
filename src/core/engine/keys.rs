@@ -334,6 +334,20 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // --- dot-repeat bookkeeping: snapshot state before dispatch ---
+        // `was_neutral`/`is_repeat_trigger` are computed from state as it was
+        // *before* this key is dispatched (matches Vim: `.` itself is never
+        // part of the thing it repeats).
+        let dot_was_neutral = self.is_dot_repeat_neutral();
+        let dot_is_repeat_trigger =
+            pre_mode == Mode::Normal && !ctrl && unicode == Some('.') && dot_was_neutral;
+        // Use the undo stack (not the `changed` out-param) as the "did this
+        // keystroke actually edit the buffer" signal: it's already the
+        // established, DRY source of truth for that question in this codebase
+        // (see `BufferState::has_unsaved_changes`), and unlike `changed` it
+        // can't be missed by a handler that forgets to set the out-param.
+        let dot_pre_undo_len = self.active_buffer_state().undo_stack.len();
+
         match self.mode {
             Mode::Normal => {
                 action = self.handle_normal_key(key_name, unicode, ctrl, &mut changed);
@@ -393,6 +407,21 @@ impl Engine {
                         self.visual_mark_end = Some((end.line, end.col));
                     }
                 }
+            }
+        }
+
+        // --- dot-repeat bookkeeping: fold this keystroke into the candidate
+        // recording (or finalize/discard it), now that dispatch has run.
+        // Excluded: Command/Search mode (ex-commands aren't dot-repeatable —
+        // `&`/`g&` cover `:s` repeat separately) and the `.` keystroke itself
+        // (it replays a command, it isn't one — see `dot_is_repeat_trigger`).
+        if !matches!(pre_mode, Mode::Command | Mode::Search) && !dot_is_repeat_trigger {
+            if matches!(self.mode, Mode::Command | Mode::Search) {
+                self.dot_scratch.clear();
+                self.dot_scratch_any_change = false;
+            } else {
+                let dot_did_change = self.active_buffer_state().undo_stack.len() > dot_pre_undo_len;
+                self.record_dot_keystroke(key_name, unicode, ctrl, dot_was_neutral, dot_did_change);
             }
         }
 
@@ -482,19 +511,31 @@ impl Engine {
     /// Decode a sequence from the macro playback queue.
     /// Returns (key_name, unicode, ctrl) tuple and the number of characters consumed.
     pub(crate) fn decode_macro_sequence(&mut self) -> Option<(String, Option<char>, bool, usize)> {
-        if self.macro_playback_queue.is_empty() {
-            return None;
-        }
+        // Cloning is cheap here — a handful of chars at most in the common
+        // case, and macros/dot-recordings aren't hot loops.
+        let queue = self.macro_playback_queue.clone();
+        self.decode_key_from_queue(&queue)
+    }
 
-        let first_char = *self.macro_playback_queue.front().unwrap();
+    /// Decode the *next* keystroke at the front of an encoded key-notation
+    /// queue (same notation as macro recording: bracketed `<...>` sequences,
+    /// the raw `\x1b` escape byte, or a literal character). Returns
+    /// `(key_name, unicode, ctrl, chars_consumed)`. Shared by macro playback
+    /// (`decode_macro_sequence`, over `self.macro_playback_queue`) and
+    /// dot-repeat replay (`replay_dot_keys`, over a private local queue) so
+    /// the two mechanisms can't interleave or clobber each other's state.
+    pub(crate) fn decode_key_from_queue(
+        &self,
+        queue: &VecDeque<char>,
+    ) -> Option<(String, Option<char>, bool, usize)> {
+        let first_char = *queue.front()?;
 
         // Check for angle-bracket notation (e.g., <Left>, <C-D>)
         if first_char == '<' {
             // Collect characters until we find '>'
             let mut sequence = String::new();
-            let temp_queue: Vec<char> = self.macro_playback_queue.iter().copied().collect();
 
-            for (i, &ch) in temp_queue.iter().enumerate() {
+            for (i, &ch) in queue.iter().enumerate() {
                 sequence.push(ch);
                 if ch == '>' {
                     // Found complete sequence
@@ -905,12 +946,13 @@ impl Engine {
                 }
             }
             Some('i') => {
+                self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 self.set_mode(Mode::Insert);
-                self.count = None; // Clear count when entering insert mode
             }
             Some('a') => {
+                self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 let max_col = self.get_max_cursor_col(self.view().cursor.line);
@@ -922,17 +964,17 @@ impl Engine {
                     self.view_mut().cursor.col = insert_max;
                 }
                 self.set_mode(Mode::Insert);
-                self.count = None; // Clear count when entering insert mode
             }
             Some('A') => {
+                self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
                 self.set_mode(Mode::Insert);
-                self.count = None; // Clear count when entering insert mode
             }
             Some('I') => {
+                self.insert_repeat_count = self.take_count();
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
@@ -948,7 +990,6 @@ impl Engine {
                 }
                 self.view_mut().cursor.col = col;
                 self.mode = Mode::Insert;
-                self.count = None; // Clear count when entering insert mode
             }
             Some('o') => {
                 let count = self.take_count();
@@ -1106,14 +1147,6 @@ impl Engine {
                         self.finish_undo_group();
                         self.clamp_cursor_col();
                         *changed = true;
-
-                        // Record for repeat
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Delete,
-                            text: String::new(),
-                            count,
-                            motion: Some(Motion::Right),
-                        });
                     }
                 }
             }
@@ -1457,24 +1490,12 @@ impl Engine {
                 // Toggle case of char(s) under cursor
                 let count = self.take_count();
                 self.toggle_case_at_cursor(count, changed);
-                self.last_change = Some(Change {
-                    op: ChangeOp::ToggleCase,
-                    text: String::new(),
-                    count,
-                    motion: None,
-                });
             }
             Some('J') => {
                 // Join lines
                 let count = self.take_count().max(1);
                 self.push_jump_location();
                 self.join_lines(count, changed);
-                self.last_change = Some(Change {
-                    op: ChangeOp::Join,
-                    text: String::new(),
-                    count,
-                    motion: None,
-                });
             }
             Some('*') => {
                 // Search forward for word under cursor
@@ -1522,9 +1543,14 @@ impl Engine {
                 *changed = self.undo_line();
             }
             Some('.') => {
-                // Repeat last change
-                let count = self.take_count();
-                self.repeat_last_change(count, changed);
+                // Repeat last change. A count given here *replaces* the
+                // original command's count (`:h .`) — so we must distinguish
+                // "no count typed" from "count of 1 typed", which is why we
+                // peek before consuming rather than trusting `take_count()`'s
+                // 1-as-sentinel default.
+                let override_count = self.peek_count();
+                self.take_count();
+                self.repeat_last_change(override_count, changed);
             }
             Some('y') => {
                 self.operator_count = self.count.take();
@@ -2532,14 +2558,6 @@ impl Engine {
                     self.start_undo_group();
                     self.replace_chars(replacement, count, changed);
                     self.finish_undo_group();
-
-                    // Record for repeat (.)
-                    self.last_change = Some(Change {
-                        op: ChangeOp::Replace,
-                        text: replacement.to_string(),
-                        count,
-                        motion: None,
-                    });
                 }
             }
             '\x17' => {
@@ -3112,20 +3130,8 @@ impl Engine {
                 let line = self.view().cursor.line;
                 if operator == '>' {
                     self.indent_lines(line, count, changed);
-                    self.last_change = Some(Change {
-                        op: ChangeOp::Indent,
-                        text: String::new(),
-                        count,
-                        motion: None,
-                    });
                 } else {
                     self.dedent_lines(line, count, changed);
-                    self.last_change = Some(Change {
-                        op: ChangeOp::Dedent,
-                        text: String::new(),
-                        count,
-                        motion: None,
-                    });
                 }
                 return EngineAction::None;
             }
@@ -3314,14 +3320,6 @@ impl Engine {
                 self.start_undo_group();
                 self.delete_lines(count, changed);
                 self.finish_undo_group();
-
-                // Record for repeat
-                self.last_change = Some(Change {
-                    op: ChangeOp::Delete,
-                    text: String::new(),
-                    count,
-                    motion: Some(Motion::DeleteLine),
-                });
             }
             Some('c') if operator == 'c' => {
                 // cc: change line (like S). With 'autoindent' on, Vim preserves
@@ -4502,11 +4500,9 @@ impl Engine {
                         };
                     }
                     if start_pos < end_pos {
-                        self.pending_change_motion = Some(('W', count));
                         self.apply_charwise_operator('c', start_pos, end_pos, changed);
                     }
                 } else {
-                    self.pending_change_motion = Some(('w', count));
                     self.apply_operator_with_motion('c', 'w', count, changed);
                 }
                 return;
@@ -4553,9 +4549,6 @@ impl Engine {
         if start_pos >= end {
             return;
         }
-
-        // Record motion for dot repeat
-        self.pending_change_motion = Some((if bigword { 'W' } else { 'w' }, count));
 
         self.apply_charwise_operator('c', start_pos, end, changed);
     }
@@ -4684,37 +4677,7 @@ impl Engine {
             self.view_mut().cursor = end_cursor;
         }
 
-        // Record the motion so `.` can replay c{motion} properly.
-        if operator == 'c' {
-            self.pending_change_motion = Some((motion, count));
-        }
-
         self.apply_charwise_operator(operator, delete_start, delete_end, changed);
-
-        // Record for dot repeat (d/y/>/</gu/gU/g~ with motion).
-        // 'c' is recorded after Esc from insert mode, not here.
-        if operator != 'c' && operator != 'y' {
-            let motion_enum = match motion {
-                'w' => Some(Motion::WordForward),
-                'b' => Some(Motion::WordBackward),
-                'e' => Some(Motion::WordEnd),
-                _ => None,
-            };
-            if let Some(m) = motion_enum {
-                self.last_change = Some(Change {
-                    op: match operator {
-                        'd' => ChangeOp::Delete,
-                        '>' => ChangeOp::Indent,
-                        '<' => ChangeOp::Dedent,
-                        '~' => ChangeOp::ToggleCase,
-                        _ => ChangeOp::Delete,
-                    },
-                    text: String::new(),
-                    count,
-                    motion: Some(m),
-                });
-            }
-        }
     }
 
     /// Apply `operator` over an *exclusive* charwise range `[lo, hi)`,
@@ -5292,14 +5255,7 @@ impl Engine {
             self.finish_undo_group();
             if !self.insert_text_buffer.is_empty() {
                 self.last_inserted_text = self.insert_text_buffer.clone();
-                self.last_change = Some(Change {
-                    op: ChangeOp::Insert,
-                    text: self.insert_text_buffer.clone(),
-                    count: 1,
-                    motion: None,
-                });
             }
-            self.pending_change_motion = None;
             self.mode = Mode::Normal;
             self.clamp_cursor_col();
             self.view_mut().extra_cursors.clear();
@@ -5432,34 +5388,13 @@ impl Engine {
         match key_name {
             "Escape" => {
                 self.finish_undo_group();
-                // Record the insert operation for repeat and ". register
+                // Record inserted text for the "." register and Ctrl-A/Ctrl-@
+                // (`.` dot-repeat itself is handled generically by the
+                // keystroke recorder wrapping `handle_key` — see
+                // `record_dot_keystroke`/`finalize_dot_recording`).
                 if !self.insert_text_buffer.is_empty() {
                     self.last_inserted_text = self.insert_text_buffer.clone();
-                    if let Some((motion_ch, count)) = self.pending_change_motion.take() {
-                        // Insert was entered via c{motion} — record as Change so `.`
-                        // replays the delete-motion + insert, not just the insert.
-                        let motion = match motion_ch {
-                            'w' => Some(Motion::WordForward),
-                            'e' => Some(Motion::WordEnd),
-                            'b' => Some(Motion::WordBackward),
-                            _ => None,
-                        };
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Change,
-                            text: self.insert_text_buffer.clone(),
-                            count,
-                            motion,
-                        });
-                    } else {
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Insert,
-                            text: self.insert_text_buffer.clone(),
-                            count: 1,
-                            motion: None,
-                        });
-                    }
                 }
-                self.pending_change_motion = None;
                 // Apply visual block insert/append to remaining lines
                 if let Some((start_line, end_line, col, _is_append, virtual_end)) =
                     self.visual_block_insert_info.take()
@@ -5529,6 +5464,27 @@ impl Engine {
                     self.finish_undo_group();
                 }
                 self.insert_open_count = 0;
+                // Repeat i/a/I/A insert for count > 1: duplicate typed text in
+                // place (Vim behavior for `3ihello<Esc>`).
+                if self.insert_repeat_count > 1 && !self.insert_text_buffer.is_empty() {
+                    let repeated = self.insert_text_buffer.repeat(self.insert_repeat_count - 1);
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let char_idx = self.buffer().line_to_char(line) + col;
+                    self.start_undo_group();
+                    self.insert_with_undo(char_idx, &repeated);
+                    self.finish_undo_group();
+                    let newlines = repeated.matches('\n').count();
+                    if newlines > 0 {
+                        self.view_mut().cursor.line += newlines;
+                        if let Some(last_nl) = repeated.rfind('\n') {
+                            self.view_mut().cursor.col = repeated[last_nl + 1..].chars().count();
+                        }
+                    } else {
+                        self.view_mut().cursor.col += repeated.chars().count();
+                    }
+                }
+                self.insert_repeat_count = 0;
                 // Track cursor pos for gi (insert at last insert position)
                 let cur = self.view().cursor;
                 self.last_insert_pos = Some((cur.line, cur.col));
@@ -6643,12 +6599,6 @@ impl Engine {
                         self.visual_anchor = None;
                         self.indent_lines(start_line, line_count, changed);
                         self.view_mut().cursor.line = start_line;
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Indent,
-                            text: String::new(),
-                            count: line_count,
-                            motion: None,
-                        });
                     }
                     return EngineAction::None;
                 }
@@ -6664,12 +6614,6 @@ impl Engine {
                         self.visual_anchor = None;
                         self.dedent_lines(start_line, line_count, changed);
                         self.view_mut().cursor.line = start_line;
-                        self.last_change = Some(Change {
-                            op: ChangeOp::Dedent,
-                            text: String::new(),
-                            count: line_count,
-                            motion: None,
-                        });
                     }
                     return EngineAction::None;
                 }
@@ -7167,253 +7111,175 @@ impl Engine {
     // Repeat command (.)
     // =======================================================================
 
-    pub(crate) fn repeat_last_change(&mut self, repeat_count: usize, changed: &mut bool) {
-        let change = match &self.last_change {
-            Some(c) => c.clone(),
-            None => return, // No change to repeat
+    /// Repeat the last dot-repeatable command (`.`).
+    ///
+    /// Unlike the old design (which reified a closed `ChangeOp`/`Motion` enum
+    /// and replayed *inserted text*), this replays the *recorded keystrokes*
+    /// of the last repeatable command through the same `handle_key` dispatcher
+    /// that produced it — see `record_dot_keystroke`/`finalize_dot_recording`
+    /// for how `last_dot_keys`/`last_dot_count` get set. Re-running the actual
+    /// keys re-derives the motion's extent live (at the new cursor position),
+    /// which is what lets this handle operator+motion, text objects, visual
+    /// operators, and insert-family commands uniformly, without per-command
+    /// replay logic.
+    ///
+    /// `override_count`, when `Some`, is the count given directly to `.`
+    /// (e.g. the `2` in `2.`) and *replaces* the count the original command
+    /// used, per `:h .`.
+    pub(crate) fn repeat_last_change(&mut self, override_count: Option<usize>, changed: &mut bool) {
+        let Some(keys) = self.last_dot_keys.clone() else {
+            return; // Nothing to repeat.
         };
 
-        let final_count = if repeat_count > 1 {
-            repeat_count
-        } else {
-            change.count
-        };
+        // `:h redo-register`: repeating a numbered-register paste ("1p, "2p, …)
+        // advances to the next register each time `.` is pressed.
+        let keys = Self::bump_numbered_register(&keys);
 
-        match change.op {
-            ChangeOp::Insert => {
-                // Repeat insert: insert the same text at current position
-                self.start_undo_group();
-                let line = self.view().cursor.line;
-                let col = self.view().cursor.col;
-                let char_idx = self.buffer().line_to_char(line) + col;
+        let effective_count = override_count.or(self.last_dot_count);
+        let mut replay = String::new();
+        if let Some(n) = effective_count {
+            replay.push_str(&n.to_string());
+        }
+        replay.push_str(&keys);
 
-                // Insert the text final_count times
-                let repeated_text = change.text.repeat(final_count);
-                self.insert_with_undo(char_idx, &repeated_text);
+        let pre_undo_len = self.active_buffer_state().undo_stack.len();
+        self.replay_dot_keys(&replay);
+        *changed = self.active_buffer_state().undo_stack.len() > pre_undo_len;
+    }
 
-                // Update cursor position based on inserted text
-                let newlines = repeated_text.matches('\n').count();
-                if newlines > 0 {
-                    self.view_mut().cursor.line += newlines;
-                    // Find column after last newline
-                    if let Some(last_nl) = repeated_text.rfind('\n') {
-                        self.view_mut().cursor.col = repeated_text[last_nl + 1..].chars().count();
-                    }
-                } else {
-                    self.view_mut().cursor.col += repeated_text.chars().count();
-                }
-                self.finish_undo_group();
-                *changed = true;
-            }
-            ChangeOp::Delete => {
-                // Repeat delete with motion — use final_count (not change.count)
-                // so that `4x` then `.` deletes 4 chars, and `2.` deletes 2 chars.
-                if let Some(motion) = &change.motion {
-                    self.start_undo_group();
-                    match motion {
-                        Motion::Right => {
-                            // Delete character(s) at cursor (like x)
-                            let line = self.view().cursor.line;
-                            let col = self.view().cursor.col;
-                            let char_idx = self.buffer().line_to_char(line) + col;
-                            let line_end = self.buffer().line_to_char(line)
-                                + self.buffer().line_len_chars(line);
-                            let available = line_end - char_idx;
-                            let to_delete = final_count.min(available);
+    /// `:h redo-register`: `"1p . .` pastes register 1, then 2, then 3, …
+    /// Only applies to a *numbered* register (1-9) used with `p`/`P`.
+    fn bump_numbered_register(keys: &str) -> String {
+        let mut chars: Vec<char> = keys.chars().collect();
+        if chars.len() >= 3
+            && chars[0] == '"'
+            && chars[1].is_ascii_digit()
+            && chars[1] != '9'
+            && matches!(chars[2], 'p' | 'P')
+        {
+            let d = chars[1].to_digit(10).unwrap();
+            chars[1] = std::char::from_digit(d + 1, 10).unwrap();
+        }
+        chars.into_iter().collect()
+    }
 
-                            if to_delete > 0 && char_idx < self.buffer().len_chars() {
-                                let deleted_chars: String = self
-                                    .buffer()
-                                    .content
-                                    .slice(char_idx..char_idx + to_delete)
-                                    .chars()
-                                    .collect();
-                                let reg = self.active_register();
-                                self.set_register(reg, deleted_chars, false);
-                                self.clear_selected_register();
-                                self.delete_with_undo(char_idx, char_idx + to_delete);
-                                self.clamp_cursor_col();
-                                *changed = true;
-                            }
-                        }
-                        Motion::DeleteLine => {
-                            // Repeat dd
-                            self.delete_lines(final_count, changed);
-                        }
-                        Motion::WordForward
-                        | Motion::WordBackward
-                        | Motion::WordEnd
-                        | Motion::WordBackwardEnd => {
-                            // Repeat dw/db/de/dge
-                            let m = match motion {
-                                Motion::WordForward => 'w',
-                                Motion::WordBackward => 'b',
-                                Motion::WordEnd => 'e',
-                                Motion::WordBackwardEnd => 'e', // ge uses 'e' in backward direction
-                                _ => unreachable!(),
-                            };
-                            self.apply_operator_with_motion('d', m, final_count, changed);
-                        }
-                        _ => {}
-                    }
-                    self.finish_undo_group();
-                }
+    /// Feed an encoded key-notation string (same alphabet as macro
+    /// recording/playback) through `handle_key`, one decoded keystroke at a
+    /// time. Used by `.` to replay a recorded command. Unlike macro playback
+    /// (`macro_playback_queue`/`advance_macro_playback`), this runs
+    /// synchronously to completion against a private queue, so it can't
+    /// interleave with — or be mistaken for — an in-progress macro recording
+    /// or playback.
+    pub(crate) fn replay_dot_keys(&mut self, keys: &str) {
+        let mut queue: VecDeque<char> = keys.chars().collect();
+        while let Some((key_name, unicode, ctrl, consume)) = self.decode_key_from_queue(&queue) {
+            for _ in 0..consume {
+                queue.pop_front();
             }
-            ChangeOp::Change => {
-                // Repeat c{motion}: delete the motion range, then insert the text.
-                if let Some(motion) = &change.motion {
-                    for _ in 0..final_count {
-                        let motion_char = match motion {
-                            Motion::WordForward => 'w',
-                            Motion::WordEnd => 'e',
-                            Motion::WordBackward => 'b',
-                            _ => continue,
-                        };
-                        // Reuse the same code path as the original cw/ce/cb:
-                        // apply_operator_with_motion deletes the range and enters
-                        // insert mode.  We then immediately insert the recorded
-                        // text and return to normal mode instead.
-                        let start_cursor = self.view().cursor;
-                        let start_pos =
-                            self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
-                        let total = self.buffer().len_chars();
+            self.macro_recursion_depth += 1;
+            self.handle_key(&key_name, unicode, ctrl);
+            self.macro_recursion_depth -= 1;
+            if self.macro_recursion_depth >= MAX_MACRO_RECURSION {
+                break;
+            }
+        }
+    }
 
-                        // For cw dot repeat, use cw-special logic: find end of
-                        // word without eating trailing whitespace.
-                        let delete_end = if motion_char == 'w' || motion_char == 'W' {
-                            let bigword = motion_char == 'W';
-                            let mut end = start_pos;
-                            for i in 0..change.count {
-                                if bigword {
-                                    while end < total
-                                        && !self.buffer().content.char(end).is_whitespace()
-                                    {
-                                        end += 1;
-                                    }
-                                } else {
-                                    while end < total
-                                        && is_word_char(self.buffer().content.char(end))
-                                    {
-                                        end += 1;
-                                    }
-                                }
-                                if i + 1 < change.count {
-                                    while end < total
-                                        && self.buffer().content.char(end).is_whitespace()
-                                    {
-                                        end += 1;
-                                    }
-                                }
-                            }
-                            end
-                        } else {
-                            for _ in 0..change.count {
-                                match motion_char {
-                                    'b' => self.move_word_backward(),
-                                    'e' => self.move_word_end(),
-                                    _ => {}
-                                }
-                            }
-                            let end_cursor = self.view().cursor;
-                            let end_pos =
-                                self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
-                            self.view_mut().cursor = start_cursor;
-                            if motion_char == 'e' {
-                                (end_pos + 1).min(total)
-                            } else {
-                                end_pos
-                            }
-                        };
-                        if start_pos < delete_end {
-                            self.start_undo_group();
-                            self.delete_with_undo(start_pos, delete_end);
-                            if !change.text.is_empty() {
-                                self.insert_with_undo(start_pos, &change.text);
-                                let inserted_chars = change.text.chars().count();
-                                let newlines = change.text.matches('\n').count();
-                                if newlines > 0 {
-                                    self.view_mut().cursor.line += newlines;
-                                    if let Some(last_nl) = change.text.rfind('\n') {
-                                        self.view_mut().cursor.col =
-                                            change.text[last_nl + 1..].chars().count();
-                                    }
-                                } else {
-                                    self.view_mut().cursor.col += inserted_chars;
-                                }
-                            }
-                            self.clamp_cursor_col();
-                            self.finish_undo_group();
-                            *changed = true;
-                        }
-                    }
-                }
-            }
-            ChangeOp::Substitute => {
-                // Repeat s command
-                for _ in 0..final_count {
-                    let line = self.view().cursor.line;
-                    let col = self.view().cursor.col;
-                    let max_col = self.get_max_cursor_col(line);
-                    if max_col > 0 || self.buffer().line_len_chars(line) > 0 {
-                        let char_idx = self.buffer().line_to_char(line) + col;
-                        let line_end =
-                            self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
-                        let available = line_end - char_idx;
-                        let to_delete = change.count.min(available);
+    /// True when we're at a point where a brand-new dot-repeatable command
+    /// could start: Normal mode, and no operator/motion/text-object/register
+    /// prefix is still waiting on more keys.
+    pub(crate) fn is_dot_repeat_neutral(&self) -> bool {
+        self.mode == Mode::Normal
+            && self.pending_key.is_none()
+            && self.pending_operator.is_none()
+            && self.pending_find_operator.is_none()
+            && self.pending_text_object.is_none()
+    }
 
-                        self.start_undo_group();
-                        if to_delete > 0 && char_idx < self.buffer().len_chars() {
-                            self.delete_with_undo(char_idx, char_idx + to_delete);
-                            *changed = true;
-                        }
+    /// Fold one dispatched keystroke into the in-progress dot-repeat
+    /// candidate, called after every keystroke that isn't excluded outright
+    /// (Command/Search mode, or the `.` trigger itself — see the call site in
+    /// `handle_key`).
+    ///
+    /// The candidate spans from the first keystroke that leaves a "neutral"
+    /// state (see `is_dot_repeat_neutral`) through the next return to
+    /// neutral. At that point it's either finalized as the new `.` target (if
+    /// any keystroke in the span produced an undo-tracked edit) or discarded
+    /// (if not — e.g. a bare motion, or an operator that got cancelled).
+    ///
+    /// A neutral keystroke that neither starts a command nor changes
+    /// anything (a plain motion like `j`) is never buffered at all, *unless*
+    /// it's a count digit — digits must be held so they can prefix whatever
+    /// real command follows (`2dd`), and a bare `"`+register prefix must
+    /// likewise be held (checked via `has_pending_prefix` below) since
+    /// neither leaves any other trace once consumed.
+    fn record_dot_keystroke(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+        was_neutral: bool,
+        did_change: bool,
+    ) {
+        let now_neutral = self.is_dot_repeat_neutral();
 
-                        // Insert the recorded text
-                        if !change.text.is_empty() {
-                            self.insert_with_undo(char_idx, &change.text);
-                            *changed = true;
-                        }
-                        self.finish_undo_group();
-                    }
-                }
+        if was_neutral && self.dot_scratch.is_empty() && !did_change && now_neutral {
+            let is_count_digit =
+                unicode.map(|c| c.is_ascii_digit()).unwrap_or(false) && self.pending_key.is_none();
+            if !is_count_digit {
+                // A neutral no-op (plain cursor motion, etc.) — nothing to record.
+                return;
             }
-            ChangeOp::SubstituteLine | ChangeOp::DeleteToEnd | ChangeOp::ChangeToEnd => {
-                // Handle other operations
-            }
-            ChangeOp::Replace => {
-                // Repeat r command — final_count is the number of chars to replace
-                if let Some(replacement_char) = change.text.chars().next() {
-                    self.start_undo_group();
-                    self.replace_chars(replacement_char, final_count, changed);
-                    self.finish_undo_group();
-                }
-            }
-            ChangeOp::ToggleCase => {
-                // Repeat ~ command
-                for _ in 0..final_count {
-                    self.toggle_case_at_cursor(change.count, changed);
-                }
-            }
-            ChangeOp::Join => {
-                // Repeat J command
-                for _ in 0..final_count {
-                    self.join_lines(change.count, changed);
-                }
-            }
-            ChangeOp::Indent => {
-                // Repeat >> command
-                let line = self.view().cursor.line;
-                for _ in 0..final_count {
-                    self.indent_lines(line, change.count, changed);
-                }
-            }
-            ChangeOp::Dedent => {
-                // Repeat << command
-                let line = self.view().cursor.line;
-                for _ in 0..final_count {
-                    self.dedent_lines(line, change.count, changed);
+        }
+
+        let encoded = self.encode_key_for_macro(key_name, unicode, ctrl);
+        for ch in encoded.chars() {
+            self.dot_scratch.push(ch);
+        }
+        self.dot_scratch_any_change |= did_change;
+
+        if now_neutral {
+            if self.dot_scratch_any_change {
+                self.finalize_dot_recording();
+            } else {
+                // Back to neutral with nothing changed yet. Keep the buffer
+                // alive only if there's a reason to believe a real command is
+                // still coming (a count and/or register prefix was consumed
+                // but not yet used) — otherwise this was a dead end (e.g. a
+                // cancelled operator) and shouldn't leak into the future.
+                let has_pending_prefix = self.count.is_some()
+                    || self.operator_count.is_some()
+                    || self.selected_register.is_some();
+                if !has_pending_prefix {
+                    self.dot_scratch.clear();
                 }
             }
         }
+    }
+
+    /// Finalize `dot_scratch` as the new `.` target: split off a purely
+    /// leading run of count digits (if any) into `last_dot_count` so `.` can
+    /// override it independently, and store the rest as `last_dot_keys`.
+    fn finalize_dot_recording(&mut self) {
+        let raw: String = self.dot_scratch.drain(..).collect();
+        self.dot_scratch_any_change = false;
+
+        let digit_prefix_len = raw.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_prefix_len > 0 && digit_prefix_len < raw.chars().count() {
+            let split_at = raw
+                .char_indices()
+                .nth(digit_prefix_len)
+                .map(|(i, _)| i)
+                .unwrap_or(raw.len());
+            let (count_str, rest) = raw.split_at(split_at);
+            if let Ok(n) = count_str.parse::<usize>() {
+                self.last_dot_count = Some(n);
+                self.last_dot_keys = Some(rest.to_string());
+                return;
+            }
+        }
+        self.last_dot_count = None;
+        self.last_dot_keys = Some(raw);
     }
 
     /// Available commands for auto-completion

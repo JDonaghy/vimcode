@@ -475,3 +475,215 @@ fn test_ce_dot_repeat() {
     press(&mut e, '.');
     assert_buf(&e, "XXX XXX baz\n");
 }
+
+// #803: `.` records the *command* (replayed through the same key dispatcher
+// that produced it), not the inserted text. Each test below is a family the
+// old text-replay design got wrong — the assertion is the exact buffer, so a
+// regression to "insert the same text at the cursor" fails loudly.
+
+#[test]
+fn test_dot_repeat_a_appends_at_new_eol_not_old_text() {
+    // A appends at end-of-line. `.` on a new line must re-append there, not
+    // insert ";" wherever the cursor happens to sit.
+    let mut e = engine_with("a\nb\n");
+    press(&mut e, 'A');
+    press(&mut e, ';');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "a;\nb\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "a;\nb;\n");
+}
+
+#[test]
+fn test_dot_repeat_i_inserts_at_new_line_start() {
+    let mut e = engine_with("a\nb\n");
+    press(&mut e, 'I');
+    press(&mut e, 'x');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xa\nb\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "xa\nxb\n");
+}
+
+#[test]
+fn test_dot_repeat_o_opens_a_new_line_each_time() {
+    // `o` then `.` must open a SECOND new line, not re-insert the text at
+    // the cursor (the old bug: `ob<Esc>.` produced "bb").
+    let mut e = engine_with("a\n");
+    press(&mut e, 'o');
+    press(&mut e, 'b');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "a\nb\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "a\nb\nb\n");
+}
+
+#[test]
+fn test_dot_repeat_big_o_opens_a_new_line_above_each_time() {
+    let mut e = engine_with("a\n");
+    press(&mut e, 'O');
+    press(&mut e, 'b');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "b\na\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "b\nb\na\n");
+}
+
+#[test]
+fn test_dot_repeat_cc_deletes_then_inserts() {
+    // The old design re-inserted "X" without deleting the line first
+    // (`cc j .` gave "Xb" instead of two lines of just "X").
+    let mut e = engine_with("a\nb\n");
+    press(&mut e, 'c');
+    press(&mut e, 'c');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "X\nb\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "X\nX\n");
+}
+
+#[test]
+fn test_dot_repeat_big_c_changes_to_new_eol() {
+    let mut e = engine_with("abc\ndef\n");
+    e.view_mut().cursor.col = 1;
+    press(&mut e, 'C');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "aX\ndef\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "aX\ndX\n");
+}
+
+#[test]
+fn test_dot_repeat_s_substitutes_char_then_inserts() {
+    let mut e = engine_with("abcd\n");
+    press(&mut e, 's');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "Xbcd\n");
+
+    press(&mut e, 'l');
+    press(&mut e, '.');
+    assert_buf(&e, "XXcd\n");
+}
+
+#[test]
+fn test_dot_repeat_p_repeats_the_paste_not_the_yank() {
+    // `.` after `p` must repeat only the paste — not "yl" too, which would
+    // yank different text each time. Was entirely non-repeatable before #803.
+    let mut e = engine_with("ab\n");
+    press(&mut e, 'y');
+    press(&mut e, 'l');
+    press(&mut e, 'p');
+    assert_buf(&e, "aab\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "aaab\n");
+}
+
+#[test]
+fn test_dot_repeat_indent_gtgt() {
+    // `>>` was entirely non-repeatable before #803.
+    let mut e = engine_with("a\n");
+    e.settings.shift_width = 4;
+    e.settings.expand_tab = true;
+    press(&mut e, '>');
+    press(&mut e, '>');
+    assert_buf(&e, "    a\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "        a\n");
+}
+
+#[test]
+fn test_dot_repeat_ctrl_a_increment() {
+    // `<C-a>` (increment number under cursor) was entirely non-repeatable
+    // before #803.
+    let mut e = engine_with("1\n2\n");
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\n2\n");
+
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "2\n3\n");
+}
+
+#[test]
+fn test_dot_repeat_visual_line_delete_same_size_new_cursor() {
+    // `:h visual-repeat`: `.` after a visual operator reselects a
+    // same-sized region at the *new* cursor, not a fixed one-line delete.
+    let mut e = engine_with("a\nb\nc\nd\ne\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'd');
+    assert_buf(&e, "c\nd\ne\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "e\n");
+}
+
+#[test]
+fn test_dot_repeat_dap_text_object() {
+    let mut e = engine_with("a\n\nb\n\nc\n");
+    press(&mut e, 'd');
+    press(&mut e, 'a');
+    press(&mut e, 'p');
+    assert_buf(&e, "b\n\nc\n");
+
+    press(&mut e, '.');
+    assert_buf(&e, "c\n");
+}
+
+#[test]
+fn test_dot_repeat_visual_block_insert() {
+    let mut e = engine_with("ab\nab\nab\nab\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'I');
+    press(&mut e, 'x');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xab\nxab\nab\nab\n");
+
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, '.');
+    assert_buf(&e, "xab\nxab\nxab\nxab\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_replaces_not_multiplies() {
+    // `:h .`: a count given to `.` *replaces* the original count.
+    let mut e = engine_with("abcdefghij\n");
+    press(&mut e, '3');
+    press(&mut e, 'x');
+    assert_buf(&e, "defghij\n");
+
+    press(&mut e, '2');
+    press(&mut e, '.');
+    // 3 + 2 = 5 characters deleted in total, not 3 + 3 or 3*2.
+    assert_buf(&e, "fghij\n");
+}
+
+#[test]
+fn test_dot_repeat_count_override_dd() {
+    let mut e = engine_with("a\nb\nc\nd\ne\nf\n");
+    press(&mut e, '2');
+    press(&mut e, 'd');
+    press(&mut e, 'd');
+    assert_buf(&e, "c\nd\ne\nf\n");
+
+    press(&mut e, '3');
+    press(&mut e, '.');
+    assert_buf(&e, "f\n");
+}

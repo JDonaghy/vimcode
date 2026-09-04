@@ -4446,7 +4446,6 @@ fn test_visual_i_quote() {
 
 // TODO: Fix cursor positioning after insert operations
 #[test]
-#[ignore]
 fn test_repeat_insert() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "line1\nline2\nline3");
@@ -4461,17 +4460,17 @@ fn test_repeat_insert() {
     assert_eq!(engine.mode, Mode::Normal);
     assert_eq!(engine.buffer().to_string(), "XYline1\nline2\nline3");
 
-    // Move to second line and repeat
+    // Move to second line and repeat. Escape left the cursor at column 1
+    // (Vim moves back one on leaving Insert), so `j` preserves that column
+    // and `.` replays `iXY<Esc>` inserting before the 'i' in "line2".
     press_char(&mut engine, 'j');
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "XYline1\nXYline2\nline3");
+    assert_eq!(engine.buffer().to_string(), "XYline1\nlXYine2\nline3");
     assert_eq!(engine.view().cursor.line, 1);
     assert_eq!(engine.view().cursor.col, 2);
 }
 
-// TODO: Fix multi-count delete repeat
 #[test]
-#[ignore]
 fn test_repeat_delete_x() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "ABCDEF\nGHIJKL");
@@ -4504,9 +4503,7 @@ fn test_repeat_delete_dd() {
     assert_eq!(engine.buffer().to_string(), "line3\nline4");
 }
 
-// TODO: Fix cursor positioning for repeat with count
 #[test]
-#[ignore]
 fn test_repeat_insert_with_count() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "abc\ndef\nghi");
@@ -4525,31 +4522,29 @@ fn test_repeat_insert_with_count() {
     assert_eq!(engine.buffer().to_string(), "Xabc\nXXXdef\nghi");
 }
 
-// TODO: Fix cursor positioning with newline repeats
 #[test]
-#[ignore]
 fn test_repeat_insert_with_newline() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "first");
     engine.update_syntax();
 
-    // Insert with newline
+    // Append at the end of the line, then split with a newline.
+    engine.view_mut().cursor.col = 4; // last char of "first"
     press_char(&mut engine, 'a');
     press_special(&mut engine, "Return");
     press_char(&mut engine, 'X');
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "first\nX");
 
-    // Move to start and repeat
+    // Repeat re-runs `a<CR>X<Esc>` at the new cursor — from column 0 on
+    // "first" that's "f" + append-after-col0 + split + "X".
     engine.view_mut().cursor.line = 0;
     engine.view_mut().cursor.col = 0;
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "\nXfirst\nX");
+    assert_eq!(engine.buffer().to_string(), "f\nXirst\nX");
 }
 
-// TODO: Implement substitute repeat
 #[test]
-#[ignore]
 fn test_repeat_substitute_s() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello\nworld");
@@ -4567,9 +4562,7 @@ fn test_repeat_substitute_s() {
     assert_eq!(engine.buffer().to_string(), "Xello\nXorld");
 }
 
-// TODO: Implement substitute repeat with count
 #[test]
-#[ignore]
 fn test_repeat_substitute_2s() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "abcdef\nghijkl");
@@ -4583,10 +4576,12 @@ fn test_repeat_substitute_2s() {
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "XYcdef\nghijkl");
 
-    // Move to second line and repeat
+    // Move to second line and repeat. Escape left the cursor at column 1
+    // (Vim moves back one on leaving Insert), so `j` preserves that column
+    // and `.` replays `2sXY<Esc>` starting the substitute at "ghijkl"'s 'h'.
     press_char(&mut engine, 'j');
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "XYcdef\nXYijkl");
+    assert_eq!(engine.buffer().to_string(), "XYcdef\ngXYjkl");
 }
 
 #[test]
@@ -4601,11 +4596,13 @@ fn test_repeat_append() {
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "o!ne\ntwo");
 
-    // Move to second line start and repeat (inserts at current position)
+    // Move to second line start and repeat — `.` re-runs the `a` command
+    // (append after cursor), not "insert the same text at the cursor": on
+    // "two" with the cursor at column 0 that appends '!' after 't'.
     press_char(&mut engine, 'j');
     engine.view_mut().cursor.col = 0; // Ensure we're at column 0
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "o!ne\n!two");
+    assert_eq!(engine.buffer().to_string(), "o!ne\nt!wo");
 }
 
 #[test]
@@ -4622,12 +4619,13 @@ fn test_repeat_open_line_o() {
     press_special(&mut engine, "Escape");
     assert_eq!(engine.buffer().to_string(), "alpha\nNEW\nbeta");
 
-    // Repeat inserts the text "NEW" at current position (not a full 'o' command)
+    // Repeat re-runs the full `o` command (open a new line below and insert),
+    // not "insert the text NEW at the current position".
     // Move to last line and repeat
     press_char(&mut engine, 'j');
     engine.view_mut().cursor.col = 0;
     press_char(&mut engine, '.');
-    assert_eq!(engine.buffer().to_string(), "alpha\nNEW\nNEWbeta");
+    assert_eq!(engine.buffer().to_string(), "alpha\nNEW\nbeta\nNEW");
 }
 
 #[test]
@@ -4644,7 +4642,6 @@ fn test_repeat_before_any_change() {
 
 // TODO: Fix count preservation in repeat
 #[test]
-#[ignore]
 fn test_repeat_preserves_count() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "ABCDEFGH\nIJKLMNOP");
@@ -4661,9 +4658,7 @@ fn test_repeat_preserves_count() {
     assert_eq!(engine.buffer().to_string(), "DEFGH\nLMNOP");
 }
 
-// TODO: Fix dd repeat with count
 #[test]
-#[ignore]
 fn test_repeat_dd_multiple_lines() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc\nd\ne\nf");
