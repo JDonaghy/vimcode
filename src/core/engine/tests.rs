@@ -8871,12 +8871,16 @@ fn test_star_word_boundaries() {
 }
 
 #[test]
-fn test_star_no_word_under_cursor() {
+fn test_star_scans_forward_for_nearest_word() {
+    // #801: Vim's `*` does not require the cursor to already be on a keyword —
+    // `nv_ident` scans forward on the line for the first one, moves there, then
+    // searches. Verified against Neovim: `*` on "   spaces" at col 0 lands on
+    // col 3 (the search wraps back to the only occurrence).
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "   spaces");
     // cursor at space (col 0)
     press_char(&mut engine, '*');
-    assert!(engine.message.contains("No word under cursor"));
+    assert_eq!(engine.view().cursor.col, 3);
 }
 
 #[test]
@@ -26180,10 +26184,12 @@ fn test_nvim_search_basic_n() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "foo bar foo baz\n");
     engine.update_syntax();
+    // #801: `/` starts searching *after* the cursor, so the match at col 0 is
+    // skipped and `n` wraps back to it. Both values verified against Neovim.
     engine.feed_keys("/foo<CR>");
-    assert_eq!(engine.view().cursor.col, 0);
-    engine.feed_keys("n");
     assert_eq!(engine.view().cursor.col, 8);
+    engine.feed_keys("n");
+    assert_eq!(engine.view().cursor.col, 0);
 }
 
 #[test]
@@ -26193,10 +26199,12 @@ fn test_nvim_search_N_reverse() {
     engine.buffer_mut().insert(0, "foo bar foo baz foo\n");
     engine.update_syntax();
     engine.view_mut().cursor.col = 16;
+    // #801: from the last match, `/` wraps to col 0; `N` then wraps back.
+    // Verified against Neovim.
     engine.feed_keys("/foo<CR>");
-    assert_eq!(engine.view().cursor.col, 16);
+    assert_eq!(engine.view().cursor.col, 0);
     engine.feed_keys("N");
-    assert_eq!(engine.view().cursor.col, 8);
+    assert_eq!(engine.view().cursor.col, 16);
 }
 
 #[test]
@@ -26239,10 +26247,12 @@ fn test_nvim_search_count_prefix_n() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "x x x x x\n");
     engine.update_syntax();
+    // #801: `/x` from col 0 lands on the *next* match (col 2), so `3n` from
+    // there reaches col 8. Verified against Neovim.
     engine.feed_keys("/x<CR>");
-    assert_eq!(engine.view().cursor.col, 0);
+    assert_eq!(engine.view().cursor.col, 2);
     engine.feed_keys("3n");
-    assert_eq!(engine.view().cursor.col, 6);
+    assert_eq!(engine.view().cursor.col, 8);
 }
 
 // -- Scroll commands --
@@ -27036,9 +27046,11 @@ fn test_nvim_slash_reuses_prev_pattern_with_n() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "foo bar foo baz foo\n");
     engine.update_syntax();
+    // #801: `/foo` skips the match under the cursor, so the three positions
+    // visited are 8, 16 and (wrapping) 0. Verified against Neovim.
     engine.feed_keys("/foo<CR>");
     engine.feed_keys("nn");
-    assert_eq!(engine.view().cursor.col, 16);
+    assert_eq!(engine.view().cursor.col, 0);
 }
 
 // -- Ex command ranges --

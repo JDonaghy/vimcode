@@ -16,23 +16,25 @@ fn test_forward_search_moves_cursor() {
 fn test_search_n_next_match() {
     let mut e = engine_with("foo bar foo baz\n");
     search_fwd(&mut e, "foo");
-    // First match at col 0
-    assert_cursor(&e, 0, 0);
-    // n moves to second match
-    press(&mut e, 'n');
+    // #801: `/` starts *after* the cursor, so the match under the cursor at
+    // col 0 is skipped (verified against Neovim).
     assert_cursor(&e, 0, 8);
+    // n wraps back round to the first match
+    press(&mut e, 'n');
+    assert_cursor(&e, 0, 0);
 }
 
 #[test]
 fn test_search_big_n_reverse() {
     let mut e = engine_with("foo bar foo baz\n");
     search_fwd(&mut e, "foo");
-    // n to second match
-    press(&mut e, 'n');
     assert_cursor(&e, 0, 8);
-    // N goes back to first match
-    press(&mut e, 'N');
+    // n wraps to the first match
+    press(&mut e, 'n');
     assert_cursor(&e, 0, 0);
+    // N reverses, wrapping back to the second
+    press(&mut e, 'N');
+    assert_cursor(&e, 0, 8);
 }
 
 #[test]
@@ -49,12 +51,12 @@ fn test_backward_search() {
 fn test_search_wrap_around() {
     let mut e = engine_with("foo\nbar\nfoo\n");
     search_fwd(&mut e, "foo");
+    assert_cursor(&e, 2, 0);
+    // n wraps past the end of the buffer to the first match
+    press(&mut e, 'n');
     assert_cursor(&e, 0, 0);
     press(&mut e, 'n');
     assert_cursor(&e, 2, 0);
-    // n again wraps to first match
-    press(&mut e, 'n');
-    assert_cursor(&e, 0, 0);
 }
 
 #[test]
@@ -171,4 +173,204 @@ fn test_search_escape_restores_cursor() {
     press_key(&mut e, "Escape");
     assert_cursor(&e, orig_line, orig_col);
     assert_mode(&e, Mode::Normal);
+}
+
+// ── #801: the Vim regex engine, offsets and n/N direction ────────────────────
+//
+// These are black-box: they drive the engine through the same `/` command line
+// a user types and assert on the resulting cursor. Every expectation below was
+// checked against `nvim --headless` (the oracle the conformance suite uses),
+// and every one of them fails against the pre-#801 `text.find(&query)` search —
+// which matched metacharacters literally, so `/^foo`, `/\<foo\>`, `/\d\+` and
+// friends simply found nothing and left the cursor where it was.
+
+#[test]
+fn test_regex_caret_anchor() {
+    let mut e = engine_with("a foo\nfoo b\n");
+    search_fwd(&mut e, "^foo");
+    // Only the line-2 "foo" is at the start of a line.
+    assert_cursor(&e, 1, 0);
+}
+
+#[test]
+fn test_regex_dollar_anchor() {
+    let mut e = engine_with("foo a\na foo\n");
+    search_fwd(&mut e, "foo$");
+    assert_cursor(&e, 1, 2);
+}
+
+#[test]
+fn test_regex_word_boundaries() {
+    let mut e = engine_with("foobar foo\n");
+    search_fwd(&mut e, "\\<foo\\>");
+    // "foobar" is not a whole-word match; the standalone "foo" at col 7 is.
+    assert_cursor(&e, 0, 7);
+}
+
+#[test]
+fn test_regex_quantifier_and_class() {
+    let mut e = engine_with("ab 123 cd\n");
+    search_fwd(&mut e, "\\d\\+");
+    assert_cursor(&e, 0, 3);
+}
+
+#[test]
+fn test_regex_very_magic() {
+    let mut e = engine_with("fooo bar\n");
+    e.view_mut().cursor.col = 2;
+    search_fwd(&mut e, "\\vo+");
+    // Vim enumerates matches non-overlapping, so "ooo" at col 1 is the only
+    // match and the search wraps back to it.
+    assert_cursor(&e, 0, 1);
+}
+
+#[test]
+fn test_regex_alternation_and_literal_dot() {
+    let mut e = engine_with("xx bar foo\n");
+    search_fwd(&mut e, "foo\\|bar");
+    assert_cursor(&e, 0, 3);
+
+    let mut e = engine_with("abc a.c\n");
+    search_fwd(&mut e, "a\\.c");
+    assert_cursor(&e, 0, 4);
+}
+
+#[test]
+fn test_regex_zs_and_ze_trim_the_match() {
+    let mut e = engine_with("foobar\n");
+    search_fwd(&mut e, "foo\\zsbar");
+    assert_cursor(&e, 0, 3);
+
+    let mut e = engine_with("xbar foobar\n");
+    search_fwd(&mut e, "foo\\zebar");
+    assert_cursor(&e, 0, 5);
+}
+
+#[test]
+fn test_regex_inline_case_override() {
+    let mut e = engine_with("x FOO foo\n");
+    search_fwd(&mut e, "\\cfoo");
+    assert_cursor(&e, 0, 2);
+}
+
+#[test]
+fn test_search_offset_end_and_begin() {
+    let mut e = engine_with("foo bar baz\n");
+    search_fwd(&mut e, "bar/e");
+    assert_cursor(&e, 0, 6); // last char of the match
+
+    let mut e = engine_with("foo bar baz\n");
+    search_fwd(&mut e, "bar/e+1");
+    assert_cursor(&e, 0, 7);
+
+    let mut e = engine_with("foo bar baz\n");
+    search_fwd(&mut e, "bar/b+2");
+    assert_cursor(&e, 0, 6);
+}
+
+#[test]
+fn test_search_offset_linewise() {
+    let mut e = engine_with("a\nfoo\nb\nc\n");
+    search_fwd(&mut e, "foo/+1");
+    assert_cursor(&e, 2, 0);
+}
+
+#[test]
+fn test_search_offset_survives_n() {
+    let mut e = engine_with("foo bar foo bar\n");
+    search_fwd(&mut e, "bar/e");
+    assert_cursor(&e, 0, 6);
+    press(&mut e, 'n');
+    assert_cursor(&e, 0, 14);
+}
+
+#[test]
+fn test_search_chained_with_semicolon() {
+    let mut e = engine_with("a foo b bar\n");
+    search_fwd(&mut e, "foo/;/bar");
+    assert_cursor(&e, 0, 8);
+}
+
+#[test]
+fn test_empty_pattern_reuses_last_search() {
+    let mut e = engine_with("foo x foo x foo\n");
+    search_fwd(&mut e, "foo");
+    assert_cursor(&e, 0, 6);
+    // `//<CR>` repeats the previous pattern.
+    search_fwd(&mut e, "");
+    assert_cursor(&e, 0, 12);
+}
+
+#[test]
+fn test_count_before_slash() {
+    let mut e = engine_with("a foo foo foo\n");
+    press(&mut e, '3');
+    press(&mut e, '/');
+    type_chars(&mut e, "foo");
+    press_key(&mut e, "Return");
+    assert_cursor(&e, 0, 10);
+}
+
+#[test]
+fn test_n_and_big_n_after_backward_search() {
+    let mut e = engine_with("bar\nfoo\nbar\nbar\n");
+    e.view_mut().cursor.line = 3;
+    search_bwd(&mut e, "bar");
+    assert_cursor(&e, 2, 0);
+    // After `?`, `n` keeps going backwards …
+    press(&mut e, 'n');
+    assert_cursor(&e, 0, 0);
+    // … and `N` reverses, i.e. goes forward.
+    press(&mut e, 'N');
+    assert_cursor(&e, 2, 0);
+}
+
+#[test]
+fn test_forward_then_backward_resets_n_direction() {
+    let mut e = engine_with("bar\nfoo\nbar\nbar\n");
+    search_fwd(&mut e, "bar");
+    assert_cursor(&e, 2, 0);
+    search_bwd(&mut e, "bar");
+    assert_cursor(&e, 0, 0);
+    // `n` now follows the *backward* direction of the last search.
+    press(&mut e, 'n');
+    assert_cursor(&e, 3, 0);
+}
+
+#[test]
+fn test_star_sets_a_whole_word_pattern_reusable_by_sub() {
+    let mut e = engine_with("foo bar foo\n");
+    press(&mut e, '*');
+    assert_cursor(&e, 0, 8);
+    // `*` set the last search pattern, so `:%s//X/g` reuses it.
+    exec(&mut e, "%s//X/g");
+    assert_eq!(buf(&e).trim_end(), "X bar X");
+}
+
+#[test]
+fn test_invalid_pattern_is_rejected_not_matched_literally() {
+    // #801 acceptance: a pattern the engine cannot translate must produce an
+    // error, never a silent fall-back to literal matching.
+    let mut e = engine_with("a\\(foo\\)\\1 b\n");
+    search_fwd(&mut e, "\\(foo\\)\\1");
+    assert!(
+        e.message.contains("back-reference"),
+        "expected a rejection message, got {:?}",
+        e.message
+    );
+    // The cursor did not move to a bogus "literal" match.
+    assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_substitute_confirm_flag_is_rejected_not_silently_dropped() {
+    let mut e = engine_with("a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    assert!(
+        e.message.contains("confirm"),
+        "expected the c flag to be rejected, got {:?}",
+        e.message
+    );
+    // Nothing was substituted behind the user's back.
+    assert_eq!(buf(&e).trim_end(), "a a");
 }
