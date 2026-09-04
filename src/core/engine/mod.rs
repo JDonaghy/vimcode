@@ -2357,6 +2357,11 @@ pub struct Engine {
     pub(crate) search_pending_count: usize,
     /// Cursor position when search mode was entered (for incremental search)
     search_start_cursor: Option<Cursor>,
+    /// Set when `/`/`?` is pressed from Visual/VisualLine/VisualBlock mode
+    /// (`v/pat<CR>d`, `V/pat<CR>`) — remembers which visual sub-mode to
+    /// return to (with the selection anchor intact) once the search resolves,
+    /// instead of always dropping back to Normal mode.
+    visual_search_return: Option<Mode>,
 
     // --- Find/Replace state ---
     /// Replacement text for current operation
@@ -3580,6 +3585,7 @@ impl Engine {
             search_smartcase_applies: true,
             search_pending_count: 1,
             search_start_cursor: None,
+            visual_search_return: None,
             replace_text: String::new(),
             replace_flags: String::new(),
             pending_key: None,
