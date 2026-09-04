@@ -172,3 +172,20 @@ Extension registry (GitHub-hosted JSON).
 ### Key Functions
 - `fetch_registry(url)` — download extension registry
 - `download_script(url, dest)` — download extension file via curl
+
+## vim_regex.rs — 854 lines
+Vim pattern → Rust `regex` translation (#801). The single translation point for
+`/`, `?`, `:s`, `:g` and the ex `/pat/` address. Rejects patterns it cannot
+express (back-references, look-around, `\&`, `\_x`) rather than falling back to
+literal matching.
+### Types
+- `Magic` — `\v` / `\m` / `\M` / `\V`
+- `CaseOverride` — `\c` / `\C`
+- `Translation` — Rust regex source + case override + `\zs`/`\ze` span group + Vim→Rust group map
+- `Compiled` — compiled `regex::Regex` plus the span group and group map
+### Key Functions
+- `translate(pattern, magic, last_sub) -> Result<Translation, String>` — pure translation
+- `compile(pattern, ignorecase, smartcase, smartcase_applies, last_sub) -> Result<Compiled, String>` — translate + apply case options + compile
+- `Compiled::span(caps)` — the byte span a match *reports*, honouring `\zs` / `\ze`
+- `pat_has_uppercase(pat)` — Vim's `'smartcase'` test (skips backslash escapes)
+- `escape_literal(s)` / `escape_vim_literal(s)` — literal escaping for Rust regex / for a Vim pattern

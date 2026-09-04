@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** September 3, 2026 — **the platform-neutrality chain drained, and the audit it mandated is now run.** Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%**. Nothing is in flight and nothing is queued for vimcode or quadraui. The most actionable thing on this page is that **#47 was closed having shipped zero code, with its blocker filed nowhere.**
+**Last updated:** September 4, 2026 (see Recent Work for #801); prior revision September 3, 2026 — **the platform-neutrality chain drained, and the audit it mandated is now run.** Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%**. Nothing is in flight and nothing is queued for vimcode or quadraui. The most actionable thing on this page is that **#47 was closed having shipped zero code, with its blocker filed nowhere.**
 
 ## Active milestone: #7 Platform-Neutral — **complete (0 open)**
 
@@ -294,6 +294,20 @@ next piece of the north star's own work.
 ## Recent Work
 
 > Sessions 389 and earlier in **SESSION_HISTORY.md**.
+
+**2026-09-04 — #801: `/` and `:s` got a real regex engine.** New
+`src/core/vim_regex.rs` translates Vim patterns (all four magic levels, `\<`/`\>`,
+`\{n,m}`/`\{-}`, `\zs`/`\ze`, `\c`/`\C`, the character classes, `~`) into Rust
+`regex`, and **rejects** what it cannot express instead of falling back to literal
+matching. `run_search` and `:s` both use it; search offsets (`/pat/e`, `/e+1`, `/b+2`,
+`/+1`), `;` chaining, `//` reuse and `3/pat` all work; `*`/`#` now set a real
+`\<word\>` pattern. `parse_ex_address`/`parse_ex_range` implement the full ex address
+grammar, which `:s`, `:g`/`:v`, `:d`, `:y`, `:j`, `:>`, `:<`, `:t`, `:m` and `:normal`
+now all accept. `:s` gained replacement expansion (`& \0 \1 \u \U \L \E \r \t`),
+the `g c e i I n &` flags (`c` errors rather than being silently dropped), `:&`/`:&&`,
+counts and `|` chaining. **`KNOWN_DEVIATIONS` 638 → 465** (−173): the `search`, `sub`
+and `g` conformance categories are clean apart from operator-pending `d/pat` (the next
+issue in the #801 chain), `gd`/`gn`, and `\1` back-references.
 
 **2026-09-03 — the chain drained; #7 closed out; the audit run.** #751–#756 converged
 mouse routing, #757–#762 keyboard dispatch, #763–#766 frame composition (`FrameOp` /
