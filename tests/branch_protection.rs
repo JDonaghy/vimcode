@@ -323,8 +323,8 @@ fn dry_run_never_invokes_gh() {
     );
 }
 
-/// The script must be executable in the checkout — `scripts/apply-branch-protection.sh`
-/// is documented as a directly runnable command in CLAUDE.md.
+/// The script must be executable in the checkout — `.github/branch-protection.json`
+/// documents it as a directly runnable command (`scripts/apply-branch-protection.sh`).
 #[test]
 fn script_is_executable() {
     use std::os::unix::fs::PermissionsExt;

@@ -96,7 +96,7 @@ All non-trivial work should be tracked via GitHub Issues.
 2. **Work on that branch**, committing as you go. Never commit code directly to `develop`. For non-issue work, use `{kind}-{short-description}` naming and you may skip the claim step.
 3. **Do NOT open a PR yet.** Keep the branch in "commits pushed, no PR" state until the user has run smoke tests or explicitly agreed testing is not needed. Subsequent pushes to the claim branch are fine.
 4. **Once approved, ask the user which landing path:**
-   - **Path A — merge locally + push.** For small/trivial changes: `git merge --ff-only <branch>`, push `develop`, delete the branch. Still available, but see **Branch protection** below — it is now an admin-only escape hatch that skips the CI gate, not the default.
+   - **Path A — merge locally + push.** For small/trivial changes: `git merge --ff-only <branch>`, push `develop`, delete the branch.
    - **Path B — open PR.** For normal feature/bugfix work: open a PR to `develop` against the already-pushed branch. Reference "Closes #{number}" if it closes an issue.
 5. **When the user confirms a merge that closes an issue**, immediately `gh issue close <number>` and unassign yourself.
 
@@ -228,43 +228,3 @@ The coordinator drives issues through `Work → Test → Review → Merge`. The 
 - If `Cargo.lock` changed: regenerate `flatpak/cargo-sources.json` with `python3 flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json`
 - Merging the PR to `main` triggers `release.yml` which creates a GitHub Release tagged `v$VERSION`
 - Never push directly to `main`
-
-### Branch protection — CI is a gate, not a suggestion (#796)
-
-Both CI jobs are **required status checks** on `develop` and `main`. Before #796
-they were advisory: `develop` (the default branch, where every agent branch
-lands) had no protection object at all and `main` had one with no
-`required_status_checks` key, so a PR with red checks was mergeable by clicking
-the button. That mattered here more than usual — multiple concurrent agents
-land branches, and a stale or partial local run (`--no-default-features`, see
-#645) is exactly what the gate is meant to catch.
-
-The settings are versioned in **`.github/branch-protection.json`** and applied
-by **`scripts/apply-branch-protection.sh`** rather than living only in the repo
-web UI, so they are reviewable in a diff and testable:
-
-```bash
-scripts/apply-branch-protection.sh --dry-run   # print the exact API payloads (offline)
-scripts/apply-branch-protection.sh --check     # audit live settings, report drift, no writes
-scripts/apply-branch-protection.sh             # apply, then read back and verify
-```
-
-Applying needs an authenticated `gh` with **admin** rights on the repo — an
-agent cannot do it; the owner runs it.
-
-- `main` uses `"strict": true` — must be up to date with base before merging.
-  It only ever receives the `develop` → `main` release PR, so that costs nothing.
-- `develop` uses `"strict": false` — with strict on, every open branch would need
-  a rebase and a full re-run each time another one landed, serialising the queue.
-- `enforce_admins: false` (#796 decision (c)) — the gate binds pull requests and
-  non-admin pushes; the owner keeps a deliberate escape hatch. **Path A (merge
-  locally + push `develop`) therefore still works for the owner, but it bypasses
-  the gate** — CI only fires after the code has landed. Prefer Path B; use Path A
-  only when you mean to.
-
-**If you rename a CI job, update `.github/branch-protection.json` in the same
-commit.** GitHub matches required checks by name: a required context naming a
-job that no longer reports stays forever-pending and blocks *every* PR.
-`tests/branch_protection.rs` asserts the two lists are equal, so a rename fails
-the suite instead of wedging the queue. Any new CI job that should gate merges
-goes in that file too.
