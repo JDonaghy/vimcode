@@ -6824,7 +6824,18 @@ fn test_insert_completion_intercepts_key() {
     // #287: predicate that backends consult to suppress global accelerators
     // (Ctrl-P → fuzzy_finder, etc.) when insert-mode completion would
     // otherwise consume the key. Mirrors the gates in handle_insert_key.
+    //
+    // #800: the accept key is mode-derived (`completion_keys.accept`) —
+    // `Engine::new()` defaults to Vim mode, so the accept key here is
+    // `<C-y>`, not `Tab` (Vscode mode's default). See
+    // `no_config_file_defaults_are_strict_vim` in settings.rs for the
+    // settings-layer half of this contract.
     let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.editor_mode,
+        crate::core::settings::EditorMode::Vim,
+        "precondition: nothing set editor_mode away from its Vim default"
+    );
     engine.buffer_mut().insert(0, "foobar\n");
 
     // Normal mode: no interception even with a popup-like state set
@@ -6839,8 +6850,9 @@ fn test_insert_completion_intercepts_key() {
     // Ctrl-N / Ctrl-P always intercepted in insert (they can start completion).
     assert!(engine.insert_completion_intercepts_key("n", true));
     assert!(engine.insert_completion_intercepts_key("p", true));
-    // Tab / Down / Up NOT intercepted without an active popup.
-    assert!(!engine.insert_completion_intercepts_key("Tab", false));
+    // Accept key (Ctrl-Y in Vim mode) / Down / Up NOT intercepted without an
+    // active popup.
+    assert!(!engine.insert_completion_intercepts_key("y", true));
     assert!(!engine.insert_completion_intercepts_key("Down", false));
     assert!(!engine.insert_completion_intercepts_key("Up", false));
     // Non-completion keys never intercepted.
@@ -6851,12 +6863,15 @@ fn test_insert_completion_intercepts_key() {
     press_char(&mut engine, 'f');
     press_char(&mut engine, 'o');
     assert!(engine.completion_display_only && engine.completion_idx.is_some());
-    // Now Tab / Down / Up are intercepted.
-    assert!(engine.insert_completion_intercepts_key("Tab", false));
+    // Now the accept key (Ctrl-Y) / Down / Up are intercepted.
+    assert!(engine.insert_completion_intercepts_key("y", true));
     assert!(engine.insert_completion_intercepts_key("Down", false));
     assert!(engine.insert_completion_intercepts_key("Up", false));
-    // Ctrl variants of those keys are NOT — only the bare versions cycle.
-    assert!(!engine.insert_completion_intercepts_key("Tab", true));
+    // Bare Tab is NOT intercepted in default (Vim) mode — it's left alone
+    // for indentation; only the configured accept key is.
+    assert!(!engine.insert_completion_intercepts_key("Tab", false));
+    // Ctrl variants of Down/Up are NOT — only the bare versions cycle.
+    assert!(!engine.insert_completion_intercepts_key("Down", true));
 }
 
 #[test]
@@ -6988,9 +7003,18 @@ fn test_completion_replaces_when_prefix_changes_unrelated() {
     );
 }
 
+/// #800: the accept key is now mode-derived (`completion_keys.accept`) —
+/// `Engine::new()` defaults to Vim mode, whose accept key is `<C-y>`, not
+/// `Tab` (Vscode mode's default). `Ctrl-Y` accepting here mirrors Vim's own
+/// `i_CTRL-Y`, which accepts when the completion menu is visible.
 #[test]
-fn test_auto_popup_tab_accepts() {
+fn test_auto_popup_ctrl_y_accepts_in_default_vim_mode() {
     let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.editor_mode,
+        crate::core::settings::EditorMode::Vim,
+        "precondition: nothing set editor_mode away from its Vim default"
+    );
     engine.buffer_mut().insert(0, "foobar\n");
     press_char(&mut engine, 'G');
     press_char(&mut engine, 'o'); // insert mode, new line
@@ -7002,11 +7026,12 @@ fn test_auto_popup_tab_accepts() {
         "popup should be display-only"
     );
     assert!(engine.completion_idx.is_some(), "popup should be active");
-    // Tab should accept the highlighted candidate
-    press_special(&mut engine, "Tab");
+    // Ctrl-Y (the Vim-mode default accept key) should accept the highlighted
+    // candidate.
+    press_ctrl(&mut engine, 'y');
     assert!(
         engine.completion_idx.is_none(),
-        "popup should be cleared after Tab"
+        "popup should be cleared after Ctrl-Y"
     );
     assert!(
         !engine.completion_display_only,
@@ -7016,6 +7041,46 @@ fn test_auto_popup_tab_accepts() {
     assert!(
         line1.starts_with("foobar"),
         "buffer should contain accepted completion, got: {}",
+        line1
+    );
+}
+
+/// #800: `<Tab>` must NOT accept the popup in default (Vim) mode — it's left
+/// alone for indentation, matching Vim's own ins-completion-menu. This is the
+/// engine-level counterpart to
+/// `ctrl_y_accepts_tab_falls_through_for_completion_popup_in_default_vim_mode_via_shell_app`
+/// in `src/tui_main/shell_app.rs`, which asserts the same thing from
+/// rendered output.
+#[test]
+fn test_auto_popup_tab_does_not_accept_in_default_vim_mode() {
+    let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.editor_mode,
+        crate::core::settings::EditorMode::Vim,
+        "precondition: nothing set editor_mode away from its Vim default"
+    );
+    engine.buffer_mut().insert(0, "foobar\n");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'o'); // insert mode, new line
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    assert!(engine.completion_idx.is_some(), "popup should be active");
+    // Tab falls through to plain indentation instead of accepting.
+    press_special(&mut engine, "Tab");
+    assert!(
+        engine.completion_idx.is_none(),
+        "popup should still be dismissed by Tab (a non-completion key), \
+         just not via acceptance"
+    );
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    assert!(
+        !line1.starts_with("foobar"),
+        "Tab must NOT accept the completion in default (Vim) mode, got: {}",
+        line1
+    );
+    assert!(
+        line1.starts_with("fo") && line1.len() > "fo".len(),
+        "Tab should still insert its normal indentation after \"fo\", got: {}",
         line1
     );
 }

@@ -3304,7 +3304,10 @@ impl Engine {
     /// `handle_insert_key`:
     ///
     /// - `Ctrl+N` / `Ctrl+P` — always (start or cycle word completion).
-    /// - `Tab` / `Down` / `Up` — only while a display-only popup is active.
+    /// - `Down` / `Up` — only while a display-only popup is active.
+    /// - The configured accept key (`completion_keys.accept`, mode-derived —
+    ///   `<Tab>` in Vscode mode, `<C-y>` in Vim mode — see #800) — only while
+    ///   a display-only popup is active.
     ///
     /// Dead in ShellApp mode until completion key intercept is re-wired (#448-C follow-on).
     #[allow(dead_code)]
@@ -3319,7 +3322,14 @@ impl Engine {
         if !popup_active {
             return false;
         }
-        !ctrl && (key_name == "Tab" || key_name == "Down" || key_name == "Up")
+        if !ctrl && (key_name == "Down" || key_name == "Up") {
+            return true;
+        }
+        let accept_key = self
+            .settings
+            .completion_keys
+            .accept(self.settings.editor_mode);
+        Self::key_matches_binding(&accept_key, ctrl, key_name)
     }
 
     // ── Fold helpers ──────────────────────────────────────────────────────────
