@@ -1,0 +1,54 @@
+{
+  "_comment": [
+    "#796: single source of truth for this repo's branch-protection settings.",
+    "",
+    "CI runs on every PR and push to main/develop, but until #796 nothing",
+    "ENFORCED it: `develop` (the default branch, where all work lands) had no",
+    "protection object at all, and `main` had one with no required_status_checks",
+    "key — so a red CI run blocked nothing anywhere. This file plus",
+    "scripts/apply-branch-protection.sh turns that advisory signal into a gate,",
+    "and keeps the applied settings reviewable in git instead of living only in",
+    "the repo's web UI where drift is invisible.",
+    "",
+    "`required_contexts` MUST match the `name:` of every job in",
+    ".github/workflows/ci.yml exactly. A required context that names a job that",
+    "no longer exists is never reported, so it stays forever-pending and blocks",
+    "EVERY pull request. tests/branch_protection.rs asserts the two lists are",
+    "equal so a job rename fails the test suite instead of wedging the queue.",
+    "",
+    "Apply with:  scripts/apply-branch-protection.sh",
+    "Audit with:  scripts/apply-branch-protection.sh --check"
+  ],
+
+  "required_contexts": [
+    "Test (Linux, headless)",
+    "Test (Linux, headless, GUI feature on)"
+  ],
+
+  "branches": {
+    "main": {
+      "_comment": [
+        "Release branch. Only ever receives the develop -> main release PR, so",
+        "`strict` (branch must be up to date with base before merging) costs",
+        "nothing and guarantees the release commit was tested as it will land."
+      ],
+      "strict": true,
+      "enforce_admins": false
+    },
+    "develop": {
+      "_comment": [
+        "Default branch, receiving many concurrent agent branches. `strict` is",
+        "deliberately false: with strict on, every branch would need a rebase",
+        "and a full re-run each time another one landed, serialising the merge",
+        "queue for no real safety gain.",
+        "",
+        "enforce_admins:false is decision (c) from #796 — the gate binds the PR",
+        "merge button and any non-admin push, while the repo owner keeps a",
+        "deliberate escape hatch (CLAUDE.md 'Path A'). See CLAUDE.md",
+        "'Branch protection' for what that does and does not buy."
+      ],
+      "strict": false,
+      "enforce_admins": false
+    }
+  }
+}
