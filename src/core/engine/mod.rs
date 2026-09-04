@@ -27,6 +27,7 @@ use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
 use super::terminal::{default_shell, InstallContext};
 use super::view::{FoldRegion, View};
+use super::vim_regex;
 use super::window::{
     GroupDivider, GroupId, GroupLayout, SplitDirection, Window, WindowDivider, WindowId,
     WindowLayout, WindowRect,
@@ -2343,6 +2344,17 @@ pub struct Engine {
     pub search_index: Option<usize>,
     /// Direction of the last search operation.
     pub search_direction: SearchDirection,
+    /// Search offset from the last `/pat/{offset}` (`:h search-offset`), e.g.
+    /// `"e"`, `"e+1"`, `"b+2"`, `"+1"`. Empty when the search had no offset.
+    /// Re-applied by `n` / `N`, which is why it lives in engine state.
+    pub search_offset: String,
+    /// Whether `'smartcase'` may apply to the current pattern. False for `*`,
+    /// `#` and `gd`, which per `:h 'smartcase'` never consult the option.
+    pub(crate) search_smartcase_applies: bool,
+    /// Count typed before `/` or `?` (`3/foo` = "jump to the 3rd match").
+    /// Held across the command line because the count is consumed on entry but
+    /// only usable once the pattern is submitted.
+    pub(crate) search_pending_count: usize,
     /// Cursor position when search mode was entered (for incremental search)
     search_start_cursor: Option<Cursor>,
 
@@ -2620,10 +2632,6 @@ pub struct Engine {
     jump_list: Vec<JumpEntry>,
     /// Current position in jump list (points past the last entry when at newest).
     jump_list_pos: usize,
-
-    // --- Search word under cursor ---
-    /// Whether current search uses word boundaries (set by * and #).
-    search_word_bounded: bool,
 
     // --- Workspace ---
     /// Path to the loaded `.vimcode-workspace` file, if any.
@@ -3157,6 +3165,9 @@ pub struct Engine {
     // --- Last substitute (&) ---
     /// Last substitute (pattern, replacement, flags) for & repeat.
     pub last_substitute: Option<(String, String, String)>,
+    /// Last *expanded* `:s` replacement string. `~` in a later replacement and
+    /// `~` in a later pattern both expand to this (`:h sub-replace-special`).
+    pub last_sub_replacement: String,
 
     // --- Yank highlight (transient visual feedback) ---
     /// Region to highlight briefly after a yank operation: (start, end, is_linewise).
@@ -3565,6 +3576,9 @@ impl Engine {
             search_matches: Vec::new(),
             search_index: None,
             search_direction: SearchDirection::Forward,
+            search_offset: String::new(),
+            search_smartcase_applies: true,
+            search_pending_count: 1,
             search_start_cursor: None,
             replace_text: String::new(),
             replace_flags: String::new(),
@@ -3662,7 +3676,6 @@ impl Engine {
             leader_partial: None,
             jump_list: Vec::new(),
             jump_list_pos: 0,
-            search_word_bounded: false,
             find_replace_open: false,
             find_replace_query: String::new(),
             find_replace_replacement: String::new(),
@@ -3879,6 +3892,7 @@ impl Engine {
             last_inserted_text: String::new(),
             last_ex_command: None,
             last_substitute: None,
+            last_sub_replacement: String::new(),
             yank_highlight: None,
             bracket_match: None,
             insert_ctrl_r_pending: false,

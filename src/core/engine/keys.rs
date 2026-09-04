@@ -1635,8 +1635,8 @@ impl Engine {
                 self.command_cursor = 0;
                 self.search_direction = SearchDirection::Forward;
                 self.search_start_cursor = Some(self.view().cursor);
-                self.search_word_bounded = false; // Clear word-boundary mode
-                self.count = None; // Clear count when entering search mode
+                // `3/foo` jumps to the third match — keep the count for submit.
+                self.search_pending_count = self.take_count();
             }
             Some('?') => {
                 self.mode = Mode::Search;
@@ -1644,8 +1644,8 @@ impl Engine {
                 self.command_cursor = 0;
                 self.search_direction = SearchDirection::Backward;
                 self.search_start_cursor = Some(self.view().cursor);
-                self.search_word_bounded = false; // Clear word-boundary mode
-                self.count = None; // Clear count when entering search mode
+                // `3?foo` jumps to the third match backwards.
+                self.search_pending_count = self.take_count();
             }
             _ => match key_name {
                 "Escape" => {
@@ -5961,20 +5961,17 @@ impl Engine {
                 let query = self.command_buffer.clone();
                 self.command_buffer.clear();
 
-                // Add to search history
+                // Restore the pre-search cursor so the submitted search starts
+                // from where the user typed `/`, not from wherever incremental
+                // search parked the cursor. `submit_search` then does all the
+                // positioning (offset + `;` chaining + count), which keeps the
+                // incsearch-on and incsearch-off paths identical.
+                if let Some(start) = self.search_start_cursor.take() {
+                    self.view_mut().cursor = start;
+                    self.push_jump_location();
+                }
+
                 if !query.is_empty() {
-                    // Push the pre-search position to the jump list so Ctrl-O returns here.
-                    // With incremental search the cursor has already moved; push the saved
-                    // start position (where the cursor was before the user typed `/`).
-                    if let Some(start) = self.search_start_cursor {
-                        let live = self.view().cursor;
-                        self.view_mut().cursor = start;
-                        self.push_jump_location();
-                        self.view_mut().cursor = live;
-                    }
-
-                    self.search_start_cursor = None; // Clear saved cursor position
-
                     self.history.add_search(&query);
                     self.search_history_index = None;
                     self.search_typing_buffer.clear();
@@ -5982,28 +5979,11 @@ impl Engine {
                     // Save session state
                     let _ = self.session.save();
                     let _ = self.history.save();
-
-                    self.search_query = query;
-                    self.run_search();
-                    // If incremental search is enabled, cursor is already at the correct match
-                    // Otherwise, jump to first match in the appropriate direction
-                    if !self.settings.incremental_search {
-                        match self.search_direction {
-                            SearchDirection::Forward => self.search_next(),
-                            SearchDirection::Backward => self.search_prev(),
-                        }
-                    }
-                } else {
-                    self.search_start_cursor = None;
-                    // Empty query with existing search — repeat in current direction
-                    if !self.search_query.is_empty() {
-                        self.run_search();
-                        match self.search_direction {
-                            SearchDirection::Forward => self.search_next(),
-                            SearchDirection::Backward => self.search_prev(),
-                        }
-                    }
                 }
+
+                let count = self.search_pending_count.max(1);
+                self.search_pending_count = 1;
+                self.submit_search(&query, count);
             }
             "Up" => {
                 // Cycle to previous search
