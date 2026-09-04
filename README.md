@@ -47,7 +47,7 @@ some test text
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core (`src/core/`), 5,501 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core (`src/core/`), 5,547 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
