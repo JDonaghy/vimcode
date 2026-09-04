@@ -9,8 +9,8 @@ impl Engine {
         }
 
         // Handle :norm[al][!] before trimming — keys may contain significant trailing whitespace
-        if let Some((range_str, keys)) = try_parse_norm(cmd.trim_start()) {
-            return self.execute_norm_command(range_str, keys);
+        if let Some(action) = self.try_execute_norm(cmd.trim_start()) {
+            return action;
         }
 
         let cmd = cmd.trim();
@@ -23,7 +23,7 @@ impl Engine {
             .as_bytes()
             .first()
             .is_some_and(|b| b.is_ascii_digit() || b".$'%+-/?<>,;".contains(b))
-            || matches!(cmd, "d" | "delete" | "y" | "yank" | "j" | "join")
+            || is_ranged_ex_name(cmd)
         {
             if let Some(action) = self.try_execute_ranged_command(cmd) {
                 return action;
@@ -2422,37 +2422,39 @@ impl Engine {
         }
     }
 
-    pub(crate) fn execute_norm_command(&mut self, range_str: &str, keys: &str) -> EngineAction {
+    /// `:[range]norm[al][!] {keys}` — the range is a full ex range, so
+    /// `:2normal $`, `:%normal Ax` and `:'a,'bnormal .` all work.
+    pub(crate) fn try_execute_norm(&mut self, cmd: &str) -> Option<EngineAction> {
+        let chars: Vec<char> = cmd.chars().collect();
+        let (range, consumed) = self.parse_ex_range(&chars);
+        let rest: String = chars[consumed..].iter().collect();
+        let keys = rest
+            .strip_prefix("normal! ")
+            .or_else(|| rest.strip_prefix("normal "))
+            .or_else(|| rest.strip_prefix("norm! "))
+            .or_else(|| rest.strip_prefix("norm "))?
+            .to_string();
+        let last = self.buffer().len_lines().saturating_sub(1);
+        let (start, end) = match range {
+            Some((a, b)) => ((a.max(0) as usize).min(last), (b.max(0) as usize).min(last)),
+            None => {
+                let l = self.view().cursor.line;
+                (l, l)
+            }
+        };
+        Some(self.execute_norm_range(start, end, &keys))
+    }
+
+    pub(crate) fn execute_norm_range(
+        &mut self,
+        start_line: usize,
+        end_line: usize,
+        keys: &str,
+    ) -> EngineAction {
         if keys.is_empty() {
             self.message = "Usage: :norm[al][!] {keys}".to_string();
             return EngineAction::Error;
         }
-
-        let total_lines = self.buffer().len_lines();
-
-        // Resolve range to 0-based (start_line, end_line)
-        let (start_line, end_line) = if range_str == "%" {
-            (0usize, total_lines.saturating_sub(1))
-        } else if range_str == "'<,'>" {
-            match self.get_visual_selection_range() {
-                Some((start, end)) => (start.line, end.line),
-                None => {
-                    self.message = "No visual selection".to_string();
-                    return EngineAction::Error;
-                }
-            }
-        } else if !range_str.is_empty() {
-            // Numeric range "N,M" (1-based line numbers → 0-based)
-            let mut parts = range_str.splitn(2, ',');
-            let start: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-            let end: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(start);
-            let s = start.saturating_sub(1).min(total_lines.saturating_sub(1));
-            let e = end.saturating_sub(1).min(total_lines.saturating_sub(1));
-            (s, e)
-        } else {
-            let l = self.view().cursor.line;
-            (l, l)
-        };
 
         let keys_chars: Vec<char> = keys.chars().collect();
 
@@ -2507,7 +2509,16 @@ impl Engine {
                 self.macro_recursion_depth -= 1;
             }
 
-            // Ensure Normal mode after each line's key sequence
+            // `:normal @a` must play the macro back *now*, on this line — the
+            // UI normally pumps the queue between keystrokes, and there is no
+            // pump inside an ex command.
+            self.drain_macro_queue();
+
+            // Vim ends an unterminated `:normal` insert as if <Esc> were typed,
+            // which shifts the cursor one column left (`:normal Ax` → col 2).
+            if self.mode != Mode::Normal {
+                self.handle_key("Escape", None, false);
+            }
             self.mode = Mode::Normal;
             self.pending_key = None;
         }
@@ -2773,263 +2784,106 @@ impl Engine {
 
     /// :m[ove] {dest} — move current line to after line {dest}.
     /// dest: absolute line number (1-based), 0 = before first line, . = current, $ = last, +N/-N = relative.
+    /// `:[range]m[ove] {addr}` — move lines to after `{addr}`.
     pub(crate) fn execute_move_command(&mut self, dest: &str) -> EngineAction {
-        let current_line = self.view().cursor.line;
-        let num_lines = self.buffer().len_lines();
-        let dest_line = self.parse_line_address(dest, current_line, num_lines);
-
-        if dest_line == current_line {
-            return EngineAction::None;
-        }
-
-        // Grab the line content to move
-        let line_start = self.buffer().line_to_char(current_line);
-        let line_end = if current_line + 1 < num_lines {
-            self.buffer().line_to_char(current_line + 1)
-        } else {
-            self.buffer().len_chars()
-        };
-        let line_text: String = self
-            .buffer()
-            .content
-            .slice(line_start..line_end)
-            .chars()
-            .collect();
-        let line_text = if line_text.ends_with('\n') {
-            line_text
-        } else {
-            format!("{}\n", line_text)
-        };
-
-        self.start_undo_group();
-
-        if dest_line > current_line {
-            // Insert first (positions shift after deletion)
-            let insert_after = dest_line.min(num_lines - 1);
-            let insert_pos = if insert_after + 1 < num_lines {
-                self.buffer().line_to_char(insert_after + 1)
-            } else {
-                self.buffer().len_chars()
-            };
-            self.insert_with_undo(insert_pos, &line_text);
-            // Delete original
-            let line_start2 = self.buffer().line_to_char(current_line);
-            let line_end2 = self.buffer().line_to_char(current_line + 1);
-            self.delete_with_undo(line_start2, line_end2);
-            self.view_mut().cursor.line = dest_line;
-        } else {
-            // Delete first
-            let del_end = if current_line < self.buffer().len_lines() {
-                self.buffer().line_to_char(current_line + 1)
-            } else {
-                self.buffer().len_chars()
-            };
-            self.delete_with_undo(line_start, del_end);
-            // Insert after dest_line
-            let insert_pos = if dest_line < self.buffer().len_lines() {
-                let after = if dest_line == 0 { 0 } else { dest_line };
-                if after == 0 {
-                    0usize
-                } else {
-                    self.buffer().line_to_char(after)
-                }
-            } else {
-                self.buffer().len_chars()
-            };
-            self.insert_with_undo(insert_pos, &line_text);
-            self.view_mut().cursor.line = if dest_line == 0 { 0 } else { dest_line };
-        }
-
-        self.finish_undo_group();
-        let max_line = self.buffer().len_lines().saturating_sub(1);
-        self.view_mut().cursor.line = self.view().cursor.line.min(max_line);
-        self.view_mut().cursor.col = 0;
-        EngineAction::None
+        let cur = self.view().cursor.line;
+        self.ex_copy_move(cur, cur, dest, true)
     }
 
-    /// :[start,end]m {dest} — move a range of lines to after line {dest}.
-    /// Lines are 0-indexed inclusive. `dest` is an address string.
+    /// `:[range]t` / `:[range]co[py] {addr}` — copy lines to after `{addr}`.
+    pub(crate) fn execute_copy_command(&mut self, dest: &str) -> EngineAction {
+        let cur = self.view().cursor.line;
+        self.ex_copy_move(cur, cur, dest, false)
+    }
+
     pub(crate) fn execute_move_range(
         &mut self,
-        src_start: usize,
-        src_end: usize,
+        start: usize,
+        end: usize,
         dest: &str,
     ) -> EngineAction {
-        let num_lines = self.buffer().len_lines();
-        if src_start > src_end {
-            self.message = "Invalid range".to_string();
-            return EngineAction::Error;
-        }
-        let current = self.view().cursor.line;
-        let dest_line = self.parse_line_address(dest, current, num_lines);
-        // Dest inside source range is a no-op (Vim disallows it; we silently skip).
-        if dest_line >= src_start && dest_line <= src_end {
-            return EngineAction::None;
-        }
-        let line_count = src_end - src_start + 1;
-
-        let block_start = self.buffer().line_to_char(src_start);
-        let block_end = if src_end + 1 < num_lines {
-            self.buffer().line_to_char(src_end + 1)
-        } else {
-            self.buffer().len_chars()
-        };
-        let block_text: String = self
-            .buffer()
-            .content
-            .slice(block_start..block_end)
-            .chars()
-            .collect();
-        let block_text = if block_text.ends_with('\n') {
-            block_text
-        } else {
-            format!("{}\n", block_text)
-        };
-
-        self.start_undo_group();
-        // Delete source first, then compute adjusted dest in the post-deletion buffer.
-        self.delete_with_undo(block_start, block_end);
-        let post_num_lines = self.buffer().len_lines();
-        let dest_is_zero = dest.trim() == "0";
-        let adjusted_dest = if dest_line > src_end {
-            dest_line - line_count
-        } else {
-            dest_line
-        };
-        let insert_pos = if dest_is_zero {
-            0
-        } else if adjusted_dest + 1 >= post_num_lines {
-            self.buffer().len_chars()
-        } else {
-            self.buffer().line_to_char(adjusted_dest + 1)
-        };
-        self.insert_with_undo(insert_pos, &block_text);
-        self.finish_undo_group();
-
-        let new_cursor_line = if dest_is_zero {
-            line_count - 1
-        } else {
-            adjusted_dest + line_count
-        };
-        let max_line = self.buffer().len_lines().saturating_sub(1);
-        self.view_mut().cursor.line = new_cursor_line.min(max_line);
-        self.view_mut().cursor.col = 0;
-        EngineAction::None
+        self.ex_copy_move(start, end, dest, true)
     }
 
-    /// :[start,end]co {dest} / :t {dest} — copy a range of lines to after line {dest}.
     pub(crate) fn execute_copy_range(
         &mut self,
-        src_start: usize,
-        src_end: usize,
+        start: usize,
+        end: usize,
         dest: &str,
     ) -> EngineAction {
-        let num_lines = self.buffer().len_lines();
-        if src_start > src_end {
-            self.message = "Invalid range".to_string();
-            return EngineAction::Error;
-        }
-        let current = self.view().cursor.line;
-        let dest_line = self.parse_line_address(dest, current, num_lines);
-        let line_count = src_end - src_start + 1;
-
-        let block_start = self.buffer().line_to_char(src_start);
-        let block_end = if src_end + 1 < num_lines {
-            self.buffer().line_to_char(src_end + 1)
-        } else {
-            self.buffer().len_chars()
-        };
-        let block_text: String = self
-            .buffer()
-            .content
-            .slice(block_start..block_end)
-            .chars()
-            .collect();
-        let block_text = if block_text.ends_with('\n') {
-            block_text
-        } else {
-            format!("{}\n", block_text)
-        };
-
-        let dest_is_zero = dest.trim() == "0";
-        let insert_pos = if dest_is_zero {
-            0
-        } else if dest_line + 1 >= num_lines {
-            self.buffer().len_chars()
-        } else {
-            self.buffer().line_to_char(dest_line + 1)
-        };
-
-        self.start_undo_group();
-        self.insert_with_undo(insert_pos, &block_text);
-        self.finish_undo_group();
-
-        let new_cursor_line = if dest_is_zero {
-            line_count - 1
-        } else {
-            dest_line + line_count
-        };
-        let max_line = self.buffer().len_lines().saturating_sub(1);
-        self.view_mut().cursor.line = new_cursor_line.min(max_line);
-        self.view_mut().cursor.col = 0;
-        EngineAction::None
+        self.ex_copy_move(start, end, dest, false)
     }
 
-    /// :t {dest} / :co[py] {dest} — copy current line to after line {dest}.
-    pub(crate) fn execute_copy_command(&mut self, dest: &str) -> EngineAction {
-        let current_line = self.view().cursor.line;
-        let num_lines = self.buffer().len_lines();
-        let dest_line = self.parse_line_address(dest, current_line, num_lines);
+    /// Shared implementation of `:t` / `:co[py]` and `:m[ove]`.
+    ///
+    /// `dest` is a full ex address, so `$`, `.`, `+N`, `-N`, `'a` and `/pat/`
+    /// all work. Vim's address `0` means "before the first line", which the old
+    /// 0-based-usize address helper could not express — hence the `isize` here,
+    /// where `-1` is that "before line 1" position.
+    fn ex_copy_move(
+        &mut self,
+        start: usize,
+        end: usize,
+        dest: &str,
+        is_move: bool,
+    ) -> EngineAction {
+        let n = self.buffer().len_lines();
+        if n == 0 || start > end || start >= n {
+            return EngineAction::None;
+        }
+        let end = end.min(n - 1);
 
-        // Grab the line content to copy
-        let line_start = self.buffer().line_to_char(current_line);
-        let line_end = if current_line + 1 < num_lines {
-            self.buffer().line_to_char(current_line + 1)
-        } else {
-            self.buffer().len_chars()
+        let dest_chars: Vec<char> = dest.chars().collect();
+        let mut di = 0usize;
+        let cur = self.view().cursor.line;
+        let Some(mut dest_line) = self.parse_ex_address(&dest_chars, &mut di, cur) else {
+            self.message = format!("E14: Invalid address: {dest}");
+            return EngineAction::Error;
         };
-        let line_text: String = self
-            .buffer()
-            .content
-            .slice(line_start..line_end)
-            .chars()
+
+        if is_move && dest_line >= start as isize && dest_line < end as isize {
+            self.message = "E134: Cannot move a range of lines into itself".to_string();
+            return EngineAction::Error;
+        }
+
+        let mut lines: Vec<String> = (0..n)
+            .map(|i| {
+                let s: String = self.buffer().content.line(i).chars().collect();
+                s.trim_end_matches('\n').to_string()
+            })
             .collect();
-        let line_text = if line_text.ends_with('\n') {
-            line_text
-        } else {
-            format!("{}\n", line_text)
-        };
+        let block: Vec<String> = lines[start..=end].to_vec();
 
-        // Insert copy after dest_line. The special address "0" means "insert
-        // before line 1" — at char 0 — and is NOT a normal "after line N" op.
-        let dest_is_zero = dest.trim() == "0";
-        let insert_pos = if dest_is_zero {
-            0
-        } else if dest_line >= num_lines {
-            self.buffer().len_chars()
-        } else {
-            let after = dest_line.min(num_lines - 1);
-            if after + 1 < num_lines {
-                self.buffer().line_to_char(after + 1)
-            } else {
-                self.buffer().len_chars()
+        if is_move {
+            lines.drain(start..=end);
+            if dest_line > end as isize {
+                dest_line -= (end - start + 1) as isize;
             }
-        };
+        }
 
-        self.start_undo_group();
-        self.insert_with_undo(insert_pos, &line_text);
-        self.finish_undo_group();
+        // `dest_line` is the line the block goes *after*; `-1` is the very top.
+        let insert_at = (dest_line + 1).max(0) as usize;
+        let insert_at = insert_at.min(lines.len());
+        let block_len = block.len();
+        for (k, line) in block.into_iter().enumerate() {
+            lines.insert(insert_at + k, line);
+        }
 
-        let new_line = if dest_is_zero {
-            0
-        } else if dest_line < current_line {
-            current_line + 1
-        } else {
-            dest_line + 1
+        let had_trailing_newline = {
+            let len = self.buffer().len_chars();
+            len == 0 || self.buffer().content.char(len - 1) == '\n'
         };
-        let max_line = self.buffer().len_lines().saturating_sub(1);
-        self.view_mut().cursor.line = new_line.min(max_line);
-        self.view_mut().cursor.col = 0;
+        let mut new_text = lines.join("\n");
+        if had_trailing_newline {
+            new_text.push('\n');
+        }
+        self.splice_buffer_text(&new_text);
+
+        // Vim leaves the cursor on the last copied/moved line.
+        let target = (insert_at + block_len - 1).min(self.buffer().len_lines().saturating_sub(1));
+        self.view_mut().cursor.line = target;
+        self.view_mut().cursor.col = self.first_non_blank_col(target);
+        self.clamp_cursor_col();
         EngineAction::None
     }
 
@@ -3474,6 +3328,7 @@ impl Engine {
         let mut done_lines: Vec<usize> = Vec::new();
         let mut n_subs = 0usize;
         let mut last_end_in_out: Option<usize> = None;
+        let mut last_was_multiline = false;
 
         while at <= body.len() {
             let Some(caps) = compiled.regex.captures_at(body, at) else {
@@ -3523,6 +3378,7 @@ impl Engine {
             n_subs += 1;
 
             let eline = line_of(mend);
+            last_was_multiline = eline > sline;
             if eline > sline {
                 // A match that swallowed a line break merges those lines, and
                 // Vim re-scans the merged line (`lnum -= nmatch_tl`) — which is
@@ -3582,6 +3438,16 @@ impl Engine {
         let target_line = last_end_in_out
             .map(|b| out[..b].matches('\n').count())
             .unwrap_or(cur);
+        // A substitution that swallowed a line break leaves the cursor on the
+        // join column rather than the first non-blank (`:%s/\n//`).
+        let target_col = if last_was_multiline {
+            last_end_in_out.map(|b| {
+                let line_start = out[..b].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                out[line_start..b].chars().count()
+            })
+        } else {
+            None
+        };
 
         let new_full = format!("{out}{trailing}");
         self.splice_buffer_text(&new_full);
@@ -3589,7 +3455,8 @@ impl Engine {
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let target_line = target_line.min(max_line);
         self.view_mut().cursor.line = target_line;
-        self.view_mut().cursor.col = self.first_non_blank_col(target_line);
+        self.view_mut().cursor.col =
+            target_col.unwrap_or_else(|| self.first_non_blank_col(target_line));
         self.clamp_cursor_col();
 
         self.message = format!(
@@ -4268,6 +4135,12 @@ impl Engine {
                 self.join_lines(end - start + 1, &mut changed);
             }
             self.finish_undo_group();
+            // Ex `:join` ends on the first non-blank of the joined line, unlike
+            // normal-mode `J` which parks the cursor on the join point.
+            let line = start.min(self.buffer().len_lines().saturating_sub(1));
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = self.first_non_blank_col(line);
+            self.clamp_cursor_col();
             return Some(EngineAction::None);
         }
 
@@ -4466,6 +4339,20 @@ pub(crate) fn expand_replacement<'a>(
         }
     }
     out
+}
+
+/// Does `cmd` start with one of the ex commands that `try_execute_ranged_command`
+/// handles, so it is worth parsing a range for even without a leading address?
+pub(crate) fn is_ranged_ex_name(cmd: &str) -> bool {
+    let (name, _) = split_ex_name(cmd);
+    let name = name.strip_suffix('!').unwrap_or(name);
+    if name.is_empty() {
+        return false;
+    }
+    ["delete", "yank", "join", "copy", "move"]
+        .iter()
+        .any(|full| full.starts_with(name))
+        || name == "t"
 }
 
 /// Split `rest` into an ex command name and its argument.
