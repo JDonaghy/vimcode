@@ -677,14 +677,11 @@ fn test_d_right_brace_paragraph_forward() {
     let mut e = engine_with("aaa\nbbb\n\nccc\nddd\n");
     press(&mut e, 'd');
     press(&mut e, '}');
-    // d} deletes lines before the blank line, keeping the blank line.
-    // Neovim: "\nccc\nddd" (blank line preserved).
-    let b = buf(&e);
-    assert!(
-        b.starts_with("\nccc") || b.starts_with("ccc"),
-        "should have ccc after deleting paragraph; got: {:?}",
-        b
-    );
+    // d} is exclusive; since the motion lands in column 1, the end moves back
+    // to the end of the previous line (:help exclusive), so the blank line
+    // is preserved and NOT deleted. Neovim: "\nccc\nddd" with cursor at (0,0).
+    assert_buf(&e, "\nccc\nddd\n");
+    assert_cursor(&e, 0, 0);
 }
 
 #[test]
@@ -720,13 +717,10 @@ fn test_d_right_paren_sentence_forward() {
     let mut e = engine_with("Hello world. Goodbye world.\n");
     press(&mut e, 'd');
     press(&mut e, ')');
-    // Should delete to next sentence start
-    let b = buf(&e);
-    assert!(
-        b.contains("Goodbye") || b.starts_with("Goodbye"),
-        "second sentence should remain: {:?}",
-        b
-    );
+    // d) deletes the first sentence (including its trailing space), leaving
+    // exactly the second sentence with the cursor on its first character.
+    assert_buf(&e, "Goodbye world.\n");
+    assert_cursor(&e, 0, 0);
 }
 
 // ── dW/dB/dE: WORD motions ──────────────────────────────────────────────────
@@ -1215,11 +1209,7 @@ fn test_dgg_from_last_line_deletes_entire_file() {
     press(&mut e, 'd');
     press(&mut e, 'g');
     press(&mut e, 'g');
-    // Should delete all lines
-    let b = buf(&e);
-    assert!(
-        b.trim().is_empty() || b == "\n",
-        "file should be empty after dgg from last line, got: {:?}",
-        b
-    );
+    // dgg from the last line deletes the whole file, leaving an empty buffer.
+    assert_buf(&e, "");
+    assert_cursor(&e, 0, 0);
 }
