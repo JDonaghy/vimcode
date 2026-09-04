@@ -105,6 +105,9 @@ fn test_gu_word_uppercase() {
 fn test_gn_selects_next_match() {
     let mut e = engine_with("foo bar foo\n");
     search_fwd(&mut e, "foo");
+    // #801: `/foo` from column 0 now lands on the *second* match, as Vim does.
+    // Reset to the buffer start so this test still exercises what it names.
+    e.view_mut().cursor.col = 0;
     // n moves to the second "foo"
     press(&mut e, 'n');
     // gn enters visual mode selecting the match "foo" (cols 8-10)
@@ -120,6 +123,9 @@ fn test_gn_selects_next_match() {
 fn test_cgn_changes_next_match() {
     let mut e = engine_with("foo bar foo\n");
     search_fwd(&mut e, "foo");
+    // #801: `/foo` from column 0 now lands on the *second* match, as Vim does.
+    // Reset to the buffer start so this test still exercises what it names.
+    e.view_mut().cursor.col = 0;
     // Start at the first foo; cgn should delete "foo" and enter Insert
     press(&mut e, 'c');
     press(&mut e, 'g');
