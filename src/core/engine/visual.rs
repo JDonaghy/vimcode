@@ -354,8 +354,29 @@ impl Engine {
             self.visual_anchor = None;
             self.visual_dollar = false;
         } else {
-            // Charwise / blockwise: delete selection normally
+            // Charwise / blockwise: delete selection normally. For a
+            // blockwise change, capture the block's row range and left
+            // column *before* the delete clears `visual_anchor`/mode, and
+            // reuse `visual_block_insert_info` — the same mechanism block
+            // `I`/`A` use — so the shared Escape handler applies whatever
+            // gets typed to every row in the block, not just the one the
+            // cursor lands on (Vim: blockwise `c` is a blockwise delete
+            // followed by a blockwise insert at the same column).
+            let block_info = if self.mode == Mode::VisualBlock {
+                self.visual_anchor
+                    .zip(self.get_visual_selection_range())
+                    .map(|(anchor, (start, end))| {
+                        let left_col = anchor.col.min(self.view().cursor.col);
+                        (start.line, end.line, left_col)
+                    })
+            } else {
+                None
+            };
             self.delete_visual_selection(changed);
+            if let Some((start_line, end_line, left_col)) = block_info {
+                self.visual_block_insert_info =
+                    Some((start_line, end_line, left_col, false, false));
+            }
         }
 
         // The delete already finished the undo group and set mode to Normal

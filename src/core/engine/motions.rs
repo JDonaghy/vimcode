@@ -1456,8 +1456,17 @@ impl Engine {
 
         let line_len = self.buffer().line_len_chars(line);
 
-        // Line with no characters or just newline
-        if line_len == 0 || line_len == 1 {
+        // A line with zero chars is trivially empty. Do NOT special-case
+        // `line_len == 1` as "just a newline" — the *last* line of a buffer
+        // with no trailing newline also has length 1, and its one character
+        // can be real content (e.g. a single-char last paragraph). That
+        // false positive made `ap`/`ip` paragraph-boundary detection treat
+        // that line as blank: `dap` would swallow it as a "trailing blank"
+        // and delete past it, and `ip`/`ap` would stop just short of
+        // including it. The loop below already handles both `line_len == 0`
+        // (never runs, falls through to `true`) and a real lone `"\n"`
+        // (matches whitespace) correctly, so it covers this case too.
+        if line_len == 0 {
             return true;
         }
 
@@ -1799,9 +1808,33 @@ impl Engine {
 
         let char_at_cursor = self.buffer().content.char(cursor_pos);
 
-        // If on whitespace and modifier is 'i', no match
-        if modifier == 'i' && (char_at_cursor.is_whitespace() && char_at_cursor != '\n') {
-            return None;
+        // `iw` on whitespace selects the contiguous run of blanks itself
+        // (Vim treats a blank run as its own "word" class for `iw`/`iW`) —
+        // it is NOT "no object", which is what an earlier version of this
+        // function returned, silently no-opping `diw`/`ciw` etc. on any
+        // whitespace character (including a lone isolated space).
+        if modifier == 'i' && char_at_cursor.is_whitespace() && char_at_cursor != '\n' {
+            let mut start = cursor_pos;
+            let mut end = cursor_pos;
+            while start > 0 {
+                let ch = self.buffer().content.char(start - 1);
+                if !ch.is_whitespace() || ch == '\n' {
+                    break;
+                }
+                start -= 1;
+            }
+            while end < total_chars {
+                let ch = self.buffer().content.char(end);
+                if !ch.is_whitespace() || ch == '\n' {
+                    break;
+                }
+                end += 1;
+            }
+            return if start < end {
+                Some((start, end))
+            } else {
+                None
+            };
         }
 
         // Find word boundaries

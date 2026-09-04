@@ -1286,62 +1286,11 @@ pub fn resolve_context_menu_click(
     ContextMenuClickResult::InsidePopup
 }
 
-/// Represents a change operation that can be repeated with `.`
-#[derive(Debug, Clone)]
-struct Change {
-    /// Type of operation
-    op: ChangeOp,
-    /// Text inserted (for insert operations)
-    text: String,
-    /// Count used with the operation
-    count: usize,
-    /// Motion used with operator (for d/c with motions)
-    motion: Option<Motion>,
-}
-
 /// C preprocessor directive kind for `[#` / `]#` navigation.
 pub(crate) enum PreprocKind {
     If,
     ElseElif,
     Endif,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-enum ChangeOp {
-    Insert,
-    Delete,
-    Change,
-    Substitute,
-    SubstituteLine,
-    DeleteToEnd,
-    ChangeToEnd,
-    Replace,
-    ToggleCase,
-    Join,
-    Indent,
-    Dedent,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-enum Motion {
-    Left,
-    Right,
-    Up,
-    Down,
-    WordForward,
-    WordBackward,
-    WordEnd,
-    WordBackwardEnd,
-    LineStart,
-    LineEnd,
-    DeleteLine,
-    CharFind(char, char), // (motion_type, target_char)
-    ParagraphForward,
-    ParagraphBackward,
-    MatchingBracket,
-    TextObject(char, char), // (modifier, object) - e.g., ('i', 'w')
 }
 
 /// Which section of the debug sidebar currently has the selection cursor.
@@ -2440,16 +2389,28 @@ pub struct Engine {
     pub pending_text_object: Option<char>,
 
     // --- Repeat state ---
-    /// Last change operation for repeat (.)
-    last_change: Option<Change>,
+    /// Encoded keystrokes (Vim key-notation, same alphabet as macro recording)
+    /// for the in-progress candidate dot-repeat command. Bracketed by
+    /// transitions in/out of a "neutral" state (Normal mode, no pending
+    /// operator/motion/register-prefix) — see `is_dot_repeat_neutral`.
+    dot_scratch: Vec<char>,
+    /// Whether an undo-tracked edit has happened since `dot_scratch` was last
+    /// empty — decides whether the in-progress candidate gets finalized (as
+    /// the new `.` target) or discarded when we return to neutral.
+    dot_scratch_any_change: bool,
+    /// The last dot-repeatable command's keystrokes, with any leading count
+    /// digits stripped out into `last_dot_count`. `.` replays this verbatim
+    /// (optionally prefixed by a new count) through the same key dispatcher
+    /// that produced it, rather than replaying stored text.
+    last_dot_keys: Option<String>,
+    /// The leading count recorded with `last_dot_keys` (None = no explicit
+    /// count was given). A count typed before `.` overrides this.
+    last_dot_count: Option<usize>,
     /// Text accumulated during insert mode for repeat
     insert_text_buffer: String,
     /// When true, Replace mode uses virtual column awareness (gR).
     /// Tabs are expanded to spaces before overwriting.
     virtual_replace: bool,
-    /// When insert mode was entered via a change operator (cw, ce, cb, etc.),
-    /// stores (motion_char, count) so `.` can replay the full change.
-    pending_change_motion: Option<(char, usize)>,
 
     // --- Settings ---
     /// Editor settings (line numbers, etc.)
@@ -3202,6 +3163,9 @@ pub struct Engine {
     /// Count for o/O repeat: when >1, Escape from insert repeats the typed text
     /// on additional new lines (Vim behavior for 3oXX<Esc>).
     pub insert_open_count: usize,
+    /// Count for i/a/I/A repeat: when >1, Escape from insert repeats the
+    /// typed text in place (Vim behavior for 3ihello<Esc>).
+    pub insert_repeat_count: usize,
     /// Force motion mode: 'v' = charwise, 'V' = linewise.
     /// Set by pressing v/V/CTRL-V while an operator is pending (e.g., dVj).
     pub force_motion_mode: Option<char>,
@@ -3607,10 +3571,12 @@ impl Engine {
             pending_operator: None,
             pending_find_operator: None,
             pending_text_object: None,
-            last_change: None,
+            dot_scratch: Vec::new(),
+            dot_scratch_any_change: false,
+            last_dot_keys: None,
+            last_dot_count: None,
             insert_text_buffer: String::new(),
             virtual_replace: false,
-            pending_change_motion: None,
             settings_mtime,
             settings_save_revision: crate::core::settings::save_revision(),
             settings,
@@ -3908,6 +3874,7 @@ impl Engine {
             insert_ctrl_v_pending: false,
             visual_block_insert_info: None,
             insert_open_count: 0,
+            insert_repeat_count: 0,
             force_motion_mode: None,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
