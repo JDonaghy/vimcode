@@ -1,0 +1,2522 @@
+   Compiling vimcode v0.10.0 (/home/john/src/vimcode/.claude/worktrees/agent-a0ef291fdaf7cef3b)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.86s
+     Running tests/nvim_conformance.rs (target/debug/deps/nvim_conformance-6eed7831e8884ff0)
+
+running 1 test
+
+=== Neovim Conformance Results ===
+Passed: 808
+Failed: 624
+Total:  1432
+
+Failures:
+FAIL BUF+CUR [op:2dw across line end] keys="2dw" start=["a b", "c d"]@(1,3)
+  buffer: nvim="a d" vimcode="a \nc d"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF [op:3dw crossing lines] keys="3dw" start=["one two", "three four"]@(1,5)
+  buffer: nvim="one " vimcode="one \nthree four"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF [op:cw on whitespace] keys="cwX<Esc>" start=["foo   bar"]@(1,4)
+  buffer: nvim="fooXbar" vimcode="fooX"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF [op:cw on punctuation] keys="cwX<Esc>" start=["foo.bar"]@(1,4)
+  buffer: nvim="fooXbar" vimcode="fooX"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF+CUR [op:cc keeps indent] keys="ccX<Esc>" start=["    foo", "bar"]@(1,6)
+  buffer: nvim="    X\nbar" vimcode="X\nbar"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL BUF+CUR [op:2cc] keys="2ccX<Esc>" start=["  a", "  b", "c"]@(1,1)
+  buffer: nvim="  X\nc" vimcode="X\n  b\nc"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF [op:d% before paren] keys="d%" start=["foo(a, b) bar"]@(1,1)
+  buffer: nvim=" bar" vimcode="foo(a, b) bar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:d/pat] keys="d/baz<CR>" start=["foo bar baz"]@(1,1)
+  buffer: nvim="baz" vimcode="fz\noo bar baz"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF+CUR [op:d/pat/e] keys="d/bar/e<CR>" start=["foo bar baz"]@(1,1)
+  buffer: nvim=" baz" vimcode="fr/e\noo bar baz"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF+CUR [op:d?pat] keys="d?foo<CR>" start=["foo bar baz"]@(1,9)
+  buffer: nvim="baz" vimcode="foo bar baz"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL BUF [op:dn] keys="/foo<CR>ggdn" start=["foo bar foo baz"]@(1,1)
+  buffer: nvim="foo baz" vimcode="foo bar foo baz"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:d/pat multiline] keys="d/ccc<CR>" start=["aaa", "bbb", "ccc"]@(1,2)
+  buffer: nvim="a\nccc" vimcode="c\n\nbbb\nccc"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF [op:d/pat/+1 linewise] keys="d/bbb/+1<CR>" start=["aaa", "bbb", "ccc", "ddd"]@(1,1)
+  buffer: nvim="ddd" vimcode="aaa\nbbb\nccc\nddd"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:d/pat to col1 exclusive rule] keys="d/ccc<CR>" start=["aaa", "bbb", "ccc"]@(1,1)
+  buffer: nvim="ccc" vimcode="c\n\nbbb\nccc"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL CUR [op:t; then ; repeat] keys="t;;" start=["foo; bar; baz"]@(1,1)
+  buffer: nvim="foo; bar; baz" vimcode="foo; bar; baz"
+  cursor: nvim=(1,8) vimcode=(1,3)
+
+FAIL CUR [op:t; then ; then ;] keys="t;;;" start=["a;b;c;d"]@(1,1)
+  buffer: nvim="a;b;c;d" vimcode="a;b;c;d"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL CUR [op:t, ; ,] keys="t,;," start=["a,b,c,d"]@(1,1)
+  buffer: nvim="a,b,c,d" vimcode="a,b,c,d"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [op:T, then ;] keys="T,;" start=["a,b,c,d"]@(1,7)
+  buffer: nvim="a,b,c,d" vimcode="a,b,c,d"
+  cursor: nvim=(1,5) vimcode=(1,7)
+
+FAIL BUF [op:x on empty line] keys="x" start=["", "x"]@(1,1)
+  buffer: nvim="\nx" vimcode="x"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:dj last line] keys="dj" start=["a", "b"]@(2,1)
+  buffer: nvim="a\nb" vimcode="a"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [op:dk first line] keys="dk" start=["a", "b"]@(1,1)
+  buffer: nvim="a\nb" vimcode="b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:d`a] keys="magg0d`a" start=["abc def", "ghi jkl"]@(2,4)
+  buffer: nvim=" jkl" vimcode="abc def\nghi jkl"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL CUR [op:y`a cursor] keys="magg0y`a" start=["abc def", "ghi jkl"]@(2,4)
+  buffer: nvim="abc def\nghi jkl" vimcode="abc def\nghi jkl"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL CUR [op:yiw cursor] keys="yiw" start=["foo bar"]@(1,6)
+  buffer: nvim="foo bar" vimcode="foo bar"
+  cursor: nvim=(1,5) vimcode=(1,6)
+
+FAIL CUR [op:yy 3p] keys="yy3p" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\na\na\nb" vimcode="a\na\na\na\nb"
+  cursor: nvim=(2,1) vimcode=(4,1)
+
+FAIL CUR [op:p linewise cursor first nonblank] keys="yyjp" start=["  a", "b"]@(1,1)
+  buffer: nvim="  a\nb\n  a" vimcode="  a\nb\n  a"
+  cursor: nvim=(3,3) vimcode=(3,1)
+
+FAIL CUR [op:P linewise cursor] keys="yyjP" start=["  a", "b"]@(1,1)
+  buffer: nvim="  a\n  a\nb" vimcode="  a\n  a\nb"
+  cursor: nvim=(2,3) vimcode=(2,1)
+
+FAIL CUR [op:p charwise multiline] keys="vjy$p" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="abcbc\nde\ndef\nghi" vimcode="abcbc\nde\ndef\nghi"
+  cursor: nvim=(1,4) vimcode=(1,8)
+
+FAIL CUR [op:P charwise multiline] keys="vjyP" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="abc\ndebc\ndef\nghi" vimcode="abc\ndebc\ndef\nghi"
+  cursor: nvim=(1,2) vimcode=(1,6)
+
+FAIL BUF+CUR [op:5dd from last line] keys="5dd" start=["a", "b", "c"]@(3,1)
+  buffer: nvim="a\nb\nc" vimcode="a\nb"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF [op:J after period (vim joinspaces)] keys="J" start=["end.", "next"]@(1,1)
+  buffer: nvim="end.  next" vimcode="end. next"
+  cursor: nvim=(1,5) vimcode=(1,5)
+
+FAIL CUR [op:J next starts with )] keys="J" start=["foo(", "  )"]@(1,1)
+  buffer: nvim="foo()" vimcode="foo()"
+  cursor: nvim=(1,5) vimcode=(1,4)
+
+FAIL BUF+CUR [op:J next blank] keys="J" start=["a", "", "b"]@(1,1)
+  buffer: nvim="a\nb" vimcode="a \nb"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL CUR [op:J current ends with space] keys="J" start=["a ", "b"]@(1,1)
+  buffer: nvim="a b" vimcode="a b"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF+CUR [op:5r beyond eol] keys="5rx" start=["abc"]@(1,2)
+  buffer: nvim="abc" vimcode="axx"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL CUR [op:r<CR>] keys="r<CR>" start=["abc def"]@(1,4)
+  buffer: nvim="abc\ndef" vimcode="abc\ndef"
+  cursor: nvim=(2,1) vimcode=(1,3)
+
+FAIL BUF+CUR [op:3r<CR>] keys="3r<CR>" start=["abcdef"]@(1,2)
+  buffer: nvim="a\nef" vimcode="a\n\n\nef"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [op:R BS restores] keys="Rxyz<BS><BS><Esc>" start=["abcdef"]@(1,2)
+  buffer: nvim="axcdef" vimcode="axyzef"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL BUF+CUR [op:2R] keys="2Rxy<Esc>" start=["abcdef"]@(1,1)
+  buffer: nvim="xyxyef" vimcode="xycdef"
+  cursor: nvim=(1,4) vimcode=(1,2)
+
+FAIL BUF+CUR [op:R <CR>] keys="Rx<CR>y<Esc>" start=["abcdef"]@(1,2)
+  buffer: nvim="ax\nydef" vimcode="axydef"
+  cursor: nvim=(2,1) vimcode=(1,3)
+
+FAIL CUR [op:g~~ cursor] keys="g~~" start=["aBc dEf"]@(1,5)
+  buffer: nvim="AbC DeF" vimcode="AbC DeF"
+  cursor: nvim=(1,1) vimcode=(1,5)
+
+FAIL CUR [op:guu] keys="guu" start=["ABC"]@(1,3)
+  buffer: nvim="abc" vimcode="abc"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL CUR [op:g~iw] keys="g~iw" start=["aBc dEf"]@(1,6)
+  buffer: nvim="aBc DeF" vimcode="aBc DeF"
+  cursor: nvim=(1,5) vimcode=(1,6)
+
+FAIL CUR [op:gUap] keys="gUap" start=["abc", "def", "", "ghi"]@(1,2)
+  buffer: nvim="ABC\nDEF\n\nghi" vimcode="ABC\nDEF\n\nghi"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF [op:3gUw] keys="3gUw" start=["a b c d"]@(1,1)
+  buffer: nvim="A B C d" vimcode="A B C D"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [op:gUiw then w .] keys="gUiww." start=["ab cd"]@(1,1)
+  buffer: nvim="AB CD" vimcode="AB cd"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF [op:3>> skips blank] keys="3>>" start=["a", "", "b"]@(1,1)
+  buffer: nvim="    a\n\n    b" vimcode="    a\n    \n    b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [op:>> cursor sol] keys=">>" start=["  abc"]@(1,4)
+  buffer: nvim="      abc" vimcode="      abc"
+  cursor: nvim=(1,7) vimcode=(1,4)
+
+FAIL BUF [op:V2>] keys="V2>" start=["a", "b"]@(1,1)
+  buffer: nvim="        a\nb" vimcode="    a\nb"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [op:3>> j .] keys="3>>j." start=["a", "b", "c", "d", "e"]@(1,1)
+  buffer: nvim="    a\n        b\n        c\n    d\ne" vimcode="    a\n                b\n                c\n            d\ne"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [op:>> noet ts4] keys=":set ts=4 noet<CR>>>" start=["a"]@(1,1)
+  buffer: nvim="\ta" vimcode="    a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [op:>>>> noet ts4] keys=":set ts=4 noet<CR>>>>>" start=["a"]@(1,1)
+  buffer: nvim="\t\ta" vimcode="        a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [op:>> existing tab noet] keys=":set ts=4 noet<CR>>>" start=["\ta"]@(1,1)
+  buffer: nvim="\t\ta" vimcode="    \ta"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [op:<< mixed tab space] keys=":set ts=4 noet<CR><<" start=["\t  a"]@(1,1)
+  buffer: nvim="  a" vimcode="  a"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [op:gqq tw20] keys=":set tw=20<CR>gqq" start=["one two three four five six seven eight"]@(1,1)
+  buffer: nvim="one two three four\nfive six seven eight" vimcode="one two three four\nfive six seven eight"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [op:gqip tw20] keys=":set tw=20<CR>gqip" start=["one two three four five six seven eight", "nine ten eleven twelve"]@(1,1)
+  buffer: nvim="one two three four\nfive six seven eight\nnine ten eleven\ntwelve" vimcode="one two three four\nfive six seven eight\nnine ten eleven\ntwelve"
+  cursor: nvim=(4,1) vimcode=(1,1)
+
+FAIL CUR [op:gqq cursor] keys=":set tw=20<CR>gqq" start=["one two three four five six seven eight"]@(1,5)
+  buffer: nvim="one two three four\nfive six seven eight" vimcode="one two three four\nfive six seven eight"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:gqq indented] keys=":set tw=20<CR>gqq" start=["    one two three four five six"]@(1,1)
+  buffer: nvim="    one two three\n    four five six" vimcode="one two three four\nfive six"
+  cursor: nvim=(2,5) vimcode=(1,1)
+
+FAIL CUR [op:Vgq] keys=":set tw=10<CR>Vgq" start=["one two three four five six"]@(1,1)
+  buffer: nvim="one two\nthree four\nfive six" vimcode="one two\nthree four\nfive six"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:o esc removes indent] keys="o<Esc>" start=["    foo", "bar"]@(1,1)
+  buffer: nvim="    foo\n\nbar" vimcode="    foo\n    \nbar"
+  cursor: nvim=(2,1) vimcode=(2,4)
+
+FAIL BUF+CUR [op:o x CR esc no trailing ws] keys="ox<CR><Esc>" start=["    foo"]@(1,1)
+  buffer: nvim="    foo\n    x\n" vimcode="    foo\n    x\n    "
+  cursor: nvim=(3,1) vimcode=(3,4)
+
+FAIL BUF+CUR [op:5i] keys="5ix<Esc>" start=["a"]@(1,1)
+  buffer: nvim="xxxxxa" vimcode="xa"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL BUF+CUR [op:3a] keys="3a-<Esc>" start=["ab"]@(1,1)
+  buffer: nvim="a---b" vimcode="a-b"
+  cursor: nvim=(1,4) vimcode=(1,2)
+
+FAIL BUF+CUR [op:3A] keys="3Ax<Esc>" start=["ab"]@(1,1)
+  buffer: nvim="abxxx" vimcode="abx"
+  cursor: nvim=(1,5) vimcode=(1,3)
+
+FAIL BUF+CUR [op:2I] keys="2Ix<Esc>" start=["  ab"]@(1,4)
+  buffer: nvim="  xxab" vimcode="  xab"
+  cursor: nvim=(1,4) vimcode=(1,3)
+
+FAIL BUF+CUR [op:3iab] keys="3iab<Esc>" start=["a"]@(1,1)
+  buffer: nvim="abababa" vimcode="aba"
+  cursor: nvim=(1,6) vimcode=(1,2)
+
+FAIL BUF+CUR [op:2i with CR] keys="2ix<CR><Esc>" start=["a"]@(1,1)
+  buffer: nvim="x\nx\na" vimcode="x\na"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF [op:cw on empty line] keys="cwX<Esc>" start=["", "a"]@(1,1)
+  buffer: nvim="X\na" vimcode="X"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:dvj charwise force] keys="dvj" start=["abc", "def"]@(1,2)
+  buffer: nvim="aef" vimcode=""
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF [op:dve exclusive force] keys="dve" start=["abc def"]@(1,1)
+  buffer: nvim="c def" vimcode=" def"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [op:dv$] keys="dv$" start=["abc def"]@(1,2)
+  buffer: nvim="af" vimcode="a"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL CUR [dot:cw . next word] keys="cwX<Esc>w." start=["foo bar baz"]@(1,1)
+  buffer: nvim="X X baz" vimcode="X X baz"
+  cursor: nvim=(1,3) vimcode=(1,4)
+
+FAIL BUF [dot:A; j .] keys="A;<Esc>j." start=["a", "b"]@(1,1)
+  buffer: nvim="a;\nb;" vimcode="a;\n;b"
+  cursor: nvim=(2,2) vimcode=(2,2)
+
+FAIL BUF+CUR [dot:ciw w .] keys="ciwX<Esc>w." start=["foo bar"]@(1,1)
+  buffer: nvim="X X" vimcode="X Xbar"
+  cursor: nvim=(1,3) vimcode=(1,4)
+
+FAIL BUF+CUR [dot:yyp .] keys="yyp." start=["a"]@(1,1)
+  buffer: nvim="a\na\na" vimcode="a\na"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF+CUR [dot:yy3p .] keys="yy3p." start=["a"]@(1,1)
+  buffer: nvim="a\na\na\na\na\na\na" vimcode="a\na\na\na"
+  cursor: nvim=(3,1) vimcode=(4,1)
+
+FAIL BUF+CUR [dot:o .] keys="ob<Esc>." start=["a"]@(1,1)
+  buffer: nvim="a\nb\nb" vimcode="a\nbb"
+  cursor: nvim=(3,1) vimcode=(2,2)
+
+FAIL BUF+CUR [dot:O .] keys="Ob<Esc>." start=["a"]@(1,1)
+  buffer: nvim="b\nb\na" vimcode="bb\na"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF [dot:vlld .] keys="vlld." start=["abcdefgh"]@(1,1)
+  buffer: nvim="gh" vimcode="defgh"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [dot:Vjd .] keys="Vjd." start=["a", "b", "c", "d", "e"]@(1,1)
+  buffer: nvim="e" vimcode="c\nd\ne"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [dot:Vj> j .] keys="Vj>j." start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="    a\n        b\n    c\nd" vimcode="    a\n            b\n        c\nd"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [dot:dap .] keys="dap." start=["a", "", "b", "", "c"]@(1,1)
+  buffer: nvim="c" vimcode="b\n\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [dot:ifoo .] keys="ifoo<Esc>." start=["ab"]@(1,1)
+  buffer: nvim="fofoooab" vimcode="fofoooab"
+  cursor: nvim=(1,5) vimcode=(1,6)
+
+FAIL BUF+CUR [dot:3Ax j .] keys="3Ax<Esc>j." start=["a", "b"]@(1,1)
+  buffer: nvim="axxx\nbxxx" vimcode="ax\nxb"
+  cursor: nvim=(2,4) vimcode=(2,2)
+
+FAIL BUF [dot:3Ax j 2.] keys="3Ax<Esc>j2." start=["a", "b"]@(1,1)
+  buffer: nvim="axxx\nbxx" vimcode="ax\nxxb"
+  cursor: nvim=(2,3) vimcode=(2,3)
+
+FAIL BUF+CUR [dot:cc j .] keys="ccX<Esc>j." start=["a", "b"]@(1,1)
+  buffer: nvim="X\nX" vimcode="X\nXb"
+  cursor: nvim=(2,1) vimcode=(2,2)
+
+FAIL BUF+CUR [dot:s l .] keys="sX<Esc>l." start=["abcd"]@(1,1)
+  buffer: nvim="XXcd" vimcode="XXbcd"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL BUF+CUR [dot:C j .] keys="CX<Esc>j." start=["abc", "def"]@(1,2)
+  buffer: nvim="aX\ndX" vimcode="aX\ndXef"
+  cursor: nvim=(2,2) vimcode=(2,3)
+
+FAIL BUF+CUR [dot:ct, .] keys="ct,X<Esc>ll." start=["a,b,c"]@(1,1)
+  buffer: nvim="X,X,c" vimcode="X,Xb,c"
+  cursor: nvim=(1,3) vimcode=(1,4)
+
+FAIL BUF [dot:df. .] keys="df.." start=["a.b.c.d"]@(1,1)
+  buffer: nvim="c.d" vimcode="b.c.d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [dot:R .] keys="Rxy<Esc>ll." start=["abcdef"]@(1,1)
+  buffer: nvim="xycxyf" vimcode="xycdef"
+  cursor: nvim=(1,5) vimcode=(1,4)
+
+FAIL BUF [dot:diw . .] keys="diw.." start=["foo bar baz"]@(1,1)
+  buffer: nvim=" baz" vimcode=" bar baz"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [dot:g&] keys=":s/a/b/g<CR>g&" start=["a a", "a a"]@(1,1)
+  buffer: nvim="b b\nb b" vimcode="b b\nb b"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [dot:"ayy "ap .] keys="\"ayyj\"ap." start=["a", "b"]@(1,1)
+  buffer: nvim="a\nb\na\na" vimcode="a\nb\na"
+  cursor: nvim=(4,1) vimcode=(3,1)
+
+FAIL BUF+CUR [dot:"1p . . increments] keys="dddddd\"1p.." start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="d\nc\nb\na" vimcode=""
+  cursor: nvim=(4,1) vimcode=(1,1)
+
+FAIL BUF [dot:>ip .] keys=">ip}j." start=["a", "b", "", "c", "d"]@(1,1)
+  buffer: nvim="    a\n    b\n\n    c\n    d" vimcode="    a\n    b\n\nc\nd"
+  cursor: nvim=(4,1) vimcode=(4,1)
+
+FAIL CUR [dot:I .] keys="Ix<Esc>j." start=["a", "b"]@(1,1)
+  buffer: nvim="xa\nxb" vimcode="xa\nxb"
+  cursor: nvim=(2,1) vimcode=(2,2)
+
+FAIL BUF+CUR [dot:i<C-w> .] keys="i<C-w>X<Esc>j$." start=["ab cd", "ef gh"]@(1,6)
+  buffer: nvim="ab Xd\nef Xh" vimcode="ab X\nef gXh"
+  cursor: nvim=(2,4) vimcode=(2,6)
+
+FAIL BUF+CUR [dot:vec .] keys="vecX<Esc>w." start=["foo bar baz"]@(1,1)
+  buffer: nvim="X X baz" vimcode="X Xbar baz"
+  cursor: nvim=(1,3) vimcode=(1,4)
+
+FAIL BUF [dot:vjd . charwise] keys="vjd." start=["a1", "b2", "c3", "d4", "e5"]@(1,1)
+  buffer: nvim="3\nd4\ne5" vimcode="2\nc3\nd4\ne5"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [dot:<C-v>jIx .] keys="<C-v>jIx<Esc>jj." start=["ab", "ab", "ab", "ab"]@(1,1)
+  buffer: nvim="xab\nxab\nxab\nxab" vimcode="xab\nxab\nxab\nab"
+  cursor: nvim=(3,1) vimcode=(3,2)
+
+FAIL BUF+CUR [dot:cw with count 2.] keys="cwX<Esc>w2." start=["a b c d e"]@(1,1)
+  buffer: nvim="X X d e" vimcode="X X c d e"
+  cursor: nvim=(1,3) vimcode=(1,4)
+
+FAIL BUF [dot:dfx count override] keys="df.2." start=["a.b.c.d.e"]@(1,1)
+  buffer: nvim="d.e" vimcode="b.c.d.e"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [dot:gUw .] keys="gUww." start=["ab cd"]@(1,1)
+  buffer: nvim="AB CD" vimcode="AB "
+  cursor: nvim=(1,4) vimcode=(1,3)
+
+FAIL BUF [dot:>> 2.] keys=">>2." start=["a"]@(1,1)
+  buffer: nvim="    a" vimcode="            a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [dot:ofoo<CR>bar .] keys="ofoo<CR>bar<Esc>." start=["a"]@(1,1)
+  buffer: nvim="a\nfoo\nbar\nfoo\nbar" vimcode="a\nfoo\nbafoo\nbarr"
+  cursor: nvim=(5,3) vimcode=(4,4)
+
+FAIL BUF+CUR [dot:p charwise .] keys="ylp." start=["ab"]@(1,1)
+  buffer: nvim="aaab" vimcode="aab"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF+CUR [dot:xp .] keys="xp." start=["abcd"]@(1,1)
+  buffer: nvim="baacd" vimcode="bcd"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF+CUR [dot:ciw then . at eol] keys="ciwX<Esc>$." start=["ab cd"]@(1,1)
+  buffer: nvim="X X" vimcode="X cXd"
+  cursor: nvim=(1,3) vimcode=(1,5)
+
+FAIL BUF [undo:xxxx 3u] keys="xxxx3u" start=["abcdef"]@(1,1)
+  buffer: nvim="bcdef" vimcode="def"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [undo:U] keys="xxxU" start=["abcdef"]@(1,1)
+  buffer: nvim="" vimcode="abcdef"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [undo:UU] keys="xxxUU" start=["abcdef"]@(1,1)
+  buffer: nvim="def" vimcode="abcdef"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [undo:A xyz u cursor] keys="A xyz<Esc>u" start=["abc"]@(1,1)
+  buffer: nvim="abc" vimcode="abc"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF+CUR [undo:arrow breaks undo] keys="ifoo<Left>bar<Esc>u" start=["ab"]@(1,1)
+  buffer: nvim="fooab" vimcode="ab"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [undo:u after :%s cursor] keys=":%s/a/b/<CR>u" start=["a", "a", "a"]@(3,1)
+  buffer: nvim="a\na\na" vimcode="a\na\na"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL CUR [undo:u after visual d] keys="vlldu" start=["abcdef"]@(1,2)
+  buffer: nvim="abcdef" vimcode="abcdef"
+  cursor: nvim=(1,2) vimcode=(1,4)
+
+FAIL BUF [undo:u restores cursor after :g] keys=":g/a/d<CR>u" start=["a", "b", "a"]@(1,1)
+  buffer: nvim="a\nb\na" vimcode="b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [undo:u after R] keys="Rxyz<Esc>u" start=["abcdef"]@(1,2)
+  buffer: nvim="abcdef" vimcode="axydef"
+  cursor: nvim=(1,2) vimcode=(1,4)
+
+FAIL BUF+CUR [undo:u after <C-v>I] keys="<C-v>jIx<Esc>u" start=["ab", "ab"]@(1,1)
+  buffer: nvim="ab\nab" vimcode="xab\nab"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF+CUR [undo:2u after insert ×3] keys="Ax<Esc>Ay<Esc>Az<Esc>2u" start=["a"]@(1,1)
+  buffer: nvim="ax" vimcode="axy"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL BUF+CUR [reg:"ayw "Ayw "ap] keys="\"ayww\"Ayw$\"ap" start=["foo bar"]@(1,1)
+  buffer: nvim="foo barfoo bar" vimcode="foo barfoo \nbar"
+  cursor: nvim=(1,14) vimcode=(1,15)
+
+FAIL BUF+CUR [reg:d/ goes to "1] keys="d/baz<CR>$\"1p" start=["foo bar baz"]@(1,1)
+  buffer: nvim="bazfoo bar " vimcode="fz\n$\"1poo bar baz"
+  cursor: nvim=(1,11) vimcode=(2,5)
+
+FAIL BUF+CUR [reg:d% goes to "1] keys="d%$\"1p" start=["(ab) cd"]@(1,1)
+  buffer: nvim=" cd(ab)" vimcode=" cd"
+  cursor: nvim=(1,7) vimcode=(1,3)
+
+FAIL BUF [reg:dn goes to "1] keys="/ab<CR>ggdn$\"1p" start=["x ab x ab"]@(1,1)
+  buffer: nvim="x abab x " vimcode="x ab x ab"
+  cursor: nvim=(1,9) vimcode=(1,9)
+
+FAIL BUF [reg:"_dd then p] keys="yyj\"_ddp" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nc\na" vimcode="a\nc\nb"
+  cursor: nvim=(3,1) vimcode=(3,1)
+
+FAIL CUR [reg:3"ap] keys="\"ayy3\"ap" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\na\na\nb" vimcode="a\na\na\na\nb"
+  cursor: nvim=(2,1) vimcode=(4,1)
+
+FAIL BUF+CUR [reg:". insert register] keys="ifoo<Esc>\".p" start=["ab"]@(1,1)
+  buffer: nvim="foofooab" vimcode="fooab"
+  cursor: nvim=(1,6) vimcode=(1,3)
+
+FAIL BUF+CUR [reg:": last cmd] keys=":s/a/b/<CR>\":p" start=["a a"]@(1,1)
+  buffer: nvim="bs/a/b/ a" vimcode="b a"
+  cursor: nvim=(1,7) vimcode=(1,1)
+
+FAIL BUF+CUR [reg:"/ last search] keys="/bar<CR>\"/P" start=["foo bar"]@(1,1)
+  buffer: nvim="foo barbar" vimcode="foo bar"
+  cursor: nvim=(1,7) vimcode=(1,5)
+
+FAIL CUR [reg:i C-r a linewise] keys="\"ayyjA<C-r>a<Esc>" start=["a", "b"]@(1,1)
+  buffer: nvim="a\nba\n" vimcode="a\nba"
+  cursor: nvim=(3,1) vimcode=(2,2)
+
+FAIL BUF+CUR [reg:"adw does not set "-] keys="\"adw\"-p" start=["foo bar"]@(1,1)
+  buffer: nvim="bar" vimcode="bfoo ar"
+  cursor: nvim=(1,1) vimcode=(1,5)
+
+FAIL BUF [reg:viw"_dP] keys="yiwwviw\"_dP" start=["foo bar"]@(1,1)
+  buffer: nvim="foofoo " vimcode="foobar "
+  cursor: nvim=(1,6) vimcode=(1,6)
+
+FAIL BUF+CUR [reg:"1 after cc] keys="ccX<Esc>j\"1p" start=["a", "b"]@(1,1)
+  buffer: nvim="X\nb\na" vimcode="X\nb"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF+CUR [reg:"= expr] keys="\"=1+1<CR>p" start=["a"]@(1,1)
+  buffer: nvim="a2" vimcode="a"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF+CUR [reg:C-r = in insert] keys="A<C-r>=2*3<CR><Esc>" start=["a"]@(1,1)
+  buffer: nvim="a6" vimcode="a2*3"
+  cursor: nvim=(1,2) vimcode=(2,1)
+
+FAIL CUR [reg:paste count charwise multiline] keys="vjy2p" start=["ab", "cd"]@(1,1)
+  buffer: nvim="aab\ncab\ncb\ncd" vimcode="aab\ncab\ncb\ncd"
+  cursor: nvim=(1,2) vimcode=(1,9)
+
+FAIL BUF+CUR [mac:10@a stops at failure] keys="qa0f,xjq10@a" start=["a,b", "c,d", "e f", "g,h"]@(1,1)
+  buffer: nvim="ab\ncd\ne f\ng,h" vimcode="ab\ncd\n f"
+  cursor: nvim=(3,1) vimcode=(4,1)
+
+FAIL BUF+CUR [mac:qA append] keys="qaxqqAjq@a" start=["ab", "cd", "ef"]@(1,1)
+  buffer: nvim="b\nd\nef" vimcode="b\ncd\nef"
+  cursor: nvim=(3,1) vimcode=(2,2)
+
+FAIL BUF+CUR [mac:recursive] keys="qaqqaA!<Esc>j@aq@a" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a!\nb!\nc!\nd!" vimcode="a!\nb!\nc!\nd!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  cursor: nvim=(4,2) vimcode=(4,16666)
+
+FAIL BUF [mac:count inside] keys="qa2dwq@a" start=["a b c d e"]@(1,1)
+  buffer: nvim="e" vimcode=""
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [mac:"ay then @a executes text] keys="\"ay$j@a" start=["ix<Esc>", "b"]@(1,1)
+  buffer: nvim="ix<Esc>\nx<Esc>b" vimcode="ix<Esc>\nx<Esc>b"
+  cursor: nvim=(2,6) vimcode=(2,7)
+
+FAIL BUF+CUR [mac:macro with ci(] keys="qaci(X<Esc>jq@a" start=["f(a)", "g(b)"]@(1,1)
+  buffer: nvim="f(X)\ng(X)" vimcode="f(a)\ng(b)"
+  cursor: nvim=(2,3) vimcode=(2,1)
+
+FAIL BUF [mac:q register letter uppercase Q] keys="qQxq@Q" start=["ab", "cd"]@(1,1)
+  buffer: nvim="\ncd" vimcode="b\ncd"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [mark:`] after yank] keys="wyiw0`]" start=["abc def"]@(1,1)
+  buffer: nvim="abc def" vimcode="abc def"
+  cursor: nvim=(1,7) vimcode=(1,1)
+
+FAIL CUR [mark:mark shifts after O] keys="maggOx<Esc>'a" start=["a", "b", "c"]@(2,1)
+  buffer: nvim="x\na\nb\nc" vimcode="x\na\nb\nc"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL CUR [mark:mark on deleted line] keys="maddgg'a" start=["a", "b", "c"]@(2,1)
+  buffer: nvim="a\nc" vimcode="a\nc"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL CUR [mark:`^] keys="jAx<Esc>gg`^" start=["ab", "cd"]@(1,1)
+  buffer: nvim="ab\ncdx" vimcode="ab\ncdx"
+  cursor: nvim=(2,3) vimcode=(1,1)
+
+FAIL CUR [mark:'' toggles] keys="3G''''" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a\nb\nc\nd" vimcode="a\nb\nc\nd"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [mark:c`a] keys="ma0c`aX<Esc>" start=["abc def"]@(1,5)
+  buffer: nvim="Xdef" vimcode="aXbc def"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL CUR [mark:`a after line join] keys="makJ`a" start=["ab", "cd"]@(2,2)
+  buffer: nvim="ab cd" vimcode="ab cd"
+  cursor: nvim=(1,5) vimcode=(2,1)
+
+FAIL CUR [mark:'a after text insert above] keys="maggOx<CR>y<Esc>'a" start=["a", "b"]@(2,1)
+  buffer: nvim="x\ny\na\nb" vimcode="x\ny\na\nb"
+  cursor: nvim=(4,1) vimcode=(2,1)
+
+FAIL CUR [mark:`` after ''] keys="G''``" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nb\nc" vimcode="a\nb\nc"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [mark:'a then '' back] keys="magg'a''" start=["a", "b", "c", "d"]@(4,1)
+  buffer: nvim="a\nb\nc\nd" vimcode="a\nb\nc\nd"
+  cursor: nvim=(1,1) vimcode=(4,1)
+
+FAIL CUR [mark:'[ after >>] keys=">jgg'[" start=["a", "b", "c"]@(2,1)
+  buffer: nvim="a\n    b\n    c" vimcode="a\n    b\n    c"
+  cursor: nvim=(2,5) vimcode=(1,1)
+
+FAIL CUR [jump:g; g; g,] keys="xjjxggg;g;g," start=["a", "b", "c"]@(1,1)
+  buffer: nvim="\nb\n" vimcode="\nb"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [jump:n C-o] keys="/foo<CR>n<C-o>" start=["foo", "foo", "foo"]@(1,1)
+  buffer: nvim="foo\nfoo\nfoo" vimcode="foo\nfoo\nfoo"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [jump:% C-o] keys="%<C-o>" start=["(abc)"]@(1,1)
+  buffer: nvim="(abc)" vimcode="(abc)"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL CUR [jump:'a C-o] keys="magg'a<C-o>" start=["a", "b", "c"]@(3,1)
+  buffer: nvim="a\nb\nc" vimcode="a\nb\nc"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL CUR [jump:C-o after j 20 lines] keys="20j<C-o>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(1,1) vimcode=(21,1)
+
+FAIL CUR [jump:C-o after (] keys="(<C-o>" start=["A b. C d."]@(1,8)
+  buffer: nvim="A b. C d." vimcode="A b. C d."
+  cursor: nvim=(1,6) vimcode=(1,8)
+
+FAIL CUR [jump:g; after 2 changes same line] keys="x$xgg0g;g;" start=["abcdef"]@(1,1)
+  buffer: nvim="bcde" vimcode="bcde"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [jump:3<C-o>] keys="2G3G4G5G3<C-o>" start=["1", "2", "3", "4", "5", "6"]@(1,1)
+  buffer: nvim="1\n2\n3\n4\n5\n6" vimcode="1\n2\n3\n4\n5\n6"
+  cursor: nvim=(2,1) vimcode=(4,1)
+
+FAIL CUR [jump:C-o after ''] keys="3G''<C-o>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a\nb\nc\nd" vimcode="a\nb\nc\nd"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [search:* cursor not on word] keys="*" start=["  foo bar foo"]@(1,1)
+  buffer: nvim="  foo bar foo" vimcode="  foo bar foo"
+  cursor: nvim=(1,11) vimcode=(1,1)
+
+FAIL CUR [search:* on punctuation] keys="*" start=["a.b a.b"]@(1,2)
+  buffer: nvim="a.b a.b" vimcode="a.b a.b"
+  cursor: nvim=(1,7) vimcode=(1,2)
+
+FAIL BUF+CUR [search:* then :s//] keys="*:%s//X/g<CR>" start=["foo bar foo"]@(1,1)
+  buffer: nvim="X bar X" vimcode="foo bar foo"
+  cursor: nvim=(1,1) vimcode=(1,9)
+
+FAIL CUR [search:/pat/e] keys="/bar/e<CR>" start=["foo bar"]@(1,1)
+  buffer: nvim="foo bar" vimcode="foo bar"
+  cursor: nvim=(1,7) vimcode=(1,1)
+
+FAIL CUR [search:/pat/e+1] keys="/bar/e+1<CR>" start=["foo bar baz"]@(1,1)
+  buffer: nvim="foo bar baz" vimcode="foo bar baz"
+  cursor: nvim=(1,8) vimcode=(1,1)
+
+FAIL CUR [search:/pat/e-1] keys="/bar/e-1<CR>" start=["foo bar baz"]@(1,1)
+  buffer: nvim="foo bar baz" vimcode="foo bar baz"
+  cursor: nvim=(1,6) vimcode=(1,1)
+
+FAIL CUR [search:/pat/b+2] keys="/bar/b+2<CR>" start=["foo bar baz"]@(1,1)
+  buffer: nvim="foo bar baz" vimcode="foo bar baz"
+  cursor: nvim=(1,7) vimcode=(1,1)
+
+FAIL CUR [search:/pat/s-1] keys="/bar/s-1<CR>" start=["foo bar baz"]@(1,1)
+  buffer: nvim="foo bar baz" vimcode="foo bar baz"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [search:/pat/+1 linewise] keys="/foo/+1<CR>" start=["a", "foo", "b", "c"]@(1,1)
+  buffer: nvim="a\nfoo\nb\nc" vimcode="a\nfoo\nb\nc"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [search:/pat/-1] keys="/foo/-1<CR>" start=["a", "b", "foo"]@(1,1)
+  buffer: nvim="a\nb\nfoo" vimcode="a\nb\nfoo"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [search:/pat/e then n keeps offset] keys="/bar/e<CR>n" start=["foo bar foo bar"]@(1,1)
+  buffer: nvim="foo bar foo bar" vimcode="foo bar foo bar"
+  cursor: nvim=(1,15) vimcode=(1,1)
+
+FAIL CUR [search:/\v] keys="/\\vo+<CR>" start=["fooo bar"]@(1,3)
+  buffer: nvim="fooo bar" vimcode="fooo bar"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL CUR [search:/foo\|bar] keys="/foo\\|bar<CR>" start=["xx bar foo"]@(1,1)
+  buffer: nvim="xx bar foo" vimcode="xx bar foo"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [search:/\<foo\>] keys="/\\<foo\\><CR>" start=["foobar foo"]@(1,1)
+  buffer: nvim="foobar foo" vimcode="foobar foo"
+  cursor: nvim=(1,8) vimcode=(1,1)
+
+FAIL CUR [search:/^foo] keys="/^foo<CR>" start=["a foo", "foo b"]@(1,1)
+  buffer: nvim="a foo\nfoo b" vimcode="a foo\nfoo b"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [search:/foo$] keys="/foo$<CR>" start=["foo a", "a foo"]@(1,1)
+  buffer: nvim="foo a\na foo" vimcode="foo a\na foo"
+  cursor: nvim=(2,3) vimcode=(1,1)
+
+FAIL CUR [search:/a\{2}] keys="/a\\{2}<CR>" start=["a aa aaa"]@(1,1)
+  buffer: nvim="a aa aaa" vimcode="a aa aaa"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [search:/\d\+] keys="/\\d\\+<CR>" start=["ab 123 cd"]@(1,1)
+  buffer: nvim="ab 123 cd" vimcode="ab 123 cd"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [search:/[bc]a] keys="/[bc]a<CR>" start=["xa ba ca"]@(1,1)
+  buffer: nvim="xa ba ca" vimcode="xa ba ca"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [search:scs lower] keys=":set ic scs<CR>/foo<CR>" start=["x FOO Foo foo"]@(1,1)
+  buffer: nvim="x FOO Foo foo" vimcode="x FOO Foo foo"
+  cursor: nvim=(1,3) vimcode=(1,11)
+
+FAIL CUR [search:\c] keys="/\\cfoo<CR>" start=["x FOO foo"]@(1,1)
+  buffer: nvim="x FOO foo" vimcode="x FOO foo"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [search:\C with ic] keys=":set ic<CR>/\\CFOO<CR>" start=["x foo FOO"]@(1,1)
+  buffer: nvim="x foo FOO" vimcode="x foo FOO"
+  cursor: nvim=(1,7) vimcode=(1,1)
+
+FAIL CUR [search:* with ic scs] keys=":set ic scs<CR>*" start=["Foo foo Foo"]@(1,1)
+  buffer: nvim="Foo foo Foo" vimcode="Foo foo Foo"
+  cursor: nvim=(1,5) vimcode=(1,9)
+
+FAIL CUR [search:// repeat] keys="/foo<CR>//<CR>" start=["foo x foo x foo"]@(1,1)
+  buffer: nvim="foo x foo x foo" vimcode="foo x foo x foo"
+  cursor: nvim=(1,13) vimcode=(1,1)
+
+FAIL CUR [search:/<CR> repeat] keys="/foo<CR>/<CR>" start=["foo x foo x foo"]@(1,1)
+  buffer: nvim="foo x foo x foo" vimcode="foo x foo x foo"
+  cursor: nvim=(1,13) vimcode=(1,7)
+
+FAIL CUR [search:3/pat] keys="3/foo<CR>" start=["a foo foo foo"]@(1,1)
+  buffer: nvim="a foo foo foo" vimcode="a foo foo foo"
+  cursor: nvim=(1,11) vimcode=(1,3)
+
+FAIL CUR [search:/pat/;/pat2/] keys="/foo/;/bar<CR>" start=["a foo b bar"]@(1,1)
+  buffer: nvim="a foo b bar" vimcode="a foo b bar"
+  cursor: nvim=(1,9) vimcode=(1,1)
+
+FAIL CUR [search:?pat?e] keys="?bar?e<CR>" start=["foo bar baz"]@(1,11)
+  buffer: nvim="foo bar baz" vimcode="foo bar baz"
+  cursor: nvim=(1,7) vimcode=(1,11)
+
+FAIL BUF+CUR [search:c/pat] keys="c/baz<CR>X<Esc>" start=["foo bar baz"]@(1,1)
+  buffer: nvim="Xbaz" vimcode="fz\nXoo bar baz"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF+CUR [search:y/pat cursor] keys="y/baz<CR>" start=["foo bar baz"]@(1,5)
+  buffer: nvim="foo bar baz" vimcode="fz\noo bar baz"
+  cursor: nvim=(1,5) vimcode=(2,1)
+
+FAIL CUR [search:/o\nb multiline] keys="/o\\nb<CR>" start=["foo", "bar"]@(1,1)
+  buffer: nvim="foo\nbar" vimcode="foo\nbar"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF [search:/ then :s//] keys="/foo<CR>:s//X/g<CR>" start=["foo bar foo"]@(1,1)
+  buffer: nvim="X bar X" vimcode="foo bar foo"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [search:\zs] keys="/foo\\zsbar<CR>" start=["foobar"]@(1,1)
+  buffer: nvim="foobar" vimcode="foobar"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [search:\ze] keys="/foo\\zebar<CR>" start=["xbar foobar"]@(1,1)
+  buffer: nvim="xbar foobar" vimcode="xbar foobar"
+  cursor: nvim=(1,6) vimcode=(1,1)
+
+FAIL CUR [search:/. literal dot] keys="/a\\.c<CR>" start=["abc a.c"]@(1,1)
+  buffer: nvim="abc a.c" vimcode="abc a.c"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL CUR [search:/ with * quantifier] keys="/ab*c<CR>" start=["ac abc abbc"]@(1,1)
+  buffer: nvim="ac abc abbc" vimcode="ac abc abbc"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [search:/ with \s] keys="/\\s<CR>" start=["a\tb c"]@(1,1)
+  buffer: nvim="a\tb c" vimcode="a\tb c"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL CUR [search:/ then ? then n] keys="/bar<CR>?bar<CR>n" start=["bar", "foo", "bar", "bar"]@(1,1)
+  buffer: nvim="bar\nfoo\nbar\nbar" vimcode="bar\nfoo\nbar\nbar"
+  cursor: nvim=(4,1) vimcode=(3,1)
+
+FAIL BUF+CUR [search:d/pat/+0? linewise] keys="d/foo/0<CR>" start=["a", "foo", "b"]@(1,1)
+  buffer: nvim="b" vimcode="a\n/0\n\nfoo\nb"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL CUR [search:/\(foo\)\1] keys="/\\(foo\\)\\1<CR>" start=["foo foofoo"]@(1,1)
+  buffer: nvim="foo foofoo" vimcode="foo foofoo"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL CUR [search:/\w\+ from col1] keys="/\\w\\+<CR>" start=["foo bar"]@(1,1)
+  buffer: nvim="foo bar" vimcode="foo bar"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL CUR [search:/$ empty match] keys="/$<CR>" start=["ab", "cd"]@(1,1)
+  buffer: nvim="ab\ncd" vimcode="ab\ncd"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL CUR [search:/^ empty match] keys="/^<CR>" start=["ab", "cd"]@(1,1)
+  buffer: nvim="ab\ncd" vimcode="ab\ncd"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [search:/\n at eol] keys="/\\n<CR>" start=["ab", "cd"]@(1,1)
+  buffer: nvim="ab\ncd" vimcode="ab\ncd"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL CUR [search:/ upper V with ic] keys=":set ic<CR>/ABC<CR>" start=["abc ABC"]@(1,1)
+  buffer: nvim="abc ABC" vimcode="abc ABC"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL CUR [search:gd] keys="gd" start=["int x = 1;", "y = x;"]@(2,5)
+  buffer: nvim="int x = 1;\ny = x;" vimcode="int x = 1;\ny = x;"
+  cursor: nvim=(1,5) vimcode=(2,5)
+
+FAIL BUF+CUR [search:gn selects] keys="/foo<CR>ggcgnX<Esc>" start=["foo bar foo"]@(1,1)
+  buffer: nvim="foo bar X" vimcode="X bar foo"
+  cursor: nvim=(1,9) vimcode=(1,1)
+
+FAIL BUF+CUR [search:cgn .] keys="/foo<CR>ggcgnX<Esc>.." start=["foo bar foo baz foo"]@(1,1)
+  buffer: nvim="X bar X baz X" vimcode="XXX bar foo baz foo"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL BUF+CUR [search:dgn] keys="/foo<CR>ggdgn" start=["foo bar foo"]@(1,1)
+  buffer: nvim="foo bar " vimcode=" bar foo"
+  cursor: nvim=(1,8) vimcode=(1,1)
+
+FAIL BUF+CUR [search:gN] keys="/foo<CR>gNd" start=["foo bar foo"]@(1,11)
+  buffer: nvim=" bar foo" vimcode="foo bar "
+  cursor: nvim=(1,1) vimcode=(1,8)
+
+FAIL CUR [sub:%] keys=":%s/a/b/<CR>" start=["a", "a", "a"]@(1,1)
+  buffer: nvim="b\nb\nb" vimcode="b\nb\nb"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [sub:%g cursor] keys=":%s/a/x/g<CR>" start=["a a", "b", "a a"]@(2,1)
+  buffer: nvim="x x\nb\nx x" vimcode="x x\nb\nx x"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF+CUR [sub:2,3] keys=":2,3s/a/b/<CR>" start=["a", "a", "a", "a"]@(1,1)
+  buffer: nvim="a\nb\nb\na" vimcode="a\na\na\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:.,+1] keys=":.,+1s/a/b/<CR>" start=["a", "a", "a", "a"]@(2,1)
+  buffer: nvim="a\nb\nb\na" vimcode="a\na\na\na"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF+CUR [sub:.,$] keys=":.,$s/a/b/<CR>" start=["a", "a", "a", "a"]@(3,1)
+  buffer: nvim="a\na\nb\nb" vimcode="a\na\na\na"
+  cursor: nvim=(4,1) vimcode=(3,1)
+
+FAIL BUF+CUR [sub:'a,'b] keys="majjmbgg:'a,'bs/a/b/<CR>" start=["a", "a", "a", "a"]@(1,1)
+  buffer: nvim="b\nb\nb\na" vimcode="a\na\na\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF [sub:'<,'> explicit] keys="Vj<Esc>:'<,'>s/a/b/<CR>" start=["a", "a", "a", "a"]@(2,1)
+  buffer: nvim="a\nb\nb\na" vimcode="a\na\na\na"
+  cursor: nvim=(3,1) vimcode=(3,1)
+
+FAIL BUF [sub:ic applies] keys=":set ic<CR>:s/a/b/g<CR>" start=["A a"]@(1,1)
+  buffer: nvim="b b" vimcode="A b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:n flag] keys=":s/a/b/gn<CR>" start=["a a"]@(1,1)
+  buffer: nvim="a a" vimcode="b b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:& flag] keys=":s/a/b/g<CR>j:s/a/c/&<CR>" start=["a a", "a a"]@(1,1)
+  buffer: nvim="b b\nc c" vimcode="b b\nc a"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [sub:&&] keys=":s/a/b/g<CR>j:&&<CR>" start=["a a", "a a"]@(1,1)
+  buffer: nvim="b b\nb b" vimcode="b b\na a"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [sub:& cmd] keys=":s/a/b/g<CR>j:&<CR>" start=["a a", "a a"]@(1,1)
+  buffer: nvim="b b\nb a" vimcode="b b\na a"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [sub:backrefs] keys=":s/\\(a\\)\\(b\\)/\\2\\1/<CR>" start=["ab"]@(1,1)
+  buffer: nvim="ba" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\v groups] keys=":s/\\v(a)(b)/\\2\\1/<CR>" start=["ab"]@(1,1)
+  buffer: nvim="ba" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:& in replacement] keys=":s/foo/[&]/<CR>" start=["foo"]@(1,1)
+  buffer: nvim="[foo]" vimcode="[&]"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\0] keys=":s/foo/[\\0]/<CR>" start=["foo"]@(1,1)
+  buffer: nvim="[foo]" vimcode="[\\0]"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\U&] keys=":s/foo/\\U&/<CR>" start=["foo"]@(1,1)
+  buffer: nvim="FOO" vimcode="\\U&"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\u&] keys=":s/foo/\\u&/<CR>" start=["foo"]@(1,1)
+  buffer: nvim="Foo" vimcode="\\u&"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\L] keys=":s/FOO/\\L&/<CR>" start=["FOO"]@(1,1)
+  buffer: nvim="foo" vimcode="\\L&"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\U..\E] keys=":s/foo/\\U&\\E-x/<CR>" start=["foo bar"]@(1,1)
+  buffer: nvim="FOO-x bar" vimcode="\\U&\\E-x bar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:\r newline] keys=":s/,/\\r/<CR>" start=["a,b"]@(1,1)
+  buffer: nvim="a\nb" vimcode="a\\rb"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [sub:\t] keys=":s/ /\\t/<CR>" start=["a b"]@(1,1)
+  buffer: nvim="a\tb" vimcode="a\\tb"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:alternation] keys=":s/a\\|c/x/g<CR>" start=["a b c"]@(1,1)
+  buffer: nvim="x b x" vimcode="a b c"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\zs] keys=":s/foo\\zsbar/X/<CR>" start=["foobar"]@(1,1)
+  buffer: nvim="fooX" vimcode="foobar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\ze] keys=":s/foo\\zebar/X/<CR>" start=["foobar"]@(1,1)
+  buffer: nvim="Xbar" vimcode="foobar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:~ prev replacement] keys=":s/a/x/<CR>:s/b/~y/<CR>" start=["a b"]@(1,1)
+  buffer: nvim="x xy" vimcode="x ~y"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:# delimiter] keys=":s#/#-#<CR>" start=["a/b"]@(1,1)
+  buffer: nvim="a-b" vimcode="a/b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:no replacement] keys=":s/b<CR>" start=["abc"]@(1,1)
+  buffer: nvim="ac" vimcode="abc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:empty pattern last search] keys="/foo<CR>:s//X/g<CR>" start=["foo bar foo"]@(1,1)
+  buffer: nvim="X bar X" vimcode="foo bar foo"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:count] keys=":s/a/b/ 2<CR>" start=["a", "a", "a", "a"]@(1,1)
+  buffer: nvim="b\nb\na\na" vimcode="b\na\na\na"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:range + count] keys=":2s/a/b/ 2<CR>" start=["a", "a", "a", "a"]@(1,1)
+  buffer: nvim="a\nb\nb\na" vimcode="a\na\na\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:trailing ws] keys=":%s/\\s\\+$//e<CR>" start=["a  ", "b "]@(1,1)
+  buffer: nvim="a\nb" vimcode="a  \nb "
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:^ anchor] keys=":%s/^/> /<CR>" start=["ab", "cd"]@(1,1)
+  buffer: nvim="> ab\n> cd" vimcode="ab\ncd"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:$ anchor] keys=":%s/$/;/<CR>" start=["ab", "cd"]@(1,1)
+  buffer: nvim="ab;\ncd;" vimcode="ab\ncd"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [sub:.*] keys=":s/.*/[&]/<CR>" start=["abc"]@(1,1)
+  buffer: nvim="[abc]" vimcode="abc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:literal dot] keys=":s/\\./,/g<CR>" start=["a.b.c"]@(1,1)
+  buffer: nvim="a,b,c" vimcode="a.b.c"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:bar chain] keys=":s/a/x/|s/b/y/<CR>" start=["a b"]@(1,1)
+  buffer: nvim="x y" vimcode="x b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:cursor after] keys=":2s/a/y/<CR>" start=["x", "a b a"]@(1,1)
+  buffer: nvim="x\ny b a" vimcode="x\na b a"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [sub:\n multiline] keys=":%s/a\\nb/X/<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="X" vimcode="a\nb"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\{2}] keys=":s/a\\{2}/X/<CR>" start=["aaa"]@(1,1)
+  buffer: nvim="Xa" vimcode="aaa"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:[] class] keys=":s/[ac]/X/g<CR>" start=["abc"]@(1,1)
+  buffer: nvim="XbX" vimcode="abc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\w\+] keys=":s/\\w\\+/X/g<CR>" start=["foo bar"]@(1,1)
+  buffer: nvim="X X" vimcode="foo bar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\< \>] keys=":s/\\<foo\\>/X/g<CR>" start=["foo foobar"]@(1,1)
+  buffer: nvim="X foobar" vimcode="foo foobar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\{-}] keys=":s/a\\{-1,}/X/<CR>" start=["aaa"]@(1,1)
+  buffer: nvim="Xaa" vimcode="aaa"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\u\1 swap words] keys=":s/\\(\\w\\+\\) \\(\\w\\+\\)/\\u\\2 \\u\\1/<CR>" start=["foo bar"]@(1,1)
+  buffer: nvim="Bar Foo" vimcode="foo bar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [sub:%s cursor at end] keys=":%s/a/x/<CR>" start=["a", "b", "a"]@(1,1)
+  buffer: nvim="x\nb\nx" vimcode="x\nb\nx"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF [sub:s on empty match ^] keys=":s/^/x/g<CR>" start=["abc"]@(1,1)
+  buffer: nvim="xabc" vimcode="abc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:$ anchor g] keys=":s/$/;/g<CR>" start=["ab"]@(1,1)
+  buffer: nvim="ab;" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:x* g on empty] keys=":s/x*/-/g<CR>" start=["abc"]@(1,1)
+  buffer: nvim="-a-b-c" vimcode="abc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:& with \n in pattern] keys=":%s/\\n//<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="abc" vimcode="a\nb\nc"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF+CUR [sub:\r in middle then cursor] keys=":s/b/\\r/<CR>" start=["abc"]@(1,1)
+  buffer: nvim="a\nc" vimcode="a\\rc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [sub:\= escaped slash] keys=":s/\\//-/<CR>" start=["a/b"]@(1,1)
+  buffer: nvim="a-b" vimcode="a/b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:\/ in replacement] keys=":s/-/\\//<CR>" start=["a-b"]@(1,1)
+  buffer: nvim="a/b" vimcode="a\\b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:& literal via \&] keys=":s/foo/\\&/<CR>" start=["foo"]@(1,1)
+  buffer: nvim="&" vimcode="\\&"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:~ literal via \~] keys=":s/a/\\~/<CR>" start=["a"]@(1,1)
+  buffer: nvim="~" vimcode="\\~"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [sub:whole line] keys=":s/\\v(\\w+) (\\w+)/\\2 \\1/<CR>" start=["hello world"]@(1,1)
+  buffer: nvim="world hello" vimcode="hello world"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [g:d] keys=":g/a/d<CR>" start=["a", "b", "a", "c"]@(1,1)
+  buffer: nvim="b\nc" vimcode="b\nc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [g:s] keys=":g/a/s/x/y/<CR>" start=["a x", "b x", "a x"]@(1,1)
+  buffer: nvim="a y\nb x\na y" vimcode="a y\nb x\na y"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:!] keys=":g!/a/d<CR>" start=["a", "b", "a", "c"]@(1,1)
+  buffer: nvim="a\na" vimcode="a\nb\na\nc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [g:normal] keys=":g/a/normal Ax<CR>" start=["a", "b", "a"]@(1,1)
+  buffer: nvim="ax\nb\nax" vimcode="ax\nb\nax"
+  cursor: nvim=(3,2) vimcode=(1,3)
+
+FAIL BUF [g:m0 reverse] keys=":g/^/m0<CR>" start=["1", "2", "3"]@(1,1)
+  buffer: nvim="3\n2\n1" vimcode="1\n2\n3"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:^$ d] keys=":g/^$/d<CR>" start=["a", "", "b", "", ""]@(1,1)
+  buffer: nvim="a\nb" vimcode="a\n\nb"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:t$] keys=":g/a/t$<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="a\nb\na" vimcode="a\nba"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL CUR [g:cursor after] keys=":g/a/s/a/x/<CR>" start=["a", "b", "a", "c"]@(1,1)
+  buffer: nvim="x\nb\nx\nc" vimcode="x\nb\nx\nc"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [g:j] keys=":g/a/j<CR>" start=["a", "b", "a", "b"]@(1,1)
+  buffer: nvim="a b\na b" vimcode="a b\na b"
+  cursor: nvim=(2,1) vimcode=(1,2)
+
+FAIL BUF+CUR [g:range] keys=":2,3g/a/s/a/b/<CR>" start=["a", "a", "a"]@(1,1)
+  buffer: nvim="a\nb\nb" vimcode="a\na\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF [g:delimiter] keys=":g#a#d<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="b" vimcode="a\nb"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [g:normal dd] keys=":g/a/normal dd<CR>" start=["a", "b", "a", "c"]@(1,1)
+  buffer: nvim="b\nc" vimcode="b\nc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:+1d] keys=":g/a/+1d<CR>" start=["a", "x", "a", "y"]@(1,1)
+  buffer: nvim="a\na" vimcode="a\nx\na\ny"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:s// reuse pattern] keys=":g/a/s//x/<CR>" start=["a", "b", "a"]@(1,1)
+  buffer: nvim="x\nb\nx" vimcode="a\nb\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:normal with count] keys=":g/./normal 2x<CR>" start=["ab", "cd"]@(1,1)
+  buffer: nvim="\n" vimcode="ab\ncd"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:copy to end reversed order] keys=":g/./t.<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\nb\nb" vimcode="a\nb"
+  cursor: nvim=(4,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:d with count] keys=":g/[ab]/d 2<CR>" start=["a", "1", "2", "b", "3", "4"]@(1,1)
+  buffer: nvim="2\n4" vimcode="a\n1\n2\nb\n3\n4"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [g:normal @a] keys="qaAx<Esc>qu:g/a/normal @a<CR>" start=["a", "b", "a"]@(1,1)
+  buffer: nvim="ax\nb\nax" vimcode="axx\nb\na"
+  cursor: nvim=(3,2) vimcode=(1,3)
+
+FAIL BUF+CUR [g:.,+1j] keys=":g/a\\|c/.,+1j<CR>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a b\nc d" vimcode="a\nb\nc\nd"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:t$] keys=":t$<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="a\nb\na" vimcode="a\nba"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF+CUR [ex:m$] keys=":m$<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="b\nc\na" vimcode="b\nca"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF+CUR [ex:m-2] keys=":m-2<CR>" start=["a", "b", "c"]@(3,1)
+  buffer: nvim="a\nc\nb" vimcode="c\na\nb"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:2,3m$] keys=":2,3m$<CR>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a\nd\nb\nc" vimcode="a\ndb\nc"
+  cursor: nvim=(4,1) vimcode=(3,1)
+
+FAIL BUF+CUR [ex:1,2t$] keys=":1,2t$<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nb\nc\na\nb" vimcode="a\nb\nca\nb"
+  cursor: nvim=(5,1) vimcode=(4,1)
+
+FAIL BUF+CUR [ex:1co$] keys=":1co$<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="a\nb\na" vimcode="a\nba"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL BUF+CUR [ex:d a then "ap] keys=":2d a<CR>\"ap" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nc\nb" vimcode="a\nb\nc"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF [ex:d 2] keys=":d 2<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="c" vimcode="a\nb\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [ex:pu!] keys="yy:pu!<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\nb" vimcode="a\nb"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:2put] keys="yy:2put<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nb\na\nc" vimcode="a\nb\nc"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:0put] keys="yy:0put<CR>" start=["a", "b"]@(2,1)
+  buffer: nvim="b\na\nb" vimcode="a\nb"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL CUR [ex:j] keys=":j<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a b\nc" vimcode="a b\nc"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF [ex:1,3j] keys=":1,3j<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a b c" vimcode="a\nb\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [ex:j!] keys=":j!<CR>" start=["a", "  b"]@(1,1)
+  buffer: nvim="a  b" vimcode="a\n  b"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [ex:j 3] keys=":j 3<CR>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a b c\nd" vimcode="a\nb\nc\nd"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [ex:>] keys=":><CR>" start=["a"]@(1,1)
+  buffer: nvim="    a" vimcode="    a"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:>>] keys=":>><CR>" start=["a"]@(1,1)
+  buffer: nvim="        a" vimcode="a"
+  cursor: nvim=(1,9) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:2,3>] keys=":2,3><CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\n    b\n    c" vimcode="a\nb\nc"
+  cursor: nvim=(3,5) vimcode=(1,1)
+
+FAIL CUR [ex:<] keys=":<<CR>" start=["        a"]@(1,1)
+  buffer: nvim="    a" vimcode="    a"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:> 2] keys=":> 2<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="    a\n    b\nc" vimcode="a\nb\nc"
+  cursor: nvim=(2,5) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:2,3sort] keys=":2,3sort<CR>" start=["c", "b", "a"]@(1,1)
+  buffer: nvim="c\na\nb" vimcode="c\nb\na"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [ex:sort /pat/ r] keys=":sort /\\d/ r<CR>" start=["b 2", "a 1"]@(1,1)
+  buffer: nvim="a 1\nb 2" vimcode="b 2\na 1"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [ex:retab] keys=":set ts=4<CR>:retab<CR>" start=["\ta"]@(1,1)
+  buffer: nvim="    a" vimcode="    a"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL BUF [ex:retab!] keys=":set noet ts=4<CR>:retab!<CR>" start=["    a"]@(1,1)
+  buffer: nvim="\ta" vimcode="    a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:retab 2] keys=":set ts=4<CR>:retab 2<CR>" start=["\ta"]@(1,1)
+  buffer: nvim="    a" vimcode="  a"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL CUR [ex:/foo/] keys=":/foo/<CR>" start=["a", "b", "foo"]@(1,1)
+  buffer: nvim="a\nb\nfoo" vimcode="a\nb\nfoo"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [ex:?a?] keys=":?a?<CR>" start=["a", "b", "c"]@(3,1)
+  buffer: nvim="a\nb\nc" vimcode="a\nb\nc"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL CUR [ex:/foo/+1] keys=":/foo/+1<CR>" start=["a", "foo", "b"]@(1,1)
+  buffer: nvim="a\nfoo\nb" vimcode="a\nfoo\nb"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:/foo/d] keys=":/foo/d<CR>" start=["a", "foo", "b"]@(1,1)
+  buffer: nvim="a\nb" vimcode="a\nfoo\nb"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:/a/,/b/d] keys=":/a/,/b/d<CR>" start=["x", "a", "y", "b", "z"]@(1,1)
+  buffer: nvim="x\nz" vimcode="x\na\ny\nb\nz"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [ex:.,/foo/d] keys=":.,/foo/d<CR>" start=["a", "b", "foo", "c"]@(1,1)
+  buffer: nvim="c" vimcode="a\nb\nfoo\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [ex:%j] keys=":%j<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a b c" vimcode="a b c"
+  cursor: nvim=(1,1) vimcode=(1,4)
+
+FAIL CUR [ex:2ka 'a] keys=":2ka<CR>'a" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nb\nc" vimcode="a\nb\nc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [ex:2mark a] keys=":2mark a<CR>'a" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nb\nc" vimcode="a\nb\nc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF [ex:le] keys=":le<CR>" start=["    a"]@(1,1)
+  buffer: nvim="a" vimcode="    a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:le 4] keys=":le 4<CR>" start=["a"]@(1,1)
+  buffer: nvim="    a" vimcode="a"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:ri 10] keys=":ri 10<CR>" start=["a"]@(1,1)
+  buffer: nvim="         a" vimcode="a"
+  cursor: nvim=(1,10) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:ce 10] keys=":ce 10<CR>" start=["a"]@(1,1)
+  buffer: nvim="    a" vimcode="a"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL CUR [ex:normal Ax] keys=":normal Ax<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="ax\nb" vimcode="ax\nb"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL CUR [ex:%normal Ax] keys=":%normal Ax<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="ax\nbx" vimcode="ax\nbx"
+  cursor: nvim=(2,2) vimcode=(2,3)
+
+FAIL CUR [ex:2,3normal I-] keys=":2,3normal I-<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\n-b\n-c" vimcode="a\n-b\n-c"
+  cursor: nvim=(3,1) vimcode=(3,2)
+
+FAIL CUR [ex:normal! Ax] keys=":normal! Ax<CR>" start=["a"]@(1,1)
+  buffer: nvim="ax" vimcode="ax"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL CUR [ex:normal cursor] keys=":2normal $<CR>" start=["abc", "def"]@(1,1)
+  buffer: nvim="abc\ndef" vimcode="abc\ndef"
+  cursor: nvim=(2,3) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:r !echo] keys=":r !echo hi<CR>" start=["a"]@(1,1)
+  buffer: nvim="a\nhi" vimcode="a"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:2;+1d] keys=":2;+1d<CR>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a\nd" vimcode="a\nb\nc\nd"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:2,+1d] keys=":2,+1d<CR>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a\nc\nd" vimcode="a\nb\nc\nd"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:$-1d] keys=":$-1d<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a\nc" vimcode="a\nb\nc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [ex:.+2] keys=":.+2<CR>" start=["1", "2", "3", "4"]@(1,1)
+  buffer: nvim="1\n2\n3\n4" vimcode="1\n2\n3\n4"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:cursor after :t$] keys=":t$<CR>" start=["a", "b"]@(1,1)
+  buffer: nvim="a\nb\na" vimcode="a\nba"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL CUR [ex:cursor after :>] keys=":><CR>" start=["  a"]@(1,2)
+  buffer: nvim="      a" vimcode="      a"
+  cursor: nvim=(1,7) vimcode=(1,2)
+
+FAIL CUR [ex:cursor after :j] keys=":j<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="a b\nc" vimcode="a b\nc"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL CUR [ex:cursor after :%normal] keys=":%normal Ax<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="ax\nbx\ncx" vimcode="ax\nbx\ncx"
+  cursor: nvim=(3,2) vimcode=(3,3)
+
+FAIL CUR [ex:cursor after :g/d] keys=":g/a/d<CR>" start=["a", "b", "a", "c"]@(1,1)
+  buffer: nvim="b\nc" vimcode="b\nc"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:d _] keys="yyj:d _<CR>p" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na" vimcode="a\nb\na"
+  cursor: nvim=(2,1) vimcode=(3,1)
+
+FAIL BUF [ex:y A append] keys=":y a<CR>j:y A<CR>\"ap" start=["a", "b"]@(1,1)
+  buffer: nvim="a\nb\na\nb" vimcode="a\nb\na"
+  cursor: nvim=(3,1) vimcode=(3,1)
+
+FAIL BUF [ex:.,.+1d] keys=":.,.+1d<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="c" vimcode="a\nb\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:'<,'>d after v] keys="vj<Esc>:'<,'>d<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="c" vimcode="a\nb\nc"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF+CUR [ex:*d after visual] keys="Vj<Esc>:*d<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="c" vimcode="a\nb\nc"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL CUR [ex:s sets last search for n] keys=":s/a/x/<CR>n" start=["a", "b", "a"]@(1,1)
+  buffer: nvim="x\nb\na" vimcode="x\nb\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [ex:s cursor col] keys=":s/a/b/<CR>" start=["xx a"]@(1,4)
+  buffer: nvim="xx b" vimcode="xx b"
+  cursor: nvim=(1,1) vimcode=(1,4)
+
+FAIL BUF+CUR [ex:%s/x/y/g with \r cursor] keys=":s/,/\\r/g<CR>" start=["a,b,c"]@(1,1)
+  buffer: nvim="a\nb\nc" vimcode="a\\rb\\rc"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:2>3? shift count] keys=":2> 2<CR>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="a\n    b\n    c\nd" vimcode="a\nb\nc\nd"
+  cursor: nvim=(3,5) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:< 2] keys=":< 2<CR>" start=["    a", "    b", "    c"]@(1,1)
+  buffer: nvim="a\nb\n    c" vimcode="    a\n    b\n    c"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:>>> 3 levels] keys=":>>><CR>" start=["a"]@(1,1)
+  buffer: nvim="            a" vimcode="a"
+  cursor: nvim=(1,13) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:j with range and count] keys=":2j 3<CR>" start=["a", "b", "c", "d", "e"]@(1,1)
+  buffer: nvim="a\nb c d\ne" vimcode="a\nb\nc\nd\ne"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [ex:t with range dest .] keys=":1,2t.<CR>" start=["a", "b", "c"]@(3,1)
+  buffer: nvim="a\nb\nc\na\nb" vimcode="a\nb\nca\nb"
+  cursor: nvim=(5,1) vimcode=(4,1)
+
+FAIL BUF+CUR [ins:C-w at line start joins] keys="i<C-w><Esc>" start=["ab", "cd"]@(2,1)
+  buffer: nvim="abcd" vimcode="ab\ncd"
+  cursor: nvim=(1,2) vimcode=(2,1)
+
+FAIL BUF+CUR [ins:C-w punctuation] keys="A<C-w><Esc>" start=["foo.bar"]@(1,8)
+  buffer: nvim="foo." vimcode=""
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL BUF+CUR [ins:C-u before start] keys="A<C-u><Esc>" start=["ab"]@(1,1)
+  buffer: nvim="" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF+CUR [ins:C-u twice] keys="Afoo<C-u><C-u><Esc>" start=["ab"]@(1,1)
+  buffer: nvim="" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF+CUR [ins:C-u with indent] keys="A<C-u><Esc>" start=["    ab"]@(1,1)
+  buffer: nvim="    " vimcode="    ab"
+  cursor: nvim=(1,4) vimcode=(1,6)
+
+FAIL BUF+CUR [ins:BS over indent (nvim smarttab)] keys="i<BS><Esc>" start=["    a"]@(1,5)
+  buffer: nvim="a" vimcode="   a"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL BUF+CUR [ins:BS mid indent] keys="i<BS><Esc>" start=["      a"]@(1,4)
+  buffer: nvim="   a" vimcode="     a"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF+CUR [ins:Tab at start (smarttab)] keys=":set ts=8<CR>i<Tab><Esc>" start=["x"]@(1,1)
+  buffer: nvim="    x" vimcode="        x"
+  cursor: nvim=(1,4) vimcode=(1,8)
+
+FAIL BUF+CUR [ins:Tab mid line ts4] keys="A<Tab>x<Esc>" start=["a"]@(1,1)
+  buffer: nvim="a   x" vimcode="a    x"
+  cursor: nvim=(1,5) vimcode=(1,6)
+
+FAIL BUF+CUR [ins:Tab mid line ts8] keys=":set ts=8<CR>A<Tab>x<Esc>" start=["a"]@(1,1)
+  buffer: nvim="a       x" vimcode="a        x"
+  cursor: nvim=(1,9) vimcode=(1,10)
+
+FAIL BUF+CUR [ins:Tab after 2 chars ts4] keys="A<Tab>x<Esc>" start=["ab"]@(1,1)
+  buffer: nvim="ab  x" vimcode="ab    x"
+  cursor: nvim=(1,5) vimcode=(1,7)
+
+FAIL BUF+CUR [ins:0 C-d] keys="A0<C-d><Esc>" start=["    a"]@(1,1)
+  buffer: nvim="a" vimcode="a0"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF+CUR [ins:C-o $ then type] keys="i<C-o>$x<Esc>" start=["foo"]@(1,1)
+  buffer: nvim="foox" vimcode="foxo"
+  cursor: nvim=(1,4) vimcode=(1,3)
+
+FAIL BUF+CUR [ins:A C-o h] keys="A<C-o>hx<Esc>" start=["foo"]@(1,1)
+  buffer: nvim="fxoo" vimcode="foxo"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL BUF+CUR [ins:C-o with count] keys="i<C-o>2wx<Esc>" start=["a b c d"]@(1,1)
+  buffer: nvim="a b xc d" vimcode="wxa b c d"
+  cursor: nvim=(1,5) vimcode=(1,2)
+
+FAIL CUR [ins:C-o p] keys="yli<C-o>p<Esc>" start=["ab"]@(1,1)
+  buffer: nvim="aab" vimcode="aab"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF+CUR [ins:C-o :s] keys="A<C-o>:s/a/b/<CR>x<Esc>" start=["a a"]@(1,1)
+  buffer: nvim="xb a" vimcode="b a"
+  cursor: nvim=(1,1) vimcode=(1,4)
+
+FAIL BUF+CUR [ins:C-v 065] keys="i<C-v>065<Esc>" start=["a"]@(1,1)
+  buffer: nvim="Aa" vimcode="065a"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL BUF+CUR [ins:C-v x41] keys="i<C-v>x41<Esc>" start=["a"]@(1,1)
+  buffer: nvim="Aa" vimcode="x41a"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL BUF [ins:CR mid-line] keys="i<CR><Esc>" start=["foo bar"]@(1,4)
+  buffer: nvim="foo\nbar" vimcode="foo\n bar"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [ins:CR on indented mid] keys="i<CR><Esc>" start=["  foo bar"]@(1,6)
+  buffer: nvim="  foo\n  bar" vimcode="  foo\n   bar"
+  cursor: nvim=(2,2) vimcode=(2,2)
+
+FAIL BUF+CUR [ins:CR then Esc removes autoindent] keys="A<CR><Esc>" start=["    foo"]@(1,8)
+  buffer: nvim="    foo\n" vimcode="    foo\n    "
+  cursor: nvim=(2,1) vimcode=(2,4)
+
+FAIL BUF [ins:CR CR keeps prev line empty] keys="A<CR><CR>x<Esc>" start=["    foo"]@(1,8)
+  buffer: nvim="    foo\n\n    x" vimcode="    foo\n    \n    x"
+  cursor: nvim=(3,5) vimcode=(3,5)
+
+FAIL BUF+CUR [ins:Down Down col memory] keys="i<Down><Down>X<Esc>" start=["abcdef", "ab", "abcdef"]@(1,5)
+  buffer: nvim="abcdef\nab\nabcdXef" vimcode="abcdef\nab\nabXcdef"
+  cursor: nvim=(3,5) vimcode=(3,3)
+
+FAIL BUF+CUR [ins:C-h as BS] keys="a<C-h><Esc>" start=["abc"]@(1,3)
+  buffer: nvim="ab" vimcode="abch"
+  cursor: nvim=(1,2) vimcode=(1,4)
+
+FAIL BUF+CUR [ins:C-j newline] keys="a<C-j><Esc>" start=["ab"]@(1,2)
+  buffer: nvim="ab\n" vimcode="abj"
+  cursor: nvim=(2,1) vimcode=(1,3)
+
+FAIL BUF [ins:( no autopair] keys="i(<Esc>" start=["a"]@(1,1)
+  buffer: nvim="(a" vimcode="()a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [ins:" no autopair] keys="i\"<Esc>" start=["a"]@(1,1)
+  buffer: nvim="\"a" vimcode="\"\"a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [ins:{ CR no autopair] keys="i{<CR><Esc>" start=["a"]@(1,1)
+  buffer: nvim="{\na" vimcode="{\n}a"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [ins:[ no autopair] keys="A[<Esc>" start=["a"]@(1,1)
+  buffer: nvim="a[" vimcode="a[]"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL BUF [ins:C-p completion] keys="A<C-p><Esc>" start=["foo", "fob", "f"]@(3,1)
+  buffer: nvim="foo\nfob\nfob" vimcode="foo\nfob\nfoo"
+  cursor: nvim=(3,3) vimcode=(3,3)
+
+FAIL BUF+CUR [ins:typing prefix then Tab] keys="ofo<Tab>x<Esc>" start=["foo bar"]@(1,1)
+  buffer: nvim="foo bar\nfo  x" vimcode="foo bar\nfoox"
+  cursor: nvim=(2,5) vimcode=(2,4)
+
+FAIL BUF+CUR [ins:C-v u00e9] keys="i<C-v>u00e9<Esc>" start=["a"]@(1,1)
+  buffer: nvim="éa" vimcode="u00e9a"
+  cursor: nvim=(1,1) vimcode=(1,5)
+
+FAIL BUF+CUR [ins:insert Tab then BS (sts)] keys="A<Tab><BS>x<Esc>" start=["a"]@(1,1)
+  buffer: nvim="a  x" vimcode="a   x"
+  cursor: nvim=(1,4) vimcode=(1,5)
+
+FAIL BUF+CUR [ins:i with count and Esc cursor] keys="2ix<Esc>" start=["abc"]@(1,2)
+  buffer: nvim="axxbc" vimcode="axbc"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF [ins:A with count and CR] keys="2Ax<CR><Esc>" start=["a"]@(1,1)
+  buffer: nvim="ax\nx\n" vimcode="ax"
+  cursor: nvim=(3,1) vimcode=(2,1)
+
+FAIL CUR [ins:C-r register linewise mid line] keys="yyjli<C-r>\"<Esc>" start=["a", "bc"]@(1,1)
+  buffer: nvim="a\nba\nc" vimcode="a\nba\nc"
+  cursor: nvim=(3,1) vimcode=(2,2)
+
+FAIL BUF+CUR [ins:C-r with tab in register] keys="yyjA<C-r>\"<Esc>" start=["a\tb", "c"]@(1,1)
+  buffer: nvim="a\tb\nca  b\n" vimcode="a\tb\nca\tb"
+  cursor: nvim=(3,1) vimcode=(2,4)
+
+FAIL BUF [ins:BS join with autoindent] keys="i<BS><BS><BS><BS><BS><Esc>" start=["a", "    b"]@(2,5)
+  buffer: nvim="b" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [ins:i then Esc then . twice] keys="ix<Esc>.." start=["a"]@(1,1)
+  buffer: nvim="xxxa" vimcode="xxxa"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL CUR [vis:Vjd] keys="Vjd" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="ghi" vimcode="ghi"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL CUR [vis:v$y p] keys="v$yjp" start=["abc", "def"]@(1,1)
+  buffer: nvim="abc\ndabc\nef" vimcode="abc\ndabc\nef"
+  cursor: nvim=(2,2) vimcode=(2,5)
+
+FAIL BUF [vis:gv after Vjd] keys="Vjdgvd" start=["a", "b", "c", "d", "e"]@(1,1)
+  buffer: nvim="d\ne" vimcode="e"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [vis:vggd] keys="vggd" start=["abc", "def"]@(2,2)
+  buffer: nvim="af" vimcode="f"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF+CUR [vis:v^d] keys="v^d" start=["   abc"]@(1,6)
+  buffer: nvim="   " vimcode="   ab"
+  cursor: nvim=(1,3) vimcode=(1,5)
+
+FAIL CUR [vis:Vr-] keys="Vr-" start=["abc"]@(1,2)
+  buffer: nvim="---" vimcode="---"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL BUF+CUR [vis:vjD] keys="vjD" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="ghi" vimcode="abc\ndef\nghi"
+  cursor: nvim=(1,2) vimcode=(2,2)
+
+FAIL BUF+CUR [vis:vjX] keys="vjX" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="ghi" vimcode="abc\ndef\nghi"
+  cursor: nvim=(1,2) vimcode=(2,2)
+
+FAIL BUF+CUR [vis:vjY p] keys="vjYGp" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="abc\ndef\nghi\nabc\ndef" vimcode="ai"
+  cursor: nvim=(4,1) vimcode=(1,2)
+
+FAIL BUF+CUR [vis:vjC] keys="vjCX<Esc>" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="X\nghi" vimcode="abc\ndef\nghi"
+  cursor: nvim=(1,1) vimcode=(2,2)
+
+FAIL BUF+CUR [vis:vjS] keys="vjSX<Esc>" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="X\nghi" vimcode="abc\ndef\nghi"
+  cursor: nvim=(1,1) vimcode=(2,2)
+
+FAIL BUF+CUR [vis:vjR] keys="vjRX<Esc>" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="X\nghi" vimcode="abc\ndef\nghi"
+  cursor: nvim=(1,1) vimcode=(2,2)
+
+FAIL BUF+CUR [vis:vlp linewise reg] keys="yyjjvlp" start=["a", "b", "xyz"]@(1,1)
+  buffer: nvim="a\nb\n\na\nz" vimcode="a\nb\na\nz"
+  cursor: nvim=(4,1) vimcode=(3,1)
+
+FAIL BUF [vis:v3iwd] keys="v3iwd" start=["a b c d"]@(1,1)
+  buffer: nvim=" c d" vimcode=" b c d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [vis:v2awd] keys="v2awd" start=["a b c d"]@(1,1)
+  buffer: nvim="c d" vimcode="b c d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [vis:Vj:normal] keys="Vj:normal Ax<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="ax\nbx\nc" vimcode="ax\nbx\nc"
+  cursor: nvim=(2,2) vimcode=(2,3)
+
+FAIL BUF+CUR [vis:Vj=] keys="Vj=" start=["  a", "    b"]@(1,1)
+  buffer: nvim="a\nb" vimcode="  a\n    b"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL CUR [vis:Vd cursor] keys="Vd" start=["  a", "  b"]@(1,3)
+  buffer: nvim="  b" vimcode="  b"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF [vis:viwd on whitespace] keys="viwd" start=["a   b"]@(1,2)
+  buffer: nvim="ab" vimcode="a  b"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL CUR [vis:vjy then P] keys="vjyP" start=["abc", "def"]@(1,2)
+  buffer: nvim="abc\ndebc\ndef" vimcode="abc\ndebc\ndef"
+  cursor: nvim=(1,2) vimcode=(1,6)
+
+FAIL BUF [vis:V3>] keys="V3>" start=["a"]@(1,1)
+  buffer: nvim="            a" vimcode="    a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [vis:vip then ip extends] keys="vipipd" start=["a", "", "b", "", "c"]@(1,1)
+  buffer: nvim="b\n\nc" vimcode="\nb\n\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [vis:vf,d] keys="vf,d" start=["a,b,c"]@(1,1)
+  buffer: nvim="b,c" vimcode=",b,c"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [vis:v/pat d] keys="v/baz<CR>d" start=["foo bar baz"]@(1,1)
+  buffer: nvim="az" vimcode="oo bar baz"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [vis:vnd] keys="/foo<CR>vnd" start=["foo x foo y foo"]@(1,1)
+  buffer: nvim="foo x oo" vimcode="oo x foo y foo"
+  cursor: nvim=(1,7) vimcode=(1,1)
+
+FAIL BUF [vis:v'a? mark d] keys="magg0v`ad" start=["abc", "def"]@(2,2)
+  buffer: nvim="f" vimcode="abc\ndef"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [vis:vjc then u] keys="vjcX<Esc>u" start=["abc", "def"]@(1,2)
+  buffer: nvim="abc\ndef" vimcode="af"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL CUR [vis:vjgq] keys=":set tw=10<CR>Vjgq" start=["one two three four five six", "seven"]@(1,1)
+  buffer: nvim="one two\nthree four\nfive six\nseven" vimcode="one two\nthree four\nfive six\nseven"
+  cursor: nvim=(4,1) vimcode=(1,1)
+
+FAIL CUR [vis:vjy "0 then p] keys="vjy\"0P" start=["ab", "cd"]@(1,1)
+  buffer: nvim="ab\ncab\ncd" vimcode="ab\ncab\ncd"
+  cursor: nvim=(1,1) vimcode=(1,4)
+
+FAIL CUR [vis:V G d cursor] keys="VGd" start=["a", "b", "c"]@(2,1)
+  buffer: nvim="a" vimcode="a"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF+CUR [vis:v s] keys="vlsX<Esc>" start=["abcd"]@(1,2)
+  buffer: nvim="aXd" vimcode="abcd"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL CUR [vis:vjy count 2p] keys="vjy$2p" start=["ab", "cd"]@(1,1)
+  buffer: nvim="abab\ncab\nc\ncd" vimcode="abab\ncab\nc\ncd"
+  cursor: nvim=(1,3) vimcode=(1,10)
+
+FAIL BUF+CUR [vis:v then gv toggles] keys="vl<Esc>$vgvd" start=["abcdef"]@(1,1)
+  buffer: nvim="cdef" vimcode="abcdef"
+  cursor: nvim=(1,1) vimcode=(1,6)
+
+FAIL BUF+CUR [vis:v_gJ] keys="VjgJ" start=["a", "  b", "c"]@(1,1)
+  buffer: nvim="a  b\nc" vimcode="a\n  b\nc"
+  cursor: nvim=(1,2) vimcode=(2,1)
+
+FAIL BUF [vis:v_r CR] keys="vr<CR>" start=["abc"]@(1,2)
+  buffer: nvim="a\rc" vimcode="abc"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL BUF [vis:v ip on blank] keys="vipd" start=["a", "", "", "b"]@(2,1)
+  buffer: nvim="a\nb" vimcode="a"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL CUR [vis:v ap trailing] keys="vapd" start=["a", "", "b", "c"]@(3,1)
+  buffer: nvim="a" vimcode="a"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL CUR [vis:vjd then p] keys="vjdp" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="afbc\nde\nghi" vimcode="afbc\nde\nghi"
+  cursor: nvim=(1,3) vimcode=(1,7)
+
+FAIL BUF+CUR [vis:Vjy then p count] keys="Vjy2p" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\nb\na\nb\nb" vimcode="a\na\na\nb\nb\nb"
+  cursor: nvim=(2,1) vimcode=(3,1)
+
+FAIL BUF+CUR [vis:vip on last para no trailing] keys="vipd" start=["a", "", "b", "c"]@(4,1)
+  buffer: nvim="a\n" vimcode="a\n\nb"
+  cursor: nvim=(2,1) vimcode=(4,1)
+
+FAIL BUF [vis:v then < count] keys="V2<" start=["        a"]@(1,1)
+  buffer: nvim="a" vimcode="    a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [vis:v with $ then j then y p] keys="v$jyGp" start=["ab", "abcd", "abc"]@(1,1)
+  buffer: nvim="ab\nabcd\naab\nabcd\nbc" vimcode="ab\nabcd\naab\nabcd\nbc"
+  cursor: nvim=(3,2) vimcode=(3,9)
+
+FAIL CUR [vb:jjAx] keys="<C-v>jjAx<Esc>" start=["abc", "def", "ghi"]@(1,2)
+  buffer: nvim="abxc\ndexf\nghxi" vimcode="abxc\ndexf\nghxi"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL CUR [vb:jj$Ax] keys="<C-v>jj$Ax<Esc>" start=["ab", "abcd", "a"]@(1,1)
+  buffer: nvim="abx\nabcdx\nax" vimcode="abx\nabcdx\nax"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL BUF+CUR [vb:jlcX] keys="<C-v>jlcX<Esc>" start=["abc", "def"]@(1,2)
+  buffer: nvim="aX\ndX" vimcode="Xa\nd"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF [vb:j>] keys="<C-v>j>" start=["abc", "def"]@(1,2)
+  buffer: nvim="a    bc\nd    ef" vimcode="    abc\n    def"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL BUF+CUR [vb:jy then Gp] keys="<C-v>jyGp" start=["ab", "cd", "", "xy"]@(1,1)
+  buffer: nvim="ab\ncd\n\nxay\n c" vimcode="ab\ncd\n\nxa\ncy"
+  cursor: nvim=(4,2) vimcode=(4,4)
+
+FAIL BUF+CUR [vb:jy then P] keys="<C-v>jy$P" start=["ab", "cd"]@(1,1)
+  buffer: nvim="aab\nccd" vimcode="aa\ncb\ncd"
+  cursor: nvim=(1,2) vimcode=(1,4)
+
+FAIL BUF [vb:ragged d] keys="<C-v>jjlld" start=["abcdef", "ab", "abcdef"]@(1,3)
+  buffer: nvim="abf\nab\nabf" vimcode="abef\nababef"
+  cursor: nvim=(1,3) vimcode=(1,3)
+
+FAIL BUF+CUR [vb:I on short line skipped] keys="<C-v>jjIx<Esc>" start=["abcdef", "ab", "abcdef"]@(1,4)
+  buffer: nvim="abcxdef\nab\nabcxdef" vimcode="axbcdef\naxb\naxbcdef"
+  cursor: nvim=(1,4) vimcode=(1,2)
+
+FAIL CUR [vb:A on short line padded] keys="<C-v>jjAx<Esc>" start=["abcdef", "ab", "abcdef"]@(1,4)
+  buffer: nvim="abcdxef\nab  x\nabcdxef" vimcode="abcdxef\nab  x\nabcdxef"
+  cursor: nvim=(1,4) vimcode=(1,5)
+
+FAIL BUF+CUR [vb:jj$d] keys="<C-v>jj$d" start=["abcdef", "ab", "abcd"]@(1,3)
+  buffer: nvim="ab\nab\nab" vimcode="abef\nabab"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL BUF+CUR [vb:jsX] keys="<C-v>jsX<Esc>" start=["abc", "def"]@(1,2)
+  buffer: nvim="aXc\ndXf" vimcode="abc\ndef"
+  cursor: nvim=(1,2) vimcode=(2,2)
+
+FAIL BUF+CUR [vb:jCX] keys="<C-v>jCX<Esc>" start=["abcdef", "abcdef"]@(1,3)
+  buffer: nvim="abX\nabX" vimcode="abcdef\nabcdef"
+  cursor: nvim=(1,3) vimcode=(2,3)
+
+FAIL BUF+CUR [vb:jD] keys="<C-v>jD" start=["abcdef", "abcdef"]@(1,3)
+  buffer: nvim="ab\nab" vimcode="abcdef\nabcdef"
+  cursor: nvim=(1,2) vimcode=(2,3)
+
+FAIL BUF+CUR [vb:jIx then .] keys="<C-v>jIx<Esc>jj." start=["ab", "ab", "ab", "ab"]@(1,1)
+  buffer: nvim="xab\nxab\nxab\nxab" vimcode="xab\nxab\nxab\nab"
+  cursor: nvim=(3,1) vimcode=(3,2)
+
+FAIL CUR [vb:A on empty middle line] keys="<C-v>jjAx<Esc>" start=["ab", "", "ab"]@(1,1)
+  buffer: nvim="axb\n x\naxb" vimcode="axb\n x\naxb"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL CUR [vb:$A on empty middle line] keys="<C-v>jj$Ax<Esc>" start=["ab", "", "ab"]@(1,1)
+  buffer: nvim="abx\nx\nabx" vimcode="abx\nx\nabx"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL BUF+CUR [vb:jjy p at eol] keys="<C-v>jjy$p" start=["ab", "cd", "ef"]@(1,1)
+  buffer: nvim="aba\ncdc\nefe" vimcode="aba\nc\ne\ncd\nef"
+  cursor: nvim=(1,3) vimcode=(1,7)
+
+FAIL BUF+CUR [vb:jjy p on shorter] keys="<C-v>jjyGp" start=["abc", "abc", "x"]@(1,2)
+  buffer: nvim="abc\nabc\nxb\n b\n " vimcode="abc\nabc\nxab\nab\nx"
+  cursor: nvim=(3,2) vimcode=(3,8)
+
+FAIL BUF+CUR [vb:jly then p] keys="<C-v>jly$p" start=["abc", "def"]@(1,1)
+  buffer: nvim="abcab\ndefde" vimcode="abcab\nde\ndef"
+  cursor: nvim=(1,4) vimcode=(1,8)
+
+FAIL BUF [vb:jIx with CR] keys="<C-v>jIx<CR><Esc>" start=["ab", "ab"]@(1,1)
+  buffer: nvim="x\nab\nab" vimcode="x\nx\nab\nab"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [vb:jc with multi chars] keys="<C-v>jlcXYZ<Esc>" start=["abcd", "abcd"]@(1,2)
+  buffer: nvim="aXYZd\naXYZd" vimcode="aXYZd\nad"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF [vb:j< ] keys="<C-v>j<" start=["    ab", "    ab"]@(1,5)
+  buffer: nvim="    ab\n    ab" vimcode="ab\nab"
+  cursor: nvim=(1,5) vimcode=(1,5)
+
+FAIL BUF+CUR [vb:jr<CR>] keys="<C-v>jr<CR>" start=["abc", "def"]@(1,2)
+  buffer: nvim="a\nc\nd\nf" vimcode="abc\ndef"
+  cursor: nvim=(1,1) vimcode=(2,2)
+
+FAIL BUF+CUR [vb:jjAx then u] keys="<C-v>jjAx<Esc>u" start=["ab", "ab", "ab"]@(1,1)
+  buffer: nvim="ab\nab\nab" vimcode="axb\nab\nab"
+  cursor: nvim=(1,2) vimcode=(1,3)
+
+FAIL BUF [vb:I with count? 2I] keys="<C-v>j2Ix<Esc>" start=["ab", "ab"]@(1,1)
+  buffer: nvim="xxab\nxxab" vimcode="xab\nxab"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [vb:jjp block over block] keys="<C-v>jy2j<C-v>jp" start=["ab", "cd", "ef", "gh"]@(1,1)
+  buffer: nvim="ab\ncd\naf\nch" vimcode="ab\ncd\na\ncf\nh"
+  cursor: nvim=(3,1) vimcode=(4,1)
+
+FAIL BUF+CUR [vb:vb yank then p linewise reg? P] keys="<C-v>jyP" start=["ab", "cd"]@(1,1)
+  buffer: nvim="aab\nccd" vimcode="a\ncab\ncd"
+  cursor: nvim=(1,1) vimcode=(1,3)
+
+FAIL BUF [vb:d then .] keys="<C-v>jdjj." start=["abcd", "abcd", "abcd", "abcd"]@(1,1)
+  buffer: nvim="bcd\nbcd\nbcd\nbcd" vimcode="bcd\nbcd\nabcd\nabcd"
+  cursor: nvim=(3,1) vimcode=(3,1)
+
+FAIL BUF [vb:r then .] keys="<C-v>jlrxjj." start=["abcd", "abcd", "abcd", "abcd"]@(1,1)
+  buffer: nvim="xxcd\nxxcd\nxxcd\nxxcd" vimcode="xxcd\nxxcd\nabcd\nabcd"
+  cursor: nvim=(3,1) vimcode=(3,1)
+
+FAIL BUF+CUR [vb:c then .] keys="<C-v>jcX<Esc>jj." start=["abcd", "abcd", "abcd", "abcd"]@(1,1)
+  buffer: nvim="Xbcd\nXbcd\nXbcd\nXbcd" vimcode="Xbcd\nbcd\nXabcd\nabcd"
+  cursor: nvim=(3,1) vimcode=(3,2)
+
+FAIL CUR [vb:g C-a] keys="<C-v>jjg<C-a>" start=["1", "1", "1"]@(1,1)
+  buffer: nvim="2\n3\n4" vimcode="2\n3\n4"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL BUF [num:hex 0xaB] keys="<C-a>" start=["0xaB"]@(1,1)
+  buffer: nvim="0xAC" vimcode="0xac"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF+CUR [num:hex C-x below zero] keys="<C-x>" start=["0x0"]@(1,1)
+  buffer: nvim="0xffffffffffffffff" vimcode="0x1"
+  cursor: nvim=(1,18) vimcode=(1,3)
+
+FAIL BUF+CUR [num:octal not default 007] keys="<C-a>" start=["007"]@(1,1)
+  buffer: nvim="008" vimcode="10"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF+CUR [num:octal nf=octal 007] keys="<C-a>" start=["007"]@(1,1)
+  buffer: nvim="010" vimcode="10"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF+CUR [num:binary 0b101] keys="<C-a>" start=["0b101"]@(1,1)
+  buffer: nvim="0b110" vimcode="1"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL BUF+CUR [num:leading zeros 009] keys="<C-a>" start=["009"]@(1,1)
+  buffer: nvim="010" vimcode="1"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF+CUR [num:leading zeros 0099 C-x] keys="<C-x>" start=["0099"]@(1,1)
+  buffer: nvim="0098" vimcode="1777777777777777777777"
+  cursor: nvim=(1,4) vimcode=(1,22)
+
+FAIL BUF [num:C-a .] keys="<C-a>." start=["x 5"]@(1,1)
+  buffer: nvim="x 7" vimcode="x 6"
+  cursor: nvim=(1,3) vimcode=(1,3)
+
+FAIL BUF+CUR [num:3C-a .] keys="3<C-a>." start=["x 5"]@(1,1)
+  buffer: nvim="x 11" vimcode="x 8"
+  cursor: nvim=(1,4) vimcode=(1,3)
+
+FAIL BUF+CUR [num:3C-a 2.] keys="3<C-a>2." start=["x 5"]@(1,1)
+  buffer: nvim="x 10" vimcode="x 8"
+  cursor: nvim=(1,4) vimcode=(1,3)
+
+FAIL BUF+CUR [num:V C-a] keys="Vjj<C-a>" start=["1", "1", "1"]@(1,1)
+  buffer: nvim="2\n2\n2" vimcode="1\n1\n1"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL CUR [num:V g C-a] keys="Vjjg<C-a>" start=["1", "1", "1"]@(1,1)
+  buffer: nvim="2\n3\n4" vimcode="2\n3\n4"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL CUR [num:V 2g C-a] keys="Vjj2g<C-a>" start=["1", "1", "1"]@(1,1)
+  buffer: nvim="3\n5\n7" vimcode="3\n5\n7"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL BUF+CUR [num:v C-a partial] keys="vj<C-a>" start=["1 1", "1 1"]@(1,1)
+  buffer: nvim="2 1\n2 1" vimcode="1 1\n1 1"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF+CUR [num:C-v block C-a] keys="<C-v>j<C-a>" start=["1 1", "1 1"]@(1,3)
+  buffer: nvim="1 2\n1 2" vimcode="1 1\n1 1"
+  cursor: nvim=(1,3) vimcode=(2,3)
+
+FAIL BUF [num:alpha] keys="<C-a>" start=["a"]@(1,1)
+  buffer: nvim="b" vimcode="a"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [num:C-a on 99999999999999999999 overflow] keys="<C-a>" start=["99999999999999999999"]@(1,1)
+  buffer: nvim="18446744073709551615" vimcode="1"
+  cursor: nvim=(1,20) vimcode=(1,1)
+
+FAIL BUF+CUR [num:V C-a skips lines without numbers] keys="Vjjg<C-a>" start=["1", "x", "1"]@(1,1)
+  buffer: nvim="2\nx\n3" vimcode="2\nx\n4"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL BUF+CUR [num:V C-a only first number per line] keys="Vj<C-a>" start=["1 2", "3 4"]@(1,1)
+  buffer: nvim="2 2\n4 4" vimcode="1 2\n3 4"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF [num:C-a 0x with uppercase X] keys="<C-a>" start=["0X0f"]@(1,1)
+  buffer: nvim="0X10" vimcode="0x10"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF [num:C-a on negative hex? -0x1] keys="<C-a>" start=["-0x1"]@(1,1)
+  buffer: nvim="-0x2" vimcode="-0x0"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF+CUR [num:C-x on 0 leading zeros 000] keys="<C-x>" start=["000"]@(1,1)
+  buffer: nvim="-001" vimcode="1777777777777777777777"
+  cursor: nvim=(1,4) vimcode=(1,22)
+
+FAIL BUF+CUR [num:V C-a cursor] keys="Vj<C-a>" start=["1", "1"]@(1,1)
+  buffer: nvim="2\n2" vimcode="1\n1"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF [num:v C-a on -5 in visual (no minus)] keys="vl<C-a>" start=["x -5"]@(1,4)
+  buffer: nvim="x -6" vimcode="x -5"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL CUR [scroll:C-f] keys="<C-f>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(21,1) vimcode=(1,1)
+
+FAIL CUR [scroll:C-b] keys="<C-b>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(60,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(40,1) vimcode=(38,1)
+
+FAIL CUR [scroll:M from 30] keys="M" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(30,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(19,1) vimcode=(20,1)
+
+FAIL CUR [scroll:zzH] keys="zzH" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(20,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(10,1) vimcode=(9,1)
+
+FAIL CUR [scroll:z.H] keys="z.H" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(20,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(10,1) vimcode=(9,1)
+
+FAIL CUR [scroll:5C-d C-d] keys="5<C-d><C-d>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(11,1) vimcode=(60,1)
+
+FAIL CUR [scroll:C-f C-f] keys="<C-f><C-f>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(41,1) vimcode=(1,1)
+
+FAIL CUR [scroll:C-f C-b] keys="<C-f><C-b>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(22,1) vimcode=(1,1)
+
+FAIL CUR [scroll:G M] keys="GM" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(49,1) vimcode=(50,1)
+
+FAIL BUF [scroll:dM] keys="dM" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [scroll:C-d col sol] keys="<C-d>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,3)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(12,1) vimcode=(12,3)
+
+FAIL CUR [scroll:so=5 30G H] keys=":set so=5<CR>30GH" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(19,1) vimcode=(14,1)
+
+FAIL CUR [scroll:so=5 30G L] keys=":set so=5<CR>30GL" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(30,1) vimcode=(35,1)
+
+FAIL CUR [scroll:so=5 C-e] keys=":set so=5<CR><C-e>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(7,1) vimcode=(2,1)
+
+FAIL CUR [scroll:C-d then H L] keys="<C-d>H" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(12,1) vimcode=(1,1)
+
+FAIL CUR [scroll:C-d then L] keys="<C-d>L" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(33,1) vimcode=(22,1)
+
+FAIL CUR [scroll:C-f then H] keys="<C-f>H" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(21,1) vimcode=(1,1)
+
+FAIL CUR [scroll:C-f then L] keys="<C-f>L" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(42,1) vimcode=(1,1)
+
+FAIL CUR [scroll:C-b after G then H] keys="<C-b>H" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(60,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(19,1) vimcode=(38,1)
+
+FAIL CUR [scroll:C-b after G then L] keys="<C-b>L" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(60,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(40,1) vimcode=(59,1)
+
+FAIL CUR [scroll:50% H] keys="50%H" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(9,1) vimcode=(19,1)
+
+FAIL CUR [scroll:30G zz H L] keys="30GzzHjL" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(41,1) vimcode=(40,1)
+
+FAIL CUR [scroll:3C-d sets scroll then C-u] keys="3<C-d><C-u>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(30,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(30,1) vimcode=(49,1)
+
+FAIL CUR [scroll:3<C-f>] keys="3<C-f>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(1,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(60,1) vimcode=(1,1)
+
+FAIL CUR [scroll:2<C-b>] keys="2<C-b>" start=["L01 a", "L02 b", "L03 c", "L04 d", "L05 e", "L06 f", "L07 g", "L08 h", "L09 i", "L10 j", "L11 k", "L12 l", "L13 m", "L14 n", "L15 o", "L16 p", "L17 q", "L18 r", "L19 s", "L20 t", "L21 u", "L22 v", "L23 w", "L24 x", "L25 y", "L26 z", "L27 a", "L28 b", "L29 c", "L30 d", "L31 e", "L32 f", "L33 g", "L34 h", "L35 i", "L36 j", "L37 k", "L38 l", "L39 m", "L40 n", "L41 o", "L42 p", "L43 q", "L44 r", "L45 s", "L46 t", "L47 u", "L48 v", "L49 w", "L50 x", "L51 y", "L52 z", "L53 a", "L54 b", "L55 c", "L56 d", "L57 e", "L58 f", "L59 g", "L60 h"]@(60,1)
+  buffer: nvim="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h" vimcode="L01 a\nL02 b\nL03 c\nL04 d\nL05 e\nL06 f\nL07 g\nL08 h\nL09 i\nL10 j\nL11 k\nL12 l\nL13 m\nL14 n\nL15 o\nL16 p\nL17 q\nL18 r\nL19 s\nL20 t\nL21 u\nL22 v\nL23 w\nL24 x\nL25 y\nL26 z\nL27 a\nL28 b\nL29 c\nL30 d\nL31 e\nL32 f\nL33 g\nL34 h\nL35 i\nL36 j\nL37 k\nL38 l\nL39 m\nL40 n\nL41 o\nL42 p\nL43 q\nL44 r\nL45 s\nL46 t\nL47 u\nL48 v\nL49 w\nL50 x\nL51 y\nL52 z\nL53 a\nL54 b\nL55 c\nL56 d\nL57 e\nL58 f\nL59 g\nL60 h"
+  cursor: nvim=(22,1) vimcode=(16,1)
+
+FAIL CUR [scroll:M on short buffer] keys="M" start=["a", "b", "c", "d", "e"]@(1,1)
+  buffer: nvim="a\nb\nc\nd\ne" vimcode="a\nb\nc\nd\ne"
+  cursor: nvim=(3,1) vimcode=(5,1)
+
+FAIL CUR [scroll:C-f on short buffer] keys="<C-f>" start=["a", "b", "c", "d", "e"]@(1,1)
+  buffer: nvim="a\nb\nc\nd\ne" vimcode="a\nb\nc\nd\ne"
+  cursor: nvim=(5,1) vimcode=(1,1)
+
+FAIL CUR [scroll:3<C-d> on short] keys="3<C-d>" start=["a", "b", "c", "d", "e", "f", "g", "h"]@(1,1)
+  buffer: nvim="a\nb\nc\nd\ne\nf\ng\nh" vimcode="a\nb\nc\nd\ne\nf\ng\nh"
+  cursor: nvim=(4,1) vimcode=(8,1)
+
+FAIL CUR [word:w onto blank line] keys="w" start=["foo", "", "bar"]@(1,1)
+  buffer: nvim="foo\n\nbar" vimcode="foo\n\nbar"
+  cursor: nvim=(2,1) vimcode=(3,1)
+
+FAIL CUR [word:ge onto blank] keys="ge" start=["foo", "", "bar"]@(3,1)
+  buffer: nvim="foo\n\nbar" vimcode="foo\n\nbar"
+  cursor: nvim=(2,1) vimcode=(1,3)
+
+FAIL CUR [word:b onto blank line] keys="b" start=["foo", "", "bar"]@(3,1)
+  buffer: nvim="foo\n\nbar" vimcode="foo\n\nbar"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [word:w over multiple blank lines] keys="w" start=["a", "", "", "b"]@(1,1)
+  buffer: nvim="a\n\n\nb" vimcode="a\n\n\nb"
+  cursor: nvim=(2,1) vimcode=(4,1)
+
+FAIL CUR [word:ww over multiple blank lines] keys="ww" start=["a", "", "", "b"]@(1,1)
+  buffer: nvim="a\n\n\nb" vimcode="a\n\n\nb"
+  cursor: nvim=(3,1) vimcode=(4,1)
+
+FAIL CUR [word:( para] keys="(" start=["a", "", "b"]@(3,1)
+  buffer: nvim="a\n\nb" vimcode="a\n\nb"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL CUR [word:}}}] keys="}}}" start=["a", "", "b", "", "c"]@(1,1)
+  buffer: nvim="a\n\nb\n\nc" vimcode="a\n\nb\n\nc"
+  cursor: nvim=(5,1) vimcode=(5,2)
+
+FAIL CUR [word:}} multiple blanks] keys="}}" start=["a", "", "", "b"]@(1,1)
+  buffer: nvim="a\n\n\nb" vimcode="a\n\n\nb"
+  cursor: nvim=(4,1) vimcode=(3,1)
+
+FAIL CUR [word:} from blank] keys="}" start=["a", "", "", "b"]@(2,1)
+  buffer: nvim="a\n\n\nb" vimcode="a\n\n\nb"
+  cursor: nvim=(4,1) vimcode=(3,1)
+
+FAIL CUR [word:{ at start] keys="{" start=["a", "b"]@(2,1)
+  buffer: nvim="a\nb" vimcode="a\nb"
+  cursor: nvim=(1,1) vimcode=(1,2)
+
+FAIL CUR [word:} whitespace-only line not blank] keys="}" start=["a", "   ", "b", ""]@(1,1)
+  buffer: nvim="a\n   \nb\n" vimcode="a\n   \nb"
+  cursor: nvim=(4,1) vimcode=(2,4)
+
+FAIL CUR [word:% in quotes] keys="%" start=["\"(\" )"]@(1,2)
+  buffer: nvim="\"(\" )" vimcode="\"(\" )"
+  cursor: nvim=(1,2) vimcode=(1,5)
+
+FAIL CUR [word:<CR>] keys="<CR>" start=["  a", "  b"]@(1,1)
+  buffer: nvim="  a\n  b" vimcode="  a\n  b"
+  cursor: nvim=(2,3) vimcode=(1,1)
+
+FAIL CUR [word:2$] keys="2$" start=["ab", "cd", "ef"]@(1,1)
+  buffer: nvim="ab\ncd\nef" vimcode="ab\ncd\nef"
+  cursor: nvim=(2,2) vimcode=(1,2)
+
+FAIL CUR [word:$jj] keys="$jj" start=["abcdef", "ab", "abcdef"]@(1,1)
+  buffer: nvim="abcdef\nab\nabcdef" vimcode="abcdef\nab\nabcdef"
+  cursor: nvim=(3,6) vimcode=(3,2)
+
+FAIL CUR [word:jj col memory] keys="jj" start=["abcdef", "ab", "abcdef"]@(1,5)
+  buffer: nvim="abcdef\nab\nabcdef" vimcode="abcdef\nab\nabcdef"
+  cursor: nvim=(3,5) vimcode=(3,2)
+
+FAIL CUR [word:gg indented (sol)] keys="gg" start=["  a", "b"]@(2,1)
+  buffer: nvim="  a\nb" vimcode="  a\nb"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [word:G indented (sol)] keys="G" start=["a", "  b"]@(1,1)
+  buffer: nvim="a\n  b" vimcode="a\n  b"
+  cursor: nvim=(2,3) vimcode=(2,1)
+
+FAIL CUR [word:$ then j to longer] keys="$j" start=["ab", "abcdef"]@(1,1)
+  buffer: nvim="ab\nabcdef" vimcode="ab\nabcdef"
+  cursor: nvim=(2,6) vimcode=(2,2)
+
+FAIL CUR [word:dd then j col? (nosol)] keys="ddj" start=["abcdef", "abcdef", "abcdef"]@(1,3)
+  buffer: nvim="abcdef\nabcdef" vimcode="abcdef\nabcdef"
+  cursor: nvim=(2,3) vimcode=(2,1)
+
+FAIL CUR [word:5G then j col (sol)] keys="2Gj" start=["abcdef", "abcdef", "abcdef"]@(1,3)
+  buffer: nvim="abcdef\nabcdef\nabcdef" vimcode="abcdef\nabcdef\nabcdef"
+  cursor: nvim=(3,1) vimcode=(3,3)
+
+FAIL CUR [word:w over punct then blank] keys="w" start=["a.", "", "b"]@(1,2)
+  buffer: nvim="a.\n\nb" vimcode="a.\n\nb"
+  cursor: nvim=(2,1) vimcode=(3,1)
+
+FAIL BUF [word:cw at eol punct] keys="cwX<Esc>" start=["a.", "b"]@(1,2)
+  buffer: nvim="aX\nb" vimcode="aX"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL BUF+CUR [to:daw on whitespace] keys="daw" start=["foo  bar"]@(1,4)
+  buffer: nvim="foo" vimcode="bar"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF [to:diw on whitespace] keys="diw" start=["foo  bar"]@(1,4)
+  buffer: nvim="foobar" vimcode="foo  bar"
+  cursor: nvim=(1,4) vimcode=(1,4)
+
+FAIL BUF+CUR [to:diw punctuation] keys="diw" start=["foo.bar"]@(1,4)
+  buffer: nvim="foobar" vimcode=".bar"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL BUF+CUR [to:daw punctuation] keys="daw" start=["foo.bar"]@(1,4)
+  buffer: nvim="foobar" vimcode=".bar"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL BUF [to:d2aw] keys="d2aw" start=["a b c d"]@(1,1)
+  buffer: nvim="c d" vimcode="b c d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [to:d3iw] keys="d3iw" start=["a b c d"]@(1,1)
+  buffer: nvim=" c d" vimcode=" b c d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [to:c2aw] keys="c2awX<Esc>" start=["a b c d"]@(1,1)
+  buffer: nvim="Xc d" vimcode="Xb c d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [to:daw leading space only] keys="daw" start=["  foo"]@(1,3)
+  buffer: nvim="  " vimcode=""
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF+CUR [to:das last sentence] keys="das" start=["One two.  Three four."]@(1,12)
+  buffer: nvim="One two." vimcode="One two.  "
+  cursor: nvim=(1,8) vimcode=(1,10)
+
+FAIL BUF+CUR [to:dis on whitespace between] keys="dis" start=["One two.  Three four."]@(1,10)
+  buffer: nvim="One two.Three four." vimcode="One two.  "
+  cursor: nvim=(1,9) vimcode=(1,10)
+
+FAIL BUF [to:dap] keys="dap" start=["a", "b", "", "c"]@(1,1)
+  buffer: nvim="c" vimcode=""
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [to:dap trailing no blank] keys="dap" start=["a", "", "b", "c"]@(3,1)
+  buffer: nvim="a" vimcode="a"
+  cursor: nvim=(1,1) vimcode=(3,1)
+
+FAIL BUF [to:dip on blank lines] keys="dip" start=["a", "", "", "b"]@(2,1)
+  buffer: nvim="a\nb" vimcode="a"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL CUR [to:dap on blank] keys="dap" start=["a", "", "", "b"]@(2,1)
+  buffer: nvim="a" vimcode="a"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF [to:d2ap] keys="d2ap" start=["a", "", "b", "", "c"]@(1,1)
+  buffer: nvim="c" vimcode="b\n\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL CUR [to:yap cursor] keys="yap" start=["a", "", "b", "c"]@(3,1)
+  buffer: nvim="a\n\nb\nc" vimcode="a\n\nb\nc"
+  cursor: nvim=(2,1) vimcode=(3,1)
+
+FAIL CUR [to:yip cursor] keys="yip" start=["a", "", "b", "c"]@(4,1)
+  buffer: nvim="a\n\nb\nc" vimcode="a\n\nb\nc"
+  cursor: nvim=(3,1) vimcode=(4,1)
+
+FAIL BUF+CUR [to:di( on )] keys="di(" start=["f(a, b)"]@(1,7)
+  buffer: nvim="f()" vimcode="f(a, b)"
+  cursor: nvim=(1,3) vimcode=(1,7)
+
+FAIL BUF+CUR [to:d2i(] keys="d2i(" start=["f(a, (b), c)"]@(1,7)
+  buffer: nvim="f()" vimcode="f(a, (), c)"
+  cursor: nvim=(1,3) vimcode=(1,7)
+
+FAIL BUF+CUR [to:di( before paren same line] keys="di(" start=["x f(a)"]@(1,1)
+  buffer: nvim="x f()" vimcode="x f(a)"
+  cursor: nvim=(1,5) vimcode=(1,1)
+
+FAIL BUF+CUR [to:ci{ multiline] keys="ci{X<Esc>" start=["{", "  a", "  b", "}"]@(2,3)
+  buffer: nvim="{\n  X\n}" vimcode="{\nX}"
+  cursor: nvim=(2,3) vimcode=(2,1)
+
+FAIL CUR [to:yi{ cursor multiline] keys="yi{" start=["{", "  a", "  b", "}"]@(3,3)
+  buffer: nvim="{\n  a\n  b\n}" vimcode="{\n  a\n  b\n}"
+  cursor: nvim=(2,1) vimcode=(3,3)
+
+FAIL BUF+CUR [to:di" on closing] keys="di\"" start=["x \"ab\" y"]@(1,6)
+  buffer: nvim="x \"\" y" vimcode="x \"ab\" y"
+  cursor: nvim=(1,4) vimcode=(1,6)
+
+FAIL BUF+CUR [to:di" before quotes] keys="di\"" start=["x \"ab\" y"]@(1,1)
+  buffer: nvim="x \"\" y" vimcode="x \"ab\" y"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL BUF+CUR [to:da" before quotes] keys="da\"" start=["x \"ab\" y"]@(1,1)
+  buffer: nvim="x y" vimcode="x \"ab\" y"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [to:yi" cursor] keys="yi\"" start=["x \"ab\" y"]@(1,5)
+  buffer: nvim="x \"ab\" y" vimcode="x \"ab\" y"
+  cursor: nvim=(1,4) vimcode=(1,5)
+
+FAIL BUF+CUR [to:d2it] keys="d2it" start=["<a><b>x</b></a>"]@(1,7)
+  buffer: nvim="<a></a>" vimcode="<a><b></b></a>"
+  cursor: nvim=(1,4) vimcode=(1,7)
+
+FAIL BUF+CUR [to:d5aw too many] keys="d5aw" start=["a b"]@(1,1)
+  buffer: nvim="a b" vimcode="b"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF [to:daw leading whitespace] keys="daw" start=["  foo bar"]@(1,1)
+  buffer: nvim=" bar" vimcode="foo bar"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [to:ciw on whitespace] keys="ciwX<Esc>" start=["a   b"]@(1,3)
+  buffer: nvim="aXb" vimcode="a  b"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL BUF [to:cip] keys="cipX<Esc>" start=["a", "b", "", "c"]@(1,1)
+  buffer: nvim="X\n\nc" vimcode="X\nc"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [to:di( across lines] keys="di(" start=["f(a,", "  b)"]@(1,3)
+  buffer: nvim="f()" vimcode="f(a,\n  b)"
+  cursor: nvim=(1,3) vimcode=(1,3)
+
+FAIL CUR [to:yi( cursor] keys="yi(" start=["f(a, b)"]@(1,5)
+  buffer: nvim="f(a, b)" vimcode="f(a, b)"
+  cursor: nvim=(1,3) vimcode=(1,5)
+
+FAIL CUR [to:ya( cursor] keys="ya(" start=["f(a, b)"]@(1,5)
+  buffer: nvim="f(a, b)" vimcode="f(a, b)"
+  cursor: nvim=(1,2) vimcode=(1,5)
+
+FAIL BUF [to:2daw] keys="2daw" start=["a b c d"]@(1,1)
+  buffer: nvim="c d" vimcode="b c d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [to:daw at end with count] keys="d2aw" start=["a b c"]@(1,5)
+  buffer: nvim="a b c" vimcode="a b"
+  cursor: nvim=(1,5) vimcode=(1,3)
+
+FAIL BUF+CUR [to:di< nested] keys="di<" start=["<a<b>c>"]@(1,5)
+  buffer: nvim="<a<>c>" vimcode="<>"
+  cursor: nvim=(1,4) vimcode=(1,2)
+
+FAIL CUR [to:di( empty] keys="di(" start=["f()"]@(1,2)
+  buffer: nvim="f()" vimcode="f()"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF [to:di( with newline after open] keys="di(" start=["f(", "a", "b)"]@(2,1)
+  buffer: nvim="f(\n)" vimcode="f(\nb)"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF+CUR [to:diw at eol on space] keys="diw" start=["foo "]@(1,4)
+  buffer: nvim="foo" vimcode="foo "
+  cursor: nvim=(1,3) vimcode=(1,4)
+
+FAIL BUF [to:daw on multi spaces at start] keys="daw" start=["   foo"]@(1,1)
+  buffer: nvim="" vimcode="foo"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [to:>ap] keys=">ap" start=["a", "b", "", "c"]@(1,1)
+  buffer: nvim="    a\n    b\n\nc" vimcode="    a\n    b\n    \n    c"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [to:ci' then .] keys="ci'X<Esc>4l." start=["'a' 'b'"]@(1,2)
+  buffer: nvim="'X' 'X'" vimcode="'X' 'Xb'"
+  cursor: nvim=(1,6) vimcode=(1,7)
+
+FAIL BUF [to:di( count 3 too many] keys="d3i(" start=["(a)"]@(1,2)
+  buffer: nvim="(a)" vimcode="()"
+  cursor: nvim=(1,2) vimcode=(1,2)
+
+FAIL BUF+CUR [to:daw on only whitespace line] keys="daw" start=["   "]@(1,2)
+  buffer: nvim="   " vimcode=" "
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL BUF [to:dap cursor after] keys="dap" start=["a", "", "b", "c", "", "d"]@(3,1)
+  buffer: nvim="a\n\nd" vimcode="a"
+  cursor: nvim=(3,1) vimcode=(3,1)
+
+FAIL CUR [misc:yyP cursor] keys="yyP" start=["  a", "b"]@(1,3)
+  buffer: nvim="  a\n  a\nb" vimcode="  a\n  a\nb"
+  cursor: nvim=(1,3) vimcode=(1,1)
+
+FAIL CUR [misc:p multi-line charwise cursor] keys="vjy$p" start=["ab", "cd"]@(1,1)
+  buffer: nvim="abab\nc\ncd" vimcode="abab\nc\ncd"
+  cursor: nvim=(1,3) vimcode=(1,6)
+
+FAIL CUR [misc:gp charwise multi] keys="vjy$gp" start=["ab", "cd"]@(1,1)
+  buffer: nvim="abab\nc\ncd" vimcode="abab\nc\ncd"
+  cursor: nvim=(2,1) vimcode=(2,2)
+
+FAIL BUF [misc:2gp] keys="yy2gp" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\na\nb" vimcode="a\na\nb\na"
+  cursor: nvim=(4,1) vimcode=(4,1)
+
+FAIL CUR [misc:p with count linewise cursor] keys="yy3p" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\na\na\nb" vimcode="a\na\na\na\nb"
+  cursor: nvim=(2,1) vimcode=(4,1)
+
+FAIL CUR [misc:P count] keys="yl3P" start=["ab"]@(1,2)
+  buffer: nvim="abbbb" vimcode="abbbb"
+  cursor: nvim=(1,4) vimcode=(1,2)
+
+FAIL BUF+CUR [misc:count on i then esc col] keys="3ix<Esc>" start=["abc"]@(1,3)
+  buffer: nvim="abxxxc" vimcode="abxc"
+  cursor: nvim=(1,5) vimcode=(1,3)
+
+FAIL BUF+CUR [misc:r Tab] keys="r<Tab>" start=["ab"]@(1,1)
+  buffer: nvim="    b" vimcode="ab"
+  cursor: nvim=(1,4) vimcode=(1,1)
+
+FAIL BUF [misc:R at eol then BS] keys="Rxyz<BS><BS><BS><BS><Esc>" start=["ab"]@(1,2)
+  buffer: nvim="ab" vimcode="axyz"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:cw on space at eol] keys="cwX<Esc>" start=["ab "]@(1,3)
+  buffer: nvim="abX" vimcode="a "
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF+CUR [misc:C then .] keys="CX<Esc>j0." start=["abc", "def"]@(1,2)
+  buffer: nvim="aX\nX" vimcode="aX\nXdef"
+  cursor: nvim=(2,1) vimcode=(2,2)
+
+FAIL BUF+CUR [misc:cc then p] keys="ccX<Esc>jp" start=["  a", "b"]@(1,1)
+  buffer: nvim="  X\nb\n  a" vimcode="X\nb  a"
+  cursor: nvim=(3,3) vimcode=(2,4)
+
+FAIL BUF [misc:S then P] keys="SX<Esc>jP" start=["a", "b"]@(1,1)
+  buffer: nvim="X\na\nb" vimcode="X\nab"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF [misc:& after &&] keys=":s/a/b/g<CR>j&" start=["a a a", "a a a"]@(1,1)
+  buffer: nvim="b b b\nb a a" vimcode="b b b\nb b b"
+  cursor: nvim=(2,1) vimcode=(2,1)
+
+FAIL BUF+CUR [misc:g& after range] keys=":1s/a/b/<CR>g&" start=["a", "a", "a"]@(1,1)
+  buffer: nvim="b\nb\nb" vimcode="a\na\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:2d then Esc] keys="2d<Esc>x" start=["abc"]@(1,2)
+  buffer: nvim="ac" vimcode="a"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF [misc:: with count] keys="3:d<CR>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="d" vimcode="b\nc\nd"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:3:s] keys="3:s/a/b/<CR>" start=["a", "a", "a", "a"]@(1,1)
+  buffer: nvim="b\nb\nb\na" vimcode="b\na\na\na"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL CUR [misc:gv after p] keys="yyjVpgvd" start=["ab", "cd"]@(1,1)
+  buffer: nvim="ab" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(2,1)
+
+FAIL BUF+CUR [misc:C-c in insert] keys="ix<C-c>x" start=["abc"]@(1,1)
+  buffer: nvim="abc" vimcode="xcxabc"
+  cursor: nvim=(1,1) vimcode=(1,4)
+
+FAIL BUF+CUR [misc:C-[ in insert] keys="ix<C-[>x" start=["abc"]@(1,1)
+  buffer: nvim="abc" vimcode="x[x]abc"
+  cursor: nvim=(1,1) vimcode=(1,4)
+
+FAIL BUF+CUR [misc:count then : then range] keys="2:normal Ax<CR>" start=["a", "b", "c"]@(1,1)
+  buffer: nvim="ax\nbx\nc" vimcode="ax\nb\nc"
+  cursor: nvim=(2,2) vimcode=(1,3)
+
+FAIL BUF [misc:c3c] keys="c3cX<Esc>" start=["a", "b", "c", "d"]@(1,1)
+  buffer: nvim="X\nd" vimcode="X\nb\nc\nd"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [misc:g?g?] keys="g?g?" start=["ab"]@(1,1)
+  buffer: nvim="no" vimcode="ab"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:gqgq] keys=":set tw=10<CR>gqgq" start=["one two three four five six"]@(1,1)
+  buffer: nvim="one two\nthree four\nfive six" vimcode="one two three four five six"
+  cursor: nvim=(3,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:gwgw] keys=":set tw=10<CR>gwgw" start=["one two three four five six"]@(1,8)
+  buffer: nvim="one two\nthree four\nfive six" vimcode="one two three four five six"
+  cursor: nvim=(1,7) vimcode=(1,8)
+
+FAIL BUF [misc:. after :g normal] keys=":1,2g/./normal x<CR>G." start=["ab", "cd", "ef"]@(1,1)
+  buffer: nvim="b\nd\nf" vimcode="ab\ncd\nef"
+  cursor: nvim=(3,1) vimcode=(3,1)
+
+FAIL BUF+CUR [misc:xp then . ] keys="xp." start=["abcd"]@(1,1)
+  buffer: nvim="baacd" vimcode="bcd"
+  cursor: nvim=(1,3) vimcode=(1,2)
+
+FAIL BUF [misc:count with text object c] keys="3ciwX<Esc>" start=["a b c d"]@(1,1)
+  buffer: nvim="X c d" vimcode="X b c d"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF [misc:count before and after with textobj] keys="2d2aw" start=["a b c d e f g"]@(1,1)
+  buffer: nvim="e f g" vimcode="b c d e f g"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:2yy 3p] keys="2yy3p" start=["a", "b"]@(1,1)
+  buffer: nvim="a\na\nb\na\nb\na\nb\nb" vimcode="a\na\na\na\nb\nb\nb\nb"
+  cursor: nvim=(2,1) vimcode=(4,1)
+
+FAIL BUF+CUR [misc:2dd on last] keys="2dd" start=["a", "b"]@(2,1)
+  buffer: nvim="a\nb" vimcode="a"
+  cursor: nvim=(2,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:cc on last line indent] keys="ccX<Esc>" start=["a", "  b"]@(2,3)
+  buffer: nvim="a\n  X" vimcode="a\nX"
+  cursor: nvim=(2,3) vimcode=(2,1)
+
+FAIL BUF [misc:cc with count beyond] keys="5ccX<Esc>" start=["a", "b"]@(1,1)
+  buffer: nvim="X" vimcode="X\nb"
+  cursor: nvim=(1,1) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:count then i on line start] keys="2Ix<Esc>" start=["ab"]@(1,1)
+  buffer: nvim="xxab" vimcode="xab"
+  cursor: nvim=(1,2) vimcode=(1,1)
+
+FAIL BUF+CUR [misc:count then o with indent] keys="2ox<Esc>" start=["  a"]@(1,1)
+  buffer: nvim="  a\n  x\n  x" vimcode="  a\n  x\nx"
+  cursor: nvim=(3,3) vimcode=(3,1)
+
+
+thread 'nvim_conformance' (3277575) panicked at tests/nvim_conformance.rs:1693:9:
+624 conformance test(s) failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test nvim_conformance ... FAILED
+
+failures:
+
+failures:
+    nvim_conformance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 55.96s
+
+error: test failed, to rerun pass `--test nvim_conformance`
