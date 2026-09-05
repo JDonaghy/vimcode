@@ -16574,19 +16574,6 @@ fn test_tab_drag_to_new_split() {
 }
 
 #[test]
-fn test_tab_drag_cancel() {
-    // With the new controller-based drag, "cancel" is handled by the
-    // controller (TabGroupController::cancel_tab_drag).  Engine state is
-    // not mutated during a drag — cancelling is a no-op at the engine level.
-    let mut e = engine_with_text("aaa\n");
-    e.new_tab(None);
-    e.buffer_mut().insert(0, "bbb\n");
-    let tabs_before = e.active_group().tabs.len();
-    // No drag state in engine any more — just verify tabs are unchanged.
-    assert_eq!(e.active_group().tabs.len(), tabs_before);
-}
-
-#[test]
 fn test_tab_drag_last_tab_closes_group() {
     let mut e = engine_with_text("aaa\n");
     // Create second group with split

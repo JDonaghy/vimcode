@@ -10019,7 +10019,7 @@ mod tests {
     ///
     /// It is also the guard for the *measure* half. `render_tab_bar` hands
     /// the same sidecar to `draw_tab_bar_icons` that
-    /// `compute_tab_bar_hit_regions` measured with; painting with icons
+    /// `compute_tab_bar_layout` measured with; painting with icons
     /// while measuring with `&[]` would leave the second tab's label painted
     /// at a column the hit regions never cover.
     #[test]

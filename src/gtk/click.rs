@@ -344,20 +344,16 @@ fn resolve_charcell_tab_click(
     char_width: f64,
 ) -> Option<crate::core::engine::TabBarClickTarget> {
     let col = (local_x / char_width).floor().max(0.0) as u16;
-    let regions: &[(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )] = if cached_layout.editor_group_split.is_some() {
+    let layout: Option<&quadraui::TabBarLayout> = if cached_layout.editor_group_split.is_some() {
         cached_layout
             .group_tab_bars
             .iter()
             .find(|g| g.group_id == group_id)
-            .map(|g| g.hit_regions.as_slice())
-            .unwrap_or(&[])
+            .map(|g| &g.hit_regions)
     } else {
-        cached_layout.tab_bar_hit_regions.as_slice()
+        Some(&cached_layout.tab_bar_hit_regions)
     };
-    render_mod::resolve_tab_bar_click(regions, col)
+    layout.and_then(|l| render_mod::resolve_tab_bar_click(l, col))
 }
 
 /// Resolve which tab (if any) a right-click landed on, without any of the

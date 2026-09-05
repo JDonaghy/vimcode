@@ -1239,16 +1239,6 @@ pub enum TabBarClickTarget {
     DiffToggle,
 }
 
-/// A hit region within a group's tab bar, expressed in character-cell units
-/// relative to the tab bar's left edge.
-#[derive(Debug, Clone)]
-pub struct TabBarHitRegion {
-    /// Column offset from the tab bar left edge.
-    pub col: u16,
-    /// Width of this region in char cells.
-    pub width: u16,
-}
-
 // ── Context menu hit regions ────────────────────────────────────────────────
 
 /// Result of resolving a click against a context menu popup.
