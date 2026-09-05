@@ -3540,9 +3540,10 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 //    holds focus. GTK-only; on TUI the same keys fell through to the editor
 //    and moved the cursor / yanked the buffer instead of the popup.
 // 5. [`route_cmdline_selection_key`] — Ctrl+C copies the command-line /
-//    message-line mouse selection, any other key clears it. TUI-only, because
-//    only TUI populates the selection today (#602 mouse drag); GTK passes its
-//    own `None` so the rung is a no-op there until it grows the drag.
+//    message-line mouse selection, any other key clears it. Shared by both
+//    backends (#816): TUI has populated `Engine::cmd_sel` since #602, and GTK
+//    now arms the same field from its own press/drag handlers via
+//    `quadraui::CommandLineLayout::hit_test`.
 // 6. [`post_key_epilogue`] — the after-every-editor-keypress bookkeeping.
 //    TUI ran seven behaviours, GTK ran three of them; the four GTK was
 //    missing (sidebar autohide, explorer refresh after a file move, quickfix
@@ -3817,10 +3818,12 @@ pub enum CmdSelKeyRoute {
 /// every other mode the selection indexes `Engine::message` with no offset.
 /// That one-column skew is the whole reason this is worth stating once.
 ///
-/// Only TUI populates `sel` today (`TuiShellApp::handle_mouse_event`, #602);
-/// GTK's `CommandLineState::command_line_selecting` is hard-coded `false`, so
-/// GTK passes `None` and gets [`CmdSelKeyRoute::Keep`] until it grows the
-/// drag.
+/// Both backends populate `sel` from `Engine::cmd_sel` (#816): TUI's
+/// `TuiShellApp::handle_mouse_event` (#602) and GTK's press/drag handlers
+/// (`handle_mouse_click_msg` / `handle_mouse_drag_msg`, driven through
+/// `quadraui::CommandLineLayout::hit_test`) both arm the same engine-level
+/// field, and `CommandLineState::command_line_selecting` mirrors
+/// `Engine::cmd_dragging` for GTK's paint layout.
 pub fn route_cmdline_selection_key(
     engine: &Engine,
     unicode: Option<char>,
@@ -19058,16 +19061,48 @@ fn command_line_char_to_byte_idx(text: &str, char_idx: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Whether `point` lands inside the painted command-line row, in the same
+/// ABSOLUTE units as `rect` (`Engine::command_line_rect`).
+///
+/// Pulled out as its own function (#816 review) because the inline version
+/// GTK's `MouseDown` handler originally wrote only compared `point.y` against
+/// `rect.y`/`rect.height` — never `point.x`. `command_line_rect`'s `x`/`width`
+/// come from `main_content_bounds` (after the activity bar + sidebar), so it
+/// does not span the full window width; a `y`-only check treats any click in
+/// the bottom `line_height`-px band as "over the command line" regardless of
+/// `x`, including clicks over the sidebar/activity bar or past the content
+/// area on the right. Since the GTK window is undecorated
+/// (`w.set_decorated(false)`), that band is also the *only* way to grab the
+/// window's South/SW/SE resize edges (`ctx.window_edge`), so the y-only
+/// version silently disabled all three, essentially always (the command line
+/// is basically always painted). Delegates to
+/// [`quadraui::Rect::contains`] — the shared point-in-rect primitive —
+/// instead of re-deriving both bounds by hand a second time.
+pub fn point_over_command_line(rect: quadraui::Rect, point: quadraui::Point) -> bool {
+    rect.width > 0.0 && rect.contains(point)
+}
+
 /// Whether the command/message line accepts a mouse-driven text selection in
 /// `engine`'s current mode — the gate `ee26268` wrote twice (TUI's
 /// Command/Search press arm vs. its separate Normal-with-message arm) as one
 /// function, so GTK's press handler (#816) states the identical rule instead
 /// of re-deriving it.
+///
+/// In `Normal`/`Visual`/`VisualLine`, this must agree with
+/// [`build_command_line`] about *which text is actually painted*: when
+/// `engine.peek_count()` is `Some`, the row shows the pending count instead
+/// of `engine.message` (e.g. typing enough digits to hit the "Count limited
+/// to 10,000" cap leaves both a live count AND a non-empty message at the
+/// same time — `core::engine::keys` sets them together). Gating on
+/// `!message.is_empty()` alone let a click there arm a selection whose
+/// indices were hit-tested against the painted count text but whose Ctrl+C
+/// copy read `engine.message` — a real, reachable text/geometry mismatch
+/// (#816 review), not a hypothetical.
 pub fn command_line_selection_allowed(engine: &Engine) -> bool {
     match engine.mode {
         Mode::Command | Mode::Search => true,
         Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
-            !engine.message.is_empty()
+            engine.peek_count().is_none() && !engine.message.is_empty()
         }
         _ => false,
     }
@@ -19111,6 +19146,22 @@ pub fn command_line_click_char_idx(
 /// [`quadraui::CommandLineLayout::selection_bounds`] hands back, in the same
 /// ABSOLUTE units as `rect`. `None` for an empty selection or one that maps
 /// to zero width.
+///
+/// **Not wired into either backend's paint path yet (#816 review).** TUI
+/// paints its selection by inverting fg/bg per character cell
+/// (`tui_main::panels::render_command_line`) and never needs pixel geometry.
+/// GTK has no equivalent: `quadraui::CommandLine` carries no `selection`
+/// field, and neither the GTK nor TUI `draw_command_line` in quadraui paints
+/// one — so a GTK user who drags a selection over the command line gets
+/// `cmd_sel`/Ctrl+C-copy behaviour with zero visual feedback. Hand-rolling a
+/// Cairo highlight rect here (even using this function's geometry) would be
+/// exactly the per-backend workaround CLAUDE.md's Platform-Neutrality Rule
+/// forbids; the correct fix is a `CommandLine::selection` field painted by
+/// quadraui's own `draw_command_line` (both backends). This function exists
+/// so that fix has the geometry math ready the day the primitive lands — see
+/// the quadraui issue tracking that gap (file one against
+/// `JDonaghy/quadraui` if it does not already exist; #816 stays open behind
+/// it rather than being closed as GTK-selection-complete).
 pub fn command_line_selection_rect(
     rect: quadraui::Rect,
     text: &str,
@@ -23252,6 +23303,58 @@ mod tests {
 
     // ── Command-line click/selection geometry (#816) ────────────────────
 
+    /// #816 review: GTK's `MouseDown` handler used a hand-rolled guard that
+    /// compared only `point.y` against the command line's rect, never
+    /// `point.x`. Since `command_line_rect`'s `x`/`width` come from
+    /// `main_content_bounds` (after the activity bar + sidebar), that guard
+    /// treated ANY click in the bottom `line_height`-px band as "over the
+    /// command line" — including clicks over the sidebar/activity bar
+    /// (left of `rect.x`) or past the content area on the right (at/past
+    /// `rect.x + rect.width`) — which silently disabled the undecorated
+    /// window's only S/SW/SE resize grab. This asserts both axes are
+    /// actually checked; it fails against the y-only version (a click at
+    /// `x = rect.x - 1.0` would wrongly return `true`).
+    #[test]
+    fn point_over_command_line_checks_both_axes() {
+        let rect = quadraui::Rect::new(100.0, 480.0, 600.0, 20.0);
+
+        // Inside the row, inside the x-span: over the command line.
+        assert!(point_over_command_line(
+            rect,
+            quadraui::Point::new(150.0, 485.0)
+        ));
+
+        // Inside the row's y-band, but LEFT of the command line's x-span
+        // (over the sidebar/activity bar) — must NOT count as "over the
+        // command line", or the window's bottom-left resize corner is dead.
+        assert!(!point_over_command_line(
+            rect,
+            quadraui::Point::new(50.0, 485.0)
+        ));
+
+        // Inside the row's y-band, but RIGHT of the command line's x-span
+        // (past the content area) — same requirement for the bottom-right
+        // corner / south edge past the content area.
+        assert!(!point_over_command_line(
+            rect,
+            quadraui::Point::new(750.0, 485.0)
+        ));
+
+        // Outside the y-band entirely (well above the command line): never
+        // "over the command line" regardless of x.
+        assert!(!point_over_command_line(
+            rect,
+            quadraui::Point::new(150.0, 10.0)
+        ));
+
+        // A zero-width rect (command line not yet painted) never counts.
+        let empty = quadraui::Rect::new(0.0, 0.0, 0.0, 0.0);
+        assert!(!point_over_command_line(
+            empty,
+            quadraui::Point::new(0.0, 0.0)
+        ));
+    }
+
     #[test]
     fn command_line_selection_allowed_gates_on_mode_and_message() {
         let mut e = Engine::new();
@@ -23271,6 +23374,34 @@ mod tests {
             !command_line_selection_allowed(&e),
             "Insert mode has no command/message line to select"
         );
+    }
+
+    /// #816 review: `core::engine::keys`'s digit-accumulation arm sets both
+    /// `count = Some(10_000)` AND `message = "Count limited to 10,000"` in
+    /// the same keypress once the cap is hit, so a live count and a
+    /// non-empty message ARE simultaneously reachable in `Mode::Normal` —
+    /// not a hypothetical the reviewer raised for nothing. In that state
+    /// `build_command_line` paints the count, not the message (see its
+    /// `Mode::Normal | Visual | VisualLine` arm), so a selection gate that
+    /// only checked `!message.is_empty()` would arm `cmd_sel` against text
+    /// nobody painted — the click hit-tests the count string while Ctrl+C's
+    /// copy reads `engine.message`. This must stay disallowed until the
+    /// count is consumed/cleared.
+    #[test]
+    fn command_line_selection_allowed_false_when_count_shadows_message() {
+        let mut e = Engine::new();
+        e.mode = Mode::Normal;
+        e.count = Some(10_000);
+        e.message = "Count limited to 10,000".to_string();
+        assert!(
+            !command_line_selection_allowed(&e),
+            "a live count shadows the message in build_command_line's paint \
+             path, so selection must not arm against the (unpainted) message"
+        );
+
+        // Once the count is consumed, the same message alone is selectable.
+        e.count = None;
+        assert!(command_line_selection_allowed(&e));
     }
 
     #[test]

@@ -6283,10 +6283,14 @@ impl App {
                 // ordered `begin_window_resize` instead of ever reaching the
                 // click. No prior GTK feature lived in that exact band to
                 // expose the conflict; the command line is the first.
-                let over_command_line = {
-                    let r = self.engine.borrow().command_line_rect.get();
-                    r.width > 0.0 && position.y >= r.y && position.y < r.y + r.height
-                };
+                //
+                // `render::point_over_command_line` checks BOTH axes — see
+                // its doc comment for why a y-only version silently disables
+                // the window's only S/SW/SE resize grab (#816 review).
+                let over_command_line = render::point_over_command_line(
+                    self.engine.borrow().command_line_rect.get(),
+                    *position,
+                );
                 if !over_command_line {
                     if let Some(edge) =
                         ctx.window_edge(position.x, position.y, backend.line_height())
