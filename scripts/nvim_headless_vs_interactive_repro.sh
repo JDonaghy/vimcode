@@ -2,32 +2,48 @@
 #
 # #805: `tests/nvim_conformance.rs` uses a *headless* `nvim --headless -l
 # script.lua` process as its conformance oracle (see `run_in_neovim` in that
-# file). For most commands that's a faithful stand-in for real Vim. But for a
-# specific family of window-relative commands (`H`/`M`/`L`, `G`, `gg`, `%`,
-# `<C-b>`, `<C-f>`, `zz`/`zt`/`zb`/`z.`/`z-`, and anything chained after one of
-# these), headless nvim silently disagrees with *interactive* Neovim: with no
-# UI ever attached, it never validates `w_topline`/`w_botline`, so a command
-# that reads "the window's top/bottom line" gets a stale value that defaults
-# to the cursor's own current line — as if the window had never scrolled at
-# all — instead of the real, already-computed scroll position.
+# file). For most commands that's a faithful stand-in for real Vim. But with no
+# UI ever attached, no redraw ever runs, so the window's scroll bookkeeping
+# (`w_topline` / `w_botline` / `w_empty_rows`) is never validated between the
+# keystrokes of a single `nvim_feedkeys()` burst. That shows up in two
+# distinguishable ways, and this script demonstrates both:
 #
-# This script proves the divergence directly: for each of a handful of
-# representative cases pulled straight out of `KNOWN_DEVIATIONS` in
-# `tests/nvim_conformance.rs`, it runs the exact same buffer + starting
-# cursor + keystrokes through:
+#   Group A — window-relative *reads*. `H`/`M`/`L`, `<C-b>`, `<C-f>`,
+#     `zz`/`zt`/`zb`/`z.`/`z-` all answer "where is the top/bottom/middle of
+#     the window?". Headless nvim's topline silently collapses to the cursor's
+#     own line, so these behave as if the window had never scrolled.
+#
+#   Group B — the *second and later* scroll command of one burst. A single
+#     `<C-d>`/`<C-u>`/`<C-f>` is immune, because it moves the cursor by
+#     exactly as much as it scrolls the window, so a wrong topline cancels out
+#     of the cursor result. The next one in the same burst inherits the
+#     un-revalidated `w_botline`/`w_empty_rows` the previous one left behind
+#     and stops against stale state.
+#
+# For each case below it runs the exact same buffer + starting cursor +
+# keystrokes through:
 #   (a) headless nvim, via the same feedkeys-and-dump-JSON approach the
 #       conformance oracle uses, and
 #   (b) real interactive nvim, driven inside a tmux pane with a genuine
 #       80x24 terminal attached, so the window is actually redrawn.
-# vimcode's own output for the same cases (from `page_up`/`page_down`/
-# `scroll_cursor_center` in `src/core/engine/motions.rs`, cross-checked via
-# `PROBE_FILTER=... cargo test --test nvim_conformance -- --nocapture` with
-# the relevant label temporarily deleted from `KNOWN_DEVIATIONS`) matches (b)
-# in every case below, never (a).
+# Both sides report window height 22 and `'scroll'` 11 on the fixture below, so
+# the comparison is apples-to-apples. vimcode's own output for the DIVERGE
+# cases (from `page_up`/`page_down`/`scroll_cursor_center` in
+# `src/core/engine/motions.rs`, cross-checked via `PROBE_FILTER=... cargo test
+# --test nvim_conformance -- --nocapture` with `PROBE_VERBOSE=1`, which prints
+# the expected-vs-actual for KNOWN_DEVIATIONS entries too) matches (b) in every
+# case, never (a). The group-B numbers are additionally pinned by direct engine
+# tests in `tests/new_vim_features.rs` (`test_ctrl_d_chain_*`,
+# `test_ctrl_f_chain_*`).
+#
+# The AGREE cases are controls, not padding: a single `<C-d>`/`<C-f>` and a
+# plain `j` must come out *identical* on both sides. If a control diverges the
+# theory above is wrong (the oracle would be broken far more broadly than
+# claimed) and the script fails loudly rather than reporting a happy result.
 #
 # Usage: scripts/nvim_headless_vs_interactive_repro.sh
-# Requires: nvim, tmux, python3. Exits non-zero if any is missing, or if a
-# comparison shows no divergence (meaning the theory above no longer holds).
+# Requires: nvim, tmux, python3. Exits non-zero if any is missing, if an
+# expected divergence has disappeared, or if a control case diverges.
 
 set -euo pipefail
 
@@ -49,13 +65,26 @@ lines = [f"L{i:02d} {chr(ord('a') + ((i - 1) % 26))}" for i in range(1, 61)]
 open(path, "w").write("\n".join(lines) + "\n")
 PY
 
-# name | start_line | start_col | keys (nvim_replace_termcodes-compatible)
+# expectation | name | start_line | start_col | keys (nvim_replace_termcodes-compatible)
+#
+# "DIVERGE" = headless and interactive must disagree (the artifact).
+# "AGREE"   = control; they must agree, or the theory is wrong.
 cases=(
-    "scroll:C-b|60|1|<C-b>"
-    "scroll:2<C-b>|60|1|2<C-b>"
-    "scroll:5C-d C-d|1|1|5<C-d><C-d>"
-    "scroll:G M|1|1|GM"
-    "scroll:50% H|1|1|50%H"
+    # Group A — window-relative reads.
+    "DIVERGE|scroll:C-b|60|1|<C-b>"
+    "DIVERGE|scroll:2<C-b>|60|1|2<C-b>"
+    "DIVERGE|scroll:G M|1|1|GM"
+    "DIVERGE|scroll:50% H|1|1|50%H"
+    # Group B — 2nd and later scroll command in one burst.
+    "DIVERGE|scroll:C-d C-d|1|1|<C-d><C-d>"
+    "DIVERGE|scroll:5C-d C-d|1|1|5<C-d><C-d>"
+    "DIVERGE|scroll:C-d twice then C-u|1|1|<C-d><C-d><C-u>"
+    "DIVERGE|scroll:C-f C-f|1|1|<C-f><C-f>"
+    # Controls — a single scroll command, and a non-scrolling motion.
+    "AGREE|control: single <C-d>|1|1|<C-d>"
+    "AGREE|control: single <C-f>|1|1|<C-f>"
+    "AGREE|control: 5<C-d>|1|1|5<C-d>"
+    "AGREE|control: 22j|1|1|22j"
 )
 
 run_headless() {
@@ -127,63 +156,93 @@ sys.stdout.write("".join(out))
 PY
 }
 
+# Poll for a file to appear (and be non-empty) rather than sleeping a fixed
+# amount: a fixed sleep is both slower than it needs to be and liable to flake
+# under load. $1 = path, $2 = timeout in seconds.
+wait_for_file() {
+    local path="$1" limit="${2:-15}" waited=0
+    while [ ! -s "$path" ]; do
+        if [ "$waited" -ge $((limit * 20)) ]; then
+            return 1
+        fi
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
 run_interactive() {
     local start_line="$1" start_col="$2" keys="$3"
     local session="repro805_$$_$RANDOM" tmpf="$workdir/case.txt" out="$workdir/result_interactive.txt"
+    local ready="$workdir/ready.txt" done_marker="$workdir/done.txt"
     local keyfile="$workdir/keys.bin"
-    rm -f "$out"
+    rm -f "$out" "$ready" "$done_marker"
     cp "$buf" "$tmpf"
     keys_to_bytes "$keys" >"$keyfile"
     tmux kill-session -t "$session" 2>/dev/null || true
     tmux new-session -d -s "$session" -x 80 -y 24
     tmux resize-window -t "$session" -x 80 -y 24
     tmux send-keys -t "$session" "nvim -u NONE -i NONE -n '$tmpf'" Enter
-    sleep 0.6
-    tmux send-keys -t "$session" ":set shiftwidth=4 expandtab tabstop=4 noswapfile" Enter
-    sleep 0.2
-    tmux send-keys -t "$session" ":call cursor($start_line,$start_col)" Enter
-    sleep 0.2
+    # Do the whole setup in one command line and have nvim itself signal that
+    # it is up and positioned, so the next step waits on a real ready signal
+    # instead of a guessed sleep.
+    tmux send-keys -t "$session" \
+        ":set shiftwidth=4 expandtab tabstop=4 noswapfile | call cursor($start_line,$start_col) | call writefile(['ok'], '$ready')" Enter
+    if ! wait_for_file "$ready"; then
+        tmux kill-session -t "$session" 2>/dev/null || true
+        echo "???"
+        return
+    fi
     tmux load-buffer -b "repro805keys" "$keyfile"
     tmux paste-buffer -b "repro805keys" -t "$session"
     tmux delete-buffer -b "repro805keys" 2>/dev/null || true
-    sleep 0.6
-    tmux send-keys -t "$session" ":call writefile([line('.') . ',' . col('.')], '$out')" Enter
-    sleep 0.4
-    tmux send-keys -t "$session" Escape
-    tmux send-keys -t "$session" ":q!" Enter
-    sleep 0.3
+    # The pasted keys are consumed from the same input stream as this command,
+    # so nvim cannot reach the `:call writefile(...)` until every one of them
+    # has been processed -- the file appearing IS the "keys are done" signal.
+    tmux send-keys -t "$session" \
+        ":call writefile([line('.') . ',' . col('.')], '$out')" Enter
+    local rc=0
+    wait_for_file "$out" || rc=1
     tmux kill-session -t "$session" 2>/dev/null || true
-    if [ -f "$out" ]; then
+    if [ "$rc" -eq 0 ]; then
         cat "$out"
     else
         echo "???"
     fi
 }
 
-echo "case | headless (oracle) | interactive (real Vim)"
-echo "-----|--------------------|------------------------"
+printf '%-28s | %-10s | %-18s | %s\n' "case" "expected" "headless (oracle)" "interactive (real Vim)"
+printf -- '-----------------------------|------------|--------------------|------------------------\n'
 fail=0
 for entry in "${cases[@]}"; do
-    IFS='|' read -r name line col keys <<<"$entry"
+    IFS='|' read -r expectation name line col keys <<<"$entry"
     headless=$(run_headless "$line" "$col" "$keys")
     interactive=$(run_interactive "$line" "$col" "$keys")
     marker=""
     if [ "$headless" != "$interactive" ]; then
-        marker="  <-- DIVERGES"
+        if [ "$expectation" = "DIVERGE" ]; then
+            marker="  <-- DIVERGES (as expected)"
+        else
+            marker="  <-- CONTROL DIVERGED (theory broken!)"
+            fail=1
+        fi
+    elif [ "$expectation" = "DIVERGE" ]; then
+        marker="  <-- expected a divergence, got agreement"
         fail=1
     fi
-    printf '%-28s | %-18s | %-22s%s\n' "$name" "$headless" "$interactive" "$marker"
+    printf '%-28s | %-10s | %-18s | %-22s%s\n' "$name" "$expectation" "$headless" "$interactive" "$marker"
 done
 
+echo
 if [ "$fail" -eq 0 ]; then
-    echo
-    echo "No divergence found -- headless and interactive nvim agreed on every case."
-    echo "(If you expected a divergence here, the headless-oracle theory in"
-    echo "tests/nvim_conformance.rs's KNOWN_DEVIATIONS comment may no longer hold.)"
-    exit 1
+    echo "As expected: headless nvim (the conformance oracle) disagrees with real"
+    echo "interactive nvim on every DIVERGE case and agrees on every control."
+    echo "vimcode's own values for the DIVERGE cases match the interactive column,"
+    echo "not the headless one -- see KNOWN_DEVIATIONS in tests/nvim_conformance.rs."
 else
-    echo
-    echo "Headless nvim (the conformance oracle) disagrees with real interactive"
-    echo "nvim on the cases marked above. vimcode's own values for these cases"
-    echo "match the interactive column, not the headless one."
+    echo "At least one case did not behave as the headless-oracle theory in"
+    echo "tests/nvim_conformance.rs's KNOWN_DEVIATIONS comment predicts. Either the"
+    echo "theory no longer holds or the local nvim/tmux differs from the one it was"
+    echo "captured against (nvim 0.9.x, 80x24 tmux pane, window height 22)."
+    exit 1
 fi

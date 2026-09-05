@@ -411,12 +411,23 @@ impl Engine {
         let vp = self.effective_viewport_lines().max(1);
         let cur = self.view().cursor.line;
         let new_top = self.view().scroll_top;
-        if cur < new_top + scrolloff {
-            self.view_mut().cursor.line = (new_top + scrolloff).min(lines);
-            self.clamp_cursor_col();
+        let forced_line = if cur < new_top + scrolloff {
+            Some((new_top + scrolloff).min(lines))
         } else if cur >= new_top + vp.saturating_sub(scrolloff) {
-            self.view_mut().cursor.line = (new_top + vp.saturating_sub(scrolloff + 1)).min(lines);
-            self.clamp_cursor_col();
+            Some((new_top + vp.saturating_sub(scrolloff + 1)).min(lines))
+        } else {
+            None
+        };
+        if let Some(line) = forced_line {
+            // #805 review: this is a *vertical* cursor move (scrolloff pushed
+            // the cursor onto a different line), so it must land on the
+            // remembered `curswant` column exactly like `j`/`k`/`<C-d>`/
+            // `<C-f>` do — a bare `clamp_cursor_col()` here would drop a
+            // `$`-set `CURSWANT_EOL` on the floor, so `$` followed by
+            // `<C-e>`/`<C-y>` would stop sticking to end-of-line.
+            let want = self.curswant();
+            self.view_mut().cursor.line = line;
+            self.apply_curswant(want);
         }
     }
 
