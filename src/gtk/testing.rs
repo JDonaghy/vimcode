@@ -203,6 +203,23 @@ pub struct Harness<A: AppLogic> {
     /// for the mechanism, including the "never take a `CwdGuard` on a thread
     /// holding a harness" rule.
     _cwd: crate::test_cwd::CwdReadGuard,
+    /// Held for the harness's whole lifetime so no other thread can be
+    /// inside Pango/Cairo text code while this one paints.
+    ///
+    /// `cargo test` runs the suite on ~20 threads and this harness paints
+    /// for real (Cairo `ImageSurface` + `pango::Layout`); libcairo hands
+    /// glyph work to a process-global FreeType layer that is not safe to use
+    /// from two threads at once, and doing so segfaults inside
+    /// `FT_Load_Glyph`. That showed up as an intermittent `SIGSEGV` in ~10%
+    /// of full-suite runs of the `vimcode_core` lib test binary — never
+    /// reproducible with the GTK tests run alone, because 123 of them rarely
+    /// collide. See `src/test_paint.rs` for the coredump stacks and the
+    /// mechanism.
+    ///
+    /// Private and deliberately unnamed by any test, same as [`Self::_cwd`]:
+    /// construct a harness through [`harness`] and the protection comes with
+    /// it.
+    _paint: crate::test_paint::PaintGuard,
 }
 
 impl<A: AppLogic> Harness<A> {
@@ -410,9 +427,14 @@ impl<A: AppLogic> Harness<A> {
 /// buffers, tabs and groups it asserts on — no `Engine::startup`, hence no
 /// dependence on the developer's real session (see [`App::new_headless`]).
 pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic> {
-    // Taken *before* the first frame is painted (`driver_with_shell` paints
-    // one immediately) and released only when the harness drops — see
-    // `Harness::_cwd` (#785).
+    // Both taken *before* the first frame is painted (`driver_with_shell`
+    // paints one immediately) and released only when the harness drops — see
+    // `Harness::_cwd` (#785) and `Harness::_paint`.
+    //
+    // Order matters only in that it must be consistent: paint first, then
+    // cwd. The `CwdGuard` writers never take the paint lock, so there is no
+    // cycle either way — see `src/test_paint.rs`.
+    let paint = crate::test_paint::PaintGuard::acquire();
     let cwd = crate::test_cwd::CwdReadGuard::acquire();
     let engine = Rc::new(RefCell::new(engine));
     let app = App::new_headless(Rc::clone(&engine));
@@ -465,6 +487,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         native_dialog_shown,
         pending_native_dialog,
         _cwd: cwd,
+        _paint: paint,
     }
 }
 

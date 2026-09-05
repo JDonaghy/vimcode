@@ -660,6 +660,9 @@ mod emoji_click_column_tests {
 
     #[test]
     fn click_resolves_exact_column_on_emoji_markdown_line() {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
         let text = "Total: **58 commands**  \u{b7}  \u{2705} 36  \u{b7}  \u{1f7e1} 2  \u{b7}  \u{274c} 14  \u{b7}  \u{23ed}\u{fe0f} 6";
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, text);
@@ -763,6 +766,9 @@ mod emoji_click_column_tests {
     /// uniform-cell division would drift +1 column per preceding wide glyph and
     /// fail — this is what pins that neither branch degrades to it.
     fn assert_emoji_columns_resolve(paint_first: bool) {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
         use quadraui::{Backend as _, ScreenLayout as QScreenLayout, Surface};
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -889,6 +895,9 @@ mod emoji_click_column_tests {
     /// resolving on a too-short line.
     #[test]
     fn click_context_matches_painted_font_not_settings_size() {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
         // ── The runner's painted editor font (see quadraui `gtk::run`). ──
         let paint_surface =
             ImageSurface::create(Format::ARgb32, 2000, 60).expect("paint ImageSurface");
