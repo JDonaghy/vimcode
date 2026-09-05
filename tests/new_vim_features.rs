@@ -89,11 +89,55 @@ fn test_L_goes_to_screen_bottom() {
 
 #[test]
 fn test_M_goes_to_screen_middle() {
+    // #805: M's target is `scroll_top + (visible_lines - 1) / 2`, matching
+    // real Vim's own `(height - 1) / 2` — NOT `viewport_lines / 2`, which
+    // this test asserted before the fix and which is off by one for an
+    // even-height window (verified against real `nvim`: a freshly opened
+    // 4-row window with cursor on line 1 sends `M` to line 2, i.e. topline
+    // (1) + 1, not topline + 2).
     let mut e = engine_with("line1\nline2\nline3\nline4\nline5\n");
     e.set_viewport_lines(4);
     e.view_mut().scroll_top = 0;
     press(&mut e, 'M');
-    assert_cursor(&e, 2, 0); // scroll_top + viewport_lines/2 = 0 + 2 = 2
+    assert_cursor(&e, 1, 0); // scroll_top + (viewport_lines - 1) / 2 = 0 + 1 = 1
+}
+
+#[test]
+fn test_H_respects_scrolloff() {
+    // #805: 'scrolloff' keeps H at least that many lines below the window's
+    // top edge, not pinned exactly to scroll_top.
+    let mut e = engine_with("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
+    e.set_viewport_lines(6);
+    e.settings.scrolloff = 2;
+    e.view_mut().scroll_top = 2;
+    e.view_mut().cursor.line = 6;
+    press(&mut e, 'H');
+    assert_cursor(&e, 4, 0); // scroll_top + scrolloff = 2 + 2 = 4
+}
+
+#[test]
+fn test_L_respects_scrolloff() {
+    // #805: mirror of `test_H_respects_scrolloff` for the bottom edge.
+    let mut e = engine_with("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
+    e.set_viewport_lines(6);
+    e.settings.scrolloff = 2;
+    e.view_mut().scroll_top = 2;
+    press(&mut e, 'L');
+    // window bottom = scroll_top + viewport - 1 = 7; minus scrolloff (2) = 5
+    assert_cursor(&e, 5, 0);
+}
+
+#[test]
+fn test_ctrl_d_count_sets_sticky_scroll_value() {
+    // #805: an explicit count on <C-d> SETS Vim's 'scroll' option (replacing,
+    // not multiplying, any previous value), and a later bare <C-d> reuses it.
+    let mut e = engine_with(&(1..=60).map(|n| format!("L{n}\n")).collect::<String>());
+    e.set_viewport_lines(20);
+    type_chars(&mut e, "5"); // count
+    ctrl(&mut e, 'd'); // sets 'scroll' = 5, moves 5 lines down
+    assert_cursor(&e, 5, 0);
+    ctrl(&mut e, 'd'); // bare <C-d>: reuses 'scroll' = 5, NOT the default half-page
+    assert_cursor(&e, 10, 0);
 }
 
 // ── Ctrl+e / Ctrl+y ──────────────────────────────────────────────────────────

@@ -357,24 +357,29 @@ fn test_rot13_multiline() {
 
 #[test]
 fn test_visual_block_i_with_short_lines() {
-    // When block column exceeds line length, should pad with spaces.
-    // Note: cursor gets clamped through short lines, so the block col
-    // becomes min(anchor.col, cursor.col). Test with explicit anchor.
+    // #805: `j`/`k` now remember the desired column (`curswant`) through a
+    // shorter intervening line instead of losing it — this applies to
+    // Visual Block's cursor too, so the block's column stays 3 (matching
+    // real Vim: a block selection anchored at column 3 keeps aiming for
+    // column 3 on every line, padding/skipping short lines as needed,
+    // rather than being dragged down to whatever the shortest line
+    // in-between could hold).
     let mut e = engine_with("abcde\nab\nabcde\n");
     // Move to col 3 on first line
     type_chars(&mut e, "3l"); // col 3
                               // Ctrl-V starts block at col 3
     e.handle_key("v", Some('v'), true); // Ctrl-V, anchor=(0,3)
-                                        // j goes to line 1, clamps col to 1 (short line "ab")
-    type_chars(&mut e, "j"); // cursor now at (1, 1)
-                             // j goes to line 2, col stays at 1
-    type_chars(&mut e, "j"); // cursor now at (2, 1)
-                             // Block is anchor.col=3, cursor.col=1, so left=1, right=3
+                                        // j onto "ab": display clamps to its last column, but
+                                        // curswant still remembers 3.
+    type_chars(&mut e, "j"); // cursor displays at (1, 1), curswant = 3
+                             // j back onto a full-length line restores column 3.
+    type_chars(&mut e, "j"); // cursor now at (2, 3)
     type_chars(&mut e, "I");
     type_chars(&mut e, "|");
     press_key(&mut e, "Escape");
-    // Insert at left col (1) of block on all 3 lines
-    assert_buf(&e, "a|bcde\na|b\na|bcde\n");
+    // Insert at column 3 of the block on lines long enough to reach it; the
+    // short middle line is padded with a space first (no 'virtualedit').
+    assert_buf(&e, "abc|de\nab |\nabc|de\n");
 }
 
 #[test]

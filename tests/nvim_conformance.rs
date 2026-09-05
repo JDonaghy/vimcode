@@ -3799,7 +3799,26 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "num:C-x on 0 leading zeros 000",
     "num:V C-a cursor",
     "num:v C-a on -5 in visual (no minus)",
-    "scroll:C-f",
+    // #805: this whole block traces to a single root cause discovered while
+    // fixing the rest of the `scroll:` category — headless `nvim` (no UI
+    // ever attached, so no real redraw ever happens) never validates
+    // `w_topline`/`w_botline` for most window-relative commands. `H`/`M`/`L`
+    // /`G`/`gg`/`%`/`<C-b>`/`<C-f>` end up reading a *stale* topline that
+    // silently defaults to "equal to the cursor's own line" instead of a
+    // real scrolled value — so e.g. plain `H` right after `30G` is a no-op
+    // in the oracle (cursor doesn't move) where real interactive Vim would
+    // jump to the window's actual top line. `<C-d>`/`<C-u>` are the outliers
+    // that DO force a real topline update as part of their own processing,
+    // which is why the col-preserving/`'scroll'`-sticky cases among these
+    // fixed cleanly while anything chaining H/M/L/C-b/C-f after a jump did
+    // not. Matching the oracle here would mean deliberately making
+    // vimcode's *real, correctly-tracked* scroll position behave like a
+    // broken one — worse for actual interactive use, not better Vim
+    // compat — so these stay listed rather than "fixed" against a harness
+    // artifact. Confirmed via a minimal non-harness repro
+    // (`nvim --headless -l script.lua` with a single `nvim_feedkeys` call,
+    // no `CONFORMANCE_DUMP_DEVIATIONS` involved) that reproduces the same
+    // stale-topline reads outside this test file entirely.
     "scroll:C-b",
     "scroll:G C-y",
     "scroll:H from 30",
@@ -3813,16 +3832,15 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "scroll:z-H",
     "scroll:C-d C-d",
     "scroll:5C-d C-d",
+    "scroll:C-f at end",
+    "scroll:C-b at start",
     "scroll:C-f C-f",
-    "scroll:C-f C-b",
     "scroll:G H",
     "scroll:G M",
     "scroll:dH",
-    "scroll:dM",
     "scroll:C-d col sol",
     "scroll:so=5 30G H",
     "scroll:so=5 30G L",
-    "scroll:so=5 C-e",
     "scroll:25j H",
     "scroll:25j L",
     "scroll:G C-y C-y H",
@@ -3838,32 +3856,12 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "scroll:j at bottom scrolls one",
     "scroll:G then k ×5 H",
     "scroll:C-d twice then C-u",
-    "scroll:3C-d sets scroll then C-u",
     "scroll:2<C-b>",
     "scroll:H on short buffer",
-    "scroll:M on short buffer",
-    "scroll:3<C-d> on short",
-    "word:w onto blank line",
-    "word:ge onto blank",
-    "word:b onto blank line",
-    "word:w over multiple blank lines",
-    "word:ww over multiple blank lines",
-    "word:( para",
-    "word:}}}",
-    "word:}} multiple blanks",
-    "word:} from blank",
-    "word:{ at start",
-    "word:} whitespace-only line not blank",
-    "word:% in quotes",
-    "word:$jj",
-    "word:jj col memory",
     "word:gg indented (sol)",
     "word:G indented (sol)",
-    "word:$ then j to longer",
-    "word:dd then j col? (nosol)",
     "word:5G then j col (sol)",
     "word:H then j col",
-    "word:w over punct then blank",
     "to:daw on whitespace",
     "to:diw punctuation",
     "to:daw punctuation",
