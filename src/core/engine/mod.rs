@@ -2458,6 +2458,17 @@ pub struct Engine {
     /// runs, so it is copied here first.
     pub(crate) visual_block_want: Option<usize>,
 
+    /// Replace-mode undo trail: one entry per character typed since `R` was
+    /// pressed — `Some(original)` when it overwrote an existing character,
+    /// `None` when it was appended past the end of the line (#807).
+    ///
+    /// `<BS>` in Replace mode does not delete: it walks back through this
+    /// trail putting the original characters back (`:h Replace-mode`).
+    pub(crate) replace_overwritten: Vec<Option<char>>,
+    /// Count given to `R` — on Escape the typed text is re-applied that many
+    /// times, still overwriting (`2Rxy` on `abcdef` → `xyxyef`).
+    pub(crate) replace_repeat_count: usize,
+
     /// Vim's `'scroll'` option: the line count `<C-d>`/`<C-u>` use. `None`
     /// means "not set yet — use half the window height". Set (replaced, not
     /// multiplied) whenever `<C-d>`/`<C-u>` is given an explicit count, and
@@ -3732,6 +3743,8 @@ impl Engine {
             command_from_visual: None,
             curswant: None,
             visual_block_want: None,
+            replace_overwritten: Vec::new(),
+            replace_repeat_count: 1,
             scroll_value: None,
             count: None,
             operator_count: None,

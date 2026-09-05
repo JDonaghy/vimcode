@@ -406,3 +406,23 @@ fn test_blockwise_delete_register_and_block_over_block() {
     press(&mut e, 'd');
     assert_register_typed(&e, '"', "a\nd", vimcode_core::RegType::Blockwise);
 }
+
+/// Visual `=` and `gJ` — the two rows `VIM_COMPATIBILITY.md` marked ✅ while
+/// the keys were in fact unbound (#807). Both assertions fail on unfixed
+/// `develop`, where the buffer comes back untouched.
+#[test]
+fn test_visual_equal_and_gJ() {
+    let mut e = engine_with("  a\n    b\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, '=');
+    assert_buf(&e, "a\nb\n");
+    assert_cursor(&e, 0, 0);
+
+    let mut e = engine_with("a\n  b\nc\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'g');
+    press(&mut e, 'J');
+    assert_buf(&e, "a  b\nc\n");
+}

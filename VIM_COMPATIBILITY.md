@@ -495,17 +495,21 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `O` | Swap to other corner (block) | ✅ | |
 | `gv` | Reselect last visual | ✅ | |
 | `d` / `x` | Delete selection | ✅ | |
-| `c` / `s` | Change selection | ✅ | |
+| `c` / `s` | Change selection | ✅ | `s` implemented in #807 — this row was ✅ before it was true |
 | `y` | Yank selection | ✅ | |
 | `>` / `<` | Indent/dedent selection | ✅ | |
 | `~` | Toggle case | ✅ | |
 | `u` | Lowercase selection | ✅ | |
 | `U` | Uppercase selection | ✅ | |
-| `=` | Auto-indent selection | ✅ | |
-| `p` / `P` | Paste over selection | ✅ | |
+| `=` | Auto-indent selection | ✅ | Implemented in #807 — this row was ✅ for months before the key did anything |
+| `p` / `P` | Paste over selection | ✅ | A blockwise register puts a rectangle back (#807) |
 | `:` | Enter command with range | ✅ | `'<,'>` pre-filled |
 | `J` | Join selected lines | ✅ | |
-| `gJ` | Join without space | ✅ | |
+| `gJ` | Join without space | ✅ | Implemented in #807 — same stale-✅ story as `=` above |
+| `D` / `X` | Delete selected lines (linewise) | ✅ | Block `D` deletes to end of line (#807) |
+| `C` / `S` / `R` | Change selected lines (linewise) | ✅ | Block `C` changes to end of line (#807) |
+| `Y` | Yank selected lines (linewise) | ✅ | #807 |
+| `CTRL-A` / `CTRL-X` | Increment/decrement in selection | ✅ | #807 |
 | `%` | Jump to matching bracket | ✅ | Extends selection |
 | `r{char}` | Replace all selected chars | ✅ | Visual/VisualLine/VisualBlock |
 | `I` (block) | Block insert | ✅ | Text applied to all block lines on Escape |
@@ -515,7 +519,7 @@ Operators `d`, `c`, `y`, `>`, `<`, `=`, `g~`, `gu`, `gU` all accept these motion
 | `g CTRL-X` | Sequential decrement | ✅ | |
 | Movement keys | Extend selection | ✅ | All motions work |
 
-**Visual mode: 26/26 (100%)**
+**Visual mode: 30/30 (100%)**
 
 ---
 

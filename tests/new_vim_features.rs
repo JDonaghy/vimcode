@@ -985,3 +985,66 @@ fn test_recursive_macro_terminates_at_eof() {
         ]
     );
 }
+
+/// `r<CR>` / `r<Tab>` and Replace-mode `<BS>` (#807).
+///
+/// Expectations are the nvim oracle's (`op:r<CR>`, `op:3r<CR>`, `misc:r Tab`,
+/// `op:5r beyond eol`, `op:R BS restores`, `op:2R`, `op:R <CR>`).
+#[test]
+fn test_r_special_keys_and_replace_mode_backspace() {
+    // r<CR> replaces the character with a line break and lands on the new line.
+    let mut e = engine_with("abc def\n");
+    type_chars(&mut e, "lll");
+    press(&mut e, 'r');
+    press_key(&mut e, "Return");
+    assert_buf(&e, "abc\ndef\n");
+    assert_cursor(&e, 1, 0);
+
+    // A count replaces N characters with ONE line break.
+    let mut e = engine_with("abcdef\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "3");
+    press(&mut e, 'r');
+    press_key(&mut e, "Return");
+    assert_buf(&e, "a\nef\n");
+
+    // r<Tab> honours 'expandtab'.
+    let mut e = engine_with("ab\n");
+    press(&mut e, 'r');
+    press_key(&mut e, "Tab");
+    assert_buf(&e, "    b\n");
+    assert_cursor(&e, 0, 3);
+
+    // A count that does not fit on the line makes `r` do nothing at all.
+    let mut e = engine_with("abc\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "5");
+    press(&mut e, 'r');
+    press(&mut e, 'x');
+    assert_buf(&e, "abc\n");
+
+    // Replace-mode <BS> restores the overwritten characters.
+    let mut e = engine_with("abcdef\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "Rxyz");
+    assert_buf(&e, "axyzef\n");
+    press_key(&mut e, "BackSpace");
+    press_key(&mut e, "BackSpace");
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "axcdef\n");
+
+    // 2R re-applies the typed text, still overwriting.
+    let mut e = engine_with("abcdef\n");
+    type_chars(&mut e, "2Rxy");
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "xyxyef\n");
+
+    // <CR> in Replace mode breaks the line without consuming a character.
+    let mut e = engine_with("abcdef\n");
+    press(&mut e, 'l');
+    type_chars(&mut e, "Rx");
+    press_key(&mut e, "Return");
+    type_chars(&mut e, "y");
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "ax\nydef\n");
+}
