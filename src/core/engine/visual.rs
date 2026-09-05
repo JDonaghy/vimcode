@@ -760,7 +760,16 @@ impl Engine {
     /// `char_idx_to_cursor` to recover that cursor's *current* line/col
     /// (correctly reflecting any earlier same-line insert), with no need to
     /// separately track a same-line column shift.
-    pub(crate) fn mc_insert_tab(&mut self) {
+    ///
+    /// Like `mc_insert`, this deliberately does **not** touch
+    /// `insert_text_buffer` — that buffer records one fragment per *logical
+    /// keystroke*, not one per cursor, because on `Escape` it becomes
+    /// `last_inserted_text` for dot-repeat and is replayed verbatim for
+    /// count-prefixed inserts. Pushing each cursor's own (possibly
+    /// differently sized) indent would make `.` insert the concatenation of
+    /// all N cursors' indents. The caller pushes the returned *primary*
+    /// cursor's text exactly once instead (#804 review).
+    pub(crate) fn mc_insert_tab(&mut self) -> String {
         let extra = self.view().extra_cursors.clone();
         let primary = *self.cursor();
 
@@ -780,6 +789,7 @@ impl Engine {
         let mut offset: usize = 0;
         let mut new_idx_of: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
+        let mut primary_text = String::new();
 
         for &orig in &all_origs {
             let idx = orig + offset;
@@ -800,7 +810,9 @@ impl Engine {
             };
             self.insert_with_undo(idx, &text);
             let inserted = text.chars().count();
-            self.insert_text_buffer.push_str(&text);
+            if orig == primary_orig {
+                primary_text = text;
+            }
             new_idx_of.insert(orig, idx + inserted);
             offset += inserted;
         }
@@ -811,6 +823,8 @@ impl Engine {
             .iter()
             .map(|o| self.char_idx_to_cursor(new_idx_of[o]))
             .collect();
+
+        primary_text
     }
 
     /// Delete one char before every cursor position with col > 0.
