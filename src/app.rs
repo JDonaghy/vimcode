@@ -86,54 +86,11 @@ use crate::gtk::*;
 // instance) and [`GtkAccelHost`], the five-hook impl for the actions that
 // need GTK's `DeferredQueue` seam.
 
-/// Register the panel-keys accelerator set on the backend. Re-runs on each
-/// settings reload so live rebinding takes effect.
-///
-/// Called from `ShellApp::setup` (#587) — mirrors `tui_main`'s call at
-/// startup. Takes the trait object (`&mut dyn quadraui::Backend`) rather
-/// than the concrete `backend::GtkBackend` because the ShellApp runner
-/// only ever hands `setup`/`handle` a `&mut dyn quadraui::Backend`; the
-/// separate `self.backend: GtkBackend` field is a distinct instance used
-/// only for click hit-testing (see the #560 comment in `render_content`)
-/// and never receives `UiEvent::Accelerator`, so registering against it
-/// would be silently ineffective.
-fn register_panel_accelerators(
-    backend: &mut dyn quadraui::Backend,
-    pk: &crate::core::settings::PanelKeys,
-) {
-    let entries: [(&str, &str); 14] = [
-        (render::ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
-        (render::ACC_FOCUS_EXPLORER, &pk.focus_explorer),
-        (render::ACC_FOCUS_SEARCH, &pk.focus_search),
-        (render::ACC_FUZZY_FINDER, &pk.fuzzy_finder),
-        (render::ACC_LIVE_GREP, &pk.live_grep),
-        (render::ACC_COMMAND_PALETTE, &pk.command_palette),
-        (render::ACC_OPEN_TERMINAL, &pk.open_terminal),
-        (
-            render::ACC_TERMINAL_TOGGLE_MAX,
-            &pk.toggle_terminal_maximize,
-        ),
-        (render::ACC_ADD_CURSOR, &pk.add_cursor),
-        (render::ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
-        (render::ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
-        (render::ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
-        (render::ACC_NAV_BACK, &pk.nav_back),
-        (render::ACC_NAV_FORWARD, &pk.nav_forward),
-    ];
-    for (id, binding) in entries {
-        let acc_id = quadraui::AcceleratorId::new(id);
-        if binding.is_empty() {
-            backend.unregister_accelerator(&acc_id);
-            continue;
-        }
-        backend.register_accelerator(&quadraui::Accelerator {
-            id: acc_id,
-            binding: quadraui::KeyBinding::Literal(binding.to_string()),
-            scope: quadraui::AcceleratorScope::Global,
-            label: None,
-        });
-    }
-}
+// `register_panel_accelerators` (the 14-entry id table + registration loop)
+// moved to `render::register_panel_accelerators` in #823 item 1 — it was
+// byte-identical to `tui_main`'s copy and had no backend-specific step.
+// Called from `ShellApp::setup` (#587) — mirrors `tui_main`'s call at
+// startup.
 
 /// [`render::PanelAcceleratorHost`] impl for GTK: each hook just queues the
 /// matching [`DeferredAction`] — GTK's `UiEvent::Accelerator` arm has no
@@ -6798,7 +6755,7 @@ impl quadraui::ShellApp for App {
         // function existed but was never called after the ShellApp
         // migration, so none of these 14 global shortcuts — including
         // Ctrl+Shift+P for the command palette — ever fired on GTK (#587).
-        register_panel_accelerators(backend, &self.engine.borrow().settings.panel_keys);
+        render::register_panel_accelerators(backend, &self.engine.borrow().settings.panel_keys);
     }
 
     fn render_content(

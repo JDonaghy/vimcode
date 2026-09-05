@@ -3957,6 +3957,58 @@ pub fn post_key_epilogue(
 // / `TuiAccelHost`, defined next to their call sites) implementing the five
 // hook methods, so the dispatcher itself never needs to know which backend is
 // calling it.
+//
+// #823 item 1: the *registration* half (the 14-entry `(id, binding)` table
+// and the loop that (un)registers each one) was, until now, a byte-identical
+// 44-line function pasted into `app.rs` and `tui_main/mod.rs`. It has no
+// backend-specific step at all — every call goes through the trait object
+// `&mut dyn quadraui::Backend` — so unlike the five [`PanelAcceleratorHost`]
+// actions above, it needed no host seam to collapse: [`register_panel_accelerators`]
+// below is the whole function, called verbatim from both `App::setup` and
+// `tui_main`'s startup path.
+
+/// Register the panel-keys accelerator set on the backend. Re-runs on each
+/// settings reload so live rebinding takes effect.
+///
+/// Shared by both backends (#823 item 1) — called from GTK's `ShellApp::setup`
+/// and TUI's startup path, each passing their own `&mut dyn quadraui::Backend`.
+pub fn register_panel_accelerators(
+    backend: &mut dyn quadraui::Backend,
+    pk: &crate::core::settings::PanelKeys,
+) {
+    let entries: [(&str, &str); 14] = [
+        (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
+        (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
+        (ACC_FOCUS_SEARCH, &pk.focus_search),
+        (ACC_FUZZY_FINDER, &pk.fuzzy_finder),
+        (ACC_LIVE_GREP, &pk.live_grep),
+        (ACC_COMMAND_PALETTE, &pk.command_palette),
+        (ACC_OPEN_TERMINAL, &pk.open_terminal),
+        (ACC_TERMINAL_TOGGLE_MAX, &pk.toggle_terminal_maximize),
+        (ACC_ADD_CURSOR, &pk.add_cursor),
+        (ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
+        (ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
+        (ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
+        (ACC_NAV_BACK, &pk.nav_back),
+        (ACC_NAV_FORWARD, &pk.nav_forward),
+    ];
+    for (id, binding) in entries {
+        let acc_id = quadraui::AcceleratorId::new(id);
+        if binding.is_empty() {
+            // Empty string = unbound (e.g. split_editor_right defaults to ""). Drop
+            // any prior registration so a settings reload removing a binding
+            // doesn't leave a stale entry.
+            backend.unregister_accelerator(&acc_id);
+            continue;
+        }
+        backend.register_accelerator(&quadraui::Accelerator {
+            id: acc_id,
+            binding: quadraui::KeyBinding::Literal(binding.to_string()),
+            scope: quadraui::AcceleratorScope::Global,
+            label: None,
+        });
+    }
+}
 
 /// The 14 panel-key accelerator actions, shared by both backends' registries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

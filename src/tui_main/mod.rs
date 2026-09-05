@@ -155,48 +155,9 @@ pub(super) fn terminal_panel_cols(engine: &Engine, screen_w: u16, sidebar_width:
 // `TuiAccelHost` (in `shell_app.rs`, next to its call sites) is the five-hook
 // impl for the actions that need TUI-local state.
 
-/// Register the panel-keys accelerator set on the backend. Re-runs on each
-/// settings reload so live rebinding takes effect.
-fn register_panel_accelerators(
-    backend: &mut dyn quadraui::Backend,
-    pk: &crate::core::settings::PanelKeys,
-) {
-    let entries: [(&str, &str); 14] = [
-        (render::ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
-        (render::ACC_FOCUS_EXPLORER, &pk.focus_explorer),
-        (render::ACC_FOCUS_SEARCH, &pk.focus_search),
-        (render::ACC_FUZZY_FINDER, &pk.fuzzy_finder),
-        (render::ACC_LIVE_GREP, &pk.live_grep),
-        (render::ACC_COMMAND_PALETTE, &pk.command_palette),
-        (render::ACC_OPEN_TERMINAL, &pk.open_terminal),
-        (
-            render::ACC_TERMINAL_TOGGLE_MAX,
-            &pk.toggle_terminal_maximize,
-        ),
-        (render::ACC_ADD_CURSOR, &pk.add_cursor),
-        (render::ACC_SELECT_ALL_MATCHES, &pk.select_all_matches),
-        (render::ACC_SPLIT_EDITOR_RIGHT, &pk.split_editor_right),
-        (render::ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
-        (render::ACC_NAV_BACK, &pk.nav_back),
-        (render::ACC_NAV_FORWARD, &pk.nav_forward),
-    ];
-    for (id, binding) in entries {
-        let acc_id = quadraui::AcceleratorId::new(id);
-        if binding.is_empty() {
-            // Empty string = unbound (e.g. split_editor_right defaults to ""). Drop
-            // any prior registration so a settings reload removing a binding
-            // doesn't leave a stale entry.
-            backend.unregister_accelerator(&acc_id);
-            continue;
-        }
-        backend.register_accelerator(&quadraui::Accelerator {
-            id: acc_id,
-            binding: quadraui::KeyBinding::Literal(binding.to_string()),
-            scope: quadraui::AcceleratorScope::Global,
-            label: None,
-        });
-    }
-}
+// `register_panel_accelerators` (the 14-entry id table + registration loop)
+// moved to `render::register_panel_accelerators` in #823 item 1 — it was
+// byte-identical to `app.rs`'s copy and had no backend-specific step.
 
 // ─── Sidebar constants ────────────────────────────────────────────────────────
 

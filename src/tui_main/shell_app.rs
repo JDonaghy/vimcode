@@ -1728,7 +1728,7 @@ impl ShellApp for TuiShellApp {
         self.engine.menu_bar_toggleable = true;
 
         render::sync_nerd_fonts(backend, &self.engine);
-        register_panel_accelerators(backend, &self.engine.settings.panel_keys);
+        render::register_panel_accelerators(backend, &self.engine.settings.panel_keys);
         self.engine
             .menu_system
             .borrow_mut()
