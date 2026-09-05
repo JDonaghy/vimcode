@@ -6,30 +6,43 @@
 > source of truth for individual tasks — this file points at the current
 > wave and explains how to resume.
 >
-> **Last updated:** 2026-09-03 — **#47 re-audited, never started, and now
-> CLOSED with no code.** The chain (#730→#657) plus slices #751–#766 are fully
-> landed and milestone #7 is 0 open, but the re-audit #47 mandates at pickup
-> found the real blocker is a `Backend`-trait ergonomics mismatch the issue text
-> didn't anticipate. **The quadraui issue that re-audit told us to file was never
-> filed, and #47 was closed anyway** — so this section is the only surviving
-> record of the blocker. Read it before attempting Stage 1, and file the gap
-> upstream first.
+> **Last updated:** 2026-09-05 (issue #827 correction pass). **The blocker below
+> was filed and cleared 2026-09-03 — this file just never caught up.** The
+> 2026-09-03 revision said "the quadraui issue was never filed" and counted "44"
+> `self.backend` call sites; both were wrong (the real blocker, quadraui#699, was
+> filed and closed the same day at 16:38Z–17:11Z, and the real count of the two
+> Rc-handle methods is **19**, not 44 — see the corrected blocker section below).
+> **#47 is reopened, in milestone #5**, and #811 (already on this branch) has
+> started consuming the fix on the TUI side. Stage 1 (the GTK-side `App` move)
+> is the live next step — read the section below for what's still accurate.
 
 ---
 
-## ⚠️ Live blocker — **#47 (macOS wrapper): closed with no code, blocker unfiled**
+## ✅ Blocker resolved 2026-09-03 — **#47 (macOS wrapper) is reopened, in milestone #5**
 
-**Read this first.** #47 is *closed*, but nothing was built and the design question
-below is still open. No open quadraui issue mentions `modal_stack_handle` or
-`drag_state_handle`; `git show 44882e9` is a documentation-only diff. Before any
-macOS work starts:
+**Corrected 2026-09-05 (issue #827).** This section previously said #47 was closed
+with its blocker unfiled. Both halves of that were wrong:
 
-1. File the `Backend`/`GtkBackend` symmetry gap on `JDonaghy/quadraui` (or fold it
-   into **quadraui#482**, "Backend API integrity", its natural home).
-2. Re-open quadraui milestone **#9 "vimcode Platform-Neutral blockers"** to hold it.
-3. Re-open **vimcode#47** behind that blocker rather than leaving it closed —
-   `GOALS.md` now states the rule this violated: *a #7 issue that turns out to be
-   supply-blocked stays open behind its blocker.*
+- **quadraui#699** — the `Backend`/`GtkBackend` symmetry gap below — was filed
+  2026-09-03 **16:38Z** (into quadraui milestone #9) and **closed 17:11Z**
+  (PR#700/`88345fb`). Follow-up **#704** closed 21:41Z.
+- **vimcode#47 was reopened 16:38Z** and is open now, in milestone #5 — it was
+  never left closed behind an unfiled blocker.
+- quadraui#699/#704 gave every backend a symmetric Rc-handle API
+  (`modal_stack_handle()` / `drag_state_handle()`), which is what the design
+  discussion below asked for (option 1). **#811** (already on this branch) has
+  ported the TUI side of vimcode onto it — bumped the quadraui pin to `4ff2a64`
+  and rewrote the four `drag_and_modal_mut` call sites in
+  `src/tui_main/shell_app.rs`.
+
+**What's still open:** the rest of Stage 1 — `struct App` (`modal_stack_handle()`
+×12 + `drag_state_handle()` ×7 = 19 call sites, not 44 — see below) already moved
+into `src/app.rs` via #785, and #811 already ported the *TUI*-relevant call sites;
+what's left is cfg-gating `App`'s remaining GTK-only fields and finishing the
+`App`-move plan below. The design analysis below (why `modal_stack_mut`/
+`drag_and_modal_mut` couldn't be stashed) is preserved as background for *why* the
+fix took the shape it did; treat "no code was moved" and "the upstream issue was
+never filed" (further down) as no longer true.
 
 _As of 2026-09-02._ Picked up #47 (native macOS GUI, thin wrapper over
 `quadraui::macos::shell_runner::run_with_shell`). The issue's own body flags
@@ -69,7 +82,11 @@ verbatim; that part of Stage 1 is low-risk mechanical work.
 
 **The actual blocker is `backend`.** `backend::GtkBackend` is a re-export of
 `quadraui::gtk::GtkBackend` (`src/gtk/backend.rs`). `App` calls exactly five
-methods on it (`grep -n 'self\.backend\.' src/gtk/mod.rs`, 44 call sites):
+methods on it (`grep -n 'self\.backend\.' src/gtk/mod.rs`, **44 call sites** —
+**corrected 2026-09-05: that count is every use of the `backend` field across
+all five methods, not just the two Rc-handle ones this blocker is about. The
+count that actually matters is `modal_stack_handle` ×12 + `drag_state_handle`
+×7 = 19 call sites**, verified at `ee26268`):
 `modal_stack_handle()`, `drag_state_handle()`, `set_current_line_height()`,
 `set_current_char_width()`, `set_pango_context()` (the last is GTK/Pango-only,
 one call site at `:5548`, trivially cfg-gated). The first four are **inherent
@@ -101,9 +118,9 @@ to the `&mut dyn Backend` borrow's lifetime — it cannot be stashed and reused
 across the borrow-drop points this pattern relies on. Simply changing
 `App.backend`'s type from `Rc<RefCell<backend::GtkBackend>>` to
 `Rc<RefCell<Box<dyn quadraui::Backend>>>` (the obvious first move) does not
-compile: the trait object exposes the wrong shape for ~40 of the 44 call
-sites, and this is the *safety-critical* code (drag/modal/click dispatch),
-not a corner where a quick workaround is low-risk.
+compile: the trait object exposes the wrong shape for the 19 `modal_stack_handle`/
+`drag_state_handle` call sites, and this is the *safety-critical* code
+(drag/modal/click dispatch), not a corner where a quick workaround is low-risk.
 
 **This is a supply-side gap, not a vimcode design choice** — the
 Platform-Neutrality Rule says stop and file it upstream rather than route
@@ -120,33 +137,40 @@ should pick, not a vimcode-side workaround):
    needs to read them for hit-testing) — bigger change, but removes the
    asymmetry at the root instead of papering over it per-backend.
 
-**Recommendation:** file this as a quadraui issue (gap in `Backend`/`GtkBackend`
-API symmetry) before any vimcode-side Stage 1 code is written, per the
-Platform-Neutrality Rule. Do **not** attempt the `App` move without that
-decision — the 44 `self.backend` call sites sit in the app's most
-safety-critical dispatch paths (mouse drag, modal overlays), and guessing at
-an API shape here risks the same "three attempts, three reverts" outcome
-`CLAUDE.md`'s #319 negative example documents for exactly this kind of
-per-backend improvisation.
+**Recommendation (as of the 2026-09-02 re-audit):** file this as a quadraui issue
+(gap in `Backend`/`GtkBackend` API symmetry) before any vimcode-side Stage 1 code
+is written, per the Platform-Neutrality Rule. That happened — see the corrected
+"Blocker resolved" section at the top of this file: **quadraui#699/#704 shipped
+the Rc-handle accessors on option 1's shape**, and #811 already ported the TUI
+side onto them. The 19 `modal_stack_handle`/`drag_state_handle` call sites in
+`src/app.rs` (moved there by #785 since this analysis was written) are what
+Stage 1's GTK-side port still needs to touch.
 
-**What did NOT happen this session — and has not happened since:** no code was
-moved, and the upstream issue was never filed. `struct App` and
-`impl quadraui::ShellApp for App` are untouched in `src/gtk/mod.rs`. The three
+**Status, corrected 2026-09-05:** the upstream issue was **not** left unfiled —
+quadraui#699 was filed and closed the same day (2026-09-03, 16:38Z–17:11Z). `struct
+App` and `impl quadraui::ShellApp for App` moved (verbatim, per #785) out of
+`src/gtk/mod.rs` into `src/app.rs` before this correction was written, and #811 has
+already rewritten the TUI-relevant call sites onto the new handle API. The three
 other platform fields (`window`, `css_provider`, `settings_monitor`) and the
-key-mapping helpers are confirmed low-risk and ready to move once the
-`backend` question is resolved — re-verify line numbers again at that point,
-since nothing here has landed to keep them stable.
+key-mapping helpers are still confirmed low-risk and ready to move — re-verify line
+numbers in `src/app.rs` before touching them, since #785/#811 already changed them
+once since this analysis was written.
 
-### Stage ordering once unblocked
+### Stage ordering — unblocked 2026-09-03
 
-**Step 1 has still not happened** (verified 2026-09-03: no open quadraui issue
-references either accessor). Nothing below is startable until it does.
+**Step 1 is resolved** (quadraui#699/#704 closed 2026-09-03; #811 ported the TUI
+side). Re-audit which of the steps below `#785`/`#811` already completed before
+starting the next one — this list was written before either landed.
 
-1. File/resolve the quadraui `Backend`/`GtkBackend` symmetry gap above.
-2. Move `struct App` + its three `impl App` blocks + `impl ShellApp for App`
-   (`src/gtk/mod.rs:538-7483`) to `src/app.rs`, gating `window`/`css_provider`/
-   `settings_monitor` behind `#[cfg(feature = "gui")]` and switching `backend`
-   to whatever shape step 1 lands on.
+1. ~~File/resolve the quadraui `Backend`/`GtkBackend` symmetry gap above.~~ ✅ Done
+   (quadraui#699/#704).
+2. ~~Move `struct App` + its three `impl App` blocks + `impl ShellApp for App`
+   (`src/gtk/mod.rs:538-7483`) to `src/app.rs`~~ ✅ **The move itself is done**
+   (#785, verbatim). **Still open:** gating `window`/`css_provider`/
+   `settings_monitor` behind `#[cfg(feature = "gui")]` and switching `backend`'s
+   ~19 `modal_stack_handle`/`drag_state_handle` call sites onto the new handle
+   API from quadraui#699/#704 (per `GOALS.md`, `src/app.rs`'s own module doc
+   still lists these as the remaining gate-blockers).
 3. `src/gtk/mod.rs` keeps only `run()`, `build_shell_config()`, and the
    genuinely GTK-only helpers (window-chrome, CSS, key-name→GDK glyph tables
    if any remain GTK-specific after the move).
