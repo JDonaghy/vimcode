@@ -790,6 +790,9 @@ mod chrome_paint_tests {
     /// background" check would pass in both cases, so this measures the
     /// actual perceptual gap instead.
     fn per_segment_contrast_deltas(theme: &Theme) -> Vec<(String, f64)> {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
         let bar = render::window_controls_status_bar(theme, false);
 
         let mut surface =

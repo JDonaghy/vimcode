@@ -52,6 +52,12 @@ pub mod app;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_cwd;
 
+/// Process-wide arbitration of Pango/Cairo text work in the test run — the
+/// lock that keeps two threads from being inside libpango/libfreetype at
+/// once, which segfaults. Test-only; never compiled into a release binary.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_paint;
+
 // Re-export quadraui so integration tests + downstream consumers pin to the
 // same version vimcode is built against.
 pub use quadraui;
