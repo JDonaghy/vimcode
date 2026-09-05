@@ -3657,7 +3657,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "vis:v_r CR",
     "vis:v ap trailing",
     "vis:vip on last para no trailing",
-    "vb:jr<CR>",
     // The last two `num:` deviations, and the only two that survive #807.
     // Both are the same class as the `ins:*(nosmarttab)` pair above:
     // `run_in_vimcode` never reads a case's `setup`, so a case whose whole
@@ -3810,8 +3809,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "word:H then j col",
     "to:das last sentence",
     "to:dis on whitespace between",
-    "to:ci{ multiline",
-    "to:d2it",
     "to:d5aw too many",
     "to:cip",
     "to:daw on only whitespace line",
