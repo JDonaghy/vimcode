@@ -1452,9 +1452,19 @@ pub struct ContextMenuItem {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct PanelHoverPopup {
-    /// Rendered markdown lines + spans (reuses the existing markdown module).
-    pub rendered: crate::core::markdown::MdRendered,
-    /// Clickable link URLs extracted from LinkUrl spans: (line_idx, start_byte, end_byte, url).
+    /// Raw markdown source (already passed through
+    /// `core::markdown::linkify_bare_urls`). Styled at paint time via
+    /// `quadraui::compose::markdown::render_markdown_to_styled` with the
+    /// active theme (#821) — see `EditorHoverPopup::markdown`'s doc for the
+    /// full rationale.
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped) — used for the
+    /// popup's empty-content check and content-width sizing.
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines. See
+    /// `EditorHoverPopup::code_highlights`.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
+    /// Clickable link URLs: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Panel name this hover belongs to.
     pub panel_name: String,
@@ -1492,8 +1502,23 @@ pub enum EditorHoverSource {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct EditorHoverPopup {
-    /// Rendered markdown content.
-    pub rendered: crate::core::markdown::MdRendered,
+    /// Raw markdown source (already passed through
+    /// `core::markdown::linkify_bare_urls`, and with any "Go to" nav links
+    /// appended). Styled at paint time via
+    /// `quadraui::compose::markdown::render_markdown_to_styled` with the
+    /// active theme — see `render.rs`'s `markdown_hover_to_quadraui_lines`
+    /// (#821).
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped) — used for scroll
+    /// bounds, clipboard copy, and selection extraction. Computed once, at
+    /// show time, via `core::markdown::hover_markdown_structure` (theme-
+    /// independent, so it doesn't drift from what's painted regardless of
+    /// theme changes while the popup is open).
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines (empty
+    /// for non-code-block lines). Byte offsets are relative to the code
+    /// line's own raw text — see `hover_markdown_structure`'s doc.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
     /// Clickable link regions: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Buffer line where the hover is anchored (0-indexed).

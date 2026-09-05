@@ -939,6 +939,32 @@ fn window_overflows_vertically(w: &RenderedWindow) -> bool {
     w.total_lines > text_rows
 }
 
+/// Terminal column one past a window's right edge — i.e. the column the
+/// *next* pane starts in, and therefore the column its group divider paints
+/// in.
+///
+/// The sum is deliberately taken in **f32**, then truncated with quadraui's
+/// own cell convention (`as u16`, per `SplitTreeDivider::cell_position`).
+/// `RenderedWindow::rect` is an f64 *widening* of the f32 rect
+/// `quadraui::SplitTree::layout` produced, and the sibling divider's
+/// `position` is that same layout's `bounds.x + first_w` added in f32 — so
+/// adding the two f64 fields back together here is not the same arithmetic
+/// and can land a whole cell away.
+///
+/// Concretely (the drag this fixes, #753's `group_divider_drag_moves_the_
+/// painted_divider_via_shell_app`): dragging a group divider to column 48 of
+/// a 46-wide editor area stores `ratio = 14/46`, which f32 resolves to a
+/// left pane of `13.999999046…` cells. quadraui's f32 `34.0 + 13.999999046`
+/// rounds back up to exactly `48.0`, so the divider paints at cell 48; the
+/// f64 sum stays `47.999999046…` and truncates to **47**, putting the left
+/// pane's own separator at 46 instead of 47. `group_divider_cells`' "the
+/// left pane already separates these two groups" guard then stops matching
+/// and both lines paint — the #481 phantom double divider, with a blank
+/// column wedged between them.
+fn window_right_edge_cell(rect: &WindowRect) -> u16 {
+    (rect.x as f32 + rect.width as f32).max(0.0) as u16
+}
+
 /// Absolute `(x, y)` terminal cells where [`render_separators`] paints a
 /// vertical `'│'` window-divider glyph — the same geometry its own
 /// painting loop below walks, factored out as a pure data computation (no
@@ -961,7 +987,9 @@ fn vertical_separator_cells(windows: &[RenderedWindow]) -> std::collections::Has
             if (a.rect.x + a.rect.width - b.rect.x).abs() < 1.0 && v_overlap {
                 // #550: `a.rect`/`b.rect` are already absolute terminal-screen
                 // coordinates, so no `editor_area` offset addition needed.
-                let sep_x = (a.rect.x + a.rect.width) as u16;
+                // See [`window_right_edge_cell`] for why the boundary column
+                // is not `(a.rect.x + a.rect.width) as u16`.
+                let sep_x = window_right_edge_cell(&a.rect);
                 let y_start = a.rect.y.max(b.rect.y) as u16;
                 let y_end = (a.rect.y + a.rect.height).min(b.rect.y + b.rect.height) as u16;
 
@@ -1213,7 +1241,9 @@ pub(super) fn group_divider_cells(
             if div_x > editor_area.x {
                 let left_col = div_x - 1;
                 let left_has_scrollbar = windows.iter().any(|w| {
-                    let last_col = (w.rect.x + w.rect.width) as u16;
+                    // Same f32-precision boundary the separator pass uses —
+                    // see [`window_right_edge_cell`].
+                    let last_col = window_right_edge_cell(&w.rect);
                     // Bound the row range the same way `window_overflows_vertically`
                     // bounds `text_rows`: `draw_editor` only paints the scrollbar
                     // into the window's *text* rows, never the last row when that
@@ -2530,5 +2560,84 @@ mod tests {
                  divider should not double up there. got cells: {cells:?}"
             );
         }
+    }
+
+    /// Regression pin for [`window_right_edge_cell`]: the exact geometry a
+    /// group-divider drag produces (the `#753`
+    /// `group_divider_drag_moves_the_painted_divider_via_shell_app` driver
+    /// test's, reduced to pure data).
+    ///
+    /// Dragging the divider of a 46-cell-wide editor area to column 48
+    /// stores `ratio = 14/46`, and `quadraui::SplitTree::layout` resolves
+    /// that to a left pane exactly `13.999999046325684` cells wide — while
+    /// the divider `position` it returns from the *same* `first_w`, summed
+    /// in f32, is exactly `48.0`. Summing the pane's f64 `x + width` here
+    /// instead yields `47.999999046…`, truncating to 47, so the separator
+    /// landed at 46: one column left of the divider's own cell, the #481
+    /// "already separated" guard stopped matching, and both the separator
+    /// and the group divider painted with a blank column wedged between.
+    #[test]
+    fn separator_column_tracks_the_divider_after_a_fractional_drag() {
+        // `13.999999046325684` is not a typo — it is `(14f32 / 46f32 * 46f32)`
+        // widened to f64, i.e. what quadraui actually hands back.
+        let left_width = (14.0f32 / 46.0f32 * 46.0f32) as f64;
+        assert!(
+            left_width < 14.0,
+            "fixture precondition: the f32 round-trip must land just *under* \
+             a whole cell (got {left_width})"
+        );
+        let left = fixture_window(
+            WindowId(0),
+            WindowRect::new(34.0, 2.0, left_width, 21.0),
+            1,
+            None,
+        );
+        let right = fixture_window(WindowId(1), WindowRect::new(48.0, 2.0, 32.0, 21.0), 1, None);
+        let windows = [left, right];
+
+        // The separator must sit in column 47 — the cell immediately left of
+        // the divider's own cell (48), exactly as it does before any drag.
+        let cells = vertical_separator_cells(&windows);
+        for y in 2..23u16 {
+            assert!(
+                cells.contains(&(47, y)),
+                "row {y}: the left pane's separator must track the divider's \
+                 cell (48) at column 47; got {cells:?}"
+            );
+        }
+
+        // ...and because it does, the group divider must not paint a *second*
+        // line at 48 across the panes' rows (#481).
+        let divider = GroupDivider {
+            split_index: 0,
+            direction: SplitDirection::Vertical,
+            position: 48.0,
+            axis_start: 34.0,
+            axis_size: 46.0,
+            cross_start: 0.0,
+            cross_size: 24.0,
+        };
+        let editor_area = Rect {
+            x: 34,
+            y: 0,
+            width: 46,
+            height: 24,
+        };
+        let div_cells = group_divider_cells(&[divider], &windows, editor_area);
+        for y in 2..23u16 {
+            assert!(
+                !div_cells.contains(&(48, y)),
+                "row {y}: the left pane already separates the two groups, so \
+                 the group divider must not paint a second line beside it; \
+                 got {div_cells:?}"
+            );
+        }
+        // Above the panes (the tab-bar rows) nothing else separates them, so
+        // the divider itself is still what paints there.
+        assert!(
+            div_cells.contains(&(48, 1)),
+            "the divider must still paint on the tab-bar row, where no pane \
+             separator covers it; got {div_cells:?}"
+        );
     }
 }
