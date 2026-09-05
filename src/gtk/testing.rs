@@ -657,6 +657,103 @@ mod tests {
         );
     }
 
+    /// #818: two nested `:vsplit`s paint **two** window-divider lines whose
+    /// `split_index` differs (0 for the outer split, 1 for the one nested
+    /// inside its second window). This is the exact shape #582/#452 warned
+    /// two independently hand-rolled recursive passes over `WindowLayout`
+    /// (`calculate_rects` and `dividers`) could number or position
+    /// inconsistently — #818 replaced both passes with the leaves/dividers
+    /// `quadraui::SplitTree::layout` computes together in one pass. Dragging
+    /// only the inner divider must move exactly that line and leave the
+    /// outer, sibling divider's column untouched; a split_index/rect mixup
+    /// reintroduced by a future change to `WindowLayout::to_split_tree`/
+    /// `dividers` would move the wrong one (or both).
+    #[test]
+    fn nested_window_split_dividers_move_independently_when_dragged() {
+        let mut engine = engine_with_long_buffer();
+        engine.split_window(SplitDirection::Vertical, None);
+        engine.split_window(SplitDirection::Vertical, None);
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // Select by `split_index` rather than by comparing painted x — the
+        // nested (inner) divider's *position* can land on either side of the
+        // outer divider's depending on which child the nesting happened in,
+        // so magnitude is not a reliable way to tell them apart. `dividers()`
+        // numbers the outer (top-level) split `0` in pre-order and the split
+        // nested inside one of its children `1`.
+        let (outer_x, inner_x, mid_y) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have been painted");
+            assert_eq!(
+                layout.window_dividers.len(),
+                2,
+                "two nested `:vsplit`s must paint two dividers, got {:?}",
+                layout.window_dividers
+            );
+            let outer = layout
+                .window_dividers
+                .iter()
+                .find(|d| d.split_index == 0)
+                .expect("the outer split must be split_index 0");
+            let inner = layout
+                .window_dividers
+                .iter()
+                .find(|d| d.split_index == 1)
+                .expect("the nested split must be split_index 1");
+            (
+                outer.position as i32,
+                inner.position as i32,
+                (inner.cross_start + inner.cross_size / 2.0) as i32,
+            )
+        };
+        assert_ne!(
+            outer_x, inner_x,
+            "the outer and inner dividers must paint at different columns"
+        );
+
+        let line_colour = h.driver.pixel(outer_x, mid_y);
+        let background = h.driver.pixel(outer_x - 40, mid_y);
+        assert_ne!(
+            line_colour, background,
+            "the divider line must be visually distinct from the pane behind it, \
+             or this test cannot tell whether it moved"
+        );
+
+        // Drag only the inner (rightmost) divider.
+        let target_x = inner_x - 50;
+        h.driver.mouse_down(inner_x as f32, mid_y as f32);
+        h.driver.mouse_move(target_x as f32, mid_y as f32);
+        h.driver.mouse_up(target_x as f32, mid_y as f32);
+        h.driver.render();
+
+        let moved_inner = painted_divider_x(&mut h, target_x, mid_y, 8, line_colour)
+            .unwrap_or_else(|| panic!("no divider line found near the drag column {target_x}"));
+        assert!(
+            moved_inner.abs_diff(target_x) <= 2,
+            "the dragged (inner) divider must repaint at {target_x}, found it at {moved_inner}"
+        );
+        assert!(
+            painted_divider_x(&mut h, inner_x, mid_y, 4, line_colour).is_none(),
+            "the dragged divider must no longer paint at its old column ({inner_x})"
+        );
+
+        // The OUTER divider — the one NOT dragged — must still repaint at (or
+        // within a couple of AA/rounding pixels of) its original column. A
+        // real split_index/rect mixup would move it by tens or hundreds of
+        // pixels (or make it vanish entirely, like the dragged divider's old
+        // column above), not by an AA rounding pixel or two — so a tight but
+        // non-zero tolerance still catches the bug class this test targets.
+        let moved_outer = painted_divider_x(&mut h, outer_x, mid_y, 4, line_colour)
+            .unwrap_or_else(|| panic!("the outer divider must still be painted near {outer_x}"));
+        assert!(
+            moved_outer.abs_diff(outer_x) <= 2,
+            "dragging the inner divider must not move the outer, sibling divider \
+             (a split_index/rect mixup between the two would move both): outer \
+             divider was at {outer_x}, now painted at {moved_outer}"
+        );
+    }
+
     /// #753, GTK half of the tab-drag rung: dragging one tab past another must
     /// reorder the **painted** tab bar.
     ///

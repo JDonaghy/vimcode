@@ -42,8 +42,19 @@ fn window_widget_id(id: WindowId) -> quadraui::WidgetId {
     quadraui::WidgetId::new(format!("w{}", id.0))
 }
 
+/// Panics if `id` isn't a well-formed `"w{usize}"` — the only strings
+/// [`window_widget_id`] ever produces, and the only producer `SplitTree`
+/// ever hands back to this function within a single `to_split_tree` →
+/// `layout` round trip. A parse failure here means `quadraui::SplitTree`
+/// mutated or fabricated a `WidgetId` this code never gave it, which would
+/// otherwise silently resolve to window `0` — a wrong-window bug far harder
+/// to spot than a panic naming the offending id.
 fn window_id_from_widget(id: &quadraui::WidgetId) -> WindowId {
-    WindowId(id.as_str()[1..].parse().unwrap_or(0))
+    WindowId(
+        id.as_str()[1..]
+            .parse()
+            .unwrap_or_else(|e| panic!("malformed window WidgetId {id:?} from SplitTree: {e}")),
+    )
 }
 
 /// See [`window_widget_id`].
@@ -51,8 +62,13 @@ fn group_widget_id(id: GroupId) -> quadraui::WidgetId {
     quadraui::WidgetId::new(format!("g{}", id.0))
 }
 
+/// See [`window_id_from_widget`] — same contract, for `GroupId`.
 fn group_id_from_widget(id: &quadraui::WidgetId) -> GroupId {
-    GroupId(id.as_str()[1..].parse().unwrap_or(0))
+    GroupId(
+        id.as_str()[1..]
+            .parse()
+            .unwrap_or_else(|e| panic!("malformed group WidgetId {id:?} from SplitTree: {e}")),
+    )
 }
 
 /// Convert a resolved `quadraui::SplitTreeDivider` back into vimcode's
