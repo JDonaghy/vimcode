@@ -2352,11 +2352,29 @@ pub struct Engine {
     pub registers: HashMap<char, (String, bool)>,
     /// Currently selected register for next yank/delete/paste (set by "x prefix).
     pub selected_register: Option<char>,
+    /// Accumulating the expression typed after `"=` (Normal mode) or
+    /// `<C-r>=` (Insert mode), up to the terminating `<CR>` — `:h quote_=`.
+    /// `true` marks the Insert-mode variant, which inserts the evaluated
+    /// result at the cursor instead of only filling the `=` register.
+    pub(crate) expr_register_pending: Option<(bool, String)>,
+    /// One-shot flag: the pending charwise-delete/change is via `%`, `/`,
+    /// `?`, `n` or `N`, so it must land in `"1` (shifting `"1`-`"9`) even
+    /// though the deleted text is often less than one line (`:h
+    /// quotedash`). Set just before dispatching into the motion, consumed
+    /// (and reset) by `apply_charwise_operator`/`apply_operator_exclusive_range`
+    /// — mirrors the existing one-shot `force_motion_mode` flag (#806).
+    pub(crate) force_numbered_register: bool,
 
     // --- Marks ---
     /// Marks per buffer: BufferId -> (mark_char -> Cursor position)
     /// Supports 'a'-'z' for file-local marks
     pub marks: HashMap<BufferId, HashMap<char, Cursor>>,
+    /// Set around a `join_lines` splice so `insert_with_undo`/`delete_with_undo`
+    /// skip their generic whole-line mark shift — `join_lines` does its own
+    /// precise offset-based mark adjustment instead, because a join (unlike
+    /// `O`/`o`/`dd`) needs the absorbed line's marks to gain a *column* offset,
+    /// not just a line shift (#806, "`a after line join").
+    pub(crate) suppress_mark_line_adjust: bool,
 
     // --- Visual mode state ---
     /// Visual mode anchor point (where visual selection started).
@@ -2488,6 +2506,10 @@ pub struct Engine {
     pub macro_recording: Option<char>,
     /// Accumulated keystrokes during recording.
     pub recording_buffer: Vec<char>,
+    /// `qA` (uppercase register) was used to start the current recording, so
+    /// `stop_macro_recording` must append to the existing lowercase register
+    /// content instead of overwriting it (`:h q`).
+    pub(crate) macro_recording_append: bool,
 
     // --- Macro playback state ---
     /// Keys to inject for playback.
@@ -2496,6 +2518,15 @@ pub struct Engine {
     pub last_macro_register: Option<char>,
     /// Prevent infinite recursion.
     pub macro_recursion_depth: usize,
+    /// Set by a Normal-mode command that failed to complete (target char not
+    /// found for `f`/`F`/`t`/`T`, `j`/`k` already at a buffer edge, …) and
+    /// checked once per keystroke by `advance_macro_playback`: a failure
+    /// during macro playback aborts the rest of the currently-playing macro
+    /// *and* any outstanding repeat count (`:h :normal`, `10@a` stopping
+    /// partway through) — real Vim's rule, and also what makes a
+    /// self-referential recursive macro terminate at EOF instead of spinning
+    /// forever (#806). Reset to `false` at the top of every `handle_key`.
+    pub(crate) command_failed: bool,
 
     // --- Git integration ---
     /// Current git branch name (None if not in a git repo or git not available).
@@ -2634,6 +2665,10 @@ pub struct Engine {
     jump_list: Vec<JumpEntry>,
     /// Current position in jump list (points past the last entry when at newest).
     jump_list_pos: usize,
+    /// Cursor position captured once at construction, used by
+    /// `seed_jump_list_if_line_left` to lazily seed an otherwise-empty
+    /// jumplist the first time the cursor leaves this starting line (#806).
+    startup_jump_entry: Option<JumpEntry>,
 
     // --- Workspace ---
     /// Path to the loaded `.vimcode-workspace` file, if any.
@@ -3133,8 +3168,17 @@ pub struct Engine {
     pub last_jump_pos: Option<(usize, usize)>,
     /// Position of last buffer edit (for '. and `. marks).
     pub last_edit_pos: Option<(usize, usize)>,
-    /// Position where cursor was when last leaving Insert mode (for `gi`).
+    /// Position where cursor was when last leaving Insert mode (for `gi`,
+    /// and for the `^`/`` `^ `` mark — `:h '^`).
     pub last_insert_pos: Option<(usize, usize)>,
+    /// Start of the most recent `>>`/`<<`-style line-shift change (for `'[`
+    /// / `` `[ ``). Narrower than real Vim's `[`/`]` (which track every
+    /// change/yank/paste — `` `] `` after yank is a tracked, separate
+    /// deviation), but covers the shift-command case (#806).
+    pub(crate) last_change_start: Option<(usize, usize)>,
+    /// End of the most recent `>>`/`<<`-style line-shift change (for `']` /
+    /// `` `] ``). See `last_change_start`.
+    pub(crate) last_change_end: Option<(usize, usize)>,
     /// Start of last visual selection (for '< and `< marks).
     pub visual_mark_start: Option<(usize, usize)>,
     /// End of last visual selection (for '> and `> marks).
@@ -3624,7 +3668,10 @@ impl Engine {
             activity_bar_selected: 1,
             registers: HashMap::new(),
             selected_register: None,
+            expr_register_pending: None,
+            force_numbered_register: false,
             marks: HashMap::new(),
+            suppress_mark_line_adjust: false,
             visual_anchor: None,
             visual_dollar: false,
             command_from_visual: None,
@@ -3657,9 +3704,11 @@ impl Engine {
             search_typing_buffer: String::new(),
             macro_recording: None,
             recording_buffer: Vec::new(),
+            macro_recording_append: false,
             macro_playback_queue: VecDeque::new(),
             last_macro_register: None,
             macro_recursion_depth: 0,
+            command_failed: false,
             git_branch,
             last_git_branch_check: None,
             scroll_bind_pairs: Vec::new(),
@@ -3714,6 +3763,7 @@ impl Engine {
             leader_partial: None,
             jump_list: Vec::new(),
             jump_list_pos: 0,
+            startup_jump_entry: None,
             find_replace_open: false,
             find_replace_query: String::new(),
             find_replace_replacement: String::new(),
@@ -3919,6 +3969,8 @@ impl Engine {
             last_jump_pos: None,
             last_edit_pos: None,
             last_insert_pos: None,
+            last_change_start: None,
+            last_change_end: None,
             visual_mark_start: None,
             visual_mark_end: None,
             global_marks: HashMap::new(),
@@ -4131,6 +4183,9 @@ impl Engine {
         // skip the expensive initial tree-sitter parse.
         crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
         engine.explorer_rebuild_rows();
+        // Record the startup position for `seed_jump_list_if_line_left` —
+        // see that function's doc comment (#806).
+        engine.startup_jump_entry = Some(engine.current_jump_entry());
         engine
     }
 

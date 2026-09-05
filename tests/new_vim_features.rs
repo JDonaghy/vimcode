@@ -695,3 +695,132 @@ fn test_set_textwidth() {
     exec(&mut e, "set textwidth=79");
     assert_eq!(e.settings.textwidth, 79);
 }
+
+// ── #806: mark adjustment, '' toggling, macro failure-stop/recursion ───────────
+
+#[test]
+fn test_mark_shifts_after_line_inserted_above() {
+    // `:h mark-motions` — inserting a line above a mark must shift the
+    // mark's line number down with it, not leave it pointing at whatever
+    // text slid into its old slot.
+    let mut e = engine_with("a\nb\nc\n");
+    press(&mut e, 'j'); // line 1, "b"
+    press(&mut e, 'm');
+    press(&mut e, 'a'); // mark a := (line 1, "b")
+    press(&mut e, 'g');
+    press(&mut e, 'g'); // back to line 0, "a"
+    press(&mut e, 'O'); // open a new blank line above line 0
+    type_chars(&mut e, "x");
+    press_key(&mut e, "Escape");
+    // Buffer is now ["x", "a", "b", "c"] — "b" (and mark a) shifted to line 2.
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "x".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]
+    );
+    press(&mut e, '\'');
+    press(&mut e, 'a');
+    assert_cursor(&e, 2, 0);
+}
+
+#[test]
+fn test_double_quote_mark_toggles() {
+    // `''` jumps to the position before the last jump — and IS ITSELF a
+    // jump, so a second `''` toggles back (`:h ''`).
+    let mut e = engine_with("a\nb\nc\nd\n");
+    press(&mut e, '3');
+    press(&mut e, 'G'); // line 2 ("c") — a real jump, so '' now targets line 0
+    assert_cursor(&e, 2, 0);
+    press(&mut e, '\'');
+    press(&mut e, '\'');
+    assert_cursor(&e, 0, 0); // back to where 3G started
+    press(&mut e, '\'');
+    press(&mut e, '\'');
+    assert_cursor(&e, 2, 0); // toggled forward again, to where '' jumped from
+}
+
+#[test]
+fn test_macro_count_stops_at_first_failure() {
+    // Vim aborts the whole repeat count when a command inside the macro
+    // fails — `100@a` must behave exactly like `10@a` here (stop once `f,`
+    // can't find a comma), not run all 100 requested repetitions.
+    let mut e = engine_with("a,b\nc,d\ne f\ng,h\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, '0');
+    press(&mut e, 'f');
+    press(&mut e, ',');
+    press(&mut e, 'x');
+    press(&mut e, 'j');
+    press(&mut e, 'q');
+    press(&mut e, '1');
+    press(&mut e, '0');
+    press(&mut e, '0');
+    press(&mut e, '@');
+    press(&mut e, 'a');
+    drain_macro_queue(&mut e);
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "ab".to_string(),
+            "cd".to_string(),
+            "e f".to_string(),
+            "g,h".to_string(),
+        ],
+        "the count must stop at the first line without a comma, not paper \
+         over it and keep going"
+    );
+    assert_cursor(&e, 2, 0);
+}
+
+#[test]
+fn test_recursive_macro_terminates_at_eof() {
+    // The idiomatic Vim "run this macro over the whole file" trick: record
+    // an empty macro (`qaq`), then re-record it ending in a self-referential
+    // `@a` — at record time that refers to the still-empty macro (a no-op),
+    // but once saved, playing it back makes `@a` recurse for real. It must
+    // stop when `j` fails at the last line, not spin forever.
+    let mut e = engine_with("a\nb\nc\nd\n");
+    press(&mut e, 'q');
+    press(&mut e, 'a');
+    press(&mut e, 'q'); // qaq: register 'a' is now "" (empty)
+    press(&mut e, 'q');
+    press(&mut e, 'a'); // start recording 'a' for real
+    press(&mut e, 'A');
+    type_chars(&mut e, "!");
+    press_key(&mut e, "Escape");
+    press(&mut e, 'j');
+    press(&mut e, '@');
+    press(&mut e, 'a'); // during recording, plays back the still-empty macro
+    press(&mut e, 'q'); // stop: register 'a' is now "A!<Esc>j@a"
+    drain_macro_queue(&mut e); // nothing should be queued, but be safe
+    press(&mut e, '@');
+    press(&mut e, 'a'); // the real, recursive invocation
+                        // Bounded drain: assert it terminates well before any "safety cap"
+                        // would — a regression back to the old behavior spins until
+                        // MAX_MACRO_RECURSION, which this loop deliberately doesn't reach.
+    let mut iterations = 0;
+    while !e.macro_playback_queue.is_empty() && iterations < 1000 {
+        e.advance_macro_playback();
+        iterations += 1;
+    }
+    assert!(
+        e.macro_playback_queue.is_empty(),
+        "recursive macro should terminate at EOF, not keep running \
+         (queue still has {} keys after {iterations} iterations)",
+        e.macro_playback_queue.len()
+    );
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "a!".to_string(),
+            "b!".to_string(),
+            "c!".to_string(),
+            "d!".to_string(),
+        ]
+    );
+}

@@ -332,6 +332,13 @@ fn test_named_register_yank_paste() {
 
 #[test]
 fn test_black_hole_register() {
+    // #806 (#2132/#553 lineage): the old version of this test asserted only
+    // `lines.contains(&"keep")`, which stays true even if `"_dd` is treated
+    // as a plain `dd` — "keep" was never touched by the delete either way,
+    // so the assertion could not distinguish "black hole worked" from
+    // "black hole is ignored". Assert the exact buffer instead, at each
+    // step, so a reinstated `"_` bug (falling through to the unnamed
+    // register) actually fails this test.
     let mut e = engine_with("keep\ndelete\n");
     // Yank "keep" into unnamed register first
     press(&mut e, 'y');
@@ -342,12 +349,23 @@ fn test_black_hole_register() {
     press(&mut e, '_');
     press(&mut e, 'd');
     press(&mut e, 'd');
-    // Paste — should still paste "keep", not "delete"
+    // The delete itself still happens — "_ only redirects the register,
+    // it doesn't disable the command.
+    let lines = get_lines(&e);
+    assert_eq!(
+        lines,
+        vec!["keep".to_string()],
+        "\"_dd must still delete the line, lines: {lines:?}"
+    );
+    // Paste — must reproduce "keep" (from `yy`), never "delete": a `"_dd`
+    // that (incorrectly) also wrote the unnamed register would paste
+    // "delete" here instead.
     press(&mut e, 'p');
     let lines = get_lines(&e);
-    assert!(
-        lines.contains(&"keep".to_string()),
-        "unnamed register should still have 'keep', lines: {lines:?}"
+    assert_eq!(
+        lines,
+        vec!["keep".to_string(), "keep".to_string()],
+        "\"_dd must not clobber the unnamed register, lines: {lines:?}"
     );
 }
 

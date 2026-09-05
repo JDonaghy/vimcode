@@ -191,17 +191,32 @@ fn test_gv_reselects_last_visual() {
 
 // ── Group 3: Register Completeness ───────────────────────────────────────────
 
+// These used to assert directly on `e.registers`/`get_register_content` —
+// internal-state checks that can pass even when the register is unreachable
+// from real key sequences (see #806's `reg:"_dd then p` finding: `"_`
+// silently fell back to the unnamed register for months because nothing
+// exercised it end-to-end). Round-tripping through `p`/`"{reg}p` instead
+// asserts on the one thing a user actually observes: what lands in the
+// buffer.
+
 #[test]
 fn test_register_0_set_on_yank() {
     let mut e = engine_with("hello\nworld\n");
     // yy sets "0
     press(&mut e, 'y');
     press(&mut e, 'y');
-    assert_register(&e, '0', "hello\n", true);
-    // dd does NOT overwrite "0
+    // dd (linewise delete of "hello") must NOT overwrite "0 — it goes to
+    // "1/"" instead. Deleting, then pasting "0 back, must reproduce
+    // "hello" (from the yank), never "world" (the just-deleted line).
     press(&mut e, 'd');
     press(&mut e, 'd');
-    assert_register(&e, '0', "hello\n", true);
+    press(&mut e, '"');
+    press(&mut e, '0');
+    press(&mut e, 'p');
+    assert_eq!(
+        get_lines(&e),
+        vec!["world".to_string(), "hello".to_string()]
+    );
 }
 
 #[test]
@@ -210,7 +225,13 @@ fn test_register_1_set_on_linewise_delete() {
     // dd sets "1 (linewise delete)
     press(&mut e, 'd');
     press(&mut e, 'd');
-    assert_register(&e, '1', "line1\n", true);
+    press(&mut e, '"');
+    press(&mut e, '1');
+    press(&mut e, 'p');
+    assert_eq!(
+        get_lines(&e),
+        vec!["line2".to_string(), "line1".to_string()]
+    );
 }
 
 #[test]
@@ -222,8 +243,16 @@ fn test_numbered_registers_shift() {
     // Second dd → "1 = "bbb\n", "2 = "aaa\n"
     press(&mut e, 'd');
     press(&mut e, 'd');
-    assert_register(&e, '1', "bbb\n", true);
-    assert_register(&e, '2', "aaa\n", true);
+    press(&mut e, '"');
+    press(&mut e, '1');
+    press(&mut e, 'p');
+    press(&mut e, '"');
+    press(&mut e, '2');
+    press(&mut e, 'p');
+    assert_eq!(
+        get_lines(&e),
+        vec!["ccc".to_string(), "bbb".to_string(), "aaa".to_string()]
+    );
 }
 
 #[test]
@@ -232,39 +261,38 @@ fn test_register_minus_small_delete() {
     // dw on "hello" — less than 1 full line → sets "-
     press(&mut e, 'd');
     press(&mut e, 'w');
-    // "-" register should contain "hello "
-    let (text, linewise) = e
-        .registers
-        .get(&'-')
-        .cloned()
-        .expect("register '-' should be set");
-    assert!(!linewise, "small delete should not be linewise");
-    assert_eq!(text, "hello ", "register '-' should contain deleted word");
+    // Move to the end of the line so the paste position is unambiguous,
+    // then paste "- back — it must contain the deleted "hello ", appended
+    // after "world".
+    press(&mut e, '$');
+    press(&mut e, '"');
+    press(&mut e, '-');
+    press(&mut e, 'p');
+    assert_eq!(get_lines(&e), vec!["worldhello ".to_string()]);
 }
 
 #[test]
 fn test_register_percent_filename() {
-    let mut e = engine_with("some content\n");
+    let mut e = engine_with("x\n");
     // Set a fake file path on the buffer
     e.active_buffer_state_mut().file_path = Some(std::path::PathBuf::from("/home/user/myfile.rs"));
-    // "% should contain just the filename
-    let content = e
-        .get_register_content('%')
-        .map(|(s, _)| s)
-        .unwrap_or_default();
-    assert_eq!(content, "myfile.rs");
+    // "% should contain just the filename — paste it to check.
+    press(&mut e, '"');
+    press(&mut e, '%');
+    press(&mut e, 'p');
+    assert_eq!(get_lines(&e), vec!["xmyfile.rs".to_string()]);
 }
 
 #[test]
 fn test_register_slash_last_search() {
     let mut e = engine_with("foo bar foo\n");
     search_fwd(&mut e, "bar");
-    // "/ should contain last search pattern
-    let content = e
-        .get_register_content('/')
-        .map(|(s, _)| s)
-        .unwrap_or_default();
-    assert_eq!(content, "bar");
+    // "/ should contain the last search pattern — paste it after the match
+    // it just found.
+    press(&mut e, '"');
+    press(&mut e, '/');
+    press(&mut e, 'p');
+    assert_eq!(get_lines(&e), vec!["foo bbarar foo".to_string()]);
 }
 
 #[test]
@@ -274,12 +302,11 @@ fn test_register_dot_last_insert() {
     press(&mut e, 'i');
     type_chars(&mut e, "world");
     press_key(&mut e, "Escape");
-    // ". should contain last inserted text
-    let content = e
-        .get_register_content('.')
-        .map(|(s, _)| s)
-        .unwrap_or_default();
-    assert_eq!(content, "world");
+    // ". should contain last inserted text — paste it back to check.
+    press(&mut e, '"');
+    press(&mut e, '.');
+    press(&mut e, 'p');
+    assert_eq!(get_lines(&e), vec!["worldworldhello".to_string()]);
 }
 
 // ── Group 4: Mark Completeness ────────────────────────────────────────────────
