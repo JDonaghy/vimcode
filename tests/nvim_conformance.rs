@@ -3605,7 +3605,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "op:gqq indented",
     "op:Vgq",
     "op:o esc removes indent",
-    "op:o x CR esc no trailing ws",
     "op:cw on empty line",
     "op:dvj charwise force",
     "op:dve exclusive force",
@@ -3621,7 +3620,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "undo:U",
     "undo:UU",
     "undo:A xyz u cursor",
-    "undo:arrow breaks undo",
     "undo:u after :%s cursor",
     "undo:u after visual d",
     "undo:u restores cursor after :g",
@@ -3638,7 +3636,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "reg:\". insert register",
     "reg:\": last cmd",
     "reg:\"/ last search",
-    "reg:i C-r a linewise",
     "reg:\"adw does not set \"-",
     "reg:viw\"_dP",
     "reg:\"1 after cc",
@@ -3693,39 +3690,18 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "ex:d _",
     "ex:y A append",
     "ex:*d after visual",
-    "ins:C-w at line start joins",
-    "ins:C-w punctuation",
-    "ins:C-u before start",
-    "ins:C-u twice",
-    "ins:C-u with indent",
-    "ins:BS over indent (nvim smarttab)",
-    "ins:BS mid indent",
-    "ins:Tab at start (smarttab)",
-    "ins:Tab mid line ts4",
-    "ins:Tab mid line ts8",
-    "ins:Tab after 2 chars ts4",
-    "ins:0 C-d",
-    "ins:C-o $ then type",
-    "ins:A C-o h",
-    "ins:C-o with count",
-    "ins:C-o p",
-    "ins:C-o :s",
-    "ins:C-v 065",
-    "ins:C-v x41",
-    "ins:CR mid-line",
-    "ins:CR on indented mid",
-    "ins:CR then Esc removes autoindent",
-    "ins:CR CR keeps prev line empty",
-    "ins:Down Down col memory",
-    "ins:C-h as BS",
-    "ins:C-j newline",
-    "ins:C-p completion",
-    "ins:typing prefix then Tab",
-    "ins:C-v u00e9",
-    "ins:insert Tab then BS (sts)",
-    "ins:C-r register linewise mid line",
-    "ins:C-r with tab in register",
-    "ins:BS join with autoindent",
+    // These two are a matched pair (#804): the paired `nvim`-side Lua
+    // `setup` toggles 'smarttab' for the oracle only — `run_in_vimcode`
+    // never reads `setup`, so both cases drive the *same* vimcode keys
+    // against two different Neovim configurations. VimCode has no
+    // 'smarttab' setting; it always behaves as Vim's actual default
+    // (smarttab **on**), so it matches the "(nvim smarttab)" case and, by
+    // construction, cannot also match "(nosmarttab)" — implementing a
+    // `nosmarttab` toggle nobody has asked for is not worth doing just to
+    // chase this pair to zero. If vimcode ever grows a real 'smarttab'
+    // setting, wire it through `run_in_vimcode` and delete this comment.
+    "ins:BS over indent (nosmarttab)",
+    "ins:Tab at start (nosmarttab)",
     "vis:Vjd",
     "vis:v$y p",
     "vis:gv after Vjd",
@@ -3927,7 +3903,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "misc:: with count",
     "misc:3:s",
     "misc:gv after p",
-    "misc:C-c in insert",
     "misc:C-[ in insert",
     "misc:count then : then range",
     "misc:c3c",
@@ -3939,7 +3914,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "misc:2yy 3p",
     "misc:2dd on last",
     "misc:cc with count beyond",
-    "misc:count then o with indent",
 ];
 
 // ---------------------------------------------------------------------------

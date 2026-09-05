@@ -3228,8 +3228,20 @@ impl Engine {
     /// Collect all words in the current buffer that start with `prefix`,
     /// deduplicated, sorted, excluding an exact match of `prefix` itself.
     /// Used by Ctrl-N/Ctrl-P (manual completion) which can afford the full scan.
+    /// Candidates for `<C-n>`/`<C-p>` keyword completion, ordered the way
+    /// Vim's actual scan is (`:h compl-keyword`): forward distance from the
+    /// cursor, wrapping around the buffer. `<C-n>` takes index 0 (nearest
+    /// match after the cursor); `<C-p>` takes the last index, which under
+    /// this wraparound ordering is the nearest match *before* the cursor —
+    /// not alphabetical order, which picks an arbitrary match regardless of
+    /// proximity (#804, "C-p completion").
     pub(crate) fn word_completions_for_prefix(&self, prefix: &str) -> Vec<String> {
-        let mut set: std::collections::HashSet<String> = Default::default();
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let cursor_pos = self.buffer().line_to_char(cursor_line) + cursor_col;
+        let total = self.buffer().len_chars().max(1);
+        let mut best_dist: std::collections::HashMap<String, usize> = Default::default();
+        let mut abs = 0usize;
         for line_idx in 0..self.buffer().len_lines() {
             let text: String = self.buffer().content.line(line_idx).chars().collect();
             let chars: Vec<char> = text.chars().collect();
@@ -3243,16 +3255,26 @@ impl Engine {
                     }
                     let word: String = chars[start..i].iter().collect();
                     if word.starts_with(prefix) && word != prefix {
-                        set.insert(word);
+                        let occ_pos = abs + start;
+                        let dist = if occ_pos >= cursor_pos {
+                            occ_pos - cursor_pos
+                        } else {
+                            occ_pos + total - cursor_pos
+                        };
+                        best_dist
+                            .entry(word)
+                            .and_modify(|d| *d = (*d).min(dist))
+                            .or_insert(dist);
                     }
                 } else {
                     i += 1;
                 }
             }
+            abs += len;
         }
-        let mut v: Vec<String> = set.into_iter().collect();
-        v.sort();
-        v
+        let mut v: Vec<(String, usize)> = best_dist.into_iter().collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        v.into_iter().map(|(w, _)| w).collect()
     }
 
     /// Delete the previously inserted candidate (or prefix), insert the new

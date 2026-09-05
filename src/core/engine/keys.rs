@@ -379,12 +379,38 @@ impl Engine {
                     if self.mode == Mode::Normal
                         && self.pending_key.is_none()
                         && self.pending_operator.is_none()
+                        // A count digit alone (`2` of `2w`) isn't a complete
+                        // command yet — without this a lone digit already
+                        // satisfies the two checks above and returns to
+                        // Insert before the motion it prefixes ever runs
+                        // (#804, "C-o with count").
+                        && self.count.is_none()
                     {
                         self.mode = Mode::Insert;
                         self.start_undo_group();
                         self.insert_ctrl_o_active = false;
-                    } else if self.mode != Mode::Normal {
-                        // Command changed mode (e.g. entered Insert via i/a/o) — clear flag
+                        // `:h i_CTRL-O`: a bare `$` sets Vim's sticky
+                        // "end of line" want-column, so resuming Insert
+                        // afterwards appends past the last character
+                        // instead of inserting before it (#804).
+                        if !ctrl && unicode == Some('$') {
+                            let line = self.view().cursor.line;
+                            self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+                        } else if !ctrl && unicode == Some('p') {
+                            // `p` leaves the cursor ON the last pasted
+                            // character in Normal mode; resuming Insert via
+                            // <C-o> continues typing *after* it instead
+                            // (#804, "C-o p").
+                            let line = self.view().cursor.line;
+                            let max_col = self.get_line_len_for_insert(line);
+                            self.view_mut().cursor.col = (self.view().cursor.col + 1).min(max_col);
+                        }
+                    } else if self.mode != Mode::Normal && self.mode != Mode::Command {
+                        // Command changed mode (e.g. entered Insert via i/a/o) — clear flag.
+                        // Mode::Command is exempt: `<C-o>:s/a/b/<CR>` is still
+                        // "one command" spanning several keystrokes — see the
+                        // `Mode::Command` arm below, which resumes Insert once
+                        // the ex-command actually runs (#804, "C-o :s").
                         self.insert_ctrl_o_active = false;
                     }
                     // If pending_key/operator is set, keep flag active for next iteration
@@ -398,6 +424,15 @@ impl Engine {
             }
             Mode::Command => {
                 action = self.handle_command_key(key_name, unicode, ctrl);
+                // Ctrl-O auto-return, continued: an ex-command entered via
+                // `<C-o>:` counts as the one command <C-o> promised, so
+                // resume Insert once it has run (mode is back to Normal) —
+                // see the `Mode::Normal` arm above for the common case (#804).
+                if self.insert_ctrl_o_active && self.mode == Mode::Normal {
+                    self.mode = Mode::Insert;
+                    self.start_undo_group();
+                    self.insert_ctrl_o_active = false;
+                }
             }
             Mode::Search => {
                 self.handle_search_key(key_name, unicode, ctrl, &mut changed);
@@ -1021,6 +1056,7 @@ impl Engine {
                 let line = self.view().cursor.line;
                 let indent = self.smart_indent_for_newline(line);
                 let indent_len = indent.len();
+                self.insert_open_indent = indent.clone();
                 let line_end =
                     self.buffer().line_to_char(line) + self.buffer().line_len_chars(line);
                 let line_content = self.buffer().content.line(line);
@@ -1064,6 +1100,7 @@ impl Engine {
                     String::new()
                 };
                 let indent_len = indent.len();
+                self.insert_open_indent = indent.clone();
                 let line_start = self.buffer().line_to_char(line);
                 // Open one new line above (count is handled on Escape via insert_open_count)
                 let text = format!("{}\n", indent);
@@ -4958,9 +4995,107 @@ impl Engine {
     /// Vim abandons a count-prefixed insert (`3ix`) as soon as the cursor is
     /// moved with an arrow/Home/End key during that insert: `3ix<Left>y<Esc>`
     /// yields `yxa`, not `yxyxyxa` (`:h i_<Left>` — "the count is not used
-    /// after a cursor key"). Called from every insert-mode cursor movement.
+    /// after a cursor key"). Called from every insert-mode cursor movement,
+    /// *after* the cursor has actually moved (see `split_insert_undo_group`,
+    /// called alongside it, which needs the post-move position).
     fn cancel_insert_repeat_count(&mut self) {
         self.insert_repeat_count = 0;
+    }
+
+    /// Splits the undo group: moving the cursor with an arrow key during
+    /// Insert mode starts a new change, so `u` after `ifoo<Left>bar<Esc>`
+    /// undoes only "bar", not the whole insert (#804, "undo:arrow breaks
+    /// undo"). Must run *after* the cursor has moved, so the new group's
+    /// saved cursor is the position the next edit will actually start from.
+    /// `finish_undo_group`/`start_undo_group` are no-ops on an empty group,
+    /// so this is free when nothing was typed yet.
+    fn split_insert_undo_group(&mut self) {
+        self.finish_undo_group();
+        self.start_undo_group();
+    }
+
+    /// `:h 'autoindent'`: "If you do not type anything on the new line
+    /// except <BS> or CTRL-D and then type <Esc>, CTRL-O or <CR>, the
+    /// indent is deleted again." Only fires on the specific line
+    /// `insert_indent_only_line` points at (set when `<CR>` last created an
+    /// indent-only line and nothing but `<BS>`/`<C-d>` has touched it since —
+    /// a plain "is this line blank" check would also strip a line the user
+    /// deliberately emptied with `<C-u>`, which Vim does not do (#804).
+    /// Moves the cursor to column 0 when it strips.
+    fn strip_blank_current_line_indent(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        if self.insert_indent_only_line.take() != Some(line) {
+            return;
+        }
+        if !self.settings.auto_indent {
+            return;
+        }
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        let content_len =
+            if line_len > 0 && self.buffer().content.char(line_start + line_len - 1) == '\n' {
+                line_len - 1
+            } else {
+                line_len
+            };
+        if content_len == 0 {
+            return;
+        }
+        let all_blank = (0..content_len)
+            .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
+        if all_blank {
+            self.delete_with_undo(line_start, line_start + content_len);
+            self.view_mut().cursor.col = 0;
+            *changed = true;
+        }
+    }
+
+    /// Expand any literal tabs in text about to be bulk-inserted (`<C-r>`
+    /// register insertion), the same way a real `<Tab>` keypress would be
+    /// expanded — `:h i_CTRL-R` inserts the register "as if typed", and that
+    /// includes 'expandtab' (#804). `start_col` is the column the first
+    /// character lands at; each embedded `\n` resets the column to 0 for the
+    /// next line.
+    fn expand_tabs_for_insert(&self, content: &str, start_col: usize) -> String {
+        if !self.settings.expand_tab || !content.contains('\t') {
+            return content.to_string();
+        }
+        let ts = (self.settings.tabstop as usize).max(1);
+        let mut out = String::with_capacity(content.len());
+        let mut col = start_col;
+        for ch in content.chars() {
+            match ch {
+                '\t' => {
+                    let target = (col / ts + 1) * ts;
+                    out.push_str(&" ".repeat(target - col));
+                    col = target;
+                }
+                '\n' => {
+                    out.push('\n');
+                    col = 0;
+                }
+                c => {
+                    out.push(c);
+                    col += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Insert the character named by a `<C-v>{digits}` numeric sequence
+    /// (`:h i_CTRL-V_digit`) at the cursor.
+    fn insert_ctrl_v_char_value(&mut self, value: u32, changed: &mut bool) {
+        let ch = char::from_u32(value).unwrap_or('\u{FFFD}');
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let char_idx = self.buffer().line_to_char(line) + col;
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        self.insert_with_undo(char_idx, s);
+        self.insert_text_buffer.push(ch);
+        self.view_mut().cursor.col += 1;
+        *changed = true;
     }
 
     pub(crate) fn handle_insert_key(
@@ -4970,6 +5105,46 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) {
+        // ── Terminal ctrl-key aliases (#804) ──────────────────────────────────
+        // In a real terminal, crossterm delivers `<C-h>` as ctrl+'h' (byte
+        // 0x08), `<C-j>`/`<C-m>` as ctrl+'j'/'m' (bytes 0x0A/0x0D), and
+        // `<C-c>`/`<C-[>` as ctrl+'c'/'bracketleft' — none of those are the
+        // named keys (`BackSpace`/`Return`/`Escape`) the rest of this
+        // function matches on, so without this they fell through to the
+        // catch-all character-insert arm and typed the literal letter
+        // instead of doing what Vim does with them. Remap to the canonical
+        // name up front so every downstream check (undo grouping, autopair
+        // backspace, autoindent CR, …) runs the real BackSpace/Return/Escape
+        // path rather than a reimplementation of it.
+        let (key_name, ctrl) = if ctrl {
+            match key_name {
+                "h" => ("BackSpace", false),
+                "j" | "m" => ("Return", false),
+                "c" | "bracketleft" => ("Escape", false),
+                other => (other, true),
+            }
+        } else {
+            (key_name, ctrl)
+        };
+
+        // `:h 'autoindent'` exempts only <BS> and <C-d> from breaking a
+        // freshly-created indent-only line's "untouched" status; every other
+        // key (including a plain <C-u>, which has its own distinct
+        // first-non-blank behavior above) clears it. <CR>/<Esc> consult and
+        // clear the flag themselves via `strip_blank_current_line_indent`.
+        if key_name != "BackSpace"
+            && key_name != "Return"
+            && key_name != "Escape"
+            && !(ctrl && key_name == "d")
+        {
+            self.insert_indent_only_line = None;
+        }
+        // A run of <Down>/<Up> remembers its want-column (#804); any other
+        // key ends the run.
+        if key_name != "Down" && key_name != "Up" {
+            self.insert_vertical_want_col = None;
+        }
+
         // ── Configured completion trigger (e.g. Ctrl-Space) ──────────────────
         {
             let trigger = self.settings.completion_keys.trigger.clone();
@@ -5141,24 +5316,47 @@ impl Engine {
             self.insert_ctrl_r_pending = false;
             if let Some(reg_char) = unicode {
                 if let Some((content, _)) = self.get_register_content(reg_char) {
-                    let content_clone = content.clone();
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
+                    // The register is inserted "as if typed" (`:h i_CTRL-R`)
+                    // — an embedded <Tab> still goes through 'expandtab'
+                    // (#804, "C-r with tab in register").
+                    let content_clone = self.expand_tabs_for_insert(&content, col);
                     let char_idx = self.buffer().line_to_char(line) + col;
-                    let char_count = content_clone.chars().count();
                     self.insert_with_undo(char_idx, &content_clone);
-                    self.view_mut().cursor.col += char_count;
+                    // A linewise register's content ends with `\n`, so the
+                    // inserted text spans multiple lines — advance the
+                    // cursor line-by-line instead of just adding the raw
+                    // character count to the current column (#804, "C-r
+                    // register linewise mid line").
+                    let lines: Vec<&str> = content_clone.split('\n').collect();
+                    if lines.len() > 1 {
+                        self.view_mut().cursor.line = line + lines.len() - 1;
+                        self.view_mut().cursor.col = lines.last().map_or(0, |l| l.chars().count());
+                    } else {
+                        self.view_mut().cursor.col = col + content_clone.chars().count();
+                    }
                     *changed = true;
                 }
             }
             return;
         }
 
-        // Ctrl+U: delete from cursor back to insert-start column (Vim behavior)
+        // Ctrl+U: delete entered characters back to insert-start column
+        // (`:h i_CTRL-U`). If nothing has been typed on this line since
+        // insert started (or a previous <C-u> already consumed it all),
+        // Vim ignores the insert-start column entirely and deletes back to
+        // the first non-blank instead — leaving autoindent alone unless the
+        // indent is all there is before the cursor, in which case that goes
+        // too (#804).
         if ctrl && key_name == "u" {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
-            let del_to = self.insert_enter_col;
+            let del_to = if col > self.insert_enter_col {
+                self.insert_enter_col
+            } else {
+                self.first_non_blank_col(line)
+            };
             if col > del_to {
                 let line_start = self.buffer().line_to_char(line);
                 let from = line_start + del_to;
@@ -5171,20 +5369,70 @@ impl Engine {
         }
 
         // Ctrl+O: execute one normal-mode command then return to insert
+        // (`:h i_CTRL-O`). "If the cursor was beyond the end of the line, it
+        // will be put on the last character" — clamp now, before the one
+        // command runs, exactly like leaving insert mode via <Esc> does
+        // (#804, "A C-o h": without this, `h` from insert's one-past-eol
+        // column lands one column too far right).
         if ctrl && key_name == "o" {
             self.finish_undo_group();
             self.mode = Mode::Normal;
+            self.clamp_cursor_col();
             self.insert_ctrl_o_active = true;
             return;
         }
 
-        // Ctrl+V: insert next character literally (two-key sequence)
+        // Ctrl+V: insert next character literally, or — when it's a digit,
+        // or one of o/O (octal), x/X (hex), u (hex4), U (hex8) — accumulate
+        // the decimal/octal/hex/unicode value of a character to insert
+        // instead (`:h i_CTRL-V_digit`, #804).
         if ctrl && key_name == "v" {
             self.insert_ctrl_v_pending = true;
             return;
         }
+        if let Some((base, max_digits, mut count, mut value)) = self.insert_ctrl_v_numeric {
+            let digit = unicode.and_then(|ch| ch.to_digit(base));
+            if let Some(d) = digit {
+                value = value * base + d;
+                count += 1;
+                if count >= max_digits {
+                    self.insert_ctrl_v_numeric = None;
+                    self.insert_ctrl_v_char_value(value, changed);
+                } else {
+                    self.insert_ctrl_v_numeric = Some((base, max_digits, count, value));
+                }
+                return;
+            }
+            // A char that doesn't fit the mode ends the sequence early: use
+            // whatever value was accumulated, then let this key fall
+            // through and get handled normally below.
+            self.insert_ctrl_v_numeric = None;
+            if count > 0 {
+                self.insert_ctrl_v_char_value(value, changed);
+            }
+        }
         if self.insert_ctrl_v_pending {
             self.insert_ctrl_v_pending = false;
+            if let Some(ch) = unicode {
+                let mode = match ch {
+                    '0'..='9' => Some((10u32, 3u32)),
+                    'o' | 'O' => Some((8, 3)),
+                    'x' | 'X' => Some((16, 2)),
+                    'u' => Some((16, 4)),
+                    'U' => Some((16, 8)),
+                    _ => None,
+                };
+                if let Some((base, max_digits)) = mode {
+                    // A leading digit is itself the first digit of the
+                    // value; o/O/x/X/u/U are mode prefixes, not digits.
+                    let (count, value) = match ch.to_digit(10) {
+                        Some(d) => (1, d),
+                        None => (0, 0),
+                    };
+                    self.insert_ctrl_v_numeric = Some((base, max_digits, count, value));
+                    return;
+                }
+            }
             // Insert the raw character regardless of what it is
             let literal = if let Some(ch) = unicode {
                 Some(ch.to_string())
@@ -5212,12 +5460,15 @@ impl Engine {
             return;
         }
 
-        // Ctrl+W: delete word backward from cursor
+        // Ctrl+W: delete word backward from cursor (`:h i_CTRL-W`). Respects
+        // Vim's three word classes (blank / keyword / punctuation) so
+        // "foo.bar" only loses "bar", not the whole run of non-blank chars
+        // (#804) — and at column 1, joins with the previous line exactly
+        // like BackSpace does, then keeps the joined cursor position (#804).
         if ctrl && key_name == "w" {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
             if col > 0 {
-                // Find start of word backward
                 let line_start = self.buffer().line_to_char(line);
                 let char_idx = line_start + col;
                 let line_text: String = self
@@ -5226,16 +5477,22 @@ impl Engine {
                     .slice(line_start..char_idx)
                     .chars()
                     .collect();
-                // Skip trailing spaces, then skip non-spaces
                 let chars: Vec<char> = line_text.chars().collect();
                 let mut i = chars.len();
-                // Skip trailing whitespace
-                while i > 0 && chars[i - 1] == ' ' {
+                // Skip trailing blanks.
+                while i > 0 && (chars[i - 1] == ' ' || chars[i - 1] == '\t') {
                     i -= 1;
                 }
-                // Skip word chars
-                while i > 0 && chars[i - 1] != ' ' {
-                    i -= 1;
+                // Skip one run of same-class (keyword vs. punctuation) chars.
+                if i > 0 {
+                    let is_word = Self::is_word_char(chars[i - 1]);
+                    while i > 0
+                        && chars[i - 1] != ' '
+                        && chars[i - 1] != '\t'
+                        && Self::is_word_char(chars[i - 1]) == is_word
+                    {
+                        i -= 1;
+                    }
                 }
                 let delete_start = line_start + i;
                 let delete_end = char_idx;
@@ -5244,6 +5501,15 @@ impl Engine {
                     self.view_mut().cursor.col = i;
                     *changed = true;
                 }
+            } else if line > 0 {
+                // At column 1: join with the previous line, same as BackSpace.
+                let prev_line_len = self.buffer().line_len_chars(line - 1);
+                let new_col = prev_line_len.saturating_sub(1);
+                let char_idx = self.buffer().line_to_char(line);
+                self.delete_with_undo(char_idx - 1, char_idx);
+                self.view_mut().cursor.line -= 1;
+                self.view_mut().cursor.col = new_col;
+                *changed = true;
             }
             return;
         }
@@ -5402,7 +5668,27 @@ impl Engine {
         // Ctrl+D: dedent current line by shiftwidth
         if ctrl && key_name == "d" {
             let line = self.view().cursor.line;
+            let col = self.view().cursor.col;
             let line_start = self.buffer().line_to_char(line);
+            // `:h i_0_CTRL-D`: if the character just before the cursor is a
+            // literal '0', that '0' is itself removed and ALL indent on the
+            // line is deleted (not just one shiftwidth) — #804.
+            if col > 0 && self.buffer().content.char(line_start + col - 1) == '0' {
+                let zero_idx = line_start + col - 1;
+                self.delete_with_undo(zero_idx, zero_idx + 1);
+                let line_start = self.buffer().line_to_char(line);
+                let line_text: String = self.buffer().content.line(line).chars().collect();
+                let indent_len = line_text
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .count();
+                if indent_len > 0 {
+                    self.delete_with_undo(line_start, line_start + indent_len);
+                }
+                self.view_mut().cursor.col = (col - 1).saturating_sub(indent_len);
+                *changed = true;
+                return;
+            }
             let sw = self.effective_shift_width();
             // Count leading spaces
             let line_text: String = self.buffer().content.line(line).chars().take(sw).collect();
@@ -5418,6 +5704,9 @@ impl Engine {
 
         match key_name {
             "Escape" => {
+                // `:h 'autoindent'` — leaving a line that's still nothing but
+                // the auto-inserted indent removes that indent (#804).
+                self.strip_blank_current_line_indent(changed);
                 self.finish_undo_group();
                 // Record inserted text for the "." register and Ctrl-A/Ctrl-@
                 // (`.` dot-repeat itself is handled generically by the
@@ -5487,14 +5776,19 @@ impl Engine {
                         let has_nl =
                             line_len > 0 && self.buffer().content.char(insert_pos - 1) == '\n';
                         let insert_pos = if has_nl { insert_pos - 1 } else { insert_pos };
-                        let new_line = format!("\n{}", text);
+                        // Repeat the *indented* line, not just the typed
+                        // text — `2ox<Esc>` on an indented line repeats
+                        // "  x", not "x" (#804).
+                        let new_line = format!("\n{}{}", self.insert_open_indent, text);
                         self.insert_with_undo(insert_pos, &new_line);
                         self.view_mut().cursor.line += 1;
-                        self.view_mut().cursor.col = text.chars().count();
+                        self.view_mut().cursor.col =
+                            self.insert_open_indent.chars().count() + text.chars().count();
                     }
                     self.finish_undo_group();
                 }
                 self.insert_open_count = 0;
+                self.insert_open_indent.clear();
                 // Repeat i/a/I/A insert for count > 1: duplicate typed text in
                 // place (Vim behavior for `3ihello<Esc>`).
                 if self.insert_repeat_count > 1 && !self.insert_text_buffer.is_empty() {
@@ -5548,7 +5842,21 @@ impl Engine {
                     let line = self.view().cursor.line;
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
-                    if col > 0 {
+                    let line_start = self.buffer().line_to_char(line);
+                    let leading_blanks = col > 0
+                        && self.settings.expand_tab
+                        && (0..col).all(|i| self.buffer().content.char(line_start + i) == ' ');
+                    if leading_blanks {
+                        // `:h smarttab`: backspacing within leading indentation
+                        // removes a whole 'shiftwidth' worth of blanks
+                        // (rounded to the previous stop), not one space at a
+                        // time (#804).
+                        let sw = self.effective_shift_width().max(1);
+                        let new_col = ((col - 1) / sw) * sw;
+                        self.delete_with_undo(line_start + new_col, char_idx);
+                        self.view_mut().cursor.col = new_col;
+                        *changed = true;
+                    } else if col > 0 {
                         // Auto-pair backspace: delete both opener and closer
                         let prev_char = self.buffer().content.char(char_idx - 1);
                         let next_char_matches =
@@ -5605,15 +5913,63 @@ impl Engine {
                     *changed = true;
                 } else {
                     let line = self.view().cursor.line;
-                    let col = self.view().cursor.col;
-                    let char_idx = self.buffer().line_to_char(line) + col;
+                    // Compute the new line's indent from the *current* line's
+                    // content before any stripping below touches it — the
+                    // second <CR> in `A<CR><CR>x` must still copy the first
+                    // line's indent even though the (untouched, blank)
+                    // intermediate line is about to be emptied out (#804).
                     let indent = self.smart_indent_for_newline(line);
                     let indent_len = indent.len();
+                    // `:h 'autoindent'`: pressing <CR> on a line that's
+                    // nothing but the not-yet-typed-on autoindent removes
+                    // that indent first (#804).
+                    self.strip_blank_current_line_indent(changed);
+                    let line = self.view().cursor.line;
+                    let col = self.view().cursor.col;
+                    let line_start = self.buffer().line_to_char(line);
+                    let mut char_idx = line_start + col;
+                    // With autoindent on, splitting a line strips leading
+                    // blanks from the remainder that moves to the new line —
+                    // it gets the freshly-computed indent instead, not the
+                    // indent-plus-leftover-whitespace a naive split would
+                    // produce (#804, "CR mid-line").
+                    let line_len = self.buffer().line_len_chars(line);
+                    let remainder_is_blank_only = if self.settings.auto_indent {
+                        let mut end = col;
+                        while end < line_len
+                            && matches!(self.buffer().content.char(line_start + end), ' ' | '\t')
+                        {
+                            end += 1;
+                        }
+                        // `\n` (or EOF) right after the stripped run means
+                        // nothing but blanks followed the cursor. Check this
+                        // *before* deleting — afterwards the same buffer
+                        // offset no longer points at the same character.
+                        let blank_only =
+                            end >= line_len || self.buffer().content.char(line_start + end) == '\n';
+                        if end > col {
+                            self.delete_with_undo(char_idx, line_start + end);
+                        }
+                        blank_only
+                    } else {
+                        col >= line_len
+                    };
+                    char_idx = self.buffer().line_to_char(line) + col;
                     let text = format!("\n{}", indent);
                     self.insert_with_undo(char_idx, &text);
                     self.insert_text_buffer.push('\n');
                     self.view_mut().cursor.line += 1;
                     self.view_mut().cursor.col = indent_len;
+                    // Track the new line as "indent-only, untouched" so a
+                    // following bare <CR>/<Esc> can remove that indent again
+                    // (`:h 'autoindent'`, #804) — only when it truly has no
+                    // other content.
+                    self.insert_indent_only_line = if !indent.is_empty() && remainder_is_blank_only
+                    {
+                        Some(self.view().cursor.line)
+                    } else {
+                        None
+                    };
                     *changed = true;
                 }
             }
@@ -5632,7 +5988,22 @@ impl Engine {
                     let col = self.view().cursor.col;
                     let char_idx = self.buffer().line_to_char(line) + col;
                     if self.settings.expand_tab {
-                        let n = self.settings.tabstop as usize;
+                        // `:h smarttab`: in front of a line (nothing but
+                        // blanks before the cursor) Tab advances using
+                        // 'shiftwidth'; everywhere else it uses 'tabstop' —
+                        // in both cases advancing to the *next* stop, not
+                        // inserting a fixed count of spaces (#804).
+                        let line_start = self.buffer().line_to_char(line);
+                        let front_of_line = (0..col).all(|i| {
+                            matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
+                        });
+                        let stop = if front_of_line {
+                            self.effective_shift_width().max(1)
+                        } else {
+                            (self.settings.tabstop as usize).max(1)
+                        };
+                        let target = (col / stop + 1) * stop;
+                        let n = target - col;
                         let spaces = " ".repeat(n);
                         self.insert_with_undo(char_idx, &spaces);
                         self.insert_text_buffer.push_str(&spaces);
@@ -5647,40 +6018,68 @@ impl Engine {
             }
             "Left" => {
                 self.cancel_insert_repeat_count();
-                self.move_left()
+                self.move_left();
+                self.split_insert_undo_group();
             }
             "Right" => {
                 self.cancel_insert_repeat_count();
-                self.move_right_insert()
+                self.move_right_insert();
+                self.split_insert_undo_group();
             }
             "Up" => {
                 self.cancel_insert_repeat_count();
                 if self.view().cursor.line > 0 {
+                    // Remember the column this vertical run started at
+                    // (#804) — clamping to each intermediate line's length
+                    // would otherwise lose it permanently, not just while
+                    // passing through a short line.
+                    let want = self
+                        .insert_vertical_want_col
+                        .unwrap_or(self.view().cursor.col);
                     self.view_mut().cursor.line -= 1;
-                    self.clamp_cursor_col_insert();
+                    let line = self.view().cursor.line;
+                    self.view_mut().cursor.col = want.min(self.get_line_len_for_insert(line));
+                    self.insert_vertical_want_col = Some(want);
                 }
+                self.split_insert_undo_group();
             }
             "Down" => {
                 self.cancel_insert_repeat_count();
                 let max_line = self.buffer().len_lines().saturating_sub(1);
                 if self.view().cursor.line < max_line {
+                    let want = self
+                        .insert_vertical_want_col
+                        .unwrap_or(self.view().cursor.col);
                     self.view_mut().cursor.line += 1;
-                    self.clamp_cursor_col_insert();
+                    let line = self.view().cursor.line;
+                    self.view_mut().cursor.col = want.min(self.get_line_len_for_insert(line));
+                    self.insert_vertical_want_col = Some(want);
                 }
+                self.split_insert_undo_group();
             }
             "Home" => {
                 self.cancel_insert_repeat_count();
-                self.view_mut().cursor.col = 0
+                self.view_mut().cursor.col = 0;
+                self.split_insert_undo_group();
             }
             "End" => {
                 self.cancel_insert_repeat_count();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+                self.split_insert_undo_group();
             }
             _ => {
                 // Try plugin insert-mode keymaps first (for non-printable or special keys)
                 if unicode.is_none() && self.plugin_run_keymap("i", key_name) {
                     // keymap handled it — skip default character insertion
+                } else if ctrl {
+                    // Catch-all (#804): every ctrl combo this function knows
+                    // how to handle has already matched an explicit arm above
+                    // and returned. Anything reaching here is an unrecognised
+                    // ctrl combo — Vim either ignores it or binds it to
+                    // something we don't implement yet, but in no case does
+                    // it insert the bare letter. Do nothing, rather than
+                    // falling through to the character-insert branch below.
                 } else if let Some(ch) = unicode {
                     if !self.view().extra_cursors.is_empty() {
                         // Multi-cursor character insert.

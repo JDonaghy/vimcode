@@ -974,3 +974,77 @@ fn save_session(engine: &mut Engine) {
 fn rc(c: Color) -> RColor {
     RColor::Rgb(c.r, c.g, c.b)
 }
+
+#[cfg(test)]
+mod translate_key_tests {
+    //! #804: crossterm decodes raw terminal control bytes into `KeyEvent`s
+    //! *before* `translate_key` ever sees them — a real terminal never hands
+    //! us the byte 0x08 directly, it hands us the `KeyEvent` crossterm
+    //! already parsed it into. These tests build exactly the `KeyEvent`
+    //! crossterm produces for each byte (per crossterm's own control-code
+    //! decoding: bytes 0x01-0x1A become `Char(('a' - 1 + byte) as char)` +
+    //! `CONTROL`, except the handful with dedicated `KeyCode` variants) and
+    //! assert what `translate_key` does with it — this is what pinned down
+    //! that `<C-h>`/`<C-j>`/`<C-c>` arrive as ctrl+letter, not as the named
+    //! `BackSpace`/`Return`/`Escape` keys `handle_insert_key` matches on by
+    //! name, which is *why* it needs its own explicit ctrl-letter arms
+    //! (see `Engine::handle_insert_key`, `#804`).
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// 0x08 (^H): crossterm decodes this as ctrl+'h', not as a `BackSpace`
+    /// keycode — `handle_insert_key` must special-case it itself.
+    #[test]
+    fn byte_0x08_is_ctrl_h_not_backspace() {
+        let (name, unicode, ctrl) =
+            translate_key(key(KeyCode::Char('h'), KeyModifiers::CONTROL), false).unwrap();
+        assert_eq!(name, "h");
+        assert_eq!(unicode, Some('h'));
+        assert!(ctrl);
+    }
+
+    /// 0x0A (^J / <NL>): crossterm decodes this as ctrl+'j'.
+    #[test]
+    fn byte_0x0a_is_ctrl_j() {
+        let (name, unicode, ctrl) =
+            translate_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL), false).unwrap();
+        assert_eq!(name, "j");
+        assert_eq!(unicode, Some('j'));
+        assert!(ctrl);
+    }
+
+    /// 0x03 (^C / ETX): crossterm decodes this as ctrl+'c'.
+    #[test]
+    fn byte_0x03_is_ctrl_c() {
+        let (name, unicode, ctrl) =
+            translate_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false).unwrap();
+        assert_eq!(name, "c");
+        assert_eq!(unicode, Some('c'));
+        assert!(ctrl);
+    }
+
+    /// 0x1B (ESC): crossterm has a dedicated `KeyCode::Esc` for this byte —
+    /// unlike ^H/^J/^C it never arrives as ctrl+'['.
+    #[test]
+    fn byte_0x1b_is_escape() {
+        let (name, unicode, ctrl) =
+            translate_key(key(KeyCode::Esc, KeyModifiers::NONE), false).unwrap();
+        assert_eq!(name, "Escape");
+        assert_eq!(unicode, None);
+        assert!(!ctrl);
+    }
+
+    /// 0x7F (DEL): the physical Backspace key on most terminals; crossterm
+    /// has a dedicated `KeyCode::Backspace` for it.
+    #[test]
+    fn byte_0x7f_is_backspace() {
+        let (name, unicode, ctrl) =
+            translate_key(key(KeyCode::Backspace, KeyModifiers::NONE), false).unwrap();
+        assert_eq!(name, "BackSpace");
+        assert_eq!(unicode, None);
+        assert!(!ctrl);
+    }
+}
