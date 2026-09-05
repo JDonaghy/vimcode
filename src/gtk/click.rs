@@ -5,7 +5,9 @@ use crate::core::WindowId;
 #[cfg(test)]
 use crate::render::Theme;
 use crate::render::{self as render_mod, GutterAction, ScreenZone, WindowZone};
+#[cfg(test)]
 use std::cell::RefCell;
+#[cfg(test)]
 use std::rc::Rc;
 
 /// Re-export the shared ClickTarget enum.
@@ -39,7 +41,7 @@ pub(crate) use render_mod::ClickTarget;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pixel_to_click_target(
     engine: &mut Engine,
-    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     line_height: f64,
@@ -171,13 +173,7 @@ pub(crate) fn pixel_to_click_target(
                     // through — no gutter/scroll reconstruction needed.
                     let (editor, editor_layout) =
                         render_mod::editor_text_layout(rw, char_width, line_height);
-                    use quadraui::Backend as _;
-                    let col = backend.borrow().editor_col_at_x(
-                        &editor_layout,
-                        &editor,
-                        view_row,
-                        x as f32,
-                    );
+                    let col = backend.editor_col_at_x(&editor_layout, &editor, view_row, x as f32);
                     ClickTarget::BufferPos(window_id, buf_line, col)
                 }
                 _ => ClickTarget::None,
@@ -502,7 +498,7 @@ fn execute_gutter_action(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse_click(
     engine: &mut Engine,
-    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     alt: bool,
@@ -593,7 +589,7 @@ pub(crate) fn handle_mouse_click(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse_double_click(
     engine: &mut Engine,
-    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     line_height: f64,
@@ -638,7 +634,7 @@ pub(crate) fn handle_mouse_double_click(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse_drag(
     engine: &mut Engine,
-    backend: &Rc<RefCell<super::backend::GtkBackend>>,
+    backend: &dyn quadraui::Backend,
     x: f64,
     y: f64,
     line_height: f64,
@@ -1093,7 +1089,7 @@ mod cross_split_drag_focus_tests {
         // must resolve as a pure hit-test — no focus/group side effects.
         let target = pixel_to_click_target(
             &mut engine,
-            &backend,
+            &*backend.borrow(),
             x_in_b,
             y_in_b,
             line_height,
@@ -1136,7 +1132,7 @@ mod cross_split_drag_focus_tests {
         // no-op, and that real clicks keep working as before.
         let click_target = pixel_to_click_target(
             &mut engine,
-            &backend,
+            &*backend.borrow(),
             x_in_b,
             y_in_b,
             line_height,
@@ -1317,7 +1313,7 @@ mod frame_hit_map_tests {
 
         let target = pixel_to_click_target(
             &mut engine,
-            &backend,
+            &*backend.borrow(),
             x,
             y,
             line_height,
@@ -1490,7 +1486,7 @@ mod single_group_tab_click_dispatch_tests {
         fn click(&mut self, local_x: f64) -> ClickTarget {
             pixel_to_click_target(
                 &mut self.engine,
-                &self.backend,
+                &*self.backend.borrow(),
                 CONTENT_X + local_x,
                 Self::CLICK_Y,
                 self.line_height,
@@ -1509,7 +1505,7 @@ mod single_group_tab_click_dispatch_tests {
         fn full_click(&mut self, local_x: f64) -> (Option<bool>, Option<EngineAction>) {
             handle_mouse_click(
                 &mut self.engine,
-                &self.backend,
+                &*self.backend.borrow(),
                 CONTENT_X + local_x,
                 Self::CLICK_Y,
                 false, // alt

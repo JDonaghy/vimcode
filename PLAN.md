@@ -13,8 +13,13 @@
 > filed and closed the same day at 16:38Z–17:11Z, and the real count of the two
 > Rc-handle methods is **19**, not 44 — see the corrected blocker section below).
 > **#47 is reopened, in milestone #5**, and #811 (already on this branch) has
-> started consuming the fix on the TUI side. Stage 1 (the GTK-side `App` move)
-> is the live next step — read the section below for what's still accurate.
+> started consuming the fix on the TUI side. #813 (also on this branch) has
+> now retyped `App::backend` off the concrete `GtkBackend` struct onto a
+> narrow `TextMetricsBackend: quadraui::Backend` trait and retired the two
+> `glib`-timer hooks the module doc used to list as blockers. What's left of
+> Stage 1 is the three remaining platform-typed fields
+> (`window`/`css_provider`/`settings_monitor`) — read the section below for
+> what's still accurate.
 
 ---
 
@@ -166,11 +171,19 @@ starting the next one — this list was written before either landed.
    (quadraui#699/#704).
 2. ~~Move `struct App` + its three `impl App` blocks + `impl ShellApp for App`
    (`src/gtk/mod.rs:538-7483`) to `src/app.rs`~~ ✅ **The move itself is done**
-   (#785, verbatim). **Still open:** gating `window`/`css_provider`/
-   `settings_monitor` behind `#[cfg(feature = "gui")]` and switching `backend`'s
-   ~19 `modal_stack_handle`/`drag_state_handle` call sites onto the new handle
-   API from quadraui#699/#704 (per `GOALS.md`, `src/app.rs`'s own module doc
-   still lists these as the remaining gate-blockers).
+   (#785, verbatim). ~~switching `backend`'s ~19 `modal_stack_handle`/
+   `drag_state_handle` call sites onto the new handle API~~ ✅ **Done (#813)** —
+   `App::backend` is now typed against a narrow local `TextMetricsBackend:
+   quadraui::Backend` trait instead of the concrete `GtkBackend` struct; all 19
+   call sites compiled unchanged. #813 also retired the two
+   `glib::idle_add_local_once(process::exit)` sites (adopted
+   `quadraui::Reaction::Exit`) and the `glib::timeout_add_local_once`
+   yank-highlight timer (ported to a poll-in-`tick` deadline, mirroring TUI's
+   `yank_hl_deadline`). **Still open:** gating `window`/`css_provider`/
+   `settings_monitor` behind `#[cfg(feature = "gui")]` — those three fields,
+   plus the genuinely toolkit-bound Pango text-measurement context now isolated
+   behind `TextMetricsBackend`, are what's left; see `src/app.rs`'s module doc
+   for the current, re-audited list (materially shorter than before #813).
 3. `src/gtk/mod.rs` keeps only `run()`, `build_shell_config()`, and the
    genuinely GTK-only helpers (window-chrome, CSS, key-name→GDK glyph tables
    if any remain GTK-specific after the move).

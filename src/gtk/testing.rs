@@ -8182,3 +8182,83 @@ mod slice7_closing_rungs {
         );
     }
 }
+
+#[cfg(test)]
+mod issue_813_exit_via_reaction {
+    //! #813: `App::backend` is now typed against the narrow
+    //! [`super::TextMetricsBackend`] trait rather than the concrete GTK
+    //! backend struct, and `save_session_and_exit` was ported off a
+    //! `glib::idle_add_local_once(process::exit)` callback onto
+    //! `App::exit_requested` + `quadraui::Reaction::Exit` — the same hook
+    //! `GtkDriver`'s own `dispatch` already understands (`exited()`/
+    //! `EventOutcome::Exit`). This is the one black-box-observable half of
+    //! that change: the old code path called `process::exit` from a deferred
+    //! `glib` callback that never runs under this headless harness (no glib
+    //! main loop here), so `:qall!` used to leave the driver's `dispatch`
+    //! returning `Reaction::Continue`/`Redraw` forever and `exited()` always
+    //! `false` — a live process would still have quit (eventually, once the
+    //! idle callback ran), but nothing in-process ever observed it. Now the
+    //! flag is checked synchronously before `handle` returns, so the exit
+    //! is observable the same frame.
+    use super::*;
+    use quadraui::UiEvent;
+
+    /// **Verified RED against unfixed `develop`:** reverting `App::handle`
+    /// to call `self.save_session_and_exit()` without the `exit_requested`/
+    /// `Reaction::Exit` wrapper (i.e. restoring the old
+    /// `glib::idle_add_local_once(|| std::process::exit(0))` body) leaves
+    /// this `dispatch` returning `Reaction::Continue` and `exited()` false,
+    /// so both assertions fire.
+    #[test]
+    fn qall_bang_returns_reaction_exit_on_gtk() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+
+        // Enter command-line mode and run `:qall!` — unconditional quit
+        // regardless of dirty-buffer state (`execute.rs`'s `"qall!"` arm),
+        // so this doesn't depend on the fixture's buffer state.
+        for c in [':', 'q', 'a', 'l', 'l', '!'] {
+            h.driver.type_char(c);
+        }
+        let reaction = h.driver.press_named(quadraui::NamedKey::Enter);
+
+        assert_eq!(
+            reaction,
+            quadraui::Reaction::Exit,
+            "`:qall!` must surface as Reaction::Exit so the runner tears \
+             down the window instead of relying on a deferred process::exit \
+             that a headless harness (no glib main loop) never runs"
+        );
+        assert!(
+            h.driver.exited(),
+            "GtkDriver::exited() must latch once `:qall!` runs"
+        );
+    }
+
+    /// A second dispatch after exit must stay latched at `Reaction::Exit`
+    /// rather than re-entering `App::handle_dispatch` on an app that has
+    /// already asked to quit — mirrors `GtkDriver::dispatch`'s own
+    /// short-circuit (`if self.exited { return Reaction::Exit; }`), so this
+    /// also guards against a future edit to `save_session_and_exit` that
+    /// clears `exit_requested` after firing once.
+    #[test]
+    fn dispatch_after_exit_stays_exited_on_gtk() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+
+        for c in [':', 'q', 'a', 'l', 'l', '!'] {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        assert!(h.driver.exited());
+
+        let reaction = h.driver.dispatch(UiEvent::KeyPressed {
+            key: quadraui::Key::Char('x'),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+        assert_eq!(reaction, quadraui::Reaction::Exit);
+    }
+}

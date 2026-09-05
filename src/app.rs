@@ -12,37 +12,47 @@
 //!
 //! # Why this module is still `#[cfg(feature = "gui")]`
 //!
-//! It is *not* yet compiled without GTK. The #47 re-audit counted only the
-//! ~40 lines that name `gtk4::` / `gio::` / `pangocairo::` directly inside
-//! this range, but the residual coupling is wider than that count and is
-//! recorded here so the next stage does not have to re-derive it:
+//! It is *not* yet compiled without a toolkit, but #813 retired the biggest
+//! blocker the #47 re-audit found: `backend` used to be typed as the
+//! concrete GTK backend struct, which is what forced every one of the ~19
+//! modal-stack/drag-state handle call sites — and by extension this whole
+//! file — to depend on it. It is now typed against [`TextMetricsBackend`],
+//! a narrow local trait that names the two GTK/Pango-only hooks (text
+//! measurement) that still have no portable equivalent; see that trait's
+//! doc comment. #813 also adopted `quadraui::Reaction::Exit` for process
+//! exit (previously an idle-callback hack) and ported the 200 ms
+//! yank-highlight one-shot to a portable poll-in-`tick` deadline
+//! (`yank_hl_deadline`) — the same pattern TUI already used. Neither hook
+//! needs a toolkit timer any more.
 //!
-//! 1. **Four platform-typed fields.** `settings_monitor`
-//!    (`gio::FileMonitor`), `window` (`gtk4::Window`), `css_provider`
-//!    (`gtk4::CssProvider`) and `backend` (`Rc<RefCell<GtkBackend>>`).
-//! 2. **~11 platform hook call sites** in otherwise-portable methods:
-//!    process exit via `glib::idle_add_local_once`, the 200 ms yank-highlight
-//!    one-shot via `glib::timeout_add_local_once`, colorscheme reload
-//!    (`CssProvider::load_from_data` + `gtk4::Settings`
-//!    `prefer_dark_theme`), OS window title / default size / maximize /
+//! What's left, recorded here so the next stage does not have to re-derive
+//! it:
+//!
+//! 1. **Three platform-typed fields.** `settings_monitor` (a file-watcher
+//!    handle), `window` (the OS window handle) and `css_provider` (the
+//!    stylesheet provider) — window-chrome, colorscheme reload, and
+//!    settings hot-reload.
+//! 2. **A handful of platform hook call sites** in otherwise-portable
+//!    methods: colorscheme reload, OS window title / default size /
 //!    minimize / close, CSD capture (`find_visible_window`), and the native
-//!    folder picker (`gtk4::FileDialog`).
+//!    folder picker.
 //! 3. **`crate::gtk::{click, css, util}`.** These are `use super::*`
 //!    submodules of the GTK backend that `App` leans on heavily. They are
-//!    *mostly* portable, but `click::build_editor_click_context` (Pango/Cairo
-//!    measurement), `css::load_css` and `util`'s pixbuf + glib-log helpers
-//!    are not — so the modules cannot be lifted wholesale without being
-//!    split first.
+//!    *mostly* portable, but `click::build_editor_click_context` (the
+//!    Pango/Cairo text-measurement context — see [`TextMetricsBackend`]),
+//!    `css::load_css` and `util`'s pixbuf + log helpers are not — so the
+//!    modules cannot be lifted wholesale without being split first.
 //!
-//! Items 2 and 3 are the real blockers for dropping the `gui` gate, and
-//! neither is a "route around it" job: per `CLAUDE.md`'s
-//! Platform-Neutrality Rule they want quadraui-side infrastructure
-//! (a backend-neutral timer/exit/window-chrome/file-picker surface, and a
+//! Items 1-3 are the real remaining blockers for dropping the `gui` gate,
+//! and none of them is a "route around it" job: per `CLAUDE.md`'s
+//! Platform-Neutrality Rule they want quadraui-side infrastructure (a
+//! backend-neutral window-chrome/file-watcher/file-picker surface, and a
 //! backend-neutral text-measurement context) rather than new per-backend
 //! code here.
 
 use gio::prelude::{FileExt, FileMonitorExt};
 use gtk4::gdk;
+use gtk4::pango;
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -156,11 +166,14 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
 /// Work that a GTK callback with no `&mut App` in hand must hand back to the
 /// next frame.
 ///
-/// #732 tranche 3: the nine deferrals below are all that is left of the
+/// #732 tranche 3: the eight deferrals below are all that is left of the
 /// Relm4-era `Msg` bus. They are genuine deferrals, not translations — each
 /// originates somewhere that cannot call an `&mut self` method at all: a
-/// `gio::FileMonitor` signal, a `glib::timeout_add_local_once` closure, or
-/// [`GtkAccelHost`], which holds only a clone of the queue.
+/// file-watcher signal, or [`GtkAccelHost`], which holds only a clone of
+/// the queue. (The 200 ms yank-highlight one-shot used to be a ninth,
+/// scheduled via a one-shot toolkit timer; #813 ported it to the portable
+/// `yank_hl_deadline` poll-in-`tick` pattern TUI already used — see
+/// [`App::yank_hl_deadline`] — so it no longer needs this queue at all.)
 ///
 /// quadraui has no deferral seam of its own to move onto — `ShellApp::tick`
 /// *is* the seam (its doc names "draining channels" as the intended use), and
@@ -168,8 +181,6 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
 /// rather than becoming a quadraui gap to file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeferredAction {
-    /// Clear the yank highlight after the flash duration has elapsed.
-    ClearYankHighlight,
     /// Refresh the file tree from the current working directory.
     RefreshFileTree,
     /// Redraw after an accelerator mutated engine state directly.
@@ -209,11 +220,70 @@ impl DeferredQueue {
     }
 }
 
+/// Narrow extension trait for the two GTK/Pango-only hooks that
+/// `quadraui::Backend` has no portable equivalent for yet (#813):
+/// `GtkBackend::set_pango_context`/`set_current_line_height`/
+/// `set_current_char_width` are inherent methods on the concrete struct,
+/// not trait methods, because they're Pango text-measurement plumbing with
+/// no TUI/macOS/Win analogue.
+///
+/// `App::backend` used to be typed as the concrete `backend::GtkBackend` —
+/// the sole reason `struct App` couldn't compile without the GTK toolkit
+/// in scope — purely so these three calls would resolve. Retyping the field
+/// to a bare `Box<dyn quadraui::Backend>` would drop them; this supertrait
+/// lets `App::backend` hold one trait object that still exposes both the
+/// 19 generic `modal_stack_handle`/`drag_state_handle` call sites (via the
+/// `Backend` supertrait bound) *and* the three narrow ones, without naming
+/// `GtkBackend` anywhere outside its single `impl` below. Only `GtkBackend`
+/// implements it — that remains real, acknowledged coupling (the module
+/// doc's "Pango measurement context" item), not something this trait
+/// pretends to solve.
+pub(crate) trait TextMetricsBackend: quadraui::Backend {
+    fn set_pango_context(&mut self, ctx: pango::Context);
+    fn set_current_line_height(&mut self, line_height: f64);
+    fn set_current_char_width(&mut self, char_width: f64);
+}
+
+impl TextMetricsBackend for backend::GtkBackend {
+    fn set_pango_context(&mut self, ctx: pango::Context) {
+        backend::GtkBackend::set_pango_context(self, ctx);
+    }
+
+    fn set_current_line_height(&mut self, line_height: f64) {
+        backend::GtkBackend::set_current_line_height(self, line_height);
+    }
+
+    fn set_current_char_width(&mut self, char_width: f64) {
+        backend::GtkBackend::set_current_char_width(self, char_width);
+    }
+}
+
 pub(crate) struct App {
     pub(crate) engine: Rc<RefCell<Engine>>,
     /// Set to true in update() whenever a draw is needed; cleared by the #[watch] block.
     /// This prevents the 20/sec SearchPollTick timer from unconditionally calling queue_draw().
     pub(crate) draw_needed: Rc<Cell<bool>>,
+    /// Set by [`App::save_session_and_exit`] when the user quits normally
+    /// (`Quit`/`SaveQuit`/`quit_menu`/the unsaved-changes confirm dialog).
+    /// Checked at the end of `ShellApp::handle`/`tick` (#813) so a
+    /// `dispatch_engine_action`/`apply_dialog_action` call nested arbitrarily
+    /// deep — including inside an early-return arm such as the menu-activated
+    /// path — still surfaces as [`quadraui::Reaction::Exit`] to the runner.
+    /// Replaces the previous idle-callback process-exit hack: quadraui's
+    /// own `Reaction::Exit` (`ReactionSink::request_exit` in the GTK
+    /// runner) already does the equivalent teardown for every other
+    /// backend. `EngineAction::QuitWithError` (`:cquit`) is deliberately
+    /// **not** routed through this flag — it needs a nonzero process exit
+    /// code, which `Reaction::Exit` cannot carry, so it keeps a direct
+    /// `std::process::exit(1)` (mirrors `tui_main::handle_action`).
+    pub(crate) exit_requested: Cell<bool>,
+    /// Deadline for clearing the yank highlight, armed by
+    /// `run_post_key_epilogue` when `epilogue.arm_yank_highlight` is set and
+    /// polled by `tick_dispatch` (#813). Replaces a one-shot toolkit timer
+    /// with the same portable poll-in-`tick` pattern TUI already used
+    /// (`yank_hl_deadline` in `tui_main/shell_app.rs`) — no toolkit timer
+    /// needed.
+    pub(crate) yank_hl_deadline: Cell<Option<std::time::Instant>>,
     /// A file dialog requested this frame, drained by the next `tick()`
     /// call (which has the `backend` handle `PlatformServices` needs).
     /// See [`PendingFileDialog`] (#572).
@@ -573,16 +643,22 @@ pub(crate) struct App {
     pub(crate) css_provider: Option<gtk4::CssProvider>,
     /// Colorscheme name at the time the CSS was last applied.
     pub(crate) last_colorscheme: String,
-    /// Cross-backend modal-overlay tracking. Pushed to when a palette /
-    /// `quadraui::Backend`-impl handle. Owns the canonical
-    /// accelerators / event-queue / viewport / services / modal-stack /
-    /// drag-state. Call sites reach modal-stack and drag-state via
-    /// `self.backend.borrow().modal_stack_handle()` and
-    /// `drag_state_handle()` (B.5b Stage 11 dropped the alias `Rc`
-    /// clones that previously lived at `App.modal_stack` /
-    /// `App.drag_state`). The `init` drain timer holds a clone and
-    /// pumps `poll_events()` every 16 ms.
-    pub(crate) backend: Rc<RefCell<backend::GtkBackend>>,
+    /// A second, standalone `quadraui::Backend`-impl handle, distinct from
+    /// the `&mut dyn quadraui::Backend` the `ShellApp` runner hands
+    /// `setup`/`handle`/`tick` — this one is owned outright by `App` for
+    /// click hit-testing and the two `TextMetricsBackend` calls that need a
+    /// long-lived handle across borrow-drop points (see the #560 comment in
+    /// `render_content`). Owns the canonical accelerators / event-queue /
+    /// viewport / services / modal-stack / drag-state. Call sites reach
+    /// modal-stack and drag-state via `self.backend.borrow().modal_stack_handle()`
+    /// and `drag_state_handle()` (B.5b Stage 11 dropped the alias `Rc` clones
+    /// that previously lived at `App.modal_stack` / `App.drag_state`). The
+    /// `init` drain timer holds a clone and pumps `poll_events()` every 16 ms.
+    ///
+    /// Typed against [`TextMetricsBackend`] rather than the concrete
+    /// `backend::GtkBackend` (#813) — see that trait's doc comment for why
+    /// a bare `Box<dyn quadraui::Backend>` isn't quite enough on its own.
+    pub(crate) backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
 }
 
 /// Decode an activity bar widget ID into a panel ID for [`App::switch_panel`].
@@ -890,11 +966,14 @@ impl App {
         last_colorscheme: String,
         settings_monitor: Option<gio::FileMonitor>,
     ) -> Self {
-        let backend = Rc::new(RefCell::new(backend::GtkBackend::new()));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(backend::GtkBackend::new())));
 
         App {
             engine,
             draw_needed: Rc::new(Cell::new(false)),
+            exit_requested: Cell::new(false),
+            yank_hl_deadline: Cell::new(None),
             pending_file_dialog: Cell::new(None),
             cached_line_height: 24.0,
             cached_char_width: 9.0,
@@ -1175,7 +1254,7 @@ impl App {
             if !engine.picker_open {
                 if let ClickTarget::BufferPos(_, line, col) = pixel_to_click_target(
                     &mut engine,
-                    &self.backend,
+                    &**self.backend.borrow(),
                     x,
                     y,
                     self.cached_line_height,
@@ -1250,7 +1329,7 @@ impl App {
                 if let Some(ref layout) = *layout_ref {
                     handle_mouse_double_click(
                         &mut engine,
-                        &self.backend,
+                        &**self.backend.borrow(),
                         x,
                         y,
                         self.cached_line_height,
@@ -1421,9 +1500,13 @@ impl App {
         self.queue_explorer_draw();
     }
 
-    /// Save the current session state and schedule process exit via idle callback.
-    /// Uses `idle_add_local_once` so `process::exit` runs outside any GTK signal
-    /// emission chain, avoiding UB from unwinding through extern "C" trampolines.
+    /// Save the current session state and request a clean shutdown.
+    ///
+    /// Sets [`App::exit_requested`] rather than calling `process::exit`
+    /// itself (#813) — `ShellApp::handle`/`tick` check the flag once they
+    /// return and surface [`quadraui::Reaction::Exit`] to the runner, which
+    /// tears the window down via `ReactionSink::request_exit`
+    /// (`gtk/run.rs`), the same mechanism every other quadraui backend uses.
     fn save_session_and_exit(&self) {
         let mut engine = self.engine.borrow_mut();
         let buffer_id = engine.active_buffer_id();
@@ -1459,7 +1542,7 @@ impl App {
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
         drop(engine);
-        gtk4::glib::idle_add_local_once(|| std::process::exit(0));
+        self.exit_requested.set(true);
     }
 
     /// Dispatch an `EngineAction` produced by `handle_key` or macro playback.
@@ -1522,7 +1605,12 @@ impl App {
                 engine.cleanup_all_swaps();
                 engine.lsp_shutdown();
                 drop(engine);
-                gtk4::glib::idle_add_local_once(|| std::process::exit(1));
+                // `:cquit` needs a nonzero exit code to signal failure to
+                // whatever invoked it (scripting/CI use), which
+                // `quadraui::Reaction::Exit` cannot carry — mirrors
+                // `tui_main::handle_action`'s direct `process::exit(1)`
+                // rather than going through `exit_requested` (#813).
+                std::process::exit(1);
             }
             EngineAction::OpenUrl(url) => {
                 open_url(&url);
@@ -1802,7 +1890,7 @@ impl App {
                     let backend_rc = self.backend.clone();
                     let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
                         &ui_event,
-                        &mut *backend_rc.borrow_mut(),
+                        &mut **backend_rc.borrow_mut(),
                         rect,
                     );
                     engine.dispatch_dap_sidebar_event(sidebar_event)
@@ -1896,12 +1984,14 @@ impl App {
             }
         }
 
-        // If a yank just happened, schedule a 200 ms one-shot to clear the highlight.
+        // If a yank just happened, arm a 200 ms deadline; `tick_dispatch`
+        // polls it and clears the highlight once it elapses (#813 — ported
+        // off a one-shot toolkit timer, mirrors TUI's `yank_hl_deadline` in
+        // `tui_main/shell_app.rs`).
         if epilogue.arm_yank_highlight {
-            let q = self.deferred.clone();
-            gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
-                q.send(DeferredAction::ClearYankHighlight);
-            });
+            self.yank_hl_deadline.set(Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(200),
+            ));
         }
     }
 
@@ -3434,7 +3524,7 @@ impl App {
         let mut engine = self.engine.borrow_mut();
         let target = pixel_to_click_target(
             &mut engine,
-            &self.backend,
+            &**self.backend.borrow(),
             x,
             y,
             self.cached_line_height,
@@ -4004,7 +4094,7 @@ impl App {
                         if let Some(ref layout) = *layout_ref {
                             handle_mouse_click(
                                 &mut engine,
-                                &self.backend,
+                                &**self.backend.borrow(),
                                 x,
                                 y,
                                 alt,
@@ -4534,7 +4624,7 @@ impl App {
                     let mut engine = self.engine.borrow_mut();
                     handle_mouse_drag(
                         &mut engine,
-                        &self.backend,
+                        &**self.backend.borrow(),
                         x,
                         y,
                         self.cached_line_height,
@@ -4937,7 +5027,7 @@ impl App {
         b.set_current_char_width(metrics.1);
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
-            render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, &mut *b)
+            render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, &mut **b)
         };
         drop(b);
 
@@ -5237,7 +5327,7 @@ impl App {
             &mut engine,
             event,
             body_rect,
-            &mut *backend_rc.borrow_mut(),
+            &mut **backend_rc.borrow_mut(),
         );
         true
     }
@@ -5495,14 +5585,15 @@ impl App {
 
     /// Maximize or restore the application window (inline window-control
     /// button).
-    fn window_toggle_maximize(&mut self) {
-        if self.window.as_ref().is_some_and(|w| w.is_maximized()) {
-            if let Some(ref w) = self.window {
-                w.unmaximize();
-            }
-        } else if let Some(ref w) = self.window {
-            w.maximize();
-        }
+    ///
+    /// Goes through `Backend::toggle_window_maximize` (#813) rather than
+    /// driving the OS window handle's maximize/unmaximize directly — the
+    /// same toggle the CSD-titlebar double-click gesture already calls
+    /// (`handle_dispatch`'s `UiEvent::DoubleClick` arm) — so there is only
+    /// one place that operates the real OS window instead of two that have
+    /// to agree.
+    fn window_toggle_maximize(&mut self, backend: &mut dyn quadraui::Backend) {
+        backend.toggle_window_maximize();
     }
 
     /// Close the application window (inline window-control button).
@@ -5759,6 +5850,584 @@ impl App {
                 interaction.pressed_id(),
             );
             interaction.set_layout(hits);
+        }
+    }
+}
+
+impl App {
+    /// The actual body of `ShellApp::handle`, moved to an inherent
+    /// method (#813) so the trait impl can wrap it with a single
+    /// `exit_requested` check that covers every early-return arm below
+    /// (including ones nested inside `dispatch_engine_action` /
+    /// `apply_dialog_action` / menu handling) without editing each one.
+    fn handle_dispatch(
+        &mut self,
+        event: quadraui::UiEvent,
+        backend: &mut dyn quadraui::Backend,
+        ctx: &quadraui::ShellContext<'_>,
+    ) -> quadraui::Reaction {
+        use quadraui::{Key, MouseButton, NamedKey, UiEvent};
+
+        // ── Menu system intercept (#552) ─────────────────────────────────────
+        // GTK's menu bar is always visible (see `ShellApp::setup`) and its
+        // dropdown overlay must intercept keys/clicks before the sidebar or
+        // editor sees them — same precedence TUI uses (mod.rs "MenuSystem
+        // intercept" block) via the identical shared `menu_system.handle()`.
+        let (menu_bar_visible, menu_system) = {
+            let eng = self.engine.borrow();
+            (eng.menu_bar_visible, eng.menu_system.clone())
+        };
+        if menu_bar_visible || menu_system.borrow().is_open() {
+            // `menu_items_rect`, not `menu_row_rect` (#720): the app icon
+            // occupies a leading slot, so the items the last frame *painted*
+            // start one slot right of the band's left edge. Hit-testing
+            // against the full band would resolve a click on `File` to
+            // whatever label now sits a slot to its left. `render_content`
+            // writes this from the same `split_menu_row_for_app_icon` call
+            // that positions the paint.
+            let bar_rect = self.menu_items_rect.get();
+            let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
+            match menu_event {
+                quadraui::MenuEvent::Activated(id) => {
+                    self.handle_menu_action(id.as_str().to_string());
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+                quadraui::MenuEvent::StateChanged | quadraui::MenuEvent::Consumed => {
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+                quadraui::MenuEvent::Ignored => {}
+            }
+        }
+
+        // ── Command Center: nav arrows + search box (#676) ────────────────────
+        // Checked before the window-control buttons below and the CSD
+        // titlebar drag-to-move fallback further down, so a click in the
+        // command center (which sits inside the title-bar band the
+        // drag-to-move check would otherwise claim) routes to tab-nav / the
+        // picker instead of starting a window drag. Mirrors TUI's
+        // `mouse.rs` "Menu bar row click — command center only" precedence.
+        // The nav-arrow / search-box actions are the shared
+        // `render::apply_command_center_hit` (#752) — the pre-#540 Relm4
+        // `Msg::MruNavBack` / `MruNavForward` / `OpenCommandCenter` variants
+        // for this exact action, already wired end-to-end but never
+        // dispatched from anywhere since the cutover. This block was their
+        // first live caller (#676); #732 turned them into plain methods,
+        // and #752 converged those methods with TUI's identical match arm
+        // into the one function in `render.rs`.
+        if let UiEvent::MouseDown {
+            button: MouseButton::Left,
+            position,
+            ..
+        } = &event
+        {
+            let cc_hit = self
+                .engine
+                .borrow()
+                .command_center_layout
+                .borrow()
+                .as_ref()
+                .map(|l| l.hit_test(position.x, position.y));
+            // `Bar` (command-center background, not an interactive segment)
+            // and `Outside`/`None` fall through so the drag-to-move fallback
+            // below still works for genuine empty-band clicks.
+            if let Some(hit) = cc_hit {
+                if crate::render::apply_command_center_hit(&mut self.engine.borrow_mut(), hit) {
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── Inline window-control buttons: minimize/maximize/close (#552) ───
+        // Shared `StatusBarInteraction` hover/press/click tracker — the same
+        // primitive quadraui's own `full_chrome_demo` reference title bar
+        // uses (quadraui#402) — instead of a hand-rolled `StatusBarHit`
+        // lookup. Gets the buttons real hover/press highlighting for free
+        // and click-on-release semantics (a press that drags off the button
+        // before release no longer fires it), matching native window
+        // controls. Runs on every event (not just MouseDown) so hover state
+        // updates as the pointer moves.
+        {
+            let rect = self.title_bar_rect.get();
+            if rect.width > 0.0 {
+                let action = self.title_bar_interaction.borrow_mut().handle(&event, rect);
+                match action {
+                    quadraui::StatusBarAction::Clicked(id) => {
+                        match id.as_str() {
+                            render::WINDOW_MINIMIZE_ACTION => self.window_minimize(),
+                            render::WINDOW_MAXIMIZE_ACTION => self.window_toggle_maximize(backend),
+                            render::WINDOW_CLOSE_ACTION => self.window_close(),
+                            _ => {}
+                        }
+                        self.draw_needed.set(true);
+                        return quadraui::Reaction::Redraw;
+                    }
+                    quadraui::StatusBarAction::Redraw => {
+                        self.draw_needed.set(true);
+                        return quadraui::Reaction::Redraw;
+                    }
+                    quadraui::StatusBarAction::Ignored => {}
+                }
+            }
+        }
+
+        // ── Outer window border: edge-resize cursor hint (quadraui#406) ──
+        // Pure side effect on hover — hint the resize pointer over the outer
+        // window border, default everywhere else (including the non-resizable
+        // full-width CSD title bar, which owns the top edge). Falls through so
+        // the editor/sidebar hover handling below still runs. Mirrors
+        // `full_chrome_demo`'s `MouseMoved` arm. GTK-only; TUI `set_cursor`
+        // is a documented no-op.
+        if let UiEvent::MouseMoved { position, .. } = &event {
+            let shape = if ctx.in_title_bar(position.x, position.y) {
+                quadraui::PointerShape::Default
+            } else {
+                match ctx.window_edge(position.x, position.y, backend.line_height()) {
+                    Some(edge) => quadraui::PointerShape::Resize(edge),
+                    None => quadraui::PointerShape::Default,
+                }
+            };
+            backend.set_cursor(shape);
+        }
+
+        // ── Sidebar hover — #754 rung ─────────────────────────────────────
+        // This backend already *painted* `screen.panel_hover` (the
+        // `RichTextPopup` block in `render_content`) and already tracked the
+        // popup's own rect, but nothing on this side ever set
+        // `engine.panel_hover` or `engine.sc_button_hovered`: the router was
+        // ~78 lines of TUI-only code. That is the #499/#484 mechanism — paint
+        // without input on one backend, input without a second painter on the
+        // other. `render::route_sidebar_hover` is now the single router and
+        // both backends call it.
+        if let UiEvent::MouseMoved { position, .. } = &event {
+            if let Some(sb) = ctx.layout.sidebar_content_bounds {
+                let lh = backend.line_height();
+                let on_popup = self
+                    .panel_hover_popup_rect
+                    .get()
+                    .is_some_and(|(px, py, pw, ph)| {
+                        let (mx, my) = (position.x as f64, position.y as f64);
+                        mx >= px && mx < px + pw && my >= py && my < py + ph
+                    });
+                let owner = render::sidebar_owner(&self.engine.borrow());
+                let changed = render::route_sidebar_hover(
+                    &mut self.engine.borrow_mut(),
+                    &owner,
+                    position.x,
+                    position.y,
+                    render::SidebarBodyGeometry {
+                        bounds: sb,
+                        row_h: lh.max(1.0),
+                        header_rows: 1.0,
+                    },
+                    true,
+                    on_popup,
+                );
+                if changed {
+                    self.draw_needed.set(true);
+                }
+            }
+        }
+
+        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
+        // (quadraui#400) + outer window border: edge-resize (quadraui#406).
+        // Runs after the menu-item intercept and the window-control-button
+        // check above, so both take priority — only a press/double-click that
+        // lands in the title bar band but misses every interactive segment
+        // (menu item, min/max/close button) reaches here, matching
+        // `Backend::begin_window_drag`'s documented contract. The title bar
+        // takes priority over the top window edge (a full-width CSD header
+        // owns it), so `in_title_bar` is checked before `window_edge` —
+        // mirrors quadraui's `full_chrome_demo` reference. TUI has no window,
+        // so `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
+        // are all documented no-ops there; this path is GTK-only.
+        match &event {
+            UiEvent::MouseDown {
+                button: MouseButton::Left,
+                position,
+                ..
+            } if ctx.in_title_bar(position.x, position.y) => {
+                backend.begin_window_drag();
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
+            UiEvent::DoubleClick { position, .. } if ctx.in_title_bar(position.x, position.y) => {
+                backend.toggle_window_maximize();
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
+            UiEvent::MouseDown {
+                button: MouseButton::Left,
+                position,
+                ..
+            } => {
+                if let Some(edge) = ctx.window_edge(position.x, position.y, backend.line_height()) {
+                    backend.begin_window_resize(edge);
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+            }
+            _ => {}
+        }
+
+        // Pointer events over the sidebar content area are forwarded to the active
+        // panel's controller before the editor click path sees them. In ShellApp
+        // mode there is no per-panel DrawingArea, so without this the file explorer
+        // never receives clicks. (#540 ShellApp port)
+        if self.try_route_sidebar_mouse_event(&event, ctx) {
+            return if self.draw_needed.get() {
+                self.draw_needed.set(false);
+                quadraui::Reaction::Redraw
+            } else {
+                quadraui::Reaction::Continue
+            };
+        }
+
+        match event {
+            UiEvent::KeyPressed { key, modifiers, .. } => {
+                let (key_name, unicode) = match key {
+                    Key::Char(c) => (c.to_string(), Some(c)),
+                    Key::Named(ref named) => {
+                        let n: &str = match named {
+                            NamedKey::Escape => "Escape",
+                            NamedKey::Tab => "Tab",
+                            NamedKey::BackTab => "BackTab",
+                            NamedKey::Enter => "Return",
+                            NamedKey::Backspace => "BackSpace",
+                            NamedKey::Delete => "Delete",
+                            NamedKey::Insert => "Insert",
+                            NamedKey::Home => "Home",
+                            NamedKey::End => "End",
+                            NamedKey::PageUp => "PageUp",
+                            NamedKey::PageDown => "PageDown",
+                            NamedKey::Up => "Up",
+                            NamedKey::Down => "Down",
+                            NamedKey::Left => "Left",
+                            NamedKey::Right => "Right",
+                            NamedKey::F(1) => "F1",
+                            NamedKey::F(2) => "F2",
+                            NamedKey::F(3) => "F3",
+                            NamedKey::F(4) => "F4",
+                            NamedKey::F(5) => "F5",
+                            NamedKey::F(6) => "F6",
+                            NamedKey::F(7) => "F7",
+                            NamedKey::F(8) => "F8",
+                            NamedKey::F(9) => "F9",
+                            NamedKey::F(10) => "F10",
+                            NamedKey::F(11) => "F11",
+                            NamedKey::F(12) => "F12",
+                            _ => "",
+                        };
+                        (n.to_string(), None)
+                    }
+                };
+                if !key_name.is_empty() || unicode.is_some() {
+                    self.handle_key_press(
+                        key_name,
+                        unicode,
+                        modifiers.ctrl,
+                        modifiers.shift,
+                        modifiers.alt,
+                        ctx,
+                    );
+                }
+            }
+            UiEvent::CharTyped(c) => {
+                // Ctrl-modified characters arrive via KeyPressed; CharTyped is
+                // for IME-composed printable characters only.
+                self.handle_key_press(c.to_string(), Some(c), false, false, false, ctx);
+            }
+            UiEvent::Accelerator(id, _mods) => {
+                let mut host = GtkAccelHost {
+                    deferred: &self.deferred,
+                };
+                if let Some(action) = render::dispatch_panel_accelerator(
+                    id.as_str(),
+                    &mut self.engine.borrow_mut(),
+                    &mut host,
+                ) {
+                    // `dispatch_panel_accelerator` already mutated `engine`
+                    // directly for these five (no `GtkAccelHost` hook — see
+                    // `render.rs`), but they still need geometry recomputed
+                    // before the next paint — matches the pre-#761 per-arm
+                    // `deferred.send(DeferredAction::Resize)`.
+                    use render::PanelAccelerator::*;
+                    if matches!(
+                        action,
+                        FuzzyFinder | LiveGrep | CommandPalette | AddCursor | SelectAllMatches
+                    ) {
+                        self.deferred.send(DeferredAction::Resize);
+                    }
+                }
+                self.draw_needed.set(true);
+            }
+            UiEvent::MouseDown {
+                button,
+                position,
+                modifiers,
+                ..
+            } => {
+                let main = ctx.layout.main_content_bounds;
+                let (w, h) = (main.width as f64, main.height as f64);
+                match button {
+                    MouseButton::Left if modifiers.ctrl => {
+                        self.handle_ctrl_mouse_click(position.x as f64, position.y as f64);
+                    }
+                    MouseButton::Left => {
+                        self.handle_mouse_click_msg(
+                            position.x as f64,
+                            position.y as f64,
+                            w,
+                            h,
+                            modifiers.alt,
+                        );
+                    }
+                    MouseButton::Right => {
+                        let rx = position.x as f64;
+                        let ry = position.y as f64;
+                        // ── Modal-overlay rung (#733 review) ────────────
+                        // A modal dialog eats every event, including
+                        // right-clicks, so it can't be right-clicked
+                        // through to the editor/tab context menu
+                        // underneath — TUI's `handle_mouse` already
+                        // returns unconditionally for any event kind
+                        // while `engine.dialog.is_some()`. This backend's
+                        // left-click path goes through
+                        // `route_modal_overlay_click` via
+                        // `handle_mouse_click_msg`, but the right-click
+                        // path used to skip straight to tab/editor
+                        // resolution below without consulting it, so a
+                        // right-click on an open dialog opened the
+                        // editor's context menu behind it. Route through
+                        // the same shared rung (`ModalMouseAction::Other`)
+                        // before doing anything else.
+                        let modal_route =
+                            self.route_modal_overlay(rx, ry, render::ModalMouseAction::Other);
+                        if modal_route == render::ModalOverlayRoute::Swallow {
+                            self.draw_needed.set(true);
+                        } else {
+                            // #546 FAILED-1: this used to unconditionally build
+                            // `EditorRightClick`, so right-clicking a tab opened
+                            // the *editor's* context menu (identical item list to
+                            // right-clicking in the buffer) instead of a
+                            // tab-specific one. Resolve the click against the
+                            // last-painted tab-bar geometry first — read-only, no
+                            // engine mutation — and only fall back to the editor
+                            // menu when it isn't over a tab.
+                            let tab_target = {
+                                let engine = self.engine.borrow();
+                                let layout_ref = self.cached_screen_layout.borrow();
+                                layout_ref.as_ref().and_then(|layout| {
+                                    resolve_tab_right_click(
+                                        &engine,
+                                        rx,
+                                        ry,
+                                        self.cached_line_height,
+                                        self.cached_char_width,
+                                        layout,
+                                        &self.cached_tab_pixel_hits.borrow(),
+                                        self.cached_frame_hit_map.borrow().as_ref(),
+                                        &self.cached_tab_bar_zones.borrow(),
+                                    )
+                                })
+                            };
+                            if let Some((group_id, tab_idx)) = tab_target {
+                                self.handle_tab_right_click(group_id, tab_idx, rx, ry);
+                            } else {
+                                self.handle_editor_right_click(rx, ry);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Mouse clicks always require a redraw (cursor movement, selection,
+                // focus change). draw_needed may already be set by the handler
+                // above, but set it unconditionally so handle() returns
+                // Reaction::Redraw even when a handler takes an early-return path.
+                self.draw_needed.set(true);
+            }
+            UiEvent::DoubleClick { position, .. } => {
+                self.handle_mouse_double_click_msg(position.x as f64, position.y as f64);
+                self.draw_needed.set(true);
+            }
+            UiEvent::MouseMoved { position, buttons } => {
+                self.mouse_pos_cell
+                    .set((position.x as f64, position.y as f64));
+                // ── Modal-overlay hover rung (#751) ─────────────────────
+                // An open context menu tracks the pointer, exactly as TUI's
+                // `handle_mouse` has always done. This backend had no hover
+                // arm at all, so whichever item was selected when the menu
+                // opened stayed highlighted wherever the pointer went (#373)
+                // — and a keyboard Down after a mouse hover then moved from
+                // the wrong row.
+                if !buttons.left {
+                    if let render::ModalOverlayRoute::ContextMenu(route) = self.route_modal_overlay(
+                        position.x as f64,
+                        position.y as f64,
+                        render::ModalMouseAction::Move,
+                    ) {
+                        self.apply_context_menu_route(route);
+                    }
+                }
+                if buttons.left {
+                    let main = ctx.layout.main_content_bounds;
+                    self.handle_mouse_drag_msg(
+                        position.x as f64,
+                        position.y as f64,
+                        main.width as f64,
+                        main.height as f64,
+                    );
+                }
+            }
+            UiEvent::MouseUp { .. } => {
+                self.handle_mouse_up_msg();
+            }
+            UiEvent::Scroll {
+                delta, position, ..
+            } => {
+                // #646: record where the wheel event happened before dispatching.
+                // `handle_mouse_scroll_msg` takes only the delta, and reads the pointer
+                // back out of `last_editor_pointer` to decide which window (or
+                // registered scroll surface) the wheel targets. Nothing set that
+                // cell after the #540 Relm4→ShellApp migration removed the
+                // `EventControllerMotion` that used to — see the field's doc — so
+                // it was permanently `None` and every wheel event fell through to
+                // the *focused* window regardless of the pointer (#240 behaviour
+                // dead on GTK, still live on TUI). A wheel event carries its own
+                // position, so use that directly rather than depending on a
+                // preceding motion event.
+                self.last_editor_pointer
+                    .set(Some((position.x as f64, position.y as f64)));
+                // #554: **negate y back to GTK's raw polarity.**
+                //
+                // Two conventions meet at this line and they disagree:
+                //
+                // - GDK's `EventControllerScroll` reports *positive dy = wheel
+                //   down*.
+                // - `UiEvent::Scroll.delta` follows quadraui's convention,
+                //   *positive y = up toward the top of the content*.
+                //   `quadraui::gtk::events::gdk_scroll_to_uievent` is what
+                //   flips one into the other — it constructs
+                //   `ScrollDelta::new(dx, -dy)`.
+                //
+                // Everything downstream of `handle_mouse_scroll_msg` — the
+                // `delta_y > 0.0 => dir = 1` viewport step, the `picker_scroll`
+                // sign, `Engine::handle_terminal_scroll`'s "> 0 = toward live"
+                // policy — was written against GTK's raw polarity and is
+                // unchanged since before the #540 Relm4→ShellApp migration.
+                // Pre-migration the Relm4 `connect_scroll` closure fed it GTK's
+                // `dy` directly (as the retired `Msg::MouseScroll`'s payload
+                // — the whole bus is gone as of #732)
+                // and *separately* pushed the negated `gdk_scroll_to_uievent`
+                // form onto the backend event queue. The migration deleted that
+                // closure and left the runner's already-negated `UiEvent::Scroll`
+                // as the only source, so every wheel notch reached the engine
+                // with the sign flipped and the editor scrolled backwards.
+                //
+                // Only y is negated: `gdk_scroll_to_uievent` passes `dx`
+                // through unchanged, so `delta.x` is already GTK-raw.
+                self.handle_mouse_scroll_msg(delta.x as f64, -(delta.y as f64));
+            }
+            UiEvent::WindowResized { .. } => {
+                // Runner sets new line_height/char_width after resize.
+                self.cached_line_height = backend.line_height() as f64;
+                self.cached_char_width = backend.char_width() as f64;
+                self.line_height_cell.set(self.cached_line_height);
+                self.char_width_cell.set(self.cached_char_width);
+                self.handle_resize();
+            }
+            UiEvent::WindowClose => {
+                self.show_quit_confirm();
+            }
+            // #593: quadraui's runner reads the system clipboard on Ctrl+V /
+            // Ctrl+Shift+V / middle-click and delivers the text here,
+            // unconditionally consuming the key — there is no raw KeyPressed
+            // fallback to catch a paste with. `Engine::route_paste` is the
+            // same focus-priority router TUI's `UiEvent::ClipboardPaste` arm
+            // already calls (`tui_main/shell_app.rs`), so this one arm covers
+            // the command line, search/replace fields, explorer rename, and
+            // the editor buffer — see that fn's doc for the full priority
+            // chain.
+            UiEvent::ClipboardPaste(text) => {
+                self.engine.borrow_mut().route_paste(&text);
+                self.draw_needed.set(true);
+            }
+            _ => {}
+        }
+
+        if self.draw_needed.get() {
+            self.draw_needed.set(false);
+            quadraui::Reaction::Redraw
+        } else {
+            quadraui::Reaction::Continue
+        }
+    }
+
+    /// The actual body of `ShellApp::tick` — see `handle_dispatch`'s
+    /// doc comment (#813). `run_pending_native_dialog`, reachable from
+    /// here via `apply_dialog_action`, can also request exit.
+    fn tick_dispatch(&mut self, backend: &mut dyn quadraui::Backend) -> quadraui::Reaction {
+        // Keep cached metrics up to date.
+        self.cached_line_height = backend.line_height() as f64;
+        self.cached_char_width = backend.char_width() as f64;
+        self.line_height_cell.set(self.cached_line_height);
+        self.char_width_cell.set(self.cached_char_width);
+
+        // Retry the window capture until the runner has mapped it — see
+        // `capture_window_and_apply_csd` (#552). No-ops once `self.window`
+        // is `Some`.
+        self.capture_window_and_apply_csd();
+
+        // Drain the actions async GTK callbacks queued for this frame.
+        for action in self.deferred.drain() {
+            match action {
+                DeferredAction::RefreshFileTree => self.refresh_file_tree(),
+                DeferredAction::Resize => self.handle_resize(),
+                DeferredAction::SettingsFileChanged => self.settings_file_changed(),
+                DeferredAction::ToggleFocusExplorer => self.toggle_focus_explorer(),
+                DeferredAction::ToggleFocusSearch => self.toggle_focus_search(),
+                DeferredAction::ToggleSidebar => self.toggle_sidebar_panel(),
+                DeferredAction::ToggleTerminal => self.toggle_terminal(),
+                DeferredAction::ToggleTerminalMaximize => self.toggle_terminal_maximize(),
+            }
+        }
+
+        // Poll the yank-highlight deadline armed by `run_post_key_epilogue`
+        // (#813 — see `yank_hl_deadline`'s doc comment).
+        if let Some(deadline) = self.yank_hl_deadline.get() {
+            if std::time::Instant::now() >= deadline {
+                self.clear_yank_highlight();
+                self.yank_hl_deadline.set(None);
+                self.draw_needed.set(true);
+            }
+        }
+
+        // Run a file dialog requested this frame — needs the runner-owned
+        // `backend` handle for `PlatformServices` (#572). See
+        // `PendingFileDialog` for why this can't happen in the
+        // `open_file_dialog` / `save_workspace_as_dialog` handlers themselves.
+        if let Some(req) = self.pending_file_dialog.take() {
+            self.run_pending_file_dialog(req, backend);
+        }
+
+        // Run a native message dialog queued by `render_content`'s
+        // edge-trigger check (#727) — same reason as the file dialog above:
+        // needs the runner-owned `backend` for `PlatformServices`, which
+        // `render_content`'s paint callback must not block inside.
+        if let Some(opts) = self.pending_native_dialog.take() {
+            self.run_pending_native_dialog(opts, backend);
+        }
+
+        // Periodic background work: LSP, DAP, git, search, etc.
+        self.handle_poll_tick();
+
+        if self.draw_needed.get() {
+            self.draw_needed.set(false);
+            quadraui::Reaction::Redraw
+        } else {
+            quadraui::Reaction::Continue
         }
     }
 }
@@ -6478,557 +7147,19 @@ impl quadraui::ShellApp for App {
         backend: &mut dyn quadraui::Backend,
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
-        use quadraui::{Key, MouseButton, NamedKey, UiEvent};
-
-        // ── Menu system intercept (#552) ─────────────────────────────────────
-        // GTK's menu bar is always visible (see `ShellApp::setup`) and its
-        // dropdown overlay must intercept keys/clicks before the sidebar or
-        // editor sees them — same precedence TUI uses (mod.rs "MenuSystem
-        // intercept" block) via the identical shared `menu_system.handle()`.
-        let (menu_bar_visible, menu_system) = {
-            let eng = self.engine.borrow();
-            (eng.menu_bar_visible, eng.menu_system.clone())
-        };
-        if menu_bar_visible || menu_system.borrow().is_open() {
-            // `menu_items_rect`, not `menu_row_rect` (#720): the app icon
-            // occupies a leading slot, so the items the last frame *painted*
-            // start one slot right of the band's left edge. Hit-testing
-            // against the full band would resolve a click on `File` to
-            // whatever label now sits a slot to its left. `render_content`
-            // writes this from the same `split_menu_row_for_app_icon` call
-            // that positions the paint.
-            let bar_rect = self.menu_items_rect.get();
-            let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
-            match menu_event {
-                quadraui::MenuEvent::Activated(id) => {
-                    self.handle_menu_action(id.as_str().to_string());
-                    self.draw_needed.set(true);
-                    return quadraui::Reaction::Redraw;
-                }
-                quadraui::MenuEvent::StateChanged | quadraui::MenuEvent::Consumed => {
-                    self.draw_needed.set(true);
-                    return quadraui::Reaction::Redraw;
-                }
-                quadraui::MenuEvent::Ignored => {}
-            }
+        let reaction = self.handle_dispatch(event, backend, ctx);
+        if self.exit_requested.get() {
+            return quadraui::Reaction::Exit;
         }
-
-        // ── Command Center: nav arrows + search box (#676) ────────────────────
-        // Checked before the window-control buttons below and the CSD
-        // titlebar drag-to-move fallback further down, so a click in the
-        // command center (which sits inside the title-bar band the
-        // drag-to-move check would otherwise claim) routes to tab-nav / the
-        // picker instead of starting a window drag. Mirrors TUI's
-        // `mouse.rs` "Menu bar row click — command center only" precedence.
-        // The nav-arrow / search-box actions are the shared
-        // `render::apply_command_center_hit` (#752) — the pre-#540 Relm4
-        // `Msg::MruNavBack` / `MruNavForward` / `OpenCommandCenter` variants
-        // for this exact action, already wired end-to-end but never
-        // dispatched from anywhere since the cutover. This block was their
-        // first live caller (#676); #732 turned them into plain methods,
-        // and #752 converged those methods with TUI's identical match arm
-        // into the one function in `render.rs`.
-        if let UiEvent::MouseDown {
-            button: MouseButton::Left,
-            position,
-            ..
-        } = &event
-        {
-            let cc_hit = self
-                .engine
-                .borrow()
-                .command_center_layout
-                .borrow()
-                .as_ref()
-                .map(|l| l.hit_test(position.x, position.y));
-            // `Bar` (command-center background, not an interactive segment)
-            // and `Outside`/`None` fall through so the drag-to-move fallback
-            // below still works for genuine empty-band clicks.
-            if let Some(hit) = cc_hit {
-                if crate::render::apply_command_center_hit(&mut self.engine.borrow_mut(), hit) {
-                    self.draw_needed.set(true);
-                    return quadraui::Reaction::Redraw;
-                }
-            }
-        }
-
-        // ── Inline window-control buttons: minimize/maximize/close (#552) ───
-        // Shared `StatusBarInteraction` hover/press/click tracker — the same
-        // primitive quadraui's own `full_chrome_demo` reference title bar
-        // uses (quadraui#402) — instead of a hand-rolled `StatusBarHit`
-        // lookup. Gets the buttons real hover/press highlighting for free
-        // and click-on-release semantics (a press that drags off the button
-        // before release no longer fires it), matching native window
-        // controls. Runs on every event (not just MouseDown) so hover state
-        // updates as the pointer moves.
-        {
-            let rect = self.title_bar_rect.get();
-            if rect.width > 0.0 {
-                let action = self.title_bar_interaction.borrow_mut().handle(&event, rect);
-                match action {
-                    quadraui::StatusBarAction::Clicked(id) => {
-                        match id.as_str() {
-                            render::WINDOW_MINIMIZE_ACTION => self.window_minimize(),
-                            render::WINDOW_MAXIMIZE_ACTION => self.window_toggle_maximize(),
-                            render::WINDOW_CLOSE_ACTION => self.window_close(),
-                            _ => {}
-                        }
-                        self.draw_needed.set(true);
-                        return quadraui::Reaction::Redraw;
-                    }
-                    quadraui::StatusBarAction::Redraw => {
-                        self.draw_needed.set(true);
-                        return quadraui::Reaction::Redraw;
-                    }
-                    quadraui::StatusBarAction::Ignored => {}
-                }
-            }
-        }
-
-        // ── Outer window border: edge-resize cursor hint (quadraui#406) ──
-        // Pure side effect on hover — hint the resize pointer over the outer
-        // window border, default everywhere else (including the non-resizable
-        // full-width CSD title bar, which owns the top edge). Falls through so
-        // the editor/sidebar hover handling below still runs. Mirrors
-        // `full_chrome_demo`'s `MouseMoved` arm. GTK-only; TUI `set_cursor`
-        // is a documented no-op.
-        if let UiEvent::MouseMoved { position, .. } = &event {
-            let shape = if ctx.in_title_bar(position.x, position.y) {
-                quadraui::PointerShape::Default
-            } else {
-                match ctx.window_edge(position.x, position.y, backend.line_height()) {
-                    Some(edge) => quadraui::PointerShape::Resize(edge),
-                    None => quadraui::PointerShape::Default,
-                }
-            };
-            backend.set_cursor(shape);
-        }
-
-        // ── Sidebar hover — #754 rung ─────────────────────────────────────
-        // This backend already *painted* `screen.panel_hover` (the
-        // `RichTextPopup` block in `render_content`) and already tracked the
-        // popup's own rect, but nothing on this side ever set
-        // `engine.panel_hover` or `engine.sc_button_hovered`: the router was
-        // ~78 lines of TUI-only code. That is the #499/#484 mechanism — paint
-        // without input on one backend, input without a second painter on the
-        // other. `render::route_sidebar_hover` is now the single router and
-        // both backends call it.
-        if let UiEvent::MouseMoved { position, .. } = &event {
-            if let Some(sb) = ctx.layout.sidebar_content_bounds {
-                let lh = backend.line_height();
-                let on_popup = self
-                    .panel_hover_popup_rect
-                    .get()
-                    .is_some_and(|(px, py, pw, ph)| {
-                        let (mx, my) = (position.x as f64, position.y as f64);
-                        mx >= px && mx < px + pw && my >= py && my < py + ph
-                    });
-                let owner = render::sidebar_owner(&self.engine.borrow());
-                let changed = render::route_sidebar_hover(
-                    &mut self.engine.borrow_mut(),
-                    &owner,
-                    position.x,
-                    position.y,
-                    render::SidebarBodyGeometry {
-                        bounds: sb,
-                        row_h: lh.max(1.0),
-                        header_rows: 1.0,
-                    },
-                    true,
-                    on_popup,
-                );
-                if changed {
-                    self.draw_needed.set(true);
-                }
-            }
-        }
-
-        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
-        // (quadraui#400) + outer window border: edge-resize (quadraui#406).
-        // Runs after the menu-item intercept and the window-control-button
-        // check above, so both take priority — only a press/double-click that
-        // lands in the title bar band but misses every interactive segment
-        // (menu item, min/max/close button) reaches here, matching
-        // `Backend::begin_window_drag`'s documented contract. The title bar
-        // takes priority over the top window edge (a full-width CSD header
-        // owns it), so `in_title_bar` is checked before `window_edge` —
-        // mirrors quadraui's `full_chrome_demo` reference. TUI has no window,
-        // so `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
-        // are all documented no-ops there; this path is GTK-only.
-        match &event {
-            UiEvent::MouseDown {
-                button: MouseButton::Left,
-                position,
-                ..
-            } if ctx.in_title_bar(position.x, position.y) => {
-                backend.begin_window_drag();
-                self.draw_needed.set(true);
-                return quadraui::Reaction::Redraw;
-            }
-            UiEvent::DoubleClick { position, .. } if ctx.in_title_bar(position.x, position.y) => {
-                backend.toggle_window_maximize();
-                self.draw_needed.set(true);
-                return quadraui::Reaction::Redraw;
-            }
-            UiEvent::MouseDown {
-                button: MouseButton::Left,
-                position,
-                ..
-            } => {
-                if let Some(edge) = ctx.window_edge(position.x, position.y, backend.line_height()) {
-                    backend.begin_window_resize(edge);
-                    self.draw_needed.set(true);
-                    return quadraui::Reaction::Redraw;
-                }
-            }
-            _ => {}
-        }
-
-        // Pointer events over the sidebar content area are forwarded to the active
-        // panel's controller before the editor click path sees them. In ShellApp
-        // mode there is no per-panel DrawingArea, so without this the file explorer
-        // never receives clicks. (#540 ShellApp port)
-        if self.try_route_sidebar_mouse_event(&event, ctx) {
-            return if self.draw_needed.get() {
-                self.draw_needed.set(false);
-                quadraui::Reaction::Redraw
-            } else {
-                quadraui::Reaction::Continue
-            };
-        }
-
-        match event {
-            UiEvent::KeyPressed { key, modifiers, .. } => {
-                let (key_name, unicode) = match key {
-                    Key::Char(c) => (c.to_string(), Some(c)),
-                    Key::Named(ref named) => {
-                        let n: &str = match named {
-                            NamedKey::Escape => "Escape",
-                            NamedKey::Tab => "Tab",
-                            NamedKey::BackTab => "BackTab",
-                            NamedKey::Enter => "Return",
-                            NamedKey::Backspace => "BackSpace",
-                            NamedKey::Delete => "Delete",
-                            NamedKey::Insert => "Insert",
-                            NamedKey::Home => "Home",
-                            NamedKey::End => "End",
-                            NamedKey::PageUp => "PageUp",
-                            NamedKey::PageDown => "PageDown",
-                            NamedKey::Up => "Up",
-                            NamedKey::Down => "Down",
-                            NamedKey::Left => "Left",
-                            NamedKey::Right => "Right",
-                            NamedKey::F(1) => "F1",
-                            NamedKey::F(2) => "F2",
-                            NamedKey::F(3) => "F3",
-                            NamedKey::F(4) => "F4",
-                            NamedKey::F(5) => "F5",
-                            NamedKey::F(6) => "F6",
-                            NamedKey::F(7) => "F7",
-                            NamedKey::F(8) => "F8",
-                            NamedKey::F(9) => "F9",
-                            NamedKey::F(10) => "F10",
-                            NamedKey::F(11) => "F11",
-                            NamedKey::F(12) => "F12",
-                            _ => "",
-                        };
-                        (n.to_string(), None)
-                    }
-                };
-                if !key_name.is_empty() || unicode.is_some() {
-                    self.handle_key_press(
-                        key_name,
-                        unicode,
-                        modifiers.ctrl,
-                        modifiers.shift,
-                        modifiers.alt,
-                        ctx,
-                    );
-                }
-            }
-            UiEvent::CharTyped(c) => {
-                // Ctrl-modified characters arrive via KeyPressed; CharTyped is
-                // for IME-composed printable characters only.
-                self.handle_key_press(c.to_string(), Some(c), false, false, false, ctx);
-            }
-            UiEvent::Accelerator(id, _mods) => {
-                let mut host = GtkAccelHost {
-                    deferred: &self.deferred,
-                };
-                if let Some(action) = render::dispatch_panel_accelerator(
-                    id.as_str(),
-                    &mut self.engine.borrow_mut(),
-                    &mut host,
-                ) {
-                    // `dispatch_panel_accelerator` already mutated `engine`
-                    // directly for these five (no `GtkAccelHost` hook — see
-                    // `render.rs`), but they still need geometry recomputed
-                    // before the next paint — matches the pre-#761 per-arm
-                    // `deferred.send(DeferredAction::Resize)`.
-                    use render::PanelAccelerator::*;
-                    if matches!(
-                        action,
-                        FuzzyFinder | LiveGrep | CommandPalette | AddCursor | SelectAllMatches
-                    ) {
-                        self.deferred.send(DeferredAction::Resize);
-                    }
-                }
-                self.draw_needed.set(true);
-            }
-            UiEvent::MouseDown {
-                button,
-                position,
-                modifiers,
-                ..
-            } => {
-                let main = ctx.layout.main_content_bounds;
-                let (w, h) = (main.width as f64, main.height as f64);
-                match button {
-                    MouseButton::Left if modifiers.ctrl => {
-                        self.handle_ctrl_mouse_click(position.x as f64, position.y as f64);
-                    }
-                    MouseButton::Left => {
-                        self.handle_mouse_click_msg(
-                            position.x as f64,
-                            position.y as f64,
-                            w,
-                            h,
-                            modifiers.alt,
-                        );
-                    }
-                    MouseButton::Right => {
-                        let rx = position.x as f64;
-                        let ry = position.y as f64;
-                        // ── Modal-overlay rung (#733 review) ────────────
-                        // A modal dialog eats every event, including
-                        // right-clicks, so it can't be right-clicked
-                        // through to the editor/tab context menu
-                        // underneath — TUI's `handle_mouse` already
-                        // returns unconditionally for any event kind
-                        // while `engine.dialog.is_some()`. This backend's
-                        // left-click path goes through
-                        // `route_modal_overlay_click` via
-                        // `handle_mouse_click_msg`, but the right-click
-                        // path used to skip straight to tab/editor
-                        // resolution below without consulting it, so a
-                        // right-click on an open dialog opened the
-                        // editor's context menu behind it. Route through
-                        // the same shared rung (`ModalMouseAction::Other`)
-                        // before doing anything else.
-                        let modal_route =
-                            self.route_modal_overlay(rx, ry, render::ModalMouseAction::Other);
-                        if modal_route == render::ModalOverlayRoute::Swallow {
-                            self.draw_needed.set(true);
-                        } else {
-                            // #546 FAILED-1: this used to unconditionally build
-                            // `EditorRightClick`, so right-clicking a tab opened
-                            // the *editor's* context menu (identical item list to
-                            // right-clicking in the buffer) instead of a
-                            // tab-specific one. Resolve the click against the
-                            // last-painted tab-bar geometry first — read-only, no
-                            // engine mutation — and only fall back to the editor
-                            // menu when it isn't over a tab.
-                            let tab_target = {
-                                let engine = self.engine.borrow();
-                                let layout_ref = self.cached_screen_layout.borrow();
-                                layout_ref.as_ref().and_then(|layout| {
-                                    resolve_tab_right_click(
-                                        &engine,
-                                        rx,
-                                        ry,
-                                        self.cached_line_height,
-                                        self.cached_char_width,
-                                        layout,
-                                        &self.cached_tab_pixel_hits.borrow(),
-                                        self.cached_frame_hit_map.borrow().as_ref(),
-                                        &self.cached_tab_bar_zones.borrow(),
-                                    )
-                                })
-                            };
-                            if let Some((group_id, tab_idx)) = tab_target {
-                                self.handle_tab_right_click(group_id, tab_idx, rx, ry);
-                            } else {
-                                self.handle_editor_right_click(rx, ry);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                // Mouse clicks always require a redraw (cursor movement, selection,
-                // focus change). draw_needed may already be set by the handler
-                // above, but set it unconditionally so handle() returns
-                // Reaction::Redraw even when a handler takes an early-return path.
-                self.draw_needed.set(true);
-            }
-            UiEvent::DoubleClick { position, .. } => {
-                self.handle_mouse_double_click_msg(position.x as f64, position.y as f64);
-                self.draw_needed.set(true);
-            }
-            UiEvent::MouseMoved { position, buttons } => {
-                self.mouse_pos_cell
-                    .set((position.x as f64, position.y as f64));
-                // ── Modal-overlay hover rung (#751) ─────────────────────
-                // An open context menu tracks the pointer, exactly as TUI's
-                // `handle_mouse` has always done. This backend had no hover
-                // arm at all, so whichever item was selected when the menu
-                // opened stayed highlighted wherever the pointer went (#373)
-                // — and a keyboard Down after a mouse hover then moved from
-                // the wrong row.
-                if !buttons.left {
-                    if let render::ModalOverlayRoute::ContextMenu(route) = self.route_modal_overlay(
-                        position.x as f64,
-                        position.y as f64,
-                        render::ModalMouseAction::Move,
-                    ) {
-                        self.apply_context_menu_route(route);
-                    }
-                }
-                if buttons.left {
-                    let main = ctx.layout.main_content_bounds;
-                    self.handle_mouse_drag_msg(
-                        position.x as f64,
-                        position.y as f64,
-                        main.width as f64,
-                        main.height as f64,
-                    );
-                }
-            }
-            UiEvent::MouseUp { .. } => {
-                self.handle_mouse_up_msg();
-            }
-            UiEvent::Scroll {
-                delta, position, ..
-            } => {
-                // #646: record where the wheel event happened before dispatching.
-                // `handle_mouse_scroll_msg` takes only the delta, and reads the pointer
-                // back out of `last_editor_pointer` to decide which window (or
-                // registered scroll surface) the wheel targets. Nothing set that
-                // cell after the #540 Relm4→ShellApp migration removed the
-                // `EventControllerMotion` that used to — see the field's doc — so
-                // it was permanently `None` and every wheel event fell through to
-                // the *focused* window regardless of the pointer (#240 behaviour
-                // dead on GTK, still live on TUI). A wheel event carries its own
-                // position, so use that directly rather than depending on a
-                // preceding motion event.
-                self.last_editor_pointer
-                    .set(Some((position.x as f64, position.y as f64)));
-                // #554: **negate y back to GTK's raw polarity.**
-                //
-                // Two conventions meet at this line and they disagree:
-                //
-                // - GDK's `EventControllerScroll` reports *positive dy = wheel
-                //   down*.
-                // - `UiEvent::Scroll.delta` follows quadraui's convention,
-                //   *positive y = up toward the top of the content*.
-                //   `quadraui::gtk::events::gdk_scroll_to_uievent` is what
-                //   flips one into the other — it constructs
-                //   `ScrollDelta::new(dx, -dy)`.
-                //
-                // Everything downstream of `handle_mouse_scroll_msg` — the
-                // `delta_y > 0.0 => dir = 1` viewport step, the `picker_scroll`
-                // sign, `Engine::handle_terminal_scroll`'s "> 0 = toward live"
-                // policy — was written against GTK's raw polarity and is
-                // unchanged since before the #540 Relm4→ShellApp migration.
-                // Pre-migration the Relm4 `connect_scroll` closure fed it GTK's
-                // `dy` directly (as the retired `Msg::MouseScroll`'s payload
-                // — the whole bus is gone as of #732)
-                // and *separately* pushed the negated `gdk_scroll_to_uievent`
-                // form onto the backend event queue. The migration deleted that
-                // closure and left the runner's already-negated `UiEvent::Scroll`
-                // as the only source, so every wheel notch reached the engine
-                // with the sign flipped and the editor scrolled backwards.
-                //
-                // Only y is negated: `gdk_scroll_to_uievent` passes `dx`
-                // through unchanged, so `delta.x` is already GTK-raw.
-                self.handle_mouse_scroll_msg(delta.x as f64, -(delta.y as f64));
-            }
-            UiEvent::WindowResized { .. } => {
-                // Runner sets new line_height/char_width after resize.
-                self.cached_line_height = backend.line_height() as f64;
-                self.cached_char_width = backend.char_width() as f64;
-                self.line_height_cell.set(self.cached_line_height);
-                self.char_width_cell.set(self.cached_char_width);
-                self.handle_resize();
-            }
-            UiEvent::WindowClose => {
-                self.show_quit_confirm();
-            }
-            // #593: quadraui's runner reads the system clipboard on Ctrl+V /
-            // Ctrl+Shift+V / middle-click and delivers the text here,
-            // unconditionally consuming the key — there is no raw KeyPressed
-            // fallback to catch a paste with. `Engine::route_paste` is the
-            // same focus-priority router TUI's `UiEvent::ClipboardPaste` arm
-            // already calls (`tui_main/shell_app.rs`), so this one arm covers
-            // the command line, search/replace fields, explorer rename, and
-            // the editor buffer — see that fn's doc for the full priority
-            // chain.
-            UiEvent::ClipboardPaste(text) => {
-                self.engine.borrow_mut().route_paste(&text);
-                self.draw_needed.set(true);
-            }
-            _ => {}
-        }
-
-        if self.draw_needed.get() {
-            self.draw_needed.set(false);
-            quadraui::Reaction::Redraw
-        } else {
-            quadraui::Reaction::Continue
-        }
+        reaction
     }
 
     fn tick(&mut self, backend: &mut dyn quadraui::Backend) -> quadraui::Reaction {
-        // Keep cached metrics up to date.
-        self.cached_line_height = backend.line_height() as f64;
-        self.cached_char_width = backend.char_width() as f64;
-        self.line_height_cell.set(self.cached_line_height);
-        self.char_width_cell.set(self.cached_char_width);
-
-        // Retry the window capture until the runner has mapped it — see
-        // `capture_window_and_apply_csd` (#552). No-ops once `self.window`
-        // is `Some`.
-        self.capture_window_and_apply_csd();
-
-        // Drain the actions async GTK callbacks queued for this frame.
-        for action in self.deferred.drain() {
-            match action {
-                DeferredAction::ClearYankHighlight => self.clear_yank_highlight(),
-                DeferredAction::RefreshFileTree => self.refresh_file_tree(),
-                DeferredAction::Resize => self.handle_resize(),
-                DeferredAction::SettingsFileChanged => self.settings_file_changed(),
-                DeferredAction::ToggleFocusExplorer => self.toggle_focus_explorer(),
-                DeferredAction::ToggleFocusSearch => self.toggle_focus_search(),
-                DeferredAction::ToggleSidebar => self.toggle_sidebar_panel(),
-                DeferredAction::ToggleTerminal => self.toggle_terminal(),
-                DeferredAction::ToggleTerminalMaximize => self.toggle_terminal_maximize(),
-            }
+        let reaction = self.tick_dispatch(backend);
+        if self.exit_requested.get() {
+            return quadraui::Reaction::Exit;
         }
-
-        // Run a file dialog requested this frame — needs the runner-owned
-        // `backend` handle for `PlatformServices` (#572). See
-        // `PendingFileDialog` for why this can't happen in the
-        // `open_file_dialog` / `save_workspace_as_dialog` handlers themselves.
-        if let Some(req) = self.pending_file_dialog.take() {
-            self.run_pending_file_dialog(req, backend);
-        }
-
-        // Run a native message dialog queued by `render_content`'s
-        // edge-trigger check (#727) — same reason as the file dialog above:
-        // needs the runner-owned `backend` for `PlatformServices`, which
-        // `render_content`'s paint callback must not block inside.
-        if let Some(opts) = self.pending_native_dialog.take() {
-            self.run_pending_native_dialog(opts, backend);
-        }
-
-        // Periodic background work: LSP, DAP, git, search, etc.
-        self.handle_poll_tick();
-
-        if self.draw_needed.get() {
-            self.draw_needed.set(false);
-            quadraui::Reaction::Redraw
-        } else {
-            quadraui::Reaction::Continue
-        }
+        reaction
     }
 
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
