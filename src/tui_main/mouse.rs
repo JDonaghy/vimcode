@@ -1214,34 +1214,26 @@ pub(super) fn handle_mouse(
                                 engine.handle_terminal_scroll(delta.y);
                                 return sidebar_width;
                             }
-                            "tui:editor_viewport" => {
-                                // #550: `find_window_at` compares against
-                                // already-absolute `rw.rect`, so the raw
-                                // event `col`/`row` are used directly.
-                                let target = last_layout.and_then(|layout| {
-                                    render::find_window_at(layout, col as f64, row as f64)
-                                        .map(|idx| &layout.windows[idx])
-                                });
-                                if let Some(rw) = target {
-                                    let dir = if down { 1 } else { -1 };
-                                    engine.scroll_viewport_with_cursor_for_window(
-                                        rw.window_id,
-                                        dir,
-                                        step,
-                                    );
-                                    engine.sync_scroll_binds();
-                                }
-                                return sidebar_width;
-                            }
                             _ => {}
                         }
                     }
                 }
             }
 
-            // Editor viewport scroll is now handled via dispatch_scroll
-            // "tui:editor_viewport" surface above — fallback to active window
-            // for scroll events that don't hit any registered surface.
+            // #825: this used to be a *fallback* below a `"tui:editor_viewport"`
+            // arm in the `dispatch_scroll` match above, for events that missed
+            // every registered surface. That arm was dead code — nothing ever
+            // registers a `"tui:editor_viewport"` `ScrollSurface` or pushes that
+            // id onto the `ModalStack`, so `dispatch_scroll` (which can only
+            // emit an id it was handed one of those two ways) could never
+            // produce it. Deleted rather than wired up: making it real means
+            // registering per-window scroll surfaces so a wheel event scrolls
+            // whichever pane is under the pointer — like GTK's
+            // `hovered_window_id` does in `handle_mouse_scroll_msg` — and this
+            // fallback, unconditionally targeting the *active* window, is the
+            // only path editor-viewport wheel scroll has ever actually taken.
+            // That GTK/TUI behavior gap is real but is a feature gap, not a
+            // duplication one; out of scope here.
             if col >= editor_left && row + 2 < term_height {
                 let dir = if matches!(ev.kind, MouseEventKind::ScrollUp) {
                     -1
@@ -1723,32 +1715,26 @@ pub(super) fn handle_mouse(
         for cev in &click_events {
             match cev {
                 quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } => {
-                    match widget.as_str() {
-                        "debug_output" => {
-                            engine.debug_output_scroll = *new_offset;
-                            engine.debug_output_auto_scroll = false;
-                            return sidebar_width;
-                        }
-                        "explorer:sb" => {
-                            engine
-                                .explorer_tree
-                                .borrow_mut()
-                                .set_scroll_offset(*new_offset);
-                            return sidebar_width;
-                        }
-                        "ext_panel:sb" => {
-                            engine.ext_panel_scroll_top = *new_offset;
-                            return sidebar_width;
-                        }
-                        "tui:settings" => {
-                            engine.settings_scroll_top = *new_offset;
-                            return sidebar_width;
-                        }
-                        other if other.starts_with("debug_sidebar:") => {
-                            // SidebarSystem handles scrollbar internally
-                            return sidebar_width;
-                        }
-                        _ => {}
+                    // #825: `terminal_scrollback` is deliberately excluded —
+                    // a click on it must `drag_state.begin()` via the
+                    // bottom-panel rung below (a scrollbar drag-begin, not a
+                    // bare offset-set), so it falls through this dispatch and
+                    // is picked up there instead. Every other id is
+                    // `render::apply_scroll_offset`, the same table the drag
+                    // path (#756) and GTK's click table share — the
+                    // hand-rolled copy this replaced knew ids GTK's copy did
+                    // not, and vice versa.
+                    if widget.as_str() != "terminal_scrollback"
+                        && render::apply_scroll_offset(
+                            engine,
+                            widget.as_str(),
+                            *new_offset,
+                            render::ScrollApplyContext {
+                                picker_visible_rows: 0,
+                            },
+                        )
+                    {
+                        return sidebar_width;
                     }
                 }
                 quadraui::UiEvent::MouseDown {
