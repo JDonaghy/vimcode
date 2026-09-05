@@ -6490,10 +6490,16 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
 // separated-status rows vimcode stacks *below* the terminal/debug-output
 // panel — adopting it would need a `ShellConfig`/`AppShellLayout` capable of
 // more than one independently-gated bottom band, which does not exist
-// upstream today. No such gap is filed in quadraui as of this pass; filing
-// one (multi-band bottom chrome, not just the terminal-split/scrollbar gaps
-// #820 flagged) is the correct next step before this is revisited, per
-// `CLAUDE.md`'s Platform-Neutrality Rule — not GTK/TUI-side code.
+// upstream today.
+//
+// **Per CLAUDE.md's Platform-Neutrality Rule, this gap must be filed on
+// `JDonaghy/quadraui`, not worked around here — that filing is drafted and
+// ready to submit** (see `docs/PENDING_QUADRAUI_ISSUES.md`, "multi-band
+// bottom chrome"), pending a session with `gh` access (this repo's worker
+// sessions are `git`-only; issue filing is a coordinator action). **#820 must
+// stay open behind that filing, not close on this investigation alone** —
+// this is a rejection with a drafted-but-unfiled blocker, not a resolved
+// question.
 
 /// One rung of the shared **bottom band** — the stack of chrome vimcode carves
 /// out of the bottom of `AppShellLayout::main_content_bounds`.
