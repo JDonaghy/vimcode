@@ -2864,7 +2864,7 @@ impl Engine {
             'r' => {
                 // Replace character: r followed by a character replaces char under cursor.
                 // Special case: Return/Enter replaces with newline (splits line).
-                let replacement = unicode.or_else(|| match key_name {
+                let replacement = unicode.or(match key_name {
                     "Return" | "KP_Enter" => Some('\n'),
                     "Tab" => Some('\t'),
                     _ => None,
