@@ -3469,22 +3469,26 @@ pub struct Engine {
     async_shell_tasks: HashMap<String, std::sync::mpsc::Receiver<(bool, String)>>,
 
     // --- AI assistant panel ---
-    /// Conversation history shown in the AI sidebar.
+    /// Conversation history shown in the AI sidebar. The business-logic
+    /// source of truth (fed to `crate::core::ai::send_chat`); `ai_chat`'s
+    /// own transcript is a per-frame render-only mirror of this, rebuilt by
+    /// `render::populate_ai_chat_controller`.
     pub ai_messages: Vec<AiMessage>,
-    /// Current input text being composed.
-    pub ai_input: String,
-    /// Cursor position in `ai_input` (char index, 0 = before first char).
-    pub ai_input_cursor: usize,
     /// Whether the AI sidebar has keyboard focus.
     pub ai_has_focus: bool,
-    /// Whether the input box is in active editing mode.
-    pub ai_input_active: bool,
     /// True while a request is in-flight.
     pub ai_streaming: bool,
     /// Channel for receiving the AI response from the background thread.
     pub ai_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    /// Scroll offset for the conversation history (in lines).
-    pub ai_scroll_top: usize,
+    /// quadraui ChatController — owns the AI sidebar's transcript scroll,
+    /// multi-line input buffer/cursor/history, and scrollbar-drag state
+    /// (#819). Both TUI and GTK call `render()` for painting and `handle()`
+    /// for mouse/keyboard events via the shared `render::route_ai_chat_event`
+    /// wrapper.
+    pub ai_chat: std::rc::Rc<std::cell::RefCell<quadraui::ChatController>>,
+    /// Cached rect from last render frame — used by `route_ai_chat_event` so
+    /// keyboard/mouse dispatch computes the same layout `render()` painted.
+    pub ai_chat_rect: std::cell::Cell<quadraui::Rect>,
 
     // --- AI inline completions (ghost text) ---
     /// Ghost text currently shown at the cursor (first/current alternative).
@@ -4156,13 +4160,13 @@ impl Engine {
             ai_completion_rx: None,
             ai_completion_prefix_tail: String::new(),
             ai_messages: Vec::new(),
-            ai_input: String::new(),
-            ai_input_cursor: 0,
             ai_has_focus: false,
-            ai_input_active: false,
             ai_streaming: false,
             ai_rx: None,
-            ai_scroll_top: 0,
+            ai_chat: std::rc::Rc::new(std::cell::RefCell::new(quadraui::ChatController::new(
+                "vimcode:ai",
+            ))),
+            ai_chat_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             md_preview_links: HashMap::new(),
             swap_write_needed: HashSet::new(),
             swap_last_write: std::time::Instant::now(),

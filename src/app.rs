@@ -443,12 +443,6 @@ pub(crate) struct App {
     /// `engine.dap_sidebar_action_hits` are relative to this rect's origin, so
     /// the router needs it to translate an absolute press (#544).
     pub(crate) cached_dap_action_rect: Cell<Option<quadraui::Rect>>,
-    /// AI-sidebar band geometry (header / message history / input) as the
-    /// last `render_content` pass painted it, from
-    /// `render::draw_ai_sidebar_panel`. `route_ai_sidebar_event` resolves
-    /// presses against this so the click and paint derivations cannot drift
-    /// (#544/#730).
-    pub(crate) cached_ai_bands: Cell<Option<render::AiSidebarBands>>,
     /// Per-group tab-drop geometry (absolute pixel bounds) computed each frame in
     /// `render_content`. Both the drag overlay (same frame) and the drag hit-test
     /// in `handle_mouse_drag_msg` (next mouse-move) read this, so the drop-zone
@@ -463,6 +457,19 @@ pub(crate) struct App {
     /// height than `draw_tree` used). Re-applied before hit-testing so draw and
     /// hit agree. (#540 ShellApp port)
     pub(crate) cached_explorer_metrics: Rc<Cell<(f64, f64)>>,
+    /// `(line_height, char_width)` the AI panel's `ChatController` was last
+    /// painted with — the same drift `cached_explorer_metrics` guards
+    /// against (#544/#819). `Backend::line_height`/`char_width` on GTK
+    /// read a mutable "current" field any widget's render pass can
+    /// overwrite for its own metrics; by the time a later mouse/keyboard
+    /// event reaches `route_ai_chat_event`, whatever painted *last* this
+    /// frame or the previous one may have left a different value there.
+    /// Re-applied via `TextMetricsBackend::set_current_line_height`/
+    /// `set_current_char_width` before `ChatController::handle` runs, so its
+    /// row-wrap math (`total_rows`/`visible_rows`) matches what `render()`
+    /// used rather than silently reading a smaller/larger viewport and
+    /// throwing off the scrollbar clamp.
+    pub(crate) cached_ai_chat_metrics: Rc<Cell<(f64, f64)>>,
     /// Pixel y-offset where the debug toolbar was last drawn.
     pub(crate) debug_toolbar_y_offset: Rc<Cell<f64>>,
     /// Pixel height of the debug toolbar (last draw).
@@ -1014,11 +1021,11 @@ impl App {
             sidebar_pointer_captured: Cell::new(false),
             cached_sc_bands: Cell::new(None),
             cached_dap_action_rect: Cell::new(None),
-            cached_ai_bands: Cell::new(None),
             cached_tab_bar_zones: Rc::new(RefCell::new(HashMap::new())),
             cached_drop_groups: Rc::new(RefCell::new(Vec::new())),
             cached_drop_tbh: Rc::new(Cell::new(0.0)),
             cached_explorer_metrics: Rc::new(Cell::new((16.0, 8.0))),
+            cached_ai_chat_metrics: Rc::new(Cell::new((16.0, 8.0))),
             debug_toolbar_y_offset: Rc::new(Cell::new(0.0)),
             debug_toolbar_height: Rc::new(Cell::new(0.0)),
             terminal_resize_dragging: false,
@@ -1805,8 +1812,6 @@ impl App {
         let mapped = map_gtk_key_name(key_name.as_str());
         let panel_key = match focus_route {
             render::FocusKeyRoute::SourceControl => sc_mapped,
-            // The AI panel's key table reads GDK spellings directly.
-            render::FocusKeyRoute::Ai => key_name.as_str(),
             _ => mapped,
         };
         let shared = render::dispatch_sidebar_panel_key(
@@ -1823,8 +1828,13 @@ impl App {
         }
         let panel_still_focused: Option<bool> = match shared {
             Some(still_focused) => Some(still_focused),
-            None => match self.dispatch_focus_owner_residual(focus_route, &key_name, unicode, ctrl)
-            {
+            None => match self.dispatch_focus_owner_residual(
+                focus_route,
+                &key_name,
+                unicode,
+                ctrl,
+                ui_event,
+            ) {
                 Some(outcome) => match outcome {
                     Some(still_focused) => Some(still_focused),
                     None => return,
@@ -1926,12 +1936,13 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// The Debug and Explorer halves of the focus-owner dispatch — the two
-    /// arms [`render::dispatch_sidebar_panel_key`] hands back as `None`
+    /// The Debug, Ai and Explorer halves of the focus-owner dispatch — the
+    /// three arms [`render::dispatch_sidebar_panel_key`] hands back as `None`
     /// because they need state this backend owns (a live `Backend` for the
-    /// DAP `SidebarSystem`; the explorer `DrawingArea`).
+    /// DAP `SidebarSystem` and the AI `ChatController`; the explorer
+    /// `DrawingArea`).
     ///
-    /// `None` — not one of these two, keep dispatching.
+    /// `None` — not one of these three, keep dispatching.
     /// `Some(Some(still_focused))` — handled; run the focus epilogue.
     /// `Some(None)` — handled completely; the caller must return.
     fn dispatch_focus_owner_residual(
@@ -1940,6 +1951,7 @@ impl App {
         key_name: &str,
         unicode: Option<char>,
         ctrl: bool,
+        ui_event: &quadraui::UiEvent,
     ) -> Option<Option<bool>> {
         let mapped = map_gtk_key_name(key_name);
         match route {
@@ -1962,6 +1974,34 @@ impl App {
                     engine.dispatch_dap_sidebar_action_key(mapped);
                 }
                 Some(Some(engine.dap_sidebar_has_focus))
+            }
+            render::FocusKeyRoute::Ai => {
+                // Unlike Debug (nav-only), the AI panel's `ChatController`
+                // needs the real, un-round-tripped `UiEvent` — `KeyPressed`
+                // *or* `CharTyped` — so free-form typed text reaches its
+                // input buffer; `gtk_key_name_to_quadraui`'s reconstruction
+                // only covers a handful of named/nav keys (#819).
+                let mut engine = self.engine.borrow_mut();
+                let rect = engine.ai_chat_rect.get();
+                let theme = render::Theme::from_name(&engine.settings.colorscheme);
+                let backend_rc = self.backend.clone();
+                // Re-apply the metrics `render()` painted the panel with —
+                // see `cached_ai_chat_metrics`'s doc for why this can't be
+                // skipped.
+                let metrics = self.cached_ai_chat_metrics.get();
+                {
+                    let mut b = backend_rc.borrow_mut();
+                    b.set_current_line_height(metrics.0);
+                    b.set_current_char_width(metrics.1);
+                }
+                let still_focused = render::route_ai_chat_event(
+                    &mut engine,
+                    ui_event,
+                    rect,
+                    &theme,
+                    &mut **backend_rc.borrow_mut(),
+                );
+                Some(Some(still_focused))
             }
             render::FocusKeyRoute::Explorer => {
                 // Explorer keys used to be routed through a per-DrawingArea
@@ -2728,29 +2768,24 @@ impl App {
                 engine.ext_sidebar_system.borrow().render(backend, q_sb);
             }
             PANEL_AI => {
-                // #730: the last of #592's 14 `ScreenLayout` fields,
-                // and the straggler #670 deferred. Paints through the
-                // same `render::draw_ai_sidebar_panel` builder TUI's
-                // `render_ai_sidebar` calls — `unit_w`/`unit_h` here are
-                // the pixel `char_width`/`line_height` GTK's other
-                // row-based panels (PANEL_GIT, PANEL_DEBUG) already
-                // convert through, unlike TUI's cell-native `1.0, 1.0`.
-                // Bands are cached for `route_ai_sidebar_event` so the
-                // click and paint derivations cannot drift (#544).
-                if let Some(ref ai) = screen.ai_panel {
-                    let bands = render::draw_ai_sidebar_panel(
-                        backend, q_sb, ai, theme, cw as f32, lh as f32,
-                    );
-                    self.cached_ai_bands.set(Some(bands));
-                } else {
-                    self.cached_ai_bands.set(None);
-                }
+                // #819: adopts quadraui's `ChatController` — one shared
+                // `render()` for both backends, like `explorer_tree` and
+                // `ext_sidebar_system` above, replacing the hand-painted
+                // `draw_ai_sidebar_panel`. `ai_chat_rect` is cached on
+                // `Engine` (not here) so `route_ai_chat_event` re-derives
+                // the identical layout `render()` painted (#544/#582/#646).
+                render::populate_ai_chat_controller(engine, theme);
+                engine.ai_chat_rect.set(q_sb);
+                engine.ai_chat.borrow().render(backend, q_sb);
+                // `cached_explorer_metrics`'s drift guard, ported: `backend`'s
+                // "current" line_height/char_width are mutable and can be
+                // overwritten by whatever paints next this frame or the
+                // next, so capture what `render()` actually used here for
+                // `route_ai_chat_event` to re-apply before `handle()` (#819).
+                self.cached_ai_chat_metrics
+                    .set((backend.line_height() as f64, backend.char_width() as f64));
             }
-            _ => {
-                // Unknown panel id: nothing painted, nothing to route a
-                // click to.
-                self.cached_ai_bands.set(None);
-            }
+            _ => {}
         }
 
         // The sidebar-item hover popup used to be composed here,
@@ -5394,7 +5429,7 @@ impl App {
                 engine.handle_ext_sidebar_ui_event(event.clone());
                 true
             }
-            render::SidebarOwner::Ai => self.route_ai_sidebar_event(pos, starts_interaction),
+            render::SidebarOwner::Ai => self.route_ai_sidebar_event(event, starts_interaction),
             // Unknown panel id: nothing was painted, so there is nothing
             // for a click to hit — let it fall through rather than
             // swallow it.
@@ -5482,25 +5517,47 @@ impl App {
         true
     }
 
-    /// Sidebar routing for the AI panel (#544/#730/#754).
+    /// Sidebar routing for the AI panel (#544/#754/#819).
     ///
-    /// `render_content` caches the header/messages/input bands in
-    /// `cached_ai_bands` at paint time (`render::draw_ai_sidebar_panel`'s
-    /// return value) — resolving a press against that means the click
-    /// router can never derive a different layout than the one actually on
-    /// screen (#544/#582/#646). The dispatch itself is
-    /// [`render::route_ai_sidebar_click`] — TUI paints this same panel but
-    /// has never cached its bands for click routing, so it does not call
-    /// this yet; see that function's doc comment. Consumes the press
-    /// unconditionally like every other panel arm in
-    /// `try_route_sidebar_mouse_event` — a click on empty panel padding
-    /// still belongs to this panel, not the editor underneath it.
-    fn route_ai_sidebar_event(&mut self, pos: quadraui::Point, starts_interaction: bool) -> bool {
-        let Some(bands) = self.cached_ai_bands.get() else {
-            return false;
-        };
+    /// `render_content` caches the panel rect in `Engine::ai_chat_rect` at
+    /// paint time — resolving a press against that means the click router
+    /// can never derive a different layout than the one actually on screen
+    /// (#544/#582/#646). The dispatch itself is [`render::route_ai_chat_event`],
+    /// which needs a live `Backend` (like [`Self::route_debug_sidebar_event`])
+    /// for `ChatController::handle`'s own layout/hit-test math. Consumes the
+    /// press unconditionally like every other panel arm in
+    /// `try_route_sidebar_mouse_event` — a click on empty panel padding still
+    /// belongs to this panel, not the editor underneath it.
+    fn route_ai_sidebar_event(
+        &mut self,
+        event: &quadraui::UiEvent,
+        starts_interaction: bool,
+    ) -> bool {
         let mut engine = self.engine.borrow_mut();
-        render::route_ai_sidebar_click(&mut engine, pos, &bands, starts_interaction);
+        let rect = engine.ai_chat_rect.get();
+        if rect.width <= 0.0 {
+            return false;
+        }
+        if starts_interaction {
+            engine.ai_has_focus = true;
+        }
+        let theme = render::Theme::from_name(&engine.settings.colorscheme);
+        let backend_rc = self.backend.clone();
+        // Re-apply the metrics `render()` painted the panel with — see
+        // `cached_ai_chat_metrics`'s doc for why this can't be skipped.
+        let metrics = self.cached_ai_chat_metrics.get();
+        {
+            let mut b = backend_rc.borrow_mut();
+            b.set_current_line_height(metrics.0);
+            b.set_current_char_width(metrics.1);
+        }
+        render::route_ai_chat_event(
+            &mut engine,
+            event,
+            rect,
+            &theme,
+            &mut **backend_rc.borrow_mut(),
+        );
         true
     }
 

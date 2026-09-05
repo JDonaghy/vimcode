@@ -1098,13 +1098,13 @@ pub(super) fn render_ext_sidebar(
 
 /// Render the AI assistant sidebar panel.
 ///
-/// #730: delegates its entire paint to the shared
-/// [`render::draw_ai_sidebar_panel`], the builder GTK's `render_content`
-/// `PANEL_AI` arm now also calls — one implementation instead of two, the
-/// same convergence #670's other four panel surfaces already went through.
-/// `unit_w`/`unit_h` are `1.0, 1.0` here since `area` is already in
-/// character cells (TUI's native coordinate space); GTK passes its pixel
-/// `char_width`/`line_height` instead.
+/// #819: delegates its entire paint to the shared `engine.ai_chat`
+/// (`quadraui::ChatController`), the same controller GTK's `render_content`
+/// `PANEL_AI` arm now also renders — one implementation instead of two,
+/// mirroring `render_explorer_sidebar_content`'s `explorer_tree` pattern.
+/// `area` is already in character cells (TUI's native coordinate space);
+/// `ChatController` reads `Backend::line_height`/`char_width` itself
+/// (`1.0`/`1.0` on TUI) rather than taking them as parameters.
 pub(super) fn render_ai_sidebar(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -1115,18 +1115,16 @@ pub(super) fn render_ai_sidebar(
         return;
     }
 
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
-    let Some(ref ai) = screen.ai_panel else {
-        return;
-    };
-
     let q_area = quadraui::Rect::new(
         area.x as f32,
         area.y as f32,
         area.width as f32,
         area.height as f32,
     );
-    render::draw_ai_sidebar_panel(backend, q_area, ai, theme, 1.0, 1.0);
+    render::populate_ai_chat_controller(engine, theme);
+    engine.ai_chat_rect.set(q_area);
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    engine.ai_chat.borrow().render(backend, q_area);
 }
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────

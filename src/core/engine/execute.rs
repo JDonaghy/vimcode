@@ -878,8 +878,7 @@ impl Engine {
         // :AI <message> — send a message to the AI assistant
         if let Some(msg) = cmd.strip_prefix("AI ").map(|s| s.trim()) {
             if !msg.is_empty() {
-                self.ai_input = msg.to_string();
-                self.ai_send_message();
+                self.ai_send_message(msg.to_string());
                 self.ai_has_focus = true;
             }
             return EngineAction::None;

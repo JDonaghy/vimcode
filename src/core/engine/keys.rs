@@ -9108,12 +9108,9 @@ impl Engine {
             return;
         }
 
-        if self.ai_has_focus && self.ai_input_active {
-            for c in first_line.chars() {
-                if !c.is_control() {
-                    self.ai_input.push(c);
-                }
-            }
+        if self.ai_has_focus {
+            let filtered: String = first_line.chars().filter(|c| !c.is_control()).collect();
+            self.ai_chat.borrow_mut().input_insert_str(&filtered);
             return;
         }
 
