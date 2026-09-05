@@ -28703,3 +28703,27 @@ fn test_saveas_with_explicit_arg_still_saves_directly() {
     assert!(target.exists());
     let _ = std::fs::remove_file(&target);
 }
+
+/// #804: `handle_insert_key`'s catch-all (`_ => { ... } else if ctrl { }`)
+/// exists precisely so an unrecognised ctrl combo can never fall through to
+/// the character-insert branch and type the literal letter — proven here
+/// with an arbitrary combo (`<C-z>`) the function has no dedicated arm for,
+/// not one of the four named in the issue. If this regresses, so does every
+/// future unhandled ctrl combo, silently.
+#[test]
+fn insert_mode_unrecognized_ctrl_combo_inserts_nothing() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab");
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'z');
+    assert_eq!(
+        engine.buffer().to_string(),
+        "ab",
+        "an unrecognised ctrl combo must not insert its letter"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "an unrecognised ctrl combo must not move the cursor either"
+    );
+}

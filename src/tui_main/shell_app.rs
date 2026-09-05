@@ -9170,6 +9170,41 @@ mod tests {
         );
     }
 
+    /// #804: in a real terminal, crossterm delivers `<C-h>` as ctrl+'h', not
+    /// as a `BackSpace` key — `Engine::handle_insert_key` used to have no
+    /// arm for that and fell through to its catch-all character-insert
+    /// branch, typing a literal "h" instead of backspacing. Black-box per
+    /// CLAUDE.md: assert on the *rendered* line, not on `Engine` state —
+    /// a passing assertion on `engine.buffer()` would not have caught the
+    /// original bug if the TUI's own key translation were what was broken
+    /// instead (it wasn't, but this test doesn't get to assume that).
+    #[test]
+    fn ctrl_h_backspaces_in_insert_mode_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        let marker = "ZQXW804MARK";
+        app.engine.buffer_mut().insert(0, marker);
+        app.engine.mode = crate::core::Mode::Insert;
+        app.engine.view_mut().cursor.col = marker.chars().count();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('h'),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(marker) && screen.contains(&marker[..marker.len() - 1]),
+            "Ctrl+h in insert mode must backspace (drop the trailing 'K'), \
+             not type a literal 'h' after the marker; screen:\n{screen}"
+        );
+    }
+
     /// #760 / #734 slice 5: Ctrl+Shift+V used to hand-roll its own paste path
     /// (read the clipboard, `load_clipboard_for_paste`, then either replay
     /// `p` or splice characters into insert mode) instead of calling

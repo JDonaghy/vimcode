@@ -3157,8 +3157,24 @@ pub struct Engine {
     pub insert_ctrl_o_active: bool,
     /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
     pub insert_enter_col: usize,
+    /// Line index of a freshly created, still-untouched autoindent-only line
+    /// (`:h 'autoindent'`), or `None`. Set when `<CR>`/`o`/`O` create a line
+    /// whose only content is the copied indent; cleared by any key other
+    /// than `<BS>`/`<C-d>` (which the docs specifically exempt). Consulted by
+    /// `<CR>`/`<Esc>` to decide whether to delete that indent again (#804).
+    pub insert_indent_only_line: Option<usize>,
     /// When true, next keypress in Insert mode is inserted literally (Ctrl-V).
     pub insert_ctrl_v_pending: bool,
+    /// Active `<C-v>{digits}` numeric character entry (`:h i_CTRL-V_digit`):
+    /// `(base, max_digits, digits_so_far, accumulated_value)`. `None` when no
+    /// numeric sequence is in progress.
+    pub insert_ctrl_v_numeric: Option<(u32, u32, u32, u32)>,
+    /// "Want" column for consecutive `<Down>`/`<Up>` in Insert mode: a run of
+    /// vertical moves remembers the column the run started at, so stepping
+    /// through a short intermediate line and back onto a long one restores
+    /// the original column instead of sticking to the short line's length
+    /// (#804). Cleared by any other key.
+    pub insert_vertical_want_col: Option<usize>,
     /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
     /// On Escape from Insert, apply insert_text_buffer to all block lines.
     /// (start_line, end_line, col, is_append, virtual_end).
@@ -3168,6 +3184,10 @@ pub struct Engine {
     /// Count for o/O repeat: when >1, Escape from insert repeats the typed text
     /// on additional new lines (Vim behavior for 3oXX<Esc>).
     pub insert_open_count: usize,
+    /// The autoindent `o`/`O` copied onto its new line, so a count-repeat
+    /// (`2ox<Esc>`) can prepend the same indent to each additional repeated
+    /// line instead of just the typed text (#804).
+    pub insert_open_indent: String,
     /// Count for i/a/I/A repeat: when >1, Escape from insert repeats the
     /// typed text in place (Vim behavior for 3ihello<Esc>).
     pub insert_repeat_count: usize,
@@ -3877,9 +3897,13 @@ impl Engine {
             insert_ctrl_g_pending: false,
             insert_ctrl_o_active: false,
             insert_enter_col: 0,
+            insert_indent_only_line: None,
             insert_ctrl_v_pending: false,
+            insert_ctrl_v_numeric: None,
+            insert_vertical_want_col: None,
             visual_block_insert_info: None,
             insert_open_count: 0,
+            insert_open_indent: String::new(),
             insert_repeat_count: 0,
             force_motion_mode: None,
             extension_state: ExtensionState::load(),
