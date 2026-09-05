@@ -5745,37 +5745,18 @@ impl App {
 
     /// User triggered quit; exit straight away when nothing is unsaved,
     /// otherwise raise the "unsaved changes" confirmation dialog.
+    ///
+    /// #823 item 4: the dialog body used to be restated here (byte-identical
+    /// to `Engine::show_quit_confirm`, `core/engine/panels.rs`) instead of
+    /// calling it — same `DialogButton` literals, just copy-pasted. TUI
+    /// already calls the engine method directly (`tui_main/shell_app.rs`,
+    /// `tui_main/mouse.rs`).
     fn show_quit_confirm(&mut self) {
         if !self.engine.borrow().has_any_unsaved() {
             self.save_session_and_exit();
             return;
         }
-        use crate::core::engine::DialogButton;
-        self.engine.borrow_mut().show_dialog(
-            "quit_unsaved",
-            "Unsaved Changes",
-            vec![
-                "You have unsaved changes.".to_string(),
-                "Do you want to save before quitting?".to_string(),
-            ],
-            vec![
-                DialogButton {
-                    label: "Save All & Quit".into(),
-                    hotkey: 's',
-                    action: "save_quit".into(),
-                },
-                DialogButton {
-                    label: "Quit Without Saving".into(),
-                    hotkey: 'q',
-                    action: "discard_quit".into(),
-                },
-                DialogButton {
-                    label: "Cancel".into(),
-                    hotkey: '\0',
-                    action: "cancel".into(),
-                },
-            ],
-        );
+        self.engine.borrow_mut().show_quit_confirm();
         self.draw_needed.set(true);
     }
 
@@ -5938,30 +5919,12 @@ impl App {
     }
 
     /// User clicked ✕ on a tab with unsaved changes — ask what to do.
+    ///
+    /// #823 item 4: was a byte-identical restatement of
+    /// `Engine::show_close_tab_confirm` (`core/engine/panels.rs`) instead of
+    /// calling it.
     fn show_close_tab_confirm(&mut self) {
-        use crate::core::engine::DialogButton;
-        self.engine.borrow_mut().show_dialog(
-            "close_tab_confirm",
-            "Unsaved Changes",
-            vec!["This file has unsaved changes.".to_string()],
-            vec![
-                DialogButton {
-                    label: "Save & Close".into(),
-                    hotkey: 's',
-                    action: "save_close".into(),
-                },
-                DialogButton {
-                    label: "Discard & Close".into(),
-                    hotkey: 'd',
-                    action: "discard".into(),
-                },
-                DialogButton {
-                    label: "Cancel".into(),
-                    hotkey: '\0',
-                    action: "cancel".into(),
-                },
-            ],
-        );
+        self.engine.borrow_mut().show_close_tab_confirm();
         self.draw_needed.set(true);
     }
 
