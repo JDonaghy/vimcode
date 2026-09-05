@@ -1131,12 +1131,16 @@ fn test_paragraph_backward_at_bof() {
 
 #[test]
 fn test_paragraph_whitespace_lines() {
+    // #805: Vim's `}`/`{` require a *completely* empty line to count as a
+    // paragraph boundary — a whitespace-only line does not qualify, so `}`
+    // skips over it and (with no real blank line in the buffer) lands on
+    // the last line instead.
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "text1\n  \t  \ntext2");
 
     press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 1); // Whitespace line
-    assert_eq!(engine.view().cursor.col, 5); // End of whitespace line
+    assert_eq!(engine.view().cursor.line, 2); // last line — no blank line exists
+    assert_eq!(engine.view().cursor.col, 0);
 }
 
 #[test]
@@ -1172,17 +1176,18 @@ fn test_paragraph_backward_multiple() {
 
 #[test]
 fn test_paragraph_consecutive_empty_lines() {
+    // #805: a run of consecutive blank lines is a single paragraph
+    // boundary in Vim, not one stop per blank line — landing inside the
+    // run and pressing `}` again skips the rest of the run in one jump
+    // (here, straight to the last line, since there's no further boundary).
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "text\n\n\n\nmore");
 
     press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 1); // First empty
+    assert_eq!(engine.view().cursor.line, 1); // first line of the blank run
 
     press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 2); // Second empty
-
-    press_char(&mut engine, '}');
-    assert_eq!(engine.view().cursor.line, 3); // Third empty
+    assert_eq!(engine.view().cursor.line, 4); // last line — no further boundary
 }
 
 #[test]
@@ -2836,6 +2841,11 @@ fn test_count_paragraph_motions() {
 
 #[test]
 fn test_count_scroll_commands() {
+    // #805: a count on <C-d>/<C-u> SETS Vim's sticky 'scroll' value (it
+    // does not multiply the half-page amount), and <C-f>/<C-b> keep a
+    // 2-line overlap between pages — both corrected by this issue, so the
+    // expected line numbers below no longer match the old
+    // "count * half/full page" arithmetic this test asserted before.
     let mut engine = Engine::new();
     // Create a buffer with 100 lines
     let mut text = String::new();
@@ -2846,26 +2856,28 @@ fn test_count_scroll_commands() {
     engine.update_syntax();
     engine.set_viewport_lines(20); // Simulate 20 lines visible
 
-    // Test 2 Ctrl-D (2 half-pages down = 20 lines)
+    // 2<C-d>: sets 'scroll' = 2, moves 2 lines down.
     press_char(&mut engine, '2');
     press_ctrl(&mut engine, 'd');
-    assert_eq!(engine.view().cursor.line, 20);
+    assert_eq!(engine.view().cursor.line, 2);
 
-    // Test 1 Ctrl-U (1 half-page up = 10 lines)
+    // 1<C-u>: sets 'scroll' = 1 (replacing 2), moves 1 line up.
     press_char(&mut engine, '1');
     press_ctrl(&mut engine, 'u');
-    assert_eq!(engine.view().cursor.line, 10);
+    assert_eq!(engine.view().cursor.line, 1);
 
-    // Test 3 Ctrl-F (3 full pages down = 60 lines) — requires page_down mode
+    // 3<C-f>: 3 full pages down, each with a 2-line overlap
+    // (18 lines/page: 1 -> 19 -> 37 -> 55) — requires page_down mode.
     engine.settings.ctrl_f_action = Some("page_down".to_string());
     press_char(&mut engine, '3');
     press_ctrl(&mut engine, 'f');
-    assert_eq!(engine.view().cursor.line, 70);
+    assert_eq!(engine.view().cursor.line, 55);
 
-    // Test 2 Ctrl-B (2 full pages up = 40 lines)
+    // 2<C-b>: 2 full pages up, mirroring <C-f> (55 -> 37 -> 19, then the
+    // window's bottom line at that scroll_top is 19 + 20 - 1 = 38).
     press_char(&mut engine, '2');
     press_ctrl(&mut engine, 'b');
-    assert_eq!(engine.view().cursor.line, 30);
+    assert_eq!(engine.view().cursor.line, 38);
 }
 
 #[test]

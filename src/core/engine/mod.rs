@@ -2245,6 +2245,11 @@ pub(crate) struct JumpEntry {
     pub window_id: WindowId,
 }
 
+/// Sentinel `curswant` value meaning "always the end of the line", set by
+/// `$` so vertical motions keep tracking the last column through lines of
+/// varying length instead of the (shorter) column `$` happened to land on.
+pub(crate) const CURSWANT_EOL: usize = usize::MAX;
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -2364,6 +2369,26 @@ pub struct Engine {
     /// visual mode variant so the selection remains visible and `'<,'>` range
     /// resolves correctly.  Cleared on command execution or Escape.
     pub command_from_visual: Option<Mode>,
+
+    // --- Cursor column memory (curswant) ---
+    /// Vim's `curswant`: the column that Normal-mode vertical motions
+    /// (`j`/`k`/`gj`/`gk`) try to return to after being clamped onto a
+    /// shorter intervening line. `None` means "not tracked yet — derive it
+    /// from the actual cursor column the first time a vertical motion needs
+    /// it". `Some(CURSWANT_EOL)` means "always the end of the line",
+    /// set by `$` (mirrors `visual_dollar` above, but for Normal mode).
+    ///
+    /// Reset to `None` at the top of `handle_key` for any key that is not
+    /// itself a curswant-preserving vertical motion or a key that merely
+    /// builds toward one (count digits, the `g` prefix) — see
+    /// `dispatch_resets_curswant` for the single choke point that decides.
+    pub(crate) curswant: Option<usize>,
+
+    /// Vim's `'scroll'` option: the line count `<C-d>`/`<C-u>` use. `None`
+    /// means "not set yet — use half the window height". Set (replaced, not
+    /// multiplied) whenever `<C-d>`/`<C-u>` is given an explicit count, and
+    /// reused by later counts until then (#805).
+    pub(crate) scroll_value: Option<usize>,
 
     // --- Count state ---
     /// Accumulated count for commands (e.g., 5j, 3dd). None means no count entered yet.
@@ -3597,6 +3622,8 @@ impl Engine {
             visual_anchor: None,
             visual_dollar: false,
             command_from_visual: None,
+            curswant: None,
+            scroll_value: None,
             count: None,
             operator_count: None,
             last_find: None,

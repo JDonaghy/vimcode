@@ -5,6 +5,58 @@ impl Engine {
     // Key handling
     // =======================================================================
 
+    /// #805: decide whether `curswant` (the Normal-mode vertical-motion
+    /// desired column tracked in `self.curswant`) survives this keystroke.
+    ///
+    /// Must run before `self.pending_key` / `self.pending_operator` /
+    /// `self.pending_find_operator` / `self.pending_text_object` are consumed
+    /// by dispatch, since the classification reads them as they stood when
+    /// this keystroke arrived.
+    ///
+    /// Preserved (left untouched) for:
+    ///  - digits accumulating a count — they don't move the cursor at all;
+    ///  - `j` / `k` themselves, and `g` resolving to `gj` / `gk` — these are
+    ///    exactly the motions that read and re-propagate `curswant`
+    ///    (see `Engine::curswant` / `Engine::apply_curswant`).
+    ///
+    /// Reset to `None` for everything else, including `$` — its own handler
+    /// sets `Some(CURSWANT_EOL)` immediately afterward, so the reset here
+    /// just guarantees a clean slate for keys that don't.
+    fn update_curswant_for_key(&mut self, unicode: Option<char>, ctrl: bool) {
+        if !matches!(
+            self.mode,
+            Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+        ) {
+            self.curswant = None;
+            return;
+        }
+        if self.pending_operator.is_some()
+            || self.pending_find_operator.is_some()
+            || self.pending_text_object.is_some()
+        {
+            self.curswant = None;
+            return;
+        }
+        if let Some(pk) = self.pending_key {
+            if pk == 'g' && matches!(unicode, Some('j') | Some('k')) {
+                return; // gj / gk continue a vertical chain like j / k do.
+            }
+            self.curswant = None;
+            return;
+        }
+        if !ctrl {
+            if let Some(ch) = unicode {
+                if matches!(ch, 'j' | 'k') {
+                    return;
+                }
+                if ch.is_ascii_digit() && (ch != '0' || self.count.is_some()) {
+                    return; // count digit in progress; cursor hasn't moved
+                }
+            }
+        }
+        self.curswant = None;
+    }
+
     /// Process a key event and return an action the UI should perform.
     pub fn handle_key(
         &mut self,
@@ -12,6 +64,11 @@ impl Engine {
         unicode: Option<char>,
         ctrl: bool,
     ) -> EngineAction {
+        // #805: decide whether this keystroke should drop the remembered
+        // `curswant` (Normal-mode vertical-motion desired column) before any
+        // of the pending-state fields it inspects get consumed below.
+        self.update_curswant_for_key(unicode, ctrl);
+
         // Spell suggestion selection intercepts all keys.
         if self.spell_suggestions.is_some() {
             self.handle_spell_suggestion_key(key_name, unicode);
@@ -767,26 +824,25 @@ impl Engine {
         if ctrl {
             match key_name {
                 "d" => {
-                    // Half-page down (fold-aware)
-                    let count = self.take_count();
-                    let half = self.viewport_lines() / 2;
-                    let scroll_amount = half * count;
-                    let max_line = self.buffer().len_lines().saturating_sub(1);
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    // <C-d>: half-page down. An explicit count SETS the
+                    // sticky 'scroll' value (replacing, not multiplying, any
+                    // previous one); a bare <C-d> reuses it (#805).
+                    let explicit = self.count.take();
+                    if let Some(n) = explicit {
+                        self.scroll_value = Some(n.max(1));
+                    }
+                    let amount = self.effective_scroll() as isize;
+                    self.scroll_and_move_by(amount);
                     return EngineAction::None;
                 }
                 "u" => {
-                    // Ctrl-U: Half-page up (fold-aware)
-                    let count = self.take_count();
-                    let half = self.viewport_lines() / 2;
-                    let scroll_amount = half * count;
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    // <C-u>: half-page up, mirrors <C-d>.
+                    let explicit = self.count.take();
+                    if let Some(n) = explicit {
+                        self.scroll_value = Some(n.max(1));
+                    }
+                    let amount = self.effective_scroll() as isize;
+                    self.scroll_and_move_by(-amount);
                     return EngineAction::None;
                 }
                 "r" => {
@@ -801,26 +857,19 @@ impl Engine {
                         self.open_find_replace();
                         return EngineAction::None;
                     }
-                    // Full page down (fold-aware)
+                    // <C-f>: full page(s) forward, 2-line overlap (#805).
                     let count = self.take_count();
-                    let viewport = self.viewport_lines();
-                    let scroll_amount = viewport * count;
-                    let max_line = self.buffer().len_lines().saturating_sub(1);
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().next_visible_line(cur, scroll_amount, max_line);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    for _ in 0..count {
+                        self.page_down();
+                    }
                     return EngineAction::None;
                 }
                 "b" => {
-                    // Full page up (fold-aware)
+                    // <C-b>: full page(s) backward, mirrors <C-f>.
                     let count = self.take_count();
-                    let viewport = self.viewport_lines();
-                    let scroll_amount = viewport * count;
-                    let cur = self.view().cursor.line;
-                    let new_line = self.view().prev_visible_line(cur, scroll_amount);
-                    self.view_mut().cursor.line = new_line;
-                    self.clamp_cursor_col();
+                    for _ in 0..count {
+                        self.page_up();
+                    }
                     return EngineAction::None;
                 }
                 "w" => {
@@ -876,28 +925,17 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "e" => {
-                    // Ctrl-E: scroll down one line (fold-aware, cursor stays)
+                    // Ctrl-E: scroll down one line (fold-aware). The cursor
+                    // only moves if the scroll pushed it out of view — and
+                    // then only as far as 'scrolloff' requires (#805).
                     let count = self.take_count();
-                    self.scroll_down_visible(count);
-                    // Keep cursor visible
-                    let viewport = self.viewport_lines();
-                    if viewport > 0 && self.view().cursor.line < self.view().scroll_top {
-                        self.view_mut().cursor.line = self.view().scroll_top;
-                        self.clamp_cursor_col();
-                    }
+                    self.scroll_viewport_with_cursor(1, count);
                     return EngineAction::None;
                 }
                 "y" => {
-                    // Ctrl-Y: scroll up one line (fold-aware, cursor stays)
+                    // Ctrl-Y: scroll up one line (fold-aware); mirrors <C-e>.
                     let count = self.take_count();
-                    self.scroll_up_visible(count);
-                    // Keep cursor visible
-                    let viewport = self.viewport_lines();
-                    if viewport > 0 && self.view().cursor.line >= self.view().scroll_top + viewport
-                    {
-                        self.view_mut().cursor.line = self.view().scroll_top + viewport - 1;
-                        self.clamp_cursor_col();
-                    }
+                    self.scroll_viewport_with_cursor(-1, count);
                     return EngineAction::None;
                 }
                 "a" => {
@@ -1191,6 +1229,7 @@ impl Engine {
                 let line = (self.view().cursor.line + count - 1).min(max_line);
                 self.view_mut().cursor.line = line;
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
+                self.curswant = Some(CURSWANT_EOL);
             }
             Some('x') => {
                 let count = self.take_count();
@@ -1298,36 +1337,45 @@ impl Engine {
                 }
             }
             Some('H') => {
-                // H: jump to top of visible screen
+                // H: jump to line [count] from top of visible screen, kept
+                // at least 'scrolloff' lines from the top (#805).
                 let count = self.take_count().max(1);
                 let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines();
+                let viewport = self.viewport_lines().max(1);
                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                let target = (scroll_top + count - 1).min(max_line);
-                let target = target.min(scroll_top + viewport.saturating_sub(1));
+                let scrolloff = self.settings.scrolloff;
+                let offset = count.saturating_sub(1).max(scrolloff);
+                let target = (scroll_top + offset)
+                    .min(scroll_top + viewport.saturating_sub(1))
+                    .min(max_line);
                 self.push_jump_location();
                 self.view_mut().cursor.line = target;
                 self.clamp_cursor_col();
             }
             Some('M') => {
-                // M: jump to middle of visible screen
-                let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines();
-                let max_line = self.buffer().len_lines().saturating_sub(1);
-                let mid = scroll_top + viewport / 2;
+                // M: jump to the middle of the lines actually visible.
+                // Unlike H/L, M ignores 'scrolloff' (#805).
+                let mid = self.middle_visible_line();
                 self.push_jump_location();
-                self.view_mut().cursor.line = mid.min(max_line);
+                self.view_mut().cursor.line = mid;
                 self.clamp_cursor_col();
             }
             Some('L') => {
-                // L: jump to bottom of visible screen
+                // L: jump to line [count] from bottom of visible screen,
+                // kept at least 'scrolloff' lines from the bottom (#805).
                 let count = self.take_count().max(1);
                 let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines();
+                let viewport = self.viewport_lines().max(1);
                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                let target_from_bottom = scroll_top + viewport.saturating_sub(count);
+                let scrolloff = self.settings.scrolloff;
+                let window_bottom = scroll_top + viewport - 1;
+                let offset = count.saturating_sub(1).max(scrolloff);
+                let target = window_bottom
+                    .saturating_sub(offset)
+                    .max(scroll_top)
+                    .min(max_line);
                 self.push_jump_location();
-                self.view_mut().cursor.line = target_from_bottom.min(max_line);
+                self.view_mut().cursor.line = target;
                 self.clamp_cursor_col();
             }
             Some('R') => {
@@ -3790,9 +3838,7 @@ impl Engine {
                 // dM: delete from current line to middle of screen (linewise)
                 let _ = self.take_count();
                 let current_line = self.view().cursor.line;
-                let viewport_lines = self.view().viewport_lines.max(1);
-                let mid = self.view().scroll_top + viewport_lines / 2;
-                let mid = mid.min(self.buffer().len_lines().saturating_sub(1));
+                let mid = self.middle_visible_line();
                 let (s, e) = if mid <= current_line {
                     (mid, current_line)
                 } else {

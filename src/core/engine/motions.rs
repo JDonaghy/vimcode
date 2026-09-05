@@ -28,9 +28,7 @@ impl Engine {
             }
         }
 
-        while pos < total_chars && self.buffer().content.char(pos).is_whitespace() {
-            pos += 1;
-        }
+        pos = self.skip_separators_forward_word_aware(pos);
 
         if pos >= total_chars {
             pos = total_chars.saturating_sub(1);
@@ -40,6 +38,60 @@ impl Engine {
         let line_start = self.buffer().line_to_char(new_line);
         self.view_mut().cursor.line = new_line;
         self.view_mut().cursor.col = pos - line_start;
+    }
+
+    /// Skip a run of separator whitespace forward from `pos`, treating a
+    /// completely blank line as a word in its own right (Vim: "An empty
+    /// line is also considered to be a word") rather than something to skip
+    /// through. Returns the position of the next non-blank word start, or
+    /// the position of a blank line's own (only) char if one is crossed, or
+    /// `len_chars()` if the buffer ends first.
+    fn skip_separators_forward_word_aware(&self, mut pos: usize) -> usize {
+        let total = self.buffer().len_chars();
+        loop {
+            if pos >= total {
+                return pos;
+            }
+            let ch = self.buffer().content.char(pos);
+            if ch == '\n' {
+                let line_of_nl = self.buffer().content.char_to_line(pos);
+                let next_line = line_of_nl + 1;
+                if next_line >= self.buffer().len_lines() {
+                    return total;
+                }
+                pos = self.buffer().line_to_char(next_line);
+                if pos >= total || self.is_line_blank_strict(next_line) {
+                    return pos;
+                }
+            } else if ch.is_whitespace() {
+                pos += 1;
+            } else {
+                return pos;
+            }
+        }
+    }
+
+    /// Mirror of `skip_separators_forward_word_aware` for backward motions
+    /// (`b`, `ge`): skip whitespace backward from `pos`, stopping as soon as
+    /// landing on a blank line's own char (that blank line is itself the
+    /// previous word) or at the start of the buffer.
+    fn skip_separators_backward_word_aware(&self, mut pos: usize) -> usize {
+        loop {
+            let ch = self.buffer().content.char(pos);
+            if !ch.is_whitespace() {
+                return pos;
+            }
+            if ch == '\n' {
+                let ln = self.buffer().content.char_to_line(pos);
+                if self.is_line_blank_strict(ln) {
+                    return pos;
+                }
+            }
+            if pos == 0 {
+                return 0;
+            }
+            pos -= 1;
+        }
     }
 
     pub(crate) fn move_word_backward(&mut self) {
@@ -52,12 +104,13 @@ impl Engine {
         }
         pos -= 1;
 
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
-        }
+        pos = self.skip_separators_backward_word_aware(pos);
 
         let ch = self.buffer().content.char(pos);
-        if is_word_char(ch) {
+        if ch == '\n' {
+            // Landed exactly on a blank line, which Vim counts as its own
+            // word — nothing more to extend backward into.
+        } else if is_word_char(ch) {
             while pos > 0 && is_word_char(self.buffer().content.char(pos - 1)) {
                 pos -= 1;
             }
@@ -181,14 +234,19 @@ impl Engine {
         // Step 2: Move back one char (from start of current word or from whitespace)
         pos -= 1;
 
-        // Step 3: Skip whitespace backward
-        while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
-            pos -= 1;
-        }
+        // Step 3: Skip whitespace backward, treating a blank line as a word
+        // in its own right (so `ge` can land on one) rather than skipping
+        // through it.
+        pos = self.skip_separators_backward_word_aware(pos);
 
-        // If at pos 0 and it's whitespace, no previous word exists
-        if pos == 0 && self.buffer().content.char(pos).is_whitespace() {
-            return;
+        // If we stopped on whitespace that ISN'T a blank line, we ran off
+        // the start of the buffer without finding a previous word.
+        let ch = self.buffer().content.char(pos);
+        if ch.is_whitespace() {
+            let ln = self.buffer().content.char_to_line(pos);
+            if !self.is_line_blank_strict(ln) {
+                return;
+            }
         }
 
         // pos is now at the last char of the previous word (the target)
@@ -432,9 +490,16 @@ impl Engine {
             return;
         }
 
-        // Step back to skip current whitespace / sentence start
+        // Step back to skip current whitespace / sentence start. A blank
+        // line is itself a paragraph/sentence boundary (`word:( para`), so
+        // stop there instead of skipping through it.
         pos = pos.saturating_sub(1);
         while pos > 0 && self.buffer().content.char(pos).is_whitespace() {
+            if self.buffer().content.char(pos) == '\n'
+                && self.is_line_blank_strict(self.buffer().content.char_to_line(pos))
+            {
+                break;
+            }
             pos -= 1;
         }
 
@@ -1406,46 +1471,71 @@ impl Engine {
 
     pub(crate) fn move_paragraph_forward(&mut self) {
         let total_lines = self.buffer().len_lines();
+        let max_line = total_lines.saturating_sub(1);
         let mut line = self.view().cursor.line;
 
-        // Move forward at least one line to find the next empty line
-        if line + 1 >= total_lines {
-            // Already at or past last line, don't move
+        // `}` always moves at least one line, and never moves past the last
+        // line of the buffer.
+        if line >= max_line {
             return;
         }
-        line += 1;
 
-        // Search for the next empty line
-        while line < total_lines && !self.is_line_empty(line) {
+        // A run of consecutive blank lines is a single paragraph boundary:
+        // if we're starting inside one, skip past the whole run first so a
+        // second `}` doesn't stop again one line later within the same run.
+        if self.is_line_blank_strict(line) {
+            while line < max_line && self.is_line_blank_strict(line) {
+                line += 1;
+            }
+        }
+        // Now advance to the next blank line (the next paragraph boundary),
+        // or the last line of the buffer if there isn't one.
+        while line < max_line && !self.is_line_blank_strict(line) {
             line += 1;
         }
 
-        // Move to the empty line we found, or the last line if we hit EOF
-        if line >= total_lines {
-            line = total_lines.saturating_sub(1);
-        }
         self.view_mut().cursor.line = line;
-        self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+        self.view_mut().cursor.col = 0;
     }
 
     pub(crate) fn move_paragraph_backward(&mut self) {
         let mut line = self.view().cursor.line;
 
-        // Already at top, don't move
+        // `{` always moves at least one line, and never moves past line 0.
         if line == 0 {
             return;
         }
-        line -= 1;
 
-        // Search backward for an empty line
-        while line > 0 && !self.is_line_empty(line) {
+        // Mirror of the forward run-skipping: starting inside a blank-line
+        // run skips the whole run before searching for the previous one.
+        if self.is_line_blank_strict(line) {
+            while line > 0 && self.is_line_blank_strict(line) {
+                line -= 1;
+            }
+        }
+        while line > 0 && !self.is_line_blank_strict(line) {
             line -= 1;
         }
 
-        // Move to the found empty line (or line 0 if that's where we stopped)
         self.view_mut().cursor.line = line;
-        // Move to end of line (column 0 for empty lines)
-        self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+        self.view_mut().cursor.col = 0;
+    }
+
+    /// Returns true if the line has no characters at all (besides its own
+    /// line terminator). Unlike `is_line_empty`, a whitespace-only line
+    /// (e.g. `"   "`) is NOT considered blank here — this is the stricter
+    /// notion Vim's `{`/`}` paragraph motions and blank-line word/sentence
+    /// boundaries use (:help paragraph: a set of consecutive blank lines
+    /// separates paragraphs, and whitespace-only doesn't count).
+    pub(crate) fn is_line_blank_strict(&self, line: usize) -> bool {
+        if line >= self.buffer().len_lines() {
+            return false;
+        }
+        let len = self.buffer().line_len_chars(line);
+        if len == 0 {
+            return true;
+        }
+        len == 1 && self.buffer().content.line(line).char(0) == '\n'
     }
 
     /// Returns true if the line is empty or contains only whitespace.
@@ -1633,6 +1723,14 @@ impl Engine {
             }
         };
 
+        // Vim's built-in `%` (no matchit plugin) treats a bracket as not a
+        // real bracket at all when it falls inside an unterminated
+        // double-quoted string earlier on the same line, and does nothing
+        // rather than matching across the string boundary.
+        if self.quotes_before_on_line(line, char_pos) % 2 == 1 {
+            return;
+        }
+
         // Find matching bracket
         if let Some(match_pos) =
             self.find_matching_bracket(char_pos, open_char, close_char, is_opening)
@@ -1642,6 +1740,16 @@ impl Engine {
             self.view_mut().cursor.line = new_line;
             self.view_mut().cursor.col = match_pos - line_start;
         }
+    }
+
+    /// Count `"` characters on `line` before `pos` (exclusive). An odd count
+    /// means `pos` falls inside an unterminated double-quoted string that
+    /// started earlier on the line.
+    fn quotes_before_on_line(&self, line: usize, pos: usize) -> usize {
+        let line_start = self.buffer().line_to_char(line);
+        (line_start..pos)
+            .filter(|&i| self.buffer().content.char(i) == '"')
+            .count()
     }
 
     pub(crate) fn search_forward_for_bracket(&mut self) {
@@ -2924,7 +3032,9 @@ impl Engine {
         if self.view().cursor.line >= new_num_lines && new_num_lines > 0 {
             self.view_mut().cursor.line = new_num_lines - 1;
         }
-        self.view_mut().cursor.col = 0;
+        // Vim leaves the cursor on the same column it was on (clamped to the
+        // resulting line's length) — it does NOT reset to column 0 or to the
+        // first non-blank character.
         self.clamp_cursor_col();
     }
 
@@ -3065,8 +3175,9 @@ impl Engine {
                 break;
             }
         }
+        let want = self.curswant();
         self.view_mut().cursor.line = next;
-        self.clamp_cursor_col();
+        self.apply_curswant(want);
     }
 
     pub(crate) fn move_up(&mut self) {
@@ -3080,8 +3191,117 @@ impl Engine {
                 break;
             }
         }
+        let want = self.curswant();
         self.view_mut().cursor.line = prev;
-        self.clamp_cursor_col();
+        self.apply_curswant(want);
+    }
+
+    /// The column a vertical motion should aim for: the remembered
+    /// `curswant` if one is set, otherwise the cursor's actual current
+    /// column (captured now, before this motion moves the line, so a chain
+    /// of `j`/`k` keeps returning to the column the chain *started* at
+    /// rather than whatever a shorter intervening line clamped it to).
+    pub(crate) fn curswant(&mut self) -> usize {
+        let want = self.curswant.unwrap_or(self.view().cursor.col);
+        self.curswant = Some(want);
+        want
+    }
+
+    /// Land the cursor on `want` (a column, or `CURSWANT_EOL` for "end of
+    /// line"), clamped to the current line's length. Does NOT touch
+    /// `self.curswant` itself — the whole point is that the desired column
+    /// survives being clamped so a later vertical motion can return to it.
+    pub(crate) fn apply_curswant(&mut self, want: usize) {
+        let line = self.view().cursor.line;
+        let max_col = self.get_max_cursor_col(line);
+        let col = if want == CURSWANT_EOL {
+            max_col
+        } else {
+            want.min(max_col)
+        };
+        self.view_mut().cursor.col = col;
+    }
+
+    /// The buffer line `M` (and `dM`) target: the middle of the lines
+    /// actually visible in the window, which for a buffer shorter than the
+    /// window is fewer than `viewport_lines()` (#805).
+    pub(crate) fn middle_visible_line(&self) -> usize {
+        let scroll_top = self.view().scroll_top;
+        let viewport = self.viewport_lines().max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let last_visible = (scroll_top + viewport - 1).min(max_line);
+        let visible_count = last_visible - scroll_top + 1;
+        scroll_top + (visible_count - 1) / 2
+    }
+
+    /// Vim's `'scroll'` option: sticky line count used by `<C-d>`/`<C-u>`.
+    /// Defaults to half the window height when never explicitly set.
+    pub(crate) fn effective_scroll(&self) -> usize {
+        self.scroll_value
+            .unwrap_or_else(|| (self.viewport_lines() / 2).max(1))
+    }
+
+    /// `<C-d>`/`<C-u>`: scroll the viewport AND move the cursor by the same
+    /// `delta` lines (positive = down), fold-aware and clamped to the
+    /// buffer. Column follows `curswant` like any other vertical motion.
+    pub(crate) fn scroll_and_move_by(&mut self, delta: isize) {
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let count = delta.unsigned_abs();
+        let (new_line, new_top) = if delta >= 0 {
+            (
+                self.view()
+                    .next_visible_line(self.view().cursor.line, count, max_line),
+                self.view()
+                    .next_visible_line(self.view().scroll_top, count, max_line),
+            )
+        } else {
+            (
+                self.view()
+                    .prev_visible_line(self.view().cursor.line, count),
+                self.view().prev_visible_line(self.view().scroll_top, count),
+            )
+        };
+        self.view_mut().cursor.line = new_line;
+        self.view_mut().scroll_top = new_top;
+        let want = self.curswant();
+        self.apply_curswant(want);
+    }
+
+    /// `<C-f>`: scroll a full page forward, keeping a 2-line overlap with
+    /// the previous page, and land the cursor on the new top line
+    /// (adjusted for `scrolloff`). Fold-aware.
+    pub(crate) fn page_down(&mut self) {
+        let viewport = self.viewport_lines().max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let overlap = 2usize.min(viewport.saturating_sub(1));
+        let step = viewport.saturating_sub(overlap);
+        let new_top = self
+            .view()
+            .next_visible_line(self.view().scroll_top, step, max_line);
+        self.view_mut().scroll_top = new_top;
+        let scrolloff = self.settings.scrolloff;
+        self.view_mut().cursor.line = self.view().next_visible_line(new_top, scrolloff, max_line);
+        let want = self.curswant();
+        self.apply_curswant(want);
+    }
+
+    /// `<C-b>`: scroll a full page backward, keeping a 2-line overlap with
+    /// the previous page, and land the cursor on the new bottom line
+    /// (adjusted for `scrolloff`). The `scroll_top` step is fold-aware; the
+    /// `scrolloff` sub-adjustment within the new page is not (no test
+    /// exercises folds combined with `scrolloff` here).
+    pub(crate) fn page_up(&mut self) {
+        let viewport = self.viewport_lines().max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let overlap = 2usize.min(viewport.saturating_sub(1));
+        let step = viewport.saturating_sub(overlap);
+        let new_top = self.view().prev_visible_line(self.view().scroll_top, step);
+        self.view_mut().scroll_top = new_top;
+        let scrolloff = self.settings.scrolloff;
+        let bottom = (new_top + viewport).saturating_sub(1).min(max_line);
+        self.view_mut().cursor.line = bottom.saturating_sub(scrolloff).max(new_top);
+        let want = self.curswant();
+        self.apply_curswant(want);
     }
 
     // ── Indent / completion helpers ───────────────────────────────────────────

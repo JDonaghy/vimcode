@@ -66,6 +66,55 @@ fn test_word_motion_w_b() {
 }
 
 #[test]
+fn test_jj_col_memory_over_short_line() {
+    // #805: Vim remembers the "desired" column (`curswant`) across a chain of
+    // vertical motions, even when an intervening line is too short to hold
+    // it — the column comes back once a line long enough to hold it is
+    // reached again, instead of staying clamped to the shortest line seen.
+    let mut e = engine_with("abcdef\nab\nabcdef\n");
+    e.view_mut().cursor.col = 4; // sits on 'e'
+    press(&mut e, 'j'); // "ab" is too short: clamps to its last column
+    assert_cursor(&e, 1, 1);
+    press(&mut e, 'j'); // back to a full-length line: column 4 is restored
+    assert_cursor(&e, 2, 4);
+}
+
+#[test]
+fn test_dollar_then_jj_sticks_to_end_of_line() {
+    // `$` sets curswant to "always end of line" (Vim's MAXCOL), so every
+    // subsequent `j` lands on the last character regardless of line length.
+    let mut e = engine_with("abcdef\nab\nabcdef\n");
+    press(&mut e, '$');
+    assert_cursor(&e, 0, 5);
+    press(&mut e, 'j');
+    assert_cursor(&e, 1, 1); // "ab" — last column is 1
+    press(&mut e, 'j');
+    assert_cursor(&e, 2, 5); // back to the long line — "$" memory restored
+}
+
+#[test]
+fn test_word_motion_w_onto_blank_line() {
+    // #805: an empty line is itself a "word" in Vim — `w` must stop there
+    // instead of skipping straight through to the next non-blank line.
+    let mut e = engine_with("foo\n\nbar\n");
+    press(&mut e, 'w');
+    assert_cursor(&e, 1, 0); // stops on the blank line
+    press(&mut e, 'w');
+    assert_cursor(&e, 2, 0); // next w reaches "bar"
+}
+
+#[test]
+fn test_paragraph_forward_whitespace_only_line_is_not_blank() {
+    // #805: Vim's `}`/`{` require a *completely* empty line to count as a
+    // paragraph boundary — a whitespace-only line does not qualify.
+    let mut e = engine_with("a\n   \nb\n\n");
+    press(&mut e, '}');
+    // The whitespace-only line must be skipped over, landing on the buffer's
+    // one genuinely blank (trailing) line, not the "   " line.
+    assert_cursor(&e, 3, 0);
+}
+
+#[test]
 fn test_line_bounds_0_dollar() {
     let mut e = engine_with("hello world\n");
     // '$' moves to end of line (last char)
