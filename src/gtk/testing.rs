@@ -9024,3 +9024,135 @@ mod issue_813_exit_via_reaction {
         assert_eq!(reaction, quadraui::Reaction::Exit);
     }
 }
+
+#[cfg(test)]
+mod engine_key_from_ui_gtk_tests {
+    //! #826: GTK's `handle_dispatch` now decodes `Key::Named` via the same
+    //! [`crate::render::engine_key_from_ui`] TUI's dispatch calls, instead of
+    //! restating an identical table inline. For the plain named keys
+    //! (Escape, Enter, Backspace, Tab, Home, End, arrows, F-keys) that is a
+    //! pure refactor — nothing observable changes, since the shared table's
+    //! output is byte-identical to GTK's old one for those keys (see the
+    //! `handle_dispatch` comment for the four keys — `BackTab`, `PageUp`,
+    //! `PageDown`, `Insert` — deliberately kept on GTK's own spelling
+    //! instead, because the shared decoder's spelling for them differs from
+    //! what GTK-side code already depends on).
+    //!
+    //! Shift+arrow selection-extension (`"Shift_Up"`/`"Shift_Right"`/…) is
+    //! the one genuine behaviour change: it used to exist only in TUI's
+    //! `translate_key`, so a shifted arrow on GTK always decoded to the bare
+    //! `"Right"`/`"Up"`/… name with no way for `Engine::handle_vscode_key`'s
+    //! `"Shift_Right"` arm to ever see it. GTK gains it for free now that
+    //! `Key::Named` goes through the same decoder.
+    use super::*;
+    use quadraui::{Key, Modifiers, NamedKey, UiEvent};
+
+    fn press<A: AppLogic>(h: &mut Harness<A>, key: Key, modifiers: Modifiers) {
+        h.driver.dispatch(UiEvent::KeyPressed {
+            key,
+            modifiers,
+            repeat: false,
+        });
+    }
+
+    /// **Verified RED against unfixed `develop`:** GTK's old inline
+    /// `Key::Named` match returned `"Right"`/`"Up"`/… unconditionally,
+    /// ignoring `modifiers.shift` entirely — so `Shift_Right` never reached
+    /// `handle_vscode_key`, `visual_anchor` was never armed, and
+    /// `vscode_copy`'s `visual_anchor.is_some()` branch was never taken;
+    /// `Ctrl+C` then fell to the "copy current line" branch instead, so the
+    /// clipboard hook would have captured `"hello world\n"` (the whole
+    /// line), not `"hello"` (the shift-selected span) — this assertion
+    /// fails against that.
+    #[test]
+    fn shift_right_extends_selection_and_ctrl_c_copies_it_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let copied_hook = std::rc::Rc::clone(&copied);
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *copied_hook.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        // Four Shift+Right presses move the cursor to col 4 ('o'); copying a
+        // `Mode::Visual` selection reuses Vim's own inclusive-of-cursor
+        // range (`get_visual_selection_text`), so [anchor=0, cursor=4]
+        // copies chars 0..=4 — "hello".
+        for _ in 0..4 {
+            press(
+                &mut h,
+                Key::Named(NamedKey::Right),
+                Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "arming a selection via Shift+Right must switch to Visual mode \
+             (`vscode_extend_selection`), same as TUI"
+        );
+
+        press(
+            &mut h,
+            Key::Char('c'),
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            copied.borrow().as_deref(),
+            Some("hello"),
+            "Ctrl+C after Shift+Right x5 must copy exactly the shift-selected \
+             span, proving the selection (not the whole line) was captured"
+        );
+    }
+
+    /// `Escape` is one of the named keys GTK now decodes via the shared
+    /// `render::engine_key_from_ui` instead of its own inline table. Drives
+    /// it end to end through the real dispatch and asserts on engine mode
+    /// (Command → Normal) rather than the decoded string, so a wrong or
+    /// empty name from the shared decoder shows up as command mode failing
+    /// to clear, exactly as it would have with GTK's old inline table.
+    ///
+    /// **Verified RED against unfixed `develop`:** temporarily making
+    /// `engine_key_from_ui` return `None` for every `NamedKey` reproduces
+    /// what a broken shared-decoder wiring looks like — the key never
+    /// reaches `Engine::handle_key`, command mode never clears, and the
+    /// assertion fails.
+    #[test]
+    fn escape_reaches_the_engine_through_the_shared_decoder_on_gtk() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        h.driver.type_char(':');
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Command,
+            "precondition: `:` must open the command line"
+        );
+
+        press(&mut h, Key::Named(NamedKey::Escape), Modifiers::default());
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Normal,
+            "Escape decoded via the shared `engine_key_from_ui` must still \
+             cancel command-line mode on GTK"
+        );
+    }
+}

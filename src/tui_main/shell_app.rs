@@ -487,8 +487,8 @@ pub struct TuiShellApp {
     tab_switcher_last_cycle: Cell<Option<Instant>>,
     /// Mirrors `event_loop`'s once-computed `keyboard_enhanced` flag
     /// (`mod.rs:696`, from `supports_keyboard_enhancement()` before the
-    /// loop starts) — threaded into `translate_key` to disambiguate a
-    /// handful of Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
+    /// loop starts) — threaded into `render::engine_key_from_ui` (#826) to
+    /// disambiguate a handful of Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
     /// Ctrl+Shift+[/]) that arrive ambiguously without the kitty keyboard
     /// protocol. Defaults to `false`, the same value `unwrap_or(false)`
     /// falls back to on any terminal that doesn't support the protocol —
@@ -3081,18 +3081,22 @@ impl render::PanelAcceleratorHost for TuiAccelHost<'_> {
 /// `TuiSidebar::{has_focus, ext_panel_name}` and closing the quadraui
 /// `MenuSystem`, which needs the `&mut dyn Backend`.
 fn handle_activity_bar_focused_key(
-    key_event: KeyEvent,
+    key: &quadraui::Key,
+    modifiers: quadraui::Modifiers,
+    keyboard_enhanced: bool,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
     backend: &mut dyn quadraui::Backend,
 ) -> Reaction {
     use render::ActivityBarKeyAction;
-    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
-    let key = match key_event.code {
-        KeyCode::Char(c) => c.to_string(),
-        code => tui_key_to_engine_name(code).unwrap_or("").to_string(),
+    let ctrl = modifiers.ctrl;
+    let key_str = match key {
+        quadraui::Key::Char(c) => c.to_string(),
+        quadraui::Key::Named(_) => render::engine_key_from_ui(key, modifiers, keyboard_enhanced)
+            .map(|(name, _, _)| name)
+            .unwrap_or_default(),
     };
-    match render::activity_bar_key_action(&key, ctrl) {
+    match render::activity_bar_key_action(&key_str, ctrl) {
         ActivityBarKeyAction::MoveDown => engine.activity_bar_move_down(),
         ActivityBarKeyAction::MoveUp => engine.activity_bar_move_up(),
         ActivityBarKeyAction::Activate => {
@@ -3128,9 +3132,9 @@ fn handle_activity_bar_focused_key(
 /// The focus-owner keyboard *sink*: TUI's half of the rung
 /// [`render::route_focus_key`] resolves (#757 / #734 slice 2), which is where
 /// the ladder — and the four cross-backend divergences it used to hide — is
-/// stated. Only the crossterm `KeyEvent` → key-name/unicode *translation*
-/// stays backend-side (TUI's key spellings differ from GTK's — see
-/// `tui_key_to_engine_name` vs `map_gtk_key_name` — and only TUI needs the
+/// stated. Named keys are decoded via the shared [`render::engine_key_from_ui`]
+/// (#826); each panel's `Key::Char` whitelist stays backend-local (TUI's char
+/// spellings differ from GTK's `map_gtk_key_name`), and only TUI needs the
 /// Ctrl+V clipboard pre-read, since quadraui's runner delivers Ctrl+V to GTK
 /// as `UiEvent::ClipboardPaste` before any key event reaches this rung, per
 /// `render::dispatch_sidebar_panel_key`'s `Search` arm doc comment).
@@ -3157,18 +3161,41 @@ fn handle_activity_bar_focused_key(
 #[allow(clippy::too_many_arguments)]
 fn handle_focus_owner_key(
     route: render::FocusKeyRoute,
-    key_event: KeyEvent,
+    key: &quadraui::Key,
+    modifiers: quadraui::Modifiers,
+    keyboard_enhanced: bool,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
     screen_h: u16,
     backend: &mut dyn quadraui::Backend,
     ui_event: &UiEvent,
 ) -> Reaction {
-    let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
+    use quadraui::{Key, NamedKey};
+    // Owned, `Copy`-cheap local for the many nested matches below — `key`
+    // itself stays a reference so `engine_name()` can keep borrowing it.
+    let key_val = key.clone();
+    let ctrl = modifiers.ctrl;
+    // #826: every `tui_key_to_engine_name(code)` call in this function's old
+    // crossterm-`KeyCode` tables becomes this — the one shared decoder's
+    // named-key table (`render::engine_key_from_ui`), which also backs GTK's
+    // `Key::Named` decode now. `Key::Char` stays inline per arm below (each
+    // panel's own char whitelist), unchanged from before.
+    let engine_name = || {
+        render::engine_key_from_ui(key, modifiers, keyboard_enhanced)
+            .map(|(name, _, _)| name)
+            .unwrap_or_default()
+    };
 
     // ── Activity bar (toolbar) ──────────────────────────────────────────
     if route == render::FocusKeyRoute::ActivityBar {
-        return handle_activity_bar_focused_key(key_event, engine, sidebar, backend);
+        return handle_activity_bar_focused_key(
+            key,
+            modifiers,
+            keyboard_enhanced,
+            engine,
+            sidebar,
+            backend,
+        );
     }
 
     // Ctrl-W prefix: set pending state for window navigation. A Vim chord,
@@ -3176,22 +3203,22 @@ fn handle_focus_owner_key(
     // TUI-only — GTK has no per-keypress chord latch to hang
     // `pending_ctrl_w` on, which is #406; converging it needs the latch
     // promoted into the engine and is out of scope for this slice.
-    if ctrl && matches!(key_event.code, KeyCode::Char('w') | KeyCode::Char('W')) {
+    if ctrl && matches!(key_val, Key::Char('w') | Key::Char('W')) {
         sidebar.pending_ctrl_w = true;
         return Reaction::Redraw;
     }
     // Ctrl-W {h,l,Left,Right}: navigate between toolbar / panel / editor.
     if sidebar.pending_ctrl_w {
         sidebar.pending_ctrl_w = false;
-        match key_event.code {
-            KeyCode::Char('h') | KeyCode::Left => {
+        match key_val {
+            Key::Char('h') | Key::Named(NamedKey::Left) => {
                 // Panel → activity bar toolbar
                 let idx = engine.activity_bar_toolbar_idx_for_active_panel();
                 sidebar.has_focus = false;
                 engine.clear_sidebar_focus();
                 engine.activity_bar_focus_in_at(idx);
             }
-            KeyCode::Char('l') | KeyCode::Right => {
+            Key::Char('l') | Key::Named(NamedKey::Right) => {
                 // Panel → editor
                 sidebar.has_focus = false;
                 engine.clear_sidebar_focus();
@@ -3204,7 +3231,7 @@ fn handle_focus_owner_key(
     // ── Search panel ────────────────────────────────────────────────────
     if route == render::FocusKeyRoute::Search {
         // Ctrl+V paste (backend-specific clipboard access)
-        if ctrl && key_event.code == KeyCode::Char('v') {
+        if ctrl && key_val == Key::Char('v') {
             let is_replace =
                 engine.search_panel_form_focus.borrow().as_deref() == Some("search:replace");
             if let Some(text) = Engine::clipboard_paste() {
@@ -3212,22 +3239,22 @@ fn handle_focus_owner_key(
             }
             return Reaction::Redraw;
         }
-        let key_name = match key_event.code {
+        let key_name = match key_val {
             // Single-char keys use the char as the key name (via `unicode`
             // below); Ctrl+b is the one that needs an explicit name.
-            KeyCode::Char('b') if ctrl => "b",
-            KeyCode::Char(_) => "",
-            code => tui_key_to_engine_name(code).unwrap_or(""),
+            Key::Char('b') if ctrl => "b".to_string(),
+            Key::Char(_) => String::new(),
+            Key::Named(_) => engine_name(),
         };
-        let unicode = match key_event.code {
-            KeyCode::Char(c) if !ctrl => Some(c),
+        let unicode = match key_val {
+            Key::Char(c) if !ctrl => Some(c),
             _ => None,
         };
-        let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+        let alt = modifiers.alt;
         let key_str = if key_name.is_empty() {
             unicode.map(|c| c.to_string()).unwrap_or_default()
         } else {
-            key_name.to_string()
+            key_name
         };
         // Shared dispatch (#762 / #734 slice 7): the same pure-`Engine` arm
         // `render::dispatch_sidebar_panel_key` states for GTK.
@@ -3251,30 +3278,30 @@ fn handle_focus_owner_key(
             .handle(ui_event, backend, rect);
         if !engine.dispatch_dap_sidebar_event(sidebar_event) {
             // Ignored by the MSV — handle action keys via shared dispatch.
-            let key_name = match key_event.code {
-                KeyCode::Char(c) => match c {
-                    'q' => "q",
-                    'x' => "x",
-                    'd' => "d",
+            let key_name = match key_val {
+                Key::Char(c) => match c {
+                    'q' => "q".to_string(),
+                    'x' => "x".to_string(),
+                    'd' => "d".to_string(),
                     'b' if ctrl => {
                         sidebar.has_focus = false;
                         engine.collapse_sidebar();
-                        ""
+                        String::new()
                     }
-                    _ => "",
+                    _ => String::new(),
                 },
-                KeyCode::F(n @ 5..=11) => match n {
+                Key::Named(NamedKey::F(n)) if (5..=11).contains(&n) => match n {
                     5 | 9 | 10 | 11 => {
                         let name = format!("F{n}");
                         engine.handle_key(&name, None, false);
                         return Reaction::Redraw;
                     }
-                    6 => "F6",
-                    _ => "",
+                    6 => "F6".to_string(),
+                    _ => String::new(),
                 },
-                code => tui_key_to_engine_name(code).unwrap_or(""),
+                Key::Named(_) => engine_name(),
             };
-            if engine.dispatch_dap_sidebar_action_key(key_name) {
+            if engine.dispatch_dap_sidebar_action_key(&key_name) {
                 sidebar.has_focus = false;
             }
         }
@@ -3289,14 +3316,9 @@ fn handle_focus_owner_key(
         // caller (`map_gtk_key_name`) never special-cases it either — neither
         // engine method reads `ctrl`, and both accept a raw named key or a
         // literal character.
-        let (key_name, unicode) = match key_event.code {
-            KeyCode::Char(c) => (c.to_string(), Some(c)),
-            code => (
-                tui_key_to_engine_name(code)
-                    .map(str::to_string)
-                    .unwrap_or_default(),
-                None,
-            ),
+        let (key_name, unicode) = match key_val {
+            Key::Char(c) => (c.to_string(), Some(c)),
+            Key::Named(_) => (engine_name(), None),
         };
         let still_focused = render::dispatch_sidebar_panel_key(
             engine, route, &key_name, unicode, None, ctrl, false,
@@ -3315,14 +3337,9 @@ fn handle_focus_owner_key(
 
     // ── Extensions marketplace panel ────────────────────────────────────
     if route == render::FocusKeyRoute::ExtSidebar {
-        let (key_name, unicode) = match key_event.code {
-            KeyCode::Char(c) => (c.to_string(), Some(c)),
-            code => (
-                tui_key_to_engine_name(code)
-                    .map(str::to_string)
-                    .unwrap_or_default(),
-                None,
-            ),
+        let (key_name, unicode) = match key_val {
+            Key::Char(c) => (c.to_string(), Some(c)),
+            Key::Named(_) => (engine_name(), None),
         };
         let still_focused = render::dispatch_sidebar_panel_key(
             engine, route, &key_name, unicode, None, ctrl, false,
@@ -3340,7 +3357,7 @@ fn handle_focus_owner_key(
         // when the selected row is not an enum, `h` sets
         // `activity_bar_focused`.
         // Ctrl-V paste into the search input or an inline edit.
-        if ctrl && key_event.code == KeyCode::Char('v') {
+        if ctrl && key_val == Key::Char('v') {
             if engine.settings_input_active || engine.settings_editing.is_some() {
                 let text = match engine.clipboard_read {
                     Some(ref cb) => cb().ok(),
@@ -3352,20 +3369,20 @@ fn handle_focus_owner_key(
             }
             return Reaction::Redraw;
         }
-        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
-            KeyCode::Char('j') | KeyCode::Down => ("j", None),
-            KeyCode::Char('k') | KeyCode::Up => ("k", None),
-            KeyCode::Char('l') | KeyCode::Right => ("l", None),
-            KeyCode::Char('h') | KeyCode::Left => ("h", None),
-            KeyCode::Char(' ') => ("Space", None),
-            KeyCode::Char('/') => ("/", None),
-            KeyCode::Char('q') => ("Escape", None),
-            KeyCode::Char(ch) => ("char", Some(ch)),
-            code => (tui_key_to_engine_name(code).unwrap_or(""), None),
+        let (key_name, unicode): (String, Option<char>) = match key_val {
+            Key::Char('j') | Key::Named(NamedKey::Down) => ("j".to_string(), None),
+            Key::Char('k') | Key::Named(NamedKey::Up) => ("k".to_string(), None),
+            Key::Char('l') | Key::Named(NamedKey::Right) => ("l".to_string(), None),
+            Key::Char('h') | Key::Named(NamedKey::Left) => ("h".to_string(), None),
+            Key::Char(' ') => ("Space".to_string(), None),
+            Key::Char('/') => ("/".to_string(), None),
+            Key::Char('q') => ("Escape".to_string(), None),
+            Key::Char(ch) => ("char".to_string(), Some(ch)),
+            Key::Named(_) => (engine_name(), None),
         };
         if !key_name.is_empty() {
             let ch = if key_name == "char" { unicode } else { None };
-            let mapped = if key_name == "char" { "" } else { key_name };
+            let mapped: &str = if key_name == "char" { "" } else { &key_name };
             let still_focused =
                 render::dispatch_sidebar_panel_key(engine, route, mapped, ch, None, ctrl, false)
                     .unwrap_or(true);
@@ -3397,7 +3414,7 @@ fn handle_focus_owner_key(
         // paste as bytes — real terminal pastes already reach every panel
         // uniformly via `UiEvent::ClipboardPaste` -> `Engine::route_paste`
         // (see this file's top-level `handle` match).
-        if ctrl && key_event.code == KeyCode::Char('v') {
+        if ctrl && key_val == Key::Char('v') {
             let text = match engine.clipboard_read {
                 Some(ref cb) => cb().ok(),
                 None => None,
@@ -3420,7 +3437,7 @@ fn handle_focus_owner_key(
     if route == render::FocusKeyRoute::SourceControl {
         // h/Left focus-to-activity-bar lives inside
         // `dispatch_sc_sidebar_key_unified`. Ctrl+b hides the sidebar.
-        if ctrl && matches!(key_event.code, KeyCode::Char('b')) {
+        if ctrl && matches!(key_val, Key::Char('b')) {
             sidebar.has_focus = false;
             engine.collapse_sidebar();
             return Reaction::Redraw;
@@ -3428,9 +3445,9 @@ fn handle_focus_owner_key(
         // With keyboard enhancement (kitty protocol), Shift+s arrives as
         // Char('s') + SHIFT, not Char('S'). Resolve the actual character
         // before matching the whitelist.
-        let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
-        let (key_str, unicode): (&str, Option<char>) = match key_event.code {
-            KeyCode::Char(ch) => {
+        let shift = modifiers.shift;
+        let (key_str, unicode): (String, Option<char>) = match key_val {
+            Key::Char(ch) => {
                 let resolved = if shift && ch.is_ascii_lowercase() {
                     ch.to_ascii_uppercase()
                 } else {
@@ -3458,16 +3475,16 @@ fn handle_focus_owner_key(
                     '/' => "/",
                     _ => "",
                 };
-                (name, Some(resolved))
+                (name.to_string(), Some(resolved))
             }
-            code => (tui_key_to_engine_name(code).unwrap_or(""), None),
+            Key::Named(_) => (engine_name(), None),
         };
         if !key_str.is_empty() || unicode.is_some() {
             // `sc_unicode` (not `unicode`) is the slot
             // `render::dispatch_sidebar_panel_key`'s `SourceControl` arm reads —
             // the shift-resolved character computed above.
             let still_focused = render::dispatch_sidebar_panel_key(
-                engine, route, key_str, None, unicode, ctrl, false,
+                engine, route, &key_str, None, unicode, ctrl, false,
             )
             .unwrap_or(true);
             if !still_focused {
@@ -3480,32 +3497,32 @@ fn handle_focus_owner_key(
     // ── Explorer (`FocusKeyRoute::Explorer`, the resolver's fallback) ───
     {
         use crate::core::engine::ExplorerKeyResult;
-        if ctrl && key_event.code == KeyCode::Char('b') {
+        if ctrl && key_val == Key::Char('b') {
             sidebar.has_focus = false;
             engine.collapse_sidebar();
         } else {
-            // `tui_key_to_engine_name` rather than a fourth bespoke copy of
-            // the same table: it also supplies "BackSpace"/"Delete", which
-            // the old explorer-local table dropped even though
+            // `engine_name()` rather than a fourth bespoke copy of the same
+            // table: it also supplies "BackSpace"/"Delete", which the old
+            // explorer-local table dropped even though
             // `dispatch_explorer_edit_key` handles them — so rename/new-entry
             // editing lost those two keys on TUI while GTK
             // (`map_gtk_key_name`) had them. `Page_Up`/`Page_Down` and
             // `PageUp`/`PageDown` are both accepted by the engine.
-            let key_name = match key_event.code {
-                KeyCode::Char('j') => "j",
-                KeyCode::Char('k') => "k",
-                KeyCode::Char('h') => "h",
-                KeyCode::Char('l') => "l",
-                KeyCode::Char('q') => "q",
-                KeyCode::Char(_) => "",
-                code => tui_key_to_engine_name(code).unwrap_or(""),
+            let key_name = match key_val {
+                Key::Char('j') => "j".to_string(),
+                Key::Char('k') => "k".to_string(),
+                Key::Char('h') => "h".to_string(),
+                Key::Char('l') => "l".to_string(),
+                Key::Char('q') => "q".to_string(),
+                Key::Char(_) => String::new(),
+                Key::Named(_) => engine_name(),
             };
-            let chr = if let KeyCode::Char(c) = key_event.code {
+            let chr = if let Key::Char(c) = key_val {
                 Some(c)
             } else {
                 None
             };
-            match engine.dispatch_explorer_key(key_name, chr, ctrl) {
+            match engine.dispatch_explorer_key(&key_name, chr, ctrl) {
                 // `dispatch_explorer_key` already called
                 // `activity_bar_focus_in_at(1)` for `FocusToolbar`.
                 ExplorerKeyResult::Unfocused | ExplorerKeyResult::FocusToolbar => {
@@ -3549,7 +3566,7 @@ struct KeyDispatchState<'a> {
 fn handle_key_pressed(
     key: quadraui::Key,
     modifiers: quadraui::Modifiers,
-    repeat: bool,
+    _repeat: bool,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
     folder_picker: &mut Option<quadraui::FolderPickerController>,
@@ -3559,16 +3576,22 @@ fn handle_key_pressed(
     backend: &mut dyn quadraui::Backend,
     state: &mut KeyDispatchState<'_>,
 ) -> Reaction {
-    let Some(key_event) = quadraui::tui::events::synth_keyevent(&key, modifiers, repeat) else {
-        return Reaction::Continue;
-    };
+    // #826: no more round trip through a synthesised crossterm `KeyEvent` —
+    // `render::engine_key_from_ui` decodes `key`/`modifiers` directly, the
+    // same function GTK's `handle_dispatch` now calls for its named keys.
+    // `_repeat` (crossterm's `KeyEventKind::Repeat` vs `Press`) was only ever
+    // used to pick a `KeyEventKind` nothing below branched on except
+    // `== Release` — which `key: quadraui::Key` can never be, since the
+    // runner already drops release events before they reach here
+    // (`quadraui::tui::events::crossterm_key_to_uievent`).
 
     // ── Shared modal keyboard rung (#734 slice 1) ──────────────────────
     let modal_route = render::route_modal_key(engine);
     if modal_route != render::ModalKeyRoute::None {
         return apply_modal_key_route(
             modal_route,
-            key_event,
+            &key,
+            modifiers,
             keyboard_enhanced,
             engine,
             sidebar,
@@ -3583,7 +3606,7 @@ fn handle_key_pressed(
     // `FolderPickerController::handle` owns the key→intent mapping itself
     // now (Escape/Enter/Up/Down/k/j/-/Backspace/printable, Ctrl-gated) — this
     // rung just feeds it the raw event and applies the outcome.
-    if folder_picker.is_some() && key_event.kind != KeyEventKind::Release {
+    if folder_picker.is_some() {
         apply_folder_picker_event(
             folder_picker,
             state.ui_event,
@@ -3593,10 +3616,6 @@ fn handle_key_pressed(
             screen_h,
         );
         return Reaction::Redraw;
-    }
-
-    if key_event.kind == KeyEventKind::Release {
-        return Reaction::Continue;
     }
 
     // ── Focus owners: activity bar + sidebar panels (#757 / slice 2) ────
@@ -3609,7 +3628,9 @@ fn handle_key_pressed(
         |engine: &mut Engine, sidebar: &mut TuiSidebar, backend: &mut dyn quadraui::Backend| {
             handle_focus_owner_key(
                 focus_route,
-                key_event,
+                &key,
+                modifiers,
+                keyboard_enhanced,
                 engine,
                 sidebar,
                 screen_h,
@@ -3621,9 +3642,11 @@ fn handle_key_pressed(
         return dispatch_focus_owner(engine, sidebar, backend);
     }
 
-    let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) else {
-        // Untranslatable (Tab/BackTab and friends) — no rung below can read
-        // them, but a focused panel navigates with them.
+    let Some((key_name, unicode, ctrl)) =
+        render::engine_key_from_ui(&key, modifiers, keyboard_enhanced)
+    else {
+        // Untranslatable (Insert/CapsLock/NumLock/ScrollLock/Menu) — no rung
+        // below can read them, but a focused panel navigates with them.
         if focus_route != render::FocusKeyRoute::None {
             return dispatch_focus_owner(engine, sidebar, backend);
         }
@@ -3636,8 +3659,8 @@ fn handle_key_pressed(
     }
 
     // ── Shared terminal (PTY) rung (#758 / #734 slice 3, #351) ──────────
-    let shift = key_event.modifiers.contains(KeyModifiers::SHIFT);
-    let alt = key_event.modifiers.contains(KeyModifiers::ALT);
+    let shift = modifiers.shift;
+    let alt = modifiers.alt;
     if render::route_terminal_key(engine, &key_name, unicode, ctrl, shift, alt) {
         return Reaction::Redraw;
     }
@@ -3812,12 +3835,23 @@ fn dispatch_post_key_action(
 /// Apply a resolved [`render::ModalKeyRoute`] on the TUI side.
 ///
 /// The decision — spell suggestions → modal dialog → context menu — is shared
-/// (`render::route_modal_key`); this is the `crossterm`-flavoured application
-/// of it. Both arms consume the key unconditionally: that is what makes the
-/// tier genuinely *modal* rather than a best-effort intercept.
+/// (`render::route_modal_key`); this is TUI's application of it, via the
+/// shared [`render::engine_key_from_ui`] decoder (#826). Both arms consume
+/// the key unconditionally: that is what makes the tier genuinely *modal*
+/// rather than a best-effort intercept.
+///
+/// Neither arm has a fallback for `engine_key_from_ui` returning `None`
+/// (Insert/CapsLock/NumLock/ScrollLock/Menu): the pre-#826 `translate_key`
+/// never returned `None` for Tab/BackTab (both had explicit arms), so the
+/// `Engine` route's old `else if` covering them by re-matching the raw
+/// crossterm `KeyCode` was dead code, and `ContextMenu`'s `Release` guard
+/// was unreachable too — `key: quadraui::Key` is never a release event, the
+/// runner drops those before this ever sees them.
+#[allow(clippy::too_many_arguments)]
 fn apply_modal_key_route(
     route: render::ModalKeyRoute,
-    key_event: KeyEvent,
+    key: &quadraui::Key,
+    modifiers: quadraui::Modifiers,
     keyboard_enhanced: bool,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
@@ -3826,32 +3860,23 @@ fn apply_modal_key_route(
 ) -> Reaction {
     match route {
         render::ModalKeyRoute::Engine => {
-            if let Some((key_name, unicode, ctrl)) = translate_key(key_event, keyboard_enhanced) {
+            if let Some((key_name, unicode, ctrl)) =
+                render::engine_key_from_ui(key, modifiers, keyboard_enhanced)
+            {
                 let action = engine.handle_key(&key_name, unicode, ctrl);
                 if handle_action(engine, action) {
                     return Reaction::Exit;
-                }
-            } else if key_event.kind != KeyEventKind::Release {
-                match key_event.code {
-                    KeyCode::Tab => {
-                        engine.handle_key("Tab", None, false);
-                    }
-                    KeyCode::BackTab => {
-                        engine.handle_key("Shift_Tab", None, false);
-                    }
-                    _ => {}
                 }
             }
             Reaction::Redraw
         }
         render::ModalKeyRoute::ContextMenu => {
-            if key_event.kind == KeyEventKind::Release {
-                return Reaction::Continue;
-            }
             // `handle_context_menu_key` consumes every key while the menu is
             // open (its `_` arm closes it), so an untranslatable key is
             // swallowed rather than falling through to the tier below.
-            if let Some((key_name, unicode, _ctrl)) = translate_key(key_event, keyboard_enhanced) {
+            if let Some((key_name, unicode, _ctrl)) =
+                render::engine_key_from_ui(key, modifiers, keyboard_enhanced)
+            {
                 let effective_key = if key_name.is_empty() {
                     unicode.map(|c| c.to_string()).unwrap_or_default()
                 } else {
@@ -6432,10 +6457,11 @@ mod tests {
         );
     }
 
-    /// The `Shift_`-prefixed names `translate_key` hands the editor
-    /// (`Shift_Up`, `Shift_Return`, …) have no PTY encoding — which is why
-    /// the old TUI arm bypassed `translate_key` and re-derived names from the
-    /// raw crossterm `KeyCode`. `render::canonical_terminal_key_name` strips
+    /// The `Shift_`-prefixed names `render::engine_key_from_ui` (formerly
+    /// `translate_key`) hands the editor (`Shift_Up`, `Shift_Return`, …) have
+    /// no PTY encoding — which is why the old TUI arm bypassed it and
+    /// re-derived names from the raw crossterm `KeyCode`.
+    /// `render::canonical_terminal_key_name` strips
     /// the prefix (shift travels as its own argument) and reconciles the two
     /// backends' spellings of the same physical keys, so the bypass is gone.
     #[test]
@@ -11736,8 +11762,9 @@ mod tests {
     /// them. Renaming a file from the TUI explorer could not delete a
     /// character.
     ///
-    /// #757 replaced that copy with the module's existing
-    /// `tui_key_to_engine_name`, which is where the two names come from.
+    /// #757 replaced that copy with the module's `tui_key_to_engine_name`,
+    /// which is where the two names come from; #826 folded that helper into
+    /// the shared `render::engine_key_from_ui` both backends now call.
     ///
     /// **Verified RED against unfixed `develop`:** reinstating the old
     /// explorer-local table leaves the painted edit text at

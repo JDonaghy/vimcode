@@ -89,9 +89,7 @@ macro_rules! debug_log {
 pub(crate) use debug_log;
 
 use ratatui::crossterm::cursor::SetCursorStyle;
-use ratatui::crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{supports_keyboard_enhancement, SetTitle};
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
@@ -298,8 +296,9 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
 /// already back to normal, the same guarantee the old `run()`'s own outer
 /// `catch_unwind` relied on around `event_loop`.
 ///
-/// `keyboard_enhanced` (threaded into `translate_key` for Ctrl-combo
-/// disambiguation) and the emergency-engine pointer registration both move
+/// `keyboard_enhanced` (threaded into `render::engine_key_from_ui` for
+/// Ctrl-combo disambiguation, #826) and the emergency-engine pointer
+/// registration both move
 /// into `TuiShellApp::setup` instead of living here — see
 /// [`shell_app::TuiShellApp::prepare_for_live_run`] and that `setup`
 /// override's doc comments for why: `run_with_shell` takes `app` *by
@@ -508,162 +507,11 @@ fn set_cell(buf: &mut ratatui::buffer::Buffer, x: u16, y: u16, ch: char, fg: RCo
 // ─── Tab bar ──────────────────────────────────────────────────────────────────
 // Tab/diff constants are defined in render_impl.rs and re-exported via `use render_impl::*;`.
 
-fn shift_map_us(c: char) -> char {
-    match c {
-        '`' => '~',
-        '1' => '!',
-        '2' => '@',
-        '3' => '#',
-        '4' => '$',
-        '5' => '%',
-        '6' => '^',
-        '7' => '&',
-        '8' => '*',
-        '9' => '(',
-        '0' => ')',
-        '-' => '_',
-        '=' => '+',
-        '[' => '{',
-        ']' => '}',
-        '\\' => '|',
-        ';' => ':',
-        '\'' => '"',
-        ',' => '<',
-        '.' => '>',
-        '/' => '?',
-        // Letters: Shift+a → 'A' (crossterm usually already sends uppercase).
-        c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
-        _ => c,
-    }
-}
-
-/// Map a crossterm `KeyCode` to the engine-facing keyname string used by the
-/// sidebar panel dispatchers (`dispatch_ext_sidebar_key_unified`,
-/// `handle_settings_key`, `dispatch_dap_sidebar_action_key`, …).
-///
-/// Covers the named navigation/control keys shared across the panels. Returns
-/// `None` for `Char(_)`, `F(_)`, and anything else — callers handle those with
-/// panel-specific remapping (e.g. Settings remaps `j`/`Down` both to `"j"`).
-fn tui_key_to_engine_name(code: KeyCode) -> Option<&'static str> {
-    Some(match code {
-        KeyCode::Esc => "Escape",
-        KeyCode::Enter => "Return",
-        KeyCode::Backspace => "BackSpace",
-        KeyCode::Delete => "Delete",
-        KeyCode::Tab => "Tab",
-        KeyCode::BackTab => "BackTab",
-        KeyCode::Up => "Up",
-        KeyCode::Down => "Down",
-        KeyCode::Left => "Left",
-        KeyCode::Right => "Right",
-        KeyCode::Home => "Home",
-        KeyCode::End => "End",
-        KeyCode::PageUp => "Page_Up",
-        KeyCode::PageDown => "Page_Down",
-        _ => return None,
-    })
-}
-
-fn translate_key(event: KeyEvent, keyboard_enhanced: bool) -> Option<(String, Option<char>, bool)> {
-    if event.kind == KeyEventKind::Release {
-        return None;
-    }
-    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
-    let shift = event.modifiers.contains(KeyModifiers::SHIFT);
-    match event.code {
-        KeyCode::Char(c) => {
-            let lower = c.to_ascii_lowercase();
-            let (key_name, unicode) = if ctrl {
-                // Engine dispatches Ctrl combos via key_name (e.g. "d" for Ctrl-D).
-                // Space is a named key; use "space" to match GTK and the engine's convention.
-                // Ctrl+Shift+X: the char arrives as uppercase (or SHIFT flag is set); keep
-                // uppercase so the engine can distinguish Ctrl+P from Ctrl+Shift+P ("P").
-                // Some special chars use GTK-style names to match GTK backend conventions.
-                let name = if lower == ' ' {
-                    "space".to_string()
-                } else if lower == '\\' || (!keyboard_enhanced && lower == '4') {
-                    // Ctrl+\ sends byte 0x1C; without keyboard enhancement crossterm decodes
-                    // 0x1C as KeyCode::Char('4')+CONTROL (formula: 0x1C-0x1C+'4'='4').
-                    // Map both to "backslash" so Ctrl+\ works in all terminals.
-                    "backslash".to_string()
-                } else if lower == '/' || (!keyboard_enhanced && lower == '7') {
-                    // Ctrl+/ sends byte 0x1F; without keyboard enhancement crossterm
-                    // decodes 0x1F as KeyCode::Char('7')+CONTROL (formula: 0x1F-0x1C+'4'='7').
-                    // Map both to "slash" so Ctrl+/ works in all terminals.
-                    "slash".to_string()
-                } else if lower == '`' {
-                    "grave".to_string()
-                } else if lower == ',' {
-                    "comma".to_string()
-                } else if (lower == ']' || lower == '}' || (!keyboard_enhanced && lower == '5'))
-                    && shift
-                {
-                    "Shift_bracketright".to_string()
-                } else if (lower == '[' || lower == '{' || (!keyboard_enhanced && lower == '3'))
-                    && shift
-                {
-                    "Shift_bracketleft".to_string()
-                } else if lower == '}' {
-                    // Ctrl+Shift+] without keyboard enhancement: terminal sends '}'
-                    "Shift_bracketright".to_string()
-                } else if lower == '{' {
-                    // Ctrl+Shift+[ without keyboard enhancement: terminal sends '{'
-                    "Shift_bracketleft".to_string()
-                } else if lower == ']' || (!keyboard_enhanced && lower == '5') {
-                    "bracketright".to_string()
-                } else if lower == '[' || (!keyboard_enhanced && lower == '3') {
-                    "bracketleft".to_string()
-                } else if c.is_uppercase() || shift {
-                    lower.to_ascii_uppercase().to_string()
-                } else {
-                    lower.to_string()
-                };
-                (name, Some(lower))
-            } else {
-                // With keyboard enhancement (Kitty protocol + REPORT_ALL_KEYS_AS_ESCAPE_CODES),
-                // shifted symbol keys may arrive as the base key + SHIFT modifier instead of
-                // the resulting character.  For example ':' comes as Char(';') + SHIFT, not
-                // Char(':').  Apply the standard US keyboard shift mapping so the engine
-                // receives the correct character.
-                let resolved = if keyboard_enhanced && shift {
-                    shift_map_us(c)
-                } else {
-                    c
-                };
-                ("".to_string(), Some(resolved))
-            };
-            Some((key_name, unicode, ctrl))
-        }
-        KeyCode::Esc => Some(("Escape".to_string(), None, false)),
-        KeyCode::Enter if shift && ctrl => Some(("Shift_Return".to_string(), None, true)),
-        KeyCode::Enter if ctrl => Some(("Return".to_string(), None, true)),
-        KeyCode::Enter => Some(("Return".to_string(), None, false)),
-        KeyCode::Backspace => Some(("BackSpace".to_string(), None, false)),
-        KeyCode::Delete => Some(("Delete".to_string(), None, false)),
-        KeyCode::Tab => Some(("Tab".to_string(), None, ctrl)),
-        KeyCode::BackTab => Some(("ISO_Left_Tab".to_string(), None, ctrl)),
-        // Shift+Arrow (no ctrl): emit as "Shift_X" for VSCode selection extension.
-        KeyCode::Up if shift && !ctrl => Some(("Shift_Up".to_string(), None, false)),
-        KeyCode::Down if shift && !ctrl => Some(("Shift_Down".to_string(), None, false)),
-        KeyCode::Left if shift && !ctrl => Some(("Shift_Left".to_string(), None, false)),
-        KeyCode::Right if shift && !ctrl => Some(("Shift_Right".to_string(), None, false)),
-        KeyCode::Home if shift => Some(("Shift_Home".to_string(), None, false)),
-        KeyCode::End if shift => Some(("Shift_End".to_string(), None, false)),
-        // Ctrl+Shift+Arrow: emit as "Shift_X" with ctrl=true for word-level selection.
-        KeyCode::Left if shift && ctrl => Some(("Shift_Left".to_string(), None, true)),
-        KeyCode::Right if shift && ctrl => Some(("Shift_Right".to_string(), None, true)),
-        KeyCode::Up => Some(("Up".to_string(), None, false)),
-        KeyCode::Down => Some(("Down".to_string(), None, false)),
-        KeyCode::Left => Some(("Left".to_string(), None, ctrl)),
-        KeyCode::Right => Some(("Right".to_string(), None, ctrl)),
-        KeyCode::Home => Some(("Home".to_string(), None, ctrl)),
-        KeyCode::End => Some(("End".to_string(), None, ctrl)),
-        KeyCode::PageUp => Some(("Page_Up".to_string(), None, false)),
-        KeyCode::PageDown => Some(("Page_Down".to_string(), None, false)),
-        KeyCode::F(n) => Some((format!("F{}", n), None, false)),
-        _ => None,
-    }
-}
+// #826: `shift_map_us`, `tui_key_to_engine_name` and `translate_key` used to
+// live here — a TUI-only re-decode of a crossterm `KeyEvent` synthesised back
+// out of the `quadraui::Key` the runner had already decoded (a pure round
+// trip). All three are now one function, [`render::engine_key_from_ui`],
+// typed against `quadraui::Key`/`Modifiers` directly; both backends call it.
 
 // ─── Engine action handling ───────────────────────────────────────────────────
 
@@ -719,76 +567,5 @@ fn rc(c: Color) -> RColor {
     RColor::Rgb(c.r, c.g, c.b)
 }
 
-#[cfg(test)]
-mod translate_key_tests {
-    //! #804: crossterm decodes raw terminal control bytes into `KeyEvent`s
-    //! *before* `translate_key` ever sees them — a real terminal never hands
-    //! us the byte 0x08 directly, it hands us the `KeyEvent` crossterm
-    //! already parsed it into. These tests build exactly the `KeyEvent`
-    //! crossterm produces for each byte (per crossterm's own control-code
-    //! decoding: bytes 0x01-0x1A become `Char(('a' - 1 + byte) as char)` +
-    //! `CONTROL`, except the handful with dedicated `KeyCode` variants) and
-    //! assert what `translate_key` does with it — this is what pinned down
-    //! that `<C-h>`/`<C-j>`/`<C-c>` arrive as ctrl+letter, not as the named
-    //! `BackSpace`/`Return`/`Escape` keys `handle_insert_key` matches on by
-    //! name, which is *why* it needs its own explicit ctrl-letter arms
-    //! (see `Engine::handle_insert_key`, `#804`).
-    use super::*;
-
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, modifiers)
-    }
-
-    /// 0x08 (^H): crossterm decodes this as ctrl+'h', not as a `BackSpace`
-    /// keycode — `handle_insert_key` must special-case it itself.
-    #[test]
-    fn byte_0x08_is_ctrl_h_not_backspace() {
-        let (name, unicode, ctrl) =
-            translate_key(key(KeyCode::Char('h'), KeyModifiers::CONTROL), false).unwrap();
-        assert_eq!(name, "h");
-        assert_eq!(unicode, Some('h'));
-        assert!(ctrl);
-    }
-
-    /// 0x0A (^J / <NL>): crossterm decodes this as ctrl+'j'.
-    #[test]
-    fn byte_0x0a_is_ctrl_j() {
-        let (name, unicode, ctrl) =
-            translate_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL), false).unwrap();
-        assert_eq!(name, "j");
-        assert_eq!(unicode, Some('j'));
-        assert!(ctrl);
-    }
-
-    /// 0x03 (^C / ETX): crossterm decodes this as ctrl+'c'.
-    #[test]
-    fn byte_0x03_is_ctrl_c() {
-        let (name, unicode, ctrl) =
-            translate_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false).unwrap();
-        assert_eq!(name, "c");
-        assert_eq!(unicode, Some('c'));
-        assert!(ctrl);
-    }
-
-    /// 0x1B (ESC): crossterm has a dedicated `KeyCode::Esc` for this byte —
-    /// unlike ^H/^J/^C it never arrives as ctrl+'['.
-    #[test]
-    fn byte_0x1b_is_escape() {
-        let (name, unicode, ctrl) =
-            translate_key(key(KeyCode::Esc, KeyModifiers::NONE), false).unwrap();
-        assert_eq!(name, "Escape");
-        assert_eq!(unicode, None);
-        assert!(!ctrl);
-    }
-
-    /// 0x7F (DEL): the physical Backspace key on most terminals; crossterm
-    /// has a dedicated `KeyCode::Backspace` for it.
-    #[test]
-    fn byte_0x7f_is_backspace() {
-        let (name, unicode, ctrl) =
-            translate_key(key(KeyCode::Backspace, KeyModifiers::NONE), false).unwrap();
-        assert_eq!(name, "BackSpace");
-        assert_eq!(unicode, None);
-        assert!(!ctrl);
-    }
-}
+// #826: the `translate_key_tests` module that used to live here moved to
+// `render::engine_key_from_ui_tests` alongside the function it now tests.
