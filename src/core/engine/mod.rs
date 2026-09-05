@@ -3027,6 +3027,30 @@ pub struct Engine {
     /// is absent whenever `settings.window_status_line` is on — matching
     /// [`Self::menu_bar_rect`]'s convention.
     pub global_status_rect: std::cell::Cell<quadraui::Rect>,
+    /// Cached command/message-line rect from the last paint (#816) — the
+    /// exact twin of [`Self::global_status_rect`] one band lower, and the
+    /// geometry [`crate::render::command_line_click_char_idx`] hit-tests
+    /// against. TUI populates it in `render_impl`/`shell_app`'s
+    /// `FrameOp::CommandLine` arm and GTK in `App`'s; both are ABSOLUTE,
+    /// backend-native units (TUI: character cells, GTK: pixels) — same
+    /// convention as `global_status_rect`. Empty rect means "not currently
+    /// painted".
+    pub command_line_rect: std::cell::Cell<quadraui::Rect>,
+    /// Mouse-driven text selection over the command/message line, as a
+    /// **character-count** `(anchor, head)` pair into the painted text
+    /// (either order) — `None` when no selection is live. Armed by a press
+    /// on the line (gated by [`crate::render::command_line_selection_allowed`]),
+    /// extended on drag, read by [`crate::render::route_cmdline_selection_key`]
+    /// for the Ctrl+C-copies-and-clears / any-other-key-clears keyboard
+    /// tier. Previously TUI-only local state (`mouse::handle_mouse`'s
+    /// `cmd_sel` parameter); lives on `Engine` now so GTK's press/drag/
+    /// release handlers can drive the same field through the same
+    /// `CommandLineLayout::hit_test`-backed helper instead of GTK growing a
+    /// second, unshared copy of this state (#816).
+    pub cmd_sel: std::cell::Cell<Option<(usize, usize)>>,
+    /// Whether a command-line mouse selection is being actively dragged
+    /// (button down, pointer moving) — the counterpart to `cmd_sel` above.
+    pub cmd_dragging: std::cell::Cell<bool>,
     /// quadraui SidebarSystem — owns debug sidebar (4 sections: Variables,
     /// Watch, Call Stack, Breakpoints) selection, scroll, keyboard nav, and
     /// mouse handling. Both TUI and GTK call `render()` and `handle()`.
@@ -3970,6 +3994,9 @@ impl Engine {
             ))),
             menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
             global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            command_line_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            cmd_sel: std::cell::Cell::new(None),
+            cmd_dragging: std::cell::Cell::new(false),
             dap_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("vars", "VARIABLES"),

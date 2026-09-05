@@ -1877,6 +1877,36 @@ impl App {
             return;
         }
 
+        // ── Shared command-line selection rung (#816) ──────────────────
+        // The keyboard side of a command/message-line mouse selection —
+        // TUI's `handle_key_pressed` has run this since #762/#734 slice 7;
+        // GTK never reached it because `cmd_sel` was TUI-only local state.
+        // #816 moved it onto `Engine` and wired GTK's mouse handlers (see
+        // `handle_mouse_click_msg` / `handle_mouse_drag_msg`) to populate it
+        // via `CommandLineLayout::hit_test`, so the same rung now applies
+        // here too. `Clear` deliberately falls through to `handle_key` below.
+        {
+            let sel = self.engine.borrow().cmd_sel.get();
+            let route =
+                render::route_cmdline_selection_key(&self.engine.borrow(), unicode, ctrl, sel);
+            match route {
+                render::CmdSelKeyRoute::Copy(text) => {
+                    let engine = self.engine.borrow();
+                    if !text.is_empty() {
+                        if let Some(ref cb) = engine.clipboard_write {
+                            let _ = cb(text.as_str());
+                        }
+                    }
+                    engine.cmd_sel.set(None);
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+                render::CmdSelKeyRoute::Clear => self.engine.borrow().cmd_sel.set(None),
+                render::CmdSelKeyRoute::Keep => {}
+            }
+        }
+
         let action = {
             let mut engine = self.engine.borrow_mut();
             let a = engine.handle_key(&key_name, unicode, ctrl);
@@ -3946,6 +3976,38 @@ impl App {
             return;
         }
 
+        // ── Command line click — start text selection (#816) ─────────────
+        // TUI's twin rung (`mouse::handle_mouse`) has done this since #194;
+        // GTK never could, for lack of a character-offset hit test on its
+        // pixel-painted command line. quadraui#705's `CommandLineLayout`
+        // closed that gap — `render::command_line_click_char_idx` hit-tests
+        // `engine.command_line_rect` (cached at paint time, just above) the
+        // same way TUI's press rung does, so this is thin wiring, not a new
+        // GTK-specific selection implementation.
+        if render::command_line_selection_allowed(&self.engine.borrow()) {
+            let data = render::build_command_line(&self.engine.borrow());
+            let char_width = self.backend.borrow().char_width();
+            let rect = self.engine.borrow().command_line_rect.get();
+            let point = quadraui::Point::new(x as f32, y as f32);
+            if let Some(char_idx) =
+                render::command_line_click_char_idx(rect, &data.text, char_width, point)
+            {
+                let mut engine = self.engine.borrow_mut();
+                if matches!(
+                    engine.mode,
+                    crate::core::Mode::Command | crate::core::Mode::Search
+                ) {
+                    let buf_len = engine.command_buffer.chars().count();
+                    engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
+                }
+                engine.cmd_sel.set(Some((char_idx, char_idx)));
+                engine.cmd_dragging.set(true);
+                drop(engine);
+                self.draw_needed.set(true);
+                return;
+            }
+        }
+
         // Debug toolbar click: resolve via cached ToolbarLayout on engine (#510).
         {
             let dbg_y = self.debug_toolbar_y_offset.get();
@@ -4464,17 +4526,21 @@ impl App {
                         y: y as f32,
                     })
                     .is_some(),
-                // GTK has no canvas sidebar separator, command-line selection or
-                // explorer drag-and-drop: the separator is a `gtk::Paned`, the
-                // command line paints through `Surface::CommandLine` (which
-                // exposes no character hit test — the quadraui gap #752
-                // recorded), and the file tree is a native widget with its own
-                // DnD. Stated here rather than omitted so the asymmetry is
-                // visible at the call site.
+                // GTK has no canvas sidebar separator or explorer drag-and-drop:
+                // the separator is a `gtk::Paned` and the file tree is a native
+                // widget with its own DnD. Stated here rather than omitted so
+                // the asymmetry is visible at the call site.
+                //
+                // Command-line selection *is* shared now (#816):
+                // `engine.cmd_dragging` is armed by `handle_mouse_click_msg`'s
+                // press rung the same way TUI's `mouse::handle_mouse` arms its
+                // local `cmd_dragging` — quadraui#705's `CommandLineLayout`
+                // closed the "no character hit test" gap the old comment here
+                // recorded.
                 sidebar_resizing: false,
                 sidebar_dnd: false,
                 sidebar_body: None,
-                command_line_selecting: false,
+                command_line_selecting: engine.cmd_dragging.get(),
                 tab_dragging: self.tab_drag.is_armed_or_dragging(),
                 divider_grabbed: self.divider_grab.is_some(),
                 terminal_split_dragging: self.terminal_split_dragging,
@@ -4678,12 +4744,29 @@ impl App {
                     );
                 }
             }
+            render::MouseDragRoute::CommandLine => {
+                // #816: same `command_line_click_char_idx` helper the press
+                // rung uses — extends `cmd_sel`'s head via
+                // `CommandLineLayout::hit_test`, mirroring TUI's identical
+                // drag arm in `mouse::handle_mouse`.
+                if let Some(mut sel) = self.engine.borrow().cmd_sel.get() {
+                    let data = render::build_command_line(&self.engine.borrow());
+                    let char_width = self.backend.borrow().char_width();
+                    let rect = self.engine.borrow().command_line_rect.get();
+                    let point = quadraui::Point::new(x as f32, y as f32);
+                    if let Some(char_idx) =
+                        render::command_line_click_char_idx(rect, &data.text, char_width, point)
+                    {
+                        sel.1 = char_idx;
+                        self.engine.borrow().cmd_sel.set(Some(sel));
+                    }
+                }
+            }
             // #192: a drag inside an open modal with nothing armed is swallowed
             // so it cannot leak to the editor underneath.
             render::MouseDragRoute::ModalSwallow
             | render::MouseDragRoute::SidebarResize
             | render::MouseDragRoute::SidebarBody
-            | render::MouseDragRoute::CommandLine
             | render::MouseDragRoute::None => {}
         }
         self.draw_needed.set(true);
@@ -4759,6 +4842,7 @@ impl App {
         }
         self.h_sb_drag_cell.set(None);
         self.divider_grab = None;
+        self.engine.borrow().cmd_dragging.set(false);
         {
             let mut engine = self.engine.borrow_mut();
             engine.mouse_drag_active = false;
@@ -6191,10 +6275,26 @@ impl App {
                 position,
                 ..
             } => {
-                if let Some(edge) = ctx.window_edge(position.x, position.y, backend.line_height()) {
-                    backend.begin_window_resize(edge);
-                    self.draw_needed.set(true);
-                    return quadraui::Reaction::Redraw;
+                // #816: the command line paints in the window's literal last
+                // `line_height` pixels — exactly the margin `window_edge`
+                // treats as the bottom resize border — so without this guard
+                // a click on it landing here first (before
+                // `handle_mouse_click_msg`'s command-line rung ever ran)
+                // ordered `begin_window_resize` instead of ever reaching the
+                // click. No prior GTK feature lived in that exact band to
+                // expose the conflict; the command line is the first.
+                let over_command_line = {
+                    let r = self.engine.borrow().command_line_rect.get();
+                    r.width > 0.0 && position.y >= r.y && position.y < r.y + r.height
+                };
+                if !over_command_line {
+                    if let Some(edge) =
+                        ctx.window_edge(position.x, position.y, backend.line_height())
+                    {
+                        backend.begin_window_resize(edge);
+                        self.draw_needed.set(true);
+                        return quadraui::Reaction::Redraw;
+                    }
                 }
             }
             _ => {}
@@ -7024,6 +7124,12 @@ impl quadraui::ShellApp for App {
                     let cmd_y = status_y + (status_bar_h - lh);
                     let cmd = render::command_line_view(&screen.command);
                     let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
+                    // #816: publish the painted rect for
+                    // `render::command_line_click_char_idx` — the exact twin
+                    // of `global_status_rect` above, and TUI's identical
+                    // cache in `shell_app.rs`'s own `FrameOp::CommandLine`
+                    // arm.
+                    self.engine.borrow().command_line_rect.set(cmd_rect);
                     backend.draw_command_line(cmd_rect, &cmd);
                     composed.push(render::FrameOp::CommandLine);
                 }

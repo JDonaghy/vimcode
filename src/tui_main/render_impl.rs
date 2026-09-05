@@ -1805,8 +1805,6 @@ mod tests {
             &mut last_click_time,
             &mut last_click_pos,
             &mut None,
-            &mut None,
-            &mut false,
             &mut should_quit,
             &mut None,
             &mut None,

@@ -262,8 +262,6 @@ pub(super) fn handle_mouse(
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
     folder_picker: &mut Option<quadraui::FolderPickerController>,
-    cmd_sel: &mut Option<(usize, usize)>,
-    cmd_dragging: &mut bool,
     should_quit: &mut bool,
     explorer_drag_src: &mut Option<usize>,
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
@@ -820,7 +818,7 @@ pub(super) fn handle_mouse(
                     )
                 }),
                 tab_dragging: tab_drag.is_armed_or_dragging(),
-                command_line_selecting: *cmd_dragging,
+                command_line_selecting: engine.cmd_dragging.get(),
                 divider_grabbed: divider_grab.is_some(),
                 terminal_split_dragging: *dragging_terminal_split,
                 terminal_panel_resizing: *dragging_terminal_resize,
@@ -907,12 +905,25 @@ pub(super) fn handle_mouse(
                     }
                 }
                 render::MouseDragRoute::CommandLine => {
-                    // #194: mirror the anchor fix above — the selection end
-                    // must be `editor_left`-relative too, or the drag anchor
-                    // and the live end drift apart by that same offset as
-                    // soon as the pointer moves.
-                    if let Some(ref mut sel) = *cmd_sel {
-                        sel.1 = col.saturating_sub(editor_left) as usize;
+                    // #816: same `command_line_click_char_idx` helper the
+                    // press rung above uses — mirrors the anchor fix (#194)
+                    // through the primitive instead of a second hand-rolled
+                    // `col - editor_left`. A drag that strays off the row
+                    // (rect y-bound) or left of it leaves the head where it
+                    // was, matching a bounded selection instead of chasing
+                    // `col` off the end of the text.
+                    if let Some(mut sel) = engine.cmd_sel.get() {
+                        let data = render::build_command_line(engine);
+                        let point = quadraui::Point::new(col as f32, row as f32);
+                        if let Some(char_idx) = render::command_line_click_char_idx(
+                            engine.command_line_rect.get(),
+                            &data.text,
+                            1.0,
+                            point,
+                        ) {
+                            sel.1 = char_idx;
+                            engine.cmd_sel.set(Some(sel));
+                        }
                     }
                 }
                 render::MouseDragRoute::Divider => {
@@ -1020,7 +1031,7 @@ pub(super) fn handle_mouse(
             // old separate `mouse_text_drag = false` reset.
             drag_state.end();
             *divider_grab = None;
-            *cmd_dragging = false;
+            engine.cmd_dragging.set(false);
             *hover_selecting = false;
             if *dragging_terminal_resize {
                 *dragging_terminal_resize = false;
@@ -1608,59 +1619,41 @@ pub(super) fn handle_mouse(
         return sidebar_width;
     }
 
-    // ── Command line click — start text selection ──────────────────────────────
-    // Skip when click is in the activity bar / sidebar columns — the command
-    // line (`chrome.cmd`, painted by `render_command_line`) only spans
-    // `main_content_bounds`, i.e. starts at `editor_left`, not `ab_width`.
-    // Gating on `ab_width` alone (pre-#194) let clicks over the sidebar's
-    // portion of the bottom row fall through here, and `char_idx = col`
-    // stored an *absolute* screen column while `render_command_line` indexes
-    // its cell vector from 0 at `area.x == editor_left` — the mismatch is
-    // exactly `editor_left` columns, so the rendered selection highlight
-    // walked off by the activity-bar+sidebar width whenever the sidebar was
-    // visible (#194). Both anchor and guard now use `editor_left`, matching
-    // the `rel_col = col - editor_left` convention used elsewhere in this
-    // file for the same row.
-    //
-    // #752 verdict, recorded rather than converged: this rung stays one-sided.
-    // Sharing it would mean *adding* a command-line text-selection
-    // implementation to GTK, and GTK has no `cmd_sel`/`cmd_dragging` state, no
-    // inverted-cell read-back pass (`render_command_line`'s `cmd_sel`
-    // argument), and paints its command line through `Surface::CommandLine`,
-    // which exposes no character-offset hit test. That is a quadraui gap, not
-    // a vimcode transcription: per `CLAUDE.md`'s Platform-Neutrality Rule the
-    // fix is a `CommandLineLayout::hit_test` in quadraui, then one shared rung
-    // here — not ~80 lines of new GTK-specific selection code. Left as-is.
-    {
-        use crate::core::Mode;
-        if row + 1 == term_height
-            && col >= editor_left
-            && matches!(engine.mode, Mode::Command | Mode::Search)
-        {
-            let char_idx = (col - editor_left) as usize;
-            let buf_len = engine.command_buffer.chars().count();
-            engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
-            *cmd_sel = Some((char_idx, char_idx));
-            *cmd_dragging = true;
-            return sidebar_width;
-        }
-        // Also allow selection on the message/command line in Normal mode.
-        if row + 1 == term_height
-            && col >= editor_left
-            && matches!(
-                engine.mode,
-                Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-            )
-            && !engine.message.is_empty()
-        {
-            let char_idx = (col - editor_left) as usize;
-            *cmd_sel = Some((char_idx, char_idx));
-            *cmd_dragging = true;
-            debug_log!(
-                "MSG_SEL start: col={} msg={:?}",
-                char_idx,
-                &engine.message[..engine.message.len().min(40)]
-            );
+    // ── Command line click — start text selection (#816) ───────────────────
+    // `render::command_line_click_char_idx` maps the click point to a
+    // character offset via quadraui#705's `CommandLineLayout::hit_test`,
+    // which now owns the `col - editor_left` arithmetic this rung used to
+    // hand-roll (and which briefly drifted from what `render_command_line`
+    // painted — #194). `engine.command_line_rect` is the row's ABSOLUTE
+    // bounds, cached at paint time (mirrors `global_status_rect`); a click
+    // outside it (including the activity-bar/sidebar columns, which the row
+    // doesn't span) is not a hit, so the old explicit `col >= editor_left`
+    // guard is gone with the arithmetic it protected.
+    // `render::command_line_selection_allowed` is the one mode gate
+    // (Command/Search, or Normal-family with a non-empty message) both
+    // backends now share — GTK's press handler (#816) states the identical
+    // rule instead of this rung staying TUI-only.
+    if render::command_line_selection_allowed(engine) {
+        let data = render::build_command_line(engine);
+        let point = quadraui::Point::new(col as f32, row as f32);
+        if let Some(char_idx) = render::command_line_click_char_idx(
+            engine.command_line_rect.get(),
+            &data.text,
+            1.0,
+            point,
+        ) {
+            if matches!(engine.mode, Mode::Command | Mode::Search) {
+                let buf_len = engine.command_buffer.chars().count();
+                engine.command_cursor = char_idx.saturating_sub(1).min(buf_len);
+            } else {
+                debug_log!(
+                    "MSG_SEL start: char_idx={} msg={:?}",
+                    char_idx,
+                    &engine.message[..engine.message.len().min(40)]
+                );
+            }
+            engine.cmd_sel.set(Some((char_idx, char_idx)));
+            engine.cmd_dragging.set(true);
             return sidebar_width;
         }
     }
@@ -2973,8 +2966,6 @@ mod tests {
             &mut last_click_time,
             &mut last_click_pos,
             &mut None,
-            &mut None,
-            &mut false,
             &mut should_quit,
             &mut None,
             &mut None,
@@ -3207,8 +3198,6 @@ mod tests {
             &mut last_click_time,
             &mut last_click_pos,
             &mut None,
-            &mut None,
-            &mut false,
             &mut should_quit,
             &mut None,
             &mut None,
@@ -3231,7 +3220,10 @@ mod tests {
     /// enough to give `handle_mouse` a non-zero `editor_left` for the
     /// message-row selection tests below, without the extra vertical-split
     /// machinery `split_engine_with_sidebar_and_menu` carries for the
-    /// divider tests.
+    /// divider tests. Also seeds `command_line_rect` (#816) — this fixture
+    /// bypasses `render_content`, which is what would normally populate it,
+    /// so it stands in for that one paint-time cache write, at the same
+    /// geometry `dispatch_left_click`'s fixed 120x40 terminal would paint.
     fn engine_with_sidebar_visible() -> Engine {
         let mut e = Engine::new();
         e.settings = crate::core::settings::Settings::default();
@@ -3239,77 +3231,21 @@ mod tests {
         if !e.app_shell.sidebar_visible() {
             e.toggle_sidebar();
         }
+        let editor_left = ACTIVITY_BAR_WIDTH + SIDEBAR_WIDTH + 1;
+        e.command_line_rect.set(quadraui::Rect::new(
+            editor_left as f32,
+            39.0,
+            (120 - editor_left) as f32,
+            1.0,
+        ));
         e
-    }
-
-    /// Like `dispatch_left_click`, but exposes `cmd_sel`/`cmd_dragging` as
-    /// out-params instead of discarding them — needed to assert on the
-    /// command-line/message selection anchor #194 fixes.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_left_click_for_cmd_sel(
-        engine: &mut Engine,
-        col: u16,
-        row: u16,
-        cmd_sel: &mut Option<(usize, usize)>,
-        cmd_dragging: &mut bool,
-    ) {
-        let ev = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        };
-        let mut sidebar = TuiSidebar::new();
-        let mut drag_state = quadraui::DragState::default();
-        let mut modal_stack = quadraui::ModalStack::new();
-        let mut last_click_time = Instant::now();
-        let mut last_click_pos: (u16, u16) = (0, 0);
-        let mut should_quit = false;
-
-        handle_mouse(
-            ev,
-            &mut sidebar,
-            engine,
-            &Some(Size {
-                width: 120,
-                height: 40,
-            }),
-            SIDEBAR_WIDTH,
-            &mut false,
-            &mut false,
-            &mut false,
-            &mut None,
-            &mut drag_state,
-            &mut modal_stack,
-            None,
-            &mut last_click_time,
-            &mut last_click_pos,
-            &mut None,
-            cmd_sel,
-            cmd_dragging,
-            &mut should_quit,
-            &mut None,
-            &mut None,
-            &mut render::TabDragState::default(),
-            &[],
-            None,
-            None,
-            &[],
-            None,
-            &mut false,
-            &mut false,
-            None,
-            None,
-            None,
-            None,
-        );
     }
 
     /// #194: clicking on the status/command-line row where `engine.message`
     /// is displayed must anchor `cmd_sel` at the column *relative to
-    /// `editor_left`* — where `render_command_line` starts indexing its cell
-    /// vector (`chrome.cmd.x == main_content_bounds.x == editor_left`) — not
-    /// the raw absolute screen column. Before the fix `char_idx = col`
+    /// `editor_left`* — where `CommandLineLayout::hit_test` (#705/#816) now
+    /// resolves it, via `engine.command_line_rect`'s cached paint geometry —
+    /// not the raw absolute screen column. Before the fix `char_idx = col`
     /// stored the absolute column while the paint side indexed from 0 at
     /// `editor_left`, so with the sidebar (30 cols) + activity bar (3 cols)
     /// visible, the rendered selection highlight walked off by exactly that
@@ -3318,25 +3254,23 @@ mod tests {
     fn message_row_click_anchors_selection_relative_to_editor_left() {
         let mut engine = engine_with_sidebar_visible();
         engine.message = "Use :%s/old/new/g for find & replace".to_string();
-        let mut cmd_sel = None;
-        let mut cmd_dragging = false;
         let editor_left = ACTIVITY_BAR_WIDTH + SIDEBAR_WIDTH + 1;
         let click_col = editor_left + 5; // 5th character of the message text
-        dispatch_left_click_for_cmd_sel(
+        dispatch_left_click(
             &mut engine,
             click_col,
             39, // term_height (40) - 1, the message/command-line row
-            &mut cmd_sel,
-            &mut cmd_dragging,
+            None,
+            &mut None,
         );
         assert_eq!(
-            cmd_sel,
+            engine.cmd_sel.get(),
             Some((5, 5)),
             "selection anchor must be editor_left-relative (5), not the raw \
              absolute screen column ({click_col})"
         );
         assert!(
-            cmd_dragging,
+            engine.cmd_dragging.get(),
             "click on the message row must arm cmd_dragging"
         );
     }
@@ -3592,8 +3526,6 @@ mod tests {
             &mut last_click_time,
             &mut last_click_pos,
             &mut None,
-            &mut None,
-            &mut false,
             &mut should_quit,
             &mut None,
             &mut None,
@@ -3773,8 +3705,6 @@ mod tests {
             &mut last_click_time,
             &mut last_click_pos,
             &mut None,
-            &mut None,
-            &mut false,
             &mut should_quit,
             &mut None,
             &mut None,
@@ -3887,8 +3817,6 @@ mod tests {
             &mut last_click_time,
             &mut last_click_pos,
             &mut None,
-            &mut None,
-            &mut false,
             &mut should_quit,
             &mut None,
             &mut None,
