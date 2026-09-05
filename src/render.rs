@@ -6476,6 +6476,24 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
 // `draw_text_display`, `draw_status_bar`, `draw_rich_text_popup`) — there is
 // no per-backend painting left to lift, only per-backend *sequencing*, which
 // is what this slice deletes.
+//
+// **Re-examined for #820** ("adopt `BottomPanelController` on GTK"), which
+// filed against a grep that read "0 uses in `src/app.rs`" as an unstarted
+// adoption. It isn't: both backends' zero call sites are deliberate (this
+// paragraph, `bottom_chrome_rects_for_shell_content`'s doc comment in
+// `tui_main/render_impl.rs`, and `TuiShellApp::render_content`'s own note by
+// `BottomChromeRects`'s construction all record the same verdict), and the
+// "3 mentions in the TUI" #820 read as partial progress are those three
+// rejection notes, not partial implementation. The blocker restated: `AppShell`
+// positions `BottomPanelController` as the last band before the content
+// area's bottom edge, so it cannot coexist with the debug toolbar and
+// separated-status rows vimcode stacks *below* the terminal/debug-output
+// panel — adopting it would need a `ShellConfig`/`AppShellLayout` capable of
+// more than one independently-gated bottom band, which does not exist
+// upstream today. No such gap is filed in quadraui as of this pass; filing
+// one (multi-band bottom chrome, not just the terminal-split/scrollbar gaps
+// #820 flagged) is the correct next step before this is revisited, per
+// `CLAUDE.md`'s Platform-Neutrality Rule — not GTK/TUI-side code.
 
 /// One rung of the shared **bottom band** — the stack of chrome vimcode carves
 /// out of the bottom of `AppShellLayout::main_content_bounds`.
