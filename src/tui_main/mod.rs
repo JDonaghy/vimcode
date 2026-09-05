@@ -458,18 +458,17 @@ fn handle_explorer_context_action(
     let is_dir = ctx_is_dir;
 
     match action {
-        "new_file" | "new_folder" => {
-            use crate::core::settings::ExplorerAction;
-            let crud_action = if action == "new_file" {
-                ExplorerAction::NewFile
-            } else {
-                ExplorerAction::NewFolder
-            };
-            engine.dispatch_explorer_crud(crud_action);
-        }
-        "rename" => {
-            use crate::core::settings::ExplorerAction;
-            engine.dispatch_explorer_crud(ExplorerAction::Rename);
+        // #823 item 6: the string -> `ExplorerAction` resolution for these
+        // two arms moved to `ExplorerAction::from_action_str` (shared with
+        // GTK's `App::explorer_action`) — see its doc comment for why
+        // `"delete"` (below) and `"move_file"` (no arm here at all) stay
+        // backend-specific rather than also routing through it.
+        "new_file" | "new_folder" | "rename" => {
+            if let Some(crud_action) =
+                crate::core::settings::ExplorerAction::from_action_str(action)
+            {
+                engine.dispatch_explorer_crud(crud_action);
+            }
         }
         "delete" => {
             engine.confirm_delete_file(&path);

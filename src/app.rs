@@ -5026,18 +5026,13 @@ impl App {
         }
     }
 
-    /// Explorer CRUD action triggered by a keyboard shortcut or context menu.
+    /// Explorer CRUD action triggered by a keyboard shortcut or context
+    /// menu. The string table moved to
+    /// [`crate::core::settings::ExplorerAction::from_action_str`] in #823
+    /// item 6 — see its doc comment for why only this 5-string resolver
+    /// (not the surrounding dispatch) is shared with TUI.
     fn explorer_action(&mut self, action_str: String) {
-        use crate::core::settings::ExplorerAction;
-        let action = match action_str.as_str() {
-            "new_file" => Some(ExplorerAction::NewFile),
-            "new_folder" => Some(ExplorerAction::NewFolder),
-            "rename" => Some(ExplorerAction::Rename),
-            "delete" => Some(ExplorerAction::Delete),
-            "move_file" => Some(ExplorerAction::MoveFile),
-            _ => None,
-        };
-        if let Some(action) = action {
+        if let Some(action) = crate::core::settings::ExplorerAction::from_action_str(&action_str) {
             self.engine.borrow_mut().dispatch_explorer_crud(action);
             self.queue_explorer_draw();
             self.draw_needed.set(true);
