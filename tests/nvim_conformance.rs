@@ -3652,8 +3652,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "ins:BS over indent (nosmarttab)",
     "ins:Tab at start (nosmarttab)",
     "vis:gv after Vjd",
-    "vis:Vr-",
-    "vis:vlp linewise reg",
     "vis:vip then ip extends",
     "vis:v'a? mark d",
     "vis:vjc then u",

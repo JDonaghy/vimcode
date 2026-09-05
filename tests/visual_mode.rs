@@ -426,3 +426,32 @@ fn test_visual_equal_and_gJ() {
     press(&mut e, 'J');
     assert_buf(&e, "a  b\nc\n");
 }
+
+/// Putting a **linewise** register over a **charwise** selection splits the
+/// line, rather than splicing the two halves back together (#807).
+///
+/// Oracle: `vis:vlp linewise reg`. Fails on unfixed `develop`, which produces
+/// `a\nb\na\nz` — the empty line where `xy` used to be is missing.
+#[test]
+fn test_visual_put_linewise_register_over_charwise_selection() {
+    let mut e = engine_with("a\nb\nxyz\n");
+    type_chars(&mut e, "yyjj");
+    press(&mut e, 'v');
+    press(&mut e, 'l');
+    press(&mut e, 'p');
+    assert_buf(&e, "a\nb\n\na\nz\n");
+    assert_cursor(&e, 3, 0);
+}
+
+/// Linewise `r` covers whole lines, so the cursor lands in column 0
+/// (#807, oracle `vis:Vr-`).
+#[test]
+fn test_visual_line_replace_cursor_column() {
+    let mut e = engine_with("abc\n");
+    press(&mut e, 'l');
+    press(&mut e, 'V');
+    press(&mut e, 'r');
+    press(&mut e, '-');
+    assert_buf(&e, "---\n");
+    assert_cursor(&e, 0, 0);
+}

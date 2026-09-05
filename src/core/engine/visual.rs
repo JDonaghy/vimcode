@@ -317,7 +317,7 @@ impl Engine {
 
         self.start_undo_group();
 
-        if sel_linewise || paste_linewise {
+        if sel_linewise {
             // Linewise paste: insert on its own line
             let line = self.view().cursor.line;
             let line_start = self.buffer().line_to_char(line);
@@ -329,6 +329,24 @@ impl Engine {
             };
             self.insert_with_undo(line_start, &content);
             self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+        } else if paste_linewise {
+            // A LINEWISE register put over a CHARWISE selection splits the
+            // line in two at the deletion point and drops the register's
+            // lines between the halves — `yyjjvlp` on `a`/`b`/`xyz` gives
+            // `a`/`b`/``/`a`/`z`, with an empty line where `xy` used to be
+            // (#807; before, the two halves were spliced back together).
+            let line = start.line;
+            let col = start.col;
+            let at = self.buffer().line_to_char(line) + col;
+            let content = if paste_content.ends_with('\n') {
+                paste_content
+            } else {
+                format!("{}\n", paste_content)
+            };
+            self.insert_with_undo(at, &format!("\n{content}"));
+            let pasted_lines = content.matches('\n').count();
+            self.view_mut().cursor.line = line + pasted_lines;
             self.view_mut().cursor.col = 0;
         } else {
             // Characterwise paste: insert at the start of the deleted selection
