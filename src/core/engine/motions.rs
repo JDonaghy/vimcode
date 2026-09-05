@@ -3229,8 +3229,11 @@ impl Engine {
         let scroll_top = self.view().scroll_top;
         let viewport = self.viewport_lines().max(1);
         let max_line = self.buffer().len_lines().saturating_sub(1);
+        // #805 review: `saturating_sub` here is cheap insurance against a
+        // transient `scroll_top > max_line` (e.g. right after the buffer
+        // shrinks) underflowing this hot path for both `M` and `dM`.
         let last_visible = (scroll_top + viewport - 1).min(max_line);
-        let visible_count = last_visible - scroll_top + 1;
+        let visible_count = last_visible.saturating_sub(scroll_top) + 1;
         scroll_top + (visible_count - 1) / 2
     }
 
