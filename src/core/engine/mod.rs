@@ -2372,16 +2372,22 @@ pub struct Engine {
 
     // --- Cursor column memory (curswant) ---
     /// Vim's `curswant`: the column that Normal-mode vertical motions
-    /// (`j`/`k`/`gj`/`gk`) try to return to after being clamped onto a
-    /// shorter intervening line. `None` means "not tracked yet — derive it
-    /// from the actual cursor column the first time a vertical motion needs
-    /// it". `Some(CURSWANT_EOL)` means "always the end of the line",
-    /// set by `$` (mirrors `visual_dollar` above, but for Normal mode).
+    /// (`j`/`k`, and the scroll commands below) try to return to after being
+    /// clamped onto a shorter intervening line. `None` means "not tracked
+    /// yet — derive it from the actual cursor column the first time a
+    /// vertical motion needs it". `Some(CURSWANT_EOL)` means "always the end
+    /// of the line", set by `$` (mirrors `visual_dollar` above, but for
+    /// Normal mode).
+    ///
+    /// `gj`/`gk` do NOT participate: they dispatch to
+    /// `move_visual_down`/`move_visual_up` (`src/core/engine/search.rs`),
+    /// which compute their target column from the raw viewport column and
+    /// never read or write this field.
     ///
     /// Reset to `None` at the top of `handle_key` for any key that is not
     /// itself a curswant-preserving vertical motion or a key that merely
-    /// builds toward one (count digits, the `g` prefix) — see
-    /// `dispatch_resets_curswant` for the single choke point that decides.
+    /// builds toward one (count digits) — see `update_curswant_for_key` for
+    /// the single choke point that decides.
     pub(crate) curswant: Option<usize>,
 
     /// Vim's `'scroll'` option: the line count `<C-d>`/`<C-u>` use. `None`

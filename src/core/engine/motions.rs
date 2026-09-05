@@ -3270,14 +3270,30 @@ impl Engine {
     /// `<C-f>`: scroll a full page forward, keeping a 2-line overlap with
     /// the previous page, and land the cursor on the new top line
     /// (adjusted for `scrolloff`). Fold-aware.
+    ///
+    /// Once the last buffer line is already visible, real Vim stops
+    /// stepping and collapses the window to show just that last line
+    /// instead of clamping the usual step (#805: confirmed against real
+    /// interactive Neovim in a real terminal, which behaves differently
+    /// here than the headless oracle `tests/nvim_conformance.rs` uses —
+    /// see `scripts/nvim_headless_vs_interactive_repro.sh`). A step that
+    /// merely undershoots `max_line` by a line or two would otherwise miss
+    /// this collapse, since it never overshoots far enough to hit
+    /// `next_visible_line`'s own clamp.
     pub(crate) fn page_down(&mut self) {
         let viewport = self.viewport_lines().max(1);
         let max_line = self.buffer().len_lines().saturating_sub(1);
+        let old_top = self.view().scroll_top;
+        if (old_top + viewport).saturating_sub(1) >= max_line {
+            self.view_mut().scroll_top = max_line;
+            self.view_mut().cursor.line = max_line;
+            let want = self.curswant();
+            self.apply_curswant(want);
+            return;
+        }
         let overlap = 2usize.min(viewport.saturating_sub(1));
         let step = viewport.saturating_sub(overlap);
-        let new_top = self
-            .view()
-            .next_visible_line(self.view().scroll_top, step, max_line);
+        let new_top = self.view().next_visible_line(old_top, step, max_line);
         self.view_mut().scroll_top = new_top;
         let scrolloff = self.settings.scrolloff;
         self.view_mut().cursor.line = self.view().next_visible_line(new_top, scrolloff, max_line);
@@ -3286,20 +3302,30 @@ impl Engine {
     }
 
     /// `<C-b>`: scroll a full page backward, keeping a 2-line overlap with
-    /// the previous page, and land the cursor on the new bottom line
-    /// (adjusted for `scrolloff`). The `scroll_top` step is fold-aware; the
-    /// `scrolloff` sub-adjustment within the new page is not (no test
-    /// exercises folds combined with `scrolloff` here).
+    /// the previous page. Mirrors `<C-f>`, with two differences confirmed
+    /// against real interactive Neovim (#805; see
+    /// `scripts/nvim_headless_vs_interactive_repro.sh` — the headless
+    /// oracle `tests/nvim_conformance.rs` uses disagrees with real Neovim
+    /// on both):
+    ///  - already at the top of the buffer is a true no-op (no cursor
+    ///    move at all), not just a clamped scroll;
+    ///  - the cursor lands on `scrolloff + 1` lines below the *previous*
+    ///    topline — not at the bottom of the new page — which only
+    ///    coincides with "bottom of the new page" when the scroll isn't
+    ///    clamped by the start of the buffer.
     pub(crate) fn page_up(&mut self) {
+        let old_top = self.view().scroll_top;
+        if old_top == 0 {
+            return;
+        }
         let viewport = self.viewport_lines().max(1);
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let overlap = 2usize.min(viewport.saturating_sub(1));
         let step = viewport.saturating_sub(overlap);
-        let new_top = self.view().prev_visible_line(self.view().scroll_top, step);
+        let new_top = self.view().prev_visible_line(old_top, step);
         self.view_mut().scroll_top = new_top;
         let scrolloff = self.settings.scrolloff;
-        let bottom = (new_top + viewport).saturating_sub(1).min(max_line);
-        self.view_mut().cursor.line = bottom.saturating_sub(scrolloff).max(new_top);
+        self.view_mut().cursor.line = (old_top + scrolloff + 1).min(max_line);
         let want = self.curswant();
         self.apply_curswant(want);
     }
@@ -5210,7 +5236,10 @@ impl Engine {
     /// Scroll so that cursor line is centered in viewport.
     pub(crate) fn scroll_cursor_center(&mut self) {
         let cursor_line = self.view().cursor.line;
-        let half = self.viewport_lines() / 2;
+        // #805: `(viewport - 1) / 2`, not `viewport / 2` — confirmed against
+        // real interactive Neovim's `zz`, which was landing one line lower
+        // than vimcode did (see scripts/nvim_headless_vs_interactive_repro.sh).
+        let half = self.viewport_lines().saturating_sub(1) / 2;
         let new_top = cursor_line.saturating_sub(half);
         self.view_mut().scroll_top = new_top;
     }

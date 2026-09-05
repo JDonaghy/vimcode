@@ -3799,26 +3799,38 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "num:C-x on 0 leading zeros 000",
     "num:V C-a cursor",
     "num:v C-a on -5 in visual (no minus)",
-    // #805: this whole block traces to a single root cause discovered while
-    // fixing the rest of the `scroll:` category — headless `nvim` (no UI
-    // ever attached, so no real redraw ever happens) never validates
-    // `w_topline`/`w_botline` for most window-relative commands. `H`/`M`/`L`
-    // /`G`/`gg`/`%`/`<C-b>`/`<C-f>` end up reading a *stale* topline that
-    // silently defaults to "equal to the cursor's own line" instead of a
-    // real scrolled value — so e.g. plain `H` right after `30G` is a no-op
-    // in the oracle (cursor doesn't move) where real interactive Vim would
-    // jump to the window's actual top line. `<C-d>`/`<C-u>` are the outliers
-    // that DO force a real topline update as part of their own processing,
-    // which is why the col-preserving/`'scroll'`-sticky cases among these
-    // fixed cleanly while anything chaining H/M/L/C-b/C-f after a jump did
-    // not. Matching the oracle here would mean deliberately making
-    // vimcode's *real, correctly-tracked* scroll position behave like a
-    // broken one — worse for actual interactive use, not better Vim
-    // compat — so these stay listed rather than "fixed" against a harness
-    // artifact. Confirmed via a minimal non-harness repro
-    // (`nvim --headless -l script.lua` with a single `nvim_feedkeys` call,
-    // no `CONFORMANCE_DUMP_DEVIATIONS` involved) that reproduces the same
-    // stale-topline reads outside this test file entirely.
+    // #805: every entry below this comment (down to, but not including,
+    // "scroll:C-d col sol") traces to a single root cause: headless `nvim`
+    // (`nvim --headless -l script.lua`, no UI ever attached, no real redraw
+    // ever happens) never validates `w_topline`/`w_botline` for most
+    // window-relative commands. `H`/`M`/`L`/`G`/`gg`/`%`/`<C-b>`/`<C-f>`/
+    // `zz`/`zt`/`zb`/`z.`/`z-`, and anything chained after one of these, end
+    // up reading a *stale* topline that silently defaults to "equal to the
+    // cursor's own line" instead of the real scrolled value — so e.g. plain
+    // `H` right after `30G` is a no-op in the oracle (cursor doesn't move)
+    // where real interactive Vim jumps to the window's actual top line.
+    // `<C-d>`/`<C-u>` are the outliers that DO force a real topline update
+    // as part of their own processing, which is why the col-preserving/
+    // `'scroll'`-sticky cases among these fixed cleanly while anything
+    // chaining H/M/L/C-b/C-f/zz/etc. after a jump did not.
+    //
+    // Matching the oracle here would mean deliberately making vimcode's
+    // *real, correctly-tracked* scroll position behave like a broken one —
+    // worse for actual interactive use, not better Vim compat — so these
+    // stay listed rather than "fixed" against a harness artifact.
+    //
+    // This is not a comment-only assertion: `scripts/nvim_headless_vs_interactive_repro.sh`
+    // reproduces the divergence outside this test file, by running the same
+    // buffer/cursor/keys through both headless nvim (like `run_in_neovim`
+    // below) and a real interactive nvim driven inside a tmux pane with an
+    // actual terminal attached (so the window really redraws). Every label
+    // in this block was re-verified this way during the #805 fix round:
+    // vimcode's own value matches the *interactive* column, never the
+    // headless one. `page_up`/`page_down`/`scroll_cursor_center` in
+    // `src/core/engine/motions.rs` carry the resulting fixes (the 2-line
+    // buffer-start/end no-op guards, the post-clamp cursor formula for
+    // `<C-b>`, and the `zz`/`z.` centering off-by-one) plus source comments
+    // pointing back here.
     "scroll:C-b",
     "scroll:G C-y",
     "scroll:H from 30",
@@ -3832,12 +3844,16 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "scroll:z-H",
     "scroll:C-d C-d",
     "scroll:5C-d C-d",
-    "scroll:C-f at end",
-    "scroll:C-b at start",
     "scroll:C-f C-f",
     "scroll:G H",
     "scroll:G M",
     "scroll:dH",
+    // Separate, genuine root cause: vimcode doesn't implement Vim's
+    // 'startofline' option at all, so `<C-d>` never moves the cursor to the
+    // first non-blank column the way this case's `vim.o.startofline=true`
+    // setup expects — confirmed against real interactive Neovim too (this
+    // one is NOT a headless-oracle artifact). Out of scope for #805; file a
+    // follow-up if 'startofline' support is wanted.
     "scroll:C-d col sol",
     "scroll:so=5 30G H",
     "scroll:so=5 30G L",

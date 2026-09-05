@@ -15,13 +15,19 @@ impl Engine {
     ///
     /// Preserved (left untouched) for:
     ///  - digits accumulating a count — they don't move the cursor at all;
-    ///  - `j` / `k` themselves, and `g` resolving to `gj` / `gk` — these are
-    ///    exactly the motions that read and re-propagate `curswant`
-    ///    (see `Engine::curswant` / `Engine::apply_curswant`).
+    ///  - `j` / `k` themselves;
+    ///  - `<C-d>` / `<C-u>` / `<C-f>` / `<C-b>` / `<C-e>` / `<C-y>` — Vim
+    ///    documents these as curswant-preserving alongside `j`/`k`, and
+    ///    `scroll_and_move_by`/`page_down`/`page_up` read/reapply `curswant`
+    ///    just like a plain vertical motion does.
     ///
-    /// Reset to `None` for everything else, including `$` — its own handler
+    /// Reset to `None` for everything else, including `$` (its own handler
     /// sets `Some(CURSWANT_EOL)` immediately afterward, so the reset here
-    /// just guarantees a clean slate for keys that don't.
+    /// just guarantees a clean slate for keys that don't) and `g` — even
+    /// when `g` is about to resolve to `gj`/`gk`: those dispatch to
+    /// `move_visual_down`/`move_visual_up` (`src/core/engine/search.rs`),
+    /// which never read or write `curswant`, so there is no downstream
+    /// motion for a preserved value to feed.
     fn update_curswant_for_key(&mut self, unicode: Option<char>, ctrl: bool) {
         if !matches!(
             self.mode,
@@ -33,25 +39,20 @@ impl Engine {
         if self.pending_operator.is_some()
             || self.pending_find_operator.is_some()
             || self.pending_text_object.is_some()
+            || self.pending_key.is_some()
         {
             self.curswant = None;
             return;
         }
-        if let Some(pk) = self.pending_key {
-            if pk == 'g' && matches!(unicode, Some('j') | Some('k')) {
-                return; // gj / gk continue a vertical chain like j / k do.
-            }
-            self.curswant = None;
-            return;
-        }
-        if !ctrl {
-            if let Some(ch) = unicode {
-                if matches!(ch, 'j' | 'k') {
+        if let Some(ch) = unicode {
+            if ctrl {
+                if matches!(ch, 'd' | 'u' | 'f' | 'b' | 'e' | 'y') {
                     return;
                 }
-                if ch.is_ascii_digit() && (ch != '0' || self.count.is_some()) {
-                    return; // count digit in progress; cursor hasn't moved
-                }
+            } else if matches!(ch, 'j' | 'k') {
+                return;
+            } else if ch.is_ascii_digit() && (ch != '0' || self.count.is_some()) {
+                return; // count digit in progress; cursor hasn't moved
             }
         }
         self.curswant = None;
@@ -1760,7 +1761,8 @@ impl Engine {
             }
             Some('%') => {
                 let pre_line = self.view().cursor.line;
-                if self.peek_count().is_some() {
+                let is_bracket_match = self.peek_count().is_none();
+                if !is_bracket_match {
                     // N% — go to N% of file
                     let pct = self.take_count().min(100);
                     let total = self.buffer().len_lines();
@@ -1773,15 +1775,23 @@ impl Engine {
                     self.view_mut().cursor.line = target;
                     let fnb = self.first_non_blank_col(target);
                     self.view_mut().cursor.col = fnb;
+                    // `N%` scrolls like any other jump — minimally, via the
+                    // `ensure_cursor_visible()` call `handle_key` already
+                    // makes after dispatch (#805: verified against real
+                    // interactive Neovim — a 50%-of-60-lines jump lands the
+                    // target line at the *bottom* of the window, not
+                    // centered; see scripts/nvim_headless_vs_interactive_repro.sh).
                 } else {
                     self.push_jump_location();
                     self.move_to_matching_bracket();
                 }
-                // Center viewport when the match is far from the current view,
-                // so the matched brace is clearly visible (like search `n`).
+                // Center viewport when a matched bracket is far from the
+                // current view, so it's clearly visible (like search `n`).
+                // Only applies to bracket matching — `N%` (above) uses the
+                // normal minimal-scroll jump behavior instead.
                 let post_line = self.view().cursor.line;
                 let vp = self.view().viewport_lines;
-                if vp > 0 && pre_line.abs_diff(post_line) > vp / 2 {
+                if is_bracket_match && vp > 0 && pre_line.abs_diff(post_line) > vp / 2 {
                     self.scroll_cursor_center();
                 }
             }
