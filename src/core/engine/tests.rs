@@ -1879,7 +1879,7 @@ fn test_yank_line_yy() {
     // Check register content
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line1\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(engine.message.contains("yanked"));
 }
 
@@ -1894,7 +1894,7 @@ fn test_yank_line_Y() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "second\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -1941,7 +1941,7 @@ fn test_delete_x_fills_register() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "A");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -1956,7 +1956,7 @@ fn test_delete_dd_fills_register() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "second\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -1972,7 +1972,7 @@ fn test_delete_D_fills_register() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "llo world");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -2200,7 +2200,7 @@ fn test_yank_last_line_no_newline() {
     // Should still be linewise with newline added
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "last\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 // --- Visual Mode Tests ---
@@ -2263,7 +2263,7 @@ fn test_visual_yank_forward() {
     // Check register
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "hello");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 
     // Should be back in normal mode
     assert_eq!(engine.mode, Mode::Normal);
@@ -2333,7 +2333,7 @@ fn test_visual_line_yank() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line1\nline2\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -2357,7 +2357,7 @@ fn test_visual_line_yank_cursor_moves_to_start() {
     // Verify register content
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line3\nline4\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -2933,7 +2933,7 @@ fn test_count_x_delete_chars() {
     // Check register contains deleted chars
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "ABC");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -2967,7 +2967,7 @@ fn test_count_dd_delete_lines() {
     // Check register contains all 3 lines
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "line1\nline2\nline3\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -2983,7 +2983,7 @@ fn test_count_yy_yank_lines() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "alpha\nbeta\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(engine.message.contains("2 lines yanked"));
 
     // Buffer should be unchanged
@@ -3003,7 +3003,7 @@ fn test_count_Y_yank_lines() {
 
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "one\ntwo\nthree\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(engine.message.contains("3 lines yanked"));
 }
 
@@ -3347,7 +3347,7 @@ fn test_count_visual_line_mode() {
 
     // Should have yanked 4 lines (lines 0-3)
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     assert!(content.contains("line 1"));
     assert!(content.contains("line 4"));
 }
@@ -3615,7 +3615,7 @@ fn test_dw_delete_word() {
     // Check register
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "hello ");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -5473,7 +5473,7 @@ fn test_visual_block_yank() {
     // Check register - should have "ab\nde"
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "ab\nde");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 
     // Should be back in normal mode
     assert_eq!(engine.mode, Mode::Normal);
@@ -12816,7 +12816,7 @@ fn test_clipboard_register_read() {
     assert!(content.is_some());
     let (text, linewise) = content.unwrap();
     assert_eq!(text, "from_clipboard");
-    assert!(!linewise);
+    assert!(!linewise.is_linewise());
 }
 
 #[test]
@@ -13020,7 +13020,7 @@ fn test_vscode_mode_ctrl_c_no_selection_copies_line() {
     // Register '+' should contain the line
     let (reg_content, is_linewise) = engine.registers.get(&'+').cloned().unwrap_or_default();
     assert!(reg_content.contains("hello"));
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]
@@ -14822,7 +14822,7 @@ fn test_yyp_pastes_on_next_line() {
     press_char(&mut engine, 'y');
     let (reg_content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(reg_content, "foo\n", "yanked content");
-    assert!(is_lw, "should be linewise");
+    assert!(is_lw.is_linewise(), "should be linewise");
     press_char(&mut engine, 'p');
     // Expected: "foo\nfoo\n\nfoo \n   foo foo\n"
     let result = engine.buffer().to_string();
@@ -14883,11 +14883,13 @@ fn test_add_cursor_at_next_match_shows_count_message() {
 fn test_load_clipboard_for_paste_preserves_linewise() {
     // When clipboard content matches the existing '"' register, is_linewise is kept.
     let mut engine = engine_with_text("foo\nbar\n");
-    engine.registers.insert('"', ("foo\n".to_string(), true));
+    engine
+        .registers
+        .insert('"', ("foo\n".to_string(), RegType::Linewise));
     engine.load_clipboard_for_paste("foo\n".to_string());
     let (_, lw) = engine.registers[&'"'].clone();
     assert!(
-        lw,
+        lw.is_linewise(),
         "load_clipboard_for_paste should preserve is_linewise when content matches"
     );
 }
@@ -14896,11 +14898,13 @@ fn test_load_clipboard_for_paste_preserves_linewise() {
 fn test_load_clipboard_for_paste_clears_linewise_for_foreign_content() {
     // When clipboard content differs (from another app), is_linewise becomes false.
     let mut engine = engine_with_text("foo\nbar\n");
-    engine.registers.insert('"', ("foo\n".to_string(), true));
+    engine
+        .registers
+        .insert('"', ("foo\n".to_string(), RegType::Linewise));
     engine.load_clipboard_for_paste("different text".to_string());
     let (_, lw) = engine.registers[&'"'].clone();
     assert!(
-        !lw,
+        !lw.is_linewise(),
         "load_clipboard_for_paste should clear is_linewise for external content"
     );
 }
@@ -14912,7 +14916,7 @@ fn test_yyp_linewise_via_clipboard_intercept() {
     press_char(&mut engine, 'y');
     press_char(&mut engine, 'y');
     let (content, lw) = engine.registers[&'"'].clone();
-    assert!(lw, "yy should set is_linewise=true");
+    assert!(lw.is_linewise(), "yy should set is_linewise=true");
     // Backend intercepts p, reads same text from clipboard, calls load_clipboard_for_paste.
     engine.load_clipboard_for_paste(content);
     press_char(&mut engine, 'p');
@@ -21923,7 +21927,8 @@ fn test_matrix_delete_register_contents() {
             "FAIL [{label}]: register content mismatch"
         );
         assert_eq!(
-            *is_linewise, expected_linewise,
+            is_linewise.is_linewise(),
+            expected_linewise,
             "FAIL [{label}]: linewise flag mismatch"
         );
     }
@@ -22361,7 +22366,8 @@ fn test_matrix_change_register_contents() {
             "FAIL [{label}]: register content mismatch"
         );
         assert_eq!(
-            *is_linewise, expected_linewise,
+            is_linewise.is_linewise(),
+            expected_linewise,
             "FAIL [{label}]: linewise flag mismatch"
         );
     }
@@ -22419,7 +22425,8 @@ fn test_matrix_yank_char_motions() {
             .unwrap_or_else(|| panic!("FAIL [{label}]: no register"));
         assert_eq!(content, expected_reg, "FAIL [{label}]: register mismatch");
         assert_eq!(
-            *is_linewise, expected_linewise,
+            is_linewise.is_linewise(),
+            expected_linewise,
             "FAIL [{label}]: linewise mismatch"
         );
         assert_eq!(
@@ -22481,7 +22488,10 @@ fn test_matrix_yank_linewise_motions() {
             .get(&'"')
             .unwrap_or_else(|| panic!("FAIL [{label}]: no register"));
         assert_eq!(content, expected_reg, "FAIL [{label}]: register mismatch");
-        assert!(is_linewise, "FAIL [{label}]: should be linewise");
+        assert!(
+            is_linewise.is_linewise(),
+            "FAIL [{label}]: should be linewise"
+        );
         assert_eq!(
             engine.view().cursor.line,
             eline,
@@ -22532,7 +22542,7 @@ fn test_matrix_yank_with_count() {
     send_keys(&mut engine, "3y2w");
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "a b c d e f ", "3y2w should yank 6 words");
-    assert!(!is_linewise, "3y2w should be charwise");
+    assert!(!is_linewise.is_linewise(), "3y2w should be charwise");
 }
 
 #[test]
@@ -22720,7 +22730,7 @@ fn test_matrix_count_yy() {
     send_keys(&mut engine, "2yy");
     let (content, is_linewise) = engine.registers.get(&'"').unwrap();
     assert_eq!(content, "a\nb\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
     // Buffer unchanged
     assert_eq!(engine.buffer().to_string(), "a\nb\nc\nd");
 }
@@ -23154,7 +23164,7 @@ fn test_3yy_P_pastes_above_line_not_inline() {
     // Verify register is linewise
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\nbbb\nccc\n");
-    assert!(is_lw, "3yy should set is_linewise=true");
+    assert!(is_lw.is_linewise(), "3yy should set is_linewise=true");
 
     // Move to line 3 (ddd), col 1 (middle of line)
     press_char(&mut engine, 'j');
@@ -23245,7 +23255,7 @@ fn test_3yy_P_via_clipboard_crlf_round_trip() {
     // Register has "aaa\nbbb\nccc\n" with is_linewise=true
     let (reg, lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(reg, "aaa\nbbb\nccc\n");
-    assert!(lw);
+    assert!(lw.is_linewise());
 
     // Simulate Windows clipboard round-trip: \r\n line endings, trailing \r\n stripped
     engine.load_clipboard_for_paste("aaa\r\nbbb\r\nccc".to_string());
@@ -23257,7 +23267,7 @@ fn test_3yy_P_via_clipboard_crlf_round_trip() {
         "CRLF should be normalized to LF with trailing newline"
     );
     assert!(
-        is_lw,
+        is_lw.is_linewise(),
         "is_linewise should survive CRLF clipboard round-trip"
     );
 
@@ -23288,11 +23298,17 @@ fn test_load_clipboard_foreign_content_not_linewise() {
     let mut engine = engine_with_text("aaa\nbbb\n");
     press_char(&mut engine, 'y');
     press_char(&mut engine, 'y');
-    assert!(engine.registers.get(&'"').unwrap().1, "should be linewise");
+    assert!(
+        engine.registers.get(&'"').unwrap().1.is_linewise(),
+        "should be linewise"
+    );
 
     engine.load_clipboard_for_paste("completely different text".to_string());
     let (_, is_lw) = engine.registers.get(&'"').unwrap();
-    assert!(!is_lw, "foreign clipboard content should not be linewise");
+    assert!(
+        !is_lw.is_linewise(),
+        "foreign clipboard content should not be linewise"
+    );
 }
 
 // ── feed_keys tests ──────────────────────────────────────────────────────
@@ -23338,7 +23354,7 @@ fn test_feed_keys_yank_and_paste() {
     engine.feed_keys("yy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\n");
-    assert!(is_lw);
+    assert!(is_lw.is_linewise());
     // Paste below
     engine.feed_keys("p");
     assert_eq!(engine.buffer().to_string(), "aaa\naaa\nbbb\nccc\n");
@@ -23441,7 +23457,7 @@ fn test_lua_eval_register() {
     }
     engine
         .registers
-        .insert('a', ("test content".to_string(), false));
+        .insert('a', ("test content".to_string(), RegType::Charwise));
     engine.execute_command("EvalReg");
     assert_eq!(engine.message, "reg:test content");
 }
@@ -23940,7 +23956,7 @@ fn test_nvim_visual_line_yank_count() {
     engine.feed_keys("2Vy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\nbbb\n");
-    assert!(is_lw, "visual line yank should be linewise");
+    assert!(is_lw.is_linewise(), "visual line yank should be linewise");
 }
 
 #[test]
@@ -24854,7 +24870,7 @@ fn test_nvim_y_big_yank_line() {
     engine.feed_keys("Y");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "hello world\n");
-    assert!(is_lw, "Y should be linewise");
+    assert!(is_lw.is_linewise(), "Y should be linewise");
 }
 
 #[test]
@@ -25294,7 +25310,7 @@ fn test_nvim_3yy_register() {
     engine.feed_keys("3yy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "aaa\nbbb\nccc\n");
-    assert!(is_lw);
+    assert!(is_lw.is_linewise());
 }
 
 #[test]
@@ -25494,7 +25510,7 @@ fn test_nvim_visual_line_join_count() {
     engine.feed_keys("Vy");
     let (content, is_lw) = engine.registers.get(&'"').unwrap().clone();
     assert_eq!(content, "hello world\n");
-    assert!(is_lw);
+    assert!(is_lw.is_linewise());
 }
 
 #[test]
@@ -26098,7 +26114,7 @@ fn test_nvim_x_fills_unnamed_register() {
     engine.feed_keys("x");
     let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
     assert_eq!(text, "A");
-    assert!(!is_linewise);
+    assert!(!is_linewise.is_linewise());
 }
 
 #[test]
@@ -26110,7 +26126,7 @@ fn test_nvim_dd_fills_unnamed_linewise() {
     engine.feed_keys("jdd");
     let (text, is_linewise) = engine.registers.get(&'"').cloned().unwrap_or_default();
     assert_eq!(text, "second\n");
-    assert!(is_linewise);
+    assert!(is_linewise.is_linewise());
 }
 
 #[test]

@@ -4721,9 +4721,14 @@ impl Engine {
                 char_idx
             };
             self.insert_with_undo(insert_pos, &content);
-            // Move cursor to end of pasted text (last char)
             let paste_len = content.chars().count();
-            if paste_len > 0 {
+            if content.contains('\n') {
+                // Vim leaves the cursor on the FIRST character of a
+                // multi-line charwise put, not the last (#807, `op:p charwise
+                // multiline` and the six `vis:*y … p` cursor cases).
+                self.view_mut().cursor.col = insert_pos - self.buffer().line_to_char(line);
+            } else if paste_len > 0 {
+                // Single line: cursor lands on the last pasted char.
                 self.view_mut().cursor.col = col + paste_len;
             }
         }
@@ -4771,9 +4776,12 @@ impl Engine {
             let col = self.view().cursor.col;
             let char_idx = self.buffer().line_to_char(line) + col;
             self.insert_with_undo(char_idx, &content);
-            // Cursor moves to end of pasted text
             let paste_len = content.chars().count();
-            if paste_len > 0 {
+            if content.contains('\n') {
+                // See `paste_after`: multi-line charwise leaves the cursor at
+                // the start of the pasted text.
+                self.view_mut().cursor.col = col;
+            } else if paste_len > 0 {
                 self.view_mut().cursor.col = col + paste_len - 1;
             }
         }
@@ -6046,10 +6054,9 @@ fn str2nr(chars: &[char], start: usize, nf: NrFormats, maxlen: usize) -> ParsedN
     let mut pre = None;
     if get(i) == '0' {
         let c1 = get(i + 1);
-        if nf.hex && (c1 == 'x' || c1 == 'X') && get(i + 2).is_ascii_hexdigit() {
-            pre = Some(c1);
-            i += 2;
-        } else if nf.bin && (c1 == 'b' || c1 == 'B') && is_bin_digit(get(i + 2)) {
+        let prefixed = (nf.hex && (c1 == 'x' || c1 == 'X') && get(i + 2).is_ascii_hexdigit())
+            || (nf.bin && (c1 == 'b' || c1 == 'B') && is_bin_digit(get(i + 2)));
+        if prefixed {
             pre = Some(c1);
             i += 2;
         } else if nf.oct && c1 != '8' && c1 != '9' {

@@ -262,3 +262,147 @@ fn test_visual_paste_preserves_ip_text_object() {
     assert_eq!(anchor.line, 0);
     assert_eq!(e.cursor().line, 1);
 }
+
+// ── #807: uppercase Visual operators + blockwise registers ───────────────────
+
+/// `:h v_D` / `v_X` / `v_Y` / `v_C` / `v_S` / `v_R` — in charwise Visual these
+/// all act **linewise** on the selected lines, and `s` is a synonym for `c`.
+///
+/// Every expectation here is the nvim oracle's (`vis:vjD`, `vis:vjX`,
+/// `vis:vjY p`, `vis:vjC`, `vis:vjS`, `vis:vjR`, `vis:v s` in
+/// `tests/nvim_conformance.rs`); before #807 none of these keys did anything
+/// at all in Visual mode, so each assertion below fails on unfixed `develop`.
+#[test]
+fn test_visual_uppercase_operators_are_linewise() {
+    // D — delete the selected lines whole.
+    let mut e = engine_with("abc\ndef\nghi\n");
+    press(&mut e, 'l');
+    press(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'D');
+    assert_buf(&e, "ghi\n");
+    assert_cursor(&e, 0, 1);
+
+    // X — same as D.
+    let mut e = engine_with("abc\ndef\nghi\n");
+    press(&mut e, 'l');
+    press(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'X');
+    assert_buf(&e, "ghi\n");
+
+    // Y — yank the selected lines linewise, so `p` opens new lines.
+    let mut e = engine_with("abc\ndef\nghi\n");
+    press(&mut e, 'l');
+    press(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'Y');
+    assert_register(&e, '"', "abc\ndef\n", true);
+    press(&mut e, 'G');
+    press(&mut e, 'p');
+    assert_buf(&e, "abc\ndef\nghi\nabc\ndef\n");
+
+    // C / S / R — replace the selected lines with one line of typed text.
+    for key in ['C', 'S', 'R'] {
+        let mut e = engine_with("abc\ndef\nghi\n");
+        press(&mut e, 'l');
+        press(&mut e, 'v');
+        press(&mut e, 'j');
+        press(&mut e, key);
+        assert_mode(&e, Mode::Insert);
+        press(&mut e, 'X');
+        press_key(&mut e, "Escape");
+        assert_buf(&e, "X\nghi\n");
+    }
+
+    // s — synonym for c, charwise.
+    let mut e = engine_with("abcd\n");
+    press(&mut e, 'l');
+    press(&mut e, 'v');
+    press(&mut e, 'l');
+    press(&mut e, 's');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "aXd\n");
+}
+
+/// Visual-Block `D` and `C` extend the block to end-of-line (`:h v_b_D`).
+#[test]
+fn test_visual_block_uppercase_to_end_of_line() {
+    let mut e = engine_with("abcdef\nabcdef\n");
+    type_chars(&mut e, "ll");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'D');
+    assert_buf(&e, "ab\nab\n");
+
+    let mut e = engine_with("abcdef\nabcdef\n");
+    type_chars(&mut e, "ll");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'C');
+    press(&mut e, 'X');
+    press_key(&mut e, "Escape");
+    assert_buf(&e, "abX\nabX\n");
+}
+
+/// A blockwise yank must survive as a **rectangle**: `p` re-inserts it column
+/// by column instead of splicing the rows in as plain text.
+///
+/// Oracle: `vb:jy then P`, `vb:jjy p at eol`, `vb:jjy p on shorter`.
+#[test]
+fn test_blockwise_yank_then_put() {
+    let mut e = engine_with("ab\ncd\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'y');
+    assert_register_typed(&e, '"', "a\nc", vimcode_core::RegType::Blockwise);
+    press(&mut e, '$');
+    press(&mut e, 'P');
+    assert_buf(&e, "aab\nccd\n");
+    assert_cursor(&e, 0, 1);
+
+    // `p` puts after the cursor's column, and at end-of-line that appends.
+    let mut e = engine_with("ab\ncd\nef\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'y');
+    press(&mut e, '$');
+    press(&mut e, 'p');
+    assert_buf(&e, "aba\ncdc\nefe\n");
+
+    // Rows past the end of the buffer are created, and short lines padded.
+    let mut e = engine_with("abc\nabc\nx\n");
+    press(&mut e, 'l');
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'y');
+    assert_register_typed(&e, '"', "b\nb\n", vimcode_core::RegType::Blockwise);
+    press(&mut e, 'G');
+    press(&mut e, 'p');
+    assert_buf(&e, "abc\nabc\nxb\n b\n \n");
+}
+
+/// A blockwise **delete** register is blockwise too, so `p` still rebuilds a
+/// rectangle — and `<C-v>p` over another block replaces it in place.
+#[test]
+fn test_blockwise_delete_register_and_block_over_block() {
+    let mut e = engine_with("ab\ncd\nef\ngh\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'y');
+    type_chars(&mut e, "2j");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'p');
+    assert_buf(&e, "ab\ncd\naf\nch\n");
+    assert_cursor(&e, 2, 0);
+
+    let mut e = engine_with("abc\ndef\n");
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    press(&mut e, 'd');
+    assert_register_typed(&e, '"', "a\nd", vimcode_core::RegType::Blockwise);
+}

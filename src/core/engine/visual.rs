@@ -222,9 +222,12 @@ impl Engine {
 
                     self.delete_with_undo(start_char, end_char);
 
-                    // Position cursor at start of line
+                    // Neovim's 'startofline' is OFF by default, so a linewise
+                    // delete keeps the cursor's column rather than jumping to
+                    // the first non-blank (#807, `vis:Vjd` / `vis:Vd cursor`).
+                    let want = self.view().cursor.col;
                     self.view_mut().cursor.line = start.line;
-                    self.view_mut().cursor.col = 0;
+                    self.view_mut().cursor.col = want;
                 }
                 Mode::Visual => {
                     // Delete characters
@@ -411,19 +414,26 @@ impl Engine {
             // cursor lands on (Vim: blockwise `c` is a blockwise delete
             // followed by a blockwise insert at the same column).
             let block_info = if self.mode == Mode::VisualBlock {
-                self.visual_anchor
-                    .zip(self.get_visual_selection_range())
-                    .map(|(anchor, (start, end))| {
-                        let left_col = anchor.col.min(self.view().cursor.col);
-                        (start.line, end.line, left_col)
-                    })
+                self.get_visual_selection_range().map(|(start, end)| {
+                    let (left_col, _) = self.visual_block_cols();
+                    (start.line, end.line, left_col)
+                })
             } else {
                 None
             };
             self.delete_visual_selection(changed);
             if let Some((start_line, end_line, left_col)) = block_info {
                 self.visual_block_insert_info =
-                    Some((start_line, end_line, left_col, false, false));
+                    // `None` park column: a blockwise `c` leaves the cursor
+                    // after the typed text, unlike `I`/`A` (#807).
+                    Some((start_line, end_line, left_col, false, false, None));
+                // `delete_visual_selection` clamps the cursor to the last
+                // *character* of the shortened line, but a blockwise change
+                // must resume typing at the block's own column — which is
+                // legally one past the end in Insert mode (#807, `vb:jlcX`
+                // pasted the typed text at column 0 without this).
+                self.view_mut().cursor.line = start_line;
+                self.view_mut().cursor.col = left_col.min(self.line_text_len(start_line));
             }
         }
 

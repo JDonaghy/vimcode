@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 use vimcode_core::quadraui;
+use vimcode_core::RegType;
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -1703,7 +1704,8 @@ fn plugin_state_register_reads_register_content() {
         "#,
     );
     // Set register a
-    e.registers.insert('a', ("test content".to_string(), false));
+    e.registers
+        .insert('a', ("test content".to_string(), RegType::Charwise));
     exec(&mut e, "ShowReg");
     assert_eq!(e.message, "reg_a=test content");
 }
@@ -1744,7 +1746,7 @@ fn plugin_state_set_register_writes_register() {
     exec(&mut e, "SetReg");
     let (content, linewise) = e.registers.get(&'b').expect("register b should be set");
     assert_eq!(content, "plugin text");
-    assert!(linewise, "register should be linewise");
+    assert!(linewise.is_linewise(), "register should be linewise");
 }
 
 // ── vimcode.state.filetype ─────────────────────────────────────────────────
