@@ -23974,7 +23974,7 @@ mod tests {
         assert_eq!(link.url, "https://example.com");
         // line_text[0] must equal the raw line so index_to_pos byte indices are valid.
         assert_eq!(
-            popup.line_text.get(0).map(String::as_str),
+            popup.line_text.first().map(String::as_str),
             Some(line),
             "line_text must carry the raw text unchanged"
         );
