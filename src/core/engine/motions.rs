@@ -1758,11 +1758,11 @@ impl Engine {
             'W' => self.find_bigword_object(modifier, cursor_pos, count),
             '"' => self.find_quote_object(modifier, '"', cursor_pos),
             '\'' => self.find_quote_object(modifier, '\'', cursor_pos),
-            '(' | ')' | 'b' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
-            '{' | '}' | 'B' => self.find_bracket_object(modifier, '{', '}', cursor_pos),
-            '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos),
-            '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos),
-            'p' => self.find_paragraph_object(modifier, cursor_pos),
+            '(' | ')' | 'b' => self.find_bracket_object(modifier, '(', ')', cursor_pos, count),
+            '{' | '}' | 'B' => self.find_bracket_object(modifier, '{', '}', cursor_pos, count),
+            '[' | ']' => self.find_bracket_object(modifier, '[', ']', cursor_pos, count),
+            '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos, count),
+            'p' => self.find_paragraph_object(modifier, cursor_pos, count),
             's' => self.find_sentence_object(modifier, cursor_pos),
             't' => self.find_tag_text_object(modifier, cursor_pos),
             '`' => self.find_quote_object(modifier, '`', cursor_pos),
@@ -1973,103 +1973,135 @@ impl Engine {
         Some((start, end))
     }
 
-    /// Find bracket text object range (i(/a()
+    /// Find bracket text object range (`i(`/`a(`, `i{`, `i[`, `i<`).
+    ///
+    /// `count` steps out that many nesting levels (`d2i(` on `f(a, (b), c)`
+    /// with the cursor on `b` takes the outer pair); a count deeper than the
+    /// available nesting fails outright, as in Vim.
     pub(crate) fn find_bracket_object(
         &self,
         modifier: char,
         open_char: char,
         close_char: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
         let total_chars = self.buffer().len_chars();
         if cursor_pos >= total_chars {
             return None;
         }
 
-        // Find the nearest enclosing bracket pair
-        let mut open_pos = None;
-        let mut depth = 0;
+        let mut open_pos = self.enclosing_open_bracket(open_char, close_char, cursor_pos)?;
+        let mut close_pos = self.find_matching_bracket(open_pos, open_char, close_char, true)?;
+        for _ in 1..count.max(1) {
+            if open_pos == 0 {
+                return None;
+            }
+            open_pos = self.enclosing_open_bracket(open_char, close_char, open_pos - 1)?;
+            close_pos = self.find_matching_bracket(open_pos, open_char, close_char, true)?;
+        }
 
-        // Search backward for opening bracket
-        let mut pos = cursor_pos;
+        if modifier != 'i' {
+            // Around: include brackets
+            return Some((open_pos, close_pos + 1));
+        }
+        if open_pos >= close_pos {
+            return None;
+        }
+        let open_line = self.buffer().content.char_to_line(open_pos);
+        let close_line = self.buffer().content.char_to_line(close_pos);
+        if open_line == close_line {
+            return Some((open_pos + 1, close_pos));
+        }
+        // Multi-line: Vim drops the line break after the open bracket when
+        // nothing but white space follows it, and the line break before the
+        // close bracket when nothing but white space precedes it (`:h ib`).
+        // Getting only one of the two right is what made `di(` on
+        // `f(` / `a` / `b)` stop after the first line (#807).
+        let start = if self.blank_after(open_pos, open_line) {
+            self.buffer().line_to_char(open_line + 1)
+        } else {
+            open_pos + 1
+        };
+        let close_line_start = self.buffer().line_to_char(close_line);
+        let end = if self.blank_before(close_pos, close_line_start) {
+            close_line_start
+        } else {
+            close_pos
+        };
+        if start <= end {
+            Some((start, end))
+        } else {
+            Some((start, start))
+        }
+    }
+
+    /// The nearest unmatched `open_char` at or before `pos`, or — when the
+    /// cursor is not inside a pair at all — the next one forward on the line
+    /// (the fallback `%` uses, `:h ib`).
+    ///
+    /// A cursor sitting **on** the closing bracket belongs to that pair, so
+    /// the scan must not count it as one more level of nesting (#807,
+    /// `to:di( on )`).
+    fn enclosing_open_bracket(
+        &self,
+        open_char: char,
+        close_char: char,
+        pos: usize,
+    ) -> Option<usize> {
+        let total_chars = self.buffer().len_chars();
+        let mut depth: i32 = 0;
+        let mut i = pos;
         loop {
-            let ch = self.buffer().content.char(pos);
-            if ch == close_char {
+            let ch = self.buffer().content.char(i);
+            if ch == close_char && i != pos {
                 depth += 1;
             } else if ch == open_char {
                 if depth == 0 {
-                    open_pos = Some(pos);
-                    break;
-                } else {
-                    depth -= 1;
+                    return Some(i);
                 }
+                depth -= 1;
             }
-            if pos == 0 {
+            if i == 0 {
                 break;
             }
-            pos -= 1;
+            i -= 1;
         }
-
-        // Cursor isn't inside/on a bracket pair: Vim still finds `i(`/`a(`
-        // etc. by scanning forward on the current line for the next opening
-        // bracket, the same fallback `%` uses (`:h ib`; #806, "mac:macro
-        // with ci(" — cursor started on `f` before `f(a)`'s paren).
-        let open_pos = match open_pos {
-            Some(p) => p,
-            None => {
-                let line = self.buffer().content.char_to_line(cursor_pos);
-                let line_start = self.buffer().line_to_char(line);
-                let line_len = self.buffer().line_len_chars(line);
-                let mut found = None;
-                for i in (cursor_pos - line_start)..line_len {
-                    let pos = line_start + i;
-                    if pos >= total_chars {
-                        break;
-                    }
-                    let ch = self.buffer().content.char(pos);
-                    if ch == '\n' {
-                        break;
-                    }
-                    if ch == open_char {
-                        found = Some(pos);
-                        break;
-                    }
-                }
-                found?
+        // Not inside a pair: scan forward on this line for the next opener.
+        let line = self.buffer().content.char_to_line(pos);
+        let line_start = self.buffer().line_to_char(line);
+        let line_len = self.buffer().line_len_chars(line);
+        for p in pos..(line_start + line_len).min(total_chars) {
+            let ch = self.buffer().content.char(p);
+            if ch == '\n' {
+                break;
             }
-        };
-
-        // Find matching closing bracket
-        let close_pos = self.find_matching_bracket(open_pos, open_char, close_char, true)?;
-
-        // Return range based on modifier
-        if modifier == 'i' {
-            // Inner: exclude brackets
-            if open_pos < close_pos {
-                let open_line = self.buffer().content.char_to_line(open_pos);
-                let close_line = self.buffer().content.char_to_line(close_pos);
-                if open_line != close_line {
-                    // Multiline: Vim makes inner bracket objects linewise —
-                    // delete from start of line after open bracket to start of
-                    // line with close bracket.
-                    let start = self.buffer().line_to_char(open_line + 1);
-                    let end = self.buffer().line_to_char(close_line);
-                    if start <= end {
-                        Some((start, end))
-                    } else {
-                        // Empty interior (brackets on adjacent lines)
-                        Some((start, start))
-                    }
-                } else {
-                    Some((open_pos + 1, close_pos))
-                }
-            } else {
-                None
+            if ch == open_char {
+                return Some(p);
             }
-        } else {
-            // Around: include brackets
-            Some((open_pos, close_pos + 1))
         }
+        None
+    }
+
+    /// Is everything between `pos` and the end of `line` white space?
+    fn blank_after(&self, pos: usize, line: usize) -> bool {
+        let line_start = self.buffer().line_to_char(line);
+        let line_end = line_start + self.buffer().line_len_chars(line);
+        for p in (pos + 1)..line_end {
+            let ch = self.buffer().content.char(p);
+            if ch == '\n' {
+                break;
+            }
+            if !ch.is_whitespace() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Is everything between `line_start` and `pos` white space?
+    fn blank_before(&self, pos: usize, line_start: usize) -> bool {
+        (line_start..pos).all(|p| self.buffer().content.char(p).is_whitespace())
     }
 
     /// Find paragraph text object range (ip/ap).
@@ -2081,6 +2113,7 @@ impl Engine {
         &self,
         modifier: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
         let total_lines = self.buffer().len_lines();
         if total_lines == 0 {
@@ -2103,16 +2136,48 @@ impl Engine {
             end_line += 1;
         }
 
-        // `ap` on a non-blank paragraph: include the following blank lines.
-        // If there are no following blank lines (end of file), include any preceding ones.
-        if modifier == 'a' && !on_blank {
-            if end_line + 1 < total_lines && self.is_line_empty(end_line + 1) {
-                while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) {
+        // `ap` pairs each block with the block of the *other* kind that
+        // follows it — a blank run takes the paragraph below it, a paragraph
+        // takes the blank lines below it (or, at end of file, the blank lines
+        // above). A count repeats that pairing, so `d2ap` swallows two
+        // paragraph+blank groups (#807).
+        if modifier == 'a' {
+            let reps = count.max(1);
+            for rep in 0..reps {
+                // Pair this block with the following block of the other kind.
+                let want = !on_blank;
+                if end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == want {
+                    while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == want {
+                        end_line += 1;
+                    }
+                } else if !on_blank && start_line > 0 && self.is_line_empty(start_line - 1) {
+                    // At end of file there is nothing trailing, so Vim takes
+                    // the preceding blank lines instead.
+                    while start_line > 0 && self.is_line_empty(start_line - 1) {
+                        start_line -= 1;
+                    }
+                }
+                if rep + 1 == reps {
+                    break;
+                }
+                // Another repetition: step over the next block of our own kind.
+                if end_line + 1 >= total_lines || self.is_line_empty(end_line + 1) != on_blank {
+                    return None;
+                }
+                while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == on_blank {
                     end_line += 1;
                 }
-            } else if start_line > 0 && self.is_line_empty(start_line - 1) {
-                while start_line > 0 && self.is_line_empty(start_line - 1) {
-                    start_line -= 1;
+            }
+        } else if count > 1 {
+            // `Nip`: N alternating blocks.
+            let mut kind = on_blank;
+            for _ in 1..count {
+                kind = !kind;
+                if end_line + 1 >= total_lines || self.is_line_empty(end_line + 1) != kind {
+                    return None;
+                }
+                while end_line + 1 < total_lines && self.is_line_empty(end_line + 1) == kind {
+                    end_line += 1;
                 }
             }
         }
@@ -2762,17 +2827,20 @@ impl Engine {
         }
 
         if start_pos >= end_pos {
-            // Empty inner range (e.g. ci( on "()"). For 'c' operator,
-            // still enter insert mode at the position between the delimiters.
+            // Empty inner range (e.g. `ci(`/`di(` on `f()`). Nothing is
+            // deleted, but Vim still moves the cursor between the delimiters
+            // (#807, `to:di( empty`).
+            let line = self.buffer().content.char_to_line(start_pos);
+            let line_start = self.buffer().line_to_char(line);
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = start_pos - line_start;
             if operator == 'c' {
-                let line = self.buffer().content.char_to_line(start_pos);
-                let line_start = self.buffer().line_to_char(line);
-                self.view_mut().cursor.line = line;
-                self.view_mut().cursor.col = start_pos - line_start;
                 self.mode = Mode::Insert;
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
                 *changed = true;
+            } else {
+                self.clamp_cursor_col();
             }
             return;
         }
@@ -5699,6 +5767,12 @@ impl Engine {
             }
             let line_content: String = self.buffer().content.line(line_idx).chars().collect();
             let body = line_content.trim_end_matches(['\n', '\r']);
+            // `:h >`: an empty line is never indented — `>ap` over a paragraph
+            // followed by a blank line must leave that blank line empty rather
+            // than filling it with 'shiftwidth' spaces (#807).
+            if body.is_empty() {
+                continue;
+            }
 
             // Measure the existing indent in *display columns* — a tab advances
             // to the next 'tabstop', which is not the same as 'shiftwidth'.
