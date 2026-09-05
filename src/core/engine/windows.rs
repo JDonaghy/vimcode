@@ -2852,6 +2852,43 @@ impl Engine {
             .and_then(|s| s.file_path.clone());
     }
 
+    /// Save the active file's cursor/scroll position, snapshot the open-file
+    /// list, save the per-workspace session (if any), then persist the
+    /// global session file.
+    ///
+    /// Shared by both backends (#823 item 5) — `App::save_session_and_exit`
+    /// (`app.rs`) and `tui_main`'s `save_session` free function were the
+    /// same ~20 lines restated twice, GTK's copy with its own window
+    /// width/height capture spliced in before `collect_session_open_files`
+    /// and its own swap-cleanup/LSP-shutdown/exit-request epilogue spliced
+    /// after `session.save()` — both are genuinely backend-specific (GTK
+    /// has a live window handle to read geometry from; TUI's own quit path
+    /// runs cleanup/shutdown around this call too, just at a different
+    /// call site, `handle_action`'s `Quit`/`SaveQuit` arm) so they stay at
+    /// each call site rather than becoming parameters here.
+    pub fn save_session_state(&mut self) {
+        let buffer_id = self.active_buffer_id();
+        if let Some(path) = self
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.as_deref())
+            .map(|p| p.to_path_buf())
+        {
+            let view = self.active_window().view.clone();
+            self.session.save_file_position(
+                &path,
+                view.cursor.line,
+                view.cursor.col,
+                view.scroll_top,
+            );
+        }
+        self.collect_session_open_files();
+        if let Some(ref root) = self.workspace_root.clone() {
+            self.save_session_for_workspace(root);
+        }
+        let _ = self.session.save();
+    }
+
     /// Restore open files from session state (called at startup when no CLI file is given).
     /// Each file gets its own tab; the previously-active file's tab is focused.
     /// Skips files that no longer exist. Removes the initial empty scratch buffer.
