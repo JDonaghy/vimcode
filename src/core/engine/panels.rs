@@ -1547,73 +1547,10 @@ impl Engine {
         result
     }
 
-    /// Extract clickable links from rendered markdown.
-    ///
-    /// Two sources of click regions are handled:
-    ///
-    /// 1. **Markdown links** — each `Link` span (the label text) is paired with
-    ///    the following `LinkUrl` span on the same line.  The click region covers
-    ///    the label; the URL drives dispatch.  Command URIs displayed as
-    ///    `:Name?args` are restored to `command:Name?args`.
-    ///
-    /// 2. **Bare URLs** — standalone `LinkUrl` spans (emitted by `render_markdown`
-    ///    for plain `http://` / `https://` text) become their own click regions.
-    ///    The span text is the URL itself, so no reconstruction is needed beyond
-    ///    the same `:` → `command:` prefix check used for markdown link URLs.
-    pub(crate) fn extract_hover_links(
-        rendered: &crate::core::markdown::MdRendered,
-    ) -> Vec<(usize, usize, usize, String)> {
-        use crate::core::markdown::MdStyle;
-        let mut links = Vec::new();
-        for (line_idx, line_spans) in rendered.spans.iter().enumerate() {
-            let Some(line) = rendered.lines.get(line_idx) else {
-                continue;
-            };
-            // Walk every span on this line.
-            let mut span_iter = line_spans.iter().peekable();
-            while let Some(span) = span_iter.next() {
-                if span.style == MdStyle::Link {
-                    // Paired markdown link: look for the following LinkUrl span.
-                    let url = span_iter
-                        .peek()
-                        .filter(|next| next.style == MdStyle::LinkUrl)
-                        .and_then(|next| {
-                            if next.end_byte <= line.len() {
-                                Some(&line[next.start_byte..next.end_byte])
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(url_text) = url {
-                        // Command URIs display as ":Name?args" — restore prefix.
-                        let url = if url_text.starts_with(':') {
-                            format!("command{}", url_text)
-                        } else {
-                            url_text.to_string()
-                        };
-                        if is_safe_url(&url) {
-                            // Click region = the Link label span.
-                            links.push((line_idx, span.start_byte, span.end_byte, url));
-                        }
-                    }
-                } else if span.style == MdStyle::LinkUrl && span.end_byte <= line.len() {
-                    // Standalone LinkUrl span (bare URL or the URL display of a
-                    // markdown link).  Make the span itself clickable.
-                    let url_text = &line[span.start_byte..span.end_byte];
-                    // Restore command: prefix if displayed as ":Name?args".
-                    let url = if url_text.starts_with(':') {
-                        format!("command{}", url_text)
-                    } else {
-                        url_text.to_string()
-                    };
-                    if is_safe_url(&url) {
-                        links.push((line_idx, span.start_byte, span.end_byte, url));
-                    }
-                }
-            }
-        }
-        links
-    }
+    // Link extraction from hover markdown moved to
+    // `core::markdown::hover_markdown_structure` (#821 — hover popups adopt
+    // quadraui's `render_markdown_to_styled`, which resolves link ranges
+    // itself instead of vimcode re-pairing `Link`/`LinkUrl` spans).
 
     /// Execute an LSP navigation command from a hover popup link.
     /// Moves the cursor to the given position before invoking the LSP request.

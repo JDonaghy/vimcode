@@ -3713,6 +3713,64 @@ mod editor_popups {
         );
         assert!(pw > 0.0 && ph > 0.0);
     }
+
+    /// #821: hover popups adopt `quadraui::compose::markdown::render_markdown_to_styled`
+    /// instead of vimcode's hand-rolled `MdStyle`-to-color span walk. GTK twin
+    /// of `tui_main::shell_app::tests::
+    /// driver_editor_hover_renders_code_and_bare_url_link_via_quadraui_markdown`:
+    /// same markdown, same three acceptance-criteria features (bold, inline
+    /// code, links), checked through GTK's own black-box surface —
+    /// `screen_contains` for the paint proof (markdown syntax must not leak),
+    /// `editor_hover_link_rects` for the link (a cached hit-region, painted by
+    /// production code, not a hardcoded rect — see that field's own doc).
+    ///
+    /// quadraui only recognizes `[text](url)` links, not bare `http://`
+    /// autolinks; `core::markdown::linkify_bare_urls` rewrites the source
+    /// markdown before quadraui ever parses it so the bare URL below still
+    /// becomes a real, clickable link on both backends.
+    ///
+    /// **RED against an unfixed tree:** comment out the `linkify_bare_urls`
+    /// call in `Engine::show_editor_hover` and `editor_hover_link_rects` comes
+    /// back without the bare-URL entry — quadraui's renderer never turns
+    /// unbracketed text into a link.
+    #[test]
+    fn editor_hover_popup_renders_code_and_bare_url_link_via_quadraui_markdown_on_gtk() {
+        let mut engine = small_engine();
+        engine.show_editor_hover(
+            1,
+            4,
+            "plain821 **bold821** and `code821` — see https://example.com/docs821",
+            crate::core::engine::EditorHoverSource::Lsp,
+            false,
+            false,
+        );
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("bold821"),
+            "the word inside **bold821** must still paint, syntax stripped; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("**bold821**"),
+            "bold markdown delimiters must not leak into painted text; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("`code821`"),
+            "inline-code backticks must not leak into painted text; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let link_rects = h.editor_hover_link_rects.borrow().clone();
+        assert!(
+            link_rects
+                .iter()
+                .any(|(_, _, _, _, uri)| uri == "https://example.com/docs821"),
+            "the bare URL must be linkified into a real clickable link rect; got {link_rects:?}"
+        );
+    }
 }
 
 /// Black-box paint proof for the four panel-region surfaces #670 ported from

@@ -1293,8 +1293,14 @@ pub struct HoverPopup {
 /// Data for rendering an editor hover popup with rich markdown content.
 #[derive(Debug, Clone)]
 pub struct EditorHoverPopupData {
-    /// Rendered markdown content.
-    pub rendered: crate::core::markdown::MdRendered,
+    /// Raw markdown source. Styled at paint time with the active theme —
+    /// see `markdown_hover_to_quadraui_lines` (#821: adopts
+    /// `quadraui::compose::markdown::render_markdown_to_styled`).
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped).
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
     /// Clickable link regions: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Buffer line where the hover is anchored (0-indexed).
@@ -1335,44 +1341,90 @@ pub struct PopupScrollbarHit {
     pub total: usize,
 }
 
-/// Flatten a `MdRendered` block into per-line `quadraui::StyledText` +
-/// per-line heading font scale. Shared by every rich-text hover/popup
-/// builder (editor hover, panel-item hover) so markdown → styled-span
-/// conversion lives in exactly one place.
-fn markdown_rendered_to_quadraui_lines(
-    rendered: &crate::core::markdown::MdRendered,
+/// Render hover-popup markdown into per-line `quadraui::StyledText` + per-line
+/// heading font scale, via quadraui's shared
+/// `quadraui::compose::markdown::render_markdown_to_styled` (#821 — replaces
+/// the previous hand-rolled `MdStyle`-to-color byte-position span walk).
+/// Shared by every rich-text hover/popup builder (editor hover, panel-item
+/// hover) so markdown → styled-span conversion lives in exactly one place.
+///
+/// `code_highlights` are vimcode's own tree-sitter highlights for fenced
+/// code-block lines (precomputed once at hover-show time by
+/// `core::markdown::hover_markdown_structure`, since quadraui's renderer is
+/// deliberately language-agnostic — see its own doc: "Tree-sitter-capable
+/// callers opt into per-language highlighting"). They're overlaid onto the
+/// relevant lines after quadraui's render.
+fn markdown_hover_to_quadraui_lines(
+    markdown: &str,
+    code_highlights: &[Vec<crate::core::markdown::MdCodeHighlight>],
     theme: &Theme,
 ) -> (Vec<quadraui::StyledText>, Vec<f32>) {
-    let mut q_lines: Vec<quadraui::StyledText> = Vec::with_capacity(rendered.lines.len());
-    let mut line_scales: Vec<f32> = Vec::with_capacity(rendered.lines.len());
-    for (line_idx, line_text) in rendered.lines.iter().enumerate() {
-        let md_spans = rendered.spans.get(line_idx);
-        let code_hl = rendered.code_highlights.get(line_idx);
-        q_lines.push(hover_line_to_styled_text(
-            line_text,
-            md_spans.map(|v| v.as_slice()).unwrap_or(&[]),
-            code_hl.map(|v| v.as_slice()).unwrap_or(&[]),
-            theme,
-        ));
-        // Heading rows render at a larger font scale (matches the
-        // legacy `font_scale` on the render-side StyledSpan).
-        let heading_level = md_spans
-            .and_then(|spans| {
-                spans.iter().find_map(|s| match s.style {
-                    crate::core::markdown::MdStyle::Heading(n) => Some(n),
-                    _ => None,
-                })
-            })
-            .unwrap_or(0);
-        let scale = match heading_level {
-            1 => 1.4,
-            2 => 1.2,
-            3..=6 => 1.1,
-            _ => 1.0,
-        };
-        line_scales.push(scale);
+    let q_theme = to_quadraui_theme(theme);
+    let mut rendered = quadraui::compose::markdown::render_markdown_to_styled(markdown, &q_theme);
+    for (line_idx, highlights) in code_highlights.iter().enumerate() {
+        if highlights.is_empty() {
+            continue;
+        }
+        if let Some(line) = rendered.lines.get_mut(line_idx) {
+            overlay_code_highlights(line, highlights, theme);
+        }
     }
-    (q_lines, line_scales)
+    (rendered.lines, rendered.line_scales)
+}
+
+/// Recolor a fenced code-block content line's raw-code span with vimcode's
+/// tree-sitter scope colors. Per quadraui's `render_code_content`, a
+/// code-block content line always has its raw (unprefixed) code text as the
+/// *last* span — the two before it are the code-rail indent + bar, which are
+/// left untouched. `highlights`' byte offsets are relative to that last
+/// span's text (see `core::markdown::hover_markdown_structure`'s doc).
+fn overlay_code_highlights(
+    line: &mut quadraui::StyledText,
+    highlights: &[crate::core::markdown::MdCodeHighlight],
+    theme: &Theme,
+) {
+    let Some(code_span) = line.spans.pop() else {
+        return;
+    };
+    let default_fg = code_span.fg;
+    let bg = code_span.bg;
+    let scope_at = |byte_pos: usize| -> Option<&str> {
+        highlights
+            .iter()
+            .find(|h| byte_pos >= h.start_byte && byte_pos < h.end_byte)
+            .map(|h| h.scope.as_str())
+    };
+
+    let mut byte_pos = 0usize;
+    let mut current_text = String::new();
+    let mut current_scope: Option<&str> = None;
+    let flush = |text: &mut String, scope: Option<&str>, spans: &mut Vec<quadraui::StyledSpan>| {
+        if text.is_empty() {
+            return;
+        }
+        let fg = scope
+            .map(|s| to_quadraui_color(theme.scope_color(s)))
+            .or(default_fg);
+        spans.push(quadraui::StyledSpan {
+            text: std::mem::take(text),
+            fg,
+            bg,
+            bold: false,
+            italic: false,
+            underline: false,
+        });
+    };
+
+    for ch in code_span.text.chars() {
+        let scope = scope_at(byte_pos);
+        if scope != current_scope {
+            flush(&mut current_text, current_scope, &mut line.spans);
+            current_scope = scope;
+        }
+        current_text.push(ch);
+        byte_pos += ch.len_utf8();
+    }
+    flush(&mut current_text, current_scope, &mut line.spans);
 }
 
 /// Convert `(line, start_byte, end_byte, url)` link tuples (the shape
@@ -1401,7 +1453,8 @@ pub fn editor_hover_to_quadraui_rich_text(
     eh: &EditorHoverPopupData,
     theme: &Theme,
 ) -> quadraui::RichTextPopup {
-    let (q_lines, line_scales) = markdown_rendered_to_quadraui_lines(&eh.rendered, theme);
+    let (q_lines, line_scales) =
+        markdown_hover_to_quadraui_lines(&eh.markdown, &eh.code_highlights, theme);
     let q_links = md_links_to_quadraui_rich_text_links(&eh.links);
 
     let q_selection = eh
@@ -1416,7 +1469,7 @@ pub fn editor_hover_to_quadraui_rich_text(
     quadraui::RichTextPopup {
         id: quadraui::WidgetId::new("editor_hover"),
         lines: q_lines,
-        line_text: eh.rendered.lines.clone(),
+        line_text: eh.line_text.clone(),
         line_scales,
         scroll_top: eh.scroll_top,
         max_visible_rows: EDITOR_HOVER_MAX_ROWS,
@@ -1465,7 +1518,7 @@ pub fn editor_hover_popup_paint(
     Option<(f32, f32, f32, f32)>,
     Option<PopupScrollbarHit>,
 ) {
-    if eh.rendered.lines.is_empty() {
+    if eh.line_text.is_empty() {
         return (vec![], None, None);
     }
     let popup = editor_hover_to_quadraui_rich_text(eh, theme);
@@ -1520,101 +1573,6 @@ pub fn editor_hover_popup_paint(
         total: popup.lines.len(),
     });
     (link_rects, popup_rect, scrollbar_hit)
-}
-
-/// Flatten one rendered hover line (text + markdown spans + tree-sitter
-/// code highlights) into a `quadraui::StyledText` whose spans correspond
-/// to contiguous runs sharing fg/bold/italic.
-fn hover_line_to_styled_text(
-    line_text: &str,
-    md_spans: &[crate::core::markdown::MdSpan],
-    code_highlights: &[crate::core::markdown::MdCodeHighlight],
-    theme: &Theme,
-) -> quadraui::StyledText {
-    use crate::core::markdown::MdStyle;
-    if line_text.is_empty() {
-        return quadraui::StyledText::default();
-    }
-
-    let default_fg = to_quadraui_color(theme.hover_fg);
-    let h1_fg = to_quadraui_color(theme.md_heading1);
-    let h2_fg = to_quadraui_color(theme.md_heading2);
-    let h3_fg = to_quadraui_color(theme.md_heading3);
-    let code_fg = to_quadraui_color(theme.md_code);
-    let link_fg = to_quadraui_color(theme.md_link);
-
-    // Style at byte position. Code highlights take priority on lines
-    // that have any (matching the TUI rasteriser's behaviour).
-    let style_at = |byte_pos: usize| -> (quadraui::Color, bool, bool) {
-        if !code_highlights.is_empty() {
-            for h in code_highlights {
-                if byte_pos >= h.start_byte && byte_pos < h.end_byte {
-                    return (to_quadraui_color(theme.scope_color(&h.scope)), false, false);
-                }
-            }
-            return (code_fg, false, false);
-        }
-        for span in md_spans {
-            if byte_pos >= span.start_byte && byte_pos < span.end_byte {
-                return match span.style {
-                    MdStyle::Heading(1) => (h1_fg, true, false),
-                    MdStyle::Heading(2) => (h2_fg, true, false),
-                    MdStyle::Heading(_) => (h3_fg, true, false),
-                    MdStyle::Bold => (default_fg, true, false),
-                    MdStyle::Italic => (default_fg, false, true),
-                    MdStyle::BoldItalic => (default_fg, true, true),
-                    MdStyle::Code | MdStyle::CodeBlock => (code_fg, false, false),
-                    MdStyle::Link | MdStyle::LinkUrl => (link_fg, false, false),
-                    MdStyle::BlockQuote => (h3_fg, false, true),
-                    MdStyle::ListBullet => (h1_fg, true, false),
-                    MdStyle::HorizontalRule | MdStyle::Image => (link_fg, false, true),
-                };
-            }
-        }
-        (default_fg, false, false)
-    };
-
-    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
-    let mut byte_pos: usize = 0;
-    let mut current_text = String::new();
-    let mut current_style: Option<(quadraui::Color, bool, bool)> = None;
-
-    for ch in line_text.chars() {
-        let s = style_at(byte_pos);
-        match current_style {
-            Some(prev) if prev == s => {
-                current_text.push(ch);
-            }
-            _ => {
-                if !current_text.is_empty() {
-                    let st = current_style.unwrap();
-                    spans.push(quadraui::StyledSpan {
-                        text: std::mem::take(&mut current_text),
-                        fg: Some(st.0),
-                        bg: None,
-                        bold: st.1,
-                        italic: st.2,
-                        underline: false,
-                    });
-                }
-                current_text.push(ch);
-                current_style = Some(s);
-            }
-        }
-        byte_pos += ch.len_utf8();
-    }
-    if !current_text.is_empty() {
-        let st = current_style.unwrap_or((default_fg, false, false));
-        spans.push(quadraui::StyledSpan {
-            text: current_text,
-            fg: Some(st.0),
-            bg: None,
-            bold: st.1,
-            italic: st.2,
-            underline: false,
-        });
-    }
-    quadraui::StyledText { spans }
 }
 
 // ─── SignatureHelp ────────────────────────────────────────────────────────────
@@ -7974,8 +7932,13 @@ pub struct ExtPanelSectionData {
 /// Rendering data for a sidebar panel hover popup (rendered markdown).
 #[derive(Debug, Clone)]
 pub struct PanelHoverPopupData {
-    /// Rendered markdown content.
-    pub rendered: crate::core::markdown::MdRendered,
+    /// Raw markdown source. Styled at paint time with the active theme —
+    /// see `EditorHoverPopupData::markdown`'s doc (#821).
+    pub markdown: String,
+    /// Plain per-line text (markdown syntax stripped).
+    pub line_text: Vec<String>,
+    /// Per-line tree-sitter highlights for fenced code-block lines.
+    pub code_highlights: Vec<Vec<crate::core::markdown::MdCodeHighlight>>,
     /// Clickable link regions: (line_idx, start_byte, end_byte, url).
     pub links: Vec<(usize, usize, usize, String)>,
     /// Flat item index being hovered (for positioning relative to panel).
@@ -8001,13 +7964,14 @@ pub fn panel_hover_to_quadraui_rich_text(
     ph: &PanelHoverPopupData,
     theme: &Theme,
 ) -> quadraui::RichTextPopup {
-    let (q_lines, line_scales) = markdown_rendered_to_quadraui_lines(&ph.rendered, theme);
+    let (q_lines, line_scales) =
+        markdown_hover_to_quadraui_lines(&ph.markdown, &ph.code_highlights, theme);
     let q_links = md_links_to_quadraui_rich_text_links(&ph.links);
 
     quadraui::RichTextPopup {
         id: quadraui::WidgetId::new("panel_hover"),
         lines: q_lines,
-        line_text: ph.rendered.lines.clone(),
+        line_text: ph.line_text.clone(),
         line_scales,
         scroll_top: 0,
         max_visible_rows: PANEL_HOVER_MAX_ROWS,
@@ -8139,7 +8103,7 @@ pub fn panel_hover_popup_paint(
     let Some(ref hover) = screen.panel_hover else {
         return (vec![], None);
     };
-    if hover.rendered.lines.is_empty() {
+    if hover.line_text.is_empty() {
         return (vec![], None);
     }
     let is_native = hover.panel_name == "source_control";
@@ -12902,13 +12866,17 @@ pub fn build_screen_layout_with_breadcrumb_row(
             hunk_lines: dp.hunk_lines.clone(),
         }),
         panel_hover: engine.panel_hover.as_ref().map(|ph| PanelHoverPopupData {
-            rendered: ph.rendered.clone(),
+            markdown: ph.markdown.clone(),
+            line_text: ph.line_text.clone(),
+            code_highlights: ph.code_highlights.clone(),
             links: ph.links.clone(),
             item_index: ph.item_index,
             panel_name: ph.panel_name.clone(),
         }),
         editor_hover: engine.editor_hover.as_ref().map(|eh| EditorHoverPopupData {
-            rendered: eh.rendered.clone(),
+            markdown: eh.markdown.clone(),
+            line_text: eh.line_text.clone(),
+            code_highlights: eh.code_highlights.clone(),
             links: eh.links.clone(),
             anchor_line: eh.anchor_line,
             anchor_col: eh.anchor_col,
@@ -23966,25 +23934,16 @@ mod tests {
     /// hit-rect even if the Pango measurement itself is accurate (#488).
     #[test]
     fn test_editor_hover_to_quadraui_rich_text_link_offsets() {
-        use crate::core::markdown::{MdRendered, MdSpan, MdStyle};
-
         let line = "See https://example.com for details";
         // byte offsets of "https://example.com": starts at 4, ends at 23
         let link_start = 4usize;
         let link_end = 23usize;
         assert_eq!(&line[link_start..link_end], "https://example.com");
 
-        let rendered = MdRendered {
-            lines: vec![line.to_string()],
-            spans: vec![vec![MdSpan {
-                start_byte: link_start,
-                end_byte: link_end,
-                style: MdStyle::LinkUrl,
-            }]],
-            code_highlights: vec![vec![]],
-        };
         let eh = EditorHoverPopupData {
-            rendered,
+            markdown: line.to_string(),
+            line_text: vec![line.to_string()],
+            code_highlights: vec![vec![]],
             links: vec![(0, link_start, link_end, "https://example.com".to_string())],
             anchor_line: 0,
             anchor_col: 0,
@@ -24029,8 +23988,6 @@ mod tests {
     /// would cause the GTK closure to measure the wrong line or wrong span.
     #[test]
     fn test_editor_hover_to_quadraui_rich_text_multi_link() {
-        use crate::core::markdown::{MdRendered, MdSpan, MdStyle};
-
         let line0 = "Docs: https://docs.rs/foo";
         let line1 = "Also see https://crates.io/crates/foo";
         // "https://docs.rs/foo" starts at 6, ends at 25
@@ -24040,24 +23997,10 @@ mod tests {
         assert_eq!(&line0[s0..e0], "https://docs.rs/foo");
         assert_eq!(&line1[s1..e1], "https://crates.io/crates/foo");
 
-        let rendered = MdRendered {
-            lines: vec![line0.to_string(), line1.to_string()],
-            spans: vec![
-                vec![MdSpan {
-                    start_byte: s0,
-                    end_byte: e0,
-                    style: MdStyle::LinkUrl,
-                }],
-                vec![MdSpan {
-                    start_byte: s1,
-                    end_byte: e1,
-                    style: MdStyle::LinkUrl,
-                }],
-            ],
-            code_highlights: vec![vec![], vec![]],
-        };
         let eh = EditorHoverPopupData {
-            rendered,
+            markdown: format!("{line0}\n{line1}"),
+            line_text: vec![line0.to_string(), line1.to_string()],
+            code_highlights: vec![vec![], vec![]],
             links: vec![
                 (0, s0, e0, "https://docs.rs/foo".to_string()),
                 (1, s1, e1, "https://crates.io/crates/foo".to_string()),

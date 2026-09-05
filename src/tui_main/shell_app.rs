@@ -11466,6 +11466,116 @@ mod tests {
         );
     }
 
+    /// #821: hover popups adopt `quadraui::compose::markdown::render_markdown_to_styled`
+    /// instead of vimcode's hand-rolled `MdStyle`-to-color span walk. Pins the
+    /// acceptance-criteria markdown features (inline code, links — bold isn't
+    /// separately checkable on TUI, see below) on both the engine's resolved
+    /// link list and painted TUI output, plus the one real feature gap the
+    /// adoption introduced: quadraui only recognizes `[text](url)` links, not
+    /// bare `http://`/`https://` autolinks. `core::markdown::linkify_bare_urls`
+    /// closes that gap by rewriting the source markdown before quadraui ever
+    /// parses it.
+    ///
+    /// Bold isn't asserted on the *painted* side: quadraui's TUI
+    /// `draw_rich_text_popup` rasterises `StyledSpan.fg`/`.bg` only — `.bold`/
+    /// `.italic`/`.underline` are never consulted (confirmed against the
+    /// pinned rev; the sole exception is an unconditional underline overlay
+    /// for the keyboard-*focused* link, unrelated to markdown styling). Bold
+    /// markdown was equally invisible on TUI before #821 (the same rasteriser
+    /// painted the old hand-rolled `RichTextPopup` too), so asserting it here
+    /// would fail for a pre-existing quadraui-TUI reason, not a #821
+    /// regression.
+    ///
+    /// **RED against an unfixed tree:** comment out the
+    /// `crate::core::markdown::linkify_bare_urls` call in
+    /// `Engine::show_editor_hover` and the bare-URL assertions below fail —
+    /// the engine's `links` list comes back empty (quadraui's renderer never
+    /// turns unbracketed text into a link) and `driver.find` still finds the
+    /// URL text, but its color is indistinguishable from body text.
+    #[test]
+    fn driver_editor_hover_renders_code_and_bare_url_link_via_quadraui_markdown() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = false;
+        crate::icons::set_nerd_fonts(false);
+        app.engine.session.explorer_visible = false;
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine.show_editor_hover(
+            0,
+            3,
+            "plain821 **bold821** and `code821` — see https://example.com/docs821",
+            crate::core::engine::EditorHoverSource::Lsp,
+            false,
+            false,
+        );
+
+        // Engine-level: the bare URL must have resolved to a real clickable
+        // link — checked directly against `EditorHoverPopup::links`, with no
+        // dependency on paint at all.
+        let links = app
+            .engine
+            .editor_hover
+            .as_ref()
+            .expect("show_editor_hover must have set editor_hover")
+            .links
+            .clone();
+        assert!(
+            links
+                .iter()
+                .any(|(_, _, _, url)| url == "https://example.com/docs821"),
+            "the bare URL must be linkified and resolved into a clickable link; got {links:?}"
+        );
+
+        // Wider than the other hover tests in this module: the popup is a
+        // fixed-width, non-wrapping box (horizontal scroll instead), and this
+        // test's line is long enough that a plain 80-col terminal clips the
+        // trailing URL text before `find` can locate it.
+        let driver = driver_with_shell(app, TuiShellApp::shell_config(false), 160, 24);
+
+        // Markdown syntax must be stripped — proves quadraui's parser ran
+        // rather than the raw source being painted verbatim.
+        assert!(
+            !driver.screen_contains("**bold821**"),
+            "bold markdown delimiters must not leak into painted text; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("`code821`"),
+            "inline-code backticks must not leak into painted text; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("bold821"),
+            "the word inside **bold821** must still paint, syntax stripped; screen:\n{}",
+            driver.screen()
+        );
+
+        let (px, py) = driver.find("plain821").expect("plain body word must paint");
+        let plain_style = driver
+            .style_at(px as u16, py as u16)
+            .expect("plain word cell must have a style");
+
+        let (cx, cy) = driver.find("code821").expect("inline code word must paint");
+        let code_style = driver
+            .style_at(cx as u16, cy as u16)
+            .expect("code word cell must have a style");
+        assert_ne!(
+            code_style.fg, plain_style.fg,
+            "inline `code821` must render in a color distinct from body text"
+        );
+
+        // Bare URL (no `[]()` brackets) must still paint, in link color.
+        let (ux, uy) = driver
+            .find("https://example.com/docs821")
+            .expect("linkify_bare_urls must have preserved the bare URL text so it still paints");
+        let url_style = driver
+            .style_at(ux as u16, uy as u16)
+            .expect("URL cell must have a style");
+        assert_ne!(
+            url_style.fg, plain_style.fg,
+            "a linkified bare URL must render in link color, not body color"
+        );
+    }
+
     // ── #757 slice 2: the shared focus-owner keyboard rung ─────────────
     //
     // `render::route_focus_key` now states the activity-bar → sidebar-panel
