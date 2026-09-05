@@ -2101,6 +2101,19 @@ const CASES_INS: &[Case] = &[
     c("ins:C-d", &["    a"], 1, 5, "i<C-d><Esc>"),
     c("ins:C-d partial", &["  a"], 1, 1, "A<C-d><Esc>"),
     c("ins:0 C-d", &["    a"], 1, 1, "A0<C-d><Esc>"),
+    // #804 CI fix: `i_0_CTRL-D` keys off Vim's `lastc` — the previous
+    // *keystroke* — not off the buffer text before the cursor. These three
+    // pin the distinction the oracle actually makes.
+    c("ins:0 C-d after text", &["    afoo"], 1, 1, "A0<C-d><Esc>"),
+    c(
+        "ins:C-d with untyped 0 before cursor",
+        &["    a0"],
+        1,
+        1,
+        "A<C-d><Esc>",
+    ),
+    c("ins:caret C-d", &["    a"], 1, 1, "A^<C-d><Esc>"),
+    c("ins:0 C-d twice", &["        a"], 1, 1, "A0<C-d><C-d><Esc>"),
     c("ins:C-o dw", &["foo bar"], 1, 1, "i<C-o>dw<Esc>"),
     c("ins:C-o $ then type", &["foo"], 1, 1, "i<C-o>$x<Esc>"),
     c("ins:A C-o h", &["foo"], 1, 1, "A<C-o>hx<Esc>"),

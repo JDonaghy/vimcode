@@ -28827,14 +28827,16 @@ fn insert_mode_ctrl_bracket_left_literal_name_leaves_insert() {
     );
 }
 
-/// #804 review: `0<C-d>` (`:h i_0_CTRL-D`) only removes ALL indent when the
-/// '0' was typed as the line's leading signal digit — i.e. only indent
-/// precedes it. A literal '0' that happens to sit right before `<C-d>` but
-/// has other non-blank text before it (`foo0<C-d>`) is NOT the signal digit
-/// and must fall through to an ordinary shiftwidth dedent that leaves the
-/// '0' (and the rest of the line) untouched.
+/// #804 CI fix: `0<C-d>` (`:h i_0_CTRL-D`) keys off Vim's `lastc` — the
+/// character of the *previous keystroke* — not off the buffer text before the
+/// cursor. Here the '0' was never typed: it was already in the line and the
+/// cursor was merely placed after it, so `<C-d>` is an ordinary shiftwidth
+/// dedent that leaves the '0' (and the rest of the line) untouched.
+///
+/// The nvim oracle pins this exact scenario as `ins:C-d with untyped 0 before
+/// cursor` in `tests/nvim_conformance.rs`.
 #[test]
-fn test_insert_ctrl_d_with_trailing_zero_after_text_is_normal_dedent() {
+fn test_insert_ctrl_d_with_untyped_trailing_zero_is_normal_dedent() {
     let mut engine = engine_with_text("    foo0\n");
     engine.settings.shift_width = 4;
     engine.handle_key("i", Some('i'), false);
@@ -28844,13 +28846,104 @@ fn test_insert_ctrl_d_with_trailing_zero_after_text_is_normal_dedent() {
     let buf = engine.buffer().to_string();
     assert_eq!(
         buf, "foo0\n",
-        "a '0' preceded by non-blank text must not trigger the i_0_CTRL-D \
+        "a '0' that was never typed must not trigger the i_0_CTRL-D \
          strip-all-indent special case — only the indent should be removed; got {buf:?}"
     );
     assert_eq!(
         engine.view().cursor.col,
         4,
         "cursor should shift left by exactly the removed indent (4), not also lose the '0'"
+    );
+}
+
+/// #804 CI fix (the regression the nvim oracle caught at the merge gate):
+/// a *typed* '0' immediately before `<C-d>` deletes that '0' and strips ALL
+/// indent, even when non-blank text precedes it. The previous implementation
+/// required only indent before the '0', so `A0<C-d>` on `"    afoo"` left the
+/// '0' behind and did a plain shiftwidth dedent. Neovim (0.9.5) gives
+/// `"afoo"` with the cursor on the final 'o'.
+#[test]
+fn test_insert_typed_zero_ctrl_d_strips_all_indent_after_text() {
+    let mut engine = engine_with_text("    afoo\n");
+    engine.settings.shift_width = 2; // deliberately != the 4-space indent
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("0", Some('0'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "afoo\n",
+        "a typed '0' before <C-d> must delete the '0' and ALL indent regardless \
+         of what precedes it (`:h i_0_CTRL-D` keys off the last keystroke); got {buf:?}"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        4,
+        "cursor should end just past 'afoo' — the typed '0' and 4 indent chars are gone"
+    );
+}
+
+/// #804 CI fix: `:h i_^_CTRL-D` — a typed `^` is the other signal prefix and
+/// behaves the same way as `0` for the strip-all-indent part. Oracle case
+/// `ins:caret C-d`.
+#[test]
+fn test_insert_typed_caret_ctrl_d_strips_all_indent() {
+    let mut engine = engine_with_text("    a\n");
+    engine.settings.shift_width = 4;
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("asciicircum", Some('^'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "a\n",
+        "a typed '^' before <C-d> must delete the '^' and all indent"
+    );
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+/// #804 CI fix: the signal is the *previous* keystroke, so it is consumed by
+/// the first `<C-d>`. A second `<C-d>` sees `lastc == <C-d>` and must fall
+/// back to an ordinary shiftwidth dedent instead of eating another character.
+/// Oracle case `ins:0 C-d twice` (8-space indent, sw=4 → `<C-d><C-d>` after
+/// the strip leaves nothing more to remove).
+#[test]
+fn test_insert_zero_ctrl_d_signal_is_not_reused_by_second_ctrl_d() {
+    let mut engine = engine_with_text("    abc\n");
+    engine.settings.shift_width = 4;
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("0", Some('0'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d> — strips '0' + all indent
+    assert_eq!(engine.buffer().to_string(), "abc\n");
+    engine.handle_key("d", Some('d'), true); // <C-d> again — plain dedent, no indent left
+    assert_eq!(
+        engine.buffer().to_string(),
+        "abc\n",
+        "the second <C-d> must not delete the 'c': the 0/^ signal only applies \
+         to the keystroke immediately before it"
+    );
+    assert_eq!(engine.view().cursor.col, 3);
+}
+
+/// #804 CI fix: `insert_last_key_char` must not survive across Insert
+/// sessions. Typing a '0', leaving Insert, then re-entering and pressing
+/// `<C-d>` is a plain dedent — otherwise the stale signal would eat the
+/// character before the cursor.
+#[test]
+fn test_insert_zero_signal_does_not_survive_leaving_insert_mode() {
+    let mut engine = engine_with_text("    a\n");
+    engine.settings.shift_width = 2;
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("0", Some('0'), false);
+    engine.handle_key("Escape", None, false);
+    engine.handle_key("A", Some('A'), false);
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "  a0\n",
+        "re-entering Insert clears the 0/^ signal — this <C-d> is a plain \
+         shiftwidth (2) dedent that keeps the '0'"
     );
 }
 

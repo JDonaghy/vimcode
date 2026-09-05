@@ -3163,6 +3163,13 @@ pub struct Engine {
     /// than `<BS>`/`<C-d>` (which the docs specifically exempt). Consulted by
     /// `<CR>`/`<Esc>` to decide whether to delete that indent again (#804).
     pub insert_indent_only_line: Option<usize>,
+    /// The character of the *previous* key pressed in Insert mode, or `None`
+    /// if that key was not a plain character (a ctrl combo, `<BS>`, an arrow
+    /// key, …) or Insert mode was only just entered. This mirrors Vim's
+    /// `lastc` in `edit()`, which exists for exactly one feature:
+    /// `:h i_0_CTRL-D` / `:h i_^_CTRL-D` key off *what you typed last*, not
+    /// off what happens to sit in the buffer before the cursor (#804).
+    pub insert_last_key_char: Option<char>,
     /// When true, next keypress in Insert mode is inserted literally (Ctrl-V).
     pub insert_ctrl_v_pending: bool,
     /// Active `<C-v>{digits}` numeric character entry (`:h i_CTRL-V_digit`):
@@ -3898,6 +3905,7 @@ impl Engine {
             insert_ctrl_o_active: false,
             insert_enter_col: 0,
             insert_indent_only_line: None,
+            insert_last_key_char: None,
             insert_ctrl_v_pending: false,
             insert_ctrl_v_numeric: None,
             insert_vertical_want_col: None,
