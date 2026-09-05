@@ -424,8 +424,6 @@ pub struct TuiShellApp {
     debug_toolbar_rect: std::rc::Rc<Cell<quadraui::Rect>>,
     last_click_time: Cell<Instant>,
     last_click_pos: Cell<(u16, u16)>,
-    cmd_sel: Cell<Option<(usize, usize)>>,
-    cmd_dragging: bool,
     explorer_sb_dragging: bool,
     explorer_drag_src: Option<usize>,
     explorer_drag_active: Option<(usize, Option<usize>)>,
@@ -1001,8 +999,6 @@ impl TuiShellApp {
             debug_toolbar_rect: std::rc::Rc::new(Cell::new(quadraui::Rect::default())),
             last_click_time: Cell::new(now.checked_sub(Duration::from_secs(1)).unwrap_or(now)),
             last_click_pos: Cell::new((0, 0)),
-            cmd_sel: Cell::new(None),
-            cmd_dragging: false,
             explorer_sb_dragging: false,
             explorer_drag_src: None,
             explorer_drag_active: None,
@@ -1537,7 +1533,6 @@ impl TuiShellApp {
 
         let mut last_click_time = self.last_click_time.get();
         let mut last_click_pos = self.last_click_pos.get();
-        let mut cmd_sel = self.cmd_sel.get();
         let mut should_quit = false;
         let last_layout = self.last_layout.borrow();
         let hover_link_rects = self.hover_link_rects.borrow();
@@ -1571,8 +1566,6 @@ impl TuiShellApp {
             &mut last_click_time,
             &mut last_click_pos,
             &mut self.folder_picker,
-            &mut cmd_sel,
-            &mut self.cmd_dragging,
             &mut should_quit,
             &mut self.explorer_drag_src,
             &mut self.explorer_drag_active,
@@ -1607,7 +1600,6 @@ impl TuiShellApp {
         self.sidebar_width = new_sidebar_width;
         self.last_click_time.set(last_click_time);
         self.last_click_pos.set(last_click_pos);
-        self.cmd_sel.set(cmd_sel);
 
         if should_quit {
             return Reaction::Exit;
@@ -2021,12 +2013,16 @@ impl ShellApp for TuiShellApp {
 
                 // ── Command line (+ mouse drag-selection inversion) ──────
                 render::FrameOp::CommandLine => {
+                    // #816: publish the painted rect for
+                    // `render::command_line_click_char_idx` — the twin of
+                    // `global_status_rect` above, and GTK's identical cache.
+                    self.engine.command_line_rect.set(to_q_rect(chrome.cmd));
                     render_command_line(
                         backend,
                         chrome.cmd,
                         &screen.command,
                         &theme,
-                        self.cmd_sel.get(),
+                        self.engine.cmd_sel.get(),
                     );
                     composed.push(render::FrameOp::CommandLine);
                 }
@@ -2426,7 +2422,6 @@ impl ShellApp for TuiShellApp {
                             sidebar_width: &mut self.sidebar_width,
                             quickfix_scroll_top: &mut self.quickfix_scroll_top,
                             last_clipboard_content: &mut self.last_clipboard_content,
-                            cmd_sel: &self.cmd_sel,
                             yank_hl_deadline: &self.yank_hl_deadline,
                             ui_event: &dap_event,
                         },
@@ -3591,9 +3586,6 @@ struct KeyDispatchState<'a> {
     /// `event_loop`'s `last_clipboard_content` local — the change-detection
     /// key for `sync_tui_clipboard` (`clipboard=unnamedplus`).
     last_clipboard_content: &'a mut Option<String>,
-    /// Command-line / message-line selection (mouse-populated, keyboard-
-    /// cleared).
-    cmd_sel: &'a Cell<Option<(usize, usize)>>,
     /// 200 ms yank-highlight expiry, armed here and cleared in `tick`.
     yank_hl_deadline: &'a Cell<Option<Instant>>,
     /// See the struct doc — the un-round-tripped source event.
@@ -3614,7 +3606,6 @@ fn handle_key_pressed(
     backend: &mut dyn quadraui::Backend,
     state: &mut KeyDispatchState<'_>,
 ) -> Reaction {
-    let cmd_sel = state.cmd_sel;
     let Some(key_event) = quadraui::tui::events::synth_keyevent(&key, modifiers, repeat) else {
         return Reaction::Continue;
     };
@@ -3743,18 +3734,20 @@ fn handle_key_pressed(
         return Reaction::Redraw;
     }
 
-    // ── Shared command-line selection rung (#762 / #734 slice 7) ────────
-    // `cmd_sel` is mouse-populated (#602); this is its keyboard side.
-    // `Clear` deliberately falls through to the editor below.
-    match render::route_cmdline_selection_key(engine, unicode, ctrl, cmd_sel.get()) {
+    // ── Shared command-line selection rung (#762 / #734 slice 7 / #816) ─
+    // `engine.cmd_sel` is mouse-populated (#602, and GTK's press/drag
+    // handlers since #816); this is its keyboard side, shared by both
+    // backends now that the state lives on `Engine` instead of TUI-only
+    // local state. `Clear` deliberately falls through to the editor below.
+    match render::route_cmdline_selection_key(engine, unicode, ctrl, engine.cmd_sel.get()) {
         render::CmdSelKeyRoute::Copy(text) => {
             if !text.is_empty() {
                 tui_copy_to_clipboard(&text, engine);
             }
-            cmd_sel.set(None);
+            engine.cmd_sel.set(None);
             return Reaction::Redraw;
         }
-        render::CmdSelKeyRoute::Clear => cmd_sel.set(None),
+        render::CmdSelKeyRoute::Clear => engine.cmd_sel.set(None),
         render::CmdSelKeyRoute::Keep => {}
     }
 
@@ -4001,13 +3994,13 @@ mod tests {
     /// Owns the values a [`KeyDispatchState`] borrows, so the direct
     /// (`driver`-bypassing) `handle_key_pressed` tests can build one without
     /// declaring six locals apiece. Fields stay public to the test module so
-    /// a test can seed (`scratch.cmd_sel.set(..)`) or assert on
-    /// (`scratch.sidebar_width`) any of them.
+    /// a test can seed or assert on (`scratch.sidebar_width`) any of them.
+    /// `cmd_sel` lives on `Engine` now (#816), not here — seed/assert via
+    /// `engine.cmd_sel` directly in tests that need it.
     struct KeyScratch {
         sidebar_width: u16,
         quickfix_scroll_top: usize,
         last_clipboard_content: Option<String>,
-        cmd_sel: Cell<Option<(usize, usize)>>,
         yank_hl_deadline: Cell<Option<Instant>>,
         /// Read by the debug/DAP sidebar tier (inert for any non-key event,
         /// and no direct test exercises that panel today) *and* the
@@ -4025,7 +4018,6 @@ mod tests {
                 sidebar_width: SIDEBAR_WIDTH,
                 quickfix_scroll_top: 0,
                 last_clipboard_content: None,
-                cmd_sel: Cell::new(None),
                 yank_hl_deadline: Cell::new(None),
                 ui_event: UiEvent::WindowFocused(true),
             }
@@ -4048,7 +4040,6 @@ mod tests {
                 sidebar_width: &mut self.sidebar_width,
                 quickfix_scroll_top: &mut self.quickfix_scroll_top,
                 last_clipboard_content: &mut self.last_clipboard_content,
-                cmd_sel: &self.cmd_sel,
                 yank_hl_deadline: &self.yank_hl_deadline,
                 ui_event: &self.ui_event,
             }
@@ -8878,7 +8869,7 @@ mod tests {
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
         let mut scratch = KeyScratch::new();
-        scratch.cmd_sel.set(Some((0usize, 4usize))); // "hello"
+        engine.cmd_sel.set(Some((0usize, 4usize))); // "hello"
 
         let reaction = handle_key_pressed(
             quadraui::Key::Char('c'),
@@ -8899,7 +8890,7 @@ mod tests {
 
         assert_eq!(reaction, Reaction::Redraw);
         assert!(
-            scratch.cmd_sel.get().is_none(),
+            engine.cmd_sel.get().is_none(),
             "Ctrl+C should clear the selection"
         );
         assert!(
@@ -8921,7 +8912,7 @@ mod tests {
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
         let mut scratch = KeyScratch::new();
-        scratch.cmd_sel.set(Some((0usize, 4usize)));
+        engine.cmd_sel.set(Some((0usize, 4usize)));
 
         let _ = handle_key_pressed(
             quadraui::Key::Char('x'),
@@ -8938,7 +8929,7 @@ mod tests {
         );
 
         assert!(
-            scratch.cmd_sel.get().is_none(),
+            engine.cmd_sel.get().is_none(),
             "any other key should clear the selection"
         );
         assert!(

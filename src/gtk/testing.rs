@@ -7363,6 +7363,154 @@ mod chrome_rung {
     }
 }
 
+/// #816: GTK adopts quadraui#705's `CommandLineLayout::hit_test` for
+/// click-to-position and drag-to-select over the command/message line — the
+/// GTK half of #194, which landed the TUI side only (the primitive this
+/// needed didn't exist yet). `engine.command_line_rect` (cached at paint
+/// time, mirroring `global_status_rect`) plus `render::command_line_click_char_idx`
+/// are the same helpers TUI's `mouse::handle_mouse` uses, so this is thin
+/// wiring through the shared primitive rather than new GTK-specific
+/// selection code — see `handle_mouse_click_msg`'s "Command line click" rung.
+///
+/// **What's covered / what isn't:** click-to-reposition-cursor and
+/// drag-to-select (`engine.cmd_sel`/`cmd_dragging`) both land, and
+/// `route_cmdline_selection_key` (already shared with TUI) makes Ctrl+C
+/// copy the selection. The VISIBLE selection highlight does not — quadraui's
+/// `CommandLine` primitive has no selection field and `Backend::draw_command_line`
+/// paints in the command line's own (monospace) font, so there is no
+/// platform-neutral way to overlay a highlight without either painting in
+/// the wrong font (`Backend::draw_status_bar` sets its own chrome font) or
+/// writing GTK-specific Cairo code, which `CLAUDE.md`'s Platform-Neutrality
+/// Rule forbids. That gap needs a quadraui issue (`CommandLine::selection`,
+/// painted by each backend's own rasteriser) before the highlight can land.
+#[cfg(test)]
+mod command_line_selection {
+    use super::*;
+    use quadraui::Backend as _;
+
+    /// Pixel center of column `col` (0-based, `:` is column 0) in the
+    /// command line, using the *same* `command_line_rect` +
+    /// `Backend::char_width` the production click/drag handlers hit-test
+    /// against — not a Pango-measured text run. Using `find_bounds` instead
+    /// would silently assume the driver's real glyph advance matches
+    /// `char_width()`'s value exactly, which this headless harness has no
+    /// reason to guarantee (quadraui#705's own paint/click round-trip test
+    /// forces a specific monospace font for exactly this reason).
+    fn col_center<A: AppLogic>(h: &Harness<A>, col: usize) -> (f32, f32) {
+        let rect = h.engine.borrow().command_line_rect.get();
+        let char_w = h.driver.backend().char_width();
+        (
+            rect.x + char_w * (col as f32 + 0.5),
+            rect.y + rect.height / 2.0,
+        )
+    }
+
+    /// Click-to-reposition asserts on the **painted cursor glyph** moving,
+    /// not on `command_cursor` alone (#587/#592: a state-only assertion
+    /// passes even if painting silently stopped consuming the field).
+    #[test]
+    fn click_in_command_line_repositions_the_painted_cursor() {
+        let mut engine = Engine::new_for_test();
+        engine.mode = crate::core::Mode::Command;
+        engine.command_buffer = "wq".to_string();
+        engine.command_cursor = 2; // starts at the end, after "wq"
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let bounds = h
+            .driver
+            .find_bounds(":wq")
+            .expect("command line text must paint");
+        let row_y = (bounds.y + bounds.height / 2.0).round() as i32;
+        // The cursor glyph paints at `text_origin_x + text_w(anchor)`; at
+        // `command_cursor == 2` the anchor is the full ":wq", so it sits at
+        // the right edge of the painted text.
+        let end_x = (bounds.x + bounds.width + 1.0).round() as i32;
+        let pixel_before = h.driver.pixel(end_x, row_y);
+
+        // Click on column 1 ('w') — should move the cursor to
+        // `command_cursor == 0`, well left of the end.
+        let (cx, cy) = col_center(&h, 1);
+        h.driver.click(cx, cy);
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().command_cursor,
+            0,
+            "clicking column 1 ('w') must move the command cursor there"
+        );
+
+        let pixel_after = h.driver.pixel(end_x, row_y);
+        assert_ne!(
+            pixel_before, pixel_after,
+            "the painted cursor glyph must move away from the end of the \
+             text once the click relocated it"
+        );
+    }
+
+    /// Drag-selecting over the command line arms `cmd_sel`/`cmd_dragging`
+    /// (mouse-populated, keyboard-cleared — `render::route_cmdline_selection_key`,
+    /// already shared with TUI) and Ctrl+C copies the selected substring to
+    /// the clipboard, exactly like TUI's
+    /// `handle_key_pressed_cmd_sel_ctrl_c_copies_and_clears`
+    /// (`tui_main/shell_app.rs`). This is the "real, observable effect"
+    /// half of #816's GTK coverage — the copied text is asserted directly,
+    /// not `cmd_sel`'s presence.
+    #[test]
+    fn drag_select_then_ctrl_c_copies_the_command_buffer_substring() {
+        let mut engine = Engine::new_for_test();
+        engine.mode = crate::core::Mode::Command;
+        engine.command_buffer = "wq!".to_string();
+        engine.command_cursor = 3;
+        let copied = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let copied_hook = std::rc::Rc::clone(&copied);
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *copied_hook.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        // Prime `command_line_rect`/`char_width` before computing click
+        // columns — both are populated by this first paint.
+        h.driver
+            .find_bounds(":wq!")
+            .expect("command line text must paint");
+
+        // Press then drag within column 1 ('w') to column 2 ('q') — per
+        // `route_cmdline_selection_key`'s existing (inclusive) contract,
+        // `sel = (1, 2)` selects the characters AT both columns: "wq".
+        let (x0, y0) = col_center(&h, 1);
+        let (x1, _) = col_center(&h, 2);
+        h.driver.drag(x0, y0, x1, y0);
+        h.driver.render();
+
+        assert!(
+            h.engine.borrow().cmd_sel.get().is_some(),
+            "a drag over the command line must arm a selection"
+        );
+
+        h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('c'),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            repeat: false,
+        });
+
+        assert_eq!(
+            copied.borrow().as_deref(),
+            Some("wq"),
+            "Ctrl+C over the drag-selected span must copy exactly the \
+             selected substring"
+        );
+        assert!(
+            h.engine.borrow().cmd_sel.get().is_none(),
+            "Ctrl+C must clear the selection after copying"
+        );
+    }
+}
+
 /// #755 slice 5: black-box coverage for the two editor rungs this slice
 /// converged — the **minimap** (which GTK painted and then had no handler
 /// for at all) and the **editor hover popup** (whose bespoke GTK copy ran

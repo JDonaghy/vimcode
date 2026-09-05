@@ -18960,7 +18960,7 @@ pub fn tab_hover_tooltip_paint(
     let _ = backend.draw_status_bar(rect, &bar, None, None);
 }
 
-fn build_command_line(engine: &Engine) -> CommandLineData {
+pub fn build_command_line(engine: &Engine) -> CommandLineData {
     let (text, right_align, show_cursor, cursor_anchor_text) = match engine.mode {
         Mode::Command if engine.history_search_active => {
             let display = format!(
@@ -19018,6 +19018,115 @@ fn build_command_line(engine: &Engine) -> CommandLineData {
         show_cursor,
         cursor_anchor_text,
     }
+}
+
+// ─── Command-line click/selection geometry (#816) ───────────────────────────
+//
+// quadraui#705 shipped `CommandLineLayout::hit_test` / `selection_bounds` —
+// the character-offset hit test the TUI-only inverted-cell read-back trick
+// used to get "for free" (and that GTK could never get at all, since it has
+// no such trick). These helpers are the ONE place both backends map a click
+// point to a command-line character offset, replacing `ee26268`'s hand-rolled
+// `col - editor_left` arithmetic in `tui_main::mouse` with a call into the
+// primitive.
+//
+// Both backends cache the painted row's ABSOLUTE bounds on
+// `Engine::command_line_rect` at paint time (mirrors `global_status_rect`) —
+// "cache what paint produced" rather than re-deriving the row's geometry at
+// click time. TUI's units are character cells (`char_width = 1.0`); GTK's are
+// pixels (`char_width = backend.char_width()`).
+
+/// Byte offset (quadraui's [`quadraui::CommandLineLayout::hit_test`] and
+/// `selection_bounds` contract) converted to a **character-count** offset —
+/// the unit `Engine::command_cursor` / `Engine::cmd_sel` use throughout
+/// (mirrors `cmd_char_to_byte`'s inverse in `core::engine::keys`). A no-op
+/// for ASCII-only command text (the overwhelming case); multibyte prefixes
+/// (the #503/#705 class of bug) are exactly where it matters.
+fn command_line_byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
+    text.get(..byte_offset)
+        .map(|s| s.chars().count())
+        .unwrap_or_else(|| text.chars().count())
+}
+
+/// The inverse of [`command_line_byte_to_char_idx`] — a character-count
+/// offset converted back to the byte offset `CommandLineLayout::selection_bounds`
+/// expects. Out-of-range indices clamp to `text.len()`.
+fn command_line_char_to_byte_idx(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
+/// Whether the command/message line accepts a mouse-driven text selection in
+/// `engine`'s current mode — the gate `ee26268` wrote twice (TUI's
+/// Command/Search press arm vs. its separate Normal-with-message arm) as one
+/// function, so GTK's press handler (#816) states the identical rule instead
+/// of re-deriving it.
+pub fn command_line_selection_allowed(engine: &Engine) -> bool {
+    match engine.mode {
+        Mode::Command | Mode::Search => true,
+        Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
+            !engine.message.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Map a click/drag `point` to a **character-count** offset into `text`, via
+/// quadraui's `CommandLine::layout(rect, ..).hit_test(x)` (issue #705/#816).
+/// `rect` must be the ABSOLUTE bounds the line was painted into
+/// (`Engine::command_line_rect`); `point` outside its row, or left of its
+/// left edge, is not a hit. The primitive itself clamps `x` past the last
+/// character to `text.len()` (previously unclamped: `ee26268`'s raw
+/// `col - editor_left` could exceed the text and only `command_cursor`'s
+/// separate `.min(buf_len)` caught it — `cmd_sel` itself did not).
+pub fn command_line_click_char_idx(
+    rect: quadraui::Rect,
+    text: &str,
+    char_width: f32,
+    point: quadraui::Point,
+) -> Option<usize> {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+    if point.y < rect.y || point.y >= rect.y + rect.height || point.x < rect.x {
+        return None;
+    }
+    let cmd = quadraui::CommandLine {
+        id: quadraui::WidgetId::new("cmdline:hit-test"),
+        text: text.to_string(),
+        cursor_offset: None,
+        right_align: false,
+    };
+    let layout = cmd.layout(rect, quadraui::CommandLineMeasure::new(char_width));
+    Some(command_line_byte_to_char_idx(
+        text,
+        layout.hit_test(point.x),
+    ))
+}
+
+/// Rect spanning a mouse selection `sel` (character-count `(anchor, head)`,
+/// either order) over `text`, painted into `rect` — the paintable geometry
+/// [`quadraui::CommandLineLayout::selection_bounds`] hands back, in the same
+/// ABSOLUTE units as `rect`. `None` for an empty selection or one that maps
+/// to zero width.
+pub fn command_line_selection_rect(
+    rect: quadraui::Rect,
+    text: &str,
+    char_width: f32,
+    sel: (usize, usize),
+) -> Option<quadraui::Rect> {
+    let cmd = quadraui::CommandLine {
+        id: quadraui::WidgetId::new("cmdline:selection"),
+        text: text.to_string(),
+        cursor_offset: None,
+        right_align: false,
+    };
+    let layout = cmd.layout(rect, quadraui::CommandLineMeasure::new(char_width));
+    let lo = command_line_char_to_byte_idx(text, sel.0);
+    let hi = command_line_char_to_byte_idx(text, sel.1);
+    layout.selection_bounds((lo, hi))
 }
 
 // ─── Shared click target + layout geometry helpers ──────────────────────────
@@ -23139,6 +23248,90 @@ mod tests {
             layout.command.text
         );
         assert!(layout.command.show_cursor);
+    }
+
+    // ── Command-line click/selection geometry (#816) ────────────────────
+
+    #[test]
+    fn command_line_selection_allowed_gates_on_mode_and_message() {
+        let mut e = Engine::new();
+        e.mode = Mode::Command;
+        assert!(command_line_selection_allowed(&e));
+        e.mode = Mode::Search;
+        assert!(command_line_selection_allowed(&e));
+
+        e.mode = Mode::Normal;
+        e.message.clear();
+        assert!(!command_line_selection_allowed(&e));
+        e.message = "hello".to_string();
+        assert!(command_line_selection_allowed(&e));
+
+        e.mode = Mode::Insert;
+        assert!(
+            !command_line_selection_allowed(&e),
+            "Insert mode has no command/message line to select"
+        );
+    }
+
+    #[test]
+    fn command_line_click_char_idx_maps_x_to_a_character_column() {
+        let rect = quadraui::Rect::new(10.0, 5.0, 20.0, 1.0);
+        // ":wq" at char_width 1.0 — column 1 is 'w'.
+        let idx = command_line_click_char_idx(rect, ":wq", 1.0, quadraui::Point::new(11.5, 5.0));
+        assert_eq!(idx, Some(1));
+    }
+
+    #[test]
+    fn command_line_click_char_idx_none_outside_the_painted_row() {
+        let rect = quadraui::Rect::new(10.0, 5.0, 20.0, 1.0);
+        // Above the row.
+        assert_eq!(
+            command_line_click_char_idx(rect, ":wq", 1.0, quadraui::Point::new(15.0, 4.0)),
+            None
+        );
+        // Left of the row (e.g. the activity bar / sidebar columns on TUI).
+        assert_eq!(
+            command_line_click_char_idx(rect, ":wq", 1.0, quadraui::Point::new(5.0, 5.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn command_line_click_char_idx_clamps_past_the_end_of_text() {
+        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
+        // ":wq" is 3 chars; clicking column 15 must clamp to the end, not
+        // return an out-of-range index (`ee26268`'s raw `col - editor_left`
+        // had no such clamp).
+        let idx = command_line_click_char_idx(rect, ":wq", 1.0, quadraui::Point::new(15.0, 0.0));
+        assert_eq!(idx, Some(3));
+    }
+
+    #[test]
+    fn command_line_click_char_idx_accounts_for_multibyte_chars() {
+        // ":éditer" — 'é' is 2 bytes; the returned offset is a CHAR count
+        // (matching `Engine::command_cursor`'s unit), not a byte count.
+        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
+        let idx = command_line_click_char_idx(rect, ":éditer", 1.0, quadraui::Point::new(2.5, 0.0));
+        // Column 2 ('d', right after the 2-byte 'é') is char index 2.
+        assert_eq!(idx, Some(2));
+    }
+
+    #[test]
+    fn command_line_selection_rect_spans_the_selected_columns() {
+        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
+        // Select ":wq" from ":wq!" — char indices 0..3.
+        let r = command_line_selection_rect(rect, ":wq!", 1.0, (0, 3)).unwrap();
+        assert_eq!((r.x, r.width), (0.0, 3.0));
+    }
+
+    #[test]
+    fn command_line_selection_rect_order_independent_and_empty_is_none() {
+        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
+        assert_eq!(
+            command_line_selection_rect(rect, ":wq!", 1.0, (3, 0)),
+            command_line_selection_rect(rect, ":wq!", 1.0, (0, 3))
+        );
+        assert!(command_line_selection_rect(rect, ":wq!", 1.0, (2, 2)).is_none());
     }
 
     #[test]
