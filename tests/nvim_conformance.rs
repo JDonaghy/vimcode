@@ -3652,12 +3652,9 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "ins:BS over indent (nosmarttab)",
     "ins:Tab at start (nosmarttab)",
     "vis:gv after Vjd",
-    "vis:vggd",
-    "vis:v^d",
     "vis:Vr-",
     "vis:vlp linewise reg",
     "vis:vip then ip extends",
-    "vis:vf,d",
     "vis:v'a? mark d",
     "vis:vjc then u",
     "vis:V G d cursor",
@@ -3665,8 +3662,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "vis:v_r CR",
     "vis:v ap trailing",
     "vis:vip on last para no trailing",
-    "vb:j>",
-    "vb:j< ",
     "vb:jr<CR>",
     // The last two `num:` deviations, and the only two that survive #807.
     // Both are the same class as the `ins:*(nosmarttab)` pair above:
