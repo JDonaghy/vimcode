@@ -26381,6 +26381,12 @@ fn test_nvim_ctrl_b_page_up() {
     engine.buffer_mut().insert(0, &lines);
     engine.update_syntax();
     engine.view_mut().cursor.line = 80;
+    // #805: `<C-b>` is a true no-op (real Vim beeps) when `scroll_top` is
+    // already 0 -- which it still would be here without this, an
+    // inconsistent state a real session never reaches because every motion
+    // keeps the viewport following the cursor. `ensure_cursor_visible`
+    // restores that invariant the same way the conformance harness does.
+    engine.ensure_cursor_visible();
     engine.feed_keys("<C-b>");
     assert!(engine.view().cursor.line < 80);
 }
