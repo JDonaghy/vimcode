@@ -19001,16 +19001,12 @@ pub enum ClickTarget {
     Gutter,
     /// Click resolved to a buffer position in a specific window.
     BufferPos(WindowId, usize, usize),
-    /// Click was on a tab-bar split button: (group_id, direction).
-    SplitButton(GroupId, SplitDirection),
-    /// Click was on a tab's close button: (group_id, tab_idx).
+    /// Click was on a tab's close button: (group_id, tab_idx). The actual
+    /// close (and dirty-buffer confirmation) is applied by the caller via
+    /// `Engine::handle_tab_bar_click` — every other tab-bar target is applied
+    /// eagerly during resolution (#814), but a close needs to defer to a
+    /// confirmation dialog before the engine mutates anything.
     CloseTab(GroupId, usize),
-    /// Click was on a diff toolbar prev-change button.
-    DiffToolbarPrev,
-    /// Click was on a diff toolbar next-change button.
-    DiffToolbarNext,
-    /// Click was on a diff toolbar toggle-fold button.
-    DiffToolbarToggleFold,
     /// Click was on a per-window status bar segment with an action.
     StatusBarAction(StatusAction),
     /// Click was on the editor action menu button.

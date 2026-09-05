@@ -418,34 +418,39 @@ pub(crate) fn resolve_tab_right_click(
     }
 }
 
-/// Apply the engine-side effect for a resolved tab-bar click target and return
-/// the `ClickTarget` the caller dispatches.
+/// Resolve a tab-bar click target and, for everything except the two targets
+/// that must defer to the caller, apply it through `Engine::handle_tab_bar_click`
+/// — the single dispatch the engine, the TUI and (as of #814) GTK all share.
+///
+/// GTK used to re-implement this arm by arm (goto_tab / open_editor_group /
+/// jump_prev_hunk / ... called directly), which is exactly how the TUI's own
+/// duplicate copy silently dropped `lsp_ensure_active_buffer()` (#752) before
+/// this file did the same. Routing through the engine's own function means a
+/// future fix to any arm lands on both backends for free.
+///
+/// The two exceptions:
+/// - `ActionMenu` needs the click's screen coordinates to place the popup,
+///   which the engine doesn't have — its own arm for this target is a
+///   deliberate no-op, so `handle_mouse_click`'s `ActionMenuButton` arm opens
+///   the menu directly instead.
+/// - `CloseTab` on a dirty buffer must defer to a confirmation dialog before
+///   anything closes, so resolution only identifies *which* tab was
+///   targeted — `handle_mouse_click`'s `CloseTab` arm makes the one call into
+///   `Engine::handle_tab_bar_click` that decides confirm-vs-close.
 fn dispatch_tab_bar_target(
     engine: &mut Engine,
     group_id: GroupId,
     target: Option<crate::core::engine::TabBarClickTarget>,
 ) -> ClickTarget {
     use crate::core::engine::TabBarClickTarget as T;
-    use crate::core::window::SplitDirection;
 
     match target {
-        Some(T::Tab(idx)) => {
-            engine.goto_tab(idx);
+        Some(T::ActionMenu) => ClickTarget::ActionMenuButton(group_id),
+        Some(T::CloseTab(idx)) => ClickTarget::CloseTab(group_id, idx),
+        Some(t) => {
+            engine.handle_tab_bar_click(group_id, t);
             ClickTarget::TabBar
         }
-        Some(T::CloseTab(idx)) => {
-            if let Some(g) = engine.editor_groups.get_mut(&group_id) {
-                g.active_tab = idx;
-            }
-            engine.line_annotations.clear();
-            ClickTarget::CloseTab(group_id, idx)
-        }
-        Some(T::SplitRight) => ClickTarget::SplitButton(group_id, SplitDirection::Vertical),
-        Some(T::SplitDown) => ClickTarget::SplitButton(group_id, SplitDirection::Horizontal),
-        Some(T::ActionMenu) => ClickTarget::ActionMenuButton(group_id),
-        Some(T::DiffPrev) => ClickTarget::DiffToolbarPrev,
-        Some(T::DiffNext) => ClickTarget::DiffToolbarNext,
-        Some(T::DiffToggle) => ClickTarget::DiffToolbarToggleFold,
         None => ClickTarget::TabBar,
     }
 }
@@ -531,38 +536,16 @@ pub(crate) fn handle_mouse_click(
             }
             (Some(false), None)
         }
-        ClickTarget::SplitButton(group_id, dir) => {
-            engine.active_group = group_id;
-            engine.open_editor_group(dir);
-            (None, None)
-        }
-        ClickTarget::DiffToolbarPrev => {
-            if engine.windows.contains_key(&engine.active_window_id()) {
-                engine.jump_prev_hunk();
-            }
-            (None, None)
-        }
-        ClickTarget::DiffToolbarNext => {
-            if engine.windows.contains_key(&engine.active_window_id()) {
-                engine.jump_next_hunk();
-            }
-            (None, None)
-        }
-        ClickTarget::DiffToolbarToggleFold => {
-            engine.diff_toggle_hide_unchanged();
-            (None, None)
-        }
         ClickTarget::CloseTab(group_id, tab_idx) => {
-            if let Some(g) = engine.editor_groups.get_mut(&group_id) {
-                g.active_tab = tab_idx;
-            }
-            engine.active_group = group_id;
-            engine.line_annotations.clear();
-            if engine.dirty() {
-                return (Some(true), None);
-            }
-            engine.close_tab();
-            (None, None)
+            // The one call into `Engine::handle_tab_bar_click` for this
+            // click — `dispatch_tab_bar_target` deliberately left the
+            // dirty-check/close undone so it could happen exactly once, here,
+            // where the caller is ready to show a confirmation dialog.
+            let needs_confirm = engine.handle_tab_bar_click(
+                group_id,
+                crate::core::engine::TabBarClickTarget::CloseTab(tab_idx),
+            );
+            (needs_confirm.then_some(true), None)
         }
         ClickTarget::ActionMenuButton(group_id) => {
             let col = (x / char_width.max(1.0)) as u16;
@@ -1564,6 +1547,45 @@ mod single_group_tab_click_dispatch_tests {
             f.engine.editor_groups[&group].tabs.len(),
             before - 1,
             "clicking a tab's × in a single-group layout must close it (#553)"
+        );
+    }
+
+    /// #814: `dispatch_tab_bar_target` used to re-implement every tab-bar
+    /// button arm by hand (`engine.open_editor_group(dir)` called directly
+    /// from GTK's own `ClickTarget::SplitButton` match arm) instead of
+    /// routing through `Engine::handle_tab_bar_click` — the single dispatch
+    /// the TUI already used. This pins the split-right button through the
+    /// full production `handle_mouse_click` entry point against the shared
+    /// engine call, so a future arm added to `handle_tab_bar_click` reaches
+    /// GTK without anyone having to remember to hand-port it here too.
+    #[test]
+    fn tab_bar_split_right_button_opens_new_group_via_shared_engine_dispatch() {
+        let mut f = Fixture::new();
+        let group = f.group;
+        let groups_before = f.engine.editor_groups.len();
+
+        // Place a synthetic SplitRight button segment just past the three
+        // tabs, mirroring the disjoint right-side button zones the
+        // rasteriser lays out in production (#515).
+        let seg_start = TAB_W * 3.0;
+        let seg_end = seg_start + 24.0;
+        f.tab_pixel_hits.get_mut(&group.0).unwrap().segments.push((
+            seg_start,
+            seg_end,
+            crate::core::engine::TabBarClickTarget::SplitRight,
+        ));
+
+        let (click_result, engine_action) = f.full_click(seg_start + 5.0);
+        assert_eq!(
+            click_result, None,
+            "a split-button click is not a buffer click"
+        );
+        assert!(engine_action.is_none());
+        assert_eq!(
+            f.engine.editor_groups.len(),
+            groups_before + 1,
+            "clicking the tab bar's split-right button must open a new editor group, \
+             routed through Engine::handle_tab_bar_click (#814)"
         );
     }
 }
