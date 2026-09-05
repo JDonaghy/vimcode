@@ -5779,6 +5779,28 @@ impl SidebarOwner {
             SidebarOwner::ExtPanel(_) | SidebarOwner::Unknown => return None,
         })
     }
+
+    /// The full engine panel-id string this owner was resolved from — same
+    /// as [`Self::panel_id`] but also covers `ExtPanel` (reconstructing its
+    /// `"ext:{name}"` form) and `Unknown` (the empty string; unreachable in
+    /// practice, since `app_shell.active_panel_id()` only ever holds one of
+    /// the seven fixed panels — ext panels bypass `app_shell` registration
+    /// entirely, per this type's own doc comment).
+    ///
+    /// #823 item 7: GTK stated this exact `ext_panel_active` /
+    /// `app_shell.active_panel_id()` resolution three times —
+    /// `App::current_active_panel_id`, `App::paint_sidebar_panel_rung`, and
+    /// the real `sidebar_owner` call a few hundred lines below both — for
+    /// callers that still need the id as a string to match against the
+    /// `PANEL_*` constants rather than this enum. This is that shared
+    /// string form.
+    pub fn panel_id_string(&self) -> String {
+        match self {
+            SidebarOwner::ExtPanel(name) => format!("ext:{name}"),
+            SidebarOwner::Unknown => String::new(),
+            other => other.panel_id().unwrap_or_default().to_string(),
+        }
+    }
 }
 
 /// Resolve [`SidebarOwner`] for the current frame.

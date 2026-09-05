@@ -2551,16 +2551,9 @@ impl App {
         lh: f64,
         cw: f64,
     ) {
-        // Which panel is active?  Extension panels bypass AppShell.
-        let active_id: String = if let Some(ref name) = engine.ext_panel_active {
-            format!("ext:{name}")
-        } else {
-            engine
-                .app_shell
-                .active_panel_id()
-                .map(|id| id.as_str().to_string())
-                .unwrap_or_else(|| PANEL_EXPLORER.to_string())
-        };
+        // Which panel is active? #823 item 7: was its own restatement of
+        // `render::sidebar_owner`'s resolution.
+        let active_id: String = render::sidebar_owner(engine).panel_id_string();
 
         match active_id.as_str() {
             PANEL_EXPLORER => {
@@ -4967,19 +4960,11 @@ impl App {
     }
 
     /// Effective active panel id, accounting for ext-panel synthetic IDs.
-    /// Extension panels bypass AppShell (no dynamic registration on the
-    /// quadraui side), so if `engine.ext_panel_active` is set we synthesise
-    /// `ext:{name}`; otherwise we read AppShell's active panel.
+    /// #823 item 7: was its own restatement of `render::sidebar_owner`'s
+    /// resolution; now just that plus
+    /// `SidebarOwner::panel_id_string` (see its doc comment).
     fn current_active_panel_id(&self) -> String {
-        let engine = self.engine.borrow();
-        if let Some(ref name) = engine.ext_panel_active {
-            return format!("ext:{name}");
-        }
-        engine
-            .app_shell
-            .active_panel_id()
-            .map(|id| id.as_str().to_string())
-            .unwrap_or_else(|| PANEL_EXPLORER.to_string())
+        render::sidebar_owner(&self.engine.borrow()).panel_id_string()
     }
 
     /// Re-sync GTK widget tree from engine sidebar state. Was previously
