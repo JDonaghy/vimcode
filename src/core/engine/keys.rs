@@ -7697,8 +7697,9 @@ impl Engine {
                     let cursor = self.view().cursor;
                     let cursor_pos = self.buffer().line_to_char(cursor.line) + cursor.col;
 
+                    let count = self.take_count().max(1);
                     if let Some((start_pos, end_pos)) =
-                        self.find_text_object_range(pending, obj_type, cursor_pos)
+                        self.find_text_object_range(pending, obj_type, cursor_pos, count)
                     {
                         // Set visual selection to the text object range
                         let start_line = self.buffer().content.char_to_line(start_pos);
