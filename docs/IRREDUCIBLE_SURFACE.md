@@ -27,7 +27,7 @@ to three:
 | **GTK's menu bar *is* its client-side titlebar.** `App::setup` pins `engine.menu_bar_visible = true` unconditionally (#552); TUI shows its menu row only in vscode-mode or via Alt. | 2 — `gtk/testing.rs:5944`, `tui_main/shell_app.rs:6032` | ✅ **Irreducible.** A property of CSD, not a transcription. Handled by fixture, not by branching production code. |
 | **Command-line text selection is TUI-only.** GTK has no `cmd_sel`/`cmd_dragging` state, no inverted-cell read-back, and paints its command line through `Surface::CommandLine`, which exposes no character-offset hit test. | 1 — `tui_main/mouse.rs:1620` | ❌ **Not irreducible — mislabelled.** See §2a. |
 
-### 1b. Struck: "the folder / workspace picker is TUI-only" (#827)
+### 1b. Struck: "the folder / workspace picker is TUI-only" (#827, adopted #815)
 
 A fourth row previously sat in the table above, verdicted ✅ **Irreducible**: *"GTK
 opens a native `GtkFileChooser`, deferred through `PendingFileDialog` and run from
@@ -36,10 +36,18 @@ verdict was wrong, not just stale — it never checked upstream. `quadraui::comp
 has existed since **2026-05-25**, and its own module doc explicitly instructs
 consumers (vimcode named) to delete the local picker and rewire both backends through
 the shared controller — the aggregation that produced this row grepped `src/` for
-"do not converge" anchors and never looked at what quadraui already shipped. This is
-an ordinary **#7 Platform-Neutral adoption gap**, not an irreducible surface: file the
-adoption issue against `FolderPickerController`, don't carry this row forward as a
-settled fact.
+"do not converge" anchors and never looked at what quadraui already shipped. This was
+an ordinary **#7 Platform-Neutral adoption gap**, not an irreducible surface.
+
+**Closed by #815:** the TUI-local `FolderPickerState` (and its `collect_dir_entries`/
+`filter_dir_entries`/`dir_fuzzy_score` helpers) is deleted; both `TuiShellApp` and
+`App` now hold an `Option<quadraui::FolderPickerController>` and paint it through
+`Backend::draw_palette` via `FrameOp::FolderPicker` (both backends now compose that
+rung — see its updated doc comment). GTK's `open_folder_dialog` no longer opens a
+native `gtk4::FileDialog`; it populates the shared controller instead. Key handling
+routes through `FolderPickerController::handle` on both backends; mouse handling
+through the shared `render::route_folder_picker_click` /
+`render::set_folder_picker_selected`. Do not re-add this row.
 
 ## 2a. One of the three is a supply gap wearing a verdict's clothes
 
@@ -129,7 +137,7 @@ The two backends are, to within about 1.3%, ordinary toolkit-free Rust that happ
 live in a backend directory. The genuinely irreducible surface is the two irreducible
 facts in §1 (frame metrics, GTK's CSD menu bar) plus roughly 250 lines of native calls
 — a few hundred lines, not tens of thousands. (The folder picker is not a third: §1b
-struck it as an unactioned adoption gap, not an irreducible fact.)
+struck it as an adoption gap, not an irreducible fact — and #815 has since closed it.)
 
 **What this does NOT claim:** that the remaining ~19,200 lines are mechanically
 convergeable. Some of it is real per-backend *structure* — GTK and TUI compose a frame
@@ -155,10 +163,9 @@ the actual remaining work.
    platform-porting problem, and a plan that treats them as one will keep missing its
    projection the way the #751–#766 chain did (−3,656 against −8,700…−9,500). Size it as
    what it is: two implementations of four entry points.
-4. **File the folder-picker #7 adoption issue.** `quadraui::compose::FolderPickerController`
-   has shipped since 2026-05-25 and nothing has adopted it — file the vimcode-side
-   deletion/rewire against it (§1b), rather than continuing to treat the TUI-only picker
-   as a settled irreducible fact.
+4. ~~File the folder-picker #7 adoption issue.~~ **Done — #815.** The vimcode-side
+   deletion/rewire against `quadraui::compose::FolderPickerController` landed (§1b);
+   both backends now share one picker.
 
 ## 6. Regenerating this
 

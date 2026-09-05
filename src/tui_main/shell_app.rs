@@ -392,7 +392,10 @@ pub struct TuiShellApp {
     pub engine: Engine,
     sidebar: TuiSidebar,
     sidebar_width: u16,
-    folder_picker: Option<FolderPickerState>,
+    /// #815: `quadraui::FolderPickerController`, adopted from the old
+    /// TUI-local `FolderPickerState`. GTK's `App` carries the identical
+    /// field type — see `app.rs`.
+    folder_picker: Option<quadraui::FolderPickerController>,
     quickfix_scroll_top: usize,
     dragging_sidebar: bool,
     dragging_terminal_resize: bool,
@@ -2028,32 +2031,18 @@ impl ShellApp for TuiShellApp {
                     composed.push(render::FrameOp::CommandLine);
                 }
 
-                // ── Folder / workspace picker modal (TUI only) ───────────
+                // ── Folder / workspace picker modal (#815) ───────────────
                 // First rung of the overlay tail — above every chrome rung,
                 // below the title-bar band and the modal stack, which is
                 // exactly where it was composed before #766 made it a named
-                // rung instead of a stray paint between two walks. See
-                // `FrameOp::FolderPicker` for why GTK has no twin.
+                // rung instead of a stray paint between two walks.
+                // `quadraui::FolderPickerController::render` paints through
+                // the shared `Palette` primitive — GTK's identical arm calls
+                // the same method with its own (pixel-unit) popup rect.
                 render::FrameOp::FolderPicker => {
                     if let Some(ref picker) = self.folder_picker {
-                        // Sizing identical to the pre-shell path's: 60% of
-                        // viewport width clamped to >= 50; 55% of viewport
-                        // height clamped to >= 15. `mouse.rs`'s folder-picker
-                        // hit-test recomputes the identical arithmetic.
-                        let width = (win_area.width * 3 / 5).max(50);
-                        let height = (win_area.height * 55 / 100).max(15);
-                        let popup_x = win_area.x + (win_area.width.saturating_sub(width)) / 2;
-                        let popup_y = win_area.y + (win_area.height.saturating_sub(height)) / 2;
-                        let palette = folder_picker_to_palette(picker, width as usize);
-                        backend.draw_palette(
-                            quadraui::Rect::new(
-                                popup_x as f32,
-                                popup_y as f32,
-                                width as f32,
-                                height as f32,
-                            ),
-                            &palette,
-                        );
+                        let popup_rect = render::folder_picker_popup_rect(win_q, 1.0);
+                        picker.render(popup_rect, backend);
                         composed.push(render::FrameOp::FolderPicker);
                     }
                 }
@@ -2359,11 +2348,8 @@ impl ShellApp for TuiShellApp {
                                     self.engine.terminal_run_command(&cmd, cols, rows);
                                 }
                                 EngineAction::OpenFolderDialog => {
-                                    self.folder_picker = Some(FolderPickerState::new(
-                                        &self.engine.cwd.clone(),
-                                        FolderPickerMode::OpenFolder,
-                                        self.engine.settings.show_hidden_files,
-                                    ));
+                                    self.folder_picker =
+                                        Some(new_folder_picker_controller(&self.engine));
                                 }
                                 EngineAction::OpenWorkspaceDialog => {
                                     self.sidebar = TuiSidebar::new();
@@ -3621,7 +3607,7 @@ fn handle_key_pressed(
     repeat: bool,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
-    folder_picker: &mut Option<FolderPickerState>,
+    folder_picker: &mut Option<quadraui::FolderPickerController>,
     keyboard_enhanced: bool,
     screen_w: u16,
     screen_h: u16,
@@ -3647,17 +3633,19 @@ fn handle_key_pressed(
         );
     }
 
-    // ── Shared folder-picker rung (#762 / #734 slice 7) ─────────────────
+    // ── Shared folder-picker rung (#815 / #762 / #734 slice 7) ──────────
     // Above every non-modal tier: once `EngineAction::OpenFolderDialog`
     // (below) populates `folder_picker`, every key belongs to the picker.
+    // `FolderPickerController::handle` owns the key→intent mapping itself
+    // now (Escape/Enter/Up/Down/k/j/-/Backspace/printable, Ctrl-gated) — this
+    // rung just feeds it the raw event and applies the outcome.
     if folder_picker.is_some() && key_event.kind != KeyEventKind::Release {
-        let ctrl = key_event.modifiers.contains(KeyModifiers::CONTROL);
-        let (name, unicode) = picker_key_spelling(key_event.code);
-        apply_folder_picker_key(
-            render::route_folder_picker_key(name, unicode, ctrl),
+        apply_folder_picker_event(
             folder_picker,
+            state.ui_event,
             engine,
             sidebar,
+            screen_w,
             screen_h,
         );
         return Reaction::Redraw;
@@ -3821,15 +3809,15 @@ fn handle_key_pressed(
 /// when the app should exit.
 ///
 /// The eight named arms are the ones whose effect needs TUI-only state — the
-/// terminal panel's column/row geometry, the in-app `FolderPickerState` (GTK
-/// opens a native `FileChooser` instead), and `TuiSidebar`. Everything else
-/// falls through to `handle_action`.
+/// terminal panel's column/row geometry, the `quadraui::FolderPickerController`
+/// (#815; GTK's `App` carries the identical field), and `TuiSidebar`.
+/// Everything else falls through to `handle_action`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_post_key_action(
     action: EngineAction,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
-    folder_picker: &mut Option<FolderPickerState>,
+    folder_picker: &mut Option<quadraui::FolderPickerController>,
     screen_w: u16,
     screen_h: u16,
     sidebar_width: u16,
@@ -3854,11 +3842,7 @@ fn dispatch_post_key_action(
         let rows = engine.session.terminal_panel_rows;
         engine.terminal_run_command(cmd, screen_w, rows);
     } else if action == EngineAction::OpenFolderDialog {
-        *folder_picker = Some(FolderPickerState::new(
-            &engine.cwd.clone(),
-            FolderPickerMode::OpenFolder,
-            engine.settings.show_hidden_files,
-        ));
+        *folder_picker = Some(new_folder_picker_controller(engine));
     } else if action == EngineAction::OpenRecentDialog {
         if engine.session.recent_workspaces.is_empty() {
             engine.message = "No recent workspaces".to_string();
@@ -3946,68 +3930,50 @@ fn apply_modal_key_route(
     }
 }
 
-/// Spell one `crossterm::KeyCode` the way [`render::route_folder_picker_key`]
-/// expects: a `(named_key, printable)` pair, exactly one of which is
-/// meaningful. Named keys use the engine's own spelling so the shared rung
-/// never has to know crossterm exists.
-fn picker_key_spelling(code: KeyCode) -> (&'static str, Option<char>) {
-    match code {
-        KeyCode::Esc => ("Escape", None),
-        KeyCode::Enter => ("Return", None),
-        KeyCode::Backspace => ("BackSpace", None),
-        KeyCode::Up => ("Up", None),
-        KeyCode::Down => ("Down", None),
-        KeyCode::Char(c) => ("", Some(c)),
-        _ => ("", None),
-    }
+/// Build a `quadraui::FolderPickerController` rooted at the engine's current
+/// working directory, surfacing `.vimcode-workspace` marker files the same
+/// way the old TUI-local `FolderPickerState` did. GTK's `App::open_folder_
+/// dialog` builds the identical controller — see `app.rs`.
+fn new_folder_picker_controller(engine: &Engine) -> quadraui::FolderPickerController {
+    quadraui::FolderPickerController::new(
+        engine.cwd.clone(),
+        vec![".vimcode-workspace".to_string()],
+        engine.settings.show_hidden_files,
+    )
 }
 
-/// Apply a resolved [`render::FolderPickerKeyRoute`] to the TUI's picker
-/// state. The decision is shared; only this application is TUI-side, because
-/// `FolderPickerState` is TUI-only (GTK opens a native `FileChooser`).
-fn apply_folder_picker_key(
-    route: render::FolderPickerKeyRoute,
-    folder_picker: &mut Option<FolderPickerState>,
+/// Drive an open folder picker with one raw `UiEvent` and apply the result.
+/// The decision (key→intent, filesystem walk, filtering, scroll) is entirely
+/// `quadraui::FolderPickerController`'s own (#815); this only applies the
+/// `Confirmed`/`Cancelled` outcomes to TUI-local state (`folder_picker`,
+/// `sidebar`) and the engine. GTK's `handle_key_press` calls the identical
+/// controller method with its own popup rect — see `app.rs`.
+fn apply_folder_picker_event(
+    folder_picker: &mut Option<quadraui::FolderPickerController>,
+    event: &quadraui::UiEvent,
     engine: &mut Engine,
     sidebar: &mut TuiSidebar,
+    screen_w: u16,
     screen_h: u16,
 ) {
-    use render::FolderPickerKeyRoute as R;
     let Some(picker) = folder_picker.as_mut() else {
         return;
     };
-    match route {
-        R::Close => *folder_picker = None,
-        R::Confirm => {
-            // ".." confirms as a navigate-up rather than an open.
-            let is_dotdot = picker
-                .filtered
-                .get(picker.selected)
-                .map(|p| p.as_os_str() == "..")
-                .unwrap_or(false);
-            if is_dotdot {
-                picker.navigate_up();
-            } else if let Some(path) = picker.selected_path() {
-                *folder_picker = None;
-                engine.open_folder(&path);
-                *sidebar = TuiSidebar::new();
-                engine.explorer_rebuild_rows();
-                if let Some(path) = engine.file_path().cloned() {
-                    engine.explorer_reveal_path(&path);
-                }
+    let viewport = quadraui::Rect::new(0.0, 0.0, screen_w as f32, screen_h as f32);
+    let popup_rect = render::folder_picker_popup_rect(viewport, 1.0);
+    let visible_rows = render::folder_picker_visible_rows(popup_rect, 1.0);
+    match picker.handle(event, visible_rows) {
+        quadraui::FolderPickerEvent::Confirmed { path } => {
+            *folder_picker = None;
+            engine.open_folder(&path);
+            *sidebar = TuiSidebar::new();
+            engine.explorer_rebuild_rows();
+            if let Some(path) = engine.file_path().cloned() {
+                engine.explorer_reveal_path(&path);
             }
         }
-        R::NavigateUp => picker.navigate_up(),
-        R::SelectPrev => picker.move_up(),
-        R::SelectNext => picker.move_down(),
-        R::PopChar => picker.pop_char(),
-        R::PushChar(c) => picker.push_char(c),
-        R::Ignore => {}
-    }
-    // Keep scroll in sync with selection.
-    if let Some(picker) = folder_picker.as_mut() {
-        let popup_h = ((screen_h as usize) * 55 / 100).max(15);
-        picker.sync_scroll(popup_h.saturating_sub(4));
+        quadraui::FolderPickerEvent::Cancelled => *folder_picker = None,
+        quadraui::FolderPickerEvent::Consumed | quadraui::FolderPickerEvent::Ignored => {}
     }
 }
 
@@ -4043,8 +4009,13 @@ mod tests {
         last_clipboard_content: Option<String>,
         cmd_sel: Cell<Option<(usize, usize)>>,
         yank_hl_deadline: Cell<Option<Instant>>,
-        /// Only the debug/DAP sidebar tier reads this, and no direct test
-        /// exercises that panel today — any non-key event is inert there.
+        /// Read by the debug/DAP sidebar tier (inert for any non-key event,
+        /// and no direct test exercises that panel today) *and* the
+        /// folder-picker rung (#815), which needs this to actually be the
+        /// `UiEvent::KeyPressed` the `key`/`modifiers`/`repeat` arguments to
+        /// `handle_key_pressed` were decoded from — a test that drives the
+        /// picker must call [`Self::set_key`] first, matching what
+        /// `TuiShellApp::handle`'s real `dap_event` construction does.
         ui_event: UiEvent,
     }
 
@@ -4058,6 +4029,18 @@ mod tests {
                 yank_hl_deadline: Cell::new(None),
                 ui_event: UiEvent::WindowFocused(true),
             }
+        }
+
+        /// Set `ui_event` to the `UiEvent::KeyPressed` a test is about to
+        /// feed `handle_key_pressed` as `key`/`modifiers`/`repeat` — see the
+        /// field's doc comment for why this matters to the folder-picker
+        /// rung specifically.
+        fn set_key(&mut self, key: quadraui::Key, modifiers: quadraui::Modifiers, repeat: bool) {
+            self.ui_event = UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+            };
         }
 
         fn state(&mut self) -> KeyDispatchState<'_> {
@@ -8725,16 +8708,16 @@ mod tests {
     #[test]
     fn handle_key_pressed_folder_picker_intercepts_keys() {
         let mut engine = Engine::new();
-        let cwd = engine.cwd.clone();
         let mut sidebar = TuiSidebar::new();
-        let mut folder_picker = Some(FolderPickerState::new(
-            &cwd,
-            FolderPickerMode::OpenFolder,
-            engine.settings.show_hidden_files,
-        ));
+        let mut folder_picker = Some(new_folder_picker_controller(&engine));
         let mut backend = backend_at(80.0, 24.0);
         let mut scratch = KeyScratch::new();
 
+        scratch.set_key(
+            quadraui::Key::Char('x'),
+            quadraui::Modifiers::default(),
+            false,
+        );
         let reaction = handle_key_pressed(
             quadraui::Key::Char('x'),
             quadraui::Modifiers::default(),
@@ -8750,12 +8733,17 @@ mod tests {
         );
         assert_eq!(reaction, Reaction::Redraw);
         assert_eq!(
-            folder_picker.as_ref().map(|p| p.query.as_str()),
+            folder_picker.as_ref().map(|p| p.query()),
             Some("x"),
             "'x' should filter the picker's entry list, not reach Engine::handle_key \
              as a delete-char motion"
         );
 
+        scratch.set_key(
+            quadraui::Key::Named(quadraui::NamedKey::Escape),
+            quadraui::Modifiers::default(),
+            false,
+        );
         let reaction = handle_key_pressed(
             quadraui::Key::Named(quadraui::NamedKey::Escape),
             quadraui::Modifiers::default(),
@@ -9070,7 +9058,7 @@ mod tests {
         let press = |key,
                      engine: &mut Engine,
                      sidebar: &mut TuiSidebar,
-                     folder_picker: &mut Option<FolderPickerState>,
+                     folder_picker: &mut Option<quadraui::FolderPickerController>,
                      backend: &mut dyn quadraui::Backend,
                      scratch: &mut KeyScratch| {
             handle_key_pressed(
@@ -10411,6 +10399,156 @@ mod tests {
             "a second click on the already-selected row must confirm it and \
              close the palette; screen:\n{screen}"
         );
+    }
+
+    /// Black-box regression for #815 (adopting
+    /// `quadraui::FolderPickerController`, replacing the deleted TUI-local
+    /// `FolderPickerState`): the open picker must actually *paint* its
+    /// entries through `FolderPickerController::render`
+    /// (`FrameOp::FolderPicker`'s arm in `render_content`), typing must
+    /// reach `FolderPickerController::handle` and filter the list, and Esc
+    /// must dismiss it — the three things #815 rewired.
+    ///
+    /// This fails to even *compile* against unfixed `develop`: pre-#815,
+    /// `TuiShellApp::folder_picker` was `Option<FolderPickerState>`, a type
+    /// this test never mentions and that has none of
+    /// `FolderPickerController`'s public API (`FolderPickerController::new`
+    /// with an `extra_file_names` argument, `PALETTE_CHROME_ROWS`-based
+    /// chrome, `.gitkeep`-free fuzzy filtering identical to the demo app).
+    #[test]
+    fn folder_picker_paints_and_filters_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_815_shell_app_folder_picker_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("distinctive_child_dir_815")).unwrap();
+        std::fs::create_dir_all(dir.join("another_unrelated_dir_815")).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.folder_picker = Some(quadraui::FolderPickerController::new(
+            dir.clone(),
+            vec![],
+            false,
+        ));
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen_contains("distinctive_child_dir_815"),
+            "the open picker must paint its entries via \
+             `FolderPickerController::render`; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("another_unrelated_dir_815"),
+            "screen:\n{}",
+            driver.screen()
+        );
+
+        // Type a query that only matches one of the two child directories.
+        for c in "distinctive".chars() {
+            driver.type_char(c);
+        }
+        assert!(
+            driver.screen_contains("distinctive_child_dir_815"),
+            "typing must reach `FolderPickerController::handle` and keep \
+             matching entries visible; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("another_unrelated_dir_815"),
+            "typing a query that only matches one entry must filter the \
+             other one out; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.press_named(quadraui::NamedKey::Escape);
+        assert!(
+            !driver.screen_contains("distinctive_child_dir_815"),
+            "Esc must dismiss the picker; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion to the paint/filter test above: confirming a highlighted
+    /// entry must call `Engine::open_folder` with *that* entry's path, not
+    /// just close the picker. Exercised directly against `handle_key_pressed`
+    /// (bypassing `driver_with_shell`, like the dialog/context-menu tests
+    /// elsewhere in this module) because `TuiDriver` has no accessor back to
+    /// the concrete `Engine` to assert `cwd` against.
+    #[test]
+    fn folder_picker_enter_confirms_and_opens_the_selected_folder() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_815_confirm_folder_picker_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let child = dir.join("confirm_target_815");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let mut engine = Engine::new();
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = Some(quadraui::FolderPickerController::new(
+            dir.clone(),
+            vec![],
+            false,
+        ));
+        let mut backend = backend_at(80.0, 24.0);
+        let mut scratch = KeyScratch::new();
+
+        // Entries sort as [\"..\", \".\", \"confirm_target_815\"] — move down
+        // twice to reach the child dir, then confirm it.
+        for _ in 0..2 {
+            scratch.set_key(
+                quadraui::Key::Named(quadraui::NamedKey::Down),
+                quadraui::Modifiers::default(),
+                false,
+            );
+            handle_key_pressed(
+                quadraui::Key::Named(quadraui::NamedKey::Down),
+                quadraui::Modifiers::default(),
+                false,
+                &mut engine,
+                &mut sidebar,
+                &mut folder_picker,
+                false,
+                80,
+                24,
+                &mut backend,
+                &mut scratch.state(),
+            );
+        }
+
+        scratch.set_key(
+            quadraui::Key::Named(quadraui::NamedKey::Enter),
+            quadraui::Modifiers::default(),
+            false,
+        );
+        let reaction = handle_key_pressed(
+            quadraui::Key::Named(quadraui::NamedKey::Enter),
+            quadraui::Modifiers::default(),
+            false,
+            &mut engine,
+            &mut sidebar,
+            &mut folder_picker,
+            false,
+            80,
+            24,
+            &mut backend,
+            &mut scratch.state(),
+        );
+
+        assert_eq!(reaction, Reaction::Redraw);
+        assert!(folder_picker.is_none(), "Enter must close the picker");
+        let expected = child.canonicalize().unwrap_or_else(|_| child.clone());
+        assert_eq!(
+            engine.cwd, expected,
+            "Enter on the highlighted entry must open *that* folder"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─── #752 / #733 slice 2: the chrome rung ────────────────────────────

@@ -2050,11 +2050,12 @@ impl TabSwitcherGeometry {
 // `context_menu_layout`, `picker_popup_rect`, `Engine::toast_layout`),
 // never a freshly recomputed one — #582 / #646.
 //
-// **Not a rung, deliberately:** the TUI folder/workspace picker. GTK opens
-// a *native* GTK file chooser deferred through `PendingFileDialog` and run
-// from `tick()`, so there is no GTK canvas surface to arbitrate against —
-// the same verdict [`FRAME_Z_ORDER`] records for the paint side. See the
-// comment on `tui_main::mouse`'s folder-picker arm.
+// **Not a rung, deliberately:** the folder/workspace picker
+// (`quadraui::FolderPickerController`, #815). Both backends now paint it —
+// see [`FrameOp::FolderPicker`] — but it swallows every mouse event while
+// open, the same way a modal dialog does, so it is checked directly by both
+// backends ([`route_folder_picker_click`]) ahead of this router rather than
+// competing for z-order through [`MOUSE_ARBITRATION_ORDER`].
 
 /// The subset of mouse actions this rung distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2885,9 +2886,12 @@ pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
 //    The rung is already stated once, in the engine. Promoting it to
 //    [`ModalKeyRoute`] would *add* behaviour — making the popup outrank the
 //    sidebar band — with no bug behind it, so it is left alone.
-//  * *Folder picker* is deliberately one-sided: GTK uses a native
-//    `GtkFileChooser` via `PendingFileDialog`, so there is no GTK twin to
-//    converge and none is built.
+//  * *Folder picker* (#815): `quadraui::FolderPickerController` now owns its
+//    own key handling directly (`FolderPickerController::handle`), so there
+//    is nothing left to state in this ladder — both backends check
+//    `folder_picker.is_some()` right after `route_modal_key` declines (a
+//    modal dialog still outranks the picker) and hand the raw event straight
+//    to the controller instead.
 
 /// Which focus owner owns a keystroke, resolved after [`route_modal_key`] has
 /// declined it and before either backend reaches its editor/terminal tier.
@@ -3522,9 +3526,10 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 //    the chord fell through to whatever tier was next — `Engine::handle_key`
 //    with the editor focused, or the focused sidebar panel's own key table
 //    otherwise — instead of being consumed as a repaint request.
-// 2. [`route_folder_picker_key`] — the modal folder picker. TUI-only *state*
-//    (GTK opens a native `FileChooser`), but the key→intent mapping is
-//    backend-neutral and now lives here rather than in a `KeyCode` match.
+// 2. The modal folder picker (`quadraui::FolderPickerController`, #815) — key
+//    handling lives entirely in the controller now (`FolderPickerController::
+//    handle`), so there is no `render.rs` rung to state for it; both backends
+//    just feed it the raw `UiEvent` while the picker is open.
 // 3. [`route_debug_fkey`] — F5/F9/F10/F11 and their Shift twins. Each backend
 //    had **half** of this rung: TUI had Shift+F5/Shift+F11 but no unshifted
 //    global F-key tier (a focused non-editor panel swallowed them), GTK had
@@ -3632,64 +3637,94 @@ pub fn is_force_redraw_key(key_name: &str, unicode: Option<char>, ctrl: bool) ->
     ctrl && (matches!(unicode, Some('l') | Some('L')) || key_name == "l" || key_name == "L")
 }
 
-/// What a key means to the modal folder picker.
+/// Popup rect for the folder-picker modal (`quadraui::FolderPickerController`,
+/// #815), in the caller's own units.
 ///
-/// The picker's *state* is TUI-only (`tui_main::FolderPickerState`; GTK opens
-/// a native `FileChooser` for `EngineAction::OpenFolderDialog`), but the
-/// key→intent mapping is not — it is the same vim-flavoured set a GTK-side
-/// in-app picker would need, so it is stated here rather than as a
-/// `crossterm::KeyCode` match inside the entry point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FolderPickerKeyRoute {
-    /// Escape — dismiss the picker without opening anything.
-    Close,
-    /// Enter — open the highlighted entry (the caller checks for `..` first
-    /// and treats that as [`FolderPickerKeyRoute::NavigateUp`]).
-    Confirm,
-    /// `-` — go to the parent directory, netrw style.
-    NavigateUp,
-    /// Up / `k`.
-    SelectPrev,
-    /// Down / `j`.
-    SelectNext,
-    /// Backspace — drop the last character of the filter query.
-    PopChar,
-    /// A printable character — append it to the filter query.
-    PushChar(char),
-    /// Consumed by the modal but with no effect (the picker swallows every
-    /// key rather than letting it reach the editor underneath).
-    Ignore,
+/// Both backends use the same proportions the controller's own
+/// `tui_folder_picker` / `gtk_folder_picker` demo apps use — 60% of the
+/// viewport width (min 50), 55% of the height (min 15 lines) — computed
+/// purely from `Backend::viewport()` / `Backend::line_height()`, which is
+/// what lets one function serve TUI (cells, `line_height() == 1.0`) and GTK
+/// (pixels) without either backend branching on its own identity.
+pub fn folder_picker_popup_rect(viewport: quadraui::Rect, line_height: f32) -> quadraui::Rect {
+    let w = (viewport.width * 0.6).max(50.0);
+    let h = (viewport.height * 0.55).max(15.0 * line_height);
+    let x = viewport.x + (viewport.width - w) / 2.0;
+    let y = viewport.y + (viewport.height - h) / 2.0;
+    quadraui::Rect::new(x, y, w, h)
 }
 
-/// Resolve one key against an open folder picker.
+/// Visible list rows inside an open folder picker's popup — the popup height
+/// minus the `Palette` chrome (title + query + borders,
+/// `quadraui::PALETTE_CHROME_ROWS`) that `FolderPickerController::handle`
+/// needs to keep the selection's scroll position in sync.
+pub fn folder_picker_visible_rows(popup_rect: quadraui::Rect, line_height: f32) -> usize {
+    let rows = (popup_rect.height / line_height.max(f32::EPSILON)) as usize;
+    rows.saturating_sub(quadraui::PALETTE_CHROME_ROWS)
+}
+
+/// Where a mouse press against an open folder-picker popup lands.
 ///
-/// `unicode` is the printable character the key produced, if any; `key_name`
-/// is the backend's own spelling of a named key. Ctrl-modified keys resolve
-/// to [`FolderPickerKeyRoute::Ignore`] rather than being typed into the
-/// filter — that is what makes `Ctrl+J`/`Ctrl+K` inert instead of moving the
-/// selection, matching the legacy `!picker_ctrl` guards.
-pub fn route_folder_picker_key(
-    key_name: &str,
-    unicode: Option<char>,
-    ctrl: bool,
-) -> FolderPickerKeyRoute {
-    match key_name {
-        "Escape" => return FolderPickerKeyRoute::Close,
-        "Return" => return FolderPickerKeyRoute::Confirm,
-        "BackSpace" => return FolderPickerKeyRoute::PopChar,
-        "Up" if !ctrl => return FolderPickerKeyRoute::SelectPrev,
-        "Down" if !ctrl => return FolderPickerKeyRoute::SelectNext,
-        _ => {}
+/// Mirrors [`PickerHitGeometry::resolve`]'s shape for the unified picker, but
+/// this rung is deliberately *not* folded into [`route_modal_overlay_click`] /
+/// [`MOUSE_ARBITRATION_ORDER`]: the folder picker swallows every input while
+/// open (like a modal dialog) rather than competing for z-order with the
+/// other overlays, so both backends check it first and return early — the
+/// same shape the pre-#815 TUI-only code already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderPickerClickRoute {
+    /// Landed on a selectable results row — index into `filtered()`.
+    SelectRow(usize),
+    /// Landed inside the popup, but not on a selectable row (title/query/
+    /// border chrome, or past the last row).
+    Consume,
+    /// Landed outside the popup — dismiss.
+    Dismiss,
+}
+
+/// Resolve a mouse press at `(x, y)` against the folder picker's painted
+/// popup `rect`. `row_height` is the backend's line height (`1.0` on TUI, the
+/// painted pixel line height on GTK); `scroll_top`/`total_filtered` come
+/// straight off the live `FolderPickerController`.
+pub fn route_folder_picker_click(
+    rect: quadraui::Rect,
+    x: f32,
+    y: f32,
+    row_height: f32,
+    scroll_top: usize,
+    total_filtered: usize,
+) -> FolderPickerClickRoute {
+    let inside = x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
+    if !inside {
+        return FolderPickerClickRoute::Dismiss;
     }
-    if ctrl {
-        return FolderPickerKeyRoute::Ignore;
+    let row_height = row_height.max(f32::EPSILON);
+    let rows_top = rect.y + quadraui::PALETTE_CHROME_ROWS as f32 * row_height;
+    let rows_bottom = rect.y + rect.height;
+    if y >= rows_top && y < rows_bottom {
+        let row = ((y - rows_top) / row_height) as usize;
+        let idx = scroll_top + row;
+        if idx < total_filtered {
+            return FolderPickerClickRoute::SelectRow(idx);
+        }
     }
-    match unicode {
-        Some('-') => FolderPickerKeyRoute::NavigateUp,
-        Some('k') => FolderPickerKeyRoute::SelectPrev,
-        Some('j') => FolderPickerKeyRoute::SelectNext,
-        Some(c) => FolderPickerKeyRoute::PushChar(c),
-        None => FolderPickerKeyRoute::Ignore,
+    FolderPickerClickRoute::Consume
+}
+
+/// Move an open folder picker's selection to `idx` by repeated
+/// `move_up`/`move_down` calls.
+///
+/// `FolderPickerController` (quadraui) exposes no direct "set selected index"
+/// setter — only relative movement, clamped at both ends — so a mouse click
+/// on a specific row has to walk there one step at a time. The list is capped
+/// at 50 entries (`FolderPickerController`'s own `filter_dir_entries` cap),
+/// so this is at most 50 calls, all pure index arithmetic.
+pub fn set_folder_picker_selected(picker: &mut quadraui::FolderPickerController, idx: usize) {
+    while picker.selected() < idx {
+        picker.move_down();
+    }
+    while picker.selected() > idx {
+        picker.move_up();
     }
 }
 
@@ -7200,18 +7235,18 @@ pub enum FrameOp {
     /// The Vim command line (`:`/`/`/`?` and messages). Unconditional on both
     /// backends: the row is always reserved and always painted, empty or not.
     CommandLine,
-    /// TUI's folder / workspace picker modal — the first rung of the overlay
-    /// tail, and the one rung of the sequence that exists on **one backend
-    /// only**.
+    /// The folder / workspace picker modal — the first rung of the overlay
+    /// tail.
     ///
-    /// GTK's equivalent is a *native* GTK file chooser, deferred through
-    /// `PendingFileDialog` and run from `tick()`, so it is not a canvas rung
-    /// there at all: GTK's `FramePresence` never marks it live and its `match`
-    /// arm is a documented no-op. `mouse.rs`'s folder-picker block records the
-    /// identical "deliberately one-sided, do not converge" verdict for the
-    /// input side — inventing a GTK canvas picker purely to make the two
-    /// sequences match would *add* per-backend code, the opposite of
-    /// `GOALS.md` milestone #7.
+    /// `quadraui::FolderPickerController` (#815) renders through the existing
+    /// `Palette` primitive (`Backend::draw_palette`) on **both** backends —
+    /// there is no per-backend paint here, just each backend calling
+    /// `FolderPickerController::render` with its own popup rect
+    /// ([`folder_picker_popup_rect`]). Before #815 this was a TUI-only rung
+    /// (GTK opened a native `GtkFileChooser` deferred through
+    /// `PendingFileDialog`); that verdict was struck as an unactioned #7
+    /// adoption gap, not an irreducible fact — see
+    /// `docs/IRREDUCIBLE_SURFACE.md` §1b.
     ///
     /// It is a rung rather than a stray paint between two walks because #766
     /// folds the frame into one sequence: a surface composed between the chrome
@@ -7323,9 +7358,10 @@ pub struct FramePresence {
     pub wildmenu: bool,
     pub status_bar: bool,
     pub command_line: bool,
-    /// TUI only — see [`FrameOp::FolderPicker`]. Not derivable from
-    /// `ScreenLayout` (the picker lives on `TuiShellApp`), so
-    /// [`Self::from_screen`] leaves it `false` and the caller sets it.
+    /// See [`FrameOp::FolderPicker`]. Not derivable from `ScreenLayout` (the
+    /// picker lives on each backend's own shell app / `App`, not the shared
+    /// engine), so [`Self::from_screen`] leaves it `false` and the caller
+    /// sets it from its own `Option<FolderPickerController>`.
     pub folder_picker: bool,
     pub menu_dropdown: bool,
     pub command_center: bool,
@@ -7646,9 +7682,6 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 //     painted from the [`FrameOp::MenuDropdown`] arm, because
 //     `MenuSystem::render` repaints the whole title-bar band and would erase
 //     anything laid down before it (#676/#712).
-//   * TUI's folder/workspace picker. GTK's equivalent is a *native* GTK file
-//     chooser deferred through `PendingFileDialog` and run from `tick()`, so it
-//     is not a canvas rung at all.
 //
 // **Why here and not in quadraui** (`CLAUDE.md`'s "check quadraui first"):
 // quadraui already owns the *shell* composition — `compose::app_shell::AppShell`
@@ -7689,7 +7722,8 @@ pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
         wildmenu: true,
         status_bar: true,
         command_line: true,
-        // TUI-only, and not open in the fixture — see `FrameOp::FolderPicker`.
+        // Shared on both backends since #815, but not open in this fixture —
+        // see `FrameOp::FolderPicker`.
         folder_picker: false,
         menu_dropdown: true,
         command_center: true,
@@ -20348,9 +20382,9 @@ mod tests {
             let arbitrated = MOUSE_ARBITRATION_ORDER.contains(&op);
             // `MenuDropdown` / `CommandCenter`: `MenuSystem::handle` owns the
             // title-bar band's own events before this router runs.
-            // `FolderPicker`: TUI-only, so there is no *shared* router rung to
-            // agree with — `mouse.rs` routes it directly and records the
-            // "deliberately one-sided" verdict.
+            // `FolderPicker`: shared on both backends since #815, but not
+            // folded into this ladder — see `route_folder_picker_click`'s
+            // doc comment for why it is checked directly instead.
             let routed_elsewhere = matches!(
                 op,
                 FrameOp::MenuDropdown | FrameOp::CommandCenter | FrameOp::FolderPicker
@@ -25642,32 +25676,68 @@ mod slice7_router_tests {
     }
 
     #[test]
-    fn folder_picker_keys_resolve_to_their_intents() {
-        use FolderPickerKeyRoute as R;
-        assert_eq!(route_folder_picker_key("Escape", None, false), R::Close);
-        assert_eq!(route_folder_picker_key("Return", None, false), R::Confirm);
+    fn folder_picker_popup_rect_is_60_by_55_percent_centred() {
+        let vp = quadraui::Rect::new(0.0, 0.0, 200.0, 100.0);
+        let rect = folder_picker_popup_rect(vp, 1.0);
+        assert!((rect.width - 120.0).abs() < 0.01, "{}", rect.width);
+        assert!((rect.height - 55.0).abs() < 0.01, "{}", rect.height);
+        assert!((rect.x - 40.0).abs() < 0.01, "{}", rect.x);
+        assert!((rect.y - 22.5).abs() < 0.01, "{}", rect.y);
+    }
+
+    #[test]
+    fn folder_picker_popup_rect_clamps_to_minimums() {
+        // Tiny viewport: width/height clamp to the documented minimums
+        // (50 units wide, 15 lines tall) rather than shrinking further.
+        let vp = quadraui::Rect::new(0.0, 0.0, 40.0, 10.0);
+        let rect = folder_picker_popup_rect(vp, 1.0);
+        assert_eq!(rect.width, 50.0);
+        assert_eq!(rect.height, 15.0);
+    }
+
+    #[test]
+    fn folder_picker_click_outside_popup_dismisses() {
+        let rect = quadraui::Rect::new(10.0, 10.0, 40.0, 20.0);
         assert_eq!(
-            route_folder_picker_key("BackSpace", None, false),
-            R::PopChar
+            route_folder_picker_click(rect, 0.0, 0.0, 1.0, 0, 10),
+            FolderPickerClickRoute::Dismiss
         );
-        assert_eq!(route_folder_picker_key("Up", None, false), R::SelectPrev);
-        assert_eq!(route_folder_picker_key("Down", None, false), R::SelectNext);
-        // Vim spellings.
-        assert_eq!(route_folder_picker_key("", Some('k'), false), R::SelectPrev);
-        assert_eq!(route_folder_picker_key("", Some('j'), false), R::SelectNext);
-        assert_eq!(route_folder_picker_key("", Some('-'), false), R::NavigateUp);
-        // Anything else printable types into the filter.
         assert_eq!(
-            route_folder_picker_key("", Some('s'), false),
-            R::PushChar('s')
+            route_folder_picker_click(rect, 100.0, 100.0, 1.0, 0, 10),
+            FolderPickerClickRoute::Dismiss
         );
-        // Ctrl-modified keys are swallowed, never typed — the `!picker_ctrl`
-        // guards the legacy `KeyCode` match spelled out five times.
-        assert_eq!(route_folder_picker_key("", Some('j'), true), R::Ignore);
-        assert_eq!(route_folder_picker_key("", Some('s'), true), R::Ignore);
-        assert_eq!(route_folder_picker_key("Up", None, true), R::Ignore);
-        // Escape/Enter/Backspace still work with Ctrl held.
-        assert_eq!(route_folder_picker_key("Escape", None, true), R::Close);
+    }
+
+    #[test]
+    fn folder_picker_click_on_chrome_consumes_without_selecting() {
+        let rect = quadraui::Rect::new(0.0, 0.0, 40.0, 20.0);
+        // Row 0 is inside the title-row chrome (PALETTE_CHROME_ROWS == 4).
+        assert_eq!(
+            route_folder_picker_click(rect, 5.0, 0.0, 1.0, 0, 10),
+            FolderPickerClickRoute::Consume
+        );
+    }
+
+    #[test]
+    fn folder_picker_click_on_a_row_selects_scroll_top_plus_offset() {
+        let rect = quadraui::Rect::new(0.0, 0.0, 40.0, 20.0);
+        let chrome = quadraui::PALETTE_CHROME_ROWS as f32;
+        // Second visible row past the chrome, with a nonzero scroll offset.
+        assert_eq!(
+            route_folder_picker_click(rect, 5.0, chrome + 1.0, 1.0, 3, 10),
+            FolderPickerClickRoute::SelectRow(4)
+        );
+    }
+
+    #[test]
+    fn folder_picker_click_past_last_row_consumes() {
+        let rect = quadraui::Rect::new(0.0, 0.0, 40.0, 20.0);
+        let chrome = quadraui::PALETTE_CHROME_ROWS as f32;
+        // Only 2 filtered entries — clicking row 5 lands past the end.
+        assert_eq!(
+            route_folder_picker_click(rect, 5.0, chrome + 5.0, 1.0, 0, 2),
+            FolderPickerClickRoute::Consume
+        );
     }
 
     #[test]

@@ -181,8 +181,6 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
 /// rather than becoming a quadraui gap to file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeferredAction {
-    /// Refresh the file tree from the current working directory.
-    RefreshFileTree,
     /// Redraw after an accelerator mutated engine state directly.
     Resize,
     /// `settings.json` changed on disk.
@@ -313,6 +311,12 @@ pub(crate) struct App {
     /// hit-testing both read `DialogLayout::hit_test` off this instead of a
     /// hand-rolled per-backend rect cache.
     pub(crate) dialog_layout: Rc<RefCell<Option<quadraui::DialogLayout>>>,
+    /// #815: the shared `quadraui::FolderPickerController`, adopted from the
+    /// old TUI-local `FolderPickerState`/native `gtk4::FileDialog` split.
+    /// `render_content` (`&self`) needs to *read* it while `handle_key_press`
+    /// (`&mut self`) mutates it, hence the `RefCell` — mirrors
+    /// `dialog_layout` above. `TuiShellApp` carries the identical field type.
+    pub(crate) folder_picker: RefCell<Option<quadraui::FolderPickerController>>,
     /// Edge-trigger flag for #727's native message-dialog path: `true`
     /// once a native present has been queued (or already shown) for the
     /// `engine.dialog` currently open. A native `AlertDialog` cannot be
@@ -605,6 +609,13 @@ pub(crate) struct App {
     /// why the click path must not re-derive it (#555).
     #[allow(clippy::type_complexity)]
     pub(crate) picker_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Folder-picker popup rect `(x, y, w, h)` **as the last frame actually
+    /// painted it** (#815) — same `(x, y, w, h)` shape and the same "click
+    /// path reads the painted rect, never re-derives it" rationale as
+    /// [`Self::picker_popup_rect`] just above. Cleared whenever the picker
+    /// is closed, alongside the other overlay-tail caches (#766).
+    #[allow(clippy::type_complexity)]
+    pub(crate) folder_picker_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
     /// Line height the last frame actually painted with, published by
     /// `render_content` — see [`App::painted_line_height`] (#555).
     pub(crate) painted_line_height: Rc<Cell<Option<f64>>>,
@@ -980,6 +991,7 @@ impl App {
             last_editor_pointer: Rc::new(Cell::new(None)),
             cached_ui_line_height: 20.0,
             dialog_layout: Rc::new(RefCell::new(None)),
+            folder_picker: RefCell::new(None),
             native_dialog_shown: Rc::new(Cell::new(false)),
             pending_native_dialog: Rc::new(Cell::new(None)),
             line_height_cell: Rc::new(Cell::new(24.0)),
@@ -1030,6 +1042,7 @@ impl App {
             composed_editor_band: Rc::new(RefCell::new(Vec::new())),
             composed_bottom_band: Rc::new(RefCell::new(Vec::new())),
             picker_popup_rect: Rc::new(Cell::new(None)),
+            folder_picker_popup_rect: Rc::new(Cell::new(None)),
             painted_sidebar_bounds: Rc::new(Cell::new(None)),
             painted_line_height: Rc::new(Cell::new(None)),
             painted_char_width: Rc::new(Cell::new(None)),
@@ -1659,11 +1672,14 @@ impl App {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     /// `ctx` is threaded in solely for the shared Alt rung's
     /// [`render::AltKeyOutcome::ResizeSidebar`] arm: GTK's authoritative
     /// sidebar width *is* the runner's `AppShell` (TUI keeps its own copy and
     /// syncs it out at end of dispatch), and `ShellContext::shell_mut` is the
-    /// only handle to it.
+    /// only handle to it. `ui_event` (#815) is the raw event `key_name`/
+    /// `unicode`/... were decoded from, needed by the folder-picker rung —
+    /// mirrors TUI's `KeyDispatchState::ui_event`.
     fn handle_key_press(
         &mut self,
         key_name: String,
@@ -1671,6 +1687,7 @@ impl App {
         ctrl: bool,
         shift: bool,
         alt: bool,
+        ui_event: &quadraui::UiEvent,
         ctx: &quadraui::ShellContext<'_>,
     ) {
         // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
@@ -1693,6 +1710,20 @@ impl App {
                 return;
             }
             render::ModalKeyRoute::None => {}
+        }
+
+        // ── Shared folder-picker rung (#815) ────────────────────────────
+        // Above every other tier: once `open_folder_dialog` (below) has
+        // populated `folder_picker`, every key belongs to the picker.
+        // `FolderPickerController::handle` owns the key→intent mapping
+        // itself (Escape/Enter/Up/Down/k/j/-/Backspace/printable,
+        // Ctrl-gated) — this rung just feeds it the raw event and applies
+        // the outcome. Mirrors TUI's identical rung in `handle_key_pressed`
+        // (`shell_app.rs`), same precedence relative to the modal rung above.
+        if self.folder_picker.borrow().is_some() {
+            self.apply_folder_picker_event(ui_event);
+            self.draw_needed.set(true);
+            return;
         }
 
         // Dismiss any panel hover popup on key press.
@@ -3746,6 +3777,17 @@ impl App {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(&mut self, x: f64, y: f64, width: f64, height: f64, alt: bool) {
+        // ── Folder picker mouse handling (#815) ─────────────────────────
+        // Checked before every other rung: like a modal dialog, the picker
+        // swallows every click while open rather than competing for z-order
+        // through `route_modal_overlay_click` / `MOUSE_ARBITRATION_ORDER` —
+        // see `render::route_folder_picker_click`'s doc comment. TUI's
+        // `mouse::handle_mouse` checks the identical shared helper.
+        if self.folder_picker.borrow().is_some() {
+            self.route_and_apply_folder_picker_click(x, y);
+            return;
+        }
+
         self.reconcile_editor_hover_modal();
 
         // ── Modal-overlay rung (#733) ─────────────────────────────────────
@@ -5648,27 +5690,113 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Show a native "Open Folder" dialog.
+    /// Show the shared folder/workspace picker modal (#815).
+    ///
+    /// Before #815 this opened a *native* `gtk4::FileDialog` in
+    /// "select folder" mode: `quadraui::PlatformServices` has no
+    /// directory-select primitive (only `show_file_open_dialog` /
+    /// `show_file_save_dialog`, both file pickers), so a native chooser was
+    /// the only option at the time. `quadraui::FolderPickerController`
+    /// (shipped 2026-05-25, quadraui#166) makes that escape hatch
+    /// unnecessary — it does its own filesystem walk — so this now opens the
+    /// identical `Palette`-based picker TUI does; see `FrameOp::FolderPicker`
+    /// and `handle_key_press`'s folder-picker rung. TUI's
+    /// `new_folder_picker_controller` builds the same controller.
     fn open_folder_dialog(&mut self) {
-        // #572: still direct gtk4::FileDialog — quadraui::PlatformServices
-        // has no folder-select mode yet (only show_file_open_dialog /
-        // show_file_save_dialog, both file pickers). Needs a new
-        // quadraui issue (folder-select support) before this can move.
-        let engine = self.engine.clone();
-        let deferred2 = self.deferred.clone();
-        let dialog = gtk4::FileDialog::new();
-        dialog.set_title("Open Folder");
-        dialog.set_accept_label(Some("Open Folder"));
-        let win = self.window.clone();
-        dialog.select_folder(win.as_ref(), gtk4::gio::Cancellable::NONE, move |result| {
-            if let Ok(file) = result {
-                // Use UFCS to call gtk4's FileExt::path (avoids gio version conflict)
-                if let Some(path) = gtk4::prelude::FileExt::path(&file) {
-                    engine.borrow_mut().open_folder(&path);
-                    deferred2.send(DeferredAction::RefreshFileTree);
+        let engine = self.engine.borrow();
+        let controller = quadraui::FolderPickerController::new(
+            engine.cwd.clone(),
+            vec![".vimcode-workspace".to_string()],
+            engine.settings.show_hidden_files,
+        );
+        drop(engine);
+        *self.folder_picker.borrow_mut() = Some(controller);
+        self.draw_needed.set(true);
+    }
+
+    /// Drive an open folder picker with one raw `UiEvent` and apply the
+    /// result. The decision (key→intent, filesystem walk, filtering,
+    /// scroll) is entirely `quadraui::FolderPickerController`'s own (#815);
+    /// this only applies the `Confirmed`/`Cancelled` outcomes to GTK-local
+    /// state and the engine. Mirrors TUI's identical
+    /// `apply_folder_picker_event` (`shell_app.rs`) — same controller, same
+    /// outcome handling; the popup rect comes from the painted-rect cache
+    /// (`folder_picker_popup_rect`, #582/#646) here instead of a fresh
+    /// `Backend::viewport()` call, since this method has no live `backend`
+    /// handle.
+    fn apply_folder_picker_event(&mut self, event: &quadraui::UiEvent) {
+        let Some((x, y, w, h)) = self.folder_picker_popup_rect.get() else {
+            return;
+        };
+        let popup_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
+        let lh = self.cached_line_height.max(1.0) as f32;
+        let visible_rows = render::folder_picker_visible_rows(popup_rect, lh);
+        let outcome = {
+            let mut picker_ref = self.folder_picker.borrow_mut();
+            let Some(picker) = picker_ref.as_mut() else {
+                return;
+            };
+            picker.handle(event, visible_rows)
+        };
+        match outcome {
+            quadraui::FolderPickerEvent::Confirmed { path } => {
+                *self.folder_picker.borrow_mut() = None;
+                self.engine.borrow_mut().open_folder(&path);
+                self.refresh_file_tree();
+            }
+            quadraui::FolderPickerEvent::Cancelled => {
+                *self.folder_picker.borrow_mut() = None;
+            }
+            quadraui::FolderPickerEvent::Consumed | quadraui::FolderPickerEvent::Ignored => {}
+        }
+    }
+
+    /// Resolve a mouse press at `(x, y)` against the open folder picker's
+    /// painted popup and apply the result. Mirrors TUI's identical block in
+    /// `mouse::handle_mouse` — same shared `render::route_folder_picker_click`
+    /// / `render::set_folder_picker_selected`, same "select row" / "consume"
+    /// / "dismiss" outcomes.
+    fn route_and_apply_folder_picker_click(&mut self, x: f64, y: f64) {
+        let Some((rx, ry, rw, rh)) = self.folder_picker_popup_rect.get() else {
+            // No painted rect to hit-test against (shouldn't happen while
+            // `folder_picker` is open, since `render_content` always caches
+            // one when it paints) — dismiss defensively rather than leave an
+            // unreachable modal up.
+            *self.folder_picker.borrow_mut() = None;
+            self.draw_needed.set(true);
+            return;
+        };
+        let rect = quadraui::Rect::new(rx as f32, ry as f32, rw as f32, rh as f32);
+        let lh = self.cached_line_height.max(1.0) as f32;
+        let Some((scroll_top, total_filtered)) = self
+            .folder_picker
+            .borrow()
+            .as_ref()
+            .map(|p| (p.scroll_top(), p.filtered().len()))
+        else {
+            return;
+        };
+        let route = render::route_folder_picker_click(
+            rect,
+            x as f32,
+            y as f32,
+            lh,
+            scroll_top,
+            total_filtered,
+        );
+        match route {
+            render::FolderPickerClickRoute::SelectRow(idx) => {
+                if let Some(picker) = self.folder_picker.borrow_mut().as_mut() {
+                    render::set_folder_picker_selected(picker, idx);
+                    let visible_rows = render::folder_picker_visible_rows(rect, lh);
+                    picker.sync_scroll(visible_rows);
                 }
             }
-        });
+            render::FolderPickerClickRoute::Consume => {}
+            render::FolderPickerClickRoute::Dismiss => {
+                *self.folder_picker.borrow_mut() = None;
+            }
+        }
         self.draw_needed.set(true);
     }
 
@@ -6086,7 +6214,21 @@ impl App {
         }
 
         match event {
-            UiEvent::KeyPressed { key, modifiers, .. } => {
+            UiEvent::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+            } => {
+                // #815: kept alongside the decoded `key_name`/`unicode` below
+                // so the folder-picker rung in `handle_key_press` can feed
+                // `FolderPickerController::handle` the *original* event
+                // instead of a re-encoded one — mirrors TUI's `dap_event`
+                // (`shell_app.rs`).
+                let raw_event = UiEvent::KeyPressed {
+                    key: key.clone(),
+                    modifiers,
+                    repeat,
+                };
                 let (key_name, unicode) = match key {
                     Key::Char(c) => (c.to_string(), Some(c)),
                     Key::Named(ref named) => {
@@ -6130,14 +6272,26 @@ impl App {
                         modifiers.ctrl,
                         modifiers.shift,
                         modifiers.alt,
+                        &raw_event,
                         ctx,
                     );
                 }
             }
             UiEvent::CharTyped(c) => {
                 // Ctrl-modified characters arrive via KeyPressed; CharTyped is
-                // for IME-composed printable characters only.
-                self.handle_key_press(c.to_string(), Some(c), false, false, false, ctx);
+                // for IME-composed printable characters only. Per
+                // `FolderPickerController::handle`'s own contract this is
+                // never the folder picker's typing source either, so passing
+                // it through as the "raw event" is correct, not a stand-in.
+                self.handle_key_press(
+                    c.to_string(),
+                    Some(c),
+                    false,
+                    false,
+                    false,
+                    &UiEvent::CharTyped(c),
+                    ctx,
+                );
             }
             UiEvent::Accelerator(id, _mods) => {
                 let mut host = GtkAccelHost {
@@ -6383,7 +6537,6 @@ impl App {
         // Drain the actions async GTK callbacks queued for this frame.
         for action in self.deferred.drain() {
             match action {
-                DeferredAction::RefreshFileTree => self.refresh_file_tree(),
                 DeferredAction::Resize => self.handle_resize(),
                 DeferredAction::SettingsFileChanged => self.settings_file_changed(),
                 DeferredAction::ToggleFocusExplorer => self.toggle_focus_explorer(),
@@ -6706,6 +6859,7 @@ impl quadraui::ShellApp for App {
         // click against last frame's geometry — the #587 class of bug.
         self.engine.borrow().command_center_layout.replace(None);
         self.picker_popup_rect.set(None);
+        self.folder_picker_popup_rect.set(None);
         self.tab_switcher_popup_rect.set(None);
         *self.context_menu_layout.borrow_mut() = None;
         *self.dialog_layout.borrow_mut() = None;
@@ -6748,10 +6902,8 @@ impl quadraui::ShellApp for App {
         let mut presence =
             render::FramePresence::from_screen(screen, layout, render::FrameMetrics::px(lh, cw));
         presence.toast_stack = toast_stack.is_some();
-        // TUI-only rung: GTK's folder chooser is a *native* GTK file dialog
-        // deferred through `PendingFileDialog` and run from `tick()`, so there
-        // is no canvas surface to compose. See `render::FrameOp::FolderPicker`.
-        presence.folder_picker = false;
+        // #815: shared with TUI now — see `render::FrameOp::FolderPicker`.
+        presence.folder_picker = self.folder_picker.borrow().is_some();
         // #727: a natively-expressible dialog is presented by the OS, not
         // composed into this frame, so the rung is not live. `dialog_layout`
         // stays cleared above and nothing is recorded — the sequence describes
@@ -6876,16 +7028,27 @@ impl quadraui::ShellApp for App {
                     composed.push(render::FrameOp::CommandLine);
                 }
 
-                // ── Folder / workspace picker (TUI only) ─────────────────────
-                // GTK's equivalent is a *native* GTK file chooser, deferred
-                // through `PendingFileDialog` and run from `tick()`, so there
-                // is nothing to compose here — the rung is never live on this
-                // backend. Present as an arm rather than absent from the enum
-                // because the sequence is shared: a rung one backend owns has
-                // to appear in the order, or the order is not the whole frame.
-                // `mouse.rs`'s folder-picker block records the identical
-                // "deliberately one-sided, do not converge" verdict for input.
-                render::FrameOp::FolderPicker => {}
+                // ── Folder / workspace picker modal (#815) ───────────────────
+                // `quadraui::FolderPickerController::render` paints through
+                // the shared `Palette` primitive — the identical method
+                // TUI's `FrameOp::FolderPicker` arm calls, just with this
+                // backend's own (pixel-unit) popup rect.
+                render::FrameOp::FolderPicker => {
+                    if let Some(ref picker) = *self.folder_picker.borrow() {
+                        let popup_rect =
+                            render::folder_picker_popup_rect(popup_viewport, lh as f32);
+                        picker.render(popup_rect, backend);
+                        // Cache the *painted* rect (#582/#646) — key/mouse
+                        // handling read this instead of re-deriving it.
+                        self.folder_picker_popup_rect.set(Some((
+                            popup_rect.x as f64,
+                            popup_rect.y as f64,
+                            popup_rect.width as f64,
+                            popup_rect.height as f64,
+                        )));
+                        composed.push(render::FrameOp::FolderPicker);
+                    }
+                }
 
                 // ── Menu dropdown overlay ────────────────────────────────────
                 // First rung of the band: `MenuSystem::render` repaints
