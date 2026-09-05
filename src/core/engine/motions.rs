@@ -533,141 +533,55 @@ impl Engine {
 
     // --- Number increment/decrement (Ctrl+a / Ctrl+x) ---
 
+    /// Normal-mode `<C-a>` / `<C-x>`: find the number at or after the cursor on
+    /// the current line and add `delta` to it.
     pub(crate) fn increment_number_at_cursor(&mut self, delta: i64, changed: &mut bool) {
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
-        let line_start = self.buffer().line_to_char(line);
-        let line_len = self.buffer().line_len_chars(line);
-
-        let line_text: String = self.buffer().content.line(line).chars().collect();
-        let chars: Vec<char> = line_text.chars().collect();
-
-        // Find number at or after cursor
-        // First, look for a digit at or after current col
-        let mut num_start = None;
-        let mut num_end = 0;
-
-        // Check if we're inside a number already
-        let search_start = col;
-        for i in search_start..chars.len() {
-            if chars[i].is_ascii_digit() {
-                // Find start of this number (walk back)
-                let mut s = i;
-                // Check for hex prefix (0x)
-                if s > 0 && chars[s - 1] == 'x' && s > 1 && chars[s - 2] == '0' {
-                    s -= 2;
-                } else if s > 0 && chars[s - 1] == '-' {
-                    // Could be negative
-                }
-                // Find exact start: walk back from i
-                let mut start = i;
-                while start > 0
-                    && (chars[start - 1].is_ascii_digit()
-                        || (start >= 2 && chars[start - 1] == 'x' && chars[start - 2] == '0'))
-                {
-                    start -= 1;
-                }
-                // Check negative sign
-                if start > 0 && chars[start - 1] == '-' {
-                    start -= 1;
-                }
-                // Find end
-                let mut end = i;
-                while end < chars.len() && chars[end].is_ascii_hexdigit() {
-                    end += 1;
-                }
-                let _ = s;
-                num_start = Some(start);
-                num_end = end;
-                break;
-            }
-        }
-
-        let start_col = match num_start {
-            Some(s) => s,
-            None => {
-                self.message = "No number under cursor".to_string();
-                return;
-            }
-        };
-
-        // Hex prefix detection: if start is on '0' (or '-0') with 'x'/'X' following,
-        // extend num_end forward to cover all hex digits so parsing sees "0xXX".
-        // Without this, cursor landing on the leading '0' of "0x09" would only see
-        // the digit "0" and increment it as decimal to "1x09" (Vim deviation #109).
-        let hex_prefix_at = if start_col + 1 < chars.len()
-            && chars[start_col] == '0'
-            && (chars[start_col + 1] == 'x' || chars[start_col + 1] == 'X')
-        {
-            Some(start_col)
-        } else if start_col + 2 < chars.len()
-            && chars[start_col] == '-'
-            && chars[start_col + 1] == '0'
-            && (chars[start_col + 2] == 'x' || chars[start_col + 2] == 'X')
-        {
-            Some(start_col + 1)
-        } else {
-            None
-        };
-        if let Some(p) = hex_prefix_at {
-            let mut end = p + 2;
-            while end < chars.len() && chars[end].is_ascii_hexdigit() {
-                end += 1;
-            }
-            num_end = end;
-        }
-
-        let num_str: String = chars[start_col..num_end].iter().collect();
-        let trimmed = num_str.trim_start_matches('-');
-        let negative = num_str.starts_with('-');
-
-        // Parse the number
-        let (value, radix, prefix_len): (i64, u32, usize) =
-            if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-                let v = i64::from_str_radix(&trimmed[2..], 16).unwrap_or(0);
-                let v = if negative { -v } else { v };
-                (v, 16, if negative { 3 } else { 2 })
-            } else if trimmed.starts_with('0')
-                && trimmed.len() > 1
-                && trimmed.chars().all(|c| c.is_ascii_digit())
-            {
-                let v = i64::from_str_radix(trimmed, 8).unwrap_or(0);
-                let v = if negative { -v } else { v };
-                (v, 8, 0)
-            } else {
-                let v: i64 = num_str.parse().unwrap_or(0);
-                (v, 10, 0)
-            };
-
-        let new_value = value + delta;
-
-        // Format new value preserving radix and padding
-        let new_str = if radix == 16 {
-            let prefix = if negative { "-0x" } else { "0x" };
-            let digits = trimmed.len() - prefix_len; // digit count
-            format!(
-                "{}{:0>width$x}",
-                prefix,
-                new_value.unsigned_abs(),
-                width = digits
-            )
-        } else if radix == 8 {
-            format!("{:o}", new_value)
-        } else {
-            format!("{}", new_value)
-        };
-
-        // Replace in buffer
-        let del_start = line_start + start_col;
-        let del_end = line_start + num_end.min(line_len);
         self.start_undo_group();
-        self.delete_with_undo(del_start, del_end);
-        self.insert_with_undo(del_start, &new_str);
+        let hit = self.addsub_on_line(line, col, delta, None).is_some();
         self.finish_undo_group();
+        if hit {
+            *changed = true;
+        } else {
+            self.message = "No number under cursor".to_string();
+        }
+    }
 
-        // Position cursor at end of new number
-        self.view_mut().cursor.col = start_col + new_str.chars().count().saturating_sub(1);
-        *changed = true;
+    /// One `do_addsub()` application on `line`.
+    ///
+    /// `sel` is `Some(selected_len)` when driven from Visual mode — the search
+    /// for a digit is then confined to `selected_len` chars starting at `col`,
+    /// and a `-` immediately before the number only counts as a sign when it is
+    /// itself inside the selection (Vim: `vl<C-a>` on the `5` of `x -5` yields
+    /// `x -6`, not `x -4`).
+    ///
+    /// Returns the column the replacement started at when the line changed.
+    ///
+    /// The caller owns the undo group — `start_undo_group()` finishes any group
+    /// already open, so a per-line group here would split a Visual-mode
+    /// `<C-a>` across N undo steps.
+    pub(crate) fn addsub_on_line(
+        &mut self,
+        line: usize,
+        col: usize,
+        delta: i64,
+        sel: Option<usize>,
+    ) -> Option<usize> {
+        if line >= self.buffer().len_lines() {
+            return None;
+        }
+        let line_text: String = self.buffer().content.line(line).chars().collect();
+        let chars: Vec<char> = line_text.trim_end_matches('\n').chars().collect();
+        let (start, len, new_text) = addsub_in_line(&chars, col, delta, NrFormats::default(), sel)?;
+
+        let line_start = self.buffer().line_to_char(line);
+        self.delete_with_undo(line_start + start, line_start + start + len);
+        self.insert_with_undo(line_start + start, &new_text);
+
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = start + new_text.chars().count().saturating_sub(1);
+        Some(start)
     }
 
     // --- Auto-indent lines (= operator) ---
@@ -5920,4 +5834,339 @@ fn eval_expr_register_arith(src: &str) -> Result<i64, String> {
         return Err("trailing characters in expression".to_string());
     }
     Ok(val)
+}
+
+// ---------------------------------------------------------------------------
+// `<C-a>` / `<C-x>` — a port of Vim's `do_addsub()` + `vim_str2nr()` (#807)
+//
+// The pre-#807 implementation parsed into `i64` and reformatted with Rust's
+// `{}`/`{:x}`, which got five separate things wrong: it dropped leading zeros
+// (`009` → `1`), always treated a leading-zero run as octal even though
+// Neovim's default 'nrformats' is `bin,hex` (`0099<C-x>` underflowed to
+// `1777777777777777777777`), had no binary support, lost the case of hex
+// digits and of the `0X` prefix, and could not represent Vim's u64 wraparound
+// (`0x0<C-x>` → `0xffffffffffffffff`).  Vim's arithmetic is **unsigned 64-bit
+// plus a separate sign flag**, so that is what this models.
+// ---------------------------------------------------------------------------
+
+/// Vim's 'nrformats'.  VimCode has no setting for it yet and pins Neovim's
+/// default (`bin,hex` — note Vim's own default additionally includes `octal`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct NrFormats {
+    pub bin: bool,
+    pub oct: bool,
+    pub hex: bool,
+    pub alpha: bool,
+}
+
+impl Default for NrFormats {
+    fn default() -> Self {
+        Self {
+            bin: true,
+            oct: false,
+            hex: true,
+            alpha: false,
+        }
+    }
+}
+
+fn is_bin_digit(c: char) -> bool {
+    c == '0' || c == '1'
+}
+
+/// Char at `i`, or `'\0'` past the end — mirrors C string indexing so the
+/// ported bounds conditions stay readable.
+fn at(chars: &[char], i: usize) -> char {
+    chars.get(i).copied().unwrap_or('\0')
+}
+
+/// Parsed shape of a numeric literal, as produced by Vim's `vim_str2nr()`.
+struct ParsedNum {
+    /// `Some('x' | 'X' | 'b' | 'B')` for a prefixed literal, `Some('0')` for
+    /// octal, `None` for plain decimal.
+    pre: Option<char>,
+    /// Characters consumed, *including* any leading sign and prefix.
+    len: usize,
+    /// Magnitude, ignoring the sign.
+    value: u64,
+    /// The literal did not fit in a `u64` and was saturated to `u64::MAX`.
+    overflow: bool,
+}
+
+/// Port of `vim_str2nr()`, limited to what `do_addsub` asks of it.
+/// Parses at most `maxlen` characters starting at `start`.
+fn str2nr(chars: &[char], start: usize, nf: NrFormats, maxlen: usize) -> ParsedNum {
+    let end = (start + maxlen).min(chars.len());
+    let get = |i: usize| -> char {
+        if i < end {
+            at(chars, i)
+        } else {
+            '\0'
+        }
+    };
+    let mut i = start;
+    if get(i) == '-' || get(i) == '+' {
+        i += 1;
+    }
+    let mut pre = None;
+    if get(i) == '0' {
+        let c1 = get(i + 1);
+        if nf.hex && (c1 == 'x' || c1 == 'X') && get(i + 2).is_ascii_hexdigit() {
+            pre = Some(c1);
+            i += 2;
+        } else if nf.bin && (c1 == 'b' || c1 == 'B') && is_bin_digit(get(i + 2)) {
+            pre = Some(c1);
+            i += 2;
+        } else if nf.oct && c1 != '8' && c1 != '9' {
+            // Octal only when every following digit is in 0..=7; a trailing
+            // `8`/`9` makes the whole run decimal again.
+            let mut j = i + 1;
+            while ('0'..='7').contains(&get(j)) {
+                j += 1;
+            }
+            if get(j) != '8' && get(j) != '9' {
+                pre = Some('0');
+            }
+        }
+    }
+    let radix: u32 = match pre {
+        Some('x') | Some('X') => 16,
+        Some('b') | Some('B') => 2,
+        Some('0') => 8,
+        _ => 10,
+    };
+    let mut value: u64 = 0;
+    let mut overflow = false;
+    let mut any = false;
+    while let Some(d) = get(i).to_digit(radix) {
+        any = true;
+        value = match value
+            .checked_mul(radix as u64)
+            .and_then(|v| v.checked_add(d as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                u64::MAX
+            }
+        };
+        i += 1;
+    }
+    if !any {
+        // e.g. a bare `0x` with no hex digits — `pre` was never set in that
+        // case, so this only happens on an empty run.
+        return ParsedNum {
+            pre: None,
+            len: 0,
+            value: 0,
+            overflow: false,
+        };
+    }
+    ParsedNum {
+        pre,
+        len: i - start,
+        value,
+        overflow,
+    }
+}
+
+/// Port of Vim's `do_addsub()` for a single line.
+///
+/// `chars` is the line without its trailing newline, `cursor_col` the char
+/// index the operation starts from, `delta` the signed amount (`<C-x>` passes
+/// a negative value), and `sel` the length of the Visual-mode selection on
+/// this line (`None` in Normal mode).
+///
+/// Returns `(replace_start, replace_len, new_text)`, or `None` when there is
+/// no number to change.
+pub(crate) fn addsub_in_line(
+    chars: &[char],
+    cursor_col: usize,
+    delta: i64,
+    nf: NrFormats,
+    sel: Option<usize>,
+) -> Option<(usize, usize, String)> {
+    if chars.is_empty() || delta == 0 {
+        return None;
+    }
+    let visual = sel.is_some();
+    let mut col = cursor_col.min(chars.len());
+
+    if !visual {
+        // Vim scans backwards over binary then hexadecimal digits so the
+        // cursor can sit anywhere *inside* a `0x..`/`0b..` literal, then
+        // rescans decimally when that overshot a plain decimal number.
+        if nf.bin {
+            while col > 0 && is_bin_digit(at(chars, col)) {
+                col -= 1;
+            }
+        }
+        if nf.hex {
+            while col > 0 && at(chars, col).is_ascii_hexdigit() {
+                col -= 1;
+            }
+        }
+        let on_hex_prefix = |c: usize| {
+            c > 0
+                && (at(chars, c) == 'x' || at(chars, c) == 'X')
+                && at(chars, c - 1) == '0'
+                && at(chars, c + 1).is_ascii_hexdigit()
+        };
+        let on_bin_prefix = |c: usize| {
+            c > 0
+                && (at(chars, c) == 'b' || at(chars, c) == 'B')
+                && at(chars, c - 1) == '0'
+                && is_bin_digit(at(chars, c + 1))
+        };
+        if nf.bin && nf.hex && !on_hex_prefix(col) {
+            // Binary/hex pattern overlap (`0b101` is also valid hex) — rescan.
+            col = cursor_col.min(chars.len());
+            while col > 0 && at(chars, col).is_ascii_digit() {
+                col -= 1;
+            }
+        }
+        if (nf.hex && on_hex_prefix(col)) || (nf.bin && on_bin_prefix(col)) {
+            col -= 1;
+        } else {
+            // Search forward for a digit, then back to the start of its run.
+            col = cursor_col.min(chars.len());
+            while col < chars.len()
+                && !at(chars, col).is_ascii_digit()
+                && !(nf.alpha && at(chars, col).is_ascii_alphabetic())
+            {
+                col += 1;
+            }
+            while col > 0
+                && at(chars, col - 1).is_ascii_digit()
+                && !(nf.alpha && at(chars, col).is_ascii_alphabetic())
+            {
+                col -= 1;
+            }
+        }
+    }
+
+    let mut negative = false;
+    let mut remaining = sel.unwrap_or(usize::MAX);
+    if let Some(sel_len) = sel {
+        // Confine the forward search to the selection.
+        let pos_col = cursor_col;
+        remaining = sel_len;
+        while col < chars.len()
+            && remaining > 0
+            && !at(chars, col).is_ascii_digit()
+            && !(nf.alpha && at(chars, col).is_ascii_alphabetic())
+        {
+            col += 1;
+            remaining -= 1;
+        }
+        if remaining == 0 || col >= chars.len() {
+            return None;
+        }
+        // Only a `-` that is itself selected acts as a sign.
+        if col > pos_col && at(chars, col - 1) == '-' {
+            negative = true;
+        }
+    }
+
+    let firstdigit = at(chars, col);
+    if !firstdigit.is_ascii_digit() && !(nf.alpha && firstdigit.is_ascii_alphabetic()) {
+        return None;
+    }
+
+    if !visual && col > 0 && at(chars, col - 1) == '-' {
+        col -= 1;
+        negative = true;
+        remaining = usize::MAX;
+    }
+
+    let maxlen = if visual {
+        remaining.min(chars.len() - col)
+    } else {
+        chars.len() - col
+    };
+    let parsed = str2nr(chars, col, nf, maxlen);
+    if parsed.len == 0 {
+        return None;
+    }
+    let mut len = parsed.len;
+    // A leading `-` is not part of a hex/octal/binary literal: leave it in the
+    // buffer and rewrite only the digits (`-0x1<C-a>` → `-0x2`).
+    if !visual && parsed.pre.is_some() && negative {
+        col += 1;
+        len -= 1;
+        negative = false;
+    }
+
+    let mut subtract = delta < 0;
+    let amount = delta.unsigned_abs();
+    if negative {
+        subtract = !subtract;
+    }
+    let oldn = parsed.value;
+    let mut n = if subtract {
+        oldn.wrapping_sub(amount)
+    } else {
+        oldn.wrapping_add(amount)
+    };
+    if parsed.pre.is_none() {
+        // Decimal wraps through zero into the opposite sign; the prefixed
+        // formats just wrap modulo 2^64 (`0x0<C-x>` → `0xffffffffffffffff`).
+        if subtract {
+            if n > oldn {
+                n = 1u64.wrapping_add(!n);
+                negative = !negative;
+            }
+        } else if n < oldn {
+            n = !n;
+            negative = !negative;
+        }
+        if n == 0 {
+            negative = false;
+        }
+    }
+    if parsed.overflow {
+        // Vim leaves a literal too big for u64 saturated at u64::MAX.
+        n = u64::MAX;
+        negative = false;
+    }
+
+    // Take the case of the *last* alphabetic character in the literal — that
+    // is how Vim decides `0xaB` → `0xAC` but `0xAb` → `0xac`.
+    let mut hexupper = false;
+    for c in chars.iter().skip(col).take(len) {
+        if c.is_ascii_alphabetic() {
+            hexupper = c.is_ascii_uppercase();
+        }
+    }
+
+    let mut lead = String::new();
+    let mut width = len;
+    if negative {
+        lead.push('-');
+    }
+    if let Some(p) = parsed.pre {
+        lead.push('0');
+        width -= 1;
+        if p != '0' {
+            lead.push(p);
+            width -= 1;
+        }
+    }
+    let digits = match parsed.pre {
+        Some('b') | Some('B') => format!("{n:b}"),
+        Some('0') => format!("{n:o}"),
+        Some('x') | Some('X') if hexupper => format!("{n:X}"),
+        Some('x') | Some('X') => format!("{n:x}"),
+        _ => format!("{n}"),
+    };
+    width = width.saturating_sub(digits.chars().count());
+    // Keep the total width by re-padding with zeros, unless that would make
+    // the result look like an octal literal when 'nrformats' includes octal.
+    if firstdigit == '0' && !(nf.oct && parsed.pre.is_none()) {
+        for _ in 0..width {
+            lead.push('0');
+        }
+    }
+    lead.push_str(&digits);
+    Some((col, len, lead))
 }

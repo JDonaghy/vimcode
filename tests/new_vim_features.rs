@@ -362,6 +362,117 @@ fn test_count_ctrl_a() {
     assert_buf(&e, "x 8 y\n");
 }
 
+/// `<C-a>` / `<C-x>` across every 'nrformats' shape VimCode supports (#807).
+///
+/// Expectations are the **oracle's**, not hand-authored: each row was taken
+/// from `nvim --headless` on the same buffer + keys (they are also covered
+/// case-by-case by the `num:*` entries in `tests/nvim_conformance.rs`, which
+/// only run when nvim is on PATH — this table is the always-on regression
+/// net). VimCode pins Neovim's default 'nrformats' of `bin,hex`, so `007` is
+/// decimal-with-leading-zeros, not octal.
+#[test]
+fn test_number_formats_table() {
+    // (start, keys-are-<C-a>?, expected buffer, expected cursor col)
+    let cases: &[(&str, bool, &str, usize)] = &[
+        // Leading zeros: the width is preserved, and the run is *decimal*
+        // (before #807, `0099<C-x>` parsed as octal into an i64 and underflowed
+        // to "1777777777777777777777").
+        ("007", true, "008", 2),
+        ("009", true, "010", 2),
+        ("0099", false, "0098", 3),
+        ("000", false, "-001", 3),
+        // Hex keeps its `0x`/`0X` prefix case and the case of its last letter.
+        ("0x0", true, "0x1", 2),
+        ("0x0", false, "0xffffffffffffffff", 17),
+        ("0xaB", true, "0xAC", 3),
+        ("0xAb", true, "0xac", 3),
+        ("0X0f", true, "0X10", 3),
+        // A leading `-` is not part of a hex literal: only the digits change.
+        ("-0x1", true, "-0x2", 3),
+        // Binary.
+        ("0b101", true, "0b110", 4),
+        ("0B101", false, "0B100", 4),
+        // Decimal signs and u64 saturation.
+        ("-1", true, "0", 0),
+        ("-1", false, "-2", 1),
+        ("99999999999999999999", true, "18446744073709551615", 19),
+    ];
+    for &(start, add, expect, col) in cases {
+        let mut e = engine_with(&format!("{start}\n"));
+        ctrl(&mut e, if add { 'a' } else { 'x' });
+        assert_eq!(
+            buf(&e),
+            format!("{expect}\n"),
+            "{start} {}",
+            if add { "<C-a>" } else { "<C-x>" }
+        );
+        assert_eq!(
+            e.cursor().col,
+            col,
+            "{start} {} cursor",
+            if add { "<C-a>" } else { "<C-x>" }
+        );
+    }
+}
+
+/// Visual-mode `<C-a>` bumps every line's first selected number by the same
+/// amount, `g<C-a>` steps per changed line, and the cursor lands on the first
+/// change — not on the last line touched (#807).
+#[test]
+fn test_visual_ctrl_a_variants() {
+    let mut e = engine_with("1\n1\n1\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\n2\n2\n");
+    assert_cursor(&e, 0, 0);
+
+    let mut e = engine_with("1\n1\n1\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'g');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\n3\n4\n");
+    assert_cursor(&e, 0, 0);
+
+    // Lines with no number do not advance the g<C-a> counter.
+    let mut e = engine_with("1\nx\n1\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'j');
+    press(&mut e, 'g');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2\nx\n3\n");
+
+    // Only the first number *inside the selection* on each line changes.
+    let mut e = engine_with("1 2\n3 4\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "2 2\n4 4\n");
+
+    // Blockwise: the selection picks which number on the line is hit.
+    let mut e = engine_with("1 1\n1 1\n");
+    press(&mut e, 'l');
+    press(&mut e, 'l');
+    ctrl(&mut e, 'v');
+    press(&mut e, 'j');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "1 2\n1 2\n");
+    assert_cursor(&e, 0, 2);
+
+    // A `-` outside the selection is not a sign: `vl<C-a>` on the `5` of
+    // `x -5` gives `x -6`, not `x -4`.
+    let mut e = engine_with("x -5\n");
+    press(&mut e, '$');
+    press(&mut e, 'v');
+    press(&mut e, 'l');
+    ctrl(&mut e, 'a');
+    assert_buf(&e, "x -6\n");
+}
+
 // ── = operator auto-indent ───────────────────────────────────────────────────
 
 #[test]

@@ -3738,27 +3738,19 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "vb:jjp block over block",
     "vb:vb yank then p linewise reg? P",
     "vb:g C-a",
-    "num:hex 0xaB",
-    "num:hex C-x below zero",
-    "num:octal not default 007",
+    // The last two `num:` deviations, and the only two that survive #807.
+    // Both are the same class as the `ins:*(nosmarttab)` pair above:
+    // `run_in_vimcode` never reads a case's `setup`, so a case whose whole
+    // point is a non-default 'nrformats' cannot be matched by an engine that
+    // has no 'nrformats' setting. VimCode pins **Neovim's default**,
+    // `bin,hex` (see `NrFormats::default()` in `src/core/engine/motions.rs`) —
+    // note Vim's own default additionally includes `octal`, which is why
+    // "num:octal not default 007" (no setup, so plain Neovim defaults) now
+    // passes as `008` while this one wants the octal `010`. If vimcode ever
+    // grows a real 'nrformats' setting, wire it through `run_in_vimcode` and
+    // delete these two.
     "num:octal nf=octal 007",
-    "num:binary 0b101",
-    "num:leading zeros 009",
-    "num:leading zeros 0099 C-x",
-    "num:V C-a",
-    "num:V g C-a",
-    "num:V 2g C-a",
-    "num:v C-a partial",
-    "num:C-v block C-a",
     "num:alpha",
-    "num:C-a on 99999999999999999999 overflow",
-    "num:V C-a skips lines without numbers",
-    "num:V C-a only first number per line",
-    "num:C-a 0x with uppercase X",
-    "num:C-a on negative hex? -0x1",
-    "num:C-x on 0 leading zeros 000",
-    "num:V C-a cursor",
-    "num:v C-a on -5 in visual (no minus)",
     // ── #805: headless-oracle scroll artifacts ──────────────────────────
     //
     // The `scroll:*` entries from here down to "word:gg indented (sol)" are

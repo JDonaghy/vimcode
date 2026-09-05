@@ -484,6 +484,95 @@ impl Engine {
         self.visual_anchor = None;
         self.visual_dollar = false;
     }
+
+    /// Visual-mode `<C-a>` / `<C-x>` / `g<C-a>` / `g<C-x>` — Vim's `op_addsub()`.
+    ///
+    /// Every line of the selection gets **its first number inside the selection**
+    /// changed; with `g_cmd` the amount grows by `count` for each line that
+    /// actually changed (lines with no number do not advance the counter).  The
+    /// cursor lands on the start of the *first* changed number, not on the last
+    /// line touched (#807).
+    pub(crate) fn visual_addsub(&mut self, sign: i64, g_cmd: bool, changed: &mut bool) {
+        let base = self.take_count().max(1) as i64;
+        let Some((start, end)) = self.get_visual_selection_range() else {
+            return;
+        };
+        let mode = self.mode;
+        let anchor = self.visual_anchor.unwrap_or(start);
+        let cursor = self.view().cursor;
+        let block_start = anchor.col.min(cursor.col);
+        let block_end = anchor.col.max(cursor.col);
+        let dollar = self.visual_dollar;
+
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
+        self.visual_dollar = false;
+
+        let mut amount = base;
+        let mut first: Option<(usize, usize)> = None;
+        self.start_undo_group();
+        for line in start.line..=end.line {
+            if line >= self.buffer().len_lines() {
+                break;
+            }
+            let line_len = {
+                let raw = self.buffer().line_len_chars(line);
+                let text: String = self.buffer().content.line(line).chars().collect();
+                if text.ends_with('\n') {
+                    raw - 1
+                } else {
+                    raw
+                }
+            };
+            let (col, len) = match mode {
+                Mode::VisualLine => (0, line_len),
+                Mode::VisualBlock => {
+                    if block_start >= line_len {
+                        continue;
+                    }
+                    let hi = if dollar {
+                        line_len
+                    } else {
+                        (block_end + 1).min(line_len)
+                    };
+                    (block_start, hi.saturating_sub(block_start))
+                }
+                _ => {
+                    let s = if line == start.line { start.col } else { 0 };
+                    let e = if line == end.line && !dollar {
+                        (end.col + 1).min(line_len)
+                    } else {
+                        line_len
+                    };
+                    if e <= s {
+                        continue;
+                    }
+                    (s, e - s)
+                }
+            };
+            if len == 0 {
+                continue;
+            }
+            if let Some(at_col) = self.addsub_on_line(line, col, sign * amount, Some(len)) {
+                if first.is_none() {
+                    first = Some((line, at_col));
+                }
+                *changed = true;
+                if g_cmd {
+                    amount += base;
+                }
+            }
+        }
+        self.finish_undo_group();
+        if let Some((line, col)) = first {
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = col;
+        } else {
+            self.view_mut().cursor.line = start.line;
+            self.view_mut().cursor.col = start.col;
+        }
+        self.clamp_cursor_col();
+    }
 }
 
 // ─── Additional methods (extracted from mod.rs) ─────────────────────────
