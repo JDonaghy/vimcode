@@ -2490,14 +2490,34 @@ impl Engine {
                     self.pending_key = Some('\x08'); // sentinel for g` handler
                 }
                 Some('q') => {
-                    // gq{motion}: format text operator
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('q');
+                    if self.pending_operator == Some('q') {
+                        // gqgq: doubled operator — same as gqq (#807).
+                        self.pending_operator = None;
+                        let count = self.take_count().max(1);
+                        let line = self.view().cursor.line;
+                        self.format_lines(line, line + count - 1, changed);
+                    } else {
+                        // gq{motion}: format text operator
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('q');
+                    }
                 }
                 Some('w') => {
-                    // gw{motion}: format text, keep cursor
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('Q');
+                    if self.pending_operator == Some('Q') {
+                        // gwgw: doubled operator — same as gww; `gw` keeps the
+                        // cursor where it was (#807).
+                        self.pending_operator = None;
+                        let count = self.take_count().max(1);
+                        let line = self.view().cursor.line;
+                        let saved = self.view().cursor;
+                        self.format_lines(line, line + count - 1, changed);
+                        self.view_mut().cursor = saved;
+                        self.clamp_cursor_col();
+                    } else {
+                        // gw{motion}: format text, keep cursor
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('Q');
+                    }
                 }
                 Some('R') => {
                     // gR: enter Virtual Replace mode (tab-aware overwrite)
@@ -2508,9 +2528,17 @@ impl Engine {
                     self.count = None;
                 }
                 Some('?') => {
-                    // g?{motion}: ROT13 encode operator
-                    self.operator_count = self.count.take();
-                    self.pending_operator = Some('R');
+                    if self.pending_operator == Some('R') {
+                        // g?g?: doubled operator — same as g?? (#807).
+                        self.pending_operator = None;
+                        let count = self.take_count().max(1);
+                        let line = self.view().cursor.line;
+                        self.apply_linewise_operator('R', line, line + count - 1, changed);
+                    } else {
+                        // g?{motion}: ROT13 encode operator
+                        self.operator_count = self.count.take();
+                        self.pending_operator = Some('R');
+                    }
                 }
                 Some('@') => {
                     // g@{motion}: call user-defined operatorfunc
@@ -3440,6 +3468,9 @@ impl Engine {
                         self.apply_case_range(line_start, line_end, operator, changed);
                     }
                 }
+                // Doubled case operators land on the first non-blank of the
+                // FIRST line, not the last one touched (#807, `op:3guu`).
+                self.move_cursor_to_first_non_blank(line);
             } else if unicode == Some('i') || unicode == Some('a') {
                 // Text object: g~iw, guaw, etc.
                 self.pending_text_object = unicode;
@@ -3617,6 +3648,7 @@ impl Engine {
                         self.apply_rot13_range(line_start, line_end, changed);
                     }
                 }
+                self.move_cursor_to_first_non_blank(line);
                 return EngineAction::None;
             }
             if unicode == Some('i') || unicode == Some('a') {
@@ -4244,6 +4276,15 @@ impl Engine {
         }
     }
 
+    /// Park the cursor on the character at `pos`.
+    pub(crate) fn move_cursor_to_range_start(&mut self, pos: usize) {
+        let pos = pos.min(self.buffer().len_chars());
+        let line = self.buffer().content.char_to_line(pos);
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = pos - self.buffer().line_to_char(line);
+        self.clamp_cursor_col();
+    }
+
     /// Apply ROT13 encoding to a char range.
     pub(crate) fn apply_rot13_range(&mut self, start: usize, end: usize, changed: &mut bool) {
         if start >= end {
@@ -4370,10 +4411,14 @@ impl Engine {
             }
             '~' | 'u' | 'U' => {
                 self.apply_case_range(start, end, operator, changed);
+                // Like every other operator, `g~`/`gu`/`gU` leave the cursor
+                // at the start of the region they changed (#807).
+                self.move_cursor_to_range_start(start);
             }
             'R' => {
                 // g?: ROT13 encode
                 self.apply_rot13_range(start, end, changed);
+                self.move_cursor_to_range_start(start);
             }
             '>' | '<' | '=' => {
                 // Indent/dedent/auto-indent: operate on full lines containing the range
@@ -4529,6 +4574,9 @@ impl Engine {
                     .buffer()
                     .line_to_char((end_line + 1).min(self.buffer().len_lines()));
                 self.apply_case_range(start, end, operator, changed);
+                // A *linewise* case operator lands on the first non-blank of
+                // the first line it changed (#807, `op:g~~ cursor`, `op:gUU`).
+                self.move_cursor_to_first_non_blank(start_line);
             }
             'R' => {
                 // g?: ROT13 encode lines
@@ -4537,6 +4585,7 @@ impl Engine {
                     .buffer()
                     .line_to_char((end_line + 1).min(self.buffer().len_lines()));
                 self.apply_rot13_range(start, end, changed);
+                self.move_cursor_to_first_non_blank(start_line);
             }
             'q' => {
                 // gq: format lines
