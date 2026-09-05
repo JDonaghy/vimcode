@@ -6012,7 +6012,12 @@ impl Engine {
                     // calculation as the single-cursor path below, per
                     // cursor, instead of always inserting a fixed
                     // `tabstop`-width block of spaces.
-                    self.mc_insert_tab();
+                    // `insert_text_buffer` records one fragment per logical
+                    // keystroke (it is replayed verbatim for dot-repeat and
+                    // count-prefixed inserts), so push only the primary
+                    // cursor's indent, once — never one fragment per cursor.
+                    let primary_text = self.mc_insert_tab();
+                    self.insert_text_buffer.push_str(&primary_text);
                     *changed = true;
                 } else {
                     let line = self.view().cursor.line;

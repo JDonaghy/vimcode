@@ -14615,6 +14615,51 @@ fn test_multi_cursor_tab_advances_to_each_cursors_own_next_tabstop() {
     );
 }
 
+/// #804 review (iteration 2): `mc_insert_tab` used to push *each* cursor's
+/// own computed indent onto `insert_text_buffer`, so one `<Tab>` keystroke
+/// with N cursors recorded N concatenated fragments. `insert_text_buffer`
+/// becomes `last_inserted_text` on `Escape` and is replayed verbatim by the
+/// `"."` register and insert-mode `<C-a>`/`<C-@>`, so the replay inserted the
+/// concatenation of every cursor's indent instead of a single tabstop-aware
+/// one. With `tabstop = 4` and cursors needing 1 and 2 spaces, the buggy code
+/// recorded `"   "` (3 spaces); correct is `" "` (the primary cursor's, once).
+#[test]
+fn test_multi_cursor_tab_records_one_insert_fragment_not_one_per_cursor() {
+    let mut engine = engine_with_text("abc\nab\nZ\n");
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    // Primary at end of "abc" (col 3) — needs 1 space to reach column 4.
+    engine.view_mut().cursor.col = 3;
+    // Extra cursor at end of "ab" (col 2) — needs 2 spaces to reach column 4.
+    engine.view_mut().extra_cursors = vec![Cursor { line: 1, col: 2 }];
+
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("Tab", None, false);
+    engine.handle_key("Escape", None, false);
+
+    assert_eq!(
+        engine.last_inserted_text, " ",
+        "one <Tab> keystroke must record exactly one insert fragment \
+         regardless of cursor count; got {:?}",
+        engine.last_inserted_text
+    );
+
+    // Replay it where a real user would notice: insert-mode <C-a> re-inserts
+    // `last_inserted_text` verbatim (same buffer the "." register and
+    // count-prefixed inserts replay).
+    engine.view_mut().cursor = Cursor { line: 2, col: 1 };
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("a", Some('a'), true);
+    engine.handle_key("Escape", None, false);
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "abc \nab  \nZ \n",
+        "replaying the recorded insert must produce a single tabstop-aware \
+         indent, not every cursor's indent concatenated; got {buf:?}"
+    );
+}
+
 #[test]
 fn test_multi_cursor_escape_collapses() {
     // Escape from insert mode should clear extra cursors
