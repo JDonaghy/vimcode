@@ -9155,4 +9155,179 @@ mod engine_key_from_ui_gtk_tests {
              cancel command-line mode on GTK"
         );
     }
+
+    /// #826 review: three more chords than the disclosed Shift+Right case
+    /// newly activate on GTK once `Key::Named` routes through the shared
+    /// `engine_key_from_ui` — GTK's old inline table ignored `shift` for
+    /// `Enter`/`Home`/`End` and never combined `shift+ctrl` for the arrows,
+    /// so none of these `Shift_`-prefixed names ever reached
+    /// `Engine::handle_vscode_key` before. Each gets its own black-box
+    /// coverage here rather than a narrowed decoder, since the unified
+    /// spelling (matching TUI) is the intended outcome of #826, not an
+    /// accidental side effect.
+    ///
+    /// Ctrl+Shift+Enter: `engine_key_from_ui`'s `NamedKey::Enter if shift &&
+    /// ctrl` arm yields `"Shift_Return"`, which `vscode.rs` dispatches to
+    /// `vscode_insert_line_above` — a different code path than plain
+    /// Ctrl+Enter's `"Return"` -> `vscode_insert_line_below`. GTK's old
+    /// table returned unconditional `"Return"` for every `Enter` press
+    /// regardless of shift, so Ctrl+Shift+Enter silently inserted the blank
+    /// line *below* the cursor instead of *above*.
+    ///
+    /// **Verified RED against unfixed `develop`:** with GTK's old table
+    /// (`NamedKey::Enter => "Return"` unconditionally), this Ctrl+Shift+Enter
+    /// press decodes as plain Ctrl+Enter, so the blank line lands below the
+    /// cursor line (still `"line1"`) instead of above it — the first
+    /// assertion (`line(1) == ""`) fails against that.
+    #[test]
+    fn ctrl_shift_enter_inserts_line_above_not_below_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "line0\nline1\nline2\n");
+        engine.view_mut().cursor = crate::core::Cursor { line: 1, col: 0 };
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::Enter),
+            Modifiers {
+                shift: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        let eng = h.engine.borrow();
+        let line = |i: usize| eng.buffer().content.line(i).to_string();
+        assert_eq!(
+            line(1).trim_end_matches('\n'),
+            "",
+            "Ctrl+Shift+Enter must insert the blank line ABOVE the original \
+             cursor line, pushing \"line1\" down rather than appending a \
+             blank line after it"
+        );
+        assert_eq!(
+            line(2).trim_end_matches('\n'),
+            "line1",
+            "the original cursor line's text must have moved down to make \
+             room for the blank line inserted above it"
+        );
+    }
+
+    /// Shift+Home / Shift+End (no ctrl): `engine_key_from_ui`'s
+    /// `NamedKey::Home if shift` / `NamedKey::End if shift` arms now yield
+    /// `"Shift_Home"`/`"Shift_End"`, which the non-ctrl `Shift_`-prefixed
+    /// arm of `handle_vscode_key` turns into `vscode_extend_selection`
+    /// (`"SmartHome"`/`"LineEnd"`) — real selection-extension that GTK's old
+    /// table (unconditional `"Home"`/`"End"`, ignoring shift) never fired.
+    ///
+    /// **Verified RED against unfixed `develop`:** GTK's old table decodes
+    /// Shift+End identically to plain End, so mode never arms `Visual` and
+    /// the cursor still moves but no selection exists — the
+    /// `Mode::Visual` assertion fails against that.
+    #[test]
+    fn shift_home_and_shift_end_extend_selection_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "hello world\n");
+        engine.view_mut().cursor = crate::core::Cursor { line: 0, col: 5 };
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::End),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "Shift+End must arm a selection (vscode_extend_selection), \
+             which never happened on GTK before #826"
+        );
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            11,
+            "Shift+End must move the cursor to end-of-line (\"hello world\" \
+             is 11 chars) via the LineEnd op"
+        );
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::Home),
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "Shift+Home must also extend (not replace) the active selection"
+        );
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            0,
+            "Shift+Home's SmartHome op must move the cursor to column 0 on \
+             a line with no leading whitespace"
+        );
+    }
+
+    /// Ctrl+Shift+Right (word-level selection): `engine_key_from_ui`'s
+    /// `NamedKey::Right if shift && ctrl` arm yields `("Shift_Right", _,
+    /// true)` — the `ctrl` flag routes `handle_vscode_key` into its `if
+    /// ctrl` block, where `"Shift_Right"` calls
+    /// `vscode_extend_selection("WordForward")` (a whole-word jump),
+    /// distinct from the plain-Shift `"Shift_Right"` arm covered by
+    /// `shift_right_extends_selection_and_ctrl_c_copies_it_on_gtk` above,
+    /// which extends one character at a time. GTK's old table never
+    /// combined ctrl+shift for the arrows at all.
+    ///
+    /// **Verified RED against unfixed `develop`:** GTK's old table decodes
+    /// Ctrl+Shift+Right as unconditional `"Right"` (no ctrl, no shift
+    /// tracking) — the cursor moves one character, mode stays `Insert`, and
+    /// the `Mode::Visual` / `col == 6` assertions below fail against that.
+    #[test]
+    fn ctrl_shift_right_extends_word_selection_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.editor_mode = crate::core::settings::EditorMode::Vscode;
+        engine.mode = crate::core::Mode::Insert;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        press(
+            &mut h,
+            Key::Named(NamedKey::Right),
+            Modifiers {
+                shift: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            h.engine.borrow().mode,
+            crate::core::Mode::Visual,
+            "Ctrl+Shift+Right must arm a selection via \
+             vscode_extend_selection(\"WordForward\")"
+        );
+        assert_eq!(
+            h.engine.borrow().view().cursor.col,
+            6,
+            "a single Ctrl+Shift+Right from col 0 in \"hello world\" must \
+             jump the cursor to the start of the next word (col 6), not \
+             one character (col 1) — proving the ctrl flag reached \
+             handle_vscode_key's word-level branch"
+        );
+    }
 }
