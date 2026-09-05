@@ -226,8 +226,10 @@ impl Engine {
                     // delete keeps the cursor's column rather than jumping to
                     // the first non-blank (#807, `vis:Vjd` / `vis:Vd cursor`).
                     let want = self.view().cursor.col;
-                    self.view_mut().cursor.line = start.line;
+                    let last = self.buffer().len_lines().saturating_sub(1);
+                    self.view_mut().cursor.line = start.line.min(last);
                     self.view_mut().cursor.col = want;
+                    self.clamp_cursor_col();
                 }
                 Mode::Visual => {
                     // Delete characters
@@ -265,12 +267,27 @@ impl Engine {
             self.finish_undo_group();
             *changed = true;
             self.clamp_cursor_col();
+            // Vim collapses `'<`/`'>` onto the start of a Visual delete, so a
+            // later `gv` reselects one character/line rather than the extent
+            // that is no longer there (#807, `vis:gv after Vjd`).
+            self.lock_visual_reselect(start, start);
         }
 
         // Exit visual mode
         self.mode = Mode::Normal;
         self.visual_anchor = None;
         self.visual_dollar = false;
+    }
+
+    /// Pin what a later `gv` will reselect, and stop `handle_key`'s generic
+    /// hook from overwriting it on the way out of Visual mode (#807).
+    pub(crate) fn lock_visual_reselect(&mut self, anchor: Cursor, cursor: Cursor) {
+        self.last_visual_mode = self.mode;
+        self.last_visual_anchor = Some(anchor);
+        self.last_visual_cursor = Some(cursor);
+        self.visual_mark_start = Some((anchor.line, anchor.col));
+        self.visual_mark_end = Some((cursor.line, cursor.col));
+        self.last_visual_locked = true;
     }
 
     /// Paste over visual selection: replace selected text with register content.
@@ -318,9 +335,16 @@ impl Engine {
         self.start_undo_group();
 
         if sel_linewise {
-            // Linewise paste: insert on its own line
-            let line = self.view().cursor.line;
-            let line_start = self.buffer().line_to_char(line);
+            // Linewise paste: insert on its own line. Anchored on the
+            // selection's own start line, not the cursor — deleting the last
+            // lines of the buffer clamps the cursor upward, and the paste must
+            // still land where the selection was (#807).
+            let line = start.line;
+            let line_start = if line < self.buffer().len_lines() {
+                self.buffer().line_to_char(line)
+            } else {
+                self.buffer().len_chars()
+            };
             // Ensure paste content ends with newline
             let content = if paste_content.ends_with('\n') {
                 paste_content

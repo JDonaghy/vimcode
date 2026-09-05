@@ -560,7 +560,8 @@ impl Engine {
                 if !matches!(
                     self.mode,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock
-                ) {
+                ) && !std::mem::take(&mut self.last_visual_locked)
+                {
                     self.last_visual_mode = pre_mode;
                     self.last_visual_anchor = pre_anchor;
                     self.last_visual_cursor = Some(pre_cursor);
@@ -7353,8 +7354,10 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle mode switching: v toggles to Visual, V toggles to VisualLine
-        if let Some(ch) = unicode {
+        // Handle mode switching: v toggles to Visual, V toggles to VisualLine.
+        // Skipped while a prefix key is pending, or the `v` of `gv` would
+        // toggle Visual off instead of completing the command (#807).
+        if let Some(ch) = unicode.filter(|_| self.pending_key.is_none()) {
             match ch {
                 'v' => {
                     if self.mode == Mode::Visual {
@@ -7833,6 +7836,24 @@ impl Engine {
                 // g Ctrl-A / g Ctrl-X in visual mode: sequential increment/decrement
                 let sign: i64 = if key_name == "a" { 1 } else { -1 };
                 self.visual_addsub(sign, true, changed);
+                return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('v') {
+                // `gv` while already in Visual mode swaps to the PREVIOUS
+                // selection (`:h gv`); before #807 it was Normal-mode only, so
+                // `vl<Esc>$vgvd` deleted nothing.
+                self.count = None;
+                let cur_anchor = self.visual_anchor;
+                let cur_cursor = self.view().cursor;
+                let cur_mode = self.mode;
+                if let (Some(a), Some(c)) = (self.last_visual_anchor, self.last_visual_cursor) {
+                    self.mode = self.last_visual_mode;
+                    self.visual_anchor = Some(a);
+                    self.view_mut().cursor = c;
+                    self.clamp_cursor_col();
+                }
+                self.last_visual_mode = cur_mode;
+                self.last_visual_anchor = cur_anchor;
+                self.last_visual_cursor = Some(cur_cursor);
                 return EngineAction::None;
             } else if pending == 'g' && unicode == Some('J') {
                 // Visual `gJ`: join the selected lines without inserting or
