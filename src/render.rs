@@ -19484,6 +19484,33 @@ pub fn screen_zone_hit_test(
 }
 
 // ─── Divider hit-test / drag (shared by GroupLayout and WindowLayout, #582) ──
+//
+// #818 adopted `quadraui::SplitTree::layout` for the geometry *computation*
+// this hit-test code consumes — `GroupLayout`/`WindowLayout::calculate_rects`
+// and `::dividers` in `core/window.rs` used to re-derive the same split math
+// in two separate hand-rolled recursive passes (the exact "second source of
+// truth" risk `SplitTree`'s module docs call out); both now build a
+// `quadraui::SplitTree` and read leaf rects + divider geometry off one
+// `layout()` call.
+//
+// The hit-test/drag code below (`DividerGeometry`, `divider_hit_test`,
+// `divider_ratio_from_pos`, `DividerMetrics`/`GTK_DIVIDER_METRICS`,
+// `route_divider_grab`, `apply_divider_drag`) deliberately stays local
+// rather than also moving onto `quadraui::SplitTreeLayout::hit_test_divider`/
+// `hit_test_divider_cell`: those two methods only support a *symmetric*
+// tolerance band (continuous) or an *exact single-cell* match (quantized).
+// Neither can express the asymmetric multi-cell bands both backends need —
+// GTK asks for `(6.0, 6.0)` uniformly, but TUI's `tol_before`/`tol_after`
+// differ per divider (`(1.0, 1.0)` for most, `(0.0, tab_bar_rows)` for a
+// horizontal group divider, whose grabbable band *is* the neighbouring
+// group's whole tab-bar block — see `tui_main::mouse`'s call site). Faking
+// that through `SplitTreeDivider`'s `thickness` field would require
+// constructing a divider whose `thickness` differs from what was actually
+// painted, defeating the "one number describes what was drawn" contract
+// `cell_position()`'s doc comment relies on. This is the concrete gap #818
+// asks to be filed against quadraui (asymmetric/multi-cell tolerance bands
+// on `SplitTreeLayout::hit_test_divider`/`hit_test_divider_cell`) rather
+// than papered over here.
 
 /// Common geometry accessor so [`divider_hit_test`] and
 /// [`divider_ratio_from_pos`] work identically over `GroupDivider`
@@ -19627,28 +19654,24 @@ pub fn divider_to_split(
     id: quadraui::WidgetId,
 ) -> (quadraui::Split, quadraui::Rect) {
     let ratio = ((div.position() - div.axis_start()) / div.axis_size()) as f32;
-    let (direction, rect) = match div.direction() {
-        // vimcode's `Vertical` = side-by-side panes = quadraui's `Horizontal`
-        // (their `Split::direction` names the divider's own orientation
-        // relative to "panes side by side" vs "panes stacked", the inverse
-        // of vimcode's "divider direction" naming — see primitives/split.rs).
-        SplitDirection::Vertical => (
-            quadraui::SplitDirection::Horizontal,
-            quadraui::Rect::new(
-                div.axis_start() as f32,
-                div.cross_start() as f32,
-                div.axis_size() as f32,
-                div.cross_size() as f32,
-            ),
+    // vimcode's `Vertical` = side-by-side panes = quadraui's `Horizontal`
+    // (their `Split::direction` names the divider's own orientation relative
+    // to "panes side by side" vs "panes stacked", the inverse of vimcode's
+    // "divider direction" naming — see `core::window::to_quadraui_direction`
+    // and primitives/split.rs).
+    let direction = crate::core::window::to_quadraui_direction(div.direction());
+    let rect = match div.direction() {
+        SplitDirection::Vertical => quadraui::Rect::new(
+            div.axis_start() as f32,
+            div.cross_start() as f32,
+            div.axis_size() as f32,
+            div.cross_size() as f32,
         ),
-        SplitDirection::Horizontal => (
-            quadraui::SplitDirection::Vertical,
-            quadraui::Rect::new(
-                div.cross_start() as f32,
-                div.axis_start() as f32,
-                div.cross_size() as f32,
-                div.axis_size() as f32,
-            ),
+        SplitDirection::Horizontal => quadraui::Rect::new(
+            div.cross_start() as f32,
+            div.axis_start() as f32,
+            div.cross_size() as f32,
+            div.axis_size() as f32,
         ),
     };
     let split = quadraui::Split {
