@@ -422,8 +422,6 @@ pub struct TuiShellApp {
     /// `driver_with_shell` wraps the app in a shell adapter, so `driver.app()`
     /// cannot reach `TuiShellApp`'s own fields (#765).
     debug_toolbar_rect: std::rc::Rc<Cell<quadraui::Rect>>,
-    last_click_time: Cell<Instant>,
-    last_click_pos: Cell<(u16, u16)>,
     explorer_sb_dragging: bool,
     explorer_drag_src: Option<usize>,
     explorer_drag_active: Option<(usize, Option<usize>)>,
@@ -997,8 +995,6 @@ impl TuiShellApp {
             last_layout: RefCell::new(None),
             tab_visible_counts: RefCell::new(Vec::new()),
             debug_toolbar_rect: std::rc::Rc::new(Cell::new(quadraui::Rect::default())),
-            last_click_time: Cell::new(now.checked_sub(Duration::from_secs(1)).unwrap_or(now)),
-            last_click_pos: Cell::new((0, 0)),
             explorer_sb_dragging: false,
             explorer_drag_src: None,
             explorer_drag_active: None,
@@ -1202,9 +1198,15 @@ impl TuiShellApp {
     /// Mirrors `event_loop`'s own bridge verbatim (see its
     /// `events::uievent_to_crossterm` call ahead of its `Event::Mouse` arm,
     /// `mod.rs`): fold `DoubleClick` back to `MouseDown` first (crossterm has
-    /// no double-click concept; `handle_mouse` re-derives it from its own
-    /// `last_click_time`/`last_click_pos` pair), then round-trip through
-    /// [`super::events::uievent_to_crossterm`]. The one piece `event_loop`
+    /// no double-click concept to round-trip through
+    /// [`super::events::uievent_to_crossterm`]), but capture the fact that it
+    /// *was* a `DoubleClick` in `is_double_click` first and pass that through
+    /// to `handle_mouse` as a plain `bool` (#817). `handle_mouse` used to
+    /// re-derive the same verdict itself from a hand-rolled
+    /// `last_click_time`/`last_click_pos` pair — a second, independent
+    /// 400ms/position detector racing the backend's own
+    /// `quadraui::DoubleClickDetector` that already classified this event as
+    /// `DoubleClick` in the first place. The one piece `event_loop`
     /// couldn't do — obtain `&mut DragState` *and* `&mut ModalStack` from a
     /// `&mut dyn Backend` — is exactly what
     /// `Backend::{drag_state_handle, modal_stack_handle}` (quadraui#704,
@@ -1508,6 +1510,11 @@ impl TuiShellApp {
             }
         }
 
+        // #817: capture the backend's own double-click verdict before
+        // folding it away for the crossterm round-trip below — this is the
+        // single source of truth `handle_mouse` now reads instead of running
+        // a second, independent timer.
+        let is_double_click = matches!(event, UiEvent::DoubleClick { .. });
         let event = match event {
             UiEvent::DoubleClick { position, .. } => UiEvent::MouseDown {
                 button: quadraui::MouseButton::Left,
@@ -1531,8 +1538,6 @@ impl TuiShellApp {
             viewport.height.round() as u16,
         ));
 
-        let mut last_click_time = self.last_click_time.get();
-        let mut last_click_pos = self.last_click_pos.get();
         let mut should_quit = false;
         let last_layout = self.last_layout.borrow();
         let hover_link_rects = self.hover_link_rects.borrow();
@@ -1563,8 +1568,7 @@ impl TuiShellApp {
             &mut drag_state,
             &mut modal_stack,
             last_layout.as_ref(),
-            &mut last_click_time,
-            &mut last_click_pos,
+            is_double_click,
             &mut self.folder_picker,
             &mut should_quit,
             &mut self.explorer_drag_src,
@@ -1598,8 +1602,6 @@ impl TuiShellApp {
         drop(dialog_layout);
 
         self.sidebar_width = new_sidebar_width;
-        self.last_click_time.set(last_click_time);
-        self.last_click_pos.set(last_click_pos);
 
         if should_quit {
             return Reaction::Exit;
@@ -5458,16 +5460,20 @@ mod tests {
     ///    column measured off frame 1 is stale from frame 2 onwards. The
     ///    `Escape` below settles it before anything is measured.
     /// 3. **Wall-clock double-click detection.** `TuiDriver::click` is a bare
-    ///    `MouseDown` (no release), and `mouse.rs`'s editor arm promotes a
-    ///    second `MouseDown` to `engine.mouse_double_click` when it lands on
-    ///    the *same cell* within `Duration::from_millis(400)` of the first.
-    ///    Parking the cursor and then pressing on that same cell therefore
-    ///    raced real time: fast machine → word-select-then-extend, loaded
-    ///    machine → two plain clicks. The park click below is deliberately one
-    ///    cell left of the drag press so `last_click_pos` differs and
-    ///    `is_double` is `false` regardless of how long the two dispatches
-    ///    take (the same "don't race the 400ms detector" lesson quadraui#592
-    ///    baked into `TuiDriver::double_click`).
+    ///    `MouseDown` (no release), and `TuiDriver::dispatch` routes every
+    ///    injected event through `TuiBackend::translate_injected`, which folds
+    ///    a second close `MouseDown` into `UiEvent::DoubleClick` inside its
+    ///    `400ms`/1.5-cell `DoubleClickDetector` (`quadraui::dispatch`).
+    ///    `mouse.rs`'s editor arm (#817) just reads that fold's verdict —
+    ///    it no longer runs a second, independent timer of its own — but the
+    ///    detector itself is still real wall-clock state: parking the cursor
+    ///    and then pressing on that same cell would still race real time,
+    ///    fast machine → word-select-then-extend, loaded machine → two plain
+    ///    clicks. The park click below is deliberately one cell left of the
+    ///    drag press so the detector's position check misses and no
+    ///    `DoubleClick` fold happens regardless of how long the two
+    ///    dispatches take (the same "don't race the 400ms detector" lesson
+    ///    quadraui#592 baked into `TuiDriver::double_click`).
     ///
     /// The assertion sweeps the whole dragged span rather than one hardcoded
     /// probe column, so it states the property under test ("some cell the drag
@@ -5533,6 +5539,220 @@ mod tests {
              screen:\n{}",
             swept,
             driver.screen()
+        );
+    }
+
+    /// #817 regression coverage: a genuine double-click must still select
+    /// the *whole clicked word* once `handle_mouse_event`/`mouse::handle_mouse`
+    /// stop running their own hand-rolled 400ms/position detector and instead
+    /// read the verdict `TuiBackend`'s `quadraui::DoubleClickDetector`
+    /// already folded into `UiEvent::DoubleClick`. Uses
+    /// `TuiDriver::double_click` (quadraui#592) rather than two `click()`s,
+    /// so the assertion is deterministic instead of racing real time.
+    ///
+    /// Probes two columns *inside the same word* (`probe_a` near its start,
+    /// `probe_b` near its end) rather than one: a lone repainted cursor glyph
+    /// — what a regression back to "fold every `DoubleClick` into a plain
+    /// `MouseDown` and call `engine.mouse_click` instead of
+    /// `mouse_double_click`" would still produce, since a plain click also
+    /// repaints the one cell the cursor lands on — only ever touches
+    /// `probe_a` (where the click landed). A real word *selection* paints
+    /// every cell of the word, including `probe_b`, with the same highlight.
+    /// Asserting `after_a == after_b` (and that both differ from their
+    /// unselected "before" style) is what actually distinguishes "selected
+    /// the word" from "moved the cursor to where the click landed" — an
+    /// earlier draft of this test asserted only the single-probe version and
+    /// stayed green with `is_double` hardcoded to `false` (verified by
+    /// temporarily reintroducing that regression), i.e. it didn't fail
+    /// against the bug it claims to cover. The two-probe design below does
+    /// fail against that regression (see `#817`'s PR for the before/after run).
+    ///
+    /// The second word — never clicked — pins down that the change is
+    /// scoped to the double-clicked word rather than some unrelated
+    /// full-line repaint; the cursor is parked off in blank space first
+    /// (rather than on the second word) so its own cursor-glyph styling
+    /// doesn't leak into that "before" snapshot.
+    #[test]
+    fn tui_editor_double_click_selects_the_word_via_shared_dispatch() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "wordZQXW817alpha tailZQXW817beta\n");
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window — `new_for_test` must not have restored \
+             an ambient session's splits"
+        );
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        // Settle the sidebar width before measuring anything (see the drag
+        // test above for why this matters).
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        let first = driver
+            .find_bounds("wordZQXW817alpha")
+            .expect("the first word should be painted");
+        let second = driver
+            .find_bounds("tailZQXW817beta")
+            .expect("the second word should be painted");
+        let row = first.y as u16;
+        assert_eq!(row, second.y as u16, "setup sanity: both words on one row");
+        let row_y = first.y + first.height / 2.0;
+        // Two probes inside the *first* word — near its start (where the
+        // double-click itself lands) and near its end — plus one inside the
+        // untouched second word.
+        let probe_a = first.x as u16 + 2;
+        let probe_b = first.x as u16 + first.width as u16 - 2;
+        assert!(
+            probe_b > probe_a + 1,
+            "setup sanity: the word must be wide enough for two distinct probes"
+        );
+        let second_probe = second.x as u16 + 2;
+        // Well past both words, same row — blank space the cursor can park
+        // on without its own cursor-glyph styling landing on any probe
+        // column (moving the plain cursor itself repaints whatever cell it
+        // was on, independent of any selection, so parking *on* a probe
+        // column would make that column's "before" snapshot include a
+        // cursor glyph the double-click's cursor move alone would clear —
+        // a false positive for "the untouched word's paint changed").
+        let park_x = second.x + second.width + 3.0;
+
+        // Park the cursor off in blank space first (single click — must
+        // never be promoted to a double-click here) so the "before"
+        // snapshot is the words' plain, unselected paint, and `mouse_up`
+        // releases it. `TuiDriver::click` is a bare `MouseDown` (no
+        // release), and mouse.rs's own scroll-surface rung
+        // (`quadraui::dispatch_click` over `engine.scroll_surfaces`) still
+        // has a registered-but-invisible `"explorer:sb"` surface at a small
+        // column even with the sidebar hidden; if the park click's
+        // `TextSelection` drag is left active, a later click landing on that
+        // column gets misrouted as a scrollbar-drag continuation and
+        // swallowed before it ever reaches the editor's double-click arm.
+        // Not this test's bug to fix, just a trap it must not fall into.
+        driver.click(park_x, row_y);
+        driver.mouse_up(park_x, row_y);
+        let before_a = driver.style_at(probe_a, row);
+        let before_b = driver.style_at(probe_b, row);
+        let before_second = driver.style_at(second_probe, row);
+
+        driver.double_click(probe_a as f32, row_y);
+
+        let after_a = driver.style_at(probe_a, row);
+        let after_b = driver.style_at(probe_b, row);
+        let after_second = driver.style_at(second_probe, row);
+
+        assert_ne!(
+            before_a,
+            after_a,
+            "double-clicking the first word must repaint it with a selection \
+             style, but column {probe_a} of row {row} paints identically \
+             before and after ({after_a:?}); screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            after_a,
+            after_b,
+            "a double-click must select the *whole* word, not just move the \
+             cursor to the clicked cell — column {probe_a} (click site) and \
+             column {probe_b} (same word, far end) must paint with the same \
+             selection style, but got {after_a:?} vs {after_b:?}; screen:\n{}",
+            driver.screen()
+        );
+        assert_ne!(
+            before_b,
+            after_b,
+            "the far end of the double-clicked word must also pick up the \
+             selection style, but column {probe_b} of row {row} paints \
+             identically before and after ({after_b:?}); screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            before_second,
+            after_second,
+            "double-clicking the first word must not touch the second word's \
+             paint, but column {second_probe} of row {row} changed \
+             ({before_second:?} -> {after_second:?}); screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #817 regression coverage, settings-sidebar site (`mouse.rs`'s
+    /// `SidebarOwner::Settings` arm, one of the four hand-rolled
+    /// 400ms/position detectors this issue deleted): a genuine double-click
+    /// on a boolean settings row must toggle it via
+    /// `engine.handle_settings_key("Return", ...)`, reading the same
+    /// `is_double_click` verdict the editor-word-selection test above
+    /// exercises. "Cursor Line" (`cursorline`) is a `SettingType::Bool` that
+    /// defaults to `true` (`default_cursorline`), so it paints `"[x]"` —
+    /// flipping to `"[ ]"` (quadraui's TUI `Form` renderer's literal
+    /// checkbox glyphs) is the rendered-output assertion.
+    ///
+    /// The click's row is derived from `engine.settings_flat_list()` — the
+    /// same list `mouse.rs`'s `SidebarOwner::Settings` arm indexes into via
+    /// `fi = settings_scroll_top + content_row` — rather than from
+    /// `find_bounds("Cursor Line")`'s painted position: the two disagree by
+    /// one row in this fixture (a pre-existing mismatch between where
+    /// `render_settings_panel` paints row N and where the click router's
+    /// `content_row = sidebar_row - 2` resolves row N, unrelated to #817 —
+    /// tracked separately). Computing the target row from the same list the
+    /// click router consults keeps this test about the double-click verdict,
+    /// not that separate off-by-one.
+    #[test]
+    fn tui_settings_double_click_toggles_a_boolean_row_via_shared_dispatch() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        assert!(
+            app.engine.settings.cursorline,
+            "setup sanity: `cursorline` must default to true so the test can \
+             observe a true -> false double-click toggle"
+        );
+        let flat = app.engine.settings_flat_list();
+        let flat_idx = flat
+            .iter()
+            .position(|row| {
+                matches!(
+                    row,
+                    crate::core::engine::SettingsRow::CoreSetting(idx)
+                        if crate::core::settings::SETTING_DEFS[*idx].key == "cursorline"
+                )
+            })
+            .expect("the flat settings list must contain the `cursorline` row");
+        // Mirrors `mouse.rs`'s `SidebarOwner::Settings` arm: `sidebar_row =
+        // row - menu_rows` (menu bar hidden here, so `menu_rows == 0`), then
+        // `content_row = sidebar_row - 2` (header + search rows), then
+        // `fi = settings_scroll_top + content_row` (scrolled to the top).
+        let row = flat_idx as u16 + 2;
+        let col = ACTIVITY_BAR_WIDTH + 2;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        let before = driver.screen();
+        let before_line = before
+            .lines()
+            .find(|l| l.contains("Cursor Line"))
+            .expect("the Cursor Line settings row should be painted");
+        assert!(
+            before_line.contains("[x]"),
+            "Cursor Line must paint checked (\"[x]\") before any click, since \
+             it defaults to true; line: {before_line:?}"
+        );
+
+        driver.double_click(col as f32, row as f32 + 0.5);
+
+        let after = driver.screen();
+        let after_line = after
+            .lines()
+            .find(|l| l.contains("Cursor Line"))
+            .expect("the Cursor Line settings row should still be painted");
+        assert!(
+            after_line.contains("[ ]"),
+            "double-clicking the Cursor Line row must toggle it to unchecked \
+             (\"[ ]\") via `engine.handle_settings_key(\"Return\", ..)`, but \
+             the checkbox glyph didn't flip; line: {after_line:?}; screen:\n{after}"
         );
     }
 

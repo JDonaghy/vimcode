@@ -1783,8 +1783,6 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut drag_state = quadraui::DragState::default();
         let mut modal_stack = quadraui::ModalStack::new();
-        let mut last_click_time = Instant::now();
-        let mut last_click_pos: (u16, u16) = (0, 0);
         let mut should_quit = false;
         handle_mouse(
             ev,
@@ -1802,8 +1800,7 @@ mod tests {
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
-            &mut last_click_time,
-            &mut last_click_pos,
+            false,
             &mut None,
             &mut should_quit,
             &mut None,
