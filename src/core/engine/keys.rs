@@ -1443,21 +1443,17 @@ impl Engine {
                 // H: jump to line [count] from top of visible screen, kept
                 // at least 'scrolloff' lines from the top (#805).
                 let count = self.take_count().max(1);
-                let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines().max(1);
-                let max_line = self.buffer().len_lines().saturating_sub(1);
-                let scrolloff = self.settings.scrolloff;
-                let offset = count.saturating_sub(1).max(scrolloff);
-                let target = (scroll_top + offset)
-                    .min(scroll_top + viewport.saturating_sub(1))
-                    .min(max_line);
+                let target = self.screen_top_target(count);
                 self.push_jump_location();
                 self.view_mut().cursor.line = target;
                 self.clamp_cursor_col();
             }
             Some('M') => {
                 // M: jump to the middle of the lines actually visible.
-                // Unlike H/L, M ignores 'scrolloff' (#805).
+                // Unlike H/L, M ignores 'scrolloff' (#805) — and its count
+                // (`:h M`), but the count must still be consumed or it leaks
+                // into the next command (#807).
+                let _ = self.take_count();
                 let mid = self.middle_visible_line();
                 self.push_jump_location();
                 self.view_mut().cursor.line = mid;
@@ -1467,16 +1463,7 @@ impl Engine {
                 // L: jump to line [count] from bottom of visible screen,
                 // kept at least 'scrolloff' lines from the bottom (#805).
                 let count = self.take_count().max(1);
-                let scroll_top = self.view().scroll_top;
-                let viewport = self.viewport_lines().max(1);
-                let max_line = self.buffer().len_lines().saturating_sub(1);
-                let scrolloff = self.settings.scrolloff;
-                let window_bottom = scroll_top + viewport - 1;
-                let offset = count.saturating_sub(1).max(scrolloff);
-                let target = window_bottom
-                    .saturating_sub(offset)
-                    .max(scroll_top)
-                    .min(max_line);
+                let target = self.screen_bottom_target(count);
                 self.push_jump_location();
                 self.view_mut().cursor.line = target;
                 self.clamp_cursor_col();
@@ -2383,17 +2370,24 @@ impl Engine {
                     }
                 }
                 Some('m') => {
-                    // gm: go to middle of screen line
+                    // gm: go to middle of screen line. The count is ignored,
+                    // but it must still be CONSUMED or it leaks into the next
+                    // command (#807).
+                    self.take_count();
                     let vp_cols = self.view().viewport_cols;
                     let mid = vp_cols / 2;
                     self.view_mut().cursor.col = mid;
                     self.clamp_cursor_col();
                 }
                 Some('M') => {
-                    // gM: go to middle of text line
+                    // gM: go to the character `count` percent into the line,
+                    // defaulting to 50 — i.e. the middle (`:h gM`). Before
+                    // #807 the count was ignored *and* leaked.
+                    let pct = self.peek_count().filter(|n| *n <= 100).unwrap_or(50);
+                    self.take_count();
                     let line = self.view().cursor.line;
-                    let line_len = self.buffer().line_len_chars(line).saturating_sub(1); // exclude newline
-                    self.view_mut().cursor.col = line_len / 2;
+                    let len = self.line_text_len(line);
+                    self.view_mut().cursor.col = len * pct / 100;
                     self.clamp_cursor_col();
                 }
                 Some('a') => {
@@ -4080,10 +4074,12 @@ impl Engine {
                 }
             }
             Some('H') => {
-                // dH: delete from current line to top of screen (linewise)
-                let _ = self.take_count();
+                // dH: delete from the current line to the [count]'th line from
+                // the top of the screen (linewise). The count used to be
+                // thrown away, making `d3H` behave as `dH` (#807).
+                let count = self.take_count().max(1);
                 let current_line = self.view().cursor.line;
-                let top = self.view().scroll_top;
+                let top = self.screen_top_target(count);
                 let (s, e) = if top <= current_line {
                     (top, current_line)
                 } else {
@@ -4092,7 +4088,8 @@ impl Engine {
                 self.apply_linewise_operator(operator, s, e, changed);
             }
             Some('M') => {
-                // dM: delete from current line to middle of screen (linewise)
+                // dM: delete from current line to middle of screen (linewise).
+                // `M` genuinely ignores its count, but must consume it.
                 let _ = self.take_count();
                 let current_line = self.view().cursor.line;
                 let mid = self.middle_visible_line();
@@ -4104,12 +4101,11 @@ impl Engine {
                 self.apply_linewise_operator(operator, s, e, changed);
             }
             Some('L') => {
-                // dL: delete from current line to bottom of screen (linewise)
-                let _ = self.take_count();
+                // dL: delete from the current line to the [count]'th line from
+                // the bottom of the screen (linewise) — see `dH` (#807).
+                let count = self.take_count().max(1);
                 let current_line = self.view().cursor.line;
-                let viewport_lines = self.view().viewport_lines.max(1);
-                let bot = (self.view().scroll_top + viewport_lines).saturating_sub(1);
-                let bot = bot.min(self.buffer().len_lines().saturating_sub(1));
+                let bot = self.screen_bottom_target(count);
                 let (s, e) = if bot >= current_line {
                     (current_line, bot)
                 } else {

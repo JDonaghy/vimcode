@@ -1048,3 +1048,61 @@ fn test_r_special_keys_and_replace_mode_backspace() {
     press_key(&mut e, "Escape");
     assert_buf(&e, "ax\nydef\n");
 }
+
+/// Counts on the screen-relative operators and motions (#807).
+///
+/// `dH` / `dL` used to throw their count away (`let _ = self.take_count()`),
+/// and `M` / `gm` / `gM` never consumed theirs at all, so it leaked into the
+/// next command. The conformance suite cannot cover these: its headless nvim
+/// oracle mis-reports window-relative state (see the Group A comment in
+/// `tests/nvim_conformance.rs`), so they are pinned here instead.
+#[test]
+fn test_screen_relative_counts() {
+    let fixture = || {
+        let mut e = engine_with(&(1..=20).map(|n| format!("L{n}\n")).collect::<String>());
+        e.set_viewport_lines(10);
+        e.view_mut().scroll_top = 0;
+        e
+    };
+
+    // d3H from line 7 deletes lines 3..7 (the 3rd line from the top down).
+    let mut e = fixture();
+    e.view_mut().cursor.line = 6;
+    type_chars(&mut e, "d3H");
+    assert_eq!(
+        get_lines(&e)[..3],
+        ["L1".to_string(), "L2".to_string(), "L8".to_string()]
+    );
+
+    // Without a count dH reaches the very top line.
+    let mut e = fixture();
+    e.view_mut().cursor.line = 6;
+    type_chars(&mut e, "dH");
+    assert_eq!(get_lines(&e)[0], "L8");
+
+    // d3L from line 1 deletes down to the 3rd line from the window bottom.
+    let mut e = fixture();
+    type_chars(&mut e, "d3L");
+    assert_eq!(get_lines(&e)[0], "L9");
+
+    // `M` ignores its count but must CONSUME it: the `3` must not survive to
+    // turn the following `x` into `3x`.
+    let mut e = fixture();
+    type_chars(&mut e, "3Mx");
+    assert_eq!(get_lines(&e)[4], "5");
+    assert_eq!(e.peek_count(), None);
+
+    // Same leak for gm / gM.
+    let mut e = engine_with("abcdefghij\n");
+    type_chars(&mut e, "3gmx");
+    assert_eq!(buf(&e).matches('a').count(), 1, "only one char removed");
+    assert_eq!(e.peek_count(), None);
+
+    // gM without a count is the middle of the line; `20gM` is 20% into it.
+    let mut e = engine_with("abcdefghij\n");
+    type_chars(&mut e, "gM");
+    assert_cursor(&e, 0, 5);
+    let mut e = engine_with("abcdefghij\n");
+    type_chars(&mut e, "20gM");
+    assert_cursor(&e, 0, 2);
+}

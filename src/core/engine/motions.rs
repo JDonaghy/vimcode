@@ -6027,6 +6027,33 @@ impl Engine {
         }
     }
 
+    /// `H`'s target: the `count`'th line from the top of the window, kept at
+    /// least 'scrolloff' lines below the top edge (#805). Shared with `dH` so
+    /// the operator form honours its count too (#807).
+    pub(crate) fn screen_top_target(&self, count: usize) -> usize {
+        let scroll_top = self.view().scroll_top;
+        let viewport = self.view().viewport_lines.max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let offset = count.saturating_sub(1).max(self.settings.scrolloff);
+        (scroll_top + offset)
+            .min(scroll_top + viewport.saturating_sub(1))
+            .min(max_line)
+    }
+
+    /// `L`'s target: the `count`'th line from the bottom of the window — the
+    /// mirror of [`Engine::screen_top_target`].
+    pub(crate) fn screen_bottom_target(&self, count: usize) -> usize {
+        let scroll_top = self.view().scroll_top;
+        let viewport = self.view().viewport_lines.max(1);
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let window_bottom = scroll_top + viewport - 1;
+        let offset = count.saturating_sub(1).max(self.settings.scrolloff);
+        window_bottom
+            .saturating_sub(offset)
+            .max(scroll_top)
+            .min(max_line)
+    }
+
     /// Park the cursor on `line`'s first non-blank column.
     pub(crate) fn move_cursor_to_first_non_blank(&mut self, line: usize) {
         let line = line.min(self.buffer().len_lines().saturating_sub(1));
