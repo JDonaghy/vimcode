@@ -2018,7 +2018,6 @@ impl Engine {
                         }
                     } else {
                         self.push_jump_location();
-                        let current_line = self.view().cursor.line;
                         let target_line = if self.peek_count().is_some() {
                             let count = self.take_count();
                             (count - 1).min(self.buffer().len_lines().saturating_sub(1))
@@ -2026,14 +2025,17 @@ impl Engine {
                             0
                         };
                         self.view_mut().cursor.line = target_line;
-                        // Real Vim leaves the column alone when `gg`'s target
-                        // line is the line the cursor is already on — only an
-                        // actual line change resets to column 0 (#806, "reg:dn
-                        // goes to \"1", which depends on a single-line-buffer
-                        // `gg` being a true no-op).
-                        if target_line != current_line {
-                            self.view_mut().cursor.col = 0;
-                        }
+                        // `gg` is a curswant-preserving vertical motion, exactly
+                        // like `G`/`j`/`k` — Neovim's 'startofline' defaults OFF
+                        // (unlike Vim's default-on), so `gg` never jumps to
+                        // column 0/first-non-blank; it keeps the column the
+                        // cursor already had, clamped to the target line's
+                        // length (verified against `nvim --headless`, the
+                        // conformance oracle this repo's tests run against;
+                        // see #806 review — a real `vim` binary's `col('.')`
+                        // after `gg` is not a substitute for the actual nvim
+                        // oracle used by `tests/nvim_conformance.rs`).
+                        self.clamp_cursor_col();
                     }
                 }
                 Some('e') => {
@@ -7592,9 +7594,15 @@ impl Engine {
             if pending == '"' {
                 // Register selection: "x (uppercase A-Z appends to lowercase).
                 // See the Normal-mode `'"'` arm for the full register-name
-                // rationale (#806).
+                // rationale (#806); `=` opens the expression-register prompt
+                // the same way there, rather than silently leaving
+                // `selected_register` set with no prompt ever shown (#806
+                // review).
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase()
+                    if ch == '=' {
+                        self.selected_register = Some('=');
+                        self.expr_register_pending = Some((false, String::new()));
+                    } else if ch.is_ascii_lowercase()
                         || ch.is_ascii_uppercase()
                         || ch.is_ascii_digit()
                         || ch == '"'

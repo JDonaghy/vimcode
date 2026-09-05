@@ -123,11 +123,19 @@ impl Engine {
         } else {
             None
         };
+        // Whether `pos` sits exactly at the start of `at_line` (column 0) —
+        // a whole-line insertion (`O`, a linewise `P`/`:put` landing above
+        // the cursor line, …). When it does, the ENTIRE original content of
+        // `at_line` — including any mark sitting exactly on that line —
+        // slides down by the inserted line count, not just marks strictly
+        // below it (#806 review: a mark on the same line `O` is invoked from
+        // was silently left pointing at the new, blank line otherwise).
+        let at_line_start = at_line.is_some_and(|l| pos == self.buffer().line_to_char(l));
         self.active_buffer_state_mut().record_insert(pos, text);
         self.buffer_mut().insert(pos, text);
         if let Some(at_line) = at_line {
             let inserted_lines = text.matches('\n').count();
-            self.shift_marks_for_line_insert(at_line, inserted_lines);
+            self.shift_marks_for_line_insert(at_line, inserted_lines, at_line_start);
         }
     }
 
@@ -162,21 +170,31 @@ impl Engine {
     /// though it may now point at a different character), only its line
     /// number moves (#806, "mark:mark shifts after O", "mark:'a after text
     /// insert above").
-    pub(crate) fn shift_marks_for_line_insert(&mut self, at_line: usize, line_count: usize) {
+    pub(crate) fn shift_marks_for_line_insert(
+        &mut self,
+        at_line: usize,
+        line_count: usize,
+        at_line_start: bool,
+    ) {
         if line_count == 0 {
             return;
         }
+        // A whole-line insertion (`at_line_start`) pushes `at_line`'s own
+        // original content down too, so a mark sitting exactly on `at_line`
+        // must shift with it — otherwise it silently points at the new,
+        // inserted (blank) line instead (#806 review).
+        let shifts = |line: usize| line > at_line || (at_line_start && line == at_line);
         let buffer_id = self.active_window().buffer_id;
         if let Some(bm) = self.marks.get_mut(&buffer_id) {
             for cursor in bm.values_mut() {
-                if cursor.line > at_line {
+                if shifts(cursor.line) {
                     cursor.line += line_count;
                 }
             }
         }
         let file = self.active_buffer_state().file_path.clone();
         for (f, line, _) in self.global_marks.values_mut() {
-            if *f == file && *line > at_line {
+            if *f == file && shifts(*line) {
                 *line += line_count;
             }
         }

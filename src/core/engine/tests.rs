@@ -5921,11 +5921,14 @@ fn test_mark_jump_exact_position() {
     press_char(&mut engine, 'm');
     press_char(&mut engine, 'b');
 
-    // Move to line 0, col 0
+    // Move to line 0 — `gg` preserves the cursor's column (clamped to the
+    // target line's length), matching Neovim's default 'startofline' being
+    // OFF (verified against `nvim --headless`; see #806 review). Column 4
+    // survives the jump since "hello world" is longer than 4 chars.
     press_char(&mut engine, 'g');
     press_char(&mut engine, 'g');
     assert_eq!(engine.view().cursor.line, 0);
-    assert_eq!(engine.view().cursor.col, 0);
+    assert_eq!(engine.view().cursor.col, 4);
 
     // Jump to exact mark position with backtick
     press_char(&mut engine, '`');

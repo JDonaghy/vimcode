@@ -728,6 +728,56 @@ fn test_mark_shifts_after_line_inserted_above() {
 }
 
 #[test]
+fn test_mark_on_same_line_shifts_when_o_inserts_above() {
+    // #806 review: `O` splices a new blank line in at COLUMN 0 of the
+    // cursor's own line, so the entire original line — including a mark
+    // sitting on that same line, not just marks strictly below it — slides
+    // down by one. Before this fix, `shift_marks_for_line_insert` only
+    // shifted `cursor.line > at_line`, silently leaving a same-line mark
+    // pointing at the new, blank line instead of the text it used to mark.
+    let mut e = engine_with("a\nb\nc\n");
+    press(&mut e, 'm');
+    press(&mut e, 'a'); // mark a := (line 0, "a") -- the line `O` fires from
+    press(&mut e, 'O'); // open a new blank line above line 0
+    type_chars(&mut e, "x");
+    press_key(&mut e, "Escape");
+    // Buffer is now ["x", "a", "b", "c"] -- "a" (and mark a) shifted to line 1.
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "x".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+        ]
+    );
+    press(&mut e, '\'');
+    press(&mut e, 'a');
+    assert_cursor(&e, 1, 0);
+}
+
+#[test]
+fn test_visual_expr_register_prompts() {
+    // #806 review: the Visual-mode `'"'` pending-key arm mirrored the
+    // Normal-mode register-name set but dropped the `'='` branch that opens
+    // `expr_register_pending` — typing `"=` in Visual mode just set
+    // `selected_register = Some('=')` with no prompt ever shown, so the
+    // keys meant for the expression ("1+1<CR>") fell through and were
+    // executed as ordinary Visual-mode motions instead of being consumed by
+    // the expression prompt. Round-trip through `p` to prove the expression
+    // was actually evaluated and landed in the buffer, not just that some
+    // internal flag got set.
+    let mut e = engine_with("hello world\n");
+    press(&mut e, 'v'); // Visual mode, selects "h"
+    press(&mut e, '"');
+    press(&mut e, '=');
+    type_chars(&mut e, "1+1");
+    press_key(&mut e, "Return"); // evaluates to "2", stored in register '='
+    press(&mut e, 'p'); // replace the visual selection with register '='
+    assert_eq!(get_lines(&e), vec!["2ello world".to_string()]);
+}
+
+#[test]
 fn test_double_quote_mark_toggles() {
     // `''` jumps to the position before the last jump — and IS ITSELF a
     // jump, so a second `''` toggles back (`:h ''`).
