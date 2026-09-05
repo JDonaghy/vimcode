@@ -895,56 +895,6 @@ impl Engine {
         *changed = true;
     }
 
-    // --- WORD text object (iW / aW) ---
-
-    pub(crate) fn find_bigword_object(
-        &self,
-        modifier: char,
-        cursor_pos: usize,
-    ) -> Option<(usize, usize)> {
-        let total_chars = self.buffer().len_chars();
-        if cursor_pos >= total_chars {
-            return None;
-        }
-
-        let char_at_cursor = self.buffer().content.char(cursor_pos);
-
-        // If on whitespace and modifier is 'i', no match
-        if modifier == 'i' && char_at_cursor.is_whitespace() {
-            return None;
-        }
-
-        let mut start = cursor_pos;
-        let mut end = cursor_pos;
-
-        // Expand backward to start of WORD (non-whitespace)
-        while start > 0 && !self.buffer().content.char(start - 1).is_whitespace() {
-            start -= 1;
-        }
-
-        // Expand forward to end of WORD
-        while end < total_chars && !self.buffer().content.char(end).is_whitespace() {
-            end += 1;
-        }
-
-        // For 'aW', include trailing whitespace
-        if modifier == 'a' {
-            while end < total_chars {
-                let ch = self.buffer().content.char(end);
-                if !ch.is_whitespace() || ch == '\n' {
-                    break;
-                }
-                end += 1;
-            }
-        }
-
-        if start < end {
-            Some((start, end))
-        } else {
-            None
-        }
-    }
-
     // --- gJ: join lines without inserting space ---
 
     pub(crate) fn join_lines_no_space(&mut self, count: usize, changed: &mut bool) {
@@ -1793,15 +1743,19 @@ impl Engine {
 
     /// Find the range for a text object.
     /// Returns (start_pos, end_pos) if found, None otherwise.
+    /// `count` is the `N` in `d2aw` / `v3iw` / `d2i(` — a text object that
+    /// cannot be extended that far returns `None` so the whole operator
+    /// aborts, which is what Vim does (#807).
     pub(crate) fn find_text_object_range(
         &self,
         modifier: char,
         obj_type: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
         match obj_type {
-            'w' => self.find_word_object(modifier, cursor_pos),
-            'W' => self.find_bigword_object(modifier, cursor_pos),
+            'w' => self.find_word_object(modifier, cursor_pos, count),
+            'W' => self.find_bigword_object(modifier, cursor_pos, count),
             '"' => self.find_quote_object(modifier, '"', cursor_pos),
             '\'' => self.find_quote_object(modifier, '\'', cursor_pos),
             '(' | ')' | 'b' => self.find_bracket_object(modifier, '(', ')', cursor_pos),
@@ -1819,100 +1773,139 @@ impl Engine {
         }
     }
 
-    /// Find word text object range (iw/aw)
+    /// Find word text object range (`iw`/`aw`), honouring `count` (#807).
+    ///
+    /// Vim splits a line into three char classes — blanks, word characters and
+    /// punctuation — and a "word" for `iw` is one maximal run of a single
+    /// class. `Niw` takes N consecutive runs (so `3iw` on `a b c` is `a b`).
+    ///
+    /// `aw` takes N *words* together with their white space: the trailing run
+    /// if there is one, otherwise the leading run — but Vim never absorbs
+    /// leading blanks that start at column 0 (`daw` on the `foo` of `  foo`
+    /// leaves `  `, while on the `foo` of `ab foo` it leaves `ab`). Starting
+    /// on blanks, `aw` is instead "these blanks plus the following word".
+    /// When there are not N words available the whole object fails, which is
+    /// how `d5aw` on `a b` correctly does nothing.
     pub(crate) fn find_word_object(
         &self,
         modifier: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
-        let total_chars = self.buffer().len_chars();
-        if cursor_pos >= total_chars {
+        self.find_word_object_classed(modifier, cursor_pos, count, char_class)
+    }
+
+    /// `iW`/`aW`: identical to [`Engine::find_word_object`] except that
+    /// punctuation counts as part of a WORD.
+    pub(crate) fn find_bigword_object(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+        count: usize,
+    ) -> Option<(usize, usize)> {
+        self.find_word_object_classed(modifier, cursor_pos, count, bigword_class)
+    }
+
+    fn find_word_object_classed(
+        &self,
+        modifier: char,
+        cursor_pos: usize,
+        count: usize,
+        class: fn(char) -> u8,
+    ) -> Option<(usize, usize)> {
+        let total = self.buffer().len_chars();
+        if cursor_pos >= total {
+            return None;
+        }
+        let count = count.max(1);
+        let at = |i: usize| self.buffer().content.char(i);
+        let cls = |i: usize| class(at(i));
+        // A newline ends every run, so runs never span lines.
+        let run_start = |mut i: usize| {
+            let c = cls(i);
+            while i > 0 && cls(i - 1) == c && c != CLASS_NL {
+                i -= 1;
+            }
+            i
+        };
+        let run_end = |mut i: usize| {
+            let c = cls(i);
+            while i < total && cls(i) == c && c != CLASS_NL {
+                i += 1;
+            }
+            if c == CLASS_NL {
+                i + 1
+            } else {
+                i
+            }
+        };
+
+        if cls(cursor_pos) == CLASS_NL {
             return None;
         }
 
-        let char_at_cursor = self.buffer().content.char(cursor_pos);
-
-        // `iw` on whitespace selects the contiguous run of blanks itself
-        // (Vim treats a blank run as its own "word" class for `iw`/`iW`) —
-        // it is NOT "no object", which is what an earlier version of this
-        // function returned, silently no-opping `diw`/`ciw` etc. on any
-        // whitespace character (including a lone isolated space).
-        if modifier == 'i' && char_at_cursor.is_whitespace() && char_at_cursor != '\n' {
-            let mut start = cursor_pos;
-            let mut end = cursor_pos;
-            while start > 0 {
-                let ch = self.buffer().content.char(start - 1);
-                if !ch.is_whitespace() || ch == '\n' {
-                    break;
+        if modifier == 'i' {
+            let start = run_start(cursor_pos);
+            let mut end = run_end(cursor_pos);
+            for _ in 1..count {
+                if end >= total || cls(end) == CLASS_NL {
+                    return None;
                 }
-                start -= 1;
+                end = run_end(end);
             }
-            while end < total_chars {
-                let ch = self.buffer().content.char(end);
-                if !ch.is_whitespace() || ch == '\n' {
-                    break;
+            return (start < end).then_some((start, end));
+        }
+
+        // `aw`
+        let line = self.buffer().content.char_to_line(cursor_pos);
+        let line_start = self.buffer().line_to_char(line);
+        if cls(cursor_pos) == CLASS_BLANK {
+            // Blanks first, then the word that follows them — repeated.
+            let start = run_start(cursor_pos);
+            let mut end = start;
+            for _ in 0..count {
+                if end < total && cls(end) == CLASS_BLANK {
+                    end = run_end(end);
                 }
-                end += 1;
-            }
-            return if start < end {
-                Some((start, end))
-            } else {
-                None
-            };
-        }
-
-        // Find word boundaries
-        let mut start = cursor_pos;
-        let mut end = cursor_pos;
-
-        // Expand backward to start of word
-        while start > 0 {
-            let ch = self.buffer().content.char(start - 1);
-            if ch.is_whitespace() || !is_word_char(ch) {
-                break;
-            }
-            start -= 1;
-        }
-
-        // Expand forward to end of word
-        while end < total_chars {
-            let ch = self.buffer().content.char(end);
-            if ch.is_whitespace() || !is_word_char(ch) {
-                break;
-            }
-            end += 1;
-        }
-
-        // For 'aw', include trailing whitespace; if none, include leading whitespace
-        if modifier == 'a' {
-            let end_before = end;
-            while end < total_chars {
-                let ch = self.buffer().content.char(end);
-                if !ch.is_whitespace() || ch == '\n' {
-                    break;
+                if end >= total || cls(end) == CLASS_NL || cls(end) == CLASS_BLANK {
+                    return None; // no word to pair the blanks with
                 }
-                end += 1;
+                end = run_end(end);
             }
-            // No trailing whitespace consumed — try leading instead
-            if end == end_before {
-                while start > 0 {
-                    let ch = self.buffer().content.char(start - 1);
-                    if !ch.is_whitespace() || ch == '\n' {
-                        break;
-                    }
-                    start -= 1;
-                }
-            }
+            return (start < end).then_some((start, end));
         }
 
-        if start < end {
-            Some((start, end))
-        } else {
-            None
+        let start = run_start(cursor_pos);
+        let mut end = start;
+        let mut white_ended = false;
+        for _ in 0..count {
+            if end >= total || cls(end) == CLASS_NL || cls(end) == CLASS_BLANK {
+                return None; // ran out of words before the count was satisfied
+            }
+            end = run_end(end);
+            white_ended = false;
+            if end < total && cls(end) == CLASS_BLANK {
+                end = run_end(end);
+                white_ended = true;
+            }
         }
+        let mut start = start;
+        if !white_ended {
+            let lead = run_start(start.saturating_sub(1));
+            if start > line_start && cls(start - 1) == CLASS_BLANK && lead > line_start {
+                start = lead;
+            }
+        }
+        (start < end).then_some((start, end))
     }
 
-    /// Find quote text object range (i"/a")
+    /// Find quote text object range (`i"`/`a"`).
+    ///
+    /// Vim pairs the quotes up from the **start of the line** rather than
+    /// searching backwards from the cursor, which is what makes `di"` work
+    /// with the cursor on the closing quote or anywhere before the pair
+    /// (`:h i_quote`; #807 — the old backward scan treated a closing quote as
+    /// an opening one and silently found no object).
     pub(crate) fn find_quote_object(
         &self,
         modifier: char,
@@ -1924,88 +1917,60 @@ impl Engine {
             return None;
         }
 
-        // Get current line bounds to search within
         let cursor_line = self.buffer().content.char_to_line(cursor_pos);
         let line_start = self.buffer().line_to_char(cursor_line);
         let line_len = self.buffer().line_len_chars(cursor_line);
         let line_end = line_start + line_len;
 
-        // Find opening quote (search backward from cursor)
-        let mut open_pos = None;
-        let mut pos = cursor_pos;
-        while pos >= line_start {
-            let ch = self.buffer().content.char(pos);
-            if ch == quote_char {
-                // Check if it's escaped
-                if pos == line_start || self.buffer().content.char(pos - 1) != '\\' {
-                    open_pos = Some(pos);
-                    break;
-                }
-            }
-            if pos == line_start {
-                break;
-            }
-            pos -= 1;
-        }
+        let is_quote = |pos: usize| {
+            self.buffer().content.char(pos) == quote_char
+                && (pos == line_start || self.buffer().content.char(pos - 1) != '\\')
+        };
+        let next_quote = |from: usize| {
+            (from..line_end).find(|&p| self.buffer().content.char(p) != '\n' && is_quote(p))
+        };
 
-        let open_pos = open_pos?;
+        // Vim's `current_quote()`: take the nearest quote *before* the cursor
+        // as the opening one; only if there is none does it look forward. The
+        // consequence is deliberate — with the cursor between two strings,
+        // `di"` deletes what is between them (`"a" x "b"` → `"a""b"`).
+        let open_pos = (line_start..cursor_pos)
+            .rev()
+            .find(|&p| is_quote(p))
+            .or_else(|| next_quote(cursor_pos))?;
+        let close_pos = next_quote(open_pos + 1)?;
 
-        // Find closing quote (search forward from opening)
-        let mut close_pos = None;
-        let mut pos = open_pos + 1;
-        while pos < line_end {
-            let ch = self.buffer().content.char(pos);
-            if ch == quote_char {
-                // Check if it's escaped
-                if self.buffer().content.char(pos - 1) != '\\' {
-                    close_pos = Some(pos);
-                    break;
-                }
-            }
-            pos += 1;
-        }
-
-        let close_pos = close_pos?;
-
-        // Return range based on modifier
         if modifier == 'i' {
             // Inner: exclude quotes
-            if open_pos < close_pos {
-                Some((open_pos + 1, close_pos))
+            return Some((open_pos + 1, close_pos));
+        }
+        // Around: include quotes + trailing whitespace (or leading if no trailing)
+        let mut end = close_pos + 1;
+        let mut start = open_pos;
+        let mut trail = end;
+        while trail < line_end {
+            let ch = self.buffer().content.char(trail);
+            if ch == ' ' || ch == '\t' {
+                trail += 1;
             } else {
-                None
+                break;
             }
+        }
+        if trail > end {
+            end = trail;
         } else {
-            // Around: include quotes + trailing whitespace (or leading if no trailing)
-            let mut end = close_pos + 1;
-            let mut start = open_pos;
-            // Try trailing whitespace first
-            let mut trail = end;
-            while trail < line_end {
-                let ch = self.buffer().content.char(trail);
+            let mut lead = start;
+            while lead > line_start {
+                let ch = self.buffer().content.char(lead - 1);
                 if ch == ' ' || ch == '\t' {
-                    trail += 1;
+                    lead -= 1;
                 } else {
                     break;
                 }
             }
-            if trail > end {
-                end = trail;
-            } else {
-                // No trailing whitespace — try leading whitespace
-                let mut lead = start;
-                while lead > line_start {
-                    let ch = self.buffer().content.char(lead - 1);
-                    if ch == ' ' || ch == '\t' {
-                        lead -= 1;
-                    } else {
-                        break;
-                    }
-                }
-                start = lead;
-            }
-            Some((start, end))
+            start = lead;
         }
+        Some((start, end))
     }
 
     /// Find bracket text object range (i(/a()
@@ -2772,7 +2737,8 @@ impl Engine {
         let cursor_pos = self.buffer().line_to_char(cursor.line) + cursor.col;
 
         // Find text object range
-        let range = match self.find_text_object_range(modifier, obj_type, cursor_pos) {
+        let count = self.take_count().max(1);
+        let range = match self.find_text_object_range(modifier, obj_type, cursor_pos, count) {
             Some(r) => r,
             None => return, // No matching text object found
         };
@@ -2826,8 +2792,15 @@ impl Engine {
         // Perform operation based on operator type
         match operator {
             'y' => {
-                // Yank only - don't delete, don't change cursor
-                // No undo group needed for yank
+                // Yank leaves the cursor on the FIRST character of the yanked
+                // text when that is before the cursor (`:h y`) — `yi(` on
+                // `f(a, b)` lands on the `a`, not wherever the cursor was
+                // (#807, `to:yi( cursor` and five siblings).
+                if start_pos < cursor_pos {
+                    let line = self.buffer().content.char_to_line(start_pos);
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = start_pos - self.buffer().line_to_char(line);
+                }
             }
             'd' | 'c' => {
                 // Delete or change
@@ -5977,6 +5950,40 @@ fn eval_expr_register_arith(src: &str) -> Result<i64, String> {
         return Err("trailing characters in expression".to_string());
     }
     Ok(val)
+}
+
+// ---------------------------------------------------------------------------
+// Char classes for the `iw`/`aw`/`iW`/`aW` text objects (#807)
+//
+// Vim groups characters into blanks, word characters and punctuation; a
+// "word" for `iw` is one maximal run of a single class, which is why `diw` on
+// the `.` of `foo.bar` deletes only the dot. `iW` collapses word and
+// punctuation into one class. A newline is its own class so runs never span
+// lines.
+// ---------------------------------------------------------------------------
+
+pub(crate) const CLASS_NL: u8 = 0;
+pub(crate) const CLASS_BLANK: u8 = 1;
+const CLASS_WORD: u8 = 2;
+const CLASS_PUNCT: u8 = 3;
+
+fn char_class(c: char) -> u8 {
+    if c == '\n' {
+        CLASS_NL
+    } else if c.is_whitespace() {
+        CLASS_BLANK
+    } else if is_word_char(c) {
+        CLASS_WORD
+    } else {
+        CLASS_PUNCT
+    }
+}
+
+fn bigword_class(c: char) -> u8 {
+    match char_class(c) {
+        CLASS_PUNCT => CLASS_WORD,
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
