@@ -7811,8 +7811,16 @@ impl Engine {
                 }
                 return EngineAction::None;
             } else if pending == 'r' {
-                // r{char}: replace all selected characters with the given character
-                if let Some(replacement) = unicode {
+                // r{char}: replace all selected characters with the given character.
+                // <CR> has no `unicode` (it arrives as key_name "Return" with
+                // unicode: None — see `press_special` in the conformance
+                // harness and the Normal-mode `'r'` handler above), and in
+                // VisualBlock mode Vim special-cases it: instead of inserting
+                // a literal character, each selected line is split into two
+                // at the block column (`:h v_b_r`; #807, `vb:jr<CR>`).
+                if self.mode == Mode::VisualBlock && matches!(key_name, "Return" | "KP_Enter") {
+                    self.replace_visual_block_with_newline(changed);
+                } else if let Some(replacement) = unicode {
                     self.replace_visual_selection(replacement, changed);
                 }
                 return EngineAction::None;

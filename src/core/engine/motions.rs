@@ -1292,8 +1292,18 @@ impl Engine {
                 // than deleting (`:h Replace-mode`; #807, `op:R BS restores`).
                 // Past the trail's start it is a plain cursor move.
                 let col = self.view().cursor.col;
+                if col == 0 {
+                    // Cursor at column 0 with a non-empty trail can only
+                    // happen if arrow-key movement desynced it from the
+                    // cursor (arrow keys don't touch the trail) — leave the
+                    // trail alone rather than silently dropping an entry, so
+                    // a later `<BS>` in the same Replace session still
+                    // restores the right character.
+                    self.move_left();
+                    return;
+                }
                 match self.replace_overwritten.pop() {
-                    Some(orig) if col > 0 => {
+                    Some(orig) => {
                         let line = self.view().cursor.line;
                         let at = self.buffer().line_to_char(line) + col - 1;
                         self.delete_with_undo(at, at + 1);
@@ -1305,7 +1315,7 @@ impl Engine {
                         self.view_mut().cursor.col = col - 1;
                         *changed = true;
                     }
-                    _ => self.move_left(),
+                    None => self.move_left(),
                 }
             }
             "Left" => self.move_left(),
@@ -1841,7 +1851,7 @@ impl Engine {
             '<' | '>' => self.find_bracket_object(modifier, '<', '>', cursor_pos, count),
             'p' => self.find_paragraph_object(modifier, cursor_pos, count),
             's' => self.find_sentence_object(modifier, cursor_pos),
-            't' => self.find_tag_text_object(modifier, cursor_pos),
+            't' => self.find_tag_text_object(modifier, cursor_pos, count),
             '`' => self.find_quote_object(modifier, '`', cursor_pos),
             'e' => self.find_latex_environment_object(modifier, cursor_pos),
             'c' if self.is_latex_buffer() => self.find_latex_command_object(modifier, cursor_pos),
@@ -2390,13 +2400,47 @@ impl Engine {
     /// `at` (around tag) includes the opening and closing tags themselves.
     /// Tag-name comparison is case-insensitive; nested same-name tags are handled by
     /// depth tracking during the forward scan for the closing tag.
+    /// `count` steps out that many tag-nesting levels (`d2it` on
+    /// `<a><b>x</b></a>` with the cursor on `x` takes `<a>`'s inner text, not
+    /// `<b>`'s) — mirrors `find_bracket_object`'s count handling (#807,
+    /// `to:d2it`; before this, tag objects silently ignored any count).
     pub(crate) fn find_tag_text_object(
         &self,
         modifier: char,
         cursor_pos: usize,
+        count: usize,
     ) -> Option<(usize, usize)> {
+        let (open_start, inner_start, close_start, close_end) =
+            self.find_enclosing_tag(cursor_pos, cursor_pos)?;
+        let mut level = (open_start, inner_start, close_start, close_end);
+        for _ in 1..count.max(1) {
+            if level.0 == 0 {
+                return None;
+            }
+            level = self.find_enclosing_tag(level.0 - 1, level.0)?;
+        }
+        let (open_start, inner_start, close_start, close_end) = level;
+        if modifier == 'i' {
+            if inner_start <= close_start {
+                Some((inner_start, close_start))
+            } else {
+                None
+            }
+        } else {
+            Some((open_start, close_end))
+        }
+    }
+
+    /// Find the nearest tag whose extent `[open_start, close_end)` contains
+    /// `contains_pos`, scanning backward for `<` starting at `scan_start`.
+    /// Returns `(open_start, inner_start, close_start, close_end)`.
+    fn find_enclosing_tag(
+        &self,
+        scan_start: usize,
+        contains_pos: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
         let total_chars = self.buffer().len_chars();
-        if total_chars == 0 || cursor_pos >= total_chars {
+        if total_chars == 0 || scan_start >= total_chars {
             return None;
         }
 
@@ -2479,8 +2523,8 @@ impl Engine {
             None // unclosed tag
         };
 
-        // Main loop: walk backward from cursor_pos looking for an enclosing open tag.
-        let mut scan_pos = cursor_pos;
+        // Main loop: walk backward from scan_start looking for an enclosing open tag.
+        let mut scan_pos = scan_start;
         loop {
             // Walk backward to the nearest '<'.
             while ch(scan_pos) != '<' {
@@ -2523,17 +2567,10 @@ impl Engine {
                     }
 
                     if let Some((close_start, close_end)) = close_result {
-                        // Accept only if cursor is within this element's extent.
-                        if cursor_pos >= open_start && cursor_pos < close_end {
-                            return if modifier == 'i' {
-                                if inner_start <= close_start {
-                                    Some((inner_start, close_start))
-                                } else {
-                                    None
-                                }
-                            } else {
-                                Some((open_start, close_end))
-                            };
+                        // Accept only if the reference position is within
+                        // this element's extent.
+                        if contains_pos >= open_start && contains_pos < close_end {
+                            return Some((open_start, inner_start, close_start, close_end));
                         }
                     }
                 }
@@ -2950,14 +2987,45 @@ impl Engine {
             'd' | 'c' => {
                 // Delete or change
                 self.start_undo_group();
-                self.delete_with_undo(start_pos, end_pos);
 
-                // Move cursor to start of deletion
-                let new_line = self.buffer().content.char_to_line(start_pos);
-                let line_start = self.buffer().line_to_char(new_line);
-                let new_col = start_pos - line_start;
-                self.view_mut().cursor.line = new_line;
-                self.view_mut().cursor.col = new_col;
+                // `ci{`/`ci(`/etc. on a bracket pair whose inner text is
+                // whole lines (the open line has only the opening delimiter,
+                // the close line only the closing one) is special-cased by
+                // Vim: `di{` joins the delimiters together linewise, but
+                // `ci{` instead leaves a single blank line — indented like
+                // the first deleted line — for the typed replacement, the
+                // same way `cc` behaves (`:h v_ib`). Before this, vimcode
+                // treated `c` exactly like `d` here, so `ci{X<Esc>` on
+                // `{`/`  a`/`  b`/`}` produced `{\nX}` instead of Vim's
+                // `{\n  X\n}` (#807, `to:ci{ multiline`).
+                let start_line = self.buffer().content.char_to_line(start_pos);
+                let end_line = self.buffer().content.char_to_line(end_pos);
+                let is_linewise_inner_bracket_change = operator == 'c'
+                    && modifier == 'i'
+                    && matches!(
+                        obj_type,
+                        '(' | ')' | 'b' | '{' | '}' | 'B' | '[' | ']' | '<' | '>'
+                    )
+                    && end_line > start_line
+                    && start_pos == self.buffer().line_to_char(start_line)
+                    && end_pos == self.buffer().line_to_char(end_line);
+
+                if is_linewise_inner_bracket_change {
+                    let indent = self.get_line_indent_str(start_line);
+                    self.delete_with_undo(start_pos, end_pos);
+                    self.insert_with_undo(start_pos, &format!("{indent}\n"));
+                    self.view_mut().cursor.line = start_line;
+                    self.view_mut().cursor.col = indent.chars().count();
+                } else {
+                    self.delete_with_undo(start_pos, end_pos);
+
+                    // Move cursor to start of deletion
+                    let new_line = self.buffer().content.char_to_line(start_pos);
+                    let line_start = self.buffer().line_to_char(new_line);
+                    let new_col = start_pos - line_start;
+                    self.view_mut().cursor.line = new_line;
+                    self.view_mut().cursor.col = new_col;
+                }
 
                 *changed = true;
 
@@ -5161,6 +5229,52 @@ impl Engine {
                 // `vis:Vr-`).
                 self.view_mut().cursor.col = 0;
             }
+            self.mode = Mode::Normal;
+            self.visual_anchor = None;
+            self.visual_dollar = false;
+            *changed = true;
+        }
+    }
+
+    /// `<C-v>{motion}r<CR>` (`:h v_b_r`): instead of inserting a literal
+    /// character into the block rectangle, each line the block touches is
+    /// split into two at the block's column range — the selected columns are
+    /// removed and replaced with a single line break. A line shorter than the
+    /// block's start column is left untouched (ragged block, nothing to
+    /// split). Processes lines bottom-to-top so a split on a later line never
+    /// shifts the char index of a line still to be processed above it.
+    pub(crate) fn replace_visual_block_with_newline(&mut self, changed: &mut bool) {
+        if let Some((start, end)) = self.get_visual_selection_range() {
+            self.start_undo_group();
+            let col_start = start.col.min(end.col);
+            let col_end = start.col.max(end.col);
+            for line in (start.line..=end.line).rev() {
+                if line >= self.buffer().len_lines() {
+                    continue;
+                }
+                let line_start = self.buffer().line_to_char(line);
+                let line_len = self.buffer().line_len_chars(line);
+                let has_nl = self.buffer().content.line(line).chars().last() == Some('\n');
+                let max_col = if has_nl {
+                    line_len.saturating_sub(1)
+                } else {
+                    line_len
+                };
+                if col_start > max_col {
+                    // Ragged line shorter than the block: no split here.
+                    continue;
+                }
+                let del_end_col = (col_end + 1).min(max_col);
+                if del_end_col > col_start {
+                    self.delete_with_undo(line_start + col_start, line_start + del_end_col);
+                }
+                self.insert_with_undo(line_start + col_start, "\n");
+            }
+            self.finish_undo_group();
+            self.view_mut().cursor = Cursor {
+                line: start.line,
+                col: 0,
+            };
             self.mode = Mode::Normal;
             self.visual_anchor = None;
             self.visual_dollar = false;
