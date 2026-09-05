@@ -2142,15 +2142,11 @@ pub(super) fn handle_mouse(
     }
 
     // ── Editor area ───────────────────────────────────────────────────────────
+    // #823 item 8: was the same 9-flag clear `Engine::clear_sidebar_focus`
+    // (accessors.rs) already states once, called by GTK's two identical
+    // "clicking the editor clears every sidebar's focus" sites.
     sidebar.has_focus = false;
-    engine.activity_bar_focused = false;
-    engine.explorer_has_focus = false;
-    engine.sc_set_focus(false);
-    engine.dap_sidebar_has_focus = false;
-    engine.ext_sidebar_has_focus = false;
-    engine.ai_has_focus = false;
-    engine.settings_has_focus = false;
-    engine.ext_panel_has_focus = false;
+    engine.clear_sidebar_focus();
     if col < editor_left {
         return sidebar_width; // separator column
     }
