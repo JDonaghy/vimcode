@@ -12243,4 +12243,97 @@ mod tests {
             driver.screen()
         );
     }
+
+    /// #823 item 8 fix regression: before this PR, `mouse.rs`'s "clicking
+    /// the editor clears every sidebar's focus" arm open-coded its own
+    /// 9-flag list and that list never touched `search_has_focus` — so
+    /// clicking into the editor while the Search panel held focus left
+    /// `engine.search_has_focus == true`. That flag is checked directly
+    /// by the shared, backend-independent `Engine::handle_key`
+    /// (`core/engine/keys.rs`: "Explorer and Search panels intercept all
+    /// keys when focused" -> `EngineAction::None`), *below* and
+    /// independent of TUI's own `route_focus_key`/`sidebar.has_focus`
+    /// gate — so even though the click already resets TUI's local
+    /// `sidebar.has_focus` to `false` (unconditionally, on the very next
+    /// line in `mouse.rs`), the leftover engine-level flag still swallowed
+    /// the next keystroke before it ever reached the editor's own key
+    /// table. Collapsing `mouse.rs` onto the shared
+    /// `Engine::clear_sidebar_focus` (accessors.rs) fixes it, since that
+    /// method already lists `search_has_focus`.
+    ///
+    /// This is the driver-level, rendered-behavior proof the GTK sibling
+    /// fix in the same commit got
+    /// (`clicking_editor_clears_a_pressed_sc_toolbar_button_highlight`,
+    /// `src/gtk/testing.rs`) and this side didn't — asserted on the
+    /// painted mode indicator / buffer text, never on the engine flag
+    /// directly, per this repo's "assert on rendered output" testing rule.
+    ///
+    /// **Verified RED** against the pre-fix code by temporarily reverting
+    /// `mouse.rs`'s `engine.clear_sidebar_focus()` call (in the "Editor
+    /// area" arm of `handle_mouse`) back to the old manual 8-flag list
+    /// that never cleared `search_has_focus`: this test failed exactly as
+    /// expected — the `i` below never entered Insert mode (the search
+    /// panel's stale focus swallowed it via `Engine::handle_key`), so
+    /// neither the `"INSERT"` assertion nor the typed-character assertion
+    /// held. Restored before this commit.
+    #[test]
+    fn clicking_editor_while_search_focused_lets_the_next_key_reach_the_editor_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXW823SEARCHFOCUS");
+        // Sidebar hidden, same minimal setup as
+        // `driver_with_shell_click_dispatches_through_shell_app_handle` (no
+        // frame-1 sidebar-width settling needed) — but `search_has_focus` /
+        // `sidebar.has_focus` still model "the Search panel currently owns
+        // the keyboard": the two are independent of sidebar visibility,
+        // exactly like the real bug (a stale focus flag left set after the
+        // panel was last shown).
+        app.engine.app_shell.hide_sidebar();
+        app.engine.search_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert_eq!(
+            render::route_focus_key(&app.engine, app.sidebar.has_focus),
+            render::FocusKeyRoute::Search,
+            "precondition: the search panel must own the keyboard before the click"
+        );
+        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+
+        let marker = driver
+            .find_bounds("ZQXW823SEARCHFOCUS")
+            .expect("the editor marker must paint before the click");
+
+        // Click squarely on the marker's first character — deep in the
+        // main content area, exactly the "Editor area" arm of
+        // `mouse::handle_mouse` — which also parks the cursor there, so
+        // the typed character below lands at a known offset.
+        driver.click(marker.x, marker.y);
+
+        // If the click failed to clear `search_has_focus`, this `i` is
+        // swallowed by `Engine::handle_key`'s search/explorer focus gate
+        // and Insert mode is never entered.
+        press_with(
+            &mut driver,
+            quadraui::Key::Char('i'),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen().contains("INSERT"),
+            "a click into the editor while the Search panel held focus must \
+             clear that focus so the very next key ('i') reaches the editor \
+             and enters Insert mode, not the search panel; screen:\n{}",
+            driver.screen()
+        );
+
+        press_with(
+            &mut driver,
+            quadraui::Key::Char('Q'),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen().contains("QZQXW823SEARCHFOCUS"),
+            "with Insert mode reached, a typed character must edit the \
+             buffer (proving the keystroke landed on the editor, not a \
+             sidebar panel); screen:\n{}",
+            driver.screen()
+        );
+    }
 }
