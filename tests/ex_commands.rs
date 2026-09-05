@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 use vimcode_core::EngineAction;
+use vimcode_core::RegType;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Group 1: Normalizer abbreviation tests
@@ -230,13 +231,14 @@ fn cmd_yank_linewise() {
     let mut e = engine_with("test line\n");
     exec(&mut e, "y");
     let (_, lw) = e.registers.get(&'"').unwrap();
-    assert!(*lw, "yank should be linewise");
+    assert!(lw.is_linewise(), "yank should be linewise");
 }
 
 #[test]
 fn cmd_put_default_register() {
     let mut e = engine_with("line1\nline2\n");
-    e.registers.insert('"', ("inserted\n".to_string(), true));
+    e.registers
+        .insert('"', ("inserted\n".to_string(), RegType::Linewise));
     exec(&mut e, "put");
     let lines = get_lines(&e);
     assert_eq!(lines[1], "inserted");
@@ -245,7 +247,8 @@ fn cmd_put_default_register() {
 #[test]
 fn cmd_put_named_register() {
     let mut e = engine_with("line1\nline2\n");
-    e.registers.insert('a', ("from_a\n".to_string(), true));
+    e.registers
+        .insert('a', ("from_a\n".to_string(), RegType::Linewise));
     exec(&mut e, "put a");
     let lines = get_lines(&e);
     assert_eq!(lines[1], "from_a");

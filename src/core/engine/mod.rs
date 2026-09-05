@@ -3307,12 +3307,17 @@ pub struct Engine {
     /// the original column instead of sticking to the short line's length
     /// (#804). Cleared by any other key.
     pub insert_vertical_want_col: Option<usize>,
-    /// Stores visual block insert/append info: (start_line, end_line, col, is_append).
+    /// Stores visual block insert/append info:
+    /// `(start_line, end_line, col, is_append, virtual_end, left_col)`.
     /// On Escape from Insert, apply insert_text_buffer to all block lines.
-    /// (start_line, end_line, col, is_append, virtual_end).
+    ///
     /// `virtual_end` = true when the block was started with `$`: the insert column
     /// for each line is that line's own end, not the captured `col`.
-    pub visual_block_insert_info: Option<(usize, usize, usize, bool, bool)>,
+    /// `park_col` is `Some(block left edge)` for `I`/`A`, where Vim leaves the
+    /// cursor on the block's own left column — which for `A` is *not* `col`.
+    /// It is `None` for a blockwise `c`, which leaves the cursor after the
+    /// typed text like any other insert (#807).
+    pub visual_block_insert_info: Option<(usize, usize, usize, bool, bool, Option<usize>)>,
     /// Count for o/O repeat: when >1, Escape from insert repeats the typed text
     /// on additional new lines (Vim behavior for 3oXX<Esc>).
     pub insert_open_count: usize,

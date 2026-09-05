@@ -705,7 +705,7 @@ fn test_y_right_brace_yank_paragraph() {
     press(&mut e, '}');
     // Should yank lines 0 through the blank line
     let (content, is_linewise) = e.registers.get(&'"').unwrap();
-    assert!(is_linewise, "y}} should be linewise");
+    assert!(is_linewise.is_linewise(), "y}} should be linewise");
     assert!(content.contains("aaa"), "should contain aaa");
     assert!(content.contains("bbb"), "should contain bbb");
 }
@@ -951,7 +951,7 @@ fn test_yge_yank_backward_to_end_of_previous_word() {
     press(&mut e, 'g');
     press(&mut e, 'e');
     let (content, is_linewise) = e.registers.get(&'"').unwrap();
-    assert!(!is_linewise, "yge should be charwise");
+    assert!(!is_linewise.is_linewise(), "yge should be charwise");
     assert!(content.contains("r"), "should include 'r' (end of bar)");
     assert_buf(&e, "foo bar baz\n"); // unchanged
 }

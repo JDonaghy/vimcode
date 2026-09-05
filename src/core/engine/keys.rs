@@ -6062,46 +6062,42 @@ impl Engine {
                 // `:h 'autoindent'` — leaving a line that's still nothing but
                 // the auto-inserted indent removes that indent (#804).
                 self.strip_blank_current_line_indent(changed);
-                self.finish_undo_group();
-                // Record inserted text for the "." register and Ctrl-A/Ctrl-@
-                // (`.` dot-repeat itself is handled generically by the
-                // keystroke recorder wrapping `handle_key` — see
-                // `record_dot_keystroke`/`finalize_dot_recording`).
-                if !self.insert_text_buffer.is_empty() {
-                    self.last_inserted_text = self.insert_text_buffer.clone();
-                }
-                // Apply visual block insert/append to remaining lines
-                if let Some((start_line, end_line, col, _is_append, virtual_end)) =
+                // Apply visual block insert/append to the remaining lines.
+                //
+                // This runs BEFORE `finish_undo_group()` on purpose: with its
+                // own start/finish pair the replicated rows became a *second*
+                // undo step, so `<C-v>jjAx<Esc>u` undid only rows 2..n and
+                // left row 1 changed (#807, `vb:jjAx then u`).
+                let mut block_park = None;
+                if let Some((start_line, end_line, col, is_append, virtual_end, park_col)) =
                     self.visual_block_insert_info.take()
                 {
-                    let text = self.insert_text_buffer.clone();
-                    if !text.is_empty() {
-                        // The first line was already typed into; apply to remaining lines
-                        let first_typed_line = start_line;
-                        self.start_undo_group();
+                    // A count on block `I`/`A` repeats the typed text on every
+                    // row (`<C-v>j2Ix` → `xx`), so replicate the repeated form.
+                    let reps = self.insert_repeat_count.max(1);
+                    let text = self.insert_text_buffer.repeat(reps);
+                    // `:h v_b_I`: a block insert whose text contains a line
+                    // break is not replicated at all.
+                    if !text.is_empty() && !text.contains('\n') {
                         for line in start_line..=end_line {
-                            if line == first_typed_line {
+                            // The first line was already typed into.
+                            if line == start_line {
                                 continue;
                             }
                             if line >= self.buffer().len_lines() {
                                 break;
                             }
-                            let line_len = self.buffer().line_len_chars(line);
-                            let line_len_no_nl = if line_len > 0
-                                && self
-                                    .buffer()
-                                    .content
-                                    .char(self.buffer().line_to_char(line) + line_len - 1)
-                                    == '\n'
-                            {
-                                line_len - 1
-                            } else {
-                                line_len
-                            };
+                            let line_len_no_nl = self.line_text_len(line);
                             // In virtual-end mode (`$<C-v>...A`), the insert column is this
                             // specific line's own end — no padding needed, just append.
                             // Otherwise use the captured column and pad if the line is shorter.
                             let target_col = if virtual_end { line_len_no_nl } else { col };
+                            // `I` skips a row too short to reach the block's
+                            // column; only `A` pads it out with spaces
+                            // (`:h v_b_I` vs `:h v_b_A`).
+                            if !is_append && target_col > line_len_no_nl {
+                                continue;
+                            }
                             let insert_col = target_col.min(line_len_no_nl);
                             let pad = target_col.saturating_sub(line_len_no_nl);
                             let char_idx = self.buffer().line_to_char(line) + insert_col;
@@ -6114,8 +6110,18 @@ impl Engine {
                                 &text,
                             );
                         }
-                        self.finish_undo_group();
+                        // Vim leaves the cursor on the block's LEFT column,
+                        // which for `A` is not the column it inserted at.
+                        block_park = park_col.map(|c| (start_line, c));
                     }
+                }
+                self.finish_undo_group();
+                // Record inserted text for the "." register and Ctrl-A/Ctrl-@
+                // (`.` dot-repeat itself is handled generically by the
+                // keystroke recorder wrapping `handle_key` — see
+                // `record_dot_keystroke`/`finalize_dot_recording`).
+                if !self.insert_text_buffer.is_empty() {
+                    self.last_inserted_text = self.insert_text_buffer.clone();
                 }
                 // Repeat o/O insert for count > 1: duplicate typed text on new lines
                 if self.insert_open_count > 1 && !self.insert_text_buffer.is_empty() {
@@ -6174,6 +6180,13 @@ impl Engine {
                     self.view_mut().cursor.col -= 1;
                 }
                 self.clamp_cursor_col();
+                // A replicated block insert overrides that: the cursor goes to
+                // the block's left column (see `block_park` above).
+                if let Some((line, col)) = block_park {
+                    self.view_mut().cursor.line = line;
+                    self.view_mut().cursor.col = col;
+                    self.clamp_cursor_col();
+                }
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
                 // Collapse all extra cursors.
@@ -7362,9 +7375,33 @@ impl Engine {
                     self.yank_visual_selection();
                     return EngineAction::None;
                 }
-                'c' if self.pending_key.is_none() => {
+                'c' | 's' if self.pending_key.is_none() => {
+                    // `:h v_s` — `s` is a synonym for `c` in Visual mode.
                     self.count = None; // Clear count (not used for visual operators)
                     self.change_visual_selection(changed);
+                    return EngineAction::None;
+                }
+                // Uppercase operators (`:h v_D`, `v_X`, `v_Y`, `v_C`, `v_S`,
+                // `v_R`) act LINEWISE on the selected lines whatever the
+                // current Visual mode is — except in Visual-Block, where `D`
+                // and `C` instead extend the block to end-of-line (#807).
+                'D' | 'X' | 'Y' | 'C' | 'S' | 'R' if self.pending_key.is_none() => {
+                    self.count = None;
+                    if self.mode == Mode::VisualBlock && matches!(ch, 'D' | 'C' | 'X') {
+                        self.visual_dollar = true;
+                        if ch == 'C' {
+                            self.change_visual_selection(changed);
+                        } else {
+                            self.delete_visual_selection(changed);
+                        }
+                    } else {
+                        self.mode = Mode::VisualLine;
+                        match ch {
+                            'D' | 'X' => self.delete_visual_selection(changed),
+                            'Y' => self.yank_visual_selection(),
+                            _ => self.change_visual_selection(changed),
+                        }
+                    }
                     return EngineAction::None;
                 }
                 'u' if !ctrl && self.pending_key.is_none() => {
@@ -7396,32 +7433,25 @@ impl Engine {
                     }
                     return EngineAction::None;
                 }
-                '>' => {
-                    // Visual indent: indent all selected lines
-                    self.count = None;
+                '>' | '<' => {
+                    // Visual indent/dedent. A count is a SHIFT MULTIPLIER here,
+                    // not a line count: `V3>` indents the selection by three
+                    // 'shiftwidth's (`:h v_>`), it does not select 3 lines
+                    // (#807 — the count used to be discarded entirely).
+                    let shifts = self.take_count().max(1);
                     if let Some((start, end)) = self.get_visual_selection_range() {
                         let start_line = start.line;
-                        let end_line = end.line;
-                        let line_count = end_line - start_line + 1;
+                        let line_count = end.line - start_line + 1;
                         // Exit visual mode first
                         self.mode = Mode::Normal;
                         self.visual_anchor = None;
-                        self.indent_lines(start_line, line_count, changed);
-                        self.view_mut().cursor.line = start_line;
-                    }
-                    return EngineAction::None;
-                }
-                '<' => {
-                    // Visual dedent: dedent all selected lines
-                    self.count = None;
-                    if let Some((start, end)) = self.get_visual_selection_range() {
-                        let start_line = start.line;
-                        let end_line = end.line;
-                        let line_count = end_line - start_line + 1;
-                        // Exit visual mode first
-                        self.mode = Mode::Normal;
-                        self.visual_anchor = None;
-                        self.dedent_lines(start_line, line_count, changed);
+                        for _ in 0..shifts {
+                            if ch == '>' {
+                                self.indent_lines(start_line, line_count, changed);
+                            } else {
+                                self.dedent_lines(start_line, line_count, changed);
+                            }
+                        }
                         self.view_mut().cursor.line = start_line;
                     }
                     return EngineAction::None;
@@ -7496,14 +7526,22 @@ impl Engine {
                 'I' => {
                     // Visual block I: insert at left column of block on all lines
                     if self.mode == Mode::VisualBlock {
+                        // `2I` repeats the typed text on every row.
+                        self.insert_repeat_count = self.take_count().max(1);
                         if let Some(anchor) = self.visual_anchor {
                             let cursor = self.view().cursor;
                             let start_line = anchor.line.min(cursor.line);
                             let end_line = anchor.line.max(cursor.line);
-                            let left_col = anchor.col.min(cursor.col);
+                            let (left_col, _) = self.visual_block_cols();
                             // Store block info for applying on Escape
-                            self.visual_block_insert_info =
-                                Some((start_line, end_line, left_col, false, false));
+                            self.visual_block_insert_info = Some((
+                                start_line,
+                                end_line,
+                                left_col,
+                                false,
+                                false,
+                                Some(left_col),
+                            ));
                             // Exit visual mode and enter insert at left col of first line
                             self.mode = Mode::Insert;
                             self.visual_anchor = None;
@@ -7524,6 +7562,7 @@ impl Engine {
                     // When the block was started with $, use each line's actual end
                     // instead of the captured column (Vim "virtual end" behaviour).
                     if self.mode == Mode::VisualBlock {
+                        self.insert_repeat_count = self.take_count().max(1);
                         if let Some(anchor) = self.visual_anchor {
                             let cursor = self.view().cursor;
                             let start_line = anchor.line.min(cursor.line);
@@ -7541,10 +7580,16 @@ impl Engine {
                                     line_len
                                 }
                             } else {
-                                anchor.col.max(cursor.col) + 1
+                                self.visual_block_cols().1 + 1
                             };
-                            self.visual_block_insert_info =
-                                Some((start_line, end_line, first_line_col, true, virtual_end));
+                            self.visual_block_insert_info = Some((
+                                start_line,
+                                end_line,
+                                first_line_col,
+                                true,
+                                virtual_end,
+                                Some(self.visual_block_cols().0),
+                            ));
                             // Exit visual mode and enter insert at the chosen col of first line
                             self.mode = Mode::Insert;
                             self.visual_anchor = None;

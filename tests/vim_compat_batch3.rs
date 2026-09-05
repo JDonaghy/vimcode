@@ -294,7 +294,10 @@ fn test_force_charwise_yv_j() {
     type_chars(&mut e, "yvj");
     // Check that the yank register has charwise content (not linewise)
     let (text, is_linewise) = e.registers.get(&'"').cloned().unwrap_or_default();
-    assert!(!is_linewise, "forced charwise yank should not be linewise");
+    assert!(
+        !is_linewise.is_linewise(),
+        "forced charwise yank should not be linewise"
+    );
     assert!(!text.is_empty());
 }
 
@@ -377,9 +380,15 @@ fn test_visual_block_i_with_short_lines() {
     type_chars(&mut e, "I");
     type_chars(&mut e, "|");
     press_key(&mut e, "Escape");
-    // Insert at column 3 of the block on lines long enough to reach it; the
-    // short middle line is padded with a space first (no 'virtualedit').
-    assert_buf(&e, "abc|de\nab |\nabc|de\n");
+    // Insert at column 3 of the block on lines long enough to reach it.
+    //
+    // #807: the short middle line is **skipped entirely**, not padded. The
+    // padding this test used to assert was a hand-authored guess; `:h v_b_I`
+    // says "if the line is short ... no text is inserted", and the nvim
+    // oracle agrees (`vb:I on short line skipped` in
+    // `tests/nvim_conformance.rs`). Padding is what block `A` does — see
+    // `vb:A on short line padded`.
+    assert_buf(&e, "abc|de\nab\nabc|de\n");
 }
 
 #[test]
