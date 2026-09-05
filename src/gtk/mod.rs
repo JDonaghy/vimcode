@@ -37,8 +37,6 @@ pub(crate) fn is_ext_panel_id(id: &str) -> bool {
     id.starts_with("ext:")
 }
 
-pub(crate) type TabSlotMap = HashMap<usize, Vec<(f64, f64)>>;
-
 /// Pango font family for UI panels (menu bar, sidebars, dropdown,
 /// dialogs, hover popups). Size is appended at use via [`UI_FONT`]
 /// from the configured `settings.ui_font_size` (#217).
@@ -289,17 +287,6 @@ pub(crate) fn abs_visible_slots(hits: &quadraui::TabBarHits) -> Vec<(f32, f32)> 
         .map(|&(a, b)| (a as f32, b as f32))
         .collect()
 }
-
-/// Cached diff toolbar button positions per group: group_id -> (prev_start, prev_end, next_start, next_end, fold_start, fold_end).
-/// Populated during draw_tab_bar, used for click hit-testing.
-pub(crate) type DiffBtnMap = HashMap<usize, (f64, f64, f64, f64, f64, f64)>;
-
-/// Cached split button pixel widths per group: group_id -> (both_btns_px, btn_right_px).
-/// Only populated when split buttons are visible (active group in multi-group, or single-group mode).
-pub(crate) type SplitBtnMap = HashMap<usize, (f64, f64)>;
-
-/// Cached action menu button pixel range per group: group_id -> (start_x, end_x).
-pub(crate) type ActionBtnMap = HashMap<usize, (f64, f64)>;
 
 /// Cached per-window status segment hit zones: window_id -> Vec<(start_x, end_x, action)>.
 /// Populated in `render_content`'s per-window/separated status bar paint

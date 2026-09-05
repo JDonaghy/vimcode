@@ -4602,9 +4602,11 @@ impl Engine {
     /// B.3+).
     ///
     /// Backends pass the same `(ctrl, shift, alt, key_char, is_tab,
-    /// is_space, is_escape)` shape they already use with
-    /// [`crate::render::matches_key_binding`], so this slots into existing
-    /// key-handler sites without translation.
+    /// is_space, is_escape)` shape their key handlers already destructure, so
+    /// this slots into existing key-handler sites without translation.
+    /// (It used to name `render::matches_key_binding` as the reference for that
+    /// shape; #812 moved that helper into `render`'s test module — it had no
+    /// production callers — so the shape is spelled out here instead.)
     /// Dead in ShellApp mode until GTK accelerator matching is re-wired (#448-C follow-on).
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]

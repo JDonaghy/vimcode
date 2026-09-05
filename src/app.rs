@@ -285,9 +285,6 @@ pub(crate) struct App {
     pub(crate) last_clipboard_content: Option<String>,
     /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
     pub(crate) tab_close_hover: Option<(usize, usize)>,
-    /// Cached tab slot widths per group, populated during draw_tab_bar for click hit-testing.
-    /// Key = group_id.0 (or usize::MAX for single-group mode), Value = cumulative x positions.
-    pub(crate) tab_slot_positions: Rc<RefCell<TabSlotMap>>,
     /// Absolute tight close-glyph rects captured in `render_content`. Consumed
     /// by `tab_close_hit_test` (hover) so it hit-tests against the exact drawn
     /// geometry — including the activity-bar/sidebar x-offset — instead of
@@ -304,10 +301,6 @@ pub(crate) struct App {
     /// GTK tab-bar click hit-test instead of the char-cell `hit_regions`, which
     /// don't match GTK's proportional-font tab layout. (#515)
     pub(crate) cached_tab_pixel_hits: Rc<RefCell<TabPixelHitMap>>,
-    /// Cached diff toolbar button pixel positions, populated during draw_tab_bar.
-    pub(crate) diff_btn_map: Rc<RefCell<DiffBtnMap>>,
-    pub(crate) split_btn_map: Rc<RefCell<SplitBtnMap>>,
-    pub(crate) action_btn_map: Rc<RefCell<ActionBtnMap>>,
     /// Cached per-window status bar segment hit zones from draw_window_status_bar.
     pub(crate) status_segment_map: Rc<RefCell<StatusSegmentMap>>,
     /// Painted rect of the separated status line's status bar (#671/#672),
@@ -919,13 +912,9 @@ impl App {
             deferred,
             last_clipboard_content: None,
             tab_close_hover: None,
-            tab_slot_positions: Rc::new(RefCell::new(HashMap::new())),
             cached_tab_close_abs: Rc::new(RefCell::new(HashMap::new())),
             cached_tab_slots_abs: Rc::new(RefCell::new(HashMap::new())),
             cached_tab_pixel_hits: Rc::new(RefCell::new(HashMap::new())),
-            diff_btn_map: Rc::new(RefCell::new(HashMap::new())),
-            split_btn_map: Rc::new(RefCell::new(HashMap::new())),
-            action_btn_map: Rc::new(RefCell::new(HashMap::new())),
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             separated_status_bar_rect: Rc::new(Cell::new(None)),
             global_status_zones: Rc::new(RefCell::new(Vec::new())),
@@ -1193,10 +1182,6 @@ impl App {
                     self.cached_char_width,
                     layout,
                     &self.cached_tab_pixel_hits.borrow(),
-                    &self.tab_slot_positions.borrow(),
-                    &self.diff_btn_map.borrow(),
-                    &self.split_btn_map.borrow(),
-                    &self.action_btn_map.borrow(),
                     self.cached_frame_hit_map.borrow().as_ref(),
                     &self.cached_tab_bar_zones.borrow(),
                     true, // real click: focus/tab/gutter side effects are intended
@@ -1272,10 +1257,6 @@ impl App {
                         self.cached_char_width,
                         layout,
                         &self.cached_tab_pixel_hits.borrow(),
-                        &self.tab_slot_positions.borrow(),
-                        &self.diff_btn_map.borrow(),
-                        &self.split_btn_map.borrow(),
-                        &self.action_btn_map.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                     );
@@ -3460,10 +3441,6 @@ impl App {
             self.cached_char_width,
             layout,
             &self.cached_tab_pixel_hits.borrow(),
-            &self.tab_slot_positions.borrow(),
-            &self.diff_btn_map.borrow(),
-            &self.split_btn_map.borrow(),
-            &self.action_btn_map.borrow(),
             self.cached_frame_hit_map.borrow().as_ref(),
             &self.cached_tab_bar_zones.borrow(),
             true, // resolving the original tab-bar mouse-down; switching tabs is intended
@@ -4035,10 +4012,6 @@ impl App {
                                 self.cached_char_width,
                                 layout,
                                 &self.cached_tab_pixel_hits.borrow(),
-                                &self.tab_slot_positions.borrow(),
-                                &self.diff_btn_map.borrow(),
-                                &self.split_btn_map.borrow(),
-                                &self.action_btn_map.borrow(),
                                 self.cached_frame_hit_map.borrow().as_ref(),
                                 &self.cached_tab_bar_zones.borrow(),
                             )
@@ -4568,10 +4541,6 @@ impl App {
                         self.cached_char_width,
                         layout,
                         &self.cached_tab_pixel_hits.borrow(),
-                        &self.tab_slot_positions.borrow(),
-                        &self.diff_btn_map.borrow(),
-                        &self.split_btn_map.borrow(),
-                        &self.action_btn_map.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                     );
