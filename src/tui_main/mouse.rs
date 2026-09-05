@@ -259,8 +259,15 @@ pub(super) fn handle_mouse(
     drag_state: &mut quadraui::DragState,
     modal_stack: &mut quadraui::ModalStack,
     last_layout: Option<&render::ScreenLayout>,
-    last_click_time: &mut Instant,
-    last_click_pos: &mut (u16, u16),
+    // #817: the backend's own `quadraui::DoubleClickDetector` (`TuiBackend`,
+    // `quadraui/src/tui/backend.rs`) already folded timing+position into a
+    // `UiEvent::DoubleClick` before `TuiShellApp::handle_mouse_event` ever
+    // reaches this function — this flag is that verdict, carried across the
+    // `UiEvent` -> crossterm `MouseEvent` round-trip (crossterm itself has no
+    // double-click concept). It replaces a second, independent 400ms/position
+    // detector that used to live here with its own `last_click_time`/
+    // `last_click_pos` state, so the two could disagree.
+    is_double_click: bool,
     folder_picker: &mut Option<quadraui::FolderPickerController>,
     should_quit: &mut bool,
     explorer_drag_src: &mut Option<usize>,
@@ -563,15 +570,10 @@ pub(super) fn handle_mouse(
                 match hit {
                     render::FindReplaceRoute::Target { target, is_input } => {
                         // Double-click inside an input field selects the word
-                        // under the cursor. TUI-only: it needs the click-time
-                        // history this backend keeps and GTK routes its own
-                        // double-clicks through `UiEvent::DoubleClick`.
-                        let now = Instant::now();
-                        let is_double = now.duration_since(*last_click_time)
-                            < Duration::from_millis(400)
-                            && *last_click_pos == (col, row);
-                        *last_click_time = now;
-                        *last_click_pos = (col, row);
+                        // under the cursor (#817: `is_double_click` comes from
+                        // the backend's own `DoubleClickDetector`, same as GTK
+                        // routes its double-clicks through `UiEvent::DoubleClick`).
+                        let is_double = is_double_click;
 
                         use crate::core::engine::FindReplaceClickTarget::*;
                         if is_double {
@@ -1936,13 +1938,9 @@ pub(super) fn handle_mouse(
                 let flat_idx = engine.ext_panel_scroll_top + (sidebar_row - content_start) as usize;
                 if flat_idx < flat_len {
                     engine.ext_panel_selected = flat_idx;
-                    // Check for double-click
-                    let now = Instant::now();
-                    let is_double = now.duration_since(*last_click_time)
-                        < Duration::from_millis(400)
-                        && *last_click_pos == (col, row);
-                    *last_click_time = now;
-                    *last_click_pos = (col, row);
+                    // #817: double-click verdict from the backend's
+                    // `DoubleClickDetector`, not a re-derived local timer.
+                    let is_double = is_double_click;
                     if is_double {
                         engine.handle_ext_panel_double_click();
                     } else {
@@ -2047,19 +2045,14 @@ pub(super) fn handle_mouse(
                 modifiers: quadraui::Modifiers::default(),
             };
             let outcome = render::route_sc_sidebar_click(engine, &click_ev, pos, &bands, true);
-            // Double-click detection stays TUI-only plumbing — crossterm has
-            // no double-click concept, so it must be synthesized here from
-            // click timing before being fed back through the same shared
-            // dispatch, matching how GTK's toolkit-native `DoubleClick`
-            // reaches `route_sc_sidebar_click` directly. Only a genuine
-            // content-row click gets one — a double-click on the header,
-            // commit box, or a toolbar button was never synthesized here.
+            // #817: reuse the backend's own `DoubleClickDetector` verdict
+            // instead of re-deriving one from click timing here — matching
+            // how GTK's toolkit-native `DoubleClick` reaches
+            // `route_sc_sidebar_click` directly. Only a genuine content-row
+            // click gets one — a double-click on the header, commit box, or
+            // a toolbar button was never synthesized here.
             if outcome == render::ScSidebarClickOutcome::Content {
-                let now = Instant::now();
-                let is_double = now.duration_since(*last_click_time) < Duration::from_millis(400)
-                    && *last_click_pos == (col, row);
-                *last_click_time = now;
-                *last_click_pos = (col, row);
+                let is_double = is_double_click;
                 if is_double {
                     let double_ev = quadraui::UiEvent::DoubleClick {
                         widget: None,
@@ -2136,13 +2129,9 @@ pub(super) fn handle_mouse(
                 let fi = engine.settings_scroll_top + content_row;
                 if fi < flat_total {
                     engine.settings_selected = fi;
-                    // Double-click toggles bools / expands categories
-                    let now = Instant::now();
-                    let is_double = now.duration_since(*last_click_time)
-                        < Duration::from_millis(400)
-                        && *last_click_pos == (col, row);
-                    *last_click_time = now;
-                    *last_click_pos = (col, row);
+                    // #817: double-click toggles bools / expands categories —
+                    // verdict from the backend's `DoubleClickDetector`.
+                    let is_double = is_double_click;
                     if is_double {
                         engine.handle_settings_key("Return", false, None);
                     }
@@ -2662,12 +2651,9 @@ pub(super) fn handle_mouse(
                 let (editor, editor_layout) = crate::render::editor_text_layout(rw, 1.0, 1.0);
                 let col_in_text = editor_layout.col_at_x(&editor, view_row, col as f32);
 
-                // Double-click detection
-                let now = Instant::now();
-                let is_double = now.duration_since(*last_click_time) < Duration::from_millis(400)
-                    && *last_click_pos == (col, row);
-                *last_click_time = now;
-                *last_click_pos = (col, row);
+                // #817: double-click verdict from the backend's
+                // `DoubleClickDetector`, not a re-derived local timer.
+                let is_double = is_double_click;
 
                 if ev.modifiers.contains(KeyModifiers::CONTROL)
                     || (ev.modifiers.contains(KeyModifiers::ALT) && engine.is_vscode_mode())
@@ -2943,8 +2929,6 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut drag_state = quadraui::DragState::default();
         let mut modal_stack = quadraui::ModalStack::new();
-        let mut last_click_time = Instant::now();
-        let mut last_click_pos: (u16, u16) = (0, 0);
         let mut should_quit = false;
 
         handle_mouse(
@@ -2963,8 +2947,7 @@ mod tests {
             &mut drag_state,
             &mut modal_stack,
             None,
-            &mut last_click_time,
-            &mut last_click_pos,
+            false,
             &mut None,
             &mut should_quit,
             &mut None,
@@ -3175,8 +3158,6 @@ mod tests {
         let mut sidebar = TuiSidebar::new();
         let mut drag_state = quadraui::DragState::default();
         let mut modal_stack = quadraui::ModalStack::new();
-        let mut last_click_time = Instant::now();
-        let mut last_click_pos: (u16, u16) = (0, 0);
         let mut should_quit = false;
 
         handle_mouse(
@@ -3195,8 +3176,7 @@ mod tests {
             &mut drag_state,
             &mut modal_stack,
             last_layout,
-            &mut last_click_time,
-            &mut last_click_pos,
+            false,
             &mut None,
             &mut should_quit,
             &mut None,
@@ -3504,8 +3484,6 @@ mod tests {
         let mut sidebar_state = TuiSidebar::new();
         let mut drag_state = quadraui::DragState::default();
         let mut modal_stack = quadraui::ModalStack::new();
-        let mut last_click_time = Instant::now();
-        let mut last_click_pos: (u16, u16) = (0, 0);
         let mut should_quit = false;
         handle_mouse(
             move_ev,
@@ -3523,8 +3501,7 @@ mod tests {
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
-            &mut last_click_time,
-            &mut last_click_pos,
+            false,
             &mut None,
             &mut should_quit,
             &mut None,
@@ -3683,8 +3660,6 @@ mod tests {
         let mut sidebar_state = TuiSidebar::new();
         let mut drag_state = quadraui::DragState::default();
         let mut modal_stack = quadraui::ModalStack::new();
-        let mut last_click_time = Instant::now();
-        let mut last_click_pos: (u16, u16) = (0, 0);
         let mut should_quit = false;
         handle_mouse(
             move_ev,
@@ -3702,8 +3677,7 @@ mod tests {
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
-            &mut last_click_time,
-            &mut last_click_pos,
+            false,
             &mut None,
             &mut should_quit,
             &mut None,
@@ -3794,8 +3768,6 @@ mod tests {
         let mut sidebar_state = TuiSidebar::new();
         let mut drag_state = quadraui::DragState::default();
         let mut modal_stack = quadraui::ModalStack::new();
-        let mut last_click_time = Instant::now();
-        let mut last_click_pos: (u16, u16) = (0, 0);
         let mut should_quit = false;
 
         handle_mouse(
@@ -3814,8 +3786,7 @@ mod tests {
             &mut drag_state,
             &mut modal_stack,
             Some(&screen),
-            &mut last_click_time,
-            &mut last_click_pos,
+            false,
             &mut None,
             &mut should_quit,
             &mut None,
