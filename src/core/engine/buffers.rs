@@ -68,12 +68,22 @@ impl Engine {
     }
 
     /// Finish the current undo group for the active buffer.
+    ///
+    /// Only records a g-/g+ timeline snapshot when the group was actually
+    /// non-empty (#804). `record_timeline_snapshot` clones the *entire*
+    /// buffer text (`Vec::remove(0)`-capped, so also O(n) to prune) — cheap
+    /// as a once-per-command cost, but `split_insert_undo_group` calls this
+    /// on every insert-mode cursor movement (arrows/Home/End), which is one
+    /// of the most frequent insert-mode interactions. Gating on "did this
+    /// group actually record an edit" keeps pure cursor movement from paying
+    /// for a full-buffer clone every keystroke.
     pub fn finish_undo_group(&mut self) {
-        self.active_buffer_state_mut().finish_undo_group();
-        // Record timeline snapshot for g-/g+ after each completed edit
-        let cursor = self.view().cursor;
-        self.active_buffer_state_mut()
-            .record_timeline_snapshot(cursor);
+        let committed = self.active_buffer_state_mut().finish_undo_group();
+        if committed {
+            let cursor = self.view().cursor;
+            self.active_buffer_state_mut()
+                .record_timeline_snapshot(cursor);
+        }
     }
 
     /// Return to Normal mode from any mode, performing any necessary cleanup

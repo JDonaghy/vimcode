@@ -371,6 +371,16 @@ impl Engine {
 
         match self.mode {
             Mode::Normal => {
+                // Was this keystroke the *start* of a brand-new command (not
+                // continuing an operator like `y`, a pending single-char
+                // command like `r`, or a register prefix like `"a`)? Needed
+                // below to tell a genuinely bare `$`/`p` apart from one that
+                // merely happens to be the *last* keystroke of a longer
+                // command (`y$`, `r p`, `"ap`) — those must not trigger the
+                // bare-`$`/bare-`p` cursor special-casing (#804 review).
+                let ctrl_o_key_starts_new_command = self.pending_key.is_none()
+                    && self.pending_operator.is_none()
+                    && self.selected_register.is_none();
                 action = self.handle_normal_key(key_name, unicode, ctrl, &mut changed);
                 // Ctrl-O auto-return: after one Normal command, return to Insert.
                 // Only if we're still in Normal mode (the command didn't change mode itself)
@@ -392,15 +402,21 @@ impl Engine {
                         // `:h i_CTRL-O`: a bare `$` sets Vim's sticky
                         // "end of line" want-column, so resuming Insert
                         // afterwards appends past the last character
-                        // instead of inserting before it (#804).
-                        if !ctrl && unicode == Some('$') {
+                        // instead of inserting before it (#804). Gated on
+                        // `ctrl_o_key_starts_new_command` so a `$` that's
+                        // merely the *motion half* of a longer command
+                        // (`y$`) doesn't also get this cursor shift.
+                        if ctrl_o_key_starts_new_command && !ctrl && unicode == Some('$') {
                             let line = self.view().cursor.line;
                             self.view_mut().cursor.col = self.get_line_len_for_insert(line);
-                        } else if !ctrl && unicode == Some('p') {
+                        } else if ctrl_o_key_starts_new_command && !ctrl && unicode == Some('p') {
                             // `p` leaves the cursor ON the last pasted
                             // character in Normal mode; resuming Insert via
                             // <C-o> continues typing *after* it instead
-                            // (#804, "C-o p").
+                            // (#804, "C-o p"). Same gate: a `p` that's the
+                            // replacement char of `r` or the command after a
+                            // `"a`-style register prefix isn't the bare `p`
+                            // command and must not shift the cursor.
                             let line = self.view().cursor.line;
                             let max_col = self.get_line_len_for_insert(line);
                             self.view_mut().cursor.col = (self.view().cursor.col + 1).min(max_col);
@@ -5116,11 +5132,18 @@ impl Engine {
         // name up front so every downstream check (undo grouping, autopair
         // backspace, autoindent CR, …) runs the real BackSpace/Return/Escape
         // path rather than a reimplementation of it.
+        //
+        // Both "bracketleft" (the crossterm/X11 keysym-style name) and "["
+        // (the literal-character name `src/core/engine/vscode.rs` already
+        // treats as its synonym elsewhere in this codebase) are accepted:
+        // the nvim-conformance harness's own `press_ctrl('[')` sends the
+        // literal "[" name, so matching only "bracketleft" would leave
+        // `<C-[>` permanently unreachable through that harness.
         let (key_name, ctrl) = if ctrl {
             match key_name {
                 "h" => ("BackSpace", false),
                 "j" | "m" => ("Return", false),
-                "c" | "bracketleft" => ("Escape", false),
+                "c" | "bracketleft" | "[" => ("Escape", false),
                 other => (other, true),
             }
         } else {
@@ -5671,9 +5694,19 @@ impl Engine {
             let col = self.view().cursor.col;
             let line_start = self.buffer().line_to_char(line);
             // `:h i_0_CTRL-D`: if the character just before the cursor is a
-            // literal '0', that '0' is itself removed and ALL indent on the
-            // line is deleted (not just one shiftwidth) — #804.
-            if col > 0 && self.buffer().content.char(line_start + col - 1) == '0' {
+            // literal '0' *typed as the line's leading signal digit* — i.e.
+            // only indent (spaces/tabs) precedes it — that '0' is itself
+            // removed and ALL indent on the line is deleted (not just one
+            // shiftwidth) — #804. A '0' that appears after other non-blank
+            // text (e.g. `foo0<C-d>`) is not the signal digit and must fall
+            // through to a normal shiftwidth dedent.
+            let zero_is_leading_signal = col > 0
+                && self.buffer().content.char(line_start + col - 1) == '0'
+                && (0..col - 1).all(|c| {
+                    let ch = self.buffer().content.char(line_start + c);
+                    ch == ' ' || ch == '\t'
+                });
+            if zero_is_leading_signal {
                 let zero_idx = line_start + col - 1;
                 self.delete_with_undo(zero_idx, zero_idx + 1);
                 let line_start = self.buffer().line_to_char(line);
@@ -5975,13 +6008,11 @@ impl Engine {
             }
             "Tab" => {
                 if !self.view().extra_cursors.is_empty() {
-                    let tab_text = if self.settings.expand_tab {
-                        " ".repeat(self.settings.tabstop as usize)
-                    } else {
-                        "\t".to_string()
-                    };
-                    self.insert_text_buffer.push_str(&tab_text);
-                    self.mc_insert(&tab_text);
+                    // #804 review: use the same next-tabstop/smarttab-aware
+                    // calculation as the single-cursor path below, per
+                    // cursor, instead of always inserting a fixed
+                    // `tabstop`-width block of spaces.
+                    self.mc_insert_tab();
                     *changed = true;
                 } else {
                     let line = self.view().cursor.line;
