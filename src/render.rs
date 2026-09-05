@@ -141,16 +141,6 @@ impl Color {
         }
     }
 
-    /// Normalise to the (0.0..=1.0, 0.0..=1.0, 0.0..=1.0) triple expected by
-    /// Cairo's `set_source_rgb` / `set_source_rgba`.
-    pub fn to_cairo(self) -> (f64, f64, f64) {
-        (
-            self.r as f64 / 255.0,
-            self.g as f64 / 255.0,
-            self.b as f64 / 255.0,
-        )
-    }
-
     /// Normalise to `(f32, f32, f32, f32)` RGBA with full opacity.
     /// Used by Direct2D (`D2D1_COLOR_F`) and Core Graphics (`CGColor`).
     pub fn to_f32_rgba(self) -> (f32, f32, f32, f32) {
@@ -165,16 +155,6 @@ impl Color {
     /// Format as a CSS `#rrggbb` hex string.
     pub fn to_hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
-    }
-
-    /// Expand to the 16-bit (0..65535) values expected by Pango attribute
-    /// constructors (`AttrColor::new_foreground` etc.).
-    pub fn to_pango_u16(self) -> (u16, u16, u16) {
-        (
-            self.r as u16 * 257,
-            self.g as u16 * 257,
-            self.b as u16 * 257,
-        )
     }
 }
 
@@ -457,17 +437,6 @@ pub struct GroupTabBar {
 
 /// Columns used by each tab's close button (the × itself + trailing space).
 pub const TAB_CLOSE_COLS: u16 = 2;
-/// Columns occupied by each split button (1 space + 2-wide glyph).
-const TAB_SPLIT_BTN_COLS: u16 = 3;
-/// Total columns reserved for both split buttons (right + down).
-const TAB_SPLIT_BOTH_COLS: u16 = TAB_SPLIT_BTN_COLS * 2;
-/// Columns for the editor action menu button ("…").
-const TAB_ACTION_BTN_COLS: u16 = 3;
-/// Columns per diff toolbar button (1 space + 1 char + 1 space).
-const DIFF_BTN_COLS: u16 = 3;
-/// Total columns for all three diff toolbar buttons.
-const DIFF_TOOLBAR_BTN_COLS: u16 = DIFF_BTN_COLS * 3;
-
 /// Cell width of one tab in the tab bar: the label plus [`TAB_CLOSE_COLS`]
 /// for the close glyph and its trailing separator.
 ///
@@ -8597,11 +8566,6 @@ pub fn debug_sidebar_chrome_to_status_bars(
     (title, action)
 }
 
-/// Returns `true` if `id` matches the debug sidebar action button.
-pub fn is_debug_sidebar_action(id: &quadraui::WidgetId) -> bool {
-    id.as_str() == "debug_sidebar:action"
-}
-
 /// `action_id` for each inline window-control button drawn by
 /// [`window_controls_status_bar`]. Shared with the GTK click handler so the
 /// two sides can't drift.
@@ -9312,760 +9276,6 @@ pub static DEBUG_BUTTONS: &[DebugButton] = &[
     },
 ];
 
-// ─── Backend Parity Harness ───────────────────────────────────────────────────
-
-/// A UI element that a backend is expected to render from a [`ScreenLayout`].
-/// Used by the parity harness to verify all three backends handle the same set
-/// of elements.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum UiElement {
-    /// Menu bar strip (File / Edit / View / …).
-    MenuBar,
-    /// Open menu dropdown overlay.
-    MenuDropdown,
-    /// Single-group tab bar (uses `ScreenLayout.tab_bar`).
-    TabBar,
-    /// Per-group tab bar in a multi-group split.
-    GroupTabBar { group_idx: usize },
-    /// Group divider lines between editor groups.
-    GroupDividers,
-    /// Breadcrumb bar for a group.
-    Breadcrumbs { group_idx: usize },
-    /// An editor window/pane.
-    EditorWindow { window_idx: usize },
-    /// Per-window status line (Vim-style).
-    WindowStatusLine { window_idx: usize },
-    /// Global status bar (when per-window status lines are off).
-    GlobalStatusBar,
-    /// Separated status line (above terminal panel).
-    SeparatedStatusLine,
-    /// Command line (always present).
-    CommandLine,
-    /// Completion popup (autocomplete).
-    CompletionPopup,
-    /// Hover popup (LSP documentation).
-    HoverPopup,
-    /// Rich editor hover popup (markdown, triggered by `gh` or mouse dwell).
-    EditorHoverPopup,
-    /// Signature help popup (function parameter hints).
-    SignatureHelp,
-    /// Wildmenu bar (Tab completion in command mode).
-    Wildmenu,
-    /// Quickfix bottom panel.
-    QuickfixPanel,
-    /// Debug toolbar strip.
-    DebugToolbar,
-    /// Terminal panel (bottom).
-    TerminalPanel,
-    /// Unified picker modal (fuzzy finder / command palette).
-    PickerPopup,
-    /// Tab switcher popup (Ctrl+Tab MRU list).
-    TabSwitcher,
-    /// Context menu popup (right-click).
-    ContextMenu,
-    /// Modal dialog popup.
-    Dialog,
-    /// Diff peek popup (inline git hunk preview).
-    DiffPeekPopup,
-    /// Panel hover popup (sidebar item hover).
-    PanelHoverPopup,
-    /// Tab hover tooltip.
-    TabTooltip,
-    /// Diff toolbar (change navigation buttons in tab bar).
-    DiffToolbar,
-    /// Activity bar (sidebar icon strip) — built by `render::build_activity_bar()` and
-    /// painted by `quadraui::{tui,gtk}::draw_activity_bar`; not stored in `ScreenLayout`.
-    ActivityBar,
-    /// Sidebar panel content — rendered by backends from ScreenLayout sidebar data.
-    Sidebar,
-}
-
-// ─── Phase 2c: Action / click-handler parity ────────────────────────────────
-
-/// A user-triggered action that each backend must handle.
-/// This is the **source of truth** for click/mouse/interaction parity.
-///
-/// Each variant documents: the trigger, the correct engine method to call,
-/// and any draw-order requirements.  Backends that are missing a handler
-/// will fail the parity test.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum UiAction {
-    // ── Explorer interactions ─────────────────────────────────────────
-    /// Single-click on a file in the explorer tree.
-    /// Must call: `engine.open_file_preview(&path)`
-    ExplorerSingleClickFile,
-    /// Double-click on a file in the explorer tree.
-    /// Must call: `engine.open_file_in_tab(&path)`
-    ExplorerDoubleClickFile,
-    /// Enter/Return key on a file in the explorer.
-    /// Must call: `engine.open_file_in_tab(&path)`
-    ExplorerEnterOnFile,
-    /// Right-click on explorer item → open context menu.
-    /// Must call: `engine.open_explorer_context_menu(path, is_dir, x, y)`
-    ExplorerRightClick,
-
-    // ── Context menu ─────────────────────────────────────────────────
-    /// Click inside an open context menu → select item and execute.
-    /// Must call: `engine.context_menu_confirm()` then dispatch action.
-    /// Must be checked BEFORE explorer/editor click handlers.
-    ContextMenuClickInside,
-    /// Click outside an open context menu → dismiss.
-    /// Must call: `engine.close_context_menu()`
-    ContextMenuClickOutside,
-
-    // ── Tab bar ──────────────────────────────────────────────────────
-    /// Click on a tab → switch to it.
-    /// Must call: `engine.goto_tab(idx)`
-    TabClick,
-    /// Click on tab close button.
-    /// Must call: `engine.goto_tab(idx)` then `engine.close_tab()`
-    TabCloseClick,
-    /// Right-click on tab → open tab context menu.
-    /// Must call: `engine.open_tab_context_menu(group_id, tab_idx, x, y)`
-    TabRightClick,
-    /// Drag a tab → reorder or move between groups.
-    /// Handled by `TabGroupController::handle_tab_drag_start/move/drop`.
-    TabDragDrop,
-
-    // ── Editor ───────────────────────────────────────────────────────
-    /// Right-click in editor → open editor context menu.
-    /// Must call: `engine.open_editor_context_menu(x, y)`
-    EditorRightClick,
-    /// Double-click in editor → word select.
-    /// Must call: `engine.mouse_double_click(wid, line, col)`
-    EditorDoubleClick,
-    /// Scroll wheel in editor → scroll viewport.
-    EditorScroll,
-
-    // ── Popup interactions ───────────────────────────────────────────
-    /// Click on editor hover popup → focus it.
-    /// Must call: `engine.editor_hover_focus()`
-    EditorHoverClick,
-    /// Click outside editor hover popup → dismiss.
-    /// Must call: `engine.dismiss_editor_hover()`
-    EditorHoverDismiss,
-    /// Scroll wheel on editor hover popup → scroll content.
-    /// Must call: `engine.editor_hover_scroll(delta)`
-    EditorHoverScroll,
-    /// Click on debug toolbar button → execute command.
-    /// Must call: `engine.execute_command(&btn.action)`
-    DebugToolbarButtonClick,
-
-    // ── Terminal ─────────────────────────────────────────────────────
-    /// Click terminal split button.
-    /// Must call: `engine.terminal_toggle_split(cols, rows)`
-    TerminalSplitButton,
-    /// Click terminal add (+) button.
-    /// Must call: `engine.terminal_new_tab(cols, rows)`
-    TerminalAddButton,
-    /// Click terminal close (×) button.
-    /// Must call: `engine.terminal_close_active_tab()`
-    TerminalCloseButton,
-    /// Click terminal maximize (□) button.
-    /// Must call: `engine.toggle_terminal_maximize(target_rows)`
-    /// followed by `engine.terminal_resize(cols, engine.session.terminal_panel_rows)`.
-    TerminalMaximizeButton,
-    /// Click in split terminal pane → switch focus.
-    /// Must set: `engine.terminal_active = 0 or 1`
-    TerminalSplitPaneClick,
-
-    // ── Activity bar ─────────────────────────────────────────────────
-    /// Click on activity bar icon → toggle sidebar panel.
-    ActivityBarClick,
-    /// Click on settings gear icon → open settings panel.
-    ActivityBarSettingsClick,
-
-    // ── Draw order requirements ──────────────────────────────────────
-    /// Context menu must be drawn AFTER sidebar (higher z-order).
-    DrawOrderContextMenuAboveSidebar,
-    /// Dialog must be drawn AFTER context menu and sidebar.
-    DrawOrderDialogOnTop,
-    /// Menu dropdown must be drawn AFTER sidebar.
-    DrawOrderMenuDropdownAboveSidebar,
-}
-
-/// Return the full set of [`UiAction`]s that every backend must handle.
-/// This is the canonical contract — if a backend doesn't handle one of these,
-/// users will experience broken interactions.
-pub fn all_required_ui_actions() -> Vec<UiAction> {
-    vec![
-        UiAction::ExplorerSingleClickFile,
-        UiAction::ExplorerDoubleClickFile,
-        UiAction::ExplorerEnterOnFile,
-        UiAction::ExplorerRightClick,
-        UiAction::ContextMenuClickInside,
-        UiAction::ContextMenuClickOutside,
-        UiAction::TabClick,
-        UiAction::TabCloseClick,
-        UiAction::TabRightClick,
-        UiAction::TabDragDrop,
-        UiAction::EditorRightClick,
-        UiAction::EditorDoubleClick,
-        UiAction::EditorScroll,
-        UiAction::EditorHoverClick,
-        UiAction::EditorHoverDismiss,
-        UiAction::EditorHoverScroll,
-        UiAction::DebugToolbarButtonClick,
-        UiAction::TerminalSplitButton,
-        UiAction::TerminalAddButton,
-        UiAction::TerminalCloseButton,
-        UiAction::TerminalMaximizeButton,
-        UiAction::TerminalSplitPaneClick,
-        UiAction::ActivityBarClick,
-        UiAction::ActivityBarSettingsClick,
-        UiAction::DrawOrderContextMenuAboveSidebar,
-        UiAction::DrawOrderDialogOnTop,
-        UiAction::DrawOrderMenuDropdownAboveSidebar,
-    ]
-}
-
-/// Collect the [`UiAction`]s that the **TUI** backend handles.
-/// This is the reference implementation — all actions should be present.
-pub fn collect_ui_actions_tui() -> Vec<UiAction> {
-    // TUI is the reference backend — it handles all actions.
-    // Each entry below is verified by the corresponding code location:
-    vec![
-        // mouse.rs:1914 — open_file_preview for single click
-        UiAction::ExplorerSingleClickFile,
-        // mouse.rs:1913 — open_file_in_tab for double click
-        UiAction::ExplorerDoubleClickFile,
-        // mod.rs key handler — open_file_in_tab for Enter
-        UiAction::ExplorerEnterOnFile,
-        // mouse.rs:898 — open_explorer_context_menu
-        UiAction::ExplorerRightClick,
-        // mouse.rs:984-1036 — context_menu click inside/outside
-        UiAction::ContextMenuClickInside,
-        UiAction::ContextMenuClickOutside,
-        // mouse.rs tab click handlers
-        UiAction::TabClick,
-        UiAction::TabCloseClick,
-        UiAction::TabRightClick,
-        UiAction::TabDragDrop,
-        // mouse.rs:977 — open_editor_context_menu
-        UiAction::EditorRightClick,
-        // mouse.rs — mouse_double_click
-        UiAction::EditorDoubleClick,
-        UiAction::EditorScroll,
-        // mouse.rs — editor_hover_focus, dismiss, scroll
-        UiAction::EditorHoverClick,
-        UiAction::EditorHoverDismiss,
-        UiAction::EditorHoverScroll,
-        // mouse.rs — debug toolbar button handling
-        UiAction::DebugToolbarButtonClick,
-        // mouse.rs:1639 — terminal_toggle_split
-        UiAction::TerminalSplitButton,
-        // mouse.rs — terminal_new_tab
-        UiAction::TerminalAddButton,
-        // mouse.rs — terminal_close_active_tab
-        UiAction::TerminalCloseButton,
-        // mouse.rs — toggle_terminal_maximize button on toolbar
-        UiAction::TerminalMaximizeButton,
-        // mouse.rs:1650 — terminal split pane click
-        UiAction::TerminalSplitPaneClick,
-        // panels.rs — activity bar icon click
-        UiAction::ActivityBarClick,
-        UiAction::ActivityBarSettingsClick,
-        // render_impl.rs — draw order: popups after terminal, picker on top
-        UiAction::DrawOrderContextMenuAboveSidebar,
-        UiAction::DrawOrderDialogOnTop,
-        UiAction::DrawOrderMenuDropdownAboveSidebar,
-    ]
-}
-
-/// Collect the [`UiAction`]s that the **Win-GUI** backend handles.
-/// Update this list as handlers are added to `src/win_gui/`.
-pub fn collect_ui_actions_wingui() -> Vec<UiAction> {
-    vec![
-        // mod.rs:2253 — open_file_preview for single click
-        UiAction::ExplorerSingleClickFile,
-        // mod.rs:2945 — open_file_in_tab for double click
-        UiAction::ExplorerDoubleClickFile,
-        // mod.rs:1535 — open_file_in_tab for Enter/Right/l
-        UiAction::ExplorerEnterOnFile,
-        // mod.rs:3015 — open_explorer_context_menu
-        UiAction::ExplorerRightClick,
-        // mod.rs:2331-2416 — context menu click inside/outside
-        UiAction::ContextMenuClickInside,
-        UiAction::ContextMenuClickOutside,
-        // mod.rs:2420-2440 — tab click + close
-        UiAction::TabClick,
-        UiAction::TabCloseClick,
-        // mod.rs:2981 — open_tab_context_menu
-        UiAction::TabRightClick,
-        // mod.rs — tab drag begin/drop
-        UiAction::TabDragDrop,
-        // mod.rs:3037 — open_editor_context_menu
-        UiAction::EditorRightClick,
-        // mod.rs:2955 — mouse_double_click
-        UiAction::EditorDoubleClick,
-        // mod.rs:3043+ — scroll handler
-        UiAction::EditorScroll,
-        // mod.rs — editor_hover_focus, dismiss_editor_hover, editor_hover_scroll
-        UiAction::EditorHoverClick,
-        UiAction::EditorHoverDismiss,
-        UiAction::EditorHoverScroll,
-        // mod.rs — debug toolbar button execute_command
-        UiAction::DebugToolbarButtonClick,
-        // mod.rs — terminal_toggle_split
-        UiAction::TerminalSplitButton,
-        // mod.rs — terminal_new_tab
-        UiAction::TerminalAddButton,
-        // mod.rs — terminal_close_active_tab
-        UiAction::TerminalCloseButton,
-        // mod.rs — toggle_terminal_maximize button on toolbar
-        UiAction::TerminalMaximizeButton,
-        // mod.rs — terminal_active = 0/1
-        UiAction::TerminalSplitPaneClick,
-        // mod.rs — sidebar panel toggle
-        UiAction::ActivityBarClick,
-        UiAction::ActivityBarSettingsClick,
-        // on_paint draw order: draw_frame → sidebar → context menu → dialog → notifications
-        UiAction::DrawOrderContextMenuAboveSidebar,
-        UiAction::DrawOrderDialogOnTop,
-        UiAction::DrawOrderMenuDropdownAboveSidebar,
-    ]
-}
-
-/// Walk a [`ScreenLayout`] and collect every [`UiElement`] that a backend is
-/// expected to render.  This is the **source of truth** for the parity harness.
-pub fn collect_expected_ui_elements(layout: &ScreenLayout) -> Vec<UiElement> {
-    let mut elems = Vec::new();
-
-    // Menu bar
-    if layout.menu_bar_visible {
-        elems.push(UiElement::MenuBar);
-        if layout.menu_dropdown_open {
-            elems.push(UiElement::MenuDropdown);
-        }
-    }
-
-    // Tab bar(s)
-    if layout.editor_group_split.is_some() {
-        for (i, _gtb) in layout.group_tab_bars.iter().enumerate() {
-            elems.push(UiElement::GroupTabBar { group_idx: i });
-        }
-        elems.push(UiElement::GroupDividers);
-    } else {
-        elems.push(UiElement::TabBar);
-    }
-
-    // Diff toolbar. One branch, not two: `group_tab_bars` is populated for
-    // every group count (#551), so the `editor_group_split.is_some()` split
-    // that used to guard a single-group mirror beside this loop was only ever
-    // asking "how many groups", never "is a toolbar drawn" (#765).
-    if layout
-        .group_tab_bars
-        .iter()
-        .any(|gtb| gtb.diff_toolbar.is_some())
-    {
-        elems.push(UiElement::DiffToolbar);
-    }
-
-    // Breadcrumbs
-    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
-        if !bc.segments.is_empty() {
-            elems.push(UiElement::Breadcrumbs { group_idx: i });
-        }
-    }
-
-    // Editor windows + per-window status lines
-    for (i, rw) in layout.windows.iter().enumerate() {
-        elems.push(UiElement::EditorWindow { window_idx: i });
-        if rw.status_line.is_some() {
-            elems.push(UiElement::WindowStatusLine { window_idx: i });
-        }
-    }
-
-    // Global status bar (only when per-window status lines are off)
-    let any_per_window_status = layout.windows.iter().any(|w| w.status_line.is_some());
-    if !any_per_window_status {
-        elems.push(UiElement::GlobalStatusBar);
-    }
-
-    // Separated status line (above terminal)
-    if layout.separated_status_line.is_some() {
-        elems.push(UiElement::SeparatedStatusLine);
-    }
-
-    // Command line (always rendered)
-    elems.push(UiElement::CommandLine);
-
-    // Popups & overlays (conditional)
-    if layout.completion.is_some() {
-        elems.push(UiElement::CompletionPopup);
-    }
-    if layout.hover.is_some() {
-        elems.push(UiElement::HoverPopup);
-    }
-    if layout.editor_hover.is_some() {
-        elems.push(UiElement::EditorHoverPopup);
-    }
-    if layout.signature_help.is_some() {
-        elems.push(UiElement::SignatureHelp);
-    }
-    if layout.wildmenu.is_some() {
-        elems.push(UiElement::Wildmenu);
-    }
-    if layout.quickfix.is_some() {
-        elems.push(UiElement::QuickfixPanel);
-    }
-    if layout.debug_toolbar.is_some() {
-        elems.push(UiElement::DebugToolbar);
-    }
-    if layout.bottom_tabs.terminal.is_some() {
-        elems.push(UiElement::TerminalPanel);
-    }
-    if layout.picker.is_some() {
-        elems.push(UiElement::PickerPopup);
-    }
-    if layout.tab_switcher.is_some() {
-        elems.push(UiElement::TabSwitcher);
-    }
-    if layout.context_menu.is_some() {
-        elems.push(UiElement::ContextMenu);
-    }
-    if layout.dialog.is_some() {
-        elems.push(UiElement::Dialog);
-    }
-    if layout.diff_peek.is_some() {
-        elems.push(UiElement::DiffPeekPopup);
-    }
-    if layout.panel_hover.is_some() {
-        elems.push(UiElement::PanelHoverPopup);
-    }
-    if layout.tab_tooltip.is_some() {
-        elems.push(UiElement::TabTooltip);
-    }
-
-    // Activity bar + sidebar — always expected (backends render these from
-    // engine state / ScreenLayout sidebar fields).
-    elems.push(UiElement::ActivityBar);
-    if layout.source_control.is_some()
-        || layout.ext_sidebar.is_some()
-        || layout.ai_panel.is_some()
-        || layout.ext_panel.is_some()
-        || layout.debug_sidebar.session_active
-    {
-        elems.push(UiElement::Sidebar);
-    }
-
-    elems.sort();
-    elems
-}
-
-/// Simulate the Win-GUI backend's `draw_frame()` + `on_paint()` branching logic
-/// to collect which [`UiElement`]s it would render.  This mirrors the actual
-/// rendering code in `src/win_gui/draw.rs` without requiring Direct2D.
-pub fn collect_ui_elements_wingui(layout: &ScreenLayout) -> Vec<UiElement> {
-    let mut elems = Vec::new();
-
-    // draw_frame(): menu bar
-    if layout.menu_bar_visible {
-        elems.push(UiElement::MenuBar);
-    }
-
-    // draw_frame(): tab bar(s)
-    if layout.editor_group_split.is_some() {
-        for (i, _gtb) in layout.group_tab_bars.iter().enumerate() {
-            elems.push(UiElement::GroupTabBar { group_idx: i });
-        }
-        elems.push(UiElement::GroupDividers);
-    } else {
-        elems.push(UiElement::TabBar);
-    }
-
-    // draw_frame(): breadcrumbs
-    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
-        if !bc.segments.is_empty() {
-            elems.push(UiElement::Breadcrumbs { group_idx: i });
-        }
-    }
-
-    // draw_frame(): editor windows
-    for (i, rw) in layout.windows.iter().enumerate() {
-        elems.push(UiElement::EditorWindow { window_idx: i });
-        if rw.status_line.is_some() {
-            elems.push(UiElement::WindowStatusLine { window_idx: i });
-        }
-    }
-
-    // draw_frame(): status bar (global, only when separated_status_line is None)
-    if layout.separated_status_line.is_none() {
-        let any_per_window = layout.windows.iter().any(|w| w.status_line.is_some());
-        if !any_per_window {
-            elems.push(UiElement::GlobalStatusBar);
-        }
-    }
-
-    // draw_frame(): command line
-    elems.push(UiElement::CommandLine);
-
-    // draw_frame(): tab tooltip
-    if layout.tab_tooltip.is_some() {
-        elems.push(UiElement::TabTooltip);
-    }
-
-    // draw_frame(): completion popup
-    if layout.completion.is_some() {
-        elems.push(UiElement::CompletionPopup);
-    }
-
-    // draw_frame(): hover popup
-    if layout.hover.is_some() {
-        elems.push(UiElement::HoverPopup);
-    }
-
-    // draw_frame(): editor hover (rich markdown)
-    if layout.editor_hover.is_some() {
-        elems.push(UiElement::EditorHoverPopup);
-    }
-
-    // draw_frame(): diff peek popup
-    if layout.diff_peek.is_some() {
-        elems.push(UiElement::DiffPeekPopup);
-    }
-
-    // draw_frame(): signature help
-    if layout.signature_help.is_some() {
-        elems.push(UiElement::SignatureHelp);
-    }
-
-    // draw_frame(): wildmenu
-    if layout.wildmenu.is_some() {
-        elems.push(UiElement::Wildmenu);
-    }
-
-    // draw_frame(): quickfix
-    if layout.quickfix.is_some() {
-        elems.push(UiElement::QuickfixPanel);
-    }
-
-    // draw_frame(): separated status line
-    if layout.separated_status_line.is_some() {
-        elems.push(UiElement::SeparatedStatusLine);
-    }
-
-    // draw_frame(): debug toolbar
-    if layout.debug_toolbar.is_some() {
-        elems.push(UiElement::DebugToolbar);
-    }
-
-    // draw_frame(): terminal
-    if layout.bottom_tabs.terminal.is_some() {
-        elems.push(UiElement::TerminalPanel);
-    }
-
-    // draw_frame(): panel hover popup
-    if layout.panel_hover.is_some() {
-        elems.push(UiElement::PanelHoverPopup);
-    }
-
-    // draw_frame(): picker
-    if layout.picker.is_some() {
-        elems.push(UiElement::PickerPopup);
-    }
-
-    // draw_frame(): tab switcher
-    if layout.tab_switcher.is_some() {
-        elems.push(UiElement::TabSwitcher);
-    }
-
-    // draw_frame(): context menu
-    if layout.context_menu.is_some() {
-        elems.push(UiElement::ContextMenu);
-    }
-
-    // draw_frame(): dialog
-    if layout.dialog.is_some() {
-        elems.push(UiElement::Dialog);
-    }
-
-    // on_paint(): sidebar (always rendered after draw_frame)
-    elems.push(UiElement::ActivityBar);
-    if layout.source_control.is_some()
-        || layout.ext_sidebar.is_some()
-        || layout.ai_panel.is_some()
-        || layout.ext_panel.is_some()
-        || layout.debug_sidebar.session_active
-    {
-        elems.push(UiElement::Sidebar);
-    }
-
-    // on_paint(): menu dropdown (rendered after sidebar for z-order)
-    if layout.menu_dropdown_open {
-        elems.push(UiElement::MenuDropdown);
-    }
-
-    // draw_tab_bar() / draw_group_tab_bar(): diff toolbar. One branch — see
-    // `collect_expected_ui_elements` above (#765).
-    if layout
-        .group_tab_bars
-        .iter()
-        .any(|gtb| gtb.diff_toolbar.is_some())
-    {
-        elems.push(UiElement::DiffToolbar);
-    }
-
-    elems.sort();
-    elems
-}
-
-/// Simulate the TUI backend's `draw_frame()` branching logic to collect which
-/// [`UiElement`]s it would render.
-pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
-    let mut elems = Vec::new();
-
-    // Menu bar
-    if layout.menu_bar_visible {
-        elems.push(UiElement::MenuBar);
-    }
-
-    // Activity bar (always rendered)
-    elems.push(UiElement::ActivityBar);
-
-    // Sidebar
-    if layout.source_control.is_some()
-        || layout.ext_sidebar.is_some()
-        || layout.ai_panel.is_some()
-        || layout.ext_panel.is_some()
-        || layout.debug_sidebar.session_active
-    {
-        elems.push(UiElement::Sidebar);
-    }
-
-    // Tab bar(s)
-    if layout.editor_group_split.is_some() {
-        for (i, _gtb) in layout.group_tab_bars.iter().enumerate() {
-            elems.push(UiElement::GroupTabBar { group_idx: i });
-        }
-        elems.push(UiElement::GroupDividers);
-    } else {
-        elems.push(UiElement::TabBar);
-    }
-
-    // Diff toolbar (rendered as part of the tab bar). One branch — see
-    // `collect_expected_ui_elements` above (#765).
-    if layout
-        .group_tab_bars
-        .iter()
-        .any(|gtb| gtb.diff_toolbar.is_some())
-    {
-        elems.push(UiElement::DiffToolbar);
-    }
-
-    // Breadcrumbs
-    for (i, bc) in layout.breadcrumbs.iter().enumerate() {
-        if !bc.segments.is_empty() {
-            elems.push(UiElement::Breadcrumbs { group_idx: i });
-        }
-    }
-
-    // Editor windows
-    for (i, rw) in layout.windows.iter().enumerate() {
-        elems.push(UiElement::EditorWindow { window_idx: i });
-        if rw.status_line.is_some() {
-            elems.push(UiElement::WindowStatusLine { window_idx: i });
-        }
-    }
-
-    // Tab tooltip
-    if layout.tab_tooltip.is_some() {
-        elems.push(UiElement::TabTooltip);
-    }
-
-    // Completion popup
-    if layout.completion.is_some() {
-        elems.push(UiElement::CompletionPopup);
-    }
-
-    // Hover popup
-    if layout.hover.is_some() {
-        elems.push(UiElement::HoverPopup);
-    }
-
-    // Editor hover popup (rich markdown)
-    if layout.editor_hover.is_some() {
-        elems.push(UiElement::EditorHoverPopup);
-    }
-
-    // Diff peek popup
-    if layout.diff_peek.is_some() {
-        elems.push(UiElement::DiffPeekPopup);
-    }
-
-    // Signature help
-    if layout.signature_help.is_some() {
-        elems.push(UiElement::SignatureHelp);
-    }
-
-    // Quickfix
-    if layout.quickfix.is_some() {
-        elems.push(UiElement::QuickfixPanel);
-    }
-
-    // Separated status line
-    if layout.separated_status_line.is_some() {
-        elems.push(UiElement::SeparatedStatusLine);
-    }
-
-    // Bottom panel (terminal / debug output)
-    if layout.bottom_tabs.terminal.is_some() {
-        elems.push(UiElement::TerminalPanel);
-    }
-
-    // Debug toolbar
-    if layout.debug_toolbar.is_some() {
-        elems.push(UiElement::DebugToolbar);
-    }
-
-    // Wildmenu
-    if layout.wildmenu.is_some() {
-        elems.push(UiElement::Wildmenu);
-    }
-
-    // Global status bar (when per-window status is off)
-    let any_per_window = layout.windows.iter().any(|w| w.status_line.is_some());
-    if !any_per_window {
-        elems.push(UiElement::GlobalStatusBar);
-    }
-
-    // Command line
-    elems.push(UiElement::CommandLine);
-
-    // Panel hover popup
-    if layout.panel_hover.is_some() {
-        elems.push(UiElement::PanelHoverPopup);
-    }
-
-    // Picker
-    if layout.picker.is_some() {
-        elems.push(UiElement::PickerPopup);
-    }
-
-    // Tab switcher
-    if layout.tab_switcher.is_some() {
-        elems.push(UiElement::TabSwitcher);
-    }
-
-    // Context menu
-    if layout.context_menu.is_some() {
-        elems.push(UiElement::ContextMenu);
-    }
-
-    // Dialog
-    if layout.dialog.is_some() {
-        elems.push(UiElement::Dialog);
-    }
-
-    // Menu dropdown (rendered last for z-order)
-    if layout.menu_dropdown_open {
-        elems.push(UiElement::MenuDropdown);
-    }
-
-    elems.sort();
-    elems
-}
-
 // ─── ScreenLayout ─────────────────────────────────────────────────────────────
 
 /// The complete, platform-agnostic description of one editor frame.
@@ -10079,17 +9289,18 @@ pub fn collect_ui_elements_tui(layout: &ScreenLayout) -> Vec<UiElement> {
 /// the three composers ([`compose_frame`], [`compose_editor_band`],
 /// [`compose_bottom_band`]) and the shared painters they call. The verdict:
 ///
-/// * **35 are composed** — either directly in a backend's rung arm, or in a
+/// * **All are composed** — either directly in a backend's rung arm, or in a
 ///   shared painter that arm calls (`bottom_tabs`, for instance, is composed by
 ///   [`paint_bottom_panel_rung`] from the `BottomOp::BottomPanel` arm on both
 ///   backends, not by either backend itself).
-/// * **1 is deliberately not composed**: [`Self::menu_dropdown_open`]. The
-///   dropdown is painted by `MenuSystem::render` from the
-///   [`FrameOp::MenuDropdown`] rung, which reads the `MenuSystem` directly;
-///   this field is the diagnostic mirror [`visible_ui_elements`] and the
-///   acceptance harnesses read. Its own doc comment carries the full reason,
-///   including why it is *not* a #587/#592 defect (nothing routes input against
-///   it either).
+///
+/// #766 recorded one exception, `menu_dropdown_open`: populated every frame,
+/// painted by nobody, kept solely because the Win-GUI backend-parity harness
+/// read it as *state* to declare its expected element set. #812 deleted that
+/// harness (the backend it compared against was removed in 3e4bcff), which left
+/// the field with zero readers, so the field went with it. The dropdown itself
+/// is unaffected — it is painted by `MenuSystem::render` from the
+/// [`FrameOp::MenuDropdown`] rung, which reads the `MenuSystem` directly.
 ///
 /// Adding a field means adding its verdict — a rung in [`FRAME_Z_ORDER`] /
 /// [`EDITOR_Z_ORDER`] / [`BOTTOM_Z_ORDER`], or a doc comment saying where it is
@@ -10116,23 +9327,6 @@ pub struct ScreenLayout {
     pub signature_help: Option<SignatureHelp>,
     /// Menu bar strip data, or `None` when the bar is hidden.
     pub menu_bar_visible: bool,
-    /// **#765 audit verdict (#735 slice 4): deliberately not composed — kept.**
-    /// Re-run and confirmed unchanged from slice 1's finding, and this closes
-    /// the #592 field table: `diff_toolbar`, the other field slice 1 left open,
-    /// was deleted by this slice (see the note where it used to sit, above).
-    ///
-    /// Zero paint readers on either backend, and that is correct — `MenuSystem`
-    /// owns its own `open_item`, and both backends' `FrameOp::MenuDropdown`
-    /// rung just calls `MenuSystem::render`, which decides for itself whether a
-    /// dropdown body is open. This field's only consumers are the
-    /// `collect_*_ui_elements` parity harnesses below, which need the flag as
-    /// *state* to declare the expected element set. Keeping it is what lets
-    /// those harnesses assert on a dropdown without reaching into `MenuSystem`
-    /// — deleting it would mean each harness re-deriving `menu_system
-    /// .borrow().is_open()`, which is a *worse* coupling, not a better one.
-    /// This is therefore a "populated but not painted" field that is **not** a
-    /// #587/#592 defect: nothing routes input against it either.
-    pub menu_dropdown_open: bool,
     /// Debug toolbar strip data, or `None` when hidden and no active session.
     pub debug_toolbar: Option<DebugToolbarData>,
     /// Debug sidebar data — always present (sections may be empty).
@@ -13096,7 +12290,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         });
 
     let menu_bar_visible = engine.menu_bar_visible;
-    let menu_dropdown_open = engine.menu_system.borrow().is_open();
 
     let debug_toolbar = engine.debug_toolbar_visible.then(|| DebugToolbarData {
         buttons: DEBUG_BUTTONS.to_vec(),
@@ -13629,7 +12822,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         bottom_tabs,
         signature_help,
         menu_bar_visible,
-        menu_dropdown_open,
         debug_toolbar,
         debug_sidebar,
         source_control,
@@ -14315,161 +13507,6 @@ pub fn sc_help_dialog_layout(
         quadraui::ToolbarItemMeasure::new(0.0)
     });
     (dialog, layout)
-}
-
-/// Adapt a `SourceControlData` (vimcode's internal representation) into a
-/// generic `quadraui::TreeView` that backends can render through the shared
-/// tree-primitive drawing path.
-///
-/// Scope: covers the four expandable sections only — Staged, Changes,
-/// Worktrees, and Recent Commits. The header row, commit input, branch
-/// picker, help dialog, and action button row are built by their own
-/// dedicated adapters (`sc_header_text`, `sc_commit_message_to_text_input`,
-/// `sc_branch_picker_to_palette`, `sc_help_dialog`, `sc_button_toolbar`).
-///
-/// Row order mirrors `render_source_control()` in the TUI so `sc.selected`
-/// (a flat row index within the sections area) maps one-to-one onto the
-/// returned `TreeView.rows`.
-pub fn source_control_to_tree_view(sc: &SourceControlData, theme: &Theme) -> quadraui::TreeView {
-    use quadraui::{
-        Badge, Decoration, SelectionMode, StyledSpan, StyledText, TreeRow, TreeStyle, TreeView,
-        WidgetId,
-    };
-
-    let mut rows: Vec<TreeRow> = Vec::new();
-
-    let add_fg = to_q_color(theme.git_added);
-    let del_fg = to_q_color(theme.git_deleted);
-    let mod_fg = to_q_color(theme.git_modified);
-    let dim_fg = to_q_color(theme.status_inactive_fg);
-    let show_worktrees = sc.worktrees.len() > 1;
-
-    // Section order: 0=Staged, 1=Changes, 2=Worktrees (conditional), 3=Log.
-    // Matches `render_source_control()` in tui_main/panels.rs.
-    // Labels include Nerd Font glyphs; backends that don't have the icon font
-    // will still show the text portion.
-    let sections: [(u16, &str, usize); 4] = [
-        (0, "\u{f055} STAGED CHANGES", sc.staged.len()),
-        (1, "\u{f02b} CHANGES", sc.unstaged.len()),
-        (2, "\u{e702} WORKTREES", sc.worktrees.len()),
-        (3, "\u{f417} RECENT COMMITS", sc.log.len()),
-    ];
-
-    for (sec_idx, label, count) in sections {
-        if sec_idx == 2 && !show_worktrees {
-            continue;
-        }
-        let is_expanded = sc.sections_expanded[sec_idx as usize];
-
-        // Section header row (branch in tree terms).
-        let badge = if count > 0 {
-            Some(Badge::plain(format!("({})", count)))
-        } else {
-            None
-        };
-        rows.push(TreeRow {
-            path: vec![sec_idx],
-            indent: 0,
-            icon: None,
-            text: StyledText::plain(label),
-            badge,
-            is_expanded: Some(is_expanded),
-            decoration: Decoration::Header,
-            edit: None,
-        });
-
-        if !is_expanded {
-            continue;
-        }
-
-        match sec_idx {
-            0 | 1 => {
-                // NOTE: no "(no changes)" placeholder row — adding one would
-                // shift the flat row count away from
-                // `engine.sc_flat_to_section_idx`, which breaks the
-                // `sc.selected` → `selected_path` mapping and causes Tab /
-                // Enter / staging to act on the wrong section.
-                let items = if sec_idx == 0 {
-                    &sc.staged
-                } else {
-                    &sc.unstaged
-                };
-                for (i, fi) in items.iter().enumerate() {
-                    let status_color = match fi.status_char {
-                        'A' => add_fg,
-                        'D' => del_fg,
-                        _ => mod_fg,
-                    };
-                    rows.push(TreeRow {
-                        path: vec![sec_idx, i as u16],
-                        indent: 1,
-                        icon: None,
-                        text: StyledText {
-                            spans: vec![
-                                StyledSpan::with_fg(fi.status_char.to_string(), status_color),
-                                StyledSpan::plain(format!(" {}", fi.path)),
-                            ],
-                        },
-                        badge: None,
-                        is_expanded: None,
-                        decoration: Decoration::Normal,
-                        edit: None,
-                    });
-                }
-            }
-            2 => {
-                for (i, wt) in sc.worktrees.iter().enumerate() {
-                    let check = if wt.is_current { "\u{2713} " } else { "  " };
-                    let main_marker = if wt.is_main { " [main]" } else { "" };
-                    let text = format!("{}{} {}{}", check, wt.branch, wt.path, main_marker);
-                    rows.push(TreeRow {
-                        path: vec![sec_idx, i as u16],
-                        indent: 1,
-                        icon: None,
-                        text: StyledText::plain(text),
-                        badge: None,
-                        is_expanded: None,
-                        decoration: Decoration::Normal,
-                        edit: None,
-                    });
-                }
-            }
-            3 => {
-                for (i, entry) in sc.log.iter().enumerate() {
-                    rows.push(TreeRow {
-                        path: vec![sec_idx, i as u16],
-                        indent: 1,
-                        icon: None,
-                        text: StyledText {
-                            spans: vec![
-                                StyledSpan::with_fg(entry.hash.clone(), dim_fg),
-                                StyledSpan::plain(format!(" {}", entry.message)),
-                            ],
-                        },
-                        badge: None,
-                        is_expanded: None,
-                        decoration: Decoration::Muted,
-                        edit: None,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Map flat `sc.selected` → `selected_path`. When selected is out of range
-    // (e.g. sections collapsed), we fall back to no selection.
-    let selected_path = rows.get(sc.selected).map(|r| r.path.clone());
-
-    TreeView {
-        id: WidgetId::new("sc-tree"),
-        rows,
-        selection_mode: SelectionMode::Single,
-        selected_path,
-        scroll_offset: 0,
-        style: TreeStyle::default(),
-        has_focus: sc.has_focus,
-    }
 }
 
 /// Populate the `SidebarSystem` on `engine.dap_sidebar_system` with
@@ -15354,181 +14391,6 @@ pub fn build_activity_bar(
         // Signals to the quadraui backend that this bar owns the keyboard so
         // it intercepts KeyPressed as ActivityBarEvent::KeyPressed (Q#368).
         is_keyboard_focused: engine.activity_bar_focused,
-    }
-}
-
-/// Adapt one section of the debug sidebar (`Variables` / `Watch` /
-/// `Call Stack` / `Breakpoints`) into a `quadraui::TreeView` for the
-/// shared `draw_tree` primitive (#281).
-///
-/// Adapt the engine-side `ExtSidebarData` into a `quadraui::TreeView`
-/// for the shared `draw_tree` primitive (#280).
-///
-/// Tree shape:
-/// - Path `[0]` — "INSTALLED (n)" header (`Decoration::Header`, badge
-///   carries the count).
-/// - Path `[0, i]` — installed item `i` (icon = filled circle / nerd-font
-///   `\u{f4d0}`; badge `[d]remove` or `[u]update` shown only on the
-///   selected row; trailing `\u{2191}` (`↑`) on the label when an
-///   update is available).
-/// - Path `[1]` — "AVAILABLE (m)" header.
-/// - Path `[1, i]` — available item `i` (hollow circle icon; badge
-///   `[i]install` on selected row only).
-/// - Empty-state placeholders (`(none installed)`, `(all installed)`,
-///   `Fetching registry…`) appear as `Decoration::Muted` rows that are
-///   intentionally not in the selection mapping.
-///
-/// `selected: usize` in `ExtSidebarData` is a flat index across items
-/// (installed first, then available). This maps to `selected_path`
-/// = `[0, selected]` while `selected < installed_count` else
-/// `[1, selected - installed_count]`.
-pub fn ext_sidebar_to_tree_view(ext: &ExtSidebarData) -> quadraui::TreeView {
-    use quadraui::{
-        Badge, Decoration, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView, WidgetId,
-    };
-
-    let mut rows: Vec<TreeRow> = Vec::new();
-
-    let installed_count = ext.items_installed.len();
-    let available_count = ext.items_available.len();
-
-    // Map flat selected → (section, item_idx) for badge gating.
-    let (sel_section, sel_item) = if ext.selected < installed_count {
-        (0u16, ext.selected)
-    } else {
-        (1u16, ext.selected.saturating_sub(installed_count))
-    };
-
-    // ── Section 0: INSTALLED ─────────────────────────────────────────────────
-    rows.push(TreeRow {
-        path: vec![0],
-        indent: 0,
-        icon: None,
-        text: StyledText::plain(format!("INSTALLED ({})", installed_count)),
-        badge: None,
-        is_expanded: Some(ext.sections_expanded[0]),
-        decoration: Decoration::Header,
-        edit: None,
-    });
-
-    if ext.sections_expanded[0] {
-        if installed_count == 0 {
-            rows.push(TreeRow {
-                path: vec![0, u16::MAX],
-                indent: 1,
-                icon: None,
-                text: StyledText::plain("(none installed)".to_string()),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Muted,
-                edit: None,
-            });
-        } else {
-            for (i, item) in ext.items_installed.iter().enumerate() {
-                let is_sel = ext.has_focus && sel_section == 0 && sel_item == i;
-                let label = if item.update_available {
-                    format!("\u{25cf} {} \u{2191}", item.display_name)
-                } else {
-                    format!("\u{25cf} {}", item.display_name)
-                };
-                let badge = if is_sel {
-                    let hint = if item.update_available {
-                        "[u]update"
-                    } else {
-                        "[d]remove"
-                    };
-                    Some(Badge::plain(hint.to_string()))
-                } else {
-                    None
-                };
-                rows.push(TreeRow {
-                    path: vec![0, i as u16],
-                    indent: 1,
-                    icon: None,
-                    text: StyledText::plain(label),
-                    badge,
-                    is_expanded: None,
-                    decoration: Decoration::Normal,
-                    edit: None,
-                });
-            }
-        }
-    }
-
-    // ── Section 1: AVAILABLE ─────────────────────────────────────────────────
-    rows.push(TreeRow {
-        path: vec![1],
-        indent: 0,
-        icon: None,
-        text: StyledText::plain(format!("AVAILABLE ({})", available_count)),
-        badge: None,
-        is_expanded: Some(ext.sections_expanded[1]),
-        decoration: Decoration::Header,
-        edit: None,
-    });
-
-    if ext.sections_expanded[1] {
-        if available_count == 0 {
-            let msg = if ext.fetching {
-                "Fetching registry\u{2026}"
-            } else {
-                "(all installed)"
-            };
-            rows.push(TreeRow {
-                path: vec![1, u16::MAX],
-                indent: 1,
-                icon: None,
-                text: StyledText::plain(msg.to_string()),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Muted,
-                edit: None,
-            });
-        } else {
-            for (i, item) in ext.items_available.iter().enumerate() {
-                let is_sel = ext.has_focus && sel_section == 1 && sel_item == i;
-                let badge = if is_sel {
-                    Some(Badge::plain("[i]install".to_string()))
-                } else {
-                    None
-                };
-                rows.push(TreeRow {
-                    path: vec![1, i as u16],
-                    indent: 1,
-                    icon: None,
-                    text: StyledText::plain(format!("\u{25cb} {}", item.display_name)),
-                    badge,
-                    is_expanded: None,
-                    decoration: Decoration::Normal,
-                    edit: None,
-                });
-            }
-        }
-    }
-
-    // Compute the selected_path matching the flat `ext.selected`. Skip
-    // when the selection points outside the visible items (e.g. all
-    // sections collapsed).
-    let selected_path = if ext.has_focus {
-        if sel_section == 0 && sel_item < installed_count && ext.sections_expanded[0] {
-            Some(vec![0u16, sel_item as u16])
-        } else if sel_section == 1 && sel_item < available_count && ext.sections_expanded[1] {
-            Some(vec![1u16, sel_item as u16])
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    TreeView {
-        id: WidgetId::new("ext-sidebar-tree"),
-        rows,
-        selection_mode: SelectionMode::Single,
-        selected_path,
-        scroll_offset: 0,
-        style: TreeStyle::default(),
-        has_focus: ext.has_focus,
     }
 }
 
@@ -16844,11 +15706,6 @@ fn build_terminal_panel(engine: &Engine) -> Option<TerminalPanel> {
     })
 }
 
-/// Build breadcrumb segments for the active editor group (public API for click handlers).
-pub fn build_breadcrumbs_for_active_group(engine: &Engine) -> Vec<BreadcrumbSegment> {
-    build_breadcrumbs_for_group(engine, engine.active_group)
-}
-
 /// Build breadcrumb segments for a single editor group.
 fn build_breadcrumbs_for_group(engine: &Engine, group_id: GroupId) -> Vec<BreadcrumbSegment> {
     let group = match engine.editor_groups.get(&group_id) {
@@ -16967,16 +15824,6 @@ fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
         Some(gid) => build_tab_bar_for_group_by_id(engine, gid),
         None => vec![],
     }
-}
-
-/// Return the number of visual rows a buffer line of `line_char_len` characters
-/// occupies when the viewport is `viewport_cols` columns wide.
-/// Always returns at least 1 (even for empty lines).
-pub fn visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> usize {
-    if viewport_cols == 0 {
-        return 1;
-    }
-    line_char_len.div_ceil(viewport_cols).max(1)
 }
 
 /// Compute word-aware wrap segment boundaries for a line.
@@ -18669,29 +17516,6 @@ fn gutter_num_text(mode: LineNumberMode, line_idx: usize, cursor_line: usize) ->
     }
 }
 
-/// Pre-format the gutter string for one line.
-/// Returns an empty string when line numbers are disabled.
-fn format_gutter(
-    mode: LineNumberMode,
-    line_idx: usize,
-    cursor_line: usize,
-    gutter_char_width: usize,
-) -> String {
-    if gutter_char_width == 0 {
-        return String::new();
-    }
-    let num_text = match gutter_num_text(mode, line_idx, cursor_line) {
-        Some(t) => t,
-        None => return String::new(),
-    };
-    // Right-align within gutter_char_width - 1 (leave one char gap on the right)
-    format!(
-        "{:>width$}",
-        num_text,
-        width = gutter_char_width.saturating_sub(1)
-    )
-}
-
 /// Pre-format the gutter string with a fold indicator prefix.
 ///
 /// Layout: `[fold_char][number right-aligned in gutter_char_width-2 cols]`
@@ -19361,19 +18185,6 @@ pub fn compute_status_hit_regions(
         col += w;
     }
     regions
-}
-
-/// Resolve a column position to a `StatusAction` using pre-computed hit regions.
-pub fn resolve_status_bar_click(
-    hit_regions: &[(u16, u16, StatusAction)],
-    col: u16,
-) -> Option<StatusAction> {
-    for &(start, width, ref action) in hit_regions {
-        if col >= start && col < start + width {
-            return Some(action.clone());
-        }
-    }
-    None
 }
 
 // ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────
@@ -20671,20 +19482,6 @@ pub fn find_window_at(layout: &ScreenLayout, x: f64, y: f64) -> Option<usize> {
     })
 }
 
-/// Resolve a view-row + relative column to `(buf_line, text_col)` using
-/// the pre-computed `RenderedLine` data.
-pub fn resolve_text_position(
-    rw: &RenderedWindow,
-    view_row: usize,
-    text_rel_col: usize,
-) -> (usize, usize) {
-    let rl = rw.lines.get(view_row);
-    let buf_line = rl.map(|l| l.line_idx).unwrap_or(rw.scroll_top + view_row);
-    let seg_offset = rl.map(|l| l.segment_col_offset).unwrap_or(0);
-    let text_col = text_rel_col + rw.scroll_left + seg_offset;
-    (buf_line, text_col)
-}
-
 /// Determine which sub-zone of a window a point falls in.
 ///
 /// `rel_x` and `rel_y` are relative to the window's top-left corner.
@@ -20967,25 +19764,6 @@ pub fn status_bar_height_px(
     let wildmenu_px = if has_wildmenu { line_height } else { 0.0 };
     let global_rows = if per_window_status_line { 1.0 } else { 2.0 };
     line_height * global_rows + wildmenu_px
-}
-
-/// Compute the quickfix panel height in pixels (0 if closed).
-pub fn quickfix_height_px(line_height: f64, quickfix_open: bool, item_count: usize) -> f64 {
-    if quickfix_open {
-        let n = item_count.clamp(1, 10) as f64;
-        (n + 1.0) * line_height
-    } else {
-        0.0
-    }
-}
-
-/// Compute the terminal/bottom panel height in pixels (0 if closed).
-pub fn terminal_panel_height_px(line_height: f64, panel_open: bool, panel_rows: usize) -> f64 {
-    if panel_open {
-        (panel_rows + 2) as f64 * line_height
-    } else {
-        0.0
-    }
 }
 
 /// Compute the debug toolbar height in pixels (0 if hidden).
@@ -21340,109 +20118,119 @@ pub fn compute_tab_drop_overlay(
     }
 }
 
-/// Compute the scrollbar-to-scroll-top mapping from a click position.
-/// Returns the new `scroll_top` value.
-///
-/// - `click_pos`: relative position of click within the scrollbar track (0.0 .. track_len).
-/// - `track_len`: total length of the scrollbar track in pixels (or cells).
-/// - `total_lines`: total number of lines in the buffer.
-/// - `viewport_lines`: number of visible lines in the viewport.
-pub fn scrollbar_click_to_scroll_top(
-    click_pos: f64,
-    track_len: f64,
-    total_lines: usize,
-    viewport_lines: usize,
-) -> usize {
-    if track_len <= 0.0 || total_lines <= viewport_lines {
-        return 0;
-    }
-    let ratio = (click_pos / track_len).clamp(0.0, 1.0);
-    let max_scroll = total_lines.saturating_sub(viewport_lines);
-    ((ratio * max_scroll as f64).round() as usize).min(max_scroll)
-}
-
-/// Compute the display column from a pixel/cell X offset within the text area.
-/// Handles tab expansion (tabs = `tabstop` display columns).
-///
-/// - `line_text`: the text of the buffer line.
-/// - `x_offset`: click position relative to the text area start, in character-width units
-///   (i.e. `(pixel_x - gutter_px) / char_width` for pixel backends, or `col - gutter` for TUI).
-/// - `tabstop`: tab stop width (default 4).
-/// - `scroll_left`: horizontal scroll offset in display columns.
-///
-/// Returns the buffer column index.
-pub fn display_col_to_buffer_col(
-    line_text: &str,
-    x_offset: usize,
-    tabstop: usize,
-    scroll_left: usize,
-) -> usize {
-    let target_display_col = x_offset + scroll_left;
-    let mut display_col = 0usize;
-    for (i, ch) in line_text.chars().enumerate() {
-        if display_col >= target_display_col {
-            return i;
-        }
-        if ch == '\t' {
-            display_col += tabstop - (display_col % tabstop);
-        } else {
-            display_col += 1;
-        }
-    }
-    line_text.chars().count()
-}
-
-/// Check if a click at `col` within a tab of total width `tab_width` is on the close button.
-/// Close button occupies the rightmost `close_cols` columns of the tab.
-pub fn is_tab_close_click(col_in_tab: usize, tab_width: usize, close_cols: usize) -> bool {
-    tab_width > close_cols && col_in_tab >= tab_width - close_cols
-}
-
-/// Matches a key binding string (e.g. `<C-S-e>`) against abstract modifier flags
-/// and a key name/char. This is the backend-agnostic core of key matching.
-///
-/// - `binding`: Vim-style binding string like `<C-b>`, `<C-S-e>`, `<A-x>`.
-/// - `ctrl`, `shift`, `alt`: whether these modifiers are pressed.
-/// - `key_char`: the lowercase character of the pressed key (if printable).
-/// - `is_tab`: true if the pressed key is Tab.
-/// - `is_space`: true if the pressed key is Space.
-/// - `is_escape`: true if the pressed key is Escape.
-#[allow(clippy::too_many_arguments)]
-pub fn matches_key_binding(
-    binding: &str,
-    ctrl: bool,
-    shift: bool,
-    alt: bool,
-    key_char: Option<char>,
-    is_tab: bool,
-    is_space: bool,
-    is_escape: bool,
-) -> bool {
-    let Some((want_ctrl, want_shift, want_alt, key_name)) =
-        crate::core::settings::parse_key_binding_named(binding)
-    else {
-        return false;
-    };
-    if want_ctrl != ctrl || want_shift != shift || want_alt != alt {
-        return false;
-    }
-    match key_name.as_str() {
-        "Tab" | "tab" => is_tab,
-        "Space" | "space" => is_space,
-        "Escape" | "Esc" => is_escape,
-        s if s.chars().count() == 1 => {
-            let want = s.chars().next().unwrap().to_ascii_lowercase();
-            key_char
-                .map(|c| c.to_ascii_lowercase() == want)
-                .unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Test-only geometry/key helpers (#812) ────────────────────────────
+    //
+    // These four were `pub fn` in the production body of this file with zero
+    // callers outside `mod tests` — every backend routes the real thing
+    // through the click/keymap paths instead. #812 moved them here rather
+    // than deleting them: the tests below are the only consumers, and they
+    // pin behaviour (tab-expansion, close-button hit box, `<C-S-x>` parsing)
+    // that is still worth asserting. If a backend ever needs one, lift it
+    // back out — do not add a second copy.
+
+    /// Compute the scrollbar-to-scroll-top mapping from a click position.
+    /// Returns the new `scroll_top` value.
+    ///
+    /// - `click_pos`: relative position of click within the scrollbar track (0.0 .. track_len).
+    /// - `track_len`: total length of the scrollbar track in pixels (or cells).
+    /// - `total_lines`: total number of lines in the buffer.
+    /// - `viewport_lines`: number of visible lines in the viewport.
+    fn scrollbar_click_to_scroll_top(
+        click_pos: f64,
+        track_len: f64,
+        total_lines: usize,
+        viewport_lines: usize,
+    ) -> usize {
+        if track_len <= 0.0 || total_lines <= viewport_lines {
+            return 0;
+        }
+        let ratio = (click_pos / track_len).clamp(0.0, 1.0);
+        let max_scroll = total_lines.saturating_sub(viewport_lines);
+        ((ratio * max_scroll as f64).round() as usize).min(max_scroll)
+    }
+
+    /// Compute the display column from a pixel/cell X offset within the text area.
+    /// Handles tab expansion (tabs = `tabstop` display columns).
+    ///
+    /// - `line_text`: the text of the buffer line.
+    /// - `x_offset`: click position relative to the text area start, in character-width units
+    ///   (i.e. `(pixel_x - gutter_px) / char_width` for pixel backends, or `col - gutter` for TUI).
+    /// - `tabstop`: tab stop width (default 4).
+    /// - `scroll_left`: horizontal scroll offset in display columns.
+    ///
+    /// Returns the buffer column index.
+    fn display_col_to_buffer_col(
+        line_text: &str,
+        x_offset: usize,
+        tabstop: usize,
+        scroll_left: usize,
+    ) -> usize {
+        let target_display_col = x_offset + scroll_left;
+        let mut display_col = 0usize;
+        for (i, ch) in line_text.chars().enumerate() {
+            if display_col >= target_display_col {
+                return i;
+            }
+            if ch == '\t' {
+                display_col += tabstop - (display_col % tabstop);
+            } else {
+                display_col += 1;
+            }
+        }
+        line_text.chars().count()
+    }
+
+    /// Check if a click at `col` within a tab of total width `tab_width` is on the close button.
+    /// Close button occupies the rightmost `close_cols` columns of the tab.
+    fn is_tab_close_click(col_in_tab: usize, tab_width: usize, close_cols: usize) -> bool {
+        tab_width > close_cols && col_in_tab >= tab_width - close_cols
+    }
+
+    /// Matches a key binding string (e.g. `<C-S-e>`) against abstract modifier flags
+    /// and a key name/char. This is the backend-agnostic core of key matching.
+    ///
+    /// - `binding`: Vim-style binding string like `<C-b>`, `<C-S-e>`, `<A-x>`.
+    /// - `ctrl`, `shift`, `alt`: whether these modifiers are pressed.
+    /// - `key_char`: the lowercase character of the pressed key (if printable).
+    /// - `is_tab`: true if the pressed key is Tab.
+    /// - `is_space`: true if the pressed key is Space.
+    /// - `is_escape`: true if the pressed key is Escape.
+    #[allow(clippy::too_many_arguments)]
+    fn matches_key_binding(
+        binding: &str,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        key_char: Option<char>,
+        is_tab: bool,
+        is_space: bool,
+        is_escape: bool,
+    ) -> bool {
+        let Some((want_ctrl, want_shift, want_alt, key_name)) =
+            crate::core::settings::parse_key_binding_named(binding)
+        else {
+            return false;
+        };
+        if want_ctrl != ctrl || want_shift != shift || want_alt != alt {
+            return false;
+        }
+        match key_name.as_str() {
+            "Tab" | "tab" => is_tab,
+            "Space" | "space" => is_space,
+            "Escape" | "Esc" => is_escape,
+            s if s.chars().count() == 1 => {
+                let want = s.chars().next().unwrap().to_ascii_lowercase();
+                key_char
+                    .map(|c| c.to_ascii_lowercase() == want)
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
 
     // ─── Frame composition (#735 slices 1-6, folded by #766) ──────────────
 
@@ -24382,209 +23170,6 @@ mod tests {
                 "status should show normal mode, got: {mode_text}"
             );
         }
-    }
-
-    // ─── Backend Parity Tests ────────────────────────────────────────────────
-
-    /// Helper: compute the set difference (elements in `expected` but not in `actual`).
-    fn missing_elements(expected: &[UiElement], actual: &[UiElement]) -> Vec<UiElement> {
-        let actual_set: std::collections::HashSet<_> = actual.iter().collect();
-        expected
-            .iter()
-            .filter(|e| !actual_set.contains(e))
-            .cloned()
-            .collect()
-    }
-
-    #[test]
-    fn test_parity_basic_layout_tui() {
-        let e = test_engine("Hello\nWorld\n");
-        let layout = render_engine(&e, 80.0, 24.0);
-
-        let expected = collect_expected_ui_elements(&layout);
-        let tui = collect_ui_elements_tui(&layout);
-        let missing = missing_elements(&expected, &tui);
-        assert!(
-            missing.is_empty(),
-            "TUI missing elements: {missing:?}\n  expected: {expected:?}\n  got: {tui:?}"
-        );
-    }
-
-    #[test]
-    fn test_parity_basic_layout_wingui() {
-        let e = test_engine("Hello\nWorld\n");
-        let layout = render_engine(&e, 80.0, 24.0);
-
-        let expected = collect_expected_ui_elements(&layout);
-        let wingui = collect_ui_elements_wingui(&layout);
-        let missing = missing_elements(&expected, &wingui);
-        assert!(
-            missing.is_empty(),
-            "Win-GUI missing elements: {missing:?}\n  expected: {expected:?}\n  got: {wingui:?}"
-        );
-    }
-
-    #[test]
-    fn test_parity_with_completion_popup() {
-        let mut e = test_engine("fn main() {\n    let x = 1;\n}\n");
-        // Simulate an active completion menu
-        e.completion_candidates = vec!["println".to_string(), "print".to_string()];
-        e.completion_idx = Some(0);
-        e.completion_start_col = 0;
-        let layout = render_engine(&e, 80.0, 24.0);
-        // The completion popup should be present
-        assert!(layout.completion.is_some(), "completion should be active");
-
-        let expected = collect_expected_ui_elements(&layout);
-        for (name, collector) in [
-            (
-                "TUI",
-                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
-            ),
-            ("Win-GUI", collect_ui_elements_wingui),
-        ] {
-            let actual = collector(&layout);
-            let missing = missing_elements(&expected, &actual);
-            assert!(
-                missing.is_empty(),
-                "{name} missing elements with completion: {missing:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_parity_with_dialog() {
-        use crate::core::engine::DialogButton;
-        let mut e = test_engine("test content\n");
-        e.show_dialog(
-            "test_dialog",
-            "Confirm",
-            vec!["Are you sure?".to_string()],
-            vec![
-                DialogButton {
-                    label: "Yes".into(),
-                    hotkey: 'y',
-                    action: "yes".into(),
-                },
-                DialogButton {
-                    label: "No".into(),
-                    hotkey: 'n',
-                    action: "no".into(),
-                },
-            ],
-        );
-        let layout = render_engine(&e, 80.0, 24.0);
-        assert!(layout.dialog.is_some(), "dialog should be active");
-
-        let expected = collect_expected_ui_elements(&layout);
-        for (name, collector) in [
-            (
-                "TUI",
-                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
-            ),
-            ("Win-GUI", collect_ui_elements_wingui),
-        ] {
-            let actual = collector(&layout);
-            let missing = missing_elements(&expected, &actual);
-            assert!(
-                missing.is_empty(),
-                "{name} missing elements with dialog: {missing:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_parity_with_menu_bar() {
-        let mut e = test_engine("hello\n");
-        e.menu_bar_visible = true;
-        let layout = render_engine(&e, 80.0, 24.0);
-        assert!(layout.menu_bar_visible, "menu bar should be visible");
-
-        let expected = collect_expected_ui_elements(&layout);
-        for (name, collector) in [
-            (
-                "TUI",
-                collect_ui_elements_tui as fn(&ScreenLayout) -> Vec<UiElement>,
-            ),
-            ("Win-GUI", collect_ui_elements_wingui),
-        ] {
-            let actual = collector(&layout);
-            let missing = missing_elements(&expected, &actual);
-            assert!(
-                missing.is_empty(),
-                "{name} missing elements with menu bar: {missing:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_parity_wingui_no_known_gaps() {
-        // All previously-known Win-GUI gaps have been fixed.  This test
-        // verifies that no regressions have been introduced.
-        let mut e = test_engine("hello world\n");
-        e.menu_bar_visible = true;
-        e.debug_toolbar_visible = true;
-        e.dap_session_active = true;
-        let layout = render_engine(&e, 80.0, 24.0);
-
-        let expected = collect_expected_ui_elements(&layout);
-        let wingui = collect_ui_elements_wingui(&layout);
-        let missing = missing_elements(&expected, &wingui);
-        assert!(
-            missing.is_empty(),
-            "Win-GUI missing elements (regressions): {missing:?}"
-        );
-    }
-
-    #[test]
-    fn test_parity_all_elements_covered_by_expected() {
-        // Verify that collect_expected_ui_elements produces at least the
-        // baseline set of elements for a simple layout.
-        let e = test_engine("line1\nline2\n");
-        let layout = render_engine(&e, 80.0, 24.0);
-        let expected = collect_expected_ui_elements(&layout);
-
-        // Must always have: tab bar, at least one window, command line, activity bar
-        assert!(expected.contains(&UiElement::TabBar));
-        assert!(expected.contains(&UiElement::EditorWindow { window_idx: 0 }));
-        assert!(expected.contains(&UiElement::CommandLine));
-        assert!(expected.contains(&UiElement::ActivityBar));
-    }
-
-    // ── Phase 2c: Action / click-handler parity tests ───────────────────
-
-    #[test]
-    fn test_action_parity_tui_covers_all_required() {
-        let required = all_required_ui_actions();
-        let tui = collect_ui_actions_tui();
-        let missing: Vec<_> = required.iter().filter(|a| !tui.contains(a)).collect();
-        assert!(
-            missing.is_empty(),
-            "TUI missing required actions: {missing:?}"
-        );
-    }
-
-    #[test]
-    fn test_action_parity_wingui_covers_all_required() {
-        let required = all_required_ui_actions();
-        let wingui = collect_ui_actions_wingui();
-        let missing: Vec<_> = required.iter().filter(|a| !wingui.contains(a)).collect();
-        assert!(
-            missing.is_empty(),
-            "Win-GUI missing required actions: {missing:?}"
-        );
-    }
-
-    #[test]
-    fn test_action_parity_wingui_matches_tui() {
-        let tui = collect_ui_actions_tui();
-        let wingui = collect_ui_actions_wingui();
-        let tui_only: Vec<_> = tui.iter().filter(|a| !wingui.contains(a)).collect();
-        let wingui_only: Vec<_> = wingui.iter().filter(|a| !tui.contains(a)).collect();
-        assert!(
-            tui_only.is_empty() && wingui_only.is_empty(),
-            "Action parity mismatch:\n  TUI-only: {tui_only:?}\n  Win-GUI-only: {wingui_only:?}"
-        );
     }
 
     /// Test that `open_file_preview` reuses/creates a preview tab, NOT replacing

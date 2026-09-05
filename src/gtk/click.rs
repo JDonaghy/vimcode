@@ -51,13 +51,6 @@ pub(crate) fn pixel_to_click_target(
     // `hit_regions` on `cached_layout` do NOT match the drawn geometry — clicks
     // must resolve against these actual pixel bounds. (#515)
     tab_pixel_hits: &TabPixelHitMap,
-    // Legacy per-backend pixel maps — no longer consulted for tab-bar clicks.
-    // Kept in the signature so existing call sites compile unchanged; slated for
-    // removal along with the rest of the pixel-map plumbing. (#515)
-    _tab_slot_positions: &TabSlotMap,
-    _diff_btn_map: &DiffBtnMap,
-    _split_btn_map: &SplitBtnMap,
-    _action_btn_map: &ActionBtnMap,
     // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
     // painted this frame (#449), plus a `FrameZone::TabBar { idx } -> (GroupId,
     // rect)` table keyed by the tab bar's *global* surface index (editors are
@@ -517,10 +510,6 @@ pub(crate) fn handle_mouse_click(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
-    tab_slot_positions: &TabSlotMap,
-    diff_btn_map: &DiffBtnMap,
-    split_btn_map: &SplitBtnMap,
-    action_btn_map: &ActionBtnMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) -> (Option<bool>, Option<EngineAction>) {
@@ -533,10 +522,6 @@ pub(crate) fn handle_mouse_click(
         char_width,
         cached_layout,
         tab_pixel_hits,
-        tab_slot_positions,
-        diff_btn_map,
-        split_btn_map,
-        action_btn_map,
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
@@ -615,10 +600,6 @@ pub(crate) fn handle_mouse_double_click(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
-    tab_slot_positions: &TabSlotMap,
-    diff_btn_map: &DiffBtnMap,
-    split_btn_map: &SplitBtnMap,
-    action_btn_map: &ActionBtnMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
@@ -631,10 +612,6 @@ pub(crate) fn handle_mouse_double_click(
         char_width,
         cached_layout,
         tab_pixel_hits,
-        tab_slot_positions,
-        diff_btn_map,
-        split_btn_map,
-        action_btn_map,
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
@@ -668,10 +645,6 @@ pub(crate) fn handle_mouse_drag(
     char_width: f64,
     cached_layout: &render::ScreenLayout,
     tab_pixel_hits: &TabPixelHitMap,
-    tab_slot_positions: &TabSlotMap,
-    diff_btn_map: &DiffBtnMap,
-    split_btn_map: &SplitBtnMap,
-    action_btn_map: &ActionBtnMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) {
@@ -684,10 +657,6 @@ pub(crate) fn handle_mouse_drag(
         char_width,
         cached_layout,
         tab_pixel_hits,
-        tab_slot_positions,
-        diff_btn_map,
-        split_btn_map,
-        action_btn_map,
         frame_hit_map,
         tab_bar_zones,
         false, // drag continuation: pure query, no focus/tab/gutter side effects
@@ -1073,20 +1042,8 @@ mod cross_split_drag_focus_tests {
     use super::*;
     use crate::render::build_screen_layout;
 
-    fn empty_maps() -> (
-        TabPixelHitMap,
-        TabSlotMap,
-        DiffBtnMap,
-        SplitBtnMap,
-        ActionBtnMap,
-    ) {
-        (
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-        )
+    fn empty_tab_pixel_hits() -> TabPixelHitMap {
+        HashMap::new()
     }
 
     #[test]
@@ -1130,8 +1087,7 @@ mod cross_split_drag_focus_tests {
         let y_in_b = rw_b.rect.y + line_height * 2.0;
 
         let backend = Rc::new(RefCell::new(super::super::backend::GtkBackend::new()));
-        let (tab_pixel_hits, tab_slot_positions, diff_btn_map, split_btn_map, action_btn_map) =
-            empty_maps();
+        let tab_pixel_hits = empty_tab_pixel_hits();
 
         // Drag continuation: the mouse is over window B's pixels, but this
         // must resolve as a pure hit-test — no focus/group side effects.
@@ -1144,10 +1100,6 @@ mod cross_split_drag_focus_tests {
             char_width,
             &screen,
             &tab_pixel_hits,
-            &tab_slot_positions,
-            &diff_btn_map,
-            &split_btn_map,
-            &action_btn_map,
             None, // no cached FrameHitMap in this test — exercises the
             // `screen_zone_hit_test` fallback path (#449)
             &HashMap::new(),
@@ -1191,10 +1143,6 @@ mod cross_split_drag_focus_tests {
             char_width,
             &screen,
             &tab_pixel_hits,
-            &tab_slot_positions,
-            &diff_btn_map,
-            &split_btn_map,
-            &action_btn_map,
             None,
             &HashMap::new(),
             true, // mutate_focus: genuine click
@@ -1366,10 +1314,6 @@ mod frame_hit_map_tests {
 
         let backend = Rc::new(RefCell::new(super::super::backend::GtkBackend::new()));
         let empty_pixel_hits: TabPixelHitMap = HashMap::new();
-        let empty_slots: TabSlotMap = HashMap::new();
-        let empty_diff: DiffBtnMap = HashMap::new();
-        let empty_split: SplitBtnMap = HashMap::new();
-        let empty_action: ActionBtnMap = HashMap::new();
 
         let target = pixel_to_click_target(
             &mut engine,
@@ -1380,10 +1324,6 @@ mod frame_hit_map_tests {
             char_width,
             &screen,
             &empty_pixel_hits,
-            &empty_slots,
-            &empty_diff,
-            &empty_split,
-            &empty_action,
             Some(&hit_map),
             &tab_bar_zones,
             true,
@@ -1557,10 +1497,6 @@ mod single_group_tab_click_dispatch_tests {
                 self.char_width,
                 &self.screen,
                 &self.tab_pixel_hits,
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::new(),
                 None,
                 &HashMap::new(),
                 true, // a genuine click
@@ -1581,10 +1517,6 @@ mod single_group_tab_click_dispatch_tests {
                 self.char_width,
                 &self.screen,
                 &self.tab_pixel_hits,
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashMap::new(),
                 None,
                 &HashMap::new(),
             )
