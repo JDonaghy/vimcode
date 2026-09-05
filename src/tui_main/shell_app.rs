@@ -5756,6 +5756,190 @@ mod tests {
         );
     }
 
+    /// #817 regression coverage, extension-panel site (`mouse.rs`'s
+    /// `SidebarOwner::ExtPanel` arm, one of the four hand-rolled
+    /// 400ms/position detectors this issue deleted — formerly around
+    /// `:1958`). `engine.handle_ext_panel_double_click()` is a no-op for a
+    /// section-*header* row (`ext_panel_flat_to_section` returns
+    /// `item_idx == usize::MAX`, and the function bails on that), while the
+    /// *single*-click branch (`handle_ext_panel_key("Return", ..)`) toggles
+    /// the section's expand/collapse state. So a genuine double-click on a
+    /// header must leave the section exactly as it was; a real double-click
+    /// that gets mis-read as a plain click collapses it, hiding its item.
+    ///
+    /// Uses `TuiDriver::double_click` (quadraui#592) to deliver a single
+    /// synthetic `UiEvent::DoubleClick` with no preceding click — this is
+    /// what proves the fold reads the backend's own `DoubleClickDetector`
+    /// verdict instead of re-deriving one from a local click-timing/position
+    /// history: the *hand-rolled* detector `#817` deleted had no prior
+    /// `last_click_time` to compare against on a lone injected event, so it
+    /// would have classified this as a first, ordinary single click and
+    /// toggled the section closed — this test is RED against that behavior
+    /// (verified by temporarily hardcoding the `ext_panel` arm's `is_double`
+    /// to `false`, which reproduces exactly that: the item disappears) and
+    /// green against the fix, which reads the already-correct verdict
+    /// `TuiBackend`'s detector attached to the injected event.
+    #[test]
+    fn tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.use_nerd_fonts = false;
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["AlphaZQXW817".to_string()],
+            },
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "AlphaZQXW817".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "AlphaItemZQXW817".to_string(),
+                id: "item1".to_string(),
+                ..Default::default()
+            }],
+        );
+        // Start on a panel *other* than Explorer, so frame 1 never paints
+        // the explorer tree: `TuiShellApp::handle_mouse_event`'s Explorer
+        // `TreeController` intercept only re-checks `active_panel_is(
+        // PANEL_EXPLORER)`, not whether `explorer_tree_rect` is stale, so a
+        // rect the Explorer's own render left behind keeps claiming every
+        // later click landing in that same screen region — including ones
+        // meant for a plugin panel that has since taken over the sidebar
+        // body. Not this test's bug to fix, just a trap it must not fall
+        // into (mirrors the "not this test's bug to fix" scroll-surface trap
+        // `tui_editor_double_click_selects_the_word_via_shared_dispatch`
+        // documents above).
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        // Same reveal-then-click sequence as
+        // `driver_click_on_extension_icon_opens_the_plugin_panel`: one benign
+        // event lets `take_requested_panel` steer the runner onto the shadow's
+        // real panel before the icon click, and row 7 is this fixture's only
+        // extension icon (hamburger@0 .. ai@6, ext@7).
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        driver.click(1.0, 7.0);
+
+        assert!(
+            driver.screen_contains("AlphaItemZQXW817"),
+            "precondition: the section defaults to expanded, so its item \
+             must already be painted; screen:\n{}",
+            driver.screen()
+        );
+
+        let header = driver
+            .find_bounds("AlphaZQXW817")
+            .expect("the section header should be painted");
+        let header_col = header.x as u16 + 1;
+        // The row to *click*, mirroring `mouse.rs`'s `SidebarOwner::ExtPanel`
+        // arm's own formula (`sidebar_row = content_start + flat_idx`, here
+        // `flat_idx = 0` for the section header) rather than the row
+        // `find_bounds` reports the header *painted* at — the two disagree by
+        // one row in this fixture (menu bar hidden, so `menu_rows == 0`; no
+        // search input active, so `content_start == 1`), the same kind of
+        // paint/click-router mismatch
+        // `tui_settings_double_click_toggles_a_boolean_row_via_shared_dispatch`
+        // documents and works around for the Settings sidebar, unrelated to
+        // #817.
+        let header_click_row = 1u16;
+
+        driver.double_click(header_col as f32, header_click_row as f32 + 0.5);
+
+        assert!(
+            driver.screen_contains("AlphaItemZQXW817"),
+            "a genuine double-click on an ext-panel section header must not \
+             toggle its expand/collapse state — `handle_ext_panel_double_click` \
+             no-ops on header rows and the single-click `Return` toggle must \
+             be suppressed by `is_double_click` — but the item under the \
+             section disappeared, meaning the double-click was mis-read as a \
+             plain click; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #817 regression coverage, git/source-control sidebar site
+    /// (`mouse.rs`'s `SidebarOwner::Git` arm, one of the four hand-rolled
+    /// 400ms/position detectors this issue deleted — formerly around
+    /// `:2076`): a genuine double-click on a changed file's row must open it
+    /// via `engine.handle_sc_sidebar_ui_event(DoubleClick)` ->
+    /// `sc_activate_row`, exactly like double-clicking a file in the
+    /// Explorer. The file here is untracked (`unstaged: Untracked`), so
+    /// `sc_activate_row`'s `is_new` branch takes the plain-open path
+    /// (`open_file_with_mode`) rather than the diff-split path — no real
+    /// `git show`/`diff` subprocess needed, just the `git rev-parse
+    /// --show-toplevel` `find_repo_root` always runs (a real, fast, git repo
+    /// this test creates with `git init`).
+    ///
+    /// A single `TuiDriver::double_click` (quadraui#592) delivers one
+    /// synthetic `UiEvent::DoubleClick` with no preceding click — `mouse.rs`'s
+    /// `Git` arm folds that one event into both an ordinary `MouseDown` (which
+    /// selects the row via `route_sc_sidebar_click`) and, because
+    /// `is_double_click` is true, a second `UiEvent::DoubleClick` fed straight
+    /// to `handle_sc_sidebar_ui_event` — so one call is enough to select *and*
+    /// activate the row. Verified RED (by temporarily hardcoding the `Git`
+    /// arm's `is_double` to `false`) against the deleted hand-rolled
+    /// detector's behavior: a lone injected event has no `last_click_time` to
+    /// compare against, so the old 400ms/position timer would have read it as
+    /// a first, ordinary click and never opened the file.
+    #[test]
+    fn tui_sc_sidebar_double_click_on_a_changed_file_opens_it() {
+        let dir = std::env::temp_dir().join("vimcode_sc817_double_click");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        let file_path = dir.join("sc817file.txt");
+        std::fs::write(&file_path, "sc817ZQXWBODYMARKER\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.sc_file_statuses = vec![crate::core::git::FileStatus {
+            path: "sc817file.txt".to_string(),
+            staged: None,
+            unstaged: Some(crate::core::git::StatusKind::Untracked),
+        }];
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+        assert!(
+            !driver.screen_contains("sc817ZQXWBODYMARKER"),
+            "precondition: no file should be open yet, so its body text must \
+             not be painted anywhere; screen:\n{}",
+            driver.screen()
+        );
+
+        let row = driver
+            .find_bounds("sc817file.txt")
+            .expect("the unstaged file row should be painted");
+
+        driver.double_click(row.x + 1.0, row.y + row.height / 2.0);
+
+        assert!(
+            driver.screen_contains("sc817ZQXWBODYMARKER"),
+            "double-clicking a changed file's row in the source-control \
+             sidebar must open it via `sc_activate_row` (reading `is_double`, \
+             this issue's shared verdict), but the file's body text never \
+             appeared in the editor pane; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #609: `render_content` must also paint the tab-hover tooltip —
     /// `render_tab_hover_tooltip`, ported from `draw_frame`'s raw-`Buffer`
     /// write to `Backend::draw_status_bar` (see that function's doc
