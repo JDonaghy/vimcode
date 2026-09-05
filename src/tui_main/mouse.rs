@@ -261,7 +261,7 @@ pub(super) fn handle_mouse(
     last_layout: Option<&render::ScreenLayout>,
     last_click_time: &mut Instant,
     last_click_pos: &mut (u16, u16),
-    folder_picker: &mut Option<FolderPickerState>,
+    folder_picker: &mut Option<quadraui::FolderPickerController>,
     cmd_sel: &mut Option<(usize, usize)>,
     cmd_dragging: &mut bool,
     should_quit: &mut bool,
@@ -688,43 +688,33 @@ pub(super) fn handle_mouse(
     }
     // ── Folder picker mouse handling ────────────────────────────────────────────
     //
-    // #751 verdict: **deliberately one-sided, do not converge.** Every other
-    // rung in `handle_mouse` above has a GTK twin that
-    // `render::route_modal_overlay_click` now arbitrates for both backends.
-    // This one does not: GTK opens the *native* GTK file chooser, deferred
-    // through `PendingFileDialog` and run from `tick()`, so there is no GTK
-    // canvas surface to hit-test and nothing for a shared router to arbitrate
-    // against. (`render::OVERLAY_Z_ORDER` records the same verdict for the
-    // paint side.) Inventing a GTK canvas picker purely to make the two tables
-    // match would add per-backend code, not remove it — the opposite of
-    // `GOALS.md` milestone #7.
+    // #815: `quadraui::FolderPickerController` now paints on both backends
+    // (`render::FrameOp::FolderPicker`), but it still swallows every click
+    // while open rather than competing for z-order through
+    // `render::route_modal_overlay_click` / `MOUSE_ARBITRATION_ORDER` — see
+    // `render::route_folder_picker_click`'s doc comment. GTK's
+    // `handle_mouse_click_msg` checks the identical shared helper.
     if let Some(ref mut picker) = folder_picker {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
             let term_cols = terminal_size.map(|s| s.width).unwrap_or(80);
             let term_rows = terminal_size.map(|s| s.height).unwrap_or(24);
-            let popup_w = (term_cols * 3 / 5).max(50);
-            let popup_h = (term_rows * 55 / 100).max(15);
-            let popup_x = (term_cols.saturating_sub(popup_w)) / 2;
-            let popup_y = (term_rows.saturating_sub(popup_h)) / 2;
-            let results_start = popup_y + 3;
-            let results_end = popup_y + popup_h - 1;
-
-            if col >= popup_x
-                && col < popup_x + popup_w
-                && row >= results_start
-                && row < results_end
-            {
-                let clicked_idx = picker.scroll_top + (row - results_start) as usize;
-                if clicked_idx < picker.filtered.len() {
-                    picker.selected = clicked_idx;
+            let viewport = quadraui::Rect::new(0.0, 0.0, term_cols as f32, term_rows as f32);
+            let popup_rect = render::folder_picker_popup_rect(viewport, 1.0);
+            match render::route_folder_picker_click(
+                popup_rect,
+                col as f32,
+                row as f32,
+                1.0,
+                picker.scroll_top(),
+                picker.filtered().len(),
+            ) {
+                render::FolderPickerClickRoute::SelectRow(idx) => {
+                    render::set_folder_picker_selected(picker, idx);
+                    let visible_rows = render::folder_picker_visible_rows(popup_rect, 1.0);
+                    picker.sync_scroll(visible_rows);
                 }
-            } else if col < popup_x
-                || col >= popup_x + popup_w
-                || row < popup_y
-                || row >= popup_y + popup_h
-            {
-                // Click outside popup — dismiss
-                *folder_picker = None;
+                render::FolderPickerClickRoute::Consume => {}
+                render::FolderPickerClickRoute::Dismiss => *folder_picker = None,
             }
             return sidebar_width;
         }

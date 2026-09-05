@@ -1002,7 +1002,8 @@ pub enum PickerSource {
     /// Line ending picker (LF / CRLF).
     LineEndings,
     /// Recent workspaces (#274). Replaces the native GTK Dialog and the
-    /// TUI's `FolderPickerState::new_recent` with the engine-driven picker.
+    /// TUI's old `FolderPickerState::new_recent` (removed, #815) with the
+    /// engine-driven picker.
     RecentWorkspaces,
     Custom(String),
 }

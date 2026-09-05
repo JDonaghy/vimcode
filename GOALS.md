@@ -79,6 +79,12 @@ Also closed earlier in the arc and still true: `fn event_loop` does not exist in
 `src/`; `src/gtk/draw.rs` is deleted; both `ShellApp` migrations (#448, #595) are
 closed.
 
+**`#815` closed the folder-picker gap §1b/§4 below found.** The TUI-local
+`FolderPickerState` is deleted; both backends now share
+`quadraui::FolderPickerController` through `FrameOp::FolderPicker` — GTK's
+`open_folder_dialog` no longer opens a native `gtk4::FileDialog`. See
+`docs/IRREDUCIBLE_SURFACE.md` §1b.
+
 ## 📏 The post-#735 audit — run, and it missed its projection
 
 The previous revision of this file said: *"re-run the sizing audit when #735 lands

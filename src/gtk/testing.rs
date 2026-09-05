@@ -7085,6 +7085,106 @@ mod modal_rung {
     }
 }
 
+/// #815 — adopting `quadraui::FolderPickerController` on GTK, replacing the
+/// *native* `gtk4::FileDialog` `open_folder_dialog` used to open.
+///
+/// The GTK half of the cross-backend pair; the TUI half lives in
+/// `tui_main::shell_app`'s `folder_picker_*_via_shell_app` tests.
+#[cfg(test)]
+mod folder_picker {
+    use super::*;
+    use crate::core::engine::PickerSource;
+
+    /// Confirming "File: Open Folder…" from the command palette must open
+    /// the shared `Palette`-based picker instead of a native chooser this
+    /// headless harness can never see (no `gtk4::Window` — see this module's
+    /// own doc, "No window"), and navigating + confirming an entry there
+    /// must actually call `Engine::open_folder`.
+    ///
+    /// RED against unfixed `develop`: pre-#815 `App::open_folder_dialog`
+    /// called `gtk4::FileDialog::select_folder`, so the picker this test
+    /// looks for did not exist as a paintable surface at all — this would
+    /// fail at the first `screen_contains("Open Folder")` assertion below,
+    /// after the command palette had already closed with nothing else
+    /// painted in its place.
+    #[test]
+    fn command_palette_confirm_opens_the_shared_picker_which_navigates_and_confirms() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.open_picker(PickerSource::CommandCenter);
+        let starting_cwd = engine
+            .cwd
+            .canonicalize()
+            .unwrap_or_else(|_| engine.cwd.clone());
+
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            h.driver.screen_contains("Show and Run Commands"),
+            "fixture must open the command palette on its default \
+             (prefix-picker) landing page; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // ">" switches the unified picker into "Show and Run Commands" mode
+        // (`picker_filter_command_center`'s prefix routing) — only then does
+        // the flat `PaletteCommand` list (which "File: Open Folder…" lives
+        // in) become the thing being filtered. Type-to-filter down to the
+        // one item, the same way a user would.
+        h.driver.type_char('>');
+        for c in "Open Folder".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("File: Open Folder"),
+            "typing must reach the picker's query and keep the matching \
+             item visible; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("File: Open Folder"),
+            "confirming must close the command palette; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("Open Folder"),
+            "confirming \"File: Open Folder…\" must dispatch \
+             `EngineAction::OpenFolderDialog`, which `App::open_folder_dialog` \
+             (#815) now answers by opening the shared \
+             `FolderPickerController` palette instead of a native \
+             `gtk4::FileDialog` this harness could never see; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Entries sort as ["..", ".", ...] — move down once to reach "."
+        // (the engine's own cwd), then confirm it.
+        h.driver.press_named(quadraui::NamedKey::Down);
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("Open Folder "),
+            "confirming an entry must close the folder picker; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        let confirmed_cwd = {
+            let engine = h.engine.borrow();
+            engine
+                .cwd
+                .canonicalize()
+                .unwrap_or_else(|_| engine.cwd.clone())
+        };
+        assert_eq!(
+            confirmed_cwd, starting_cwd,
+            "confirming \".\" must call `Engine::open_folder` with the \
+             picker's root, round-tripping back to the same directory"
+        );
+    }
+}
+
 /// #752 / #733 slice 2 — the chrome rung: breadcrumbs, the three status
 /// bands, and the global status bar, all sequenced by
 /// `render::route_chrome_click` and shared verbatim with TUI's `handle_mouse`.
