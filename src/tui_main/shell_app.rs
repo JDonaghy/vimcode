@@ -1997,8 +1997,12 @@ impl ShellApp for TuiShellApp {
                 // ── Wildmenu bar (command Tab completion) ────────────────
                 render::FrameOp::Wildmenu => {
                     if let Some(ref wm) = screen.wildmenu {
-                        let bar = render::wildmenu_to_status_bar(wm, &theme);
-                        backend.draw_status_bar(to_q_rect(chrome.wildmenu), &bar, None, None);
+                        render::paint_wildmenu_rung(
+                            backend,
+                            wm,
+                            &theme,
+                            to_q_rect(chrome.wildmenu),
+                        );
                         composed.push(render::FrameOp::Wildmenu);
                     }
                 }
@@ -2006,9 +2010,12 @@ impl ShellApp for TuiShellApp {
                 // ── Global status bar ────────────────────────────────────
                 render::FrameOp::StatusBar => {
                     if let Some(ref bar) = screen.global_status_bar {
-                        let q_rect = to_q_rect(chrome.status);
-                        self.engine.global_status_rect.set(q_rect);
-                        backend.draw_status_bar(q_rect, bar, None, None);
+                        let _ = render::paint_global_status_bar_rung(
+                            backend,
+                            &self.engine,
+                            bar,
+                            to_q_rect(chrome.status),
+                        );
                         composed.push(render::FrameOp::StatusBar);
                     }
                 }
@@ -2071,8 +2078,7 @@ impl ShellApp for TuiShellApp {
                 // directly) — hence the unconditional clear before the walk.
                 render::FrameOp::CommandCenter => {
                     if let Some((cc_rect, cc)) = pending_command_center.take() {
-                        let painted = backend.draw_command_center(cc_rect, &cc);
-                        self.engine.command_center_layout.replace(Some(painted));
+                        render::paint_command_center_rung(backend, &self.engine, cc_rect, &cc);
                         composed.push(render::FrameOp::CommandCenter);
                     }
                 }
@@ -2083,7 +2089,7 @@ impl ShellApp for TuiShellApp {
                 // supplies the clip viewport.
                 render::FrameOp::FindReplace => {
                     if let Some(ref find_replace) = screen.find_replace {
-                        backend.draw_find_replace(win_q, find_replace);
+                        render::paint_find_replace_rung(backend, find_replace, win_q);
                         composed.push(render::FrameOp::FindReplace);
                     }
                 }
@@ -2091,7 +2097,12 @@ impl ShellApp for TuiShellApp {
                 // ── Unified picker modal ─────────────────────────────────
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
-                        render_picker_popup(picker, win_area, &theme, backend);
+                        let _ = render::paint_picker_rung(
+                            backend,
+                            picker,
+                            win_q,
+                            &render::TUI_PICKER_SIZING,
+                        );
                         composed.push(render::FrameOp::UnifiedPicker);
                     }
                 }
@@ -2140,14 +2151,14 @@ impl ShellApp for TuiShellApp {
                             screen_row: ctx_menu.screen_row + 1,
                             ..ctx_menu.clone()
                         };
-                        let (menu, menu_layout) = render::context_menu_generic_layout(
+                        let menu_layout = render::paint_context_menu_rung(
+                            backend,
                             &inset_panel,
                             inner_viewport,
                             1.0,
                             1.0,
                             1.0,
                         );
-                        let _ = backend.draw_context_menu(&menu, &menu_layout);
                         *self.context_menu_layout.borrow_mut() = Some(menu_layout);
                         composed.push(render::FrameOp::ContextMenu);
                     }
@@ -2160,9 +2171,8 @@ impl ShellApp for TuiShellApp {
                 // the user can see. GTK painted it *underneath* until #735.
                 render::FrameOp::Dialog => {
                     if let Some(ref dialog) = screen.dialog {
-                        let (q_dialog, dlg_layout) =
-                            render::dialog_generic_layout(dialog, win_q, 1.0, 1.0);
-                        let _ = backend.draw_dialog(&q_dialog, &dlg_layout);
+                        let dlg_layout =
+                            render::paint_dialog_rung(backend, dialog, win_q, 1.0, 1.0);
                         *self.dialog_layout.borrow_mut() = Some(dlg_layout);
                         composed.push(render::FrameOp::Dialog);
                     }
@@ -2171,8 +2181,7 @@ impl ShellApp for TuiShellApp {
                 // ── Toast overlay (#450) — top of the sequence ───────────
                 render::FrameOp::ToastStack => {
                     if let Some(ref stack) = toast_stack {
-                        let toast_layout = backend.draw_toast_stack(win_q, stack);
-                        self.engine.toast_layout.replace(Some(toast_layout));
+                        render::paint_toast_stack_rung(backend, &self.engine, stack, win_q);
                         composed.push(render::FrameOp::ToastStack);
                     }
                 }

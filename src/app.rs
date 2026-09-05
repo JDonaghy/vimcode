@@ -6687,8 +6687,6 @@ impl quadraui::ShellApp for App {
         backend: &mut dyn quadraui::Backend,
         layout: &quadraui::AppShellLayout,
     ) {
-        use quadraui::{ScreenLayout as QSL, Surface};
-
         let engine = self.engine.borrow();
         let theme = Theme::from_name(&engine.settings.colorscheme);
         self.sync_per_frame_backend_state(backend, &engine, &theme);
@@ -7024,7 +7022,6 @@ impl quadraui::ShellApp for App {
                 // ── Wildmenu bar (command Tab completion) ────────────────────
                 render::FrameOp::Wildmenu => {
                     if let Some(ref wm) = screen.wildmenu {
-                        let wm_bar = render::wildmenu_to_status_bar(wm, &theme);
                         // Shares the global bar's row when per-window status
                         // lines are on (there is no global bar to sit under).
                         let wm_y = if per_window_status {
@@ -7034,7 +7031,7 @@ impl quadraui::ShellApp for App {
                         };
                         let wm_rect =
                             quadraui::Rect::new(x as f32, wm_y as f32, w as f32, lh as f32);
-                        let _ = backend.draw_status_bar(wm_rect, &wm_bar, None, None);
+                        render::paint_wildmenu_rung(backend, wm, &theme, wm_rect);
                         composed.push(render::FrameOp::Wildmenu);
                     }
                 }
@@ -7050,13 +7047,11 @@ impl quadraui::ShellApp for App {
                     if let Some(ref bar) = screen.global_status_bar {
                         let sb_rect =
                             quadraui::Rect::new(x as f32, status_y as f32, w as f32, lh as f32);
-                        self.engine.borrow().global_status_rect.set(sb_rect);
+                        let sb_layout =
+                            render::paint_global_status_bar_rung(backend, &engine, bar, sb_rect);
                         // Same zone recovery as the per-window and separated bars above.
                         *self.global_status_zones.borrow_mut() =
-                            render::status_bar_zones_from_layout(
-                                &backend.status_bar_layout(sb_rect, bar),
-                            );
-                        let _ = backend.draw_status_bar(sb_rect, bar, None, None);
+                            render::status_bar_zones_from_layout(&sb_layout);
                         composed.push(render::FrameOp::StatusBar);
                     }
                 }
@@ -7151,8 +7146,7 @@ impl quadraui::ShellApp for App {
                             engine.tab_nav_can_go_forward(),
                             &title,
                         );
-                        let cc_layout = backend.draw_command_center(cc_rect, &cc);
-                        engine.command_center_layout.replace(Some(cc_layout));
+                        render::paint_command_center_rung(backend, &engine, cc_rect, &cc);
                         composed.push(render::FrameOp::CommandCenter);
                     }
                 }
@@ -7176,7 +7170,7 @@ impl quadraui::ShellApp for App {
                 // site.
                 render::FrameOp::FindReplace => {
                     if let Some(ref find_replace) = screen.find_replace {
-                        backend.draw_find_replace(popup_viewport, find_replace);
+                        render::paint_find_replace_rung(backend, find_replace, popup_viewport);
                         composed.push(render::FrameOp::FindReplace);
                     }
                 }
@@ -7193,31 +7187,18 @@ impl quadraui::ShellApp for App {
                 // `gtk_picker_sizing`), so no Pango/Cairo access is needed here.
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
-                        let has_preview = picker.preview.is_some();
-                        let geo = render::PickerGeometry::compute(
-                            popup_vp.width,
-                            popup_vp.height,
-                            has_preview,
+                        let rect = render::paint_picker_rung(
+                            backend,
+                            picker,
+                            popup_viewport,
                             &render::gtk_picker_sizing(lh as f32),
                         );
-                        let palette = render::picker_panel_to_palette(picker);
-                        let mut frame = QSL::new();
-                        frame.push(Surface::Palette {
-                            rect: quadraui::Rect::new(
-                                geo.popup_x,
-                                geo.popup_y,
-                                geo.popup_w,
-                                geo.popup_h,
-                            ),
-                            palette: &palette,
-                        });
-                        frame.draw(backend);
                         // Hand the *painted* rect to the click/drag handlers (#555).
                         self.picker_popup_rect.set(Some((
-                            geo.popup_x as f64,
-                            geo.popup_y as f64,
-                            geo.popup_w as f64,
-                            geo.popup_h as f64,
+                            rect.x as f64,
+                            rect.y as f64,
+                            rect.width as f64,
+                            rect.height as f64,
                         )));
                         composed.push(render::FrameOp::UnifiedPicker);
                     }
@@ -7273,14 +7254,14 @@ impl quadraui::ShellApp for App {
                     if let Some(panel) =
                         screen.context_menu.as_ref().filter(|p| !p.items.is_empty())
                     {
-                        let (menu, mlayout) =
-                            render::context_menu_generic_layout(panel, popup_viewport, cw, lh, 0.0);
-                        let mut frame = QSL::new();
-                        frame.push(Surface::ContextMenu {
-                            menu: &menu,
-                            layout: &mlayout,
-                        });
-                        frame.draw(backend);
+                        let mlayout = render::paint_context_menu_rung(
+                            backend,
+                            panel,
+                            popup_viewport,
+                            cw,
+                            lh,
+                            0.0,
+                        );
                         *self.context_menu_layout.borrow_mut() = Some(mlayout);
                         composed.push(render::FrameOp::ContextMenu);
                     }
@@ -7309,14 +7290,8 @@ impl quadraui::ShellApp for App {
                 // prompt), which no native alert facility hosts.
                 render::FrameOp::Dialog => {
                     if let Some(panel) = screen.dialog.as_ref() {
-                        let (dialog, dlayout) =
-                            render::dialog_generic_layout(panel, popup_viewport, cw, lh);
-                        let mut frame = QSL::new();
-                        frame.push(Surface::Dialog {
-                            dialog: &dialog,
-                            layout: &dlayout,
-                        });
-                        frame.draw(backend);
+                        let dlayout =
+                            render::paint_dialog_rung(backend, panel, popup_viewport, cw, lh);
                         *self.dialog_layout.borrow_mut() = Some(dlayout);
                         composed.push(render::FrameOp::Dialog);
                     }
@@ -7335,8 +7310,7 @@ impl quadraui::ShellApp for App {
                 // arbitrates.
                 render::FrameOp::ToastStack => {
                     if let Some(ref stack) = toast_stack {
-                        let toast_layout = backend.draw_toast_stack(popup_viewport, stack);
-                        engine.toast_layout.replace(Some(toast_layout));
+                        render::paint_toast_stack_rung(backend, &engine, stack, popup_viewport);
                         composed.push(render::FrameOp::ToastStack);
                     }
                 }

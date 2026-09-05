@@ -2,6 +2,47 @@
 
 **Last updated:** September 5, 2026 (issue #827 correction pass — the #47/44-call-site claims below were stale within hours of being written; see the corrected section); prior revisions September 4 (#801) and September 3 (the platform-neutrality chain drained, and the audit it mandated is now run). Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%** (though most of that miss is #731/#732 dead-code removal, not convergence — see `GOALS.md` §2/§3 for the corrected attribution). Nothing is in flight and nothing is queued for vimcode. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) was filed and closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction.
 
+## #824 — partially done: 8 of the 10 named `FrameOp` arms converged; 2 documented as genuinely one-sided
+
+`render_content`'s `FrameOp` match had drifted back to 10 duplicated arms after
+#763–#766 (those slices converged the *composition* — order/gates — not the
+arm *bodies*). This pass adds render.rs's `paint_wildmenu_rung`,
+`paint_global_status_bar_rung`, `paint_find_replace_rung`,
+`paint_command_center_rung`, `paint_picker_rung`, `paint_context_menu_rung`,
+`paint_dialog_rung`, `paint_toast_stack_rung` — one shared body per arm,
+following the `paint_bottom_panel_rung`/`paint_quickfix_rung` precedent
+(rect math stays per backend; only the convert-and-draw body is shared).
+Both `src/app.rs` and `src/tui_main/shell_app.rs` now call these instead of
+transcribing the body twice; the dead TUI-only `render_impl::render_picker_popup`
+duplicate was deleted along with it. Added `gtk::testing::chrome_surfaces::
+toast_stack_overlay_paints` (GTK had no black-box toast coverage at all before
+this — confirmed it goes red against the #587-shape bug of caching a layout
+without painting it, via a temporary swap to `Backend::toast_stack_layout`).
+
+**Two of the ten stayed unconverged, on purpose** (see `render.rs`'s
+"Frame-op rung painters (#824)" section doc comment for the full reasoning):
+
+- **`FrameOp::CommandLine`** — TUI paints the row cell-by-cell
+  (`panels::render_command_line`, cursor + mouse drag-selection inversion
+  baked into the composed cells) instead of through
+  `Backend::draw_command_line`, because that trait method has no
+  selection-range parameter. Converging it needs a quadraui `Backend` trait
+  change first (Platform-Neutrality Rule) — nothing filed yet.
+- **`FrameOp::TabSwitcher`** — GTK feeds `TabSwitcherGeometry::visible_rows`
+  into `tab_switcher_to_quadraui_list_view`; TUI feeds `max_visible` (a
+  different field — see that struct's doc comment). Might be harmless,
+  might be a latent bug; a duplication-convergence pass shouldn't silently
+  pick one for a shared function, so both arms keep their own geometry prep.
+
+The related "same shape" opportunities the issue also named —
+`compose_bottom_band_rungs` and the editor-band composer — are **not**
+touched by this pass; they're a separate slice.
+
+`cargo build` / `cargo clippy -- -D warnings` / `cargo clippy
+--no-default-features -- -D warnings` / `cargo fmt -- --check` all clean.
+Targeted tests (55: every `render_content_paints_*_via_shell_app` plus the
+GTK driver tests for every touched arm, including the new toast test) pass.
+
 ## #822 — partially fixed; item 2 blocked on an unfiled quadraui gap (drafted, not yet submitted)
 
 Issue #822 listed three fix items. Item 1 (delete the `compute_tab_bar_hit_regions`

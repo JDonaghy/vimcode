@@ -4287,6 +4287,56 @@ mod chrome_surfaces {
         assert_region_changed(&without, &with, "an open find/replace overlay");
     }
 
+    /// Sample the pixels inside `rect`, in `(x, y)`-ascending order — the
+    /// generic twin of [`find_replace_region_pixels`] for an overlay whose
+    /// corner-anchored position isn't worth hand-deriving when the paint
+    /// already cached exactly where it landed.
+    fn sample_rect_pixels(
+        h: &mut Harness<impl AppLogic>,
+        rect: quadraui::Rect,
+    ) -> Vec<(u8, u8, u8)> {
+        let mut px = Vec::new();
+        let mut y = rect.y as i32;
+        while y < (rect.y + rect.height) as i32 {
+            let mut x = rect.x as i32;
+            while x < (rect.x + rect.width) as i32 {
+                px.push(h.driver.pixel(x, y));
+                x += 3;
+            }
+            y += 2;
+        }
+        px
+    }
+
+    /// #824: `FrameOp::ToastStack` now routes through the shared
+    /// `render::paint_toast_stack_rung` — this is the GTK half of the
+    /// black-box coverage the convergence needs (TUI already has
+    /// `render_content_paints_toast_via_shell_app`). Aims at the bounds
+    /// `engine.toast_layout` cached from the *paint itself* (#587's lesson:
+    /// never assert on a cache field being populated instead of on what got
+    /// painted), rather than a guessed corner offset.
+    #[test]
+    fn toast_stack_overlay_paints() {
+        let mut engine = small_engine();
+        engine.push_toast("Saved", "buffer.rs saved", quadraui::ToastSeverity::Info);
+        let mut h = harness(engine, 1400, 900);
+        let bounds = h
+            .engine
+            .borrow()
+            .toast_layout
+            .borrow()
+            .as_ref()
+            .and_then(|l| l.visible_toasts.first())
+            .map(|vt| vt.bounds)
+            .expect("a pushed toast must paint and cache a ToastStackLayout entry for it");
+        assert!(bounds.width > 0.0 && bounds.height > 0.0);
+
+        let with = sample_rect_pixels(&mut h, bounds);
+        let mut without_h = harness(small_engine(), 1400, 900);
+        let without = sample_rect_pixels(&mut without_h, bounds);
+        assert_region_changed(&without, &with, "an open toast");
+    }
+
     /// Two tabs so `open_tab_switcher` has more than one MRU entry to show
     /// (it no-ops — leaves `tab_switcher_open` false — with only one).
     fn engine_with_two_tabs() -> Engine {
