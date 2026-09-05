@@ -1328,8 +1328,8 @@ pub(super) fn handle_mouse(
 
         // Right-click on tab bar → open tab context menu.
         //
-        // #654: hit-test via the cached `hit_regions` (built once by
-        // `render::compute_tab_bar_hit_regions` during
+        // #654: hit-test via the cached `hit_regions` layout (built once by
+        // `render::compute_tab_bar_layout` during
         // `build_screen_layout`) rather than rebuilding the primitive and
         // re-measuring every tab here. Left-click routing (below) and the
         // drag-slot map already read those regions, so all three now share

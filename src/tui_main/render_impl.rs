@@ -490,8 +490,8 @@ pub(super) fn paint_editor_popups(
 /// Given a column within a group's tab bar, return the shortened file path of
 /// the tab at that column, or `None` if the column doesn't hit a tab with a file.
 ///
-/// `hit_regions` are the bar-relative regions cached on `ScreenLayout` /
-/// `GroupTabBar` by `render::build_screen_layout` — the same list
+/// `hit_regions` is the `TabBarLayout` cached on `ScreenLayout` /
+/// `GroupTabBar` by `render::build_screen_layout` — the same layout
 /// `render::resolve_tab_bar_click` routes real clicks through.
 ///
 /// #654: this used to walk the tabs itself, hand-rolling
@@ -500,16 +500,13 @@ pub(super) fn paint_editor_popups(
 /// space for (see `tab_drag_slots_from_hit_regions`' #477 note — the same
 /// duplicate had already drifted there). The result was a two-column drift
 /// between tooltip and click hit-testing on any tab bar scrolled past tab 0.
-/// Sharing the regions removes the whole class: tooltip, click, and drag now
+/// Sharing the layout removes the whole class: tooltip, click, and drag now
 /// read the same geometry.
 pub(super) fn tab_tooltip_at_col(
     engine: &Engine,
     group_id: GroupId,
     local_col: u16,
-    hit_regions: &[(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )],
+    hit_regions: &quadraui::TabBarLayout,
 ) -> Option<String> {
     use crate::core::engine::TabBarClickTarget;
     let i = match render::resolve_tab_bar_click(hit_regions, local_col)? {
@@ -531,32 +528,30 @@ pub(super) fn tab_tooltip_at_col(
 
 /// Extract per-tab drag-and-drop slot bounds — `(x_start, x_end)` pairs in
 /// absolute screen-column units, ordered by tab index — from a tab bar's
-/// hit regions. `base_x` is the absolute left edge the region columns are
+/// layout. `base_x` is the absolute left edge the region columns are
 /// relative to (bar left edge = column 0).
 ///
-/// #477: hit regions are the single source of truth already used for mouse
-/// click routing (`render::resolve_tab_bar_click`); this just re-slices
-/// them into the `(f32, f32)` shape the drag overlay / drop-zone geometry
-/// expects, instead of hand-rolling `name.chars().count() + TAB_CLOSE_COLS`
-/// per tab (which had drifted from the real per-tab close-button width and
-/// from an obsolete "+2 for the scroll indicator" adjustment that the
-/// quadraui TUI tab bar rasteriser doesn't actually reserve space for).
+/// #477: `visible_tabs` is the single source of truth already used for mouse
+/// click routing (`render::resolve_tab_bar_click`'s `hit_test`); this just
+/// re-slices it into the `(f32, f32)` shape the drag overlay / drop-zone
+/// geometry expects, instead of hand-rolling `name.chars().count() +
+/// TAB_CLOSE_COLS` per tab (which had drifted from the real per-tab
+/// close-button width and from an obsolete "+2 for the scroll indicator"
+/// adjustment that the quadraui TUI tab bar rasteriser doesn't actually
+/// reserve space for).
 fn tab_drag_slots_from_hit_regions(
-    hit_regions: &[(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )],
+    hit_regions: &quadraui::TabBarLayout,
     base_x: f32,
 ) -> Vec<(f32, f32)> {
-    use crate::core::engine::TabBarClickTarget;
     let mut tabs: Vec<(usize, f32, f32)> = hit_regions
+        .visible_tabs
         .iter()
-        .filter_map(|(region, target)| match target {
-            TabBarClickTarget::Tab(idx) => {
-                let start = base_x + region.col as f32;
-                Some((*idx, start, start + region.width as f32))
-            }
-            _ => None,
+        .map(|vt| {
+            (
+                vt.tab_idx,
+                base_x + vt.bounds.x,
+                base_x + vt.bounds.x + vt.bounds.width,
+            )
         })
         .collect();
     tabs.sort_unstable_by_key(|(idx, ..)| *idx);
@@ -564,9 +559,9 @@ fn tab_drag_slots_from_hit_regions(
 }
 
 /// Build the per-group tab-drag slot map consumed by the drag overlay and
-/// drop-zone hit testing. Reuses the hit regions already cached on each
+/// drop-zone hit testing. Reuses the layout already cached on each
 /// `GroupTabBar` by `render::build_screen_layout()` (from
-/// `compute_tab_bar_hit_regions()`) instead of recomputing tab positions
+/// `compute_tab_bar_layout()`) instead of recomputing tab positions
 /// (#515).
 ///
 /// #551: this used to branch, reading `ScreenLayout::tab_bar_hit_regions` at

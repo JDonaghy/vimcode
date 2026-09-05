@@ -418,12 +418,11 @@ pub struct GroupTabBar {
     pub diff_toolbar: Option<DiffToolbarData>,
     /// Index of the first visible tab (scroll offset for overflow tab bars).
     pub tab_scroll_offset: usize,
-    /// Pre-computed click regions for this tab bar, in char-cell units
-    /// relative to the tab bar's left edge (column 0 = left edge of group bounds).
-    pub hit_regions: Vec<(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )>,
+    /// The resolved `quadraui::TabBarLayout` this tab bar painted with, in
+    /// char-cell units relative to the tab bar's left edge (column 0 = left
+    /// edge of group bounds). Backends hit-test clicks against this directly
+    /// via [`resolve_tab_bar_click`] instead of re-deriving geometry (#822).
+    pub hit_regions: quadraui::TabBarLayout,
     /// Pre-built quadraui `TabBar` primitive — backends draw this directly.
     pub bar: quadraui::TabBar,
     /// Per-tab icon sidecar parallel to `bar.tabs` (#703), from
@@ -457,7 +456,7 @@ pub const TAB_CLOSE_COLS: u16 = 2;
 /// and #654's own note said this would be the single edit needed on the
 /// vimcode side — #654 had already routed the tooltip, both context-menu
 /// hit-tests, the click router and the drag-slot map through
-/// [`compute_tab_bar_hit_regions`], so nothing else measures a tab.
+/// [`compute_tab_bar_layout`], so nothing else measures a tab.
 ///
 /// A tab named `"日本語.rs"` (9 chars, 12 columns) is now both measured
 /// and painted 12 cells wide, so the next tab starts at cell 12 and every hit
@@ -532,7 +531,7 @@ fn tab_icon_color(ext: &str) -> Color {
     Color::from_rgb(r, g, b)
 }
 
-/// Compute hit regions for a group's tab bar.
+/// Compute a group's tab bar layout.
 ///
 /// Layout (left to right):
 /// `[tab0][tab1]...[tabN]  [diff_toolbar?] [split_btns?] [action_btn]`
@@ -540,12 +539,13 @@ fn tab_icon_color(ext: &str) -> Color {
 /// All positions are in char-cell columns relative to the tab bar left edge.
 ///
 /// Per D6: layout math lives in `quadraui::TabBar::layout()`. This
-/// function builds the TabBar primitive, asks it for a layout, and
-/// converts the layout's `hit_regions` into the engine's legacy
-/// `(TabBarHitRegion, TabBarClickTarget)` shape. Until TUI / GTK /
-/// Win-GUI migrate to consume `TabBarLayout` directly, this shim
-/// is the bridge — but the layout math itself has only one
-/// source of truth now.
+/// function builds the TabBar primitive and asks it for a layout — the
+/// same `quadraui::TabBarLayout` both backends cache on `GroupTabBar`
+/// and hit-test directly via [`resolve_tab_bar_click`] /
+/// `quadraui::TabBarLayout::hit_test`. (#822: this used to downconvert
+/// into a vimcode-local `(TabBarHitRegion, TabBarClickTarget)` shape as
+/// a bridge for backends that hadn't migrated to `TabBarLayout` yet —
+/// both had, so the downconversion was pure duplication.)
 ///
 /// `icons_sidecar` is the sidecar from [`build_tab_bar_icons`] — the *same*
 /// slice the backend paints with. It must be threaded through here because an
@@ -553,7 +553,7 @@ fn tab_icon_color(ext: &str) -> Color {
 /// with icons is the measure/paint desync #654 exists to prevent. (Named with
 /// the suffix because bare `icons` would shadow the [`crate::icons`] module
 /// this file uses throughout.)
-pub fn compute_tab_bar_hit_regions(
+pub fn compute_tab_bar_layout(
     tabs: &[TabInfo],
     icons_sidecar: &[Option<quadraui::TabIcon>],
     tab_scroll_offset: usize,
@@ -561,12 +561,7 @@ pub fn compute_tab_bar_hit_regions(
     has_diff_toolbar: bool,
     diff_label_cols: u16,
     has_split_buttons: bool,
-) -> Vec<(
-    crate::core::engine::TabBarHitRegion,
-    crate::core::engine::TabBarClickTarget,
-)> {
-    use crate::core::engine::{TabBarClickTarget, TabBarHitRegion};
-
+) -> quadraui::TabBarLayout {
     // Synthesise a DiffToolbarData shaped to match diff_label_cols so
     // build_tab_bar_primitive emits the right segments. The primitive's
     // diff segments are fixed 3-cell widths each, so we just need a
@@ -606,7 +601,7 @@ pub fn compute_tab_bar_hit_regions(
         .map(|(i, t)| tab_hit_width(t, quadraui::tab_icon_cols(icons_sidecar, i)))
         .collect();
 
-    let layout = primitive.layout(
+    primitive.layout(
         bar_width as f32,
         1.0,
         0.0, // scroll arrows disabled — matches existing TUI behaviour
@@ -616,54 +611,62 @@ pub fn compute_tab_bar_hit_regions(
             // in legacy char-cell units, which is exactly what we want here.
             quadraui::SegmentMeasure::new(primitive.right_segments[i].width_cells as f32)
         },
-    );
-
-    // Convert layout hit regions → legacy (TabBarHitRegion, TabBarClickTarget).
-    // Order preserved from the layout: close regions before tab bodies,
-    // and segments (which are disjoint from tab regions) appended at the end.
-    let mut regions = Vec::new();
-    for (rect, hit) in &layout.hit_regions {
-        let col = rect.x.round() as u16;
-        let width = rect.width.round() as u16;
-        let target = match hit {
-            quadraui::TabBarHit::Tab(i) => Some(TabBarClickTarget::Tab(*i)),
-            quadraui::TabBarHit::TabClose(i) => Some(TabBarClickTarget::CloseTab(*i)),
-            quadraui::TabBarHit::RightSegment(id) => match id.as_str() {
-                "tab:split_right" => Some(TabBarClickTarget::SplitRight),
-                "tab:split_down" => Some(TabBarClickTarget::SplitDown),
-                "tab:diff_prev" => Some(TabBarClickTarget::DiffPrev),
-                "tab:diff_next" => Some(TabBarClickTarget::DiffNext),
-                "tab:diff_toggle" => Some(TabBarClickTarget::DiffToggle),
-                "tab:action_menu" => Some(TabBarClickTarget::ActionMenu),
-                _ => None,
-            },
-            // Scroll arrows / Empty don't exist in the legacy enum — skipped.
-            quadraui::TabBarHit::ScrollLeft
-            | quadraui::TabBarHit::ScrollRight
-            | quadraui::TabBarHit::Empty => None,
-        };
-        if let Some(t) = target {
-            regions.push((TabBarHitRegion { col, width }, t));
-        }
-    }
-    regions
+    )
 }
 
-/// Resolve a column position (in char cells, relative to the tab bar left edge)
-/// to a `TabBarClickTarget` by walking the hit region list.
+/// Map a `quadraui::TabBarHit` to the engine's `TabBarClickTarget`.
+///
+/// `RightSegment` ids are the ones `build_tab_bar_primitive` assigns to its
+/// split/diff/action-menu segments; scroll arrows and `Empty` have no
+/// engine-level click meaning.
+fn tab_bar_hit_target(hit: quadraui::TabBarHit) -> Option<crate::core::engine::TabBarClickTarget> {
+    use crate::core::engine::TabBarClickTarget;
+    match hit {
+        quadraui::TabBarHit::Tab(i) => Some(TabBarClickTarget::Tab(i)),
+        quadraui::TabBarHit::TabClose(i) => Some(TabBarClickTarget::CloseTab(i)),
+        quadraui::TabBarHit::RightSegment(id) => match id.as_str() {
+            "tab:split_right" => Some(TabBarClickTarget::SplitRight),
+            "tab:split_down" => Some(TabBarClickTarget::SplitDown),
+            "tab:diff_prev" => Some(TabBarClickTarget::DiffPrev),
+            "tab:diff_next" => Some(TabBarClickTarget::DiffNext),
+            "tab:diff_toggle" => Some(TabBarClickTarget::DiffToggle),
+            "tab:action_menu" => Some(TabBarClickTarget::ActionMenu),
+            _ => None,
+        },
+        quadraui::TabBarHit::ScrollLeft
+        | quadraui::TabBarHit::ScrollRight
+        | quadraui::TabBarHit::Empty => None,
+    }
+}
+
+/// Resolve a column position (in char cells, relative to the tab bar left
+/// edge) to a `TabBarClickTarget` by hit-testing the `TabBarLayout` paint
+/// already produced — per `feedback_cache_paint_layout`, this reads what
+/// paint produced instead of re-deriving geometry in the click handler.
+/// Row is fixed at `0.0`: every hit region in a `TabBarLayout` spans the
+/// bar's single row (`bar_height = 1.0` at construction), so a column-only
+/// probe lands inside every region's `y` range.
 pub fn resolve_tab_bar_click(
-    hit_regions: &[(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )],
+    layout: &quadraui::TabBarLayout,
     col: u16,
 ) -> Option<crate::core::engine::TabBarClickTarget> {
-    for (region, target) in hit_regions {
-        if col >= region.col && col < region.col + region.width {
-            return Some(*target);
-        }
+    tab_bar_hit_target(layout.hit_test(col as f32, 0.0))
+}
+
+/// An empty `TabBarLayout` — no tabs, no hit regions — for contexts where no
+/// tab bar was built (e.g. `ScreenLayout::tab_bar_hit_regions` in multi-group
+/// mode, where each group carries its own layout instead).
+fn empty_tab_bar_layout() -> quadraui::TabBarLayout {
+    quadraui::TabBarLayout {
+        bar_width: 0.0,
+        bar_height: 0.0,
+        visible_tabs: Vec::new(),
+        visible_segments: Vec::new(),
+        scroll_left: None,
+        scroll_right: None,
+        hit_regions: Vec::new(),
+        resolved_scroll_offset: 0,
     }
-    None
 }
 
 /// One segment in the breadcrumb bar (either a path component or a symbol).
@@ -9403,15 +9406,13 @@ pub struct ScreenLayout {
     // `group_tab_bars[0].tab_scroll_offset` — the value the paint actually
     // uses. Slice 1 recorded both as "superseded, never composed" and left the
     // deletion to this slice because it lands in the editor band.
-    /// Hit regions (char-cell columns, relative to the tab bar's left edge) for
-    /// the single-group / active tab bar. Empty in
-    /// multi-group mode (each group carries its own `hit_regions` on its
-    /// `GroupTabBar`). Lets backends resolve tab-bar clicks through the shared
-    /// `resolve_tab_bar_click` path instead of per-backend pixel maps. (#515)
-    pub tab_bar_hit_regions: Vec<(
-        crate::core::engine::TabBarHitRegion,
-        crate::core::engine::TabBarClickTarget,
-    )>,
+    /// The `quadraui::TabBarLayout` (char-cell columns, relative to the tab
+    /// bar's left edge) for the single-group / active tab bar. A blank
+    /// (zero-tab) layout in multi-group mode (each group carries its own
+    /// layout on its `GroupTabBar::hit_regions`). Lets backends resolve
+    /// tab-bar clicks through the shared `resolve_tab_bar_click` path instead
+    /// of per-backend pixel maps. (#515, #822)
+    pub tab_bar_hit_regions: quadraui::TabBarLayout,
     /// When `status_line_above_terminal` is OFF and the terminal panel is open,
     /// this carries the active window's status line to render as a dedicated row
     /// above the terminal panel. When `Some`, per-window `status_line` fields on
@@ -12638,7 +12639,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
             // sidecar the backend hands to `tab_bar_layout_icons` is the same
             // one it hands to `draw_tab_bar_icons`.
             let tab_icons = build_tab_bar_icons(&tabs);
-            let hit_regions = compute_tab_bar_hit_regions(
+            let hit_regions = compute_tab_bar_layout(
                 &tabs,
                 &tab_icons,
                 tab_scroll_offset,
@@ -12750,49 +12751,23 @@ pub fn build_screen_layout_with_breadcrumb_row(
         vec![]
     };
 
-    let tab_scroll_offset_single = engine
-        .editor_groups
-        .get(&engine.active_group)
-        .map(|g| g.tab_scroll_offset)
-        .unwrap_or(0);
-    // Hit regions for the single-group / active tab bar, in char-cells. The bar
-    // spans the full editor content width (bounding box of all window rects);
-    // divide by char_width so the result is backend-neutral (TUI char_width=1.0).
-    // `has_split_buttons = true` mirrors the `true` passed to
-    // `build_tab_bar_primitive` for this group's own `GroupTabBar::bar` above.
-    // Empty in multi-group mode (handled per-group on each GroupTabBar). (#515)
+    // The single-group / active tab bar's layout, in char-cells. #551 made
+    // `group_tab_bars` populated for every group count (a single group is a
+    // split of one), so when `n < 2` it holds exactly one entry built from
+    // the same tabs/scroll-offset/bar-width inputs this mirror used to
+    // recompute independently. Cloning that entry's layout — rather than
+    // calling `compute_tab_bar_layout` a second time — means this field is
+    // always byte-for-byte what `GroupTabBar::bar` painted (#822,
+    // `feedback_cache_paint_layout`: hit-testing must read what paint
+    // produced, never re-derive it). Empty in multi-group mode (handled
+    // per-group on each `GroupTabBar`). (#515)
     let tab_bar_hit_regions = if n >= 2 || window_rects.is_empty() {
-        Vec::new()
+        empty_tab_bar_layout()
     } else {
-        let min_x = window_rects
-            .iter()
-            .map(|(_, r)| r.x)
-            .fold(f64::MAX, f64::min);
-        let max_r = window_rects
-            .iter()
-            .map(|(_, r)| r.x + r.width)
-            .fold(f64::MIN, f64::max);
-        let bar_width_cells = ((max_r - min_x) / char_width).round().max(0.0) as u16;
-        // Sourced from the group's *own* `GroupTabBar` rather than from a
-        // parallel single-group `ScreenLayout::diff_toolbar` mirror, which
-        // #765 deleted. This arm only runs when `n < 2`, so `group_tab_bars`
-        // holds exactly the one bar these regions describe — and it is the
-        // same `diff_toolbar` the paint reads, so the hit regions cannot
-        // disagree with the buttons they are meant to cover.
-        let diff_toolbar = group_tab_bars.first().and_then(|g| g.diff_toolbar.as_ref());
-        let diff_label_cols = diff_toolbar
-            .and_then(|dt| dt.change_label.as_ref())
-            .map(|l| l.len() as u16 + 1)
-            .unwrap_or(0);
-        compute_tab_bar_hit_regions(
-            &tab_bar,
-            &build_tab_bar_icons(&tab_bar),
-            tab_scroll_offset_single,
-            bar_width_cells,
-            diff_toolbar.is_some(),
-            diff_label_cols,
-            true,
-        )
+        group_tab_bars
+            .first()
+            .map(|g| g.hit_regions.clone())
+            .unwrap_or_else(empty_tab_bar_layout)
     };
 
     ScreenLayout {
@@ -24741,21 +24716,13 @@ mod tests {
         // #764: `ScreenLayout::tab_scroll_offset` — the single-group mirror
         // this used to compare against — is deleted; `GroupTabBar` is the only
         // copy now, so the equivalence this line asserted is structural.
-        // `TabBarHitRegion`/`TabBarClickTarget` are `Debug` but not `PartialEq`,
-        // so compare their debug renderings pairwise.
+        // #822: `ScreenLayout::tab_bar_hit_regions` is now a clone of this
+        // group's own `TabBarLayout` (`quadraui::TabBarLayout` derives
+        // `PartialEq`), so the equality is exact, not just debug-string equal.
         assert_eq!(
-            gtb.hit_regions.len(),
-            screen.tab_bar_hit_regions.len(),
-            "group hit regions must match the legacy single-group hit regions"
+            gtb.hit_regions, screen.tab_bar_hit_regions,
+            "group tab bar layout must match the legacy single-group mirror"
         );
-        for ((ra, ta), (rb, tb)) in gtb
-            .hit_regions
-            .iter()
-            .zip(screen.tab_bar_hit_regions.iter())
-        {
-            assert_eq!(format!("{ra:?}"), format!("{rb:?}"));
-            assert_eq!(format!("{ta:?}"), format!("{tb:?}"));
-        }
         // The group's bounds must be the editor content area, i.e. the tab row
         // recovered from it lands exactly on the editor's top edge.
         assert_eq!(gtb.bounds.x, content_bounds.x);
