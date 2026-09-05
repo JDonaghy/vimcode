@@ -14082,9 +14082,37 @@ fn test_plugin_disabled_not_registered() {
 
 // ─── Source Control (Session 99) ─────────────────────────────────────────
 
+/// An existing, empty, **non-git** directory for [`make_sc_engine_with_files`]
+/// to use as `Engine::cwd` — see that fixture's doc comment for what running
+/// the SC tests against a real checkout did instead.
+///
+/// Per-process (pid-suffixed) rather than a shared constant so two concurrent
+/// `cargo test` runs (a second worktree, CI matrix job, …) cannot collide, and
+/// deliberately *not* `git init`-ed: every `git -C` call made from it must
+/// fail, which is exactly what the tests below assert.
+fn sc_scratch_cwd() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("vimcode-sc-tests-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Build an engine with synthetic SC file statuses for testing.
+///
+/// `cwd` is re-pointed at an empty scratch directory that is deliberately
+/// **not** a git repository, because the `sc_*` actions the tests below drive
+/// (`sc_do_commit`, `sc_stage_all`, `sc_unstage_all`, …) shell out to real
+/// `git -C <engine.cwd>` commands. Several of those tests document their
+/// expectations as "will fail silently since we're not in a real git repo" —
+/// which was only true when the suite ran somewhere unversioned. Run from a
+/// checkout (i.e. always), `Engine::new()`'s `cwd` *is* the vimcode repo, so
+/// `test_sc_unified_dispatch_stage_all` ran `git add -A` over the developer's
+/// working tree and `test_sc_commit_ctrl_enter_commits` then committed it
+/// under the message `"test\nmultiline"` — silently swallowing every
+/// uncommitted change in the checkout the suite was run from. Observed for
+/// real while fixing #821.
 fn make_sc_engine_with_files() -> Engine {
     let mut engine = Engine::new();
+    engine.cwd = sc_scratch_cwd();
     engine.sc_file_statuses = vec![
         git::FileStatus {
             path: "a.rs".to_string(),
@@ -14099,6 +14127,30 @@ fn make_sc_engine_with_files() -> Engine {
     ];
     engine.sc_sections_expanded = [true, true, false, true];
     engine
+}
+
+/// Guard for the hazard documented on [`make_sc_engine_with_files`]: the SC
+/// fixture's `cwd` must never be inside a git work tree, or the `sc_*` tests
+/// below stage and commit the checkout the suite is being run from.
+///
+/// Fails (as intended) against the pre-fix fixture, whose `cwd` was
+/// `Engine::new()`'s — the repo root.
+#[test]
+fn sc_fixture_cwd_is_never_inside_a_git_work_tree() {
+    let engine = make_sc_engine_with_files();
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&engine.cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .expect("git must be runnable to check the fixture's cwd");
+    assert!(
+        !out.status.success(),
+        "the SC fixture's cwd ({}) is inside a git work tree — the sc_* tests \
+         run real `git add -A` / `git commit` against it and would swallow \
+         every uncommitted change in that checkout",
+        engine.cwd.display()
+    );
 }
 
 #[test]
