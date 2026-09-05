@@ -830,6 +830,18 @@ impl Engine {
             79
         };
 
+        // `gq` keeps the indent of the first line of the range and applies it
+        // to every wrapped line (`:h gq`; #807, `op:gqq indented` used to
+        // strip it), so 'textwidth' is measured against the indented width.
+        let indent: String = {
+            let first: String = self.buffer().content.line(start).chars().collect();
+            first
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect()
+        };
+        let tw = tw.saturating_sub(indent.chars().count()).max(1);
+
         // Collect the text of the range
         let mut text = String::new();
         for l in start..=end {
@@ -860,6 +872,7 @@ impl Engine {
                 if line_buf.is_empty() {
                     line_buf.push_str(word);
                 } else if line_buf.len() + 1 + word.len() > tw {
+                    result.push_str(&indent);
                     result.push_str(&line_buf);
                     result.push('\n');
                     line_buf = word.to_string();
@@ -869,6 +882,7 @@ impl Engine {
                 }
             }
             if !line_buf.is_empty() {
+                result.push_str(&indent);
                 result.push_str(&line_buf);
                 if pi < paragraphs.len() - 1 || end + 1 < total {
                     result.push('\n');
@@ -889,9 +903,15 @@ impl Engine {
         self.insert_with_undo(range_start, &result);
         self.finish_undo_group();
 
-        // Move cursor to start of formatted area
-        self.view_mut().cursor.line = start;
-        self.view_mut().cursor.col = self.first_non_blank_col(start);
+        // `gq` leaves the cursor on the FIRST non-blank of the LAST formatted
+        // line (`:h gq`; #807 — it used to stay on the first line).  `gw` is
+        // the variant that keeps the cursor, and its caller restores it.
+        let formatted_lines = result.matches('\n').count()
+            + usize::from(!result.is_empty() && !result.ends_with('\n'));
+        let last = (start + formatted_lines.saturating_sub(1))
+            .min(self.buffer().len_lines().saturating_sub(1));
+        self.view_mut().cursor.line = last;
+        self.view_mut().cursor.col = self.first_non_blank_col(last);
         *changed = true;
     }
 
@@ -2915,10 +2935,14 @@ impl Engine {
             }
             '~' | 'u' | 'U' => {
                 self.apply_case_range(start_pos, end_pos, operator, changed);
+                // Cursor to the start of the changed region, like every other
+                // operator (#807, `op:g~iw`, `op:gUap`).
+                self.move_cursor_to_range_start(start_pos);
             }
             'R' => {
                 // g?: ROT13 encode
                 self.apply_rot13_range(start_pos, end_pos, changed);
+                self.move_cursor_to_range_start(start_pos);
             }
             '>' | '<' | '=' => {
                 let start_line = self.buffer().content.char_to_line(start_pos);
@@ -4747,9 +4771,10 @@ impl Engine {
                 let content_with_newline = format!("\n{}", content);
                 self.insert_with_undo(line_end, &content_with_newline);
             };
-            // Move cursor to first non-blank of new line
-            self.view_mut().cursor.line += 1;
-            self.view_mut().cursor.col = 0;
+            // `:h p` — linewise put leaves the cursor on the first non-blank
+            // of the first pasted line, not column 0 (#807).
+            let target = self.view().cursor.line + 1;
+            self.move_cursor_to_first_non_blank(target);
         } else {
             // Paste after cursor position
             let line = self.view().cursor.line;
@@ -4809,8 +4834,10 @@ impl Engine {
             let line = self.view().cursor.line;
             let line_start = self.buffer().line_to_char(line);
             self.insert_with_undo(line_start, &content);
-            // Cursor stays on same line number (which is now the pasted line)
-            self.view_mut().cursor.col = 0;
+            // Cursor stays on the same line number (now the pasted line), on
+            // its first non-blank — see `paste_after` (#807).
+            let target = self.view().cursor.line;
+            self.move_cursor_to_first_non_blank(target);
         } else {
             // Paste before cursor position
             let line = self.view().cursor.line;
@@ -5907,6 +5934,13 @@ impl Engine {
             let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
             self.last_change_end = Some((end_line, end_col));
         }
+    }
+
+    /// Park the cursor on `line`'s first non-blank column.
+    pub(crate) fn move_cursor_to_first_non_blank(&mut self, line: usize) {
+        let line = line.min(self.buffer().len_lines().saturating_sub(1));
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = self.first_non_blank_col(line);
     }
 }
 
