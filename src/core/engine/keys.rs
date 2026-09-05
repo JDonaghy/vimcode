@@ -288,6 +288,15 @@ impl Engine {
             self.dismiss_completion();
         }
 
+        // `insert_last_key_char` (Vim's `lastc`) is only meaningful *within* one
+        // Insert session, so any key handled outside Insert mode — including the
+        // `i`/`a`/`A`/`o` that enters it, and the Normal-mode command run by
+        // `<C-o>` — clears it. Without this, `A<C-d>` on a line that already
+        // ends in a literal '0' would be mistaken for `:h i_0_CTRL-D` (#804).
+        if self.mode != Mode::Insert {
+            self.insert_last_key_char = None;
+        }
+
         // Capture cursor position before dispatching (used by cursor_move hook below).
         let pre_cursor_line = self.cursor().line;
         let pre_cursor_col = self.cursor().col;
@@ -5150,6 +5159,14 @@ impl Engine {
             (key_name, ctrl)
         };
 
+        // Vim's `lastc` (`edit()` in edit.c): remember the character of the
+        // key *before* this one so `<C-d>` can recognise the `0`/`^` signal
+        // prefix (`:h i_0_CTRL-D`). Only a plain typed character counts — a
+        // ctrl combo or a named key (`<BS>`, `<Left>`, …) sets it to `None`,
+        // which is what makes `0<C-d><C-d>` dedent normally the second time.
+        let prev_insert_key_char = self.insert_last_key_char;
+        self.insert_last_key_char = if ctrl { None } else { unicode };
+
         // `:h 'autoindent'` exempts only <BS> and <C-d> from breaking a
         // freshly-created indent-only line's "untouched" status; every other
         // key (including a plain <C-u>, which has its own distinct
@@ -5693,22 +5710,23 @@ impl Engine {
             let line = self.view().cursor.line;
             let col = self.view().cursor.col;
             let line_start = self.buffer().line_to_char(line);
-            // `:h i_0_CTRL-D`: if the character just before the cursor is a
-            // literal '0' *typed as the line's leading signal digit* — i.e.
-            // only indent (spaces/tabs) precedes it — that '0' is itself
-            // removed and ALL indent on the line is deleted (not just one
-            // shiftwidth) — #804. A '0' that appears after other non-blank
-            // text (e.g. `foo0<C-d>`) is not the signal digit and must fall
-            // through to a normal shiftwidth dedent.
-            let zero_is_leading_signal = col > 0
-                && self.buffer().content.char(line_start + col - 1) == '0'
-                && (0..col - 1).all(|c| {
-                    let ch = self.buffer().content.char(line_start + c);
-                    ch == ' ' || ch == '\t'
-                });
-            if zero_is_leading_signal {
-                let zero_idx = line_start + col - 1;
-                self.delete_with_undo(zero_idx, zero_idx + 1);
+            // `:h i_0_CTRL-D` / `:h i_^_CTRL-D`: when the key typed immediately
+            // before this `<C-d>` was a literal `0` or `^`, that character is
+            // itself deleted and ALL indent on the line is removed (not just
+            // one shiftwidth) — #804.
+            //
+            // The trigger is Vim's `lastc` — *the previous keystroke* — not the
+            // buffer text before the cursor (`ins_shift()` in edit.c). The two
+            // differ in both directions and the nvim oracle pins both:
+            //   * `A0<C-d>` on `"    afoo"` DOES strip everything → `"afoo"`,
+            //     even though non-blank text precedes the typed '0';
+            //   * `A<C-d>` on `"    a0"` does NOT, even though a literal '0'
+            //     sits right before the cursor, because no '0' was typed.
+            let typed_signal_prefix =
+                col > 0 && matches!(prev_insert_key_char, Some('0') | Some('^'));
+            if typed_signal_prefix {
+                let signal_idx = line_start + col - 1;
+                self.delete_with_undo(signal_idx, signal_idx + 1);
                 let line_start = self.buffer().line_to_char(line);
                 let line_text: String = self.buffer().content.line(line).chars().collect();
                 let indent_len = line_text
