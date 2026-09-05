@@ -216,8 +216,8 @@ impl Engine {
     fn vscode_copy(&mut self) {
         if self.visual_anchor.is_some() {
             if let Some((text, is_linewise)) = self.get_visual_selection_text() {
-                self.set_register('+', text.clone(), is_linewise);
-                self.set_register('"', text, is_linewise);
+                self.set_register_typed('+', text.clone(), is_linewise);
+                self.set_register_typed('"', text, is_linewise);
             }
             // Keep selection visible after copy.
         } else {
@@ -244,8 +244,8 @@ impl Engine {
     fn vscode_cut(&mut self, changed: &mut bool) {
         if self.visual_anchor.is_some() {
             if let Some((text, is_linewise)) = self.get_visual_selection_text() {
-                self.set_register('+', text.clone(), is_linewise);
-                self.set_register('"', text, is_linewise);
+                self.set_register_typed('+', text.clone(), is_linewise);
+                self.set_register_typed('"', text, is_linewise);
             }
             self.vscode_delete_selection(changed);
         } else {
@@ -281,8 +281,8 @@ impl Engine {
         if self.visual_anchor.is_some() {
             self.vscode_delete_selection(changed);
         }
-        if let Some((text, is_linewise)) = self.get_register_content('+') {
-            if is_linewise {
+        if let Some((text, reg_type)) = self.get_register_content('+') {
+            if reg_type.is_linewise() {
                 // Linewise: insert before current line.
                 let line = self.view().cursor.line;
                 let line_start = self.buffer().line_to_char(line);

@@ -1409,7 +1409,7 @@ impl Engine {
                     if let Some(ref cb_read) = self.clipboard_read {
                         if let Ok(text) = cb_read() {
                             if !text.is_empty() {
-                                self.registers.insert('"', (text, false));
+                                self.registers.insert('"', (text, RegType::Charwise));
                                 let mut changed = false;
                                 self.paste_after(1, &mut changed);
                             }

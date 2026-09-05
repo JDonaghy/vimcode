@@ -1162,13 +1162,14 @@ impl Engine {
 
     pub(crate) fn paste_after_adjusted_indent(&mut self, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
 
         if !is_linewise {
             // For characterwise, just paste normally
@@ -1206,13 +1207,14 @@ impl Engine {
 
     pub(crate) fn paste_before_adjusted_indent(&mut self, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
 
         if !is_linewise {
             self.paste_before(1, changed);
@@ -4089,9 +4091,19 @@ impl Engine {
         self.selected_register.unwrap_or('"')
     }
 
-    /// Sets a register's content. `is_linewise` affects paste behavior.
-    /// For `+` and `*` registers, also writes to the system clipboard.
+    /// Sets a register's content, charwise or linewise.
+    ///
+    /// Convenience wrapper over [`Engine::set_register_typed`] for the many
+    /// callers that can only ever produce those two types; blockwise yanks and
+    /// deletes call the typed form directly.
     pub(crate) fn set_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        self.set_register_typed(reg, content, RegType::from_linewise(is_linewise));
+    }
+
+    /// Sets a register's content. The [`RegType`] affects paste behavior.
+    /// For `+` and `*` registers, also writes to the system clipboard.
+    pub(crate) fn set_register_typed(&mut self, reg: char, content: String, ty: RegType) {
+        let is_linewise = ty.is_linewise();
         // `"_` is the black hole register (`:h quote_`): writes to it vanish
         // entirely — crucially, they do NOT fall through to the unnamed
         // register the way every other named register does below. This is
@@ -4103,8 +4115,16 @@ impl Engine {
         // Uppercase register (A-Z): append to lowercase register
         if reg.is_ascii_uppercase() {
             let lower = reg.to_ascii_lowercase();
-            let (existing, existing_lw) = self.registers.get(&lower).cloned().unwrap_or_default();
-            let combined_lw = existing_lw || is_linewise;
+            let (existing, existing_ty) = self.registers.get(&lower).cloned().unwrap_or_default();
+            let existing_lw = existing_ty.is_linewise();
+            // An append inherits the "widest" type: linewise wins over
+            // charwise, and a blockwise append degrades to the appended type
+            // (Vim does not concatenate two rectangles).
+            let combined_ty = if existing_lw || is_linewise {
+                RegType::Linewise
+            } else {
+                ty
+            };
             let combined = if existing.is_empty() {
                 content.clone()
             } else if existing_lw {
@@ -4123,14 +4143,14 @@ impl Engine {
                 format!("{}{}", existing, content)
             };
             self.registers
-                .insert(lower, (combined.clone(), combined_lw));
-            self.registers.insert('"', (combined, combined_lw));
+                .insert(lower, (combined.clone(), combined_ty));
+            self.registers.insert('"', (combined, combined_ty));
             return;
         }
-        self.registers.insert(reg, (content.clone(), is_linewise));
+        self.registers.insert(reg, (content.clone(), ty));
         // Also copy to unnamed register if using a named register
         if reg != '"' {
-            self.registers.insert('"', (content.clone(), is_linewise));
+            self.registers.insert('"', (content.clone(), ty));
         }
         // Sync clipboard registers to system clipboard
         if reg == '+' || reg == '*' {
@@ -4142,8 +4162,8 @@ impl Engine {
         }
     }
 
-    /// Gets a register's content and linewise flag (borrowed).
-    pub(crate) fn get_register(&self, reg: char) -> Option<&(String, bool)> {
+    /// Gets a register's content and type (borrowed).
+    pub(crate) fn get_register(&self, reg: char) -> Option<&(String, RegType)> {
         self.registers.get(&reg)
     }
 
@@ -4151,11 +4171,17 @@ impl Engine {
     /// target is the unnamed register. Yanks to a named register (e.g. "ayy)
     /// leave "0 untouched, matching Vim's :help registers semantics.
     pub(crate) fn set_yank_register(&mut self, reg: char, content: String, is_linewise: bool) {
-        self.set_register(reg, content.clone(), is_linewise);
+        self.set_yank_register_typed(reg, content, RegType::from_linewise(is_linewise));
+    }
+
+    /// [`set_yank_register`] with an explicit [`RegType`] — blockwise yanks
+    /// (`<C-v>y`) must reach `"0` with their blockwise-ness intact.
+    pub(crate) fn set_yank_register_typed(&mut self, reg: char, content: String, ty: RegType) {
+        self.set_register_typed(reg, content.clone(), ty);
         if reg == '"' {
             // "0 is the yank-only register — set on every unnamed yank, never on
             // deletes or on yanks to an explicit named register.
-            self.registers.insert('0', (content, is_linewise));
+            self.registers.insert('0', (content, ty));
         }
     }
 
@@ -4163,7 +4189,12 @@ impl Engine {
     /// - Linewise / multi-line: shifts "1"-"8" → "2"-"9", sets "1".
     /// - Character (< 1 line): sets "-" (small-delete register).
     pub(crate) fn set_delete_register(&mut self, reg: char, content: String, is_linewise: bool) {
-        self.set_delete_register_impl(reg, content, is_linewise, false);
+        self.set_delete_register_impl(reg, content, RegType::from_linewise(is_linewise), false);
+    }
+
+    /// [`set_delete_register`] with an explicit [`RegType`].
+    pub(crate) fn set_delete_register_typed(&mut self, reg: char, content: String, ty: RegType) {
+        self.set_delete_register_impl(reg, content, ty, false);
     }
 
     /// Like [`set_delete_register`], but always goes through the numbered
@@ -4181,17 +4212,18 @@ impl Engine {
         content: String,
         is_linewise: bool,
     ) {
-        self.set_delete_register_impl(reg, content, is_linewise, true);
+        self.set_delete_register_impl(reg, content, RegType::from_linewise(is_linewise), true);
     }
 
     fn set_delete_register_impl(
         &mut self,
         reg: char,
         content: String,
-        is_linewise: bool,
+        ty: RegType,
         force_numbered: bool,
     ) {
-        self.set_register(reg, content.clone(), is_linewise);
+        let is_linewise = ty.is_linewise();
+        self.set_register_typed(reg, content.clone(), ty);
         // Black hole: no register bookkeeping of any kind (see `set_register`).
         if reg == '_' {
             return;
@@ -4205,7 +4237,7 @@ impl Engine {
                     self.registers.insert(to, val);
                 }
             }
-            self.registers.insert('1', (content, is_linewise));
+            self.registers.insert('1', (content, ty));
         } else if !content.is_empty() && reg == '"' {
             // Small character delete: set "-" register — but only for an
             // unnamed delete. An explicit register (`"adw`) does NOT also
@@ -4213,19 +4245,19 @@ impl Engine {
             // multi-line/linewise explicit-register delete DOES still touch
             // "1-"9 above (verified against real Vim: `"add` sets both "a
             // and "1; `"bdw` sets only "b, leaving "- untouched).
-            self.registers.insert('-', (content, false));
+            self.registers.insert('-', (content, RegType::Charwise));
         }
     }
 
     /// Gets register content as owned data.
     /// For `+` and `*` registers, reads from the system clipboard.
     /// For `%`, `/`, `.` read-only registers, returns the appropriate value.
-    pub fn get_register_content(&mut self, reg: char) -> Option<(String, bool)> {
+    pub fn get_register_content(&mut self, reg: char) -> Option<(String, RegType)> {
         match reg {
             '+' | '*' => {
                 if let Some(ref cb_read) = self.clipboard_read {
                     match cb_read() {
-                        Ok(text) => return Some((text, false)),
+                        Ok(text) => return Some((text, RegType::Charwise)),
                         Err(e) => {
                             self.message = format!("Clipboard read failed: {}", e);
                         }
@@ -4243,15 +4275,15 @@ impl Engine {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                Some((name, false))
+                Some((name, RegType::Charwise))
             }
             '/' => {
                 // Last search pattern (read-only)
-                Some((self.search_query.clone(), false))
+                Some((self.search_query.clone(), RegType::Charwise))
             }
             '.' => {
                 // Last inserted text (read-only)
-                Some((self.last_inserted_text.clone(), false))
+                Some((self.last_inserted_text.clone(), RegType::Charwise))
             }
             _ => self.registers.get(&reg).cloned(),
         }
@@ -4550,6 +4582,85 @@ impl Engine {
         self.message = msg;
     }
 
+    /// Put a blockwise register back as a rectangle (`:h blockwise-register`).
+    ///
+    /// Each `\n`-separated chunk goes on a successive line starting at the
+    /// cursor's line, at a fixed column: `cursor.col + 1` for `p`, `cursor.col`
+    /// for `P`.  Lines shorter than that column are padded with spaces, and
+    /// lines past the end of the buffer are created.  `count` repeats each
+    /// chunk horizontally, not vertically.
+    ///
+    /// Before #807 a blockwise yank was stored as an ordinary charwise
+    /// register, so `<C-v>jy` then `p` spliced `"a\nc"` in as literal text and
+    /// broke the line in half.
+    pub(crate) fn paste_blockwise(
+        &mut self,
+        content: &str,
+        count: usize,
+        after: bool,
+        changed: &mut bool,
+    ) {
+        let chunks: Vec<String> = content
+            .split('\n')
+            .map(|c| {
+                if count > 1 {
+                    c.repeat(count)
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        if chunks.is_empty() {
+            return;
+        }
+        let start_line = self.view().cursor.line;
+        let cur_len = self.buffer().line_len_chars(start_line);
+        let has_nl = cur_len > 0
+            && self
+                .buffer()
+                .content
+                .line(start_line)
+                .chars()
+                .last()
+                .map(|c| c == '\n')
+                .unwrap_or(false);
+        let cur_text_len = if has_nl { cur_len - 1 } else { cur_len };
+        let col = if after && cur_text_len > 0 {
+            (self.view().cursor.col + 1).min(cur_text_len)
+        } else {
+            self.view().cursor.col.min(cur_text_len)
+        };
+
+        self.start_undo_group();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let line = start_line + i;
+            if line >= self.buffer().len_lines() {
+                // Past the end of the buffer: open a new line first.
+                let end = self.buffer().len_chars();
+                self.insert_with_undo(end, "\n");
+            }
+            let line_start = self.buffer().line_to_char(line);
+            let raw = self.buffer().line_len_chars(line);
+            let text: String = self.buffer().content.line(line).chars().collect();
+            let text_len = if text.ends_with('\n') { raw - 1 } else { raw };
+            let mut insert = String::new();
+            if text_len < col {
+                // Short line: pad out to the block's column with spaces.
+                for _ in text_len..col {
+                    insert.push(' ');
+                }
+            }
+            insert.push_str(chunk);
+            let at = line_start + text_len.min(col);
+            self.insert_with_undo(at, &insert);
+        }
+        self.finish_undo_group();
+        self.view_mut().cursor.line = start_line;
+        self.view_mut().cursor.col = col;
+        self.clear_selected_register();
+        *changed = true;
+    }
+
     /// Paste after cursor (p). Linewise pastes below current line.
     ///
     /// `count` repeats the *whole register content* `count` times as a single
@@ -4561,13 +4672,19 @@ impl Engine {
     /// landed — #806, "misc:2yy 3p").
     pub fn paste_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, true, changed);
+            return;
+        }
         let content = if count > 1 {
             content.repeat(count)
         } else {
@@ -4620,13 +4737,19 @@ impl Engine {
     /// `count` repeats the register content as a single block — see `paste_after`.
     pub(crate) fn paste_before(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, false, changed);
+            return;
+        }
         let content = if count > 1 {
             content.repeat(count)
         } else {
@@ -4664,13 +4787,19 @@ impl Engine {
     /// `count` repeats the register content as a single block — see `paste_after`.
     pub(crate) fn paste_after_cursor_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, true, changed);
+            return;
+        }
         let content = if count > 1 {
             content.repeat(count)
         } else {
@@ -4731,13 +4860,19 @@ impl Engine {
     /// `count` repeats the register content as a single block — see `paste_after`.
     pub(crate) fn paste_before_cursor_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
-        let (content, is_linewise) = match self.get_register_content(reg) {
+        let (content, reg_type) = match self.get_register_content(reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
                 return;
             }
         };
+        let is_linewise = reg_type.is_linewise();
+        if reg_type.is_blockwise() {
+            // A rectangle goes back as a rectangle (#807).
+            self.paste_blockwise(&content, count, false, changed);
+            return;
+        }
         let content = if count > 1 {
             content.repeat(count)
         } else {

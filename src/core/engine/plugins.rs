@@ -133,7 +133,13 @@ impl Engine {
         .to_string();
 
         // Registers snapshot
-        let registers_snapshot = self.registers.clone();
+        // The plugin ABI predates blockwise registers and still exposes a plain
+        // `is_linewise` bool (#807); flatten at the boundary.
+        let registers_snapshot = self
+            .registers
+            .iter()
+            .map(|(k, (text, ty))| (*k, (text.clone(), ty.is_linewise())))
+            .collect();
 
         // Marks snapshot for the active buffer (1-indexed)
         let marks_snapshot = self
@@ -301,7 +307,8 @@ impl Engine {
                     let _ = cb(&content);
                 }
             }
-            self.registers.insert(ch, (content, linewise));
+            self.registers
+                .insert(ch, (content, RegType::from_linewise(linewise)));
         }
         // Apply line insertions (process in reverse to keep indices stable)
         if !ctx.insert_lines.is_empty() {

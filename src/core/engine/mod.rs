@@ -60,6 +60,44 @@ pub struct TerminalSlot {
     pub install_ctx: Option<InstallContext>,
 }
 
+/// How a register's contents were captured, and therefore how `p`/`P` put them
+/// back — Vim's `MCHAR` / `MLINE` / `MBLOCK` (`:h registers`).
+///
+/// Before #807 this was a bare `bool` meaning "linewise", which made blockwise
+/// yanks indistinguishable from charwise ones: `<C-v>jy` followed by `p`
+/// pasted the block's lines as ordinary text instead of re-inserting a
+/// rectangle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RegType {
+    /// Character-wise (`MCHAR`) — the default.
+    #[default]
+    Charwise,
+    /// Line-wise (`MLINE`) — `p` opens whole new lines below the cursor.
+    Linewise,
+    /// Block-wise (`MBLOCK`) — `p` re-inserts a rectangle, one line per
+    /// `\n`-separated chunk, starting at the cursor's column.
+    Blockwise,
+}
+
+impl RegType {
+    /// Charwise/linewise from the legacy `is_linewise` boolean.
+    pub fn from_linewise(linewise: bool) -> Self {
+        if linewise {
+            Self::Linewise
+        } else {
+            Self::Charwise
+        }
+    }
+
+    pub fn is_linewise(self) -> bool {
+        matches!(self, Self::Linewise)
+    }
+
+    pub fn is_blockwise(self) -> bool {
+        matches!(self, Self::Blockwise)
+    }
+}
+
 /// Actions returned from `handle_key` that the UI layer must act on.
 /// This keeps GTK/platform concerns out of the core engine.
 #[derive(Debug, PartialEq)]
@@ -2348,8 +2386,9 @@ pub struct Engine {
     pub activity_bar_selected: u16,
 
     // --- Registers (yank/delete storage) ---
-    /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is (content, is_linewise).
-    pub registers: HashMap<char, (String, bool)>,
+    /// Named registers: 'a'-'z' plus '"' (unnamed default). Value is
+    /// `(content, register type)` — see [`RegType`].
+    pub registers: HashMap<char, (String, RegType)>,
     /// Currently selected register for next yank/delete/paste (set by "x prefix).
     pub selected_register: Option<char>,
     /// Accumulating the expression typed after `"=` (Normal mode) or
@@ -2407,6 +2446,17 @@ pub struct Engine {
     /// builds toward one (count digits) — see `update_curswant_for_key` for
     /// the single choke point that decides.
     pub(crate) curswant: Option<usize>,
+
+    /// The column a Visual-Block selection's moving edge *wants*, latched at
+    /// the start of every keystroke while Visual-Block is active (#807).
+    ///
+    /// `<C-v>jj` down onto a shorter line clamps `cursor.col`, but Vim keeps
+    /// the block anchored on the wanted column — `<C-v>jjy` on
+    /// `abc / abc / x` with the cursor in column 2 yanks `b`, `b`, `` and not
+    /// `ab`, `ab`, `x`. `curswant` itself already holds that value, but
+    /// `handle_key` clears it on the operator keystroke *before* the operator
+    /// runs, so it is copied here first.
+    pub(crate) visual_block_want: Option<usize>,
 
     /// Vim's `'scroll'` option: the line count `<C-d>`/`<C-u>` use. `None`
     /// means "not set yet — use half the window height". Set (replaced, not
@@ -3676,6 +3726,7 @@ impl Engine {
             visual_dollar: false,
             command_from_visual: None,
             curswant: None,
+            visual_block_want: None,
             scroll_value: None,
             count: None,
             operator_count: None,

@@ -1800,8 +1800,8 @@ impl Engine {
                     '/',
                 ];
                 for &r in &special_regs {
-                    if let Some((content, is_lw)) = self.registers.get(&r).cloned() {
-                        let kind = if is_lw { "l" } else { "c" };
+                    if let Some((content, ty)) = self.registers.get(&r).cloned() {
+                        let kind = reg_type_letter(ty);
                         let preview: String = content.chars().take(40).collect();
                         lines.push(format!(
                             "\"{}  {}  {}",
@@ -1812,8 +1812,8 @@ impl Engine {
                     }
                 }
                 for c in 'a'..='z' {
-                    if let Some((content, is_lw)) = self.registers.get(&c).cloned() {
-                        let kind = if is_lw { "l" } else { "c" };
+                    if let Some((content, ty)) = self.registers.get(&c).cloned() {
+                        let kind = reg_type_letter(ty);
                         let preview: String = content.chars().take(40).collect();
                         lines.push(format!(
                             "\"{}  {}  {}",
@@ -2211,8 +2211,9 @@ impl Engine {
                 // :y[ank] [register] — yank current line
                 let line = self.view().cursor.line;
                 let text = self.buffer().content.line(line).chars().collect::<String>();
-                self.registers.insert('"', (text.clone(), true));
-                self.registers.insert('0', (text, true));
+                self.registers
+                    .insert('"', (text.clone(), RegType::Linewise));
+                self.registers.insert('0', (text, RegType::Linewise));
                 EngineAction::None
             }
             "put" => {
@@ -2358,9 +2359,10 @@ impl Engine {
                     let reg = arg.chars().next().unwrap_or('"');
                     let line = self.view().cursor.line;
                     let text = self.buffer().content.line(line).chars().collect::<String>();
-                    self.registers.insert(reg, (text.clone(), true));
+                    self.registers
+                        .insert(reg, (text.clone(), RegType::Linewise));
                     if reg != '"' {
-                        self.registers.insert('"', (text, true));
+                        self.registers.insert('"', (text, RegType::Linewise));
                     }
                     return EngineAction::None;
                 }
@@ -4538,5 +4540,14 @@ fn split_cmd_and_arg<'a>(rest: &'a str, name: &str) -> Option<&'a str> {
         Some(rest.trim())
     } else {
         None
+    }
+}
+
+/// `:registers` type column — Vim prints `c`, `l` or `b` (`:h :registers`).
+fn reg_type_letter(ty: RegType) -> &'static str {
+    match ty {
+        RegType::Charwise => "c",
+        RegType::Linewise => "l",
+        RegType::Blockwise => "b",
     }
 }
