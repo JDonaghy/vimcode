@@ -2335,48 +2335,29 @@ impl ShellApp for TuiShellApp {
                             // made File▸Quit, File▸Open Folder, File▸Recent,
                             // Save Workspace As and Terminal▸New all no-ops.
                             // Mirrors `mod.rs:1450`-`:1498`.
+                            //
+                            // #823 item 2: this used to re-match `act` inline,
+                            // a near-duplicate of `dispatch_post_key_action`'s
+                            // body that had already drifted from it — it
+                            // measured `OpenTerminal`'s column count from the
+                            // raw viewport width instead of
+                            // `terminal_panel_cols`, so a terminal opened from
+                            // the menu bar while the sidebar was visible got
+                            // the wrong width until the next resize event
+                            // recomputed it. Routing through the same
+                            // function both fixes that and removes the
+                            // duplication.
                             let act = self.engine.dispatch_menu_action(&action);
-                            let cols = viewport.width as u16;
-                            let rows = self.engine.session.terminal_panel_rows;
-                            match act {
-                                EngineAction::OpenTerminal => {
-                                    self.engine.terminal_new_tab(cols, rows);
-                                }
-                                EngineAction::RunInTerminal(cmd) => {
-                                    self.engine.terminal_run_command(&cmd, cols, rows);
-                                }
-                                EngineAction::OpenFolderDialog => {
-                                    self.folder_picker =
-                                        Some(new_folder_picker_controller(&self.engine));
-                                }
-                                EngineAction::OpenWorkspaceDialog => {
-                                    self.sidebar = TuiSidebar::new();
-                                    self.engine.explorer_rebuild_rows();
-                                }
-                                EngineAction::SaveWorkspaceAsDialog => {
-                                    let ws_path = self.engine.cwd.join(".vimcode-workspace");
-                                    self.engine.save_workspace_as(&ws_path);
-                                }
-                                EngineAction::OpenRecentDialog => {
-                                    // #274: engine-driven picker; replaces
-                                    // the TUI-local
-                                    // `FolderPickerState::new_recent`.
-                                    if self.engine.session.recent_workspaces.is_empty() {
-                                        self.engine.message = "No recent workspaces".to_string();
-                                    } else {
-                                        self.engine.open_picker(
-                                            crate::core::engine::PickerSource::RecentWorkspaces,
-                                        );
-                                    }
-                                }
-                                EngineAction::QuitWithUnsaved => {
-                                    self.engine.show_quit_confirm();
-                                }
-                                act => {
-                                    if handle_action(&mut self.engine, act) {
-                                        break 'dispatch Reaction::Exit;
-                                    }
-                                }
+                            if dispatch_post_key_action(
+                                act,
+                                &mut self.engine,
+                                &mut self.sidebar,
+                                &mut self.folder_picker,
+                                viewport.width as u16,
+                                viewport.height as u16,
+                                self.sidebar_width,
+                            ) {
+                                break 'dispatch Reaction::Exit;
                             }
                         }
                         break 'dispatch Reaction::Redraw;
@@ -6126,6 +6107,80 @@ mod tests {
         assert!(
             screen.contains("Terminal"),
             "bottom panel terminal tab bar should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #823 item 2: `TuiShellApp::handle`'s `MenuEvent::Activated` arm used
+    /// to re-match the resulting `EngineAction` inline, a near-duplicate of
+    /// `dispatch_post_key_action`'s body (pasted a few hundred lines away)
+    /// that had already drifted from it — the inline copy measured
+    /// `OpenTerminal`'s column count from the raw viewport width instead of
+    /// `terminal_panel_cols`, so a terminal opened from the menu bar while
+    /// the sidebar was visible got the wrong PTY width until the next
+    /// resize recomputed it. The two copies are now one function
+    /// (`dispatch_post_key_action`), called from both call sites.
+    ///
+    /// That width regression itself isn't something this test can observe:
+    /// `TuiDriver`'s only feedback channel is the painted screen (this
+    /// file's module doc: "no accessor back to the concrete `TuiShellApp`"),
+    /// and a spawned shell's own prompt content is environment-dependent,
+    /// not a reliable proxy for PTY column count
+    /// (`render_content_paints_bottom_panel_terminal_via_shell_app`'s doc
+    /// comment above makes the same call for the same reason). What this
+    /// guards is the collapse's actual regression risk: that Terminal ▸ New
+    /// Terminal, now reached only through the shared
+    /// `dispatch_post_key_action` call, still opens a terminal pane rather
+    /// than silently becoming a no-op — exactly the #634 reachability
+    /// regression this arm's other doc comment (just above, in `handle`)
+    /// warns about for the sibling menu actions.
+    ///
+    /// RED-verified: with the `dispatch_post_key_action(...)` call in the
+    /// `MenuEvent::Activated` arm replaced by a no-op, this test fails (no
+    /// "Terminal" tab-bar label paints outside the menu-bar row after
+    /// Enter); restored before committing.
+    #[test]
+    fn menu_terminal_activation_opens_terminal_pane_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // 't' is `MENU_STRUCTURE`'s alt-letter for the "Terminal" menu
+        // (`render.rs`: `("Terminal", 't', &[...])`) — Alt+T reveals +
+        // activates it in one dispatch, the same #318 shim
+        // `alt_letter_reveals_menu_bar_via_shell_app` exercises for File.
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('t'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New Terminal"),
+            "Alt+T should reveal the menu bar and open the Terminal dropdown; screen:\n{screen}"
+        );
+
+        // Enter activates the first (already-selected) item, "New Terminal"
+        // (action id "terminal" -> `EngineAction::OpenTerminal`) — mirrors
+        // `menu_intercept_routes_via_is_open_when_bar_hidden_with_dropdown_
+        // open_via_shell_app`'s identical use of Enter to activate a
+        // dropdown's first item. `MenuSystem::handle` closes the dropdown
+        // itself before returning `Activated`, so nothing from the dropdown
+        // box can paint on the rows checked below.
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        // The bottom-panel tab bar's "Terminal" label (`render::
+        // build_bottom_panel_tab_bar`) is the deterministic proof a
+        // terminal pane actually opened. Skip row 0: the menu bar's own
+        // "Terminal" top-level label lives there too (and stays painted
+        // regardless of whether the terminal opened), so a whole-screen
+        // search would pass even against a no-op.
+        let screen = driver.screen();
+        assert!(
+            screen.lines().skip(1).any(|l| l.contains("Terminal")),
+            "Terminal \u{25b8} New Terminal must open a terminal pane (bottom-panel \
+             tab bar showing \"Terminal\" outside the menu-bar row); screen:\n{screen}"
         );
     }
 
