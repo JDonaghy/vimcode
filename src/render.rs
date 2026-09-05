@@ -4844,6 +4844,17 @@ pub enum TabDragMove {
 /// Five parallel fields per backend became one, which is what makes the
 /// invariants checkable: a `source` can only exist while `dragging`, and
 /// `press` and `dragging` are never both set.
+///
+/// **#822 asks this to be replaced by `quadraui::compose::TabGroupController`.**
+/// That adoption was investigated and correctly declined for now:
+/// `TabGroupController` owns its own `Vec<Pane>`/`GroupLayout` model, and
+/// vimcode already owns the authoritative model in `Engine` — adopting it
+/// as-is would mean mirroring `Engine`'s editor-group state into a second
+/// source of truth. The upstream gap this implies (an external-model
+/// adoption path for `TabGroupController`) is drafted, not yet filed, in
+/// `docs/PENDING_QUADRAUI_ISSUES.md`. Per `CLAUDE.md`'s Platform-Neutrality
+/// Rule, that filing — not new code here — is the correct next step, and
+/// #822 must stay open behind it, not close on this investigation alone.
 #[derive(Debug, Clone)]
 pub struct TabDragState {
     /// Where the left button went down inside a tab bar, until either the
@@ -19913,6 +19924,14 @@ pub fn screen_to_drop_group_bounds(screen: &ScreenLayout) -> Vec<DropGroupBounds
         .collect()
 }
 
+/// #822 asks this adapter (and [`build_tab_drop_groups`]) to be replaced by
+/// `quadraui::compose::TabGroupController`. See the doc comment on
+/// [`TabDragState`] and `docs/PENDING_QUADRAUI_ISSUES.md` for why that isn't
+/// a like-for-like swap yet, and #822 must stay open behind the drafted
+/// quadraui gap rather than close on this investigation alone. The geometry
+/// math this function does is already shared (it calls straight through to
+/// `quadraui::compute_drop_zone`); what's local is the `Engine` ↔
+/// `TabDropGroup` adapter.
 pub fn compute_tab_drop_zone(
     cursor_x: f32,
     cursor_y: f32,
