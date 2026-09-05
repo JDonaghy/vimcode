@@ -2874,9 +2874,12 @@ impl Engine {
 
     // ── AI assistant panel ─────────────────────────────────────────────────────
 
-    /// Send the current `ai_input` as a user message; clears input and spawns background thread.
-    pub fn ai_send_message(&mut self) {
-        let text = self.ai_input.trim().to_string();
+    /// Send `text` as a user message; spawns the background request thread.
+    /// Callers (`ChatControllerEvent::Submit` dispatch, the `:AI` command,
+    /// the palette's `chat_send:` action) own clearing whatever input widget
+    /// held the text — this only mutates the conversation/request state.
+    pub fn ai_send_message(&mut self, text: String) {
+        let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
             return;
         }
@@ -2884,8 +2887,6 @@ impl Engine {
             role: "user".to_string(),
             content: text,
         });
-        self.ai_input.clear();
-        self.ai_input_cursor = 0;
         self.ai_streaming = true;
 
         let provider = self.settings.ai_provider.clone();
@@ -2904,9 +2905,6 @@ impl Engine {
             );
             let _ = tx.send(result);
         });
-
-        // Scroll to bottom so the user sees the new message
-        self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
     }
 
     /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
@@ -2927,7 +2925,6 @@ impl Engine {
                     role: "assistant".to_string(),
                     content: reply,
                 });
-                self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
             }
             Err(e) => {
                 self.message = format!("AI error: {e}");
@@ -2941,116 +2938,41 @@ impl Engine {
         self.ai_messages.clear();
         self.ai_rx = None;
         self.ai_streaming = false;
-        self.ai_scroll_top = 0;
+        self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
     }
 
-    /// Handle keyboard input for the AI sidebar panel.
-    /// Returns `true` if the key was consumed.
-    /// Insert text at the current ai_input cursor position (used for paste).
-    pub fn ai_insert_text(&mut self, text: &str) {
-        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-        self.ai_input.insert_str(byte, text);
-        self.ai_input_cursor += text.chars().count();
-    }
-
-    pub fn handle_ai_panel_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
-        if self.ai_input_active {
-            let char_len = self.ai_input.chars().count();
-            match key {
-                "Escape" => {
-                    self.ai_input_active = false;
-                }
-                "Return" if !ctrl => {
-                    self.ai_send_message();
-                    self.ai_input_active = false;
-                }
-                "BackSpace" => {
-                    if self.ai_input_cursor > 0 {
-                        self.ai_input_cursor -= 1;
-                        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                        let next = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor + 1);
-                        self.ai_input.drain(byte..next);
-                    }
-                }
-                "Delete" => {
-                    if self.ai_input_cursor < char_len {
-                        let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                        let next = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor + 1);
-                        self.ai_input.drain(byte..next);
-                    }
-                }
-                "Left" => {
-                    self.ai_input_cursor = self.ai_input_cursor.saturating_sub(1);
-                }
-                "Right" => {
-                    self.ai_input_cursor = (self.ai_input_cursor + 1).min(char_len);
-                }
-                "Home" => {
-                    self.ai_input_cursor = 0;
-                }
-                "End" => {
-                    self.ai_input_cursor = char_len;
-                }
-                _ if ctrl && key == "a" => {
-                    self.ai_input_cursor = 0;
-                }
-                _ if ctrl && key == "e" => {
-                    self.ai_input_cursor = char_len;
-                }
-                _ if ctrl && key == "k" => {
-                    let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                    self.ai_input.truncate(byte);
-                }
-                _ => {
-                    if let Some(ch) = unicode {
-                        if !ch.is_control() {
-                            let byte = cmd_char_to_byte(&self.ai_input, self.ai_input_cursor);
-                            self.ai_input.insert(byte, ch);
-                            self.ai_input_cursor += 1;
-                        }
-                    }
-                }
+    /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
+    /// (`self.ai_chat`) returned from `handle()`. Shared by GTK and TUI via
+    /// `render::route_ai_chat_event` (#819 — the ChatController adoption that
+    /// replaced this panel's hand-rolled `handle_ai_panel_key`/`ai_insert_text`).
+    ///
+    /// Returns whether the panel should keep keyboard focus — `false` only on
+    /// `Cancelled` (Escape), mirroring every other panel's "Escape leaves the
+    /// panel" convention now that the always-focused `ChatController` input has
+    /// no separate "not editing" mode to fall back into.
+    pub fn dispatch_ai_chat_event(&mut self, event: quadraui::ChatControllerEvent) -> bool {
+        use quadraui::ChatControllerEvent as Ev;
+        match event {
+            Ev::Submit { text } => {
+                self.ai_send_message(text);
+                self.ai_chat.borrow_mut().clear_input();
+                true
             }
-            return true;
-        }
-
-        match key {
-            "q" | "Escape" => {
+            Ev::Cancelled => {
                 self.ai_has_focus = false;
-                true
+                false
             }
-            "h" | "Left" if !ctrl => {
-                self.ai_has_focus = false;
-                self.activity_bar_focus_in_at(6);
-                true
-            }
-            "i" | "a" | "Return" => {
-                self.ai_input_active = true;
-                true
-            }
-            "j" | "Down" => {
-                self.ai_scroll_top = self.ai_scroll_top.saturating_add(1);
-                true
-            }
-            "k" | "Up" => {
-                self.ai_scroll_top = self.ai_scroll_top.saturating_sub(1);
-                true
-            }
-            "G" => {
-                self.ai_scroll_top = self.ai_messages.len().saturating_sub(1);
-                true
-            }
-            "g" => {
-                self.ai_scroll_top = 0;
-                true
-            }
-            "c" if ctrl => {
-                // Ctrl-C: clear conversation
+            // Ctrl+C: clear the conversation. `ChatController` has no
+            // built-in binding for it (only Escape/Ctrl+S/Alt+Enter/
+            // Ctrl+Enter/PageUp/PageDown/Ctrl+A/Ctrl+E are handled
+            // internally), so it falls to this app-hotkey escape hatch,
+            // exactly as its own doc comment recommends.
+            Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('c')" => {
                 self.ai_clear();
                 true
             }
-            _ => false,
+            _ => true,
         }
     }
 

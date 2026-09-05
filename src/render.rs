@@ -2916,7 +2916,8 @@ pub enum FocusKeyRoute {
     ExtSidebar,
     /// The settings panel — `Engine::handle_settings_key`.
     Settings,
-    /// The AI assistant panel — `Engine::handle_ai_panel_key`.
+    /// The AI assistant panel — `route_ai_chat_event` (needs a live
+    /// `Backend`, like [`FocusKeyRoute::Debug`]; see that variant's doc).
     Ai,
     /// The source-control panel — `dispatch_sc_sidebar_key_unified`.
     SourceControl,
@@ -3558,10 +3559,13 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 /// spelling (`Return`/`Escape`/`BackSpace`/`Up`/… and the bare character for
 /// printables). Returns `Some(panel_still_focused)` — the flag the caller
 /// feeds to its "did focus leave the sidebar?" bookkeeping — or `None` for
-/// the three routes this cannot own:
+/// the four routes this cannot own:
 ///
 /// - [`FocusKeyRoute::Debug`] needs a live `Backend` and the un-round-tripped
 ///   `UiEvent` to drive `dap_sidebar_system`,
+/// - [`FocusKeyRoute::Ai`] needs the same — a live `Backend` and the
+///   un-round-tripped `UiEvent` — to drive `ai_chat` (`ChatController`, #819);
+///   see [`route_ai_chat_event`],
 /// - [`FocusKeyRoute::Explorer`] is a backend widget on GTK and a `TuiSidebar`
 ///   on TUI,
 /// - [`FocusKeyRoute::ActivityBar`] / [`FocusKeyRoute::None`] are not sidebar
@@ -3613,11 +3617,7 @@ pub fn dispatch_sidebar_panel_key(
             engine.dispatch_sc_sidebar_key_unified(key_name, ctrl, sc_unicode);
             engine.sc_has_focus
         }
-        FocusKeyRoute::Ai => {
-            engine.handle_ai_panel_key(key_name, ctrl, unicode);
-            engine.ai_has_focus
-        }
-        FocusKeyRoute::Debug | FocusKeyRoute::Explorer => return None,
+        FocusKeyRoute::Debug | FocusKeyRoute::Explorer | FocusKeyRoute::Ai => return None,
         FocusKeyRoute::ActivityBar | FocusKeyRoute::None => return None,
     })
 }
@@ -6146,36 +6146,46 @@ pub fn route_sc_sidebar_click(
     ScSidebarClickOutcome::Content
 }
 
-/// Route a press to the AI assistant sidebar's body, given the
-/// [`AiSidebarBands`] the shared painter (`draw_ai_sidebar_panel`) laid the
-/// panel out into. A press in the input band activates editing there
-/// (cursor at end); anywhere else in the panel just moves focus — mirrors
-/// `#730`'s GTK-only `route_ai_sidebar_event`, which this replaces.
+/// Dispatch a mouse/scroll/keyboard [`quadraui::UiEvent`] to the AI assistant
+/// sidebar's `ChatController` (#819 — the adoption that replaced the
+/// hand-painted `draw_ai_sidebar_panel`/`route_ai_sidebar_click` pair this
+/// function and [`populate_ai_chat_controller`] took over from). Shared by
+/// GTK and TUI, mirroring [`route_explorer_tree_event`] and
+/// [`dispatch_dap_sidebar_body_event`]: `rect` must be the same rect the
+/// caller's last `ai_chat.borrow().render(backend, rect)` used (both
+/// backends cache it in `Engine::ai_chat_rect`), so `ChatController::handle`
+/// re-derives the identical layout `render()` painted rather than risking
+/// the #544/#582/#646 drift a second hand-rolled geometry pass invites.
 ///
-/// TUI paints this same panel (`panels::render_ai_sidebar` also calls
-/// `draw_ai_sidebar_panel`) but has never cached the returned bands for
-/// click routing the way GTK's `cached_ai_bands` does, so it does not yet
-/// call this function — the AI panel stayed keyboard-only there before
-/// #754 and stays that way after it. That is a real, separate gap (wiring a
-/// bands cache into `TuiShellApp`), not the duplication this function
-/// fixes: there was never a second copy of this dispatch logic on TUI to
-/// converge with.
-pub fn route_ai_sidebar_click(
+/// Returns whether the panel should keep keyboard focus — see
+/// [`Engine::dispatch_ai_chat_event`], which this delegates the semantic
+/// event to after `ChatController::handle` resolves it.
+///
+/// On GTK, `backend`'s "current" `line_height`/`char_width` — what
+/// [`quadraui::Backend::line_height`]/`char_width` actually read — are
+/// mutable and can be left at whatever some *other* widget's render pass
+/// last set them to by the time an event reaches here. Callers must
+/// re-apply the metrics `render()` painted this panel with (GTK's `App`
+/// caches them in `cached_ai_chat_metrics` for exactly this) *before*
+/// calling this function, the same way [`route_explorer_tree_event`]'s
+/// callers re-apply `cached_explorer_metrics`. Skipping this doesn't panic
+/// or misroute the event — it silently feeds `ChatController::handle` a
+/// different `total_rows`/`visible_rows` than `render()` computed, which
+/// desyncs the scrollbar clamp from the very first scroll notch (caught by
+/// `ai_panel_scrolls_transcript`, #819 review).
+pub fn route_ai_chat_event(
     engine: &mut Engine,
-    pos: quadraui::Point,
-    bands: &AiSidebarBands,
-    starts_interaction: bool,
-) {
-    if starts_interaction {
-        engine.ai_has_focus = true;
-        let in_input = pos.y >= bands.input.y && pos.y < bands.input.y + bands.input.height;
-        if in_input {
-            engine.ai_input_active = true;
-            engine.ai_input_cursor = engine.ai_input.chars().count();
-        } else {
-            engine.ai_input_active = false;
-        }
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+    theme: &Theme,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return engine.ai_has_focus;
     }
+    populate_ai_chat_controller(engine, theme);
+    let chat_event = engine.ai_chat.borrow_mut().handle(event, backend, rect);
+    engine.dispatch_ai_chat_event(chat_event)
 }
 
 // ─── Frame composition: the editor band (#764, #735 slice 3) ────────────────
@@ -8168,51 +8178,6 @@ pub fn panel_hover_popup_paint(
     (link_rects, popup_rect)
 }
 
-// ─── AiPanelData ─────────────────────────────────────────────────────────────
-
-/// A single message in the AI conversation history, pre-formatted for rendering.
-#[derive(Debug, Clone)]
-pub struct AiPanelMessage {
-    /// "user" or "assistant"
-    pub role: String,
-    /// Message text (may be multi-line)
-    pub content: String,
-}
-
-/// Rendering data for the AI assistant sidebar panel.
-#[derive(Debug, Clone)]
-pub struct AiPanelData {
-    pub messages: Vec<AiPanelMessage>,
-    /// Current input being composed.
-    pub input: String,
-    /// Whether the panel has keyboard focus.
-    pub has_focus: bool,
-    /// Whether the text input box is in active edit mode.
-    pub input_active: bool,
-    /// True while waiting for an AI response.
-    pub streaming: bool,
-    /// Scroll offset into the messages list.
-    pub scroll_top: usize,
-    /// Cursor position within `input` (char index).
-    pub input_cursor: usize,
-}
-
-/// Row zones painted by [`draw_ai_sidebar_panel`], in the caller's own
-/// coordinate space (character cells for TUI, pixels for GTK) — mirrors
-/// [`ScSidebarBands`], the git-panel equivalent this pattern is copied
-/// from. Cache the returned value and reuse it for click routing (#544):
-/// re-deriving the layout in the click handler is the bug #544/#582/#646
-/// all trace back to.
-#[derive(Debug, Clone, Copy)]
-pub struct AiSidebarBands {
-    /// Header row ("AI ASSISTANT" title).
-    pub header: quadraui::Rect,
-    /// Scrollable message-history area.
-    pub messages: quadraui::Rect,
-    /// Separator row + input box (everything below the message history).
-    pub input: quadraui::Rect,
-}
-
 // ─── SettingDef ───────────────────────────────────────────────────────────────
 
 // SettingType, SettingDef, and SETTING_DEFS are defined in settings.rs and
@@ -9405,8 +9370,6 @@ pub struct ScreenLayout {
     pub group_dividers: Vec<GroupDivider>,
     /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
     pub ext_sidebar: Option<ExtSidebarData>,
-    /// AI assistant panel data — `Some` when the AI panel is the active sidebar panel.
-    pub ai_panel: Option<AiPanelData>,
     /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
     pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
@@ -12748,7 +12711,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
     });
 
     let ext_sidebar = build_ext_sidebar_data(engine);
-    let ai_panel = build_ai_panel_data(engine);
 
     // Build breadcrumbs for each editor group
     let breadcrumbs = if engine.settings.breadcrumbs {
@@ -12909,7 +12871,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         window_dividers,
         minimap,
         ext_sidebar,
-        ai_panel,
         ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
         diff_peek: engine.diff_peek.as_ref().map(|dp| DiffPeekPopup {
@@ -15291,291 +15252,48 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
     })
 }
 
-fn build_ai_panel_data(engine: &Engine) -> Option<AiPanelData> {
-    // Always build so backends can check ai_has_focus.
-    let messages = engine
+/// Populate `engine.ai_chat` (a [`quadraui::ChatController`]) with the
+/// current conversation and busy state for the next `render()`/`handle()`
+/// pass — the AI-panel twin of [`populate_explorer_tree_controller`]. Call
+/// once before either (both [`route_ai_chat_event`] and the two backends'
+/// `PANEL_AI` render arms do).
+///
+/// `engine.ai_messages` stays the business-logic source of truth (what
+/// `crate::core::ai::send_chat` actually sends); this rebuilds the
+/// controller's own `Vec<ChatTurn>` mirror from it on every call, matching
+/// [`quadraui::ChatController::set_transcript`]'s "replace, don't
+/// accumulate" contract so streamed/cleared history never double-renders.
+pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
+    let user_fg = to_quadraui_color(theme.keyword);
+    let asst_fg = to_quadraui_color(theme.string_lit);
+    let turns: Vec<quadraui::ChatTurn> = engine
         .ai_messages
         .iter()
-        .map(|m| AiPanelMessage {
-            role: m.role.clone(),
-            content: m.content.clone(),
+        .map(|m| {
+            let (role, fg) = if m.role == "user" {
+                (quadraui::ChatRole::User, user_fg)
+            } else {
+                (quadraui::ChatRole::Assistant, asst_fg)
+            };
+            quadraui::ChatTurn {
+                role,
+                text: quadraui::StyledText::colored(m.content.clone(), fg),
+                timestamp_unix: None,
+                line_scales: Vec::new(),
+            }
         })
         .collect();
-    Some(AiPanelData {
-        messages,
-        input: engine.ai_input.clone(),
-        has_focus: engine.ai_has_focus,
-        input_active: engine.ai_input_active,
-        streaming: engine.ai_streaming,
-        scroll_top: engine.ai_scroll_top,
-        input_cursor: engine.ai_input_cursor,
-    })
-}
 
-/// One full-row `StatusBar` used as a plain text row — the same
-/// "single-segment `StatusBar` stands in for a plain text row" trick
-/// [`tab_hover_tooltip_paint`] and TUI's retired `draw_rule_row_q` use
-/// (#609/#671). `draw_status_bar`'s own per-backend impl already fills the
-/// row's background across the *entire* rect regardless of text length, so
-/// unlike that retired TUI-only helper there is no manual space-padding of
-/// `text` to `rect`'s width.
-fn draw_ai_text_row(
-    backend: &mut dyn quadraui::Backend,
-    rect: quadraui::Rect,
-    text: &str,
-    fg: quadraui::Color,
-    bg: quadraui::Color,
-) {
-    if rect.width <= 0.0 || rect.height <= 0.0 {
-        return;
-    }
-    let bar = quadraui::StatusBar {
-        id: quadraui::WidgetId::new("ai:row"),
-        left_segments: vec![quadraui::StatusBarSegment {
-            text: text.to_string(),
-            fg,
-            bg,
-            bold: false,
-            action_id: None,
-        }],
-        right_segments: vec![],
-    };
-    let _ = backend.draw_status_bar(rect, &bar, None, None);
-}
-
-/// Paint the AI assistant sidebar panel through `Backend` primitives —
-/// header row, scrollable message history (`Backend::draw_message_list`),
-/// separator, and a multi-line growing input box with an inline cursor
-/// cell. One implementation shared by TUI's `render_ai_sidebar` and GTK's
-/// `render_content` `PANEL_AI` arm (#730 — the 14th and last `ScreenLayout`
-/// field #592 tracked, and the straggler #670 deferred).
-///
-/// `unit_w` / `unit_h` scale a character cell / text row into the caller's
-/// native coordinate space: `1.0, 1.0` for TUI (cell-native — `area` is
-/// already in character cells), or `char_width, line_height` in pixels for
-/// GTK — the same convention [`tab_hover_tooltip_paint`] and
-/// [`sc_sidebar_bands`] use.
-///
-/// Returns the [`AiSidebarBands`] this frame painted — cache it and reuse
-/// it for click routing (#544/#582/#646: never re-derive the layout in the
-/// click handler).
-pub fn draw_ai_sidebar_panel(
-    backend: &mut dyn quadraui::Backend,
-    area: quadraui::Rect,
-    ai: &AiPanelData,
-    theme: &Theme,
-    unit_w: f32,
-    unit_h: f32,
-) -> AiSidebarBands {
-    let empty_bands = AiSidebarBands {
-        header: quadraui::Rect::new(area.x, area.y, 0.0, 0.0),
-        messages: quadraui::Rect::new(area.x, area.y, 0.0, 0.0),
-        input: quadraui::Rect::new(area.x, area.y, 0.0, 0.0),
-    };
-    if area.width <= 0.0 || area.height <= 0.0 || unit_w <= 0.0 || unit_h <= 0.0 {
-        return empty_bands;
-    }
-
-    backend.set_theme(to_quadraui_theme(theme));
-
+    let mut chat = engine.ai_chat.borrow_mut();
+    chat.set_transcript(turns);
+    chat.set_busy(engine.ai_streaming);
     let header_fg = to_quadraui_color(theme.status_fg);
-    let header_bg = to_quadraui_color(theme.status_bg);
-    let default_fg = to_quadraui_color(theme.foreground);
-    let dim_fg = to_quadraui_color(theme.line_number_fg);
-    let panel_bg = to_quadraui_color(theme.completion_bg);
-    let input_active_bg = to_quadraui_color(theme.fuzzy_selected_bg);
-
-    let area_rows = (area.height / unit_h).floor().max(0.0) as usize;
-    let area_cols = (area.width / unit_w).floor().max(0.0) as usize;
-    let bottom = area.y + area.height;
-    let mut y = area.y;
-
-    // ── Row 0: header ─────────────────────────────────────────────────────────
-    let header_rect = quadraui::Rect::new(area.x, y, area.width, unit_h);
-    if y < bottom {
-        let hdr = if ai.streaming {
-            " \u{f0e5} AI ASSISTANT  (thinking…)"
-        } else {
-            " \u{f0e5} AI ASSISTANT"
-        };
-        draw_ai_text_row(backend, header_rect, hdr, header_fg, header_bg);
-        y += unit_h;
-    }
-
-    // ── Compute input height (grows with content) ─────────────────────────────
-    let pfx_len = 3usize; // " > " / "   "
-    let content_w = area_cols.saturating_sub(pfx_len).max(1);
-    let input_chars: Vec<char> = ai.input.chars().collect();
-    let input_line_count = {
-        let raw = if input_chars.is_empty() {
-            1
-        } else {
-            input_chars.len().div_ceil(content_w)
-        };
-        // cap so messages keep at least 3 rows
-        raw.min(area_rows.saturating_sub(5).max(1))
-    };
-    // +1 for separator row
-    let input_rows = input_line_count + 1;
-    let msg_area_rows = area_rows.saturating_sub(1 + input_rows);
-
-    // ── Message history ───────────────────────────────────────────────────────
-    let scroll = ai.scroll_top;
-    let wrap_w = content_w.saturating_sub(1).max(10); // slightly narrower for "  " indent
-    let q_user_fg = to_quadraui_color(theme.keyword);
-    let q_asst_fg = to_quadraui_color(theme.string_lit);
-    let q_default_fg = to_quadraui_color(theme.foreground);
-    let q_panel_bg = to_quadraui_color(theme.completion_bg);
-    let mut rows: Vec<quadraui::MessageRow> = Vec::new();
-    for msg in &ai.messages {
-        let is_user = msg.role == "user";
-        let role_label = if is_user { "You:" } else { "AI:" };
-        let role_fg = if is_user { q_user_fg } else { q_asst_fg };
-        rows.push(quadraui::MessageRow::new(role_label, role_fg, 0.0));
-        for line in msg.content.lines() {
-            if line.is_empty() {
-                rows.push(quadraui::MessageRow::new("", q_default_fg, 2.0));
-                continue;
-            }
-            let chars: Vec<char> = line.chars().collect();
-            let mut pos = 0;
-            while pos < chars.len() {
-                let end = (pos + wrap_w).min(chars.len());
-                let chunk: String = chars[pos..end].iter().collect();
-                rows.push(quadraui::MessageRow::new(chunk, q_default_fg, 2.0));
-                pos = end;
-            }
-        }
-        rows.push(quadraui::MessageRow::new("", q_panel_bg, 0.0)); // blank separator
-    }
-
-    let total = rows.len();
-    let start = scroll.min(total.saturating_sub(msg_area_rows));
-    let msg_list = quadraui::MessageList {
-        id: quadraui::WidgetId::new("ai:messages"),
-        rows,
-        scroll_top: start,
-    };
-    let msg_area_top = y;
-    let messages_rect = quadraui::Rect::new(
-        area.x,
-        msg_area_top,
-        area.width,
-        msg_area_rows as f32 * unit_h,
-    );
-    backend.draw_message_list(messages_rect, &msg_list);
-    y += msg_area_rows as f32 * unit_h;
-
-    // Fill any rows the message list didn't cover (when there are
-    // fewer messages than the visible area).
-    let painted = msg_list.rows.len().saturating_sub(start).min(msg_area_rows);
-    let mut fill_y = msg_area_top + painted as f32 * unit_h;
-    let msg_bottom = msg_area_top + msg_area_rows as f32 * unit_h;
-    while fill_y < msg_bottom {
-        draw_ai_text_row(
-            backend,
-            quadraui::Rect::new(area.x, fill_y, area.width, unit_h),
-            "",
-            dim_fg,
-            panel_bg,
-        );
-        fill_y += unit_h;
-    }
-
-    // ── Separator ─────────────────────────────────────────────────────────────
-    if y < bottom {
-        let sep: String = std::iter::repeat_n('─', area_cols).collect();
-        draw_ai_text_row(
-            backend,
-            quadraui::Rect::new(area.x, y, area.width, unit_h),
-            &sep,
-            dim_fg,
-            header_bg,
-        );
-        y += unit_h;
-    }
-
-    let input_top = y;
-
-    // ── Input area (multi-line, grows with content) ────────────────────────────
-    let (inp_bg, inp_fg) = if ai.input_active {
-        (input_active_bg, default_fg)
+    let header = if engine.ai_streaming {
+        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})"
     } else {
-        (panel_bg, dim_fg)
+        " \u{f0e5} AI ASSISTANT"
     };
-    let cursor = ai.input_cursor.min(input_chars.len());
-    let cursor_line = cursor.checked_div(content_w).unwrap_or(0);
-    let cursor_col = if content_w > 0 {
-        cursor % content_w
-    } else {
-        cursor
-    };
-
-    if ai.input_active || !ai.input.is_empty() {
-        // Split input into visual chunks
-        let chunks: Vec<&[char]> = if input_chars.is_empty() {
-            vec![&[][..]]
-        } else {
-            input_chars.chunks(content_w).collect()
-        };
-        for (line_idx, chunk) in chunks.iter().enumerate().take(input_line_count) {
-            if y >= bottom {
-                break;
-            }
-            // Prefix (" > " on first line, "   " on continuations) + content,
-            // in one call — the row-blank, prefix-write, and content-write
-            // are always the same `inp_fg`/`inp_bg` pair, and
-            // `draw_status_bar` fills the whole row's background regardless
-            // of text length, so painting the concatenated text in a single
-            // call is behaviour-identical to a three-pass cell-by-cell
-            // version.
-            let pfx = if line_idx == 0 { " > " } else { "   " };
-            let content: String = chunk.iter().collect();
-            let text = format!("{pfx}{content}");
-            draw_ai_text_row(
-                backend,
-                quadraui::Rect::new(area.x, y, area.width, unit_h),
-                &text,
-                inp_fg,
-                inp_bg,
-            );
-            // Cursor (inverted cell on the cursor line)
-            if ai.input_active && line_idx == cursor_line {
-                let cx = area.x + (pfx_len + cursor_col) as f32 * unit_w;
-                if cx < area.x + area.width {
-                    let cursor_ch = input_chars.get(cursor).copied().unwrap_or(' ');
-                    draw_ai_text_row(
-                        backend,
-                        quadraui::Rect::new(cx, y, unit_w, unit_h),
-                        &cursor_ch.to_string(),
-                        inp_bg,
-                        inp_fg,
-                    );
-                }
-            }
-            y += unit_h;
-        }
-    } else if y < bottom {
-        // Placeholder when input is empty and not active
-        let placeholder = if ai.streaming {
-            " (waiting for response…)"
-        } else {
-            " Press i to type…"
-        };
-        draw_ai_text_row(
-            backend,
-            quadraui::Rect::new(area.x, y, area.width, unit_h),
-            placeholder,
-            inp_fg,
-            inp_bg,
-        );
-    }
-
-    AiSidebarBands {
-        header: header_rect,
-        messages: messages_rect,
-        input: quadraui::Rect::new(area.x, input_top, area.width, (bottom - input_top).max(0.0)),
-    }
+    chat.set_status(quadraui::StyledText::colored(header, header_fg));
 }
 
 /// Build the cell grid for a single terminal session.
@@ -26168,13 +25886,14 @@ mod slice7_router_tests {
         post_key_epilogue(&mut engine, None);
     }
 
-    /// The four routes [`dispatch_sidebar_panel_key`] declines are exactly
+    /// The five routes [`dispatch_sidebar_panel_key`] declines are exactly
     /// the ones a backend must still handle itself.
     #[test]
     fn sidebar_panel_dispatch_declines_only_the_backend_owned_routes() {
         let mut engine = Engine::new_for_test();
         for route in [
             FocusKeyRoute::Debug,
+            FocusKeyRoute::Ai,
             FocusKeyRoute::Explorer,
             FocusKeyRoute::ActivityBar,
             FocusKeyRoute::None,
@@ -26193,11 +25912,12 @@ mod slice7_router_tests {
                 "{route:?} needs backend-owned state and must be handed back"
             );
         }
-        // A panel route is claimed even when the panel is not focused — the
-        // resolver above is what decides *whether* to call this.
+        // A panel route that this function *does* own is still claimed even
+        // when the panel is not focused — the resolver above is what decides
+        // *whether* to call this.
         assert!(dispatch_sidebar_panel_key(
             &mut engine,
-            FocusKeyRoute::Ai,
+            FocusKeyRoute::Settings,
             "j",
             Some('j'),
             Some('j'),

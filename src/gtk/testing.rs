@@ -3368,68 +3368,155 @@ second line here
         );
     }
 
-    /// AI: selecting the panel must paint its content — the 14th and last of
-    /// #592's `ScreenLayout` fields, and the straggler #670 deferred (#730).
+    /// AI: selecting the panel must paint its content through the adopted
+    /// `quadraui::ChatController` (#819, replacing the hand-painted
+    /// `draw_ai_sidebar_panel`) — `ChatController::render`'s status strip is
+    /// this panel's header row.
     ///
     /// Asserts on the *rendered* header text via `screen_contains`, never on
-    /// `ai_panel`/`ai_has_focus` state alone — `ScreenLayout.picker` sat
-    /// populated on GTK for months while nothing painted it (CLAUDE.md
-    /// rule 1 / #587).
+    /// engine state alone — `ScreenLayout.picker` sat populated on GTK for
+    /// months while nothing painted it (CLAUDE.md rule 1 / #587).
     #[test]
     fn ai_panel_paints_its_header() {
         let h = panel_harness(PANEL_AI);
         assert!(
             h.driver.screen_contains("AI ASSISTANT"),
-            "selecting the AI panel must paint its header (#730)"
+            "selecting the AI panel must paint its header (#730/#819)"
         );
     }
 
-    /// AI: a press in the message-history area must focus the panel without
-    /// opening the input box, and a press in the input box's own band must
-    /// also activate text entry — the same "click focuses, click-in-input
-    /// edits" split `git_panel_click_activates_the_commit_box_but_not_the_
-    /// header` exercises for the git sidebar's commit box (#544/#730).
-    ///
-    /// The input band is always the bottom-most one `render::draw_ai_
-    /// sidebar_panel` paints (header, then message history, then separator +
-    /// input), so a point near the very bottom edge is reliably inside it
-    /// without re-deriving the exact row math here.
+    /// AI: a press anywhere in the panel body must focus it. The
+    /// `ChatController` input has no separate "not editing" mode to
+    /// distinguish a message-history click from an input-box click (#819 —
+    /// every keystroke lands in the input once focused), so unlike the git
+    /// sidebar's commit box this is a single always-focused body, not a
+    /// click-focuses/click-in-input-edits split.
     #[test]
-    fn ai_panel_click_focuses_panel_and_activates_input_box() {
+    fn ai_panel_click_focuses_panel() {
         let mut h = panel_harness(PANEL_AI);
-        // Give the input box enough text to wrap across several rows, so its
-        // band grows well past the ~1-row margin `window_edge` (checked
-        // before sidebar routing, for CSD edge-resize) reserves along the
-        // window's outer bottom edge. Without this, a click low enough to
-        // land in the (1-row-tall, empty-input) input band also lands in
-        // that resize margin and never reaches sidebar routing at all.
-        h.engine.borrow_mut().ai_input = "x ".repeat(120);
         assert!(!h.engine.borrow().ai_has_focus);
-        assert!(!h.engine.borrow().ai_input_active);
 
         let sb = h.painted_sidebar_bounds.get().unwrap();
-        let lh = h.painted_line_height.get().unwrap() as f32;
-
-        // A press a few rows down (comfortably below the 1-row header, still
-        // well above the input box) must focus the panel but leave the input
-        // box inactive.
-        h.driver.click(sb.x + 20.0, sb.y + lh * 3.0);
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
         assert!(
             h.engine.borrow().ai_has_focus,
             "a click in the panel body must focus it (#544)"
         );
+    }
+
+    /// AI: typing after a click must land in the `ChatController` input box
+    /// and grow across multiple visual lines on `Enter` — the "multi-line
+    /// growing input box with an inline cursor cell" this panel's own doc
+    /// comment always described but the pre-#819 hand-rolled input never
+    /// actually supported (plain `Enter` used to *submit*; there was no way
+    /// to type a newline into the box at all).
+    ///
+    /// Verified red against the pre-#819 code: with the hand-rolled
+    /// `handle_ai_panel_key`, `Enter` while editing called `ai_send_message`
+    /// and closed the box instead of inserting `\n`, so "second" was never
+    /// painted on its own row — this test asserts on the *rendered* input
+    /// text via `screen_contains`, not on engine state, so it fails exactly
+    /// where the old behavior diverges.
+    #[test]
+    fn ai_panel_typed_text_supports_multiline_input() {
+        let mut h = panel_harness(PANEL_AI);
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        assert!(h.engine.borrow().ai_has_focus);
+
+        for c in "first".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        for c in "second".chars() {
+            h.driver.type_char(c);
+        }
+
+        assert_eq!(
+            h.engine.borrow().ai_chat.borrow().input_text(),
+            "first\nsecond",
+            "Enter must insert a newline into the input buffer, not submit"
+        );
         assert!(
-            !h.engine.borrow().ai_input_active,
-            "a click in the message-history area must not activate the input box"
+            h.driver.screen_contains("first") && h.driver.screen_contains("second"),
+            "both input lines must be painted"
+        );
+    }
+
+    /// AI: `Ctrl+S` submits the input as a user turn, which must then appear
+    /// in the rendered transcript, and the input box must clear.
+    #[test]
+    fn ai_panel_submit_appends_transcript_turn() {
+        let mut h = panel_harness(PANEL_AI);
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+
+        for c in "hello assistant".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        assert!(
+            h.driver.screen_contains("hello assistant"),
+            "a submitted message must appear in the rendered transcript (#819)"
+        );
+        assert_eq!(
+            h.engine.borrow().ai_chat.borrow().input_text(),
+            "",
+            "submitting must clear the input box"
+        );
+    }
+
+    /// AI: the transcript must scroll — messages painted while stuck to the
+    /// tail must no longer include the earliest message once scrolled up,
+    /// and scrolling must reveal it. `ChatController` follows the tail by
+    /// default (#819), so a fresh long conversation shows only its most
+    /// recent turns until the user scrolls.
+    #[test]
+    fn ai_panel_scrolls_transcript() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.ai_messages = (0..60)
+                .map(|i| crate::core::ai::AiMessage {
+                    role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                    content: format!("MSG_MARKER_{i}"),
+                })
+                .collect();
+        }
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        // A neutral event to force a repaint against the freshly-seeded
+        // transcript before sampling the screen.
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+
+        assert!(
+            h.driver.screen_contains("MSG_MARKER_59"),
+            "stuck-to-bottom must show the most recent message"
+        );
+        assert!(
+            !h.driver.screen_contains("MSG_MARKER_0"),
+            "a 60-message conversation must not fit entirely in the viewport, \
+             so the very first message must be scrolled out of view"
         );
 
-        // A press well inside the (now multi-row) input box's band — but
-        // clear of the window's bottom-edge resize margin — must also
-        // activate text entry.
-        h.driver.click(sb.x + 20.0, sb.y + sb.height - lh * 2.5);
+        // Scroll up (positive delta.y, quadraui's convention) over the panel.
+        for _ in 0..60 {
+            h.driver.dispatch(quadraui::UiEvent::Scroll {
+                widget: None,
+                delta: quadraui::ScrollDelta::new(0.0, 1.0),
+                position: quadraui::Point::new(sb.x + 20.0, sb.y + 20.0),
+            });
+        }
+
+        assert_eq!(
+            h.engine.borrow().ai_chat.borrow().transcript_scroll_top(),
+            0,
+            "60 wheel notches (180 rows) must be enough to reach the very \
+             top of a 60-message transcript"
+        );
         assert!(
-            h.engine.borrow().ai_input_active,
-            "a click in the input box must activate it (#544)"
+            h.driver.screen_contains("MSG_MARKER_0"),
+            "scrolling up over the panel must reveal earlier messages (#819)"
         );
     }
 }

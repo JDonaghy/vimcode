@@ -3405,56 +3405,32 @@ fn handle_focus_owner_key(
     }
 
     // ── AI assistant panel ──────────────────────────────────────────────
+    // #819: routes straight to `engine.ai_chat` (`quadraui::ChatController`)
+    // via the shared `render::route_ai_chat_event`, the same pattern as the
+    // `Debug` arm above — the always-focused `ChatController` input needs
+    // the real `UiEvent` (`KeyPressed` *or* `CharTyped`) for free-form typed
+    // text, not a hand-rolled key table like the retired
+    // `handle_ai_panel_key` built from `KeyCode` spellings.
     if route == render::FocusKeyRoute::Ai {
-        // h/Left focus-to-activity-bar lives inside `handle_ai_panel_key`.
+        // Literal Ctrl+V fallback for terminals that don't send bracketed
+        // paste as bytes — real terminal pastes already reach every panel
+        // uniformly via `UiEvent::ClipboardPaste` -> `Engine::route_paste`
+        // (see this file's top-level `handle` match).
         if ctrl && key_event.code == KeyCode::Char('v') {
             let text = match engine.clipboard_read {
                 Some(ref cb) => cb().ok(),
                 None => None,
             };
             if let Some(t) = text {
-                engine.ai_insert_text(&t);
+                engine.ai_chat.borrow_mut().input_insert_str(&t);
             }
             return Reaction::Redraw;
         }
-        let (key_name, unicode): (&str, Option<char>) = match key_event.code {
-            KeyCode::Down if !engine.ai_input_active => ("j", None),
-            KeyCode::Up if !engine.ai_input_active => ("k", None),
-            KeyCode::Char('j') if !engine.ai_input_active => ("j", None),
-            KeyCode::Char('k') if !engine.ai_input_active => ("k", None),
-            KeyCode::Char('h') if !engine.ai_input_active && !ctrl => ("h", None),
-            KeyCode::Left if !engine.ai_input_active => ("Left", None),
-            KeyCode::Char('G') if !engine.ai_input_active => ("G", None),
-            KeyCode::Char('g') if !engine.ai_input_active => ("g", None),
-            KeyCode::Char('i') | KeyCode::Char('a') if !engine.ai_input_active => ("i", None),
-            KeyCode::Enter => ("Return", None),
-            KeyCode::Esc => ("Escape", None),
-            KeyCode::Char('q') if !engine.ai_input_active => ("Escape", None),
-            KeyCode::Backspace => ("BackSpace", None),
-            KeyCode::Delete => ("Delete", None),
-            KeyCode::Left => ("Left", None),
-            KeyCode::Right => ("Right", None),
-            KeyCode::Home => ("Home", None),
-            KeyCode::End => ("End", None),
-            KeyCode::Char('c') if ctrl => ("c", None),
-            KeyCode::Char('a') if ctrl => ("a", None), // Ctrl-A → start of input
-            KeyCode::Char('e') if ctrl => ("e", None),
-            KeyCode::Char('k') if ctrl => ("k", None),
-            KeyCode::Char(ch) => ("char", Some(ch)),
-            _ => ("", None),
-        };
-        if !key_name.is_empty() {
-            let (mapped, uni) = if key_name == "char" {
-                ("", unicode)
-            } else {
-                (key_name, None)
-            };
-            let still_focused =
-                render::dispatch_sidebar_panel_key(engine, route, mapped, uni, None, ctrl, false)
-                    .unwrap_or(true);
-            if !still_focused {
-                sidebar.has_focus = false;
-            }
+        let rect = engine.ai_chat_rect.get();
+        let theme = render::Theme::from_name(&engine.settings.colorscheme);
+        let still_focused = render::route_ai_chat_event(engine, ui_event, rect, &theme, backend);
+        if !still_focused {
+            sidebar.has_focus = false;
         }
         return Reaction::Redraw;
     }
@@ -7953,6 +7929,139 @@ mod tests {
         assert!(
             screen.contains("AI ASSISTANT"),
             "AI panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// AI: typing after focusing the panel must land in the `ChatController`
+    /// (#819) input box and grow across multiple visual lines on `Enter` —
+    /// the "multi-line growing input box" this panel's own doc comment
+    /// always described but the pre-#819 hand-rolled TUI key table never
+    /// actually supported (plain `Enter` used to *submit*, and there was no
+    /// way to type a newline at all).
+    #[test]
+    fn ai_panel_typed_text_supports_multiline_input_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert_eq!(
+            render::route_focus_key(&app.engine, app.sidebar.has_focus),
+            render::FocusKeyRoute::Ai,
+            "precondition: the AI panel must own the keyboard"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "first".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        for c in "second".chars() {
+            driver.type_char(c);
+        }
+
+        // Purely rendered-output assertions (`driver.app()` returns an
+        // opaque `impl AppLogic` on TUI, unlike GTK's `Harness` which keeps
+        // a separate `Rc<RefCell<Engine>>` handle — so state can't be read
+        // back here even if the rule allowed it). Two independent signals
+        // that `Enter` inserted a newline rather than submitting:
+        // - no role marker ("You") is painted, i.e. nothing was submitted;
+        // - "second" is painted on the row directly below "first"'s, i.e.
+        //   the input box grew by one line rather than the words landing
+        //   on the same row (which typing both with no `Enter` would also
+        //   produce) or "first" being promoted into the transcript while
+        //   "second" starts a fresh one-line input (which a *submitting*
+        //   `Enter` would produce).
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("You"),
+            "no role marker must be painted -- nothing was submitted; screen:\n{screen}"
+        );
+        let lines: Vec<&str> = screen.lines().collect();
+        let first_row = lines
+            .iter()
+            .position(|l| l.contains("first"))
+            .unwrap_or_else(|| panic!("'first' must be painted; screen:\n{screen}"));
+        let second_row = lines
+            .iter()
+            .position(|l| l.contains("second"))
+            .unwrap_or_else(|| panic!("'second' must be painted; screen:\n{screen}"));
+        assert_eq!(
+            second_row,
+            first_row + 1,
+            "Enter must insert a newline into the input buffer, growing it \
+             by one row, not submit; screen:\n{screen}"
+        );
+    }
+
+    /// AI: `Ctrl+S` submits the input as a user turn, which must appear in
+    /// the rendered transcript, and the input box must clear.
+    #[test]
+    fn ai_panel_submit_appends_transcript_turn_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello assistant".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello assistant"),
+            "a submitted message must appear in the rendered transcript (#819); screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("You"),
+            "the submitted turn must carry its role marker; screen:\n{screen}"
+        );
+    }
+
+    /// AI: the transcript must scroll — `ChatController` follows the tail by
+    /// default (#819), so a long conversation shows only its most recent
+    /// turns until the user scrolls up, at which point earlier messages
+    /// become visible.
+    #[test]
+    fn ai_panel_scrolls_transcript_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.ai_messages = (0..60)
+            .map(|i| crate::core::ai::AiMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                content: format!("MSG_MARKER_{i}"),
+            })
+            .collect();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_59"),
+            "stuck-to-bottom must show the most recent message; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("MSG_MARKER_0"),
+            "a 60-message conversation must not fit an 80x24 screen, so the \
+             very first message must be scrolled out of view; screen:\n{screen}"
+        );
+
+        for _ in 0..60 {
+            driver.press_named(quadraui::NamedKey::PageUp);
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_0"),
+            "scrolling up over the panel must reveal earlier messages (#819); screen:\n{screen}"
         );
     }
 

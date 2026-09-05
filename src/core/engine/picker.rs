@@ -2044,8 +2044,7 @@ impl Engine {
                     // Send a question to the AI provider
                     let question = question.to_string();
                     self.close_picker();
-                    self.ai_input = question;
-                    self.ai_send_message();
+                    self.ai_send_message(question);
                     self.ai_has_focus = true;
                     EngineAction::None
                 } else if key == "chat_configure" {
