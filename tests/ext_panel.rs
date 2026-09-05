@@ -470,9 +470,9 @@ fn editor_hover_shows_annotation() {
     e.trigger_editor_hover_at_cursor();
     assert!(e.editor_hover.is_some());
     let hover = e.editor_hover.as_ref().unwrap();
-    assert!(!hover.rendered.lines.is_empty());
+    assert!(!hover.line_text.is_empty());
     // Content should include the annotation
-    let text = hover.rendered.lines.join("\n");
+    let text = hover.line_text.join("\n");
     assert!(text.contains("blame: John, 2h ago"));
 }
 
@@ -484,7 +484,7 @@ fn editor_hover_shows_plugin_content() {
         .insert(0, "**Commit abc123**\n\nfeat: add hover".to_string());
     e.trigger_editor_hover_at_cursor();
     assert!(e.editor_hover.is_some());
-    let text = e.editor_hover.as_ref().unwrap().rendered.lines.join("\n");
+    let text = e.editor_hover.as_ref().unwrap().line_text.join("\n");
     assert!(text.contains("Commit abc123"));
 }
 
