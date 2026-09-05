@@ -1486,21 +1486,9 @@ impl App {
     /// (`gtk/run.rs`), the same mechanism every other quadraui backend uses.
     fn save_session_and_exit(&self) {
         let mut engine = self.engine.borrow_mut();
-        let buffer_id = engine.active_buffer_id();
-        if let Some(path) = engine
-            .buffer_manager
-            .get(buffer_id)
-            .and_then(|s| s.file_path.as_deref())
-            .map(|p| p.to_path_buf())
-        {
-            let view = engine.active_window().view.clone();
-            engine.session.save_file_position(
-                &path,
-                view.cursor.line,
-                view.cursor.col,
-                view.scroll_top,
-            );
-        }
+        // GTK-only: capture the live window geometry into session state
+        // *before* `save_session_state` persists it — `Engine` has no
+        // window handle of its own to read this from (#823 item 5).
         engine.session.window.width = self
             .window
             .as_ref()
@@ -1511,11 +1499,7 @@ impl App {
             .as_ref()
             .map(|w| w.default_height())
             .unwrap_or(600);
-        engine.collect_session_open_files();
-        if let Some(ref root) = engine.workspace_root.clone() {
-            engine.save_session_for_workspace(root);
-        }
-        let _ = engine.session.save();
+        engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
         drop(engine);

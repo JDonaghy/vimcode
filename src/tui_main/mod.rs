@@ -704,27 +704,13 @@ fn handle_action(engine: &mut Engine, action: EngineAction) -> bool {
     }
 }
 
+/// Thin wrapper kept so this file's several call sites don't all need
+/// rewriting to `engine.save_session_state()` — the actual body moved to
+/// [`crate::core::engine::Engine::save_session_state`] in #823 item 5 (it
+/// was the same ~20 lines as `app.rs`'s `save_session_and_exit`, modulo
+/// GTK's window-size capture and shutdown epilogue).
 fn save_session(engine: &mut Engine) {
-    let buffer_id = engine.active_buffer_id();
-    if let Some(path) = engine
-        .buffer_manager
-        .get(buffer_id)
-        .and_then(|s| s.file_path.as_deref())
-        .map(|p| p.to_path_buf())
-    {
-        let view = engine.active_window().view.clone();
-        engine.session.save_file_position(
-            &path,
-            view.cursor.line,
-            view.cursor.col,
-            view.scroll_top,
-        );
-    }
-    engine.collect_session_open_files();
-    if let Some(ref root) = engine.workspace_root.clone() {
-        engine.save_session_for_workspace(root);
-    }
-    let _ = engine.session.save();
+    engine.save_session_state();
 }
 
 // ─── Color / index helpers ───────────────────────────────────────────────────
