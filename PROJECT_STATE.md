@@ -2,6 +2,98 @@
 
 **Last updated:** September 5, 2026 (issue #827 correction pass — the #47/44-call-site claims below were stale within hours of being written; see the corrected section); prior revisions September 4 (#801) and September 3 (the platform-neutrality chain drained, and the audit it mandated is now run). Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%** (though most of that miss is #731/#732 dead-code removal, not convergence — see `GOALS.md` §2/§3 for the corrected attribution). Nothing is in flight and nothing is queued for vimcode. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) was filed and closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction.
 
+## #825 — partially done: click-path scroll-offset table converged + one dead arm deleted; the other four fix items need more design work than mechanical dedup
+
+Issue #825 asked to converge five mouse-apply surfaces (modal overlay, drag,
+mouse-up, chrome click, scroll) plus two dead/shadowed-routing cleanups. This
+pass converged **one piece safely** and found that most of the rest is riskier
+than the issue's framing suggests — documented here so the next session
+doesn't re-walk the same investigation.
+
+**Done:**
+- The click path's `ScrollOffsetChanged` handling (`src/tui_main/mouse.rs`
+  "Scroll-surface click dispatch", `src/app.rs` same-named section) now calls
+  the existing `render::apply_scroll_offset` — the same union table the *drag*
+  path already shares (#756) — instead of each hand-rolling its own arms.
+  Verified **behavior-preserving, not just refactored**: `engine.scroll_surfaces`
+  only ever holds `terminal_scrollback`/`debug_output` (registered by the
+  shared paint code both backends call) plus `explorer:sb`/`ext_panel:sb`
+  (TUI-only, `src/tui_main/panels.rs`) — grepped every push site to confirm.
+  GTK's two old arms (`debug_output`, `terminal_scrollback`) matched
+  `apply_scroll_offset`'s bodies exactly, so its conversion is 1:1. TUI's old
+  table additionally had `tui:settings`/`debug_sidebar:*` (also match exactly)
+  and deliberately **excludes** `terminal_scrollback` from the shared call —
+  a click on it must still fall through to the bottom-panel rung below, which
+  begins a scrollbar *drag* rather than a bare offset-set; folding it in here
+  would silently break continued-drag-after-click on that scrollbar. This is a
+  pure internal refactor (CLAUDE.md's exemption applies — no new black-box
+  test added; all 111 pre-existing mouse/scroll tests across both backends
+  still pass, `cargo build`/`clippy -D warnings`/`clippy --no-default-features
+  -D warnings`/`fmt --check` all clean).
+- Deleted a second, **provably dead** match arm: TUI's wheel-scroll table had
+  a `"tui:editor_viewport"` case (window-aware, variable-step scroll) that
+  `quadraui::dispatch_scroll` can never emit — confirmed against the pinned
+  rev (`quadraui/src/dispatch.rs`) that it only produces an id from either a
+  registered `ScrollSurface` or a `ModalStack` push, and grepped that
+  `"tui:editor_viewport"` is registered as neither, anywhere. The *fallback*
+  below it (unconditionally scrolling the active window, fixed step 3) was
+  already the only path ever taken; its comment claimed otherwise and has
+  been corrected. **Discovered while verifying, not fixed:** this means TUI's
+  mouse-wheel-over-editor has never supported "scroll the pane under the
+  pointer without changing focus" the way GTK's `handle_mouse_scroll_msg`
+  (`hovered_window_id`) does — a real GTK/TUI behavior gap, but a *feature*
+  gap, not a duplication one; out of this issue's scope to fix blind.
+
+**Not done — needs a design decision, not a mechanical swap, before touching:**
+- **Wheel scroll (the rest of item 5).** Deeper than the click path: TUI has
+  an *earlier*, separate direct-dispatch block (`mouse.rs`, the
+  `PANEL_EXPLORER`/`PANEL_GIT`/`PANEL_SEARCH`/`PANEL_SETTINGS` checks ahead of
+  the `dispatch_scroll` block) that returns early for the explorer panel with
+  a **hardcoded ±3** step — meaning the later `"explorer:sb"` arm in the
+  `dispatch_scroll` wheel table can only ever fire when `PANEL_EXPLORER` is
+  *not* active, i.e. never (that surface is only registered when it is
+  active). That arm is dead too, but unlike `tui:editor_viewport` its
+  "shadow" carries different semantics (fixed step vs. proportional-to-delta
+  step) — deciding which is actually wanted is a product call, not cleanup.
+  GTK's own wheel table (`app.rs::handle_mouse_scroll_msg`) only has 3 arms
+  (`editor_hover`, `debug_output`, `terminal_scrollback` — verified pointwise
+  identical to TUI's, safe to share) and never touches
+  explorer/ext-panel/settings scroll via this mechanism at all. A shared
+  `apply_wheel_scroll` is buildable for the 3 common arms; folding in the
+  TUI-only ones needs the shadow above resolved first.
+- **MouseUp sequence (item 3).** Read both `mouse.rs`'s `Up(Left)` arm and
+  `app.rs::handle_mouse_up_msg` in full: real per-backend asymmetry beyond
+  what the issue's "same 8-step sequence" implies — TUI has explorer
+  drag-and-drop finalize (GTK doesn't show it here), GTK clears
+  `debug_button_pressed` and a GTK-only `h_sb_drag_cell` field here (not yet
+  migrated onto the shared `DragState`, unverified whether TUI's equivalent
+  is handled by one of `shell_app.rs`'s ported panel intercepts instead), and
+  the terminal-resize/split finalize math is expressed in different units per
+  backend (rows vs. `cached_char_width`-derived cols, per the issue's own
+  `TerminalPanelResize` note). A shared function needs a host-trait shape
+  (per the issue's own suggestion for item 1) to parameterize these, not a
+  copy-paste.
+- **Modal overlay apply (item 1), drag-route apply (item 2), chrome apply +
+  the `render_window_status_line` dropped-layout root cause (item 4)** — not
+  investigated this session; still exactly as scoped in the issue body
+  (re-verify line numbers first, several of the issue's cited ranges had
+  already drifted by the time this pass started).
+- **Dead/unreachable routing.** The activity-bar arm
+  (`mouse.rs`, `col < ab_width` block): traced quadraui's `ShellAdapter::handle`
+  (pinned rev `4ff2a64`, `quadraui/src/shell_adapter.rs`) and confirmed
+  `AppShell::handle` runs first and short-circuits on
+  `PanelChanged`/`SidebarHidden`/`BottomItemClicked`/etc. before the raw
+  `MouseDown` ever reaches `TuiShellApp::handle_mouse_event` →
+  `mouse::handle_mouse` — matching `shell_app.rs`'s own comment. **Not yet
+  confirmed:** whether the arm's `MenuToggle` target (the hamburger icon, at
+  `bar_row` 0) is itself one of `AppShell`'s registered activity-bar items
+  that this same interception covers, or a TUI-drawn extra that `AppShell`
+  would report `Ignored` for and let fall through to this "unreachable" arm
+  after all — check `build_shell_config`'s activity-bar item registration
+  before deleting; getting this wrong silently breaks the menu-bar toggle.
+  The shadowed debug/explorer routing (`shell_app.rs` intercepts vs.
+  `mouse.rs` ~1976-2043 per the issue) — not investigated this session.
+
 ## #824 — partially done: 8 of the 10 named `FrameOp` arms converged; 2 documented as genuinely one-sided
 
 `render_content`'s `FrameOp` match had drifted back to 10 duplicated arms after

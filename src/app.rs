@@ -3896,28 +3896,30 @@ impl App {
             *self.backend.borrow().drag_state_handle().borrow_mut() = drag;
             for cev in &click_events {
                 match cev {
-                    quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset }
-                        if widget.as_str() == "debug_output" =>
-                    {
-                        let mut engine = self.engine.borrow_mut();
-                        engine.debug_output_scroll = *new_offset;
-                        engine.debug_output_auto_scroll = false;
-                        drop(engine);
-                        self.draw_needed.set(true);
-                        return;
+                    quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset } => {
+                        // #825: shared with TUI's click table and the drag
+                        // path (#756) — `render::apply_scroll_offset` is the
+                        // union of every id either backend emits here. GTK
+                        // only ever registers `debug_output`/
+                        // `terminal_scrollback` into `scroll_surfaces`
+                        // (`explorer:sb`/`ext_panel:sb` are TUI-only), so
+                        // this is a like-for-like replacement of the two
+                        // hand-rolled arms above, not a behavior change.
+                        if render::apply_scroll_offset(
+                            &mut self.engine.borrow_mut(),
+                            widget.as_str(),
+                            *new_offset,
+                            render::ScrollApplyContext {
+                                picker_visible_rows: 0,
+                            },
+                        ) {
+                            self.draw_needed.set(true);
+                            return;
+                        }
                     }
                     quadraui::UiEvent::MouseDown {
                         widget: Some(id), ..
                     } if id.as_str() == "debug_output" => {
-                        return;
-                    }
-                    quadraui::UiEvent::ScrollOffsetChanged { widget, new_offset }
-                        if widget.as_str() == "terminal_scrollback" =>
-                    {
-                        if let Some(term) = self.engine.borrow_mut().active_terminal_mut() {
-                            term.set_scroll_offset(*new_offset);
-                        }
-                        self.draw_needed.set(true);
                         return;
                     }
                     _ => {}
