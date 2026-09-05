@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** September 4, 2026 (see Recent Work for #801); prior revision September 3, 2026 — **the platform-neutrality chain drained, and the audit it mandated is now run.** Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%**. Nothing is in flight and nothing is queued for vimcode or quadraui. The most actionable thing on this page is that **#47 was closed having shipped zero code, with its blocker filed nowhere.**
+**Last updated:** September 5, 2026 (issue #827 correction pass — the #47/44-call-site claims below were stale within hours of being written; see the corrected section); prior revisions September 4 (#801) and September 3 (the platform-neutrality chain drained, and the audit it mandated is now run). Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%** (though most of that miss is #731/#732 dead-code removal, not convergence — see `GOALS.md` §2/§3 for the corrected attribution). Nothing is in flight and nothing is queued for vimcode. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) was filed and closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction.
 
 ## Active milestone: #7 Platform-Neutral — **complete (0 open)**
 
@@ -44,15 +44,21 @@ Still true from earlier in the arc: `fn event_loop` does not exist in `src/`;
 
 ### The post-#735 sizing audit — run on `develop @ eedebf8`
 
-Production lines, `#[cfg(test)]` excluded. **All four columns measured with the same
+Production lines, `#[cfg(test)]` excluded. **All columns measured with the same
 script** (`scripts/prod_lines.py`, added for this audit) so they are comparable:
 
-| | 2026-05-01 | 2026-07-01 | pre-chain 2026-08-31 | **now 2026-09-03** |
-|---|---|---|---|---|
-| `src/gtk/` | 18,969 | 13,675 | 12,526 | **9,650** |
-| `src/tui_main/` | 14,649 | 10,358 | 11,125 | **10,345** |
-| **both backends** | 33,618 | 24,033 | 23,651 | **19,995** |
-| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | **21,405** |
+| | 2026-05-01 | 2026-07-01 | pre-chain 2026-08-31 | pre-#785 2026-09-03 | **post-#785, now @ `ee26268`** |
+|---|---|---|---|---|---|
+| `src/gtk/` | 18,969 | 13,675 | 12,526 | 9,650 | **2,607** |
+| `src/tui_main/` | 14,649 | 10,358 | 11,125 | 10,345 | **10,366** |
+| `src/app.rs` (hoisted out of `src/gtk/` by #785) | — | — | — | — | **7,131** |
+| **all three files** | 33,618 | 24,033 | 23,651 | 19,995 (2 files) | **20,104** |
+| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | 21,405 | **21,405** |
+
+(#785, "stage 1 of #47," hoisted `struct App` verbatim out of `src/gtk/mod.rs` into
+a new `src/app.rs` — see `GOALS.md`'s post-#735 audit for the full account. The
+`src/gtk/` = 9,650 figure this file previously carried as "now" predates that move;
+regenerated at `ee26268` per #827.)
 
 **Projected vs. actual over the chain (08-31 → 09-03):**
 
@@ -98,8 +104,11 @@ is a long way from the north star, and the remaining gap should not be planned a
 ### What remains — four items, none of them queued
 
 1. ~~**The irreducible surface is recorded but never aggregated.**~~ ✅ **Done
-   2026-09-03: [`docs/IRREDUCIBLE_SURFACE.md`](docs/IRREDUCIBLE_SURFACE.md).** The nine
-   verdicts reduce to four facts, three genuinely irreducible. And the sizing answer:
+   2026-09-03, corrected 2026-09-05:
+   [`docs/IRREDUCIBLE_SURFACE.md`](docs/IRREDUCIBLE_SURFACE.md).** The nine
+   verdicts reduce to **three** facts (the folder-picker verdict was wrong and has
+   been struck — `quadraui::compose::FolderPickerController` has existed since
+   2026-05-25), **two** genuinely irreducible. And the sizing answer:
    **only 246 of 19,429 production lines (1.3%) name a native toolkit type**, so
    platform-specificity is *not* what keeps the backends large — `src/gtk/mod.rs` and
    `src/tui_main/shell_app.rs` are two implementations of the same four `ShellApp` entry
@@ -107,52 +116,55 @@ is a long way from the north star, and the remaining gap should not be planned a
    (`tui_main/mouse.rs:1620`, command-line selection) turned out to be a **mislabelled
    supply gap**: `CommandLineLayout::hit_test` does not exist in quadraui and was never
    filed; **#194** is the open consumer-side symptom.
-2. **The duplication moved down into quadraui and is unqueued.** **quadraui#481**
-   (shared runtime core — 1,671 non-trivial lines byte-identical between `gtk/*.rs` and
-   `macos/*.rs`, `EventOutcome` declared twice verbatim, the resize debounce written
-   twice and absent on macOS) and **quadraui#482** (Backend API integrity — trait
-   asymmetry, unit leaks, a UTF-8 boundary fix living as 7 private copies). Both open,
-   both un-milestoned, neither in any queue.
-3. **#47's blocker is filed nowhere** — see below.
+2. **The "duplication moved down into quadraui" claim is largely refuted (#827).**
+   quadraui#481/#482 remain open and un-milestoned, but most of the headline numbers
+   don't hold up at the pinned rev: `EventOutcome` is declared once, not twice
+   (quadraui#496); the 1,671-line byte-identical claim was withdrawn by quadraui#481's
+   own correction comment as "idiom coincidence" (real duplication ~85 lines); the
+   UTF-8 fix has been public since 2026-08-15 (quadraui#503); the tree-layout
+   "twins" are both 1-line wrappers over one shared function (quadraui#499); and
+   quadraui#482's eight children (#503–#510) are all closed. See `GOALS.md` §2 for
+   the full table. What's still real: macOS dispatches `WindowResized` undebounced
+   while TUI/GTK share a `ResizeDebouncer`.
+3. **#47's blocker was filed and cleared 2026-09-03** — see below (this used to say
+   "filed nowhere"; it wasn't, within hours of that claim being written).
 4. **The divergence bug class is still ~44 issues deep** (#206, #420, #264, #194, #233
    and friends), plus milestone #5's cross-backend residue (#149, #167, #168, #233,
    #294). `GOALS.md`'s thesis is that each is a symptom of a duplicated surface; if the
    convergence had reached far enough this list would be shrinking. It is the only
    outcome measure this goal has that isn't a line count — watch it.
 
-### ⚠️ #47 was closed having shipped no code
+### ✅ #47's blocker was filed and cleared — this section was stale (#827)
 
-**#47 (native macOS GUI) is closed and its diff is documentation only.** Commit
-`44882e9` — *"re-audit at pickup, no code — Backend-trait Rc-handle gap blocks Stage 1"* —
-recorded the real blocker: `App` calls `GtkBackend::modal_stack_handle()` /
-`drag_state_handle()` at 44 call sites in the drag and modal dispatch paths. Those are
+**Corrected 2026-09-05.** #47 (native macOS GUI) was closed 2026-09-02 with commit
+`44882e9` — *"re-audit at pickup, no code — Backend-trait Rc-handle gap blocks Stage
+1"* — recording the real blocker: `App` called `GtkBackend::modal_stack_handle()` /
+`drag_state_handle()` at **19** call sites (`modal_stack_handle` ×12,
+`drag_state_handle` ×7 — not the "44" this file previously said, which counted every
+use of the `backend` field via `grep -n 'self\.backend\.' src/gtk/mod.rs`, not just
+the two Rc-handle methods) in the drag and modal dispatch paths. Those were
 **inherent methods on the concrete struct, not on the generic `quadraui::Backend`
 trait**, and `MacBackend`'s trait equivalents (`modal_stack_mut`, `drag_and_modal_mut`)
-return short-lived `&mut` borrows that cannot be stashed and reused the way `App` does.
-Full findings and two candidate API shapes are in [`PLAN.md`](PLAN.md).
+returned short-lived `&mut` borrows that couldn't be stashed and reused the way `App`
+does. Full findings are in [`PLAN.md`](PLAN.md).
 
-That commit's own recommendation — *"file this as a quadraui issue before any
-vimcode-side Stage 1 code is written"* — **was never carried out.** No open quadraui
-issue mentions either method name. The finding now lives only in `PLAN.md`, attached to a
-**closed** issue, which is precisely where the next triage pass will not look.
-
-**This is `GOALS.md`'s supply-side trap in a new shape.** The documented failure mode was
-"infra lands in quadraui but the #7 adoption issue never gets picked up." This is the
-inverse: the consume-side issue was *closed* while its supply-side blocker went
-unrecorded. The rule that would have caught it is now written down in `GOALS.md`: **a #7
-issue that turns out to be supply-blocked stays open behind its blocker; it does not get
-closed.**
-
-**Action:** file the gap on `JDonaghy/quadraui` (or fold it into quadraui#482, its
-natural home), re-open quadraui milestone #9 "vimcode Platform-Neutral blockers", and
-re-open vimcode#47 behind it.
+**That blocker was filed — this file just never caught up.** **quadraui#699** was
+filed 2026-09-03 16:38Z (into quadraui milestone #9) and **closed 17:11Z**
+(PR#700/`88345fb`); follow-up **#704** closed 21:41Z. **vimcode#47 was reopened
+16:38Z** and is **open now, in milestone #5**. quadraui#699/#704 gave every backend a
+symmetric Rc-handle API, and vimcode has already started consuming it: **#811**
+bumped the quadraui pin to `4ff2a64` and ported the TUI-side call sites off the
+now-removed `drag_and_modal_mut`. The actual next actionable item is **vimcode#47
+Stage 1** (the GTK-side `App` move), not a re-filing task — see `PLAN.md` and
+`GOALS.md` for the full correction.
 
 ### Milestone hygiene
 
 - **#7 is 0 open.** #146 moved to #4 Editor Features; #47 sits in #5 Cross-Platform UI
-  Crate, which `GOALS.md` defines as covering the macOS/Windows backends.
-- **quadraui milestone #9** ("vimcode Platform-Neutral blockers") is closed out and
-  should be re-opened to hold the #47 blocker.
+  Crate, which `GOALS.md` defines as covering the macOS/Windows backends, and is
+  **open** (reopened 2026-09-03).
+- **quadraui milestone #9** ("vimcode Platform-Neutral blockers") is **open** (0
+  open / 7 closed issues) — it held quadraui#699 and does not need re-opening.
 - **Stale Win-GUI issues.** Roughly a dozen open `Win-GUI:` issues (#160–#178, #61,
   #172, #176) describe a backend **deleted from this repo on 2026-05-11** (`3e4bcff`).
   Their live counterparts are quadraui#19–#31 / quadraui#580. They should be migrated or
@@ -317,7 +329,20 @@ mouse routing, #757–#762 keyboard dispatch, #763–#766 frame composition (`Fr
 post-#735 sizing audit the previous revision mandated and added `scripts/prod_lines.py`
 so it is reproducible: backends **−3,656** against a −8,700…−9,500 projection, `render.rs`
 **+6,396**, net **+2,740**. #47 closed having shipped **no code** (`44882e9`) with its
-`Backend`-trait Rc-handle blocker filed nowhere — the top open action.
+`Backend`-trait Rc-handle blocker filed nowhere — the top open action. *(Corrected
+2026-09-05, issue #827: that blocker — quadraui#699, at 19 not 44 call sites — was
+filed and closed the same day, 16:38Z–17:11Z, and #47 was reopened 16:38Z. This
+entry's "filed nowhere" was already wrong by the time the revision carrying it was
+written; see the corrected section above.)*
+
+**2026-09-05 — GOALS.md/PLAN.md/PROJECT_STATE.md/IRREDUCIBLE_SURFACE.md corrected
+(#827).** A four-agent audit of `develop @ ee26268` found the planning docs
+materially stale: the #47-blocker-unfiled claim (quadraui#699 had already closed),
+the 44-call-site figure (real count 19), the quadraui#481/#482 "duplication moved
+down a level" claims (mostly refuted at the pinned rev), the `src/gtk/` size-table
+column (predated #785's move), and the `IRREDUCIBLE_SURFACE.md` folder-picker
+verdict (wrong — `FolderPickerController` has existed in quadraui since 05-25).
+Corrected all four docs; no code changed.
 
 **2026-09-01 — platform-neutrality audit, and everything it found is now queued.**
 Filed #730 (`ai_panel`), #731 (orphan handles), #732 (`Msg` bus), #733 (mouse routers),
