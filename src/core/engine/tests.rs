@@ -24951,8 +24951,10 @@ fn test_nvim_double_quote_jump_previous() {
 
 #[test]
 fn test_nvim_di_paren_empty() {
-    // di( on "()" is a no-op (nothing inside)
-    nvim_case("()\n", 0, 0, "di(", "()\n", 0, 0);
+    // di( on "()" deletes nothing, but Vim still parks the cursor *between*
+    // the delimiters — verified against nvim, which is why the trailing `0, 0`
+    // this test used to assert became `0, 1` in #807.
+    nvim_case("()\n", 0, 0, "di(", "()\n", 0, 1);
 }
 
 #[test]
@@ -24973,8 +24975,9 @@ fn test_nvim_da_paren_nested_from_inner() {
 
 #[test]
 fn test_nvim_di_quote_empty() {
-    // di" on empty quotes "" is a no-op
-    nvim_case("say \"\" end\n", 0, 4, "di\"", "say \"\" end\n", 0, 4);
+    // di" on empty quotes "" deletes nothing but moves the cursor between
+    // them — see `test_nvim_di_paren_empty` (#807).
+    nvim_case("say \"\" end\n", 0, 4, "di\"", "say \"\" end\n", 0, 5);
 }
 
 // ── Phase 4 Batch 6: J edge cases ───────────────────────────────────────
