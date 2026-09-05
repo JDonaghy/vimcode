@@ -5206,6 +5206,79 @@ mod tests {
         );
     }
 
+    /// Terminal column of a divider glyph within `+/- span` cells of
+    /// `target`, for asserting a divider repainted near a drag target (or
+    /// stayed exactly at a column, with `span == 0`) without hardcoding the
+    /// exact cell. The TUI twin of `gtk::testing`'s `painted_divider_x`.
+    fn divider_near_col<S>(cells: &[(char, S)], target: usize, span: usize) -> Option<usize> {
+        let lo = target.saturating_sub(span);
+        let hi = (target + span).min(cells.len().saturating_sub(1));
+        (lo..=hi).find(|&i| cells[i].0 == '\u{2502}')
+    }
+
+    /// #818: two nested `:vsplit`-style editor-group splits paint **two**
+    /// divider glyphs on the same row, whose `split_index` differs (0 for
+    /// the outer split, 1 for the one nested inside its second group). This
+    /// is the exact shape #582/#452 warned two independently hand-rolled
+    /// recursive passes over `GroupLayout` (`calculate_group_rects` and
+    /// `dividers`) could number or position inconsistently — #818 replaced
+    /// both passes with the leaves/dividers `quadraui::SplitTree::layout`
+    /// computes together in one pass. Dragging only the inner divider must
+    /// move exactly that glyph and leave the outer, sibling divider's column
+    /// untouched; a split_index/rect mixup reintroduced by a future change
+    /// to `GroupLayout::to_split_tree`/`dividers` would move the wrong one
+    /// (or both).
+    #[test]
+    fn nested_group_split_dividers_move_independently_when_dragged() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "short\n");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let mut driver = driver_with_shell(app, config(), 120, 24);
+        // See the sibling tests above for why one dispatched no-op event is
+        // needed before the layout is settled enough to measure.
+        driver.mouse_up(1.0, 1.0);
+
+        let (tab_x, _) = driver
+            .find("[No Name]")
+            .expect("each pane paints its own tab label");
+        let after = tab_x as usize;
+        let row = 5_usize;
+        let cells = driver.styled_row(row as u16);
+        let outer = divider_col_on_row(&cells, after)
+            .expect("the outer vertical split must paint a divider glyph");
+        let inner = divider_col_on_row(&cells, outer + 1)
+            .expect("the nested vertical split must paint a second divider glyph");
+        assert_ne!(
+            outer, inner,
+            "the outer and inner dividers must paint at different columns"
+        );
+
+        // Drag only the inner divider a few cells left.
+        let target = inner - 5;
+        driver.mouse_down(inner as f32, row as f32);
+        driver.mouse_move(target as f32, row as f32);
+        driver.mouse_up(target as f32, row as f32);
+
+        let moved_cells = driver.styled_row(row as u16);
+        let screen = driver.screen();
+        let moved_inner = divider_near_col(&moved_cells, target, 1).unwrap_or_else(|| {
+            panic!("no divider glyph found near the drag column {target}; screen:\n{screen}")
+        });
+        assert!(
+            moved_inner.abs_diff(target) <= 1,
+            "the dragged inner divider should track the drag column ({target}) \
+             within a cell of rounding; screen:\n{screen}"
+        );
+        assert_eq!(
+            divider_near_col(&moved_cells, outer, 0),
+            Some(outer),
+            "dragging the inner divider must not move the outer, sibling \
+             divider (a split_index/rect mixup between the two would move \
+             both); screen:\n{screen}"
+        );
+    }
+
     /// #609: `render_content` must also paint the tab-drag ghost overlay —
     /// `render_tab_drag_overlay`, ported from a raw-`Frame`-write tail
     /// (the ghost label) to `Backend::draw_status_bar` (see its doc
