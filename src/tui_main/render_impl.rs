@@ -776,27 +776,6 @@ pub(super) fn render_all_windows(
     render_separators(backend, windows, theme);
 }
 
-/// Render the unified picker popup. Supports single-pane (no preview) and
-/// two-pane (with preview) layouts, fuzzy match highlighting, and scrollbar.
-pub(super) fn render_picker_popup(
-    picker: &render::PickerPanel,
-    term_area: Rect,
-    theme: &Theme,
-    backend: &mut dyn quadraui::Backend,
-) {
-    let has_preview = picker.preview.is_some();
-    let geo = render::PickerGeometry::compute(
-        term_area.width as f32,
-        term_area.height as f32,
-        has_preview,
-        &render::TUI_PICKER_SIZING,
-    );
-    let palette = render::picker_panel_to_palette(picker);
-    let q_rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_palette(q_rect, &palette);
-}
-
 /// Render one editor window (pane) into `frame`.
 ///
 /// Phase C Stage 1C (#276) collapsed the body of this function to a

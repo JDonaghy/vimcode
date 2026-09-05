@@ -7351,8 +7351,8 @@ pub enum FrameOp {
     CommandCenter,
     /// `Backend::draw_find_replace`.
     FindReplace,
-    /// The unified picker / command palette (`Surface::Palette` on GTK,
-    /// `render_picker_popup` on TUI).
+    /// The unified picker / command palette — [`paint_picker_rung`] on both
+    /// backends (#824).
     UnifiedPicker,
     /// The Ctrl+Tab MRU popup (`Backend::draw_list`).
     TabSwitcher,
@@ -7577,6 +7577,175 @@ pub fn check_frame_order(composed: &[FrameOp]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ─── Frame-op rung painters (#824) ────────────────────────────────────────
+//
+// Ten of `FrameOp`'s fourteen arms were the same 6-25 line body, transcribed
+// once per backend with px swapped for cell units. This is that body, once,
+// per arm. `rect` (and, where the two backends' units genuinely differ,
+// `char_width`/`line_height`) stays a caller-supplied argument, never
+// computed here — #756 already chose "rect math stays per backend" for the
+// apply half of a frame (see [`FrameMetrics`]'s doc comment), and these
+// functions *are* that apply half, not a third unit convention layered on
+// top of it.
+//
+// Two of the fourteen arms turned out **not** to be this shape on closer
+// reading, so they are not here — each stays a full per-backend arm in
+// `render_content`:
+//
+//   * `FrameOp::CommandLine` — TUI paints the row cell-by-cell via
+//     `panels::render_command_line` (cursor placement + mouse
+//     drag-selection inversion baked into the composed cells) instead of
+//     going through `Backend::draw_command_line`, because that trait
+//     method has no selection-range parameter for it to feed. Converging
+//     the two arms would mean growing quadraui's `Backend` trait first
+//     (Platform-Neutrality Rule: build the shared capability upstream,
+//     then consume it here) — nothing is filed for that yet.
+//   * `FrameOp::TabSwitcher` — GTK feeds `TabSwitcherGeometry::visible_rows`
+//     (the height-capped row count) into `tab_switcher_to_quadraui_list_view`;
+//     TUI feeds `max_visible` (the uncapped height budget) — see that
+//     struct's doc comment for the distinction. Whether that's a harmless
+//     pre-existing divergence (the list adapter may already clamp by
+//     `items.len()`) or a latent bug is a question a duplication-convergence
+//     pass shouldn't answer by silently picking one field for a shared
+//     function — left for a follow-up with the room to investigate it.
+//
+// `FrameOp::MenuRow`, `SidebarPanel`, `MenuDropdown` and `FolderPicker` are
+// the other four arms; each was already established (by #815/#763/#766) as
+// genuinely one-sided or already sharing its real body through a different
+// helper, and none of that changes here.
+
+/// The [`FrameOp::Wildmenu`] rung's whole body on both backends.
+pub fn paint_wildmenu_rung(
+    b: &mut dyn quadraui::Backend,
+    wm: &WildmenuData,
+    theme: &Theme,
+    rect: quadraui::Rect,
+) {
+    let bar = wildmenu_to_status_bar(wm, theme);
+    let _ = b.draw_status_bar(rect, &bar, None, None);
+}
+
+/// The [`FrameOp::StatusBar`] (global status line) rung's whole body on both
+/// backends.
+///
+/// Returns the resolved [`quadraui::StatusBarLayout`] so GTK can derive its
+/// click zones from the same measurement the paint produced — mirrors
+/// [`paint_separated_status_rung`]'s reasoning exactly. TUI recomputes zones
+/// statelessly at click time instead (cheap in cell units) and ignores the
+/// return value.
+pub fn paint_global_status_bar_rung(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    bar: &quadraui::StatusBar,
+    rect: quadraui::Rect,
+) -> quadraui::StatusBarLayout {
+    engine.global_status_rect.set(rect);
+    let _ = b.draw_status_bar(rect, bar, None, None);
+    b.status_bar_layout(rect, bar)
+}
+
+/// The [`FrameOp::FindReplace`] rung's whole body on both backends.
+///
+/// `find_replace.group_bounds` (or, on GTK, `panel.group_bounds`) is already
+/// absolute screen space (#550), so `viewport` only supplies the clip
+/// rectangle — both call sites already computed it for other rungs.
+pub fn paint_find_replace_rung(
+    b: &mut dyn quadraui::Backend,
+    panel: &FindReplacePanel,
+    viewport: quadraui::Rect,
+) {
+    b.draw_find_replace(viewport, panel);
+}
+
+/// The [`FrameOp::CommandCenter`] rung's whole body on both backends.
+///
+/// Building the `quadraui::CommandCenter` descriptor itself (the title
+/// string in particular — GTK derives it from `engine.cwd`, TUI from
+/// `TuiShellApp::window_title_stem`) stays at the call site; this is only
+/// the paint + cache-set once that descriptor and its rect exist.
+pub fn paint_command_center_rung(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    rect: quadraui::Rect,
+    cc: &quadraui::CommandCenter,
+) {
+    let layout = b.draw_command_center(rect, cc);
+    engine.command_center_layout.replace(Some(layout));
+}
+
+/// The [`FrameOp::UnifiedPicker`] rung's whole body on both backends.
+///
+/// Returns the popup rect it resolved and painted into, so GTK can cache it
+/// for click/drag hit-testing (#555, #587); TUI recomputes the identical
+/// geometry cheaply at click time instead and ignores the return value.
+pub fn paint_picker_rung(
+    b: &mut dyn quadraui::Backend,
+    picker: &PickerPanel,
+    viewport: quadraui::Rect,
+    sizing: &PickerSizing,
+) -> quadraui::Rect {
+    let has_preview = picker.preview.is_some();
+    let geo = PickerGeometry::compute(viewport.width, viewport.height, has_preview, sizing);
+    let palette = picker_panel_to_palette(picker);
+    let rect = quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h);
+    b.draw_palette(rect, &palette);
+    rect
+}
+
+/// The [`FrameOp::ContextMenu`] rung's whole body on both backends.
+///
+/// `viewport`/`char_width`/`line_height`/`border_chrome_inset` are exactly
+/// [`context_menu_generic_layout`]'s parameters — see its doc comment for why
+/// the inset differs (TUI's ASCII border is drawn *outside*
+/// `layout.bounds`, GTK's inside it). TUI's `+1`-inset viewport and panel
+/// (to make room for that border) is genuinely per-backend geometry prep and
+/// stays at the call site, not here.
+pub fn paint_context_menu_rung(
+    b: &mut dyn quadraui::Backend,
+    panel: &ContextMenuPanel,
+    viewport: quadraui::Rect,
+    char_width: f64,
+    line_height: f64,
+    border_chrome_inset: f64,
+) -> quadraui::ContextMenuLayout {
+    let (menu, layout) = context_menu_generic_layout(
+        panel,
+        viewport,
+        char_width,
+        line_height,
+        border_chrome_inset,
+    );
+    let _ = b.draw_context_menu(&menu, &layout);
+    layout
+}
+
+/// The [`FrameOp::Dialog`] rung's whole body on both backends.
+///
+/// `char_width`/`line_height` are [`dialog_generic_layout`]'s — GTK passes
+/// its measured pixel metrics, TUI passes `1.0`/`1.0` for one cell.
+pub fn paint_dialog_rung(
+    b: &mut dyn quadraui::Backend,
+    panel: &DialogPanel,
+    viewport: quadraui::Rect,
+    char_width: f64,
+    line_height: f64,
+) -> quadraui::DialogLayout {
+    let (dialog, layout) = dialog_generic_layout(panel, viewport, char_width, line_height);
+    let _ = b.draw_dialog(&dialog, &layout);
+    layout
+}
+
+/// The [`FrameOp::ToastStack`] rung's whole body on both backends.
+pub fn paint_toast_stack_rung(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    stack: &quadraui::ToastStack,
+    viewport: quadraui::Rect,
+) {
+    let layout = b.draw_toast_stack(viewport, stack);
+    engine.toast_layout.replace(Some(layout));
 }
 
 /// Where the menu bar's labels end, in absolute coordinates.
