@@ -3903,7 +3903,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "misc:: with count",
     "misc:3:s",
     "misc:gv after p",
-    "misc:C-[ in insert",
     "misc:count then : then range",
     "misc:c3c",
     "misc:g?g?",

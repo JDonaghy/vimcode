@@ -14587,6 +14587,34 @@ fn test_multi_cursor_backspace() {
     assert_eq!(buf, "oo bar oo\n");
 }
 
+/// #804 review: the multi-cursor `"Tab"` arm used to always insert a fixed
+/// `tabstop`-width block of spaces at every cursor, unlike the single-cursor
+/// path (which advances each cursor to its own *next* tabstop, per
+/// `:h smarttab`). With `tabstop = 4`, a cursor at column 3 needs only 1
+/// space to reach the next stop (col 4) while a cursor at column 2 needs 2
+/// — proving the fix is genuinely per-cursor, not just a different constant.
+#[test]
+fn test_multi_cursor_tab_advances_to_each_cursors_own_next_tabstop() {
+    let mut engine = engine_with_text("abc\nab\n");
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    // Primary at end of "abc" (col 3) — 1 space to reach column 4.
+    engine.view_mut().cursor.col = 3;
+    // Extra cursor at end of "ab" (col 2) — 2 spaces to reach column 4.
+    engine.view_mut().extra_cursors = vec![Cursor { line: 1, col: 2 }];
+
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("Tab", None, false);
+    engine.handle_key("Escape", None, false);
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "abc \nab  \n",
+        "each cursor must advance to its OWN next tabstop (1 space vs 2), \
+         not both inserting the same fixed-width block; got {buf:?}"
+    );
+}
+
 #[test]
 fn test_multi_cursor_escape_collapses() {
     // Escape from insert mode should clear extra cursors
@@ -28725,5 +28753,114 @@ fn insert_mode_unrecognized_ctrl_combo_inserts_nothing() {
         engine.view().cursor.col,
         0,
         "an unrecognised ctrl combo must not move the cursor either"
+    );
+}
+
+/// #804 review: the terminal-ctrl-alias remap in `handle_insert_key` must
+/// accept `key_name == "["` (the literal-character name), not only
+/// `"bracketleft"` (the crossterm/X11 keysym name) — `src/core/engine/
+/// vscode.rs` already treats `"bracketleft" | "["` as synonyms elsewhere,
+/// and `tests/nvim_conformance.rs`'s own `press_ctrl('[')` sends the literal
+/// `"["` name, so matching only `"bracketleft"` would leave `<C-[>` (Vim's
+/// other spelling of Escape) permanently unreachable through that harness.
+#[test]
+fn insert_mode_ctrl_bracket_left_literal_name_leaves_insert() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab");
+    press_char(&mut engine, 'i');
+    assert_eq!(engine.mode, Mode::Insert);
+    press_ctrl(&mut engine, '[');
+    assert_eq!(
+        engine.mode,
+        Mode::Normal,
+        "<C-[> sent as the literal \"[\" key name must leave insert mode like Escape"
+    );
+    assert_eq!(
+        engine.buffer().to_string(),
+        "ab",
+        "<C-[> must not insert a literal '[' character"
+    );
+}
+
+/// #804 review: `0<C-d>` (`:h i_0_CTRL-D`) only removes ALL indent when the
+/// '0' was typed as the line's leading signal digit — i.e. only indent
+/// precedes it. A literal '0' that happens to sit right before `<C-d>` but
+/// has other non-blank text before it (`foo0<C-d>`) is NOT the signal digit
+/// and must fall through to an ordinary shiftwidth dedent that leaves the
+/// '0' (and the rest of the line) untouched.
+#[test]
+fn test_insert_ctrl_d_with_trailing_zero_after_text_is_normal_dedent() {
+    let mut engine = engine_with_text("    foo0\n");
+    engine.settings.shift_width = 4;
+    engine.handle_key("i", Some('i'), false);
+    engine.view_mut().cursor.col = 8; // end of "    foo0"
+    engine.handle_key("d", Some('d'), true); // <C-d>
+
+    let buf = engine.buffer().to_string();
+    assert_eq!(
+        buf, "foo0\n",
+        "a '0' preceded by non-blank text must not trigger the i_0_CTRL-D \
+         strip-all-indent special case — only the indent should be removed; got {buf:?}"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        4,
+        "cursor should shift left by exactly the removed indent (4), not also lose the '0'"
+    );
+}
+
+/// #804 review: the `<C-o>` resume-insert cursor special-casing keyed off
+/// `unicode == Some('$')`/`Some('p')` — the *last* keystroke of whatever
+/// command just ran — rather than "was the whole command a bare `$`/`p`".
+/// `<C-o>y$` yanks to end-of-line, which per `:h y` must not move the
+/// cursor at all; the bare-`$` "snap to end-of-line" special case must not
+/// fire just because the operator's motion happened to be `$`.
+#[test]
+fn test_ctrl_o_y_dollar_does_not_get_bare_dollar_cursor_shift() {
+    let mut engine = engine_with_text("abcdef\n");
+    engine.view_mut().cursor.col = 2;
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("o", Some('o'), true); // <C-o>
+    engine.handle_key("y", Some('y'), false); // pending_operator = 'y'
+    engine.handle_key("$", Some('$'), false); // completes y$
+    assert_eq!(
+        engine.mode,
+        Mode::Insert,
+        "y$ is one complete command; <C-o> should resume Insert"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "y$ must not move the cursor — it must not be treated as a bare `$`"
+    );
+}
+
+/// #804 review, companion case: `<C-o>r p` replaces a character *with* 'p'.
+/// The completed command's defining/last keystroke is 'p', but it is the
+/// `r` command, not the bare `p` paste command — resuming Insert must not
+/// apply the bare-`p` "advance one column past what was pasted" shift.
+#[test]
+fn test_ctrl_o_r_p_does_not_get_bare_p_cursor_shift() {
+    let mut engine = engine_with_text("abc\n");
+    engine.view_mut().cursor.col = 0;
+    engine.handle_key("i", Some('i'), false);
+    engine.handle_key("o", Some('o'), true); // <C-o>
+    engine.handle_key("r", Some('r'), false); // pending_key = 'r'
+    engine.handle_key("p", Some('p'), false); // replacement char, completes r
+    assert_eq!(
+        engine.mode,
+        Mode::Insert,
+        "r p is one complete command; <C-o> should resume Insert"
+    );
+    assert_eq!(
+        engine.buffer().to_string(),
+        "pbc\n",
+        "r should have replaced 'a' with 'p'"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "`r`'s replacement char being 'p' must not trigger the bare-`p` cursor shift \
+         (`r` leaves the cursor ON the replaced character, it doesn't advance past it)"
     );
 }

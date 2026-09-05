@@ -9178,6 +9178,13 @@ mod tests {
     /// a passing assertion on `engine.buffer()` would not have caught the
     /// original bug if the TUI's own key translation were what was broken
     /// instead (it wasn't, but this test doesn't get to assume that).
+    ///
+    /// Re-verified RED against the pre-fix code (#804 review): temporarily
+    /// reverting `handle_insert_key`'s terminal-ctrl-alias remap block (the
+    /// `let (key_name, ctrl) = if ctrl { match key_name { "h" => ... } }`
+    /// arm) to a no-op and re-running this test fails it — the rendered
+    /// line still shows the marker with a literal 'h' appended instead of
+    /// losing its trailing character.
     #[test]
     fn ctrl_h_backspaces_in_insert_mode_via_shell_app() {
         let mut app = TuiShellApp::new(None);

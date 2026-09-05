@@ -746,6 +746,73 @@ impl Engine {
             .collect();
     }
 
+    /// Insert a tabstop-aware indent at every cursor position (primary +
+    /// extra) simultaneously (#804 review). Unlike `mc_insert`, the text
+    /// inserted can differ *per cursor* — each one advances to its own next
+    /// tabstop/shiftwidth stop per `:h smarttab`, mirroring the single-
+    /// cursor `"Tab"` arm in `handle_insert_key` instead of always inserting
+    /// a fixed `tabstop`-width block of spaces regardless of column.
+    ///
+    /// Cursors are processed in ascending char-index order with a running
+    /// offset, same as `mc_insert` — but because the buffer is already
+    /// mutated by every earlier iteration by the time a later cursor is
+    /// processed, `orig + offset` can be fed straight back through
+    /// `char_idx_to_cursor` to recover that cursor's *current* line/col
+    /// (correctly reflecting any earlier same-line insert), with no need to
+    /// separately track a same-line column shift.
+    pub(crate) fn mc_insert_tab(&mut self) {
+        let extra = self.view().extra_cursors.clone();
+        let primary = *self.cursor();
+
+        let primary_orig = self.buffer().line_to_char(primary.line) + primary.col;
+        let extra_origs: Vec<usize> = extra
+            .iter()
+            .map(|c| self.buffer().line_to_char(c.line) + c.col)
+            .collect();
+
+        let mut all_origs: Vec<usize> = extra_origs.clone();
+        all_origs.push(primary_orig);
+        all_origs.sort_unstable();
+
+        let expand = self.settings.expand_tab;
+        let tabstop = (self.settings.tabstop as usize).max(1);
+
+        let mut offset: usize = 0;
+        let mut new_idx_of: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+
+        for &orig in &all_origs {
+            let idx = orig + offset;
+            let cur = self.char_idx_to_cursor(idx);
+            let text = if expand {
+                let line_start = self.buffer().line_to_char(cur.line);
+                let front_of_line = (0..cur.col)
+                    .all(|i| matches!(self.buffer().content.char(line_start + i), ' ' | '\t'));
+                let stop = if front_of_line {
+                    self.effective_shift_width().max(1)
+                } else {
+                    tabstop
+                };
+                let target = (cur.col / stop + 1) * stop;
+                " ".repeat(target - cur.col)
+            } else {
+                "\t".to_string()
+            };
+            self.insert_with_undo(idx, &text);
+            let inserted = text.chars().count();
+            self.insert_text_buffer.push_str(&text);
+            new_idx_of.insert(orig, idx + inserted);
+            offset += inserted;
+        }
+
+        let primary_new = new_idx_of[&primary_orig];
+        self.view_mut().cursor = self.char_idx_to_cursor(primary_new);
+        self.view_mut().extra_cursors = extra_origs
+            .iter()
+            .map(|o| self.char_idx_to_cursor(new_idx_of[o]))
+            .collect();
+    }
+
     /// Delete one char before every cursor position with col > 0.
     /// Extra cursors at col == 0 are left in place (line-merge not done in multi-cursor mode).
     /// Returns `true` if at least one deletion was performed.
