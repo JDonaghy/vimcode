@@ -2631,6 +2631,124 @@ mod tests {
         }
     }
 
+    /// #823 item 4: `App::show_quit_confirm` used to restate
+    /// `Engine::show_quit_confirm`'s dialog body inline (byte-identical
+    /// `DialogButton` literals, `core/engine/panels.rs`) instead of calling
+    /// it. Reached here through the real menu path — clicking File > Quit
+    /// with unsaved changes — rather than calling either method directly,
+    /// so a regression in the collapse (the App method silently not
+    /// calling the engine one, or calling some other dialog) shows up the
+    /// same way a user's click would, unlike the sibling test above (which
+    /// opens the identical dialog via `engine.show_quit_confirm()` directly
+    /// and would stay green even if `App::show_quit_confirm` called
+    /// nothing at all).
+    ///
+    /// The dialog is natively-expressible (#727), so — same as the sibling
+    /// test above — it never paints in-canvas and `screen_contains
+    /// ("Unsaved Changes")` cannot be the proof; `native_dialog_shown` /
+    /// `pending_native_dialog` are the same two signals reused here.
+    ///
+    /// RED-verified: with `App::show_quit_confirm`'s
+    /// `self.engine.borrow_mut().show_quit_confirm()` call replaced by a
+    /// no-op, this test fails (no native dialog is ever queued); restored
+    /// before committing.
+    #[test]
+    fn menu_quit_with_unsaved_changes_opens_confirm_dialog() {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "unsaved change");
+        // `buffer_mut().insert` edits the rope directly and does not flip
+        // `BufferState::dirty` (that's set by the engine's own edit
+        // commands) — `has_any_unsaved()` (what `handle_menu_action`'s
+        // "quit_menu" arm gates on) reads `dirty` directly, so the fixture
+        // must set it explicitly or the click below silently takes the
+        // "nothing unsaved" branch instead.
+        let id = engine.active_buffer_id();
+        if let Some(buf) = engine.buffer_manager.get_mut(id) {
+            buf.dirty = true;
+        }
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+
+        let quit = h
+            .driver
+            .find_bounds("Quit")
+            .expect("clicking File must open its dropdown, showing Quit");
+        h.driver
+            .click(quit.x + quit.width / 2.0, quit.y + quit.height / 2.0);
+        h.driver.render();
+
+        assert!(
+            h.native_dialog_shown.get(),
+            "File > Quit with unsaved changes must open the quit-confirm \
+             dialog (the edge-trigger flag must flip)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "File > Quit with unsaved changes must queue the native \
+             quit-confirm present"
+        );
+    }
+
+    /// #823 item 4 (close-tab half): `App::show_close_tab_confirm` used to
+    /// restate `Engine::show_close_tab_confirm`'s dialog body inline
+    /// (byte-identical `DialogButton` literals, `core/engine/panels.rs`)
+    /// instead of calling it. Reached through a real click on a dirty tab's
+    /// × button — `handle_mouse_click`'s `Some(true)` ("close-tab on dirty
+    /// buffer") result, `gtk/click.rs` — the same path
+    /// `single_group_tab_close_button_closes_that_tab` above exercises for
+    /// a *clean* tab (which closes immediately, no dialog); this is its
+    /// dirty-tab sibling.
+    ///
+    /// Same reasoning as the quit-confirm test above applies to the
+    /// assertions: `close_tab_confirm` is equally natively-expressible
+    /// (#727: no `DialogTable`, no text input), so `native_dialog_shown` /
+    /// `pending_native_dialog` are the proof, not `screen_contains`.
+    ///
+    /// RED-verified: with `App::show_close_tab_confirm`'s
+    /// `self.engine.borrow_mut().show_close_tab_confirm()` call replaced by
+    /// a no-op, this test fails (no native dialog is ever queued);
+    /// restored before committing.
+    #[test]
+    fn close_dirty_tab_button_opens_confirm_dialog() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "alpha");
+        // Captured before `new_tab` below switches the active buffer —
+        // this is tab 0's buffer, the one whose × this test clicks.
+        let buf0 = engine.active_buffer_id();
+        engine.new_tab(None);
+        engine.new_tab(None);
+        if let Some(buf) = engine.buffer_manager.get_mut(buf0) {
+            buf.dirty = true;
+        }
+        let mut h = harness(engine, 1400, 900);
+
+        let (x, y) = h
+            .driver
+            .tab_close_center(&editor_tab_bar_id(), 0)
+            .expect("the single-group tab bar must have painted tab 0's close button");
+        h.driver.click(x, y);
+        h.driver.render();
+
+        assert!(
+            h.native_dialog_shown.get(),
+            "clicking \u{d7} on a dirty tab must open the close-tab-confirm \
+             dialog (the edge-trigger flag must flip)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "clicking \u{d7} on a dirty tab must queue the native \
+             close-tab-confirm present"
+        );
+    }
+
     /// #727's native path only covers dialogs `quadraui::native_dialog_options`
     /// reports as natively expressible — a dialog carrying a text input
     /// (e.g. the move-file destination prompt) is not, and must keep
