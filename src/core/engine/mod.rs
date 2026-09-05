@@ -3254,6 +3254,14 @@ pub struct Engine {
     pub last_visual_cursor: Option<Cursor>,
     /// Visual mode saved when leaving visual mode (for gv).
     pub last_visual_mode: Mode,
+    /// One-shot: the last Visual operator already set
+    /// `last_visual_anchor`/`last_visual_cursor` itself, so `handle_key`'s
+    /// generic "record the selection on leaving Visual mode" hook must not
+    /// overwrite them (#807).
+    ///
+    /// Vim collapses `'<`/`'>` onto the start of a Visual **delete**, so `gv`
+    /// afterwards reselects a single character/line, not the original extent.
+    pub(crate) last_visual_locked: bool,
 
     // --- Change list (g; / g,) ---
     /// List of (line, col) positions where buffer changes occurred. Max 100.
@@ -4046,6 +4054,7 @@ impl Engine {
             last_visual_anchor: None,
             last_visual_cursor: None,
             last_visual_mode: Mode::Normal,
+            last_visual_locked: false,
             change_list: Vec::new(),
             change_list_pos: 0,
             last_inserted_text: String::new(),

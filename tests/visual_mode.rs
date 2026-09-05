@@ -455,3 +455,35 @@ fn test_visual_line_replace_cursor_column() {
     assert_buf(&e, "---\n");
     assert_cursor(&e, 0, 0);
 }
+
+/// `gv` after a Visual delete reselects a *collapsed* region — Vim moves both
+/// `'<` and `'>` to the start of the deleted text — and `gv` pressed while
+/// already in Visual mode swaps to the previous selection (#807).
+///
+/// Oracle: `vis:gv after Vjd`, `vis:v then gv toggles`, `misc:gv after p`.
+#[test]
+fn test_gv_after_delete_and_inside_visual() {
+    // Vjd removes two lines; gv then reselects ONE line, not two.
+    let mut e = engine_with("a\nb\nc\nd\ne\n");
+    press(&mut e, 'V');
+    press(&mut e, 'j');
+    press(&mut e, 'd');
+    assert_buf(&e, "c\nd\ne\n");
+    press(&mut e, 'g');
+    press(&mut e, 'v');
+    press(&mut e, 'd');
+    assert_buf(&e, "d\ne\n");
+
+    // gv inside Visual mode jumps back to the previous selection.
+    let mut e = engine_with("abcdef\n");
+    press(&mut e, 'v');
+    press(&mut e, 'l');
+    press_key(&mut e, "Escape");
+    press(&mut e, '$');
+    press(&mut e, 'v');
+    press(&mut e, 'g');
+    press(&mut e, 'v');
+    press(&mut e, 'd');
+    assert_buf(&e, "cdef\n");
+    assert_cursor(&e, 0, 0);
+}
