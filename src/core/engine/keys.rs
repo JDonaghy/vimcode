@@ -1485,6 +1485,8 @@ impl Engine {
                 // R: enter Replace mode
                 self.start_undo_group();
                 self.insert_text_buffer.clear();
+                self.replace_overwritten.clear();
+                self.replace_repeat_count = self.take_count().max(1);
                 self.mode = Mode::Replace;
                 self.count = None;
             }
@@ -2523,6 +2525,8 @@ impl Engine {
                     // gR: enter Virtual Replace mode (tab-aware overwrite)
                     self.start_undo_group();
                     self.insert_text_buffer.clear();
+                    self.replace_overwritten.clear();
+                    self.replace_repeat_count = self.take_count().max(1);
                     self.virtual_replace = true;
                     self.mode = Mode::Replace;
                     self.count = None;
@@ -2860,12 +2864,10 @@ impl Engine {
             'r' => {
                 // Replace character: r followed by a character replaces char under cursor.
                 // Special case: Return/Enter replaces with newline (splits line).
-                let replacement = unicode.or_else(|| {
-                    if key_name == "Return" {
-                        Some('\n')
-                    } else {
-                        None
-                    }
+                let replacement = unicode.or_else(|| match key_name {
+                    "Return" | "KP_Enter" => Some('\n'),
+                    "Tab" => Some('\t'),
+                    _ => None,
                 });
                 if let Some(replacement) = replacement {
                     let count = self.take_count();
@@ -7505,6 +7507,22 @@ impl Engine {
                     }
                     return EngineAction::None;
                 }
+                '=' if self.pending_key.is_none() => {
+                    // Visual `=`: re-indent the selected lines (`:h v_=`).
+                    // VIM_COMPATIBILITY.md claimed this worked long before it
+                    // did — #807 makes the claim true.
+                    self.count = None;
+                    if let Some((start, end)) = self.get_visual_selection_range() {
+                        let start_line = start.line;
+                        let line_count = end.line - start_line + 1;
+                        self.mode = Mode::Normal;
+                        self.visual_anchor = None;
+                        self.visual_dollar = false;
+                        self.auto_indent_lines(start_line, line_count, changed);
+                        self.move_cursor_to_first_non_blank(start_line);
+                    }
+                    return EngineAction::None;
+                }
                 '~' => {
                     // Visual toggle case
                     self.count = None;
@@ -7796,6 +7814,23 @@ impl Engine {
                 // g Ctrl-A / g Ctrl-X in visual mode: sequential increment/decrement
                 let sign: i64 = if key_name == "a" { 1 } else { -1 };
                 self.visual_addsub(sign, true, changed);
+                return EngineAction::None;
+            } else if pending == 'g' && unicode == Some('J') {
+                // Visual `gJ`: join the selected lines without inserting or
+                // collapsing white space (`:h v_gJ`) — another row
+                // VIM_COMPATIBILITY.md marked ✅ before it existed (#807).
+                self.count = None;
+                if let Some((start, end)) = self.get_visual_selection_range() {
+                    let line_count = end.line - start.line + 1;
+                    self.mode = Mode::Normal;
+                    self.visual_anchor = None;
+                    self.visual_dollar = false;
+                    self.view_mut().cursor.line = start.line;
+                    self.view_mut().cursor.col = 0;
+                    if line_count > 1 {
+                        self.join_lines_no_space(line_count, changed);
+                    }
+                }
                 return EngineAction::None;
             } else if pending == 'g' && unicode == Some('c') {
                 // gc in visual mode: toggle comment on selected lines

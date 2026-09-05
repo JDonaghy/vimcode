@@ -1248,6 +1248,24 @@ impl Engine {
         let _ = ctrl;
         match key_name {
             "Escape" => {
+                // `2Rxy` re-applies the typed text `count - 1` more times,
+                // still overwriting (#807, `op:2R`).
+                let reps = self.replace_repeat_count.max(1);
+                let typed = self.insert_text_buffer.clone();
+                if reps > 1 && !typed.is_empty() && !typed.contains('\n') {
+                    for _ in 1..reps {
+                        for ch in typed.chars() {
+                            self.replace_mode_put(ch, changed);
+                        }
+                    }
+                }
+                self.replace_repeat_count = 1;
+                self.replace_overwritten.clear();
+                // The whole Replace session is ONE undo step (`R` opened the
+                // group). Closing it here is also what makes the session land
+                // on the undo stack in time for dot-repeat's change detection
+                // (#807, `dot:R .`).
+                self.finish_undo_group();
                 self.virtual_replace = false;
                 self.mode = Mode::Normal;
                 // Vim steps cursor one left when leaving Replace mode (unless at col 0)
@@ -1256,9 +1274,39 @@ impl Engine {
                 }
                 self.clamp_cursor_col();
             }
+            "Return" | "KP_Enter" => {
+                // `<CR>` in Replace mode breaks the line without consuming a
+                // character (`:h Replace-mode`; #807, `op:R <CR>`).
+                let line = self.view().cursor.line;
+                let col = self.view().cursor.col;
+                let char_idx = self.buffer().line_to_char(line) + col;
+                self.insert_with_undo(char_idx, "\n");
+                self.insert_text_buffer.push('\n');
+                self.replace_overwritten.clear();
+                self.view_mut().cursor.line = line + 1;
+                self.view_mut().cursor.col = 0;
+                *changed = true;
+            }
             "BackSpace" => {
-                // In replace mode, backspace just moves cursor back (simplified)
-                self.move_left();
+                // Replace-mode `<BS>` restores what was overwritten rather
+                // than deleting (`:h Replace-mode`; #807, `op:R BS restores`).
+                // Past the trail's start it is a plain cursor move.
+                let col = self.view().cursor.col;
+                match self.replace_overwritten.pop() {
+                    Some(orig) if col > 0 => {
+                        let line = self.view().cursor.line;
+                        let at = self.buffer().line_to_char(line) + col - 1;
+                        self.delete_with_undo(at, at + 1);
+                        if let Some(c) = orig {
+                            let mut buf = [0u8; 4];
+                            self.insert_with_undo(at, c.encode_utf8(&mut buf));
+                        }
+                        self.insert_text_buffer.pop();
+                        self.view_mut().cursor.col = col - 1;
+                        *changed = true;
+                    }
+                    _ => self.move_left(),
+                }
             }
             "Left" => self.move_left(),
             "Right" => self.move_right(),
@@ -1331,26 +1379,35 @@ impl Engine {
                         }
                     }
 
-                    self.start_undo_group();
-                    if col < line_content_len {
-                        // Overwrite: delete one char, insert replacement
-                        self.delete_with_undo(char_idx, char_idx + 1);
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        self.insert_with_undo(char_idx, s);
-                        self.view_mut().cursor.col += 1;
-                    } else {
-                        // Past end of line: insert
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf);
-                        self.insert_with_undo(char_idx, s);
-                        self.view_mut().cursor.col += 1;
-                    }
-                    self.finish_undo_group();
-                    *changed = true;
+                    let _ = (char_idx, line_content_len);
+                    self.replace_mode_put(ch, changed);
+                    self.insert_text_buffer.push(ch);
                 }
             }
         }
+    }
+
+    /// Overwrite the character under the cursor with `ch`, remembering what
+    /// was there so Replace-mode `<BS>` can put it back (#807).
+    fn replace_mode_put(&mut self, ch: char, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let line_start = self.buffer().line_to_char(line);
+        let char_idx = line_start + col;
+        let content_len = self.line_text_len(line);
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        if col < content_len {
+            let orig = self.buffer().content.char(char_idx);
+            self.delete_with_undo(char_idx, char_idx + 1);
+            self.insert_with_undo(char_idx, s);
+            self.replace_overwritten.push(Some(orig));
+        } else {
+            self.insert_with_undo(char_idx, s);
+            self.replace_overwritten.push(None);
+        }
+        self.view_mut().cursor.col = col + 1;
+        *changed = true;
     }
 
     // --- Paragraph motions ---
@@ -4572,7 +4629,41 @@ impl Engine {
             available
         };
 
+        // `:h r` — the count must fit on the line, otherwise `r` fails
+        // entirely (`5rx` on `abc` changes nothing).
+        if count > available {
+            return;
+        }
         let to_replace = count.min(available);
+
+        if replacement == '\n' {
+            // `Nr<CR>` replaces the N characters with a SINGLE line break and
+            // leaves the cursor at the start of the new line (`:h r`; #807 —
+            // vimcode used to insert N line breaks).
+            if to_replace == 0 {
+                return;
+            }
+            self.delete_with_undo(char_idx, char_idx + to_replace);
+            self.insert_with_undo(char_idx, "\n");
+            self.view_mut().cursor.line = line + 1;
+            self.view_mut().cursor.col = 0;
+            *changed = true;
+            return;
+        }
+        if replacement == '\t' && self.settings.expand_tab {
+            // With 'expandtab', `r<Tab>` puts spaces in, not a tab (#807).
+            let width = (self.settings.tabstop as usize).max(1);
+            let spaces = " ".repeat(width);
+            if to_replace == 0 {
+                return;
+            }
+            self.delete_with_undo(char_idx, char_idx + to_replace);
+            self.insert_with_undo(char_idx, &spaces);
+            self.view_mut().cursor.col = col + width - 1;
+            self.clamp_cursor_col();
+            *changed = true;
+            return;
+        }
 
         if to_replace > 0 && char_idx < self.buffer().len_chars() {
             // Build the replacement string

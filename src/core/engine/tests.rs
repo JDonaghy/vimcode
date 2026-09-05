@@ -2107,12 +2107,15 @@ fn test_replace_char_doesnt_cross_line() {
     // Move to 'i' (last char of first line)
     engine.view_mut().cursor.col = 1;
 
-    // Try to replace 3 chars - should only replace 'i' (not crossing newline)
+    // `3rx` needs three characters on THIS line and there is only one, so
+    // Vim does nothing at all — it does not silently replace what it can.
+    // #807 corrected this hand-authored expectation against the nvim oracle
+    // (`op:5r beyond eol`: `5rx` on `abc` leaves `abc`).
     press_char(&mut engine, '3');
     press_char(&mut engine, 'r');
     press_char(&mut engine, 'x');
 
-    assert_eq!(engine.buffer().to_string(), "hx\nbye");
+    assert_eq!(engine.buffer().to_string(), "hi\nbye");
 }
 
 #[test]
