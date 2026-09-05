@@ -614,14 +614,29 @@ pub fn render_markdown(input: &str) -> MdRendered {
 // (`Theme::md_heading1/2/3`) are *not* preserved — quadraui renders every
 // heading level as bold + a larger `line_scales` factor, with no per-level
 // color; this is an accepted, documented divergence, not a bug.
+//
+// Two further parity gaps vs. the local `render_markdown`, both documented as
+// intentional deferrals in quadraui's own `compose/markdown.rs` module doc
+// (pinned rev `4ff2a645`) rather than bugs to work around here: quadraui's
+// renderer has **no image support** (`![alt](src)` degrades silently — no
+// alt-text fallback, unlike the local pipeline's `image_alt_text` handling),
+// and **only single-level list support** (nested `- a\n  - b` markdown does
+// not indent the nested item). Low real-world impact for LSP hover/doc-
+// comment text, which rarely nests lists or embeds images, but noted here so
+// a future caller doesn't assume full parity.
 
 /// Wrap bare `http://` / `https://` URLs in `[url](url)` markdown link
 /// syntax so quadraui's `render_markdown_to_styled` (which only recognizes
 /// bracketed links) still makes them clickable. A URL immediately preceded
 /// by `(` is assumed to already be a link destination (`[text](url)`) and is
 /// left alone. Fenced code blocks are skipped entirely (their contents
-/// should never be rewritten). Adapted from `scan_bare_urls` above, which
-/// performs the equivalent scan for the local pulldown-cmark pipeline.
+/// should never be rewritten), and so are inline single-backtick code spans
+/// (`` `like this` ``) — quadraui's `parse_inline` treats backtick-delimited
+/// text as verbatim and never re-parses markdown syntax inside it, so
+/// rewriting a URL there would inject literal `[url](url)` text into the
+/// rendered code span instead of producing a link. Adapted from
+/// `scan_bare_urls` above, which performs the equivalent scan for the local
+/// pulldown-cmark pipeline.
 pub fn linkify_bare_urls(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_code_block = false;
@@ -647,7 +662,20 @@ fn linkify_bare_urls_in_line(line: &str, out: &mut String) {
     let bytes = line.as_bytes();
     let len = bytes.len();
     let mut i = 0usize;
+    let mut in_code_span = false;
     while i < len {
+        if bytes[i] == b'`' {
+            in_code_span = !in_code_span;
+            out.push('`');
+            i += 1;
+            continue;
+        }
+        if in_code_span {
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
         let scheme_len = if bytes[i..].starts_with(b"https://") {
             Some(8usize)
         } else if bytes[i..].starts_with(b"http://") {
@@ -1023,6 +1051,33 @@ mod tests {
         assert_eq!(
             out,
             "visit [https://example.com](https://example.com), please."
+        );
+    }
+
+    #[test]
+    fn linkify_bare_urls_skips_inline_code_spans() {
+        let out = linkify_bare_urls("See `https://example.com` for docs.");
+        assert_eq!(out, "See `https://example.com` for docs.");
+    }
+
+    #[test]
+    fn linkify_bare_urls_still_wraps_url_after_inline_code_span_closes() {
+        let out = linkify_bare_urls("`code` then https://example.com after");
+        assert_eq!(
+            out,
+            "`code` then [https://example.com](https://example.com) after"
+        );
+    }
+
+    #[test]
+    fn hover_markdown_structure_leaves_url_in_inline_code_as_plain_text() {
+        let markdown = linkify_bare_urls("See `https://example.com` for docs.");
+        let (line_text, links, _) = hover_markdown_structure(&markdown);
+        assert_eq!(line_text.len(), 1);
+        assert_eq!(line_text[0], "See https://example.com for docs.");
+        assert!(
+            links.is_empty(),
+            "URL inside inline code span must not become a clickable link: {links:?}"
         );
     }
 
