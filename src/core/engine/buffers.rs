@@ -1,5 +1,9 @@
 use super::*;
 
+/// `(mark char, absolute character offset)` pairs — see
+/// `Engine::snapshot_marks_as_offsets` / `restore_marks_from_offsets`.
+type MarkOffsets = Vec<(char, usize)>;
+
 impl Engine {
     // =======================================================================
     // Buffer operations
@@ -112,17 +116,182 @@ impl Engine {
 
     /// Insert text with undo recording.
     pub fn insert_with_undo(&mut self, pos: usize, text: &str) {
+        // Snapshot before the edit — `char_to_line` needs the pre-insert
+        // buffer to know which line `pos` falls on (#806).
+        let at_line = if text.contains('\n') {
+            Some(self.buffer().content.char_to_line(pos))
+        } else {
+            None
+        };
         self.active_buffer_state_mut().record_insert(pos, text);
         self.buffer_mut().insert(pos, text);
+        if let Some(at_line) = at_line {
+            let inserted_lines = text.matches('\n').count();
+            self.shift_marks_for_line_insert(at_line, inserted_lines);
+        }
     }
 
     /// Delete a range with undo recording.
     pub fn delete_with_undo(&mut self, start: usize, end: usize) {
         // Capture the text being deleted before deleting
         let deleted_text: String = self.buffer().content.slice(start..end).chars().collect();
+        // A whole-line-consuming delete (`dd`, `:d`, …) always starts exactly
+        // at a line boundary — see `shift_marks_for_line_delete` for why that
+        // matters and why a mid-line splice (e.g. `J`'s newline removal,
+        // handled separately with precise column tracking) must NOT go
+        // through this path (#806).
+        let at_line = if !self.suppress_mark_line_adjust && deleted_text.contains('\n') {
+            Some(self.buffer().content.char_to_line(start))
+        } else {
+            None
+        };
         self.active_buffer_state_mut()
             .record_delete(start, &deleted_text);
         self.buffer_mut().delete_range(start, end);
+        if let Some(at_line) = at_line {
+            let removed_lines = deleted_text.matches('\n').count();
+            self.shift_marks_for_line_delete(at_line, removed_lines);
+        }
+    }
+
+    /// Shift every mark strictly below `at_line` down by `line_count` —
+    /// real Vim's rule for a full-line insertion (`O`, `o`, `:put`, …): a
+    /// mark's column is left alone (Vim never re-derives it from an edit
+    /// elsewhere on the line — verified against real Vim: deleting text
+    /// earlier on a line leaves a mark's stored column unchanged, even
+    /// though it may now point at a different character), only its line
+    /// number moves (#806, "mark:mark shifts after O", "mark:'a after text
+    /// insert above").
+    pub(crate) fn shift_marks_for_line_insert(&mut self, at_line: usize, line_count: usize) {
+        if line_count == 0 {
+            return;
+        }
+        let buffer_id = self.active_window().buffer_id;
+        if let Some(bm) = self.marks.get_mut(&buffer_id) {
+            for cursor in bm.values_mut() {
+                if cursor.line > at_line {
+                    cursor.line += line_count;
+                }
+            }
+        }
+        let file = self.active_buffer_state().file_path.clone();
+        for (f, line, _) in self.global_marks.values_mut() {
+            if *f == file && *line > at_line {
+                *line += line_count;
+            }
+        }
+    }
+
+    /// Shift/remove marks for a full-line deletion covering `[at_line,
+    /// at_line + line_count)`. A mark inside the removed range no longer has
+    /// a line to point at and is unset — real Vim removes it too (`:h
+    /// mark-motions`) — rather than left dangling on whatever line happens
+    /// to have slid into its old slot; a mark below the range shifts up
+    /// (#806, "mark:mark on deleted line").
+    pub(crate) fn shift_marks_for_line_delete(&mut self, at_line: usize, line_count: usize) {
+        if line_count == 0 {
+            return;
+        }
+        let buffer_id = self.active_window().buffer_id;
+        if let Some(bm) = self.marks.get_mut(&buffer_id) {
+            bm.retain(|_, cursor| !(cursor.line >= at_line && cursor.line < at_line + line_count));
+            for cursor in bm.values_mut() {
+                if cursor.line >= at_line + line_count {
+                    cursor.line -= line_count;
+                }
+            }
+        }
+        let file = self.active_buffer_state().file_path.clone();
+        self.global_marks.retain(|_, (f, line, _)| {
+            !(*f == file && *line >= at_line && *line < at_line + line_count)
+        });
+        for (f, line, _) in self.global_marks.values_mut() {
+            if *f == file && *line >= at_line + line_count {
+                *line -= line_count;
+            }
+        }
+    }
+
+    /// Read every local mark (active buffer) and global mark (pointing at
+    /// the active buffer's file) as an absolute character offset, using the
+    /// buffer as it exists *right now* — call before mutating it. Paired
+    /// with `restore_marks_from_offsets`, used by `join_lines` for its
+    /// precise column-aware mark fixup (#806).
+    pub(crate) fn snapshot_marks_as_offsets(&self) -> (MarkOffsets, MarkOffsets) {
+        let buffer_id = self.active_window().buffer_id;
+        let local = self
+            .marks
+            .get(&buffer_id)
+            .map(|m| {
+                m.iter()
+                    .map(|(&ch, c)| (ch, self.buffer().line_to_char(c.line) + c.col))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let file = self.active_buffer_state().file_path.clone();
+        let global = self
+            .global_marks
+            .iter()
+            .filter(|(_, (f, _, _))| *f == file)
+            .map(|(&ch, &(_, line, col))| (ch, self.buffer().line_to_char(line) + col))
+            .collect();
+        (local, global)
+    }
+
+    /// Write back offsets captured by `snapshot_marks_as_offsets`, splicing
+    /// them through an edit that removes `del_len` chars at `pos` and
+    /// inserts `ins_len` chars there, then re-deriving (line, col) from the
+    /// buffer as it exists *after* the edit. An offset that landed strictly
+    /// inside the removed span collapses to `pos` (no test exercises this;
+    /// join only ever removes whitespace, never a marked position).
+    pub(crate) fn restore_marks_from_offsets(
+        &mut self,
+        local: MarkOffsets,
+        global: MarkOffsets,
+        pos: usize,
+        del_len: usize,
+        ins_len: usize,
+    ) {
+        let splice = |o: usize| -> usize {
+            if o < pos {
+                o
+            } else if o < pos + del_len {
+                pos
+            } else {
+                o + ins_len - del_len
+            }
+        };
+        let new_local: Vec<(char, Cursor)> = local
+            .into_iter()
+            .map(|(ch, off)| {
+                let new_off = splice(off);
+                let line = self.buffer().content.char_to_line(new_off);
+                let col = new_off - self.buffer().line_to_char(line);
+                (ch, Cursor { line, col })
+            })
+            .collect();
+        let new_global: Vec<(char, usize, usize)> = global
+            .into_iter()
+            .map(|(ch, off)| {
+                let new_off = splice(off);
+                let line = self.buffer().content.char_to_line(new_off);
+                let col = new_off - self.buffer().line_to_char(line);
+                (ch, line, col)
+            })
+            .collect();
+        if !new_local.is_empty() {
+            let buffer_id = self.active_window().buffer_id;
+            let bm = self.marks.entry(buffer_id).or_default();
+            for (ch, cursor) in new_local {
+                bm.insert(ch, cursor);
+            }
+        }
+        if !new_global.is_empty() {
+            let file = self.active_buffer_state().file_path.clone();
+            for (ch, line, col) in new_global {
+                self.global_marks.insert(ch, (file.clone(), line, col));
+            }
+        }
     }
 
     /// Perform undo on the active buffer. Returns true if undo was performed.

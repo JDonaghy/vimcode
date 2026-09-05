@@ -22329,9 +22329,12 @@ fn test_matrix_change_register_contents() {
     // c should populate the register with deleted text
     let cases: &[(&str, &str, usize, usize, &str, &str, bool)] = &[
         ("cw_reg", "hello world foo", 0, 0, "cw<Esc>", "hello", false),
-        // NOTE: Neovim cc register has "two\n" (with newline, linewise=true).
-        // VimCode: "two" (no newline, linewise=false).
-        ("cc_reg", "one\ntwo\nthree", 1, 0, "cc<Esc>", "two", false),
+        // `cc`'s register content is linewise, "two\n" (`:h registers`), even
+        // though the buffer edit itself only clears the line's content and
+        // leaves the newline in place (#806, "reg:\"1 after cc" — matches
+        // Neovim; this used to be documented here as a known VimCode
+        // deviation instead of fixed).
+        ("cc_reg", "one\ntwo\nthree", 1, 0, "cc<Esc>", "two\n", true),
         (
             "ciw_reg",
             "hello world foo",

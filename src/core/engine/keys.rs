@@ -70,10 +70,24 @@ impl Engine {
         // of the pending-state fields it inspects get consumed below.
         self.update_curswant_for_key(unicode, ctrl);
 
+        // Reset the per-keystroke failure flag (#806) — set by a Normal-mode
+        // command below that couldn't complete, and read once, right after
+        // this call returns, by `advance_macro_playback`.
+        self.command_failed = false;
+
         // Spell suggestion selection intercepts all keys.
         if self.spell_suggestions.is_some() {
             self.handle_spell_suggestion_key(key_name, unicode);
             return EngineAction::None;
+        }
+
+        // Expression register (`"=` in Normal mode, `<C-r>=` in Insert mode)
+        // intercepts all keys until the terminating `<CR>`/`<Esc>` — it's a
+        // mini command-line, entered from (and returning to) whichever mode
+        // triggered it, so it can't be handled as part of the mode-specific
+        // dispatch below (#806, `reg:"= expr`, `reg:C-r = in insert`).
+        if self.expr_register_pending.is_some() {
+            return self.handle_expr_register_key(key_name, unicode);
         }
 
         // Clear message on any keypress (unless we're in command/search mode
@@ -652,6 +666,47 @@ impl Engine {
         action
     }
 
+    /// Handle one keystroke while the `"=`/`<C-r>=` expression prompt is
+    /// open (`self.expr_register_pending.is_some()`). `<CR>` evaluates the
+    /// accumulated text and stores the result in the `=` register; the
+    /// Insert-mode variant (`from_insert`) also inserts it at the cursor,
+    /// "as if typed" like any other `<C-r>` register paste. `<Esc>` cancels
+    /// without touching the `=` register, matching `i_CTRL-R_CTRL-R`'s
+    /// abort behavior (#806).
+    fn handle_expr_register_key(&mut self, key_name: &str, unicode: Option<char>) -> EngineAction {
+        let Some((from_insert, mut buf)) = self.expr_register_pending.take() else {
+            return EngineAction::None;
+        };
+        match key_name {
+            "Return" => match Engine::eval_expr_register(&buf) {
+                Ok(result) => {
+                    self.registers.insert('=', (result.clone(), false));
+                    if from_insert {
+                        self.insert_register_content_at_cursor(&result);
+                    }
+                }
+                Err(e) => {
+                    self.message = format!("E15: Invalid expression: {}", e);
+                }
+            },
+            "Escape" => {
+                // Cancelled — leave the `=` register untouched and drop back
+                // into whichever mode triggered the prompt with no side effects.
+            }
+            "BackSpace" => {
+                buf.pop();
+                self.expr_register_pending = Some((from_insert, buf));
+            }
+            _ => {
+                if let Some(ch) = unicode {
+                    buf.push(ch);
+                    self.expr_register_pending = Some((from_insert, buf));
+                }
+            }
+        }
+        EngineAction::None
+    }
+
     /// Decode a sequence from the macro playback queue.
     /// Returns (key_name, unicode, ctrl) tuple and the number of characters consumed.
     pub(crate) fn decode_macro_sequence(&self) -> Option<(String, Option<char>, bool, usize)> {
@@ -755,6 +810,19 @@ impl Engine {
                 self.macro_playback_queue.clear();
                 self.message = "Macro recursion limit reached".to_string();
                 return (false, EngineAction::Error);
+            }
+
+            // A command inside the macro failed (`f{char}` not found, `j`/`k`
+            // already at a buffer edge, …): real Vim aborts the rest of this
+            // macro invocation *and* any outstanding repeat count right here
+            // (#806, "mac:10@a stops at failure"). This is also what makes a
+            // self-referential recursive macro terminate at EOF instead of
+            // spinning to `MAX_MACRO_RECURSION` — the trailing `@a` that
+            // would re-queue another pass is still sitting unexpanded at the
+            // front of the queue when the failure happens, so clearing here
+            // discards it before it ever runs (#806, "mac:recursive").
+            if self.command_failed {
+                self.macro_playback_queue.clear();
             }
 
             (!self.macro_playback_queue.is_empty(), action)
@@ -890,13 +958,20 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "o" => {
-                    // Ctrl-O: Jump list back
-                    self.jump_list_back();
+                    // Ctrl-O: jump list back, `N<C-o>` repeats N times
+                    // (#806, "jump:3<C-o>" — this previously ignored its count).
+                    let count = self.take_count().max(1);
+                    for _ in 0..count {
+                        self.jump_list_back();
+                    }
                     return EngineAction::None;
                 }
                 "i" => {
                     // Ctrl-I: Jump list forward (same as Tab in many terminals)
-                    self.jump_list_forward();
+                    let count = self.take_count().max(1);
+                    for _ in 0..count {
+                        self.jump_list_forward();
+                    }
                     return EngineAction::None;
                 }
                 "p" => {
@@ -1052,13 +1127,23 @@ impl Engine {
             Some('j') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_down();
+                    if !self.move_down() {
+                        // Already at the last line: a macro/`:normal` playing
+                        // this back must stop here (#806, "mac:recursive" —
+                        // this is what makes a self-referential macro
+                        // terminate at EOF instead of spinning forever).
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('k') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_up();
+                    if !self.move_up() {
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('l') => {
@@ -1387,20 +1472,27 @@ impl Engine {
                 self.count = None;
             }
             Some('(') => {
-                // (: backward sentence
+                // (: backward sentence. Only pushes a jump when the sentence
+                // start lands on a different line — verified against real
+                // Neovim, same rule as `%` (#806, "jump:C-o after (": pushing
+                // unconditionally here made `<C-o>` snap straight back to
+                // the pre-`(` column instead of leaving a same-line move
+                // alone).
                 let count = self.take_count();
-                self.push_jump_location();
+                let pre_cursor = self.view().cursor;
                 for _ in 0..count {
                     self.move_sentence_backward();
                 }
+                self.record_jump_from(pre_cursor);
             }
             Some(')') => {
-                // ): forward sentence
+                // ): forward sentence — see `(` above for the same-line gate.
                 let count = self.take_count();
-                self.push_jump_location();
+                let pre_cursor = self.view().cursor;
                 for _ in 0..count {
                     self.move_sentence_forward();
                 }
+                self.record_jump_from(pre_cursor);
             }
             Some('f') => {
                 self.pending_key = Some('f');
@@ -1496,7 +1588,7 @@ impl Engine {
                             .chars()
                             .collect();
                         let reg = self.active_register();
-                        self.set_register(reg, deleted_chars, false);
+                        self.set_delete_register(reg, deleted_chars, false);
                         self.clear_selected_register();
 
                         self.start_undo_group();
@@ -1696,15 +1788,11 @@ impl Engine {
             }
             Some('p') => {
                 let count = self.take_count();
-                for _ in 0..count {
-                    self.paste_after(changed);
-                }
+                self.paste_after(count, changed);
             }
             Some('P') => {
                 let count = self.take_count();
-                for _ in 0..count {
-                    self.paste_before(changed);
-                }
+                self.paste_before(count, changed);
             }
             Some('q') => {
                 // If already recording, stop recording
@@ -1782,8 +1870,15 @@ impl Engine {
                     // target line at the *bottom* of the window, not
                     // centered; see scripts/nvim_headless_vs_interactive_repro.sh).
                 } else {
-                    self.push_jump_location();
+                    // `%` always moves the `` ` `` pcmark, but only appends
+                    // to the persistent jumplist when the matched bracket is
+                    // on a DIFFERENT line — verified against real Neovim:
+                    // `getjumplist()` stays empty for a same-line match, yet
+                    // `` `` `` still returns to the pre-`%` column (#806,
+                    // "jump:% C-o" vs "mark:`` after %").
+                    let pre_cursor = self.view().cursor;
                     self.move_to_matching_bracket();
+                    self.record_jump_from(pre_cursor);
                 }
                 // Center viewport when a matched bracket is far from the
                 // current view, so it's clearly visible (like search `n`).
@@ -1923,15 +2018,22 @@ impl Engine {
                         }
                     } else {
                         self.push_jump_location();
-                        if self.peek_count().is_some() {
+                        let current_line = self.view().cursor.line;
+                        let target_line = if self.peek_count().is_some() {
                             let count = self.take_count();
-                            let target_line =
-                                (count - 1).min(self.buffer().len_lines().saturating_sub(1));
-                            self.view_mut().cursor.line = target_line;
+                            (count - 1).min(self.buffer().len_lines().saturating_sub(1))
                         } else {
-                            self.view_mut().cursor.line = 0;
+                            0
+                        };
+                        self.view_mut().cursor.line = target_line;
+                        // Real Vim leaves the column alone when `gg`'s target
+                        // line is the line the cursor is already on — only an
+                        // actual line change resets to column 0 (#806, "reg:dn
+                        // goes to \"1", which depends on a single-line-buffer
+                        // `gg` being a true no-op).
+                        if target_line != current_line {
+                            self.view_mut().cursor.col = 0;
                         }
-                        self.view_mut().cursor.col = 0;
                     }
                 }
                 Some('e') => {
@@ -2210,16 +2312,12 @@ impl Engine {
                 Some('p') => {
                     // gp: paste after, leave cursor after pasted text
                     let count = self.take_count();
-                    for _ in 0..count {
-                        self.paste_after_cursor_after(changed);
-                    }
+                    self.paste_after_cursor_after(count, changed);
                 }
                 Some('P') => {
                     // gP: paste before, leave cursor after pasted text
                     let count = self.take_count();
-                    for _ in 0..count {
-                        self.paste_before_cursor_after(changed);
-                    }
+                    self.paste_before_cursor_after(count, changed);
                 }
                 Some('v') => {
                     // gv: reselect last visual selection
@@ -2618,14 +2716,26 @@ impl Engine {
                     self.finish_undo_group();
                 }
             '"' => {
-                // Register selection: "x sets selected_register for next operation
-                // Uppercase A-Z appends to lowercase register
+                // Register selection: "x sets selected_register for next operation.
+                // Uppercase A-Z appends to lowercase register. `_` is the black
+                // hole (reads/writes go nowhere — `:h quote_`); `.`, `/`, `%`,
+                // `:`, `-` are the read-mostly special registers (`:h
+                // registers`); `=` opens the expression-register prompt (#806).
                 if let Some(ch) = unicode {
-                    if ch.is_ascii_lowercase()
+                    if ch == '=' {
+                        self.selected_register = Some('=');
+                        self.expr_register_pending = Some((false, String::new()));
+                    } else if ch.is_ascii_lowercase()
                         || ch.is_ascii_uppercase()
                         || ch == '"'
                         || ch == '+'
                         || ch == '*'
+                        || ch == '_'
+                        || ch == '.'
+                        || ch == '/'
+                        || ch == '%'
+                        || ch == ':'
+                        || ch == '-'
                         || ch.is_ascii_digit()
                     {
                         self.selected_register = Some(ch);
@@ -2641,6 +2751,10 @@ impl Engine {
                         self.open_cmdline_window(true);
                     } else if ch.is_ascii_lowercase() {
                         self.start_macro_recording(ch);
+                    } else if ch.is_ascii_uppercase() {
+                        // qA: append to register "a" instead of overwriting
+                        // it (`:h q`, #806 "mac:qA append").
+                        self.start_macro_recording_append(ch.to_ascii_lowercase());
                     } else {
                         self.message = "Invalid register for macro".to_string();
                     }
@@ -2679,11 +2793,21 @@ impl Engine {
                 // Character find motions
                 if let Some(target) = unicode {
                     let count = self.take_count();
+                    let mut found = true;
                     for _ in 0..count {
-                        self.find_char(pending, target);
+                        if !self.find_char(pending, target) {
+                            found = false;
+                            break;
+                        }
                     }
                     // Remember this find for ; and , repeat
                     self.last_find = Some((pending, target));
+                    // Target not found on the line: a macro/`:normal` playing
+                    // this back must stop here rather than continue on as if
+                    // it succeeded (#806, "mac:10@a stops at failure").
+                    if !found {
+                        self.command_failed = true;
+                    }
                 }
             }
             'r' => {
@@ -2771,15 +2895,33 @@ impl Engine {
                 if let Some(ch) = unicode {
                     match ch {
                         '\'' => {
-                            // '' jump to position before last jump
+                            // '' jumps to the position before the last jump —
+                            // and IS ITSELF a jump, so it toggles: read the
+                            // target before `push_jump_location` overwrites
+                            // `last_jump_pos` with where we're jumping FROM
+                            // (#806, "mark:'' toggles").
                             if let Some((line, _)) = self.last_jump_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 let target = line.min(max_line);
+                                self.push_jump_location();
                                 self.view_mut().cursor.line = target;
                                 self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous jump position".to_string();
+                            }
+                        }
+                        '^' => {
+                            // '^ / `^: position where Insert mode was last
+                            // left, RAW column (may be one past the last
+                            // char — clamped like any other mark jump).
+                            if let Some((line, col)) = self.last_insert_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous insert position".to_string();
                             }
                         }
                         '.' => {
@@ -2792,6 +2934,30 @@ impl Engine {
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous edit position".to_string();
+                            }
+                        }
+                        '[' => {
+                            // '[ jump to start of last change (#806, "mark:'[ after >>")
+                            if let Some((line, _)) = self.last_change_start {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
+                            }
+                        }
+                        ']' => {
+                            // '] jump to end of last change
+                            if let Some((line, _)) = self.last_change_end {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                let target = line.min(max_line);
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
                             }
                         }
                         '<' => {
@@ -2820,15 +2986,20 @@ impl Engine {
                         }
                         _ if ch.is_ascii_lowercase() => {
                             let buffer_id = self.active_window().buffer_id;
-                            if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                                if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                    let target = mark_cursor.line;
-                                    self.view_mut().cursor.line = target;
-                                    self.view_mut().cursor.col = self.first_non_blank_col(target);
-                                    self.clamp_cursor_col();
-                                } else {
-                                    self.message = format!("Mark '{}' not set", ch);
-                                }
+                            let target = self
+                                .marks
+                                .get(&buffer_id)
+                                .and_then(|m| m.get(&ch))
+                                .map(|c| c.line);
+                            if let Some(target) = target {
+                                // Mark jumps always move the pcmark, but only
+                                // append to the jumplist when they actually
+                                // change line (#806, "jump:'a C-o").
+                                let pre_cursor = self.view().cursor;
+                                self.view_mut().cursor.line = target;
+                                self.view_mut().cursor.col = self.first_non_blank_col(target);
+                                self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark '{}' not set", ch);
                             }
@@ -2837,9 +3008,11 @@ impl Engine {
                             if let Some(&(_, line, _)) = self.global_marks.get(&ch) {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 let target = line.min(max_line);
+                                let pre_cursor = self.view().cursor;
                                 self.view_mut().cursor.line = target;
                                 self.view_mut().cursor.col = self.first_non_blank_col(target);
                                 self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark '{}' not set", ch);
                             }
@@ -2903,14 +3076,28 @@ impl Engine {
                 if let Some(ch) = unicode {
                     match ch {
                         '`' => {
-                            // `` jump to exact position before last jump
+                            // `` jumps to the exact position before the last
+                            // jump — and toggles, same as '' (#806, "mark:``
+                            // after ''").
                             if let Some((line, col)) = self.last_jump_pos {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                let target_line = line.min(max_line);
+                                self.push_jump_location();
+                                self.view_mut().cursor.line = target_line;
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous jump position".to_string();
+                            }
+                        }
+                        '^' => {
+                            if let Some((line, col)) = self.last_insert_pos {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
                                 self.view_mut().cursor.line = line.min(max_line);
                                 self.view_mut().cursor.col = col;
                                 self.clamp_cursor_col();
                             } else {
-                                self.message = "No previous jump position".to_string();
+                                self.message = "No previous insert position".to_string();
                             }
                         }
                         '.' => {
@@ -2945,13 +3132,12 @@ impl Engine {
                         }
                         _ if ch.is_ascii_lowercase() => {
                             let buffer_id = self.active_window().buffer_id;
-                            if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                                if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                    self.view_mut().cursor = *mark_cursor;
-                                    self.clamp_cursor_col();
-                                } else {
-                                    self.message = format!("Mark `{}` not set", ch);
-                                }
+                            let target = self.marks.get(&buffer_id).and_then(|m| m.get(&ch)).copied();
+                            if let Some(mark_cursor) = target {
+                                let pre_cursor = self.view().cursor;
+                                self.view_mut().cursor = mark_cursor;
+                                self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark `{}` not set", ch);
                             }
@@ -2959,9 +3145,12 @@ impl Engine {
                         _ if ch.is_ascii_uppercase() => {
                             if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
                                 let max_line = self.buffer().len_lines().saturating_sub(1);
-                                self.view_mut().cursor.line = line.min(max_line);
+                                let target_line = line.min(max_line);
+                                let pre_cursor = self.view().cursor;
+                                self.view_mut().cursor.line = target_line;
                                 self.view_mut().cursor.col = col;
                                 self.clamp_cursor_col();
+                                self.record_jump_from(pre_cursor);
                             } else {
                                 self.message = format!("Mark `{}` not set", ch);
                             }
@@ -3502,8 +3691,13 @@ impl Engine {
                             .slice(line_start..delete_end)
                             .chars()
                             .collect();
+                        // `cc` register content is linewise (`:h registers`)
+                        // even though the buffer edit itself only clears the
+                        // line's content and leaves the newline in place —
+                        // `"1p` after `cc` must paste back a whole line
+                        // (#806, "reg:\"1 after cc").
                         let reg = self.active_register();
-                        self.set_register(reg, deleted, false);
+                        self.set_delete_register(reg, format!("{}\n", deleted), true);
                         self.clear_selected_register();
 
                         self.delete_with_undo(line_start, delete_end);
@@ -4062,6 +4256,9 @@ impl Engine {
         end: usize,
         changed: &mut bool,
     ) {
+        // One-shot; consume unconditionally so it can never leak into a
+        // later, unrelated command regardless of which branch below runs.
+        let force_numbered = std::mem::take(&mut self.force_numbered_register);
         if start >= end {
             return;
         }
@@ -4123,7 +4320,11 @@ impl Engine {
             'd' => {
                 let text: String = self.buffer().content.slice(start..end).chars().collect();
                 let reg = self.active_register();
-                self.set_delete_register(reg, text, false);
+                if force_numbered {
+                    self.set_delete_register_special_motion(reg, text, false);
+                } else {
+                    self.set_delete_register(reg, text, false);
+                }
                 self.clear_selected_register();
                 self.start_undo_group();
                 self.delete_with_undo(start, end);
@@ -4134,7 +4335,11 @@ impl Engine {
             'c' => {
                 let text: String = self.buffer().content.slice(start..end).chars().collect();
                 let reg = self.active_register();
-                self.set_delete_register(reg, text, false);
+                if force_numbered {
+                    self.set_delete_register_special_motion(reg, text, false);
+                } else {
+                    self.set_delete_register(reg, text, false);
+                }
                 self.clear_selected_register();
                 self.start_undo_group();
                 self.delete_with_undo(start, end);
@@ -4211,6 +4416,11 @@ impl Engine {
         end_line: usize,
         changed: &mut bool,
     ) {
+        // One-shot; a linewise delete already always lands in "1 via
+        // `delete_lines`, so this flag is irrelevant here — just make sure it
+        // can't leak into a later command when `apply_operator_exclusive_range`
+        // redirected here instead of into `apply_charwise_operator`.
+        self.force_numbered_register = false;
         if start_line > end_line {
             return;
         }
@@ -4920,6 +5130,12 @@ impl Engine {
             (end_pos, start_pos)
         };
 
+        // `d/pat<CR>`, `dn`, `dN`, … always land in "1 on delete, even when
+        // the match is within one line (#806, "d/ goes to \"1", "dn goes to
+        // \"1") — consumed by `apply_charwise_operator`/
+        // `apply_operator_exclusive_range` just below.
+        self.force_numbered_register = true;
+
         // `:help search-offset`: an `e[+-N]` offset (`/pat/e`) makes the
         // search motion INCLUSIVE of the last matched character — bypass the
         // exclusive-linewise adjustment entirely and just extend the range.
@@ -5007,7 +5223,13 @@ impl Engine {
                 .chars()
                 .collect();
             let reg = self.active_register();
-            self.set_register(reg, text, false);
+            if operator == 'y' {
+                self.set_yank_register(reg, text, false);
+            } else {
+                // `%` always goes to "1 even though the matched region is
+                // often less than a line (#806, "d% goes to \"1").
+                self.set_delete_register_special_motion(reg, text, false);
+            }
             self.clear_selected_register();
 
             if operator == 'y' {
@@ -5162,6 +5384,26 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// Insert register/expression content at the cursor "as if typed"
+    /// (`:h i_CTRL-R`) — shared by plain `<C-r>{reg}` and the result of
+    /// `<C-r>=expr<CR>` (#806). Expands embedded tabs per 'expandtab' and
+    /// advances the cursor line-by-line for a linewise (or otherwise
+    /// multi-line) register instead of just adding the raw character count.
+    fn insert_register_content_at_cursor(&mut self, content: &str) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let content = self.expand_tabs_for_insert(content, col);
+        let char_idx = self.buffer().line_to_char(line) + col;
+        self.insert_with_undo(char_idx, &content);
+        let lines: Vec<&str> = content.split('\n').collect();
+        if lines.len() > 1 {
+            self.view_mut().cursor.line = line + lines.len() - 1;
+            self.view_mut().cursor.col = lines.last().map_or(0, |l| l.chars().count());
+        } else {
+            self.view_mut().cursor.col = col + content.chars().count();
+        }
     }
 
     /// Insert the character named by a `<C-v>{digits}` numeric sequence
@@ -5407,31 +5649,18 @@ impl Engine {
             self.insert_ctrl_r_pending = true;
             return;
         }
-        // When Ctrl+R pending, next char selects the register to insert
+        // When Ctrl+R pending, next char selects the register to insert.
+        // `=` doesn't paste directly — it opens the expression prompt (#806,
+        // "reg:C-r = in insert"), same as `"=` in Normal mode.
         if self.insert_ctrl_r_pending {
             self.insert_ctrl_r_pending = false;
+            if unicode == Some('=') {
+                self.expr_register_pending = Some((true, String::new()));
+                return;
+            }
             if let Some(reg_char) = unicode {
                 if let Some((content, _)) = self.get_register_content(reg_char) {
-                    let line = self.view().cursor.line;
-                    let col = self.view().cursor.col;
-                    // The register is inserted "as if typed" (`:h i_CTRL-R`)
-                    // — an embedded <Tab> still goes through 'expandtab'
-                    // (#804, "C-r with tab in register").
-                    let content_clone = self.expand_tabs_for_insert(&content, col);
-                    let char_idx = self.buffer().line_to_char(line) + col;
-                    self.insert_with_undo(char_idx, &content_clone);
-                    // A linewise register's content ends with `\n`, so the
-                    // inserted text spans multiple lines — advance the
-                    // cursor line-by-line instead of just adding the raw
-                    // character count to the current column (#804, "C-r
-                    // register linewise mid line").
-                    let lines: Vec<&str> = content_clone.split('\n').collect();
-                    if lines.len() > 1 {
-                        self.view_mut().cursor.line = line + lines.len() - 1;
-                        self.view_mut().cursor.col = lines.last().map_or(0, |l| l.chars().count());
-                    } else {
-                        self.view_mut().cursor.col = col + content_clone.chars().count();
-                    }
+                    self.insert_register_content_at_cursor(&content);
                     *changed = true;
                 }
             }
@@ -7361,7 +7590,9 @@ impl Engine {
         // Handle multi-key sequences (gg, {, }, text objects, register selection)
         if let Some(pending) = self.pending_key.take() {
             if pending == '"' {
-                // Register selection: "x (uppercase A-Z appends to lowercase)
+                // Register selection: "x (uppercase A-Z appends to lowercase).
+                // See the Normal-mode `'"'` arm for the full register-name
+                // rationale (#806).
                 if let Some(ch) = unicode {
                     if ch.is_ascii_lowercase()
                         || ch.is_ascii_uppercase()
@@ -7369,6 +7600,12 @@ impl Engine {
                         || ch == '"'
                         || ch == '+'
                         || ch == '*'
+                        || ch == '_'
+                        || ch == '.'
+                        || ch == '/'
+                        || ch == '%'
+                        || ch == ':'
+                        || ch == '-'
                     {
                         self.selected_register = Some(ch);
                     }
@@ -7517,13 +7754,23 @@ impl Engine {
             Some('j') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_down();
+                    if !self.move_down() {
+                        // Already at the last line: a macro/`:normal` playing
+                        // this back must stop here (#806, "mac:recursive" —
+                        // this is what makes a self-referential macro
+                        // terminate at EOF instead of spinning forever).
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('k') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_up();
+                    if !self.move_up() {
+                        self.command_failed = true;
+                        break;
+                    }
                 }
             }
             Some('l') => {

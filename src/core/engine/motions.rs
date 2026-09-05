@@ -1258,7 +1258,7 @@ impl Engine {
 
         if !is_linewise {
             // For characterwise, just paste normally
-            self.paste_after(changed);
+            self.paste_after(1, changed);
             return;
         }
 
@@ -1301,7 +1301,7 @@ impl Engine {
         };
 
         if !is_linewise {
-            self.paste_before(changed);
+            self.paste_before(1, changed);
             return;
         }
 
@@ -2129,7 +2129,34 @@ impl Engine {
             pos -= 1;
         }
 
-        let open_pos = open_pos?;
+        // Cursor isn't inside/on a bracket pair: Vim still finds `i(`/`a(`
+        // etc. by scanning forward on the current line for the next opening
+        // bracket, the same fallback `%` uses (`:h ib`; #806, "mac:macro
+        // with ci(" — cursor started on `f` before `f(a)`'s paren).
+        let open_pos = match open_pos {
+            Some(p) => p,
+            None => {
+                let line = self.buffer().content.char_to_line(cursor_pos);
+                let line_start = self.buffer().line_to_char(line);
+                let line_len = self.buffer().line_len_chars(line);
+                let mut found = None;
+                for i in (cursor_pos - line_start)..line_len {
+                    let pos = line_start + i;
+                    if pos >= total_chars {
+                        break;
+                    }
+                    let ch = self.buffer().content.char(pos);
+                    if ch == '\n' {
+                        break;
+                    }
+                    if ch == open_char {
+                        found = Some(pos);
+                        break;
+                    }
+                }
+                found?
+            }
+        };
 
         // Find matching closing bracket
         let close_pos = self.find_matching_bracket(open_pos, open_char, close_char, true)?;
@@ -3163,12 +3190,15 @@ impl Engine {
         }
     }
 
-    pub(crate) fn move_down(&mut self) {
+    /// Returns `false` when already on the last visible line (no-op) — used
+    /// by the `j` handler to detect a failed move for macro-abort purposes
+    /// (#806).
+    pub(crate) fn move_down(&mut self) -> bool {
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let mut next = self.view().cursor.line;
         loop {
             if next >= max_line {
-                return;
+                return false;
             }
             next += 1;
             if !self.view().is_line_hidden(next) {
@@ -3178,13 +3208,15 @@ impl Engine {
         let want = self.curswant();
         self.view_mut().cursor.line = next;
         self.apply_curswant(want);
+        true
     }
 
-    pub(crate) fn move_up(&mut self) {
+    /// Returns `false` when already on the first visible line (no-op) — see `move_down`.
+    pub(crate) fn move_up(&mut self) -> bool {
         let mut prev = self.view().cursor.line;
         loop {
             if prev == 0 {
-                return;
+                return false;
             }
             prev -= 1;
             if !self.view().is_line_hidden(prev) {
@@ -3194,6 +3226,7 @@ impl Engine {
         let want = self.curswant();
         self.view_mut().cursor.line = prev;
         self.apply_curswant(want);
+        true
     }
 
     /// The column a vertical motion should aim for: the remembered
@@ -4145,6 +4178,14 @@ impl Engine {
     /// Sets a register's content. `is_linewise` affects paste behavior.
     /// For `+` and `*` registers, also writes to the system clipboard.
     pub(crate) fn set_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        // `"_` is the black hole register (`:h quote_`): writes to it vanish
+        // entirely — crucially, they do NOT fall through to the unnamed
+        // register the way every other named register does below. This is
+        // what makes `"_dd` (or `viw"_dP`, `:d _`) leave `""`/`"1`-`"9`
+        // untouched instead of clobbering them (#806).
+        if reg == '_' {
+            return;
+        }
         // Uppercase register (A-Z): append to lowercase register
         if reg.is_ascii_uppercase() {
             let lower = reg.to_ascii_lowercase();
@@ -4153,10 +4194,19 @@ impl Engine {
             let combined = if existing.is_empty() {
                 content.clone()
             } else if existing_lw {
-                // Linewise: just concatenate (existing already ends with \n)
+                // Existing is linewise: already ends with '\n', just concatenate.
                 format!("{}{}", existing, content)
-            } else {
+            } else if is_linewise {
+                // Charwise existing + linewise append: the result becomes
+                // linewise, so it needs the line break the append itself
+                // doesn't carry yet.
                 format!("{}\n{}", existing, content)
+            } else {
+                // Charwise + charwise: appending is plain concatenation, no
+                // separator (`:h quote_alpha`) — a `\n` here was corrupting
+                // `"Ayw` appends with a line break neither piece had (#806,
+                // `reg:"ayw "Ayw "ap`).
+                format!("{}{}", existing, content)
             };
             self.registers
                 .insert(lower, (combined.clone(), combined_lw));
@@ -4199,8 +4249,40 @@ impl Engine {
     /// - Linewise / multi-line: shifts "1"-"8" → "2"-"9", sets "1".
     /// - Character (< 1 line): sets "-" (small-delete register).
     pub(crate) fn set_delete_register(&mut self, reg: char, content: String, is_linewise: bool) {
+        self.set_delete_register_impl(reg, content, is_linewise, false);
+    }
+
+    /// Like [`set_delete_register`], but always goes through the numbered
+    /// `"1"`-`"9"` chain even when the deleted text is less than one line.
+    /// Real Vim carves out this exception specifically for deletes made with
+    /// `%`, `` ` ``, `/`, `?`, `n`, `N`, `(`, `)`, `{`, `}` — motions that
+    /// aren't "smaller than a line" deletes even when their result happens to
+    /// be (`:h quotedash`: "This does not happen for the delete operator
+    /// with a few specific motions, or a specific register was used with the
+    /// delete."). Ordinary char motions (`dw`, `x`, `dl`, …) still use the
+    /// small-delete `"-` register via `set_delete_register` (#806).
+    pub(crate) fn set_delete_register_special_motion(
+        &mut self,
+        reg: char,
+        content: String,
+        is_linewise: bool,
+    ) {
+        self.set_delete_register_impl(reg, content, is_linewise, true);
+    }
+
+    fn set_delete_register_impl(
+        &mut self,
+        reg: char,
+        content: String,
+        is_linewise: bool,
+        force_numbered: bool,
+    ) {
         self.set_register(reg, content.clone(), is_linewise);
-        if is_linewise || content.contains('\n') {
+        // Black hole: no register bookkeeping of any kind (see `set_register`).
+        if reg == '_' {
+            return;
+        }
+        if is_linewise || content.contains('\n') || force_numbered {
             // Multi-line delete: shift numbered registers down
             for i in (1usize..=8).rev() {
                 let from = char::from_digit(i as u32, 10).unwrap();
@@ -4210,8 +4292,13 @@ impl Engine {
                 }
             }
             self.registers.insert('1', (content, is_linewise));
-        } else if !content.is_empty() {
-            // Small character delete: set "-" register
+        } else if !content.is_empty() && reg == '"' {
+            // Small character delete: set "-" register — but only for an
+            // unnamed delete. An explicit register (`"adw`) does NOT also
+            // touch "- (#806, `reg:"adw does not set "-`), even though a
+            // multi-line/linewise explicit-register delete DOES still touch
+            // "1-"9 above (verified against real Vim: `"add` sets both "a
+            // and "1; `"bdw` sets only "b, leaving "- untouched).
             self.registers.insert('-', (content, false));
         }
     }
@@ -4259,6 +4346,20 @@ impl Engine {
     /// Clears the selected register after an operation.
     pub(crate) fn clear_selected_register(&mut self) {
         self.selected_register = None;
+    }
+
+    /// Evaluate the text typed into the `"=`/`<C-r>=` expression register and
+    /// return its result formatted as it would be inserted/pasted, or an
+    /// error message.
+    ///
+    /// Real Vim runs the full Vimscript expression evaluator here. VimCode
+    /// doesn't embed one, so this covers only integer arithmetic (`+ - * /
+    /// %`, unary minus, parens) — enough for the "do a little math and paste
+    /// the answer" idiom the register exists for (#806). Anything fancier
+    /// (string concatenation, function calls, variables) reports an error
+    /// rather than silently doing the wrong thing.
+    pub(crate) fn eval_expr_register(src: &str) -> Result<String, String> {
+        eval_expr_register_arith(src).map(|n| n.to_string())
     }
 
     /// Records a yank highlight region for brief visual feedback.
@@ -4321,7 +4422,18 @@ impl Engine {
     pub(crate) fn start_macro_recording(&mut self, register: char) {
         self.macro_recording = Some(register);
         self.recording_buffer.clear();
+        self.macro_recording_append = false;
         self.message = format!("Recording macro into register '{}'", register);
+    }
+
+    /// Start recording a macro that appends to `register`'s existing content
+    /// instead of overwriting it (`qA` — `register` is already the lowercase
+    /// target, #806 "mac:qA append").
+    pub(crate) fn start_macro_recording_append(&mut self, register: char) {
+        self.macro_recording = Some(register);
+        self.recording_buffer.clear();
+        self.macro_recording_append = true;
+        self.message = format!("Recording macro into register '{}' (appending)", register);
     }
 
     /// Stop recording and save the macro to the register.
@@ -4330,12 +4442,20 @@ impl Engine {
             // Convert recording_buffer to string
             let macro_content: String = self.recording_buffer.iter().collect();
 
-            // Store in register (not linewise)
-            self.set_register(reg, macro_content, false);
+            // Store in register (not linewise). `set_register`'s uppercase
+            // form does a plain charwise concat onto the existing lowercase
+            // content — exactly `qA`'s append semantics — so route through
+            // that instead of duplicating the combine logic here.
+            if self.macro_recording_append {
+                self.set_register(reg.to_ascii_uppercase(), macro_content, false);
+            } else {
+                self.set_register(reg, macro_content, false);
+            }
 
             self.message = format!("Macro recorded into register '{}'", reg);
             self.macro_recording = None;
             self.recording_buffer.clear();
+            self.macro_recording_append = false;
         }
     }
 
@@ -4517,7 +4637,15 @@ impl Engine {
     }
 
     /// Paste after cursor (p). Linewise pastes below current line.
-    pub fn paste_after(&mut self, changed: &mut bool) {
+    ///
+    /// `count` repeats the *whole register content* `count` times as a single
+    /// paste (`:h p`) — NOT `count` separate paste operations. The two differ
+    /// for a multi-line register: `2yy3p` must produce three back-to-back
+    /// copies of the two yanked lines, not each yanked line tripled in place
+    /// (the latter is what calling this function in a loop produces, since
+    /// each call re-pastes after wherever the *previous* call's cursor
+    /// landed — #806, "misc:2yy 3p").
+    pub fn paste_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
         let (content, is_linewise) = match self.get_register_content(reg) {
             Some(pair) => pair,
@@ -4525,6 +4653,11 @@ impl Engine {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -4570,7 +4703,8 @@ impl Engine {
     }
 
     /// Paste before cursor (P). Linewise pastes above current line.
-    pub(crate) fn paste_before(&mut self, changed: &mut bool) {
+    /// `count` repeats the register content as a single block — see `paste_after`.
+    pub(crate) fn paste_before(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
         let (content, is_linewise) = match self.get_register_content(reg) {
             Some(pair) => pair,
@@ -4578,6 +4712,11 @@ impl Engine {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -4608,7 +4747,8 @@ impl Engine {
     }
 
     /// Paste after cursor, leave cursor after pasted text (gp).
-    pub(crate) fn paste_after_cursor_after(&mut self, changed: &mut bool) {
+    /// `count` repeats the register content as a single block — see `paste_after`.
+    pub(crate) fn paste_after_cursor_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
         let (content, is_linewise) = match self.get_register_content(reg) {
             Some(pair) => pair,
@@ -4616,6 +4756,11 @@ impl Engine {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -4669,7 +4814,8 @@ impl Engine {
     }
 
     /// Paste before cursor, leave cursor after pasted text (gP).
-    pub(crate) fn paste_before_cursor_after(&mut self, changed: &mut bool) {
+    /// `count` repeats the register content as a single block — see `paste_after`.
+    pub(crate) fn paste_before_cursor_after(&mut self, count: usize, changed: &mut bool) {
         let reg = self.active_register();
         let (content, is_linewise) = match self.get_register_content(reg) {
             Some(pair) => pair,
@@ -4677,6 +4823,11 @@ impl Engine {
                 self.clear_selected_register();
                 return;
             }
+        };
+        let content = if count > 1 {
+            content.repeat(count)
+        } else {
+            content
         };
 
         self.start_undo_group();
@@ -5207,16 +5358,36 @@ impl Engine {
 
             // Delete: newline + leading whitespace of next line
             let del_end = next_line_start + leading_ws;
-            self.delete_with_undo(newline_pos, del_end);
 
             // Insert a space unless the next non-ws char is ')' or next line was empty/only ws.
             // Also don't add space if the current line already ends with whitespace.
             let should_add_space = !matches!(next_non_ws, None | Some(')') | Some(']') | Some('}'));
             let ends_with_ws = newline_pos > cur_line_start
                 && self.buffer().content.char(newline_pos - 1).is_whitespace();
+            let insert_space = should_add_space && !ends_with_ws;
 
-            if should_add_space && !ends_with_ws {
+            // A join needs the absorbed line's marks to gain a *column*
+            // offset (not just shift down a line, which is all the generic
+            // `delete_with_undo`/`insert_with_undo` hook does) — precise
+            // offset-based fixup, done by hand around the raw splice
+            // (#806, "mark:`a after line join").
+            let (local_marks, global_marks) = self.snapshot_marks_as_offsets();
+            self.suppress_mark_line_adjust = true;
+            self.delete_with_undo(newline_pos, del_end);
+            if insert_space {
                 self.insert_with_undo(newline_pos, " ");
+            }
+            self.suppress_mark_line_adjust = false;
+            let ins_len = if insert_space { 1 } else { 0 };
+            self.restore_marks_from_offsets(
+                local_marks,
+                global_marks,
+                newline_pos,
+                del_end - newline_pos,
+                ins_len,
+            );
+
+            if insert_space {
                 // Cursor at the inserted space
                 join_col = newline_pos - cur_line_start;
             } else {
@@ -5282,7 +5453,7 @@ impl Engine {
 
     /// Build a `JumpEntry` snapshot of the engine's current cursor position
     /// and the pane (group/tab/window) it's in.
-    fn current_jump_entry(&self) -> JumpEntry {
+    pub(crate) fn current_jump_entry(&self) -> JumpEntry {
         JumpEntry {
             file: self.active_buffer_state().file_path.clone(),
             line: self.view().cursor.line,
@@ -5293,13 +5464,22 @@ impl Engine {
         }
     }
 
-    /// Push the current cursor position onto the jump list.
+    /// Push the current cursor position onto the jump list, and set it as
+    /// the `''`/`` `` `` mark (pcmark).
     pub fn push_jump_location(&mut self) {
         // Save pre-jump position for '' / `` marks
         let line = self.view().cursor.line;
         let col = self.view().cursor.col;
         self.last_jump_pos = Some((line, col));
+        self.append_jump_list_entry();
+    }
 
+    /// The jumplist-only half of `push_jump_location` — appends the current
+    /// cursor position, deduped against the top entry and truncating any
+    /// forward (redo) history. Split out so `record_jump_from` can update
+    /// the `''` mark unconditionally while only conditionally touching the
+    /// persistent list (#806).
+    fn append_jump_list_entry(&mut self) {
         let entry = self.current_jump_entry();
 
         // Truncate forward history when a new jump is made
@@ -5322,8 +5502,52 @@ impl Engine {
         self.jump_list_pos = self.jump_list.len();
     }
 
+    /// Lazily seed the jumplist with the startup position the first time
+    /// `<C-o>` is asked to go somewhere and the list is otherwise empty.
+    /// Real Neovim behaves this way for line-changing-but-not-jump-worthy
+    /// motions (`j`/`k`, even `20j`): `getjumplist()` reports empty right
+    /// after such a motion, yet a bare `<C-o>` still returns to the
+    /// position editing started at — but ONLY once the cursor has actually
+    /// left that starting *line*; a same-line motion (`%` on a one-line
+    /// match, `(` within a sentence) leaves `<C-o>` a genuine no-op (#806:
+    /// "jump:C-o after j 20 lines" needs the seed, "jump:% C-o" / "jump:C-o
+    /// after (" must NOT get one). Checking "has the line changed" here,
+    /// right before the fallback would otherwise report "already at
+    /// oldest", reproduces both without a real jump command ever having to
+    /// decide it retroactively.
+    fn seed_jump_list_if_line_left(&mut self) {
+        if !self.jump_list.is_empty() {
+            return;
+        }
+        if let Some(entry) = &self.startup_jump_entry {
+            if entry.line != self.view().cursor.line {
+                self.jump_list.push(entry.clone());
+                self.jump_list_pos = self.jump_list.len();
+            }
+        }
+    }
+
+    /// Record a jump that started at `pre_cursor` (cursor has already moved
+    /// to its destination by the time this is called). Always updates the
+    /// `''`/`` `` `` pcmark, but only appends a *persistent jumplist* entry
+    /// when the move actually changed line. Verified against real Neovim: a
+    /// same-line `%`/`(`/`)` still moves the pcmark (`` `` `` returns to the
+    /// exact starting column) even though `getjumplist()` stays untouched
+    /// (#806, "mark:`` after %" vs "jump:% C-o").
+    pub(crate) fn record_jump_from(&mut self, pre_cursor: Cursor) {
+        self.last_jump_pos = Some((pre_cursor.line, pre_cursor.col));
+        if self.view().cursor.line == pre_cursor.line {
+            return;
+        }
+        let post_cursor = self.view().cursor;
+        self.view_mut().cursor = pre_cursor;
+        self.append_jump_list_entry();
+        self.view_mut().cursor = post_cursor;
+    }
+
     /// Navigate backward in the jump list (Ctrl-O).
     pub fn jump_list_back(&mut self) {
+        self.seed_jump_list_if_line_left();
         // When at the "live" end (not stored in list), save current position
         // so Ctrl-I can return to it, then jump to the previous entry.
         if self.jump_list_pos == self.jump_list.len() {
@@ -5484,6 +5708,13 @@ impl Engine {
             self.insert_with_undo(line_start, &new_indent);
         }
         self.finish_undo_group();
+        // `'[`/`` `[ `` and `']`/`` `] `` after a shift command (#806, "mark:'[
+        // after >>"). Narrower than real Vim's `[`/`]` (which track every
+        // change/yank/paste — see `last_change_start`'s doc comment).
+        self.last_change_start = Some((start_line, 0));
+        let end_line = (start_line + count.saturating_sub(1)).min(total.saturating_sub(1));
+        let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
+        self.last_change_end = Some((end_line, end_col));
         *changed = true;
     }
 
@@ -5566,6 +5797,127 @@ impl Engine {
         self.finish_undo_group();
         if count > 0 {
             *changed = true;
+            // See `indent_lines`'s matching comment (#806, "mark:'[ after >>").
+            self.last_change_start = Some((start_line, 0));
+            let end_line = (start_line + count.saturating_sub(1)).min(total.saturating_sub(1));
+            let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
+            self.last_change_end = Some((end_line, end_col));
         }
     }
+}
+
+/// Minimal recursive-descent integer arithmetic parser backing
+/// [`Engine::eval_expr_register`] — `:h expr-register`, scoped down to
+/// `+ - * / %`, unary minus, and parens (#806). `/` and `%` truncate toward
+/// zero, matching Vimscript integer division.
+fn eval_expr_register_arith(src: &str) -> Result<i64, String> {
+    struct Parser<'a> {
+        chars: std::iter::Peekable<std::str::Chars<'a>>,
+    }
+
+    impl Parser<'_> {
+        fn skip_ws(&mut self) {
+            while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
+                self.chars.next();
+            }
+        }
+
+        fn expr(&mut self) -> Result<i64, String> {
+            let mut val = self.term()?;
+            loop {
+                self.skip_ws();
+                match self.chars.peek() {
+                    Some('+') => {
+                        self.chars.next();
+                        val += self.term()?;
+                    }
+                    Some('-') => {
+                        self.chars.next();
+                        val -= self.term()?;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(val)
+        }
+
+        fn term(&mut self) -> Result<i64, String> {
+            let mut val = self.unary()?;
+            loop {
+                self.skip_ws();
+                match self.chars.peek() {
+                    Some('*') => {
+                        self.chars.next();
+                        val *= self.unary()?;
+                    }
+                    Some('/') => {
+                        self.chars.next();
+                        let rhs = self.unary()?;
+                        if rhs == 0 {
+                            return Err("divide by zero".to_string());
+                        }
+                        val /= rhs;
+                    }
+                    Some('%') => {
+                        self.chars.next();
+                        let rhs = self.unary()?;
+                        if rhs == 0 {
+                            return Err("divide by zero".to_string());
+                        }
+                        val %= rhs;
+                    }
+                    _ => break,
+                }
+            }
+            Ok(val)
+        }
+
+        fn unary(&mut self) -> Result<i64, String> {
+            self.skip_ws();
+            match self.chars.peek() {
+                Some('-') => {
+                    self.chars.next();
+                    Ok(-self.unary()?)
+                }
+                Some('+') => {
+                    self.chars.next();
+                    self.unary()
+                }
+                _ => self.atom(),
+            }
+        }
+
+        fn atom(&mut self) -> Result<i64, String> {
+            self.skip_ws();
+            if let Some('(') = self.chars.peek() {
+                self.chars.next();
+                let val = self.expr()?;
+                self.skip_ws();
+                if self.chars.peek() == Some(&')') {
+                    self.chars.next();
+                } else {
+                    return Err("expected ')'".to_string());
+                }
+                return Ok(val);
+            }
+            let mut digits = String::new();
+            while matches!(self.chars.peek(), Some(c) if c.is_ascii_digit()) {
+                digits.push(self.chars.next().unwrap());
+            }
+            if digits.is_empty() {
+                return Err("expected a number".to_string());
+            }
+            digits.parse::<i64>().map_err(|e| e.to_string())
+        }
+    }
+
+    let mut parser = Parser {
+        chars: src.chars().peekable(),
+    };
+    let val = parser.expr()?;
+    parser.skip_ws();
+    if parser.chars.peek().is_some() {
+        return Err("trailing characters in expression".to_string());
+    }
+    Ok(val)
 }

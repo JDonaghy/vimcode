@@ -1411,7 +1411,7 @@ impl Engine {
                             if !text.is_empty() {
                                 self.registers.insert('"', (text, false));
                                 let mut changed = false;
-                                self.paste_after(&mut changed);
+                                self.paste_after(1, &mut changed);
                             }
                         }
                     }

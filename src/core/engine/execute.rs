@@ -4072,14 +4072,17 @@ impl Engine {
             self.view_mut().cursor.line = start;
             self.view_mut().cursor.col = 0;
             let mut changed = false;
+            // Route the register through `delete_lines`'s own
+            // `set_delete_register` (via `active_register`) instead of
+            // deleting into the unnamed register and copying afterward —
+            // the copy step can't express "don't write anywhere", so `:d _`
+            // was clobbering "" like a plain `:d` (#806, "ex:d _").
+            if let Some(r) = reg {
+                self.selected_register = Some(r);
+            }
             self.start_undo_group();
             self.delete_lines(end - start + 1, &mut changed);
             self.finish_undo_group();
-            if let Some(r) = reg {
-                if let Some(v) = self.registers.get(&'"').cloned() {
-                    self.registers.insert(r, v);
-                }
-            }
             let line = self.view().cursor.line;
             self.view_mut().cursor.col = self.first_non_blank_col(line);
             self.clamp_cursor_col();
@@ -4091,12 +4094,10 @@ impl Engine {
             let (start, end) = self.range_with_count(range, count, last_line);
             let saved = self.view().cursor;
             self.view_mut().cursor.line = start;
-            self.yank_lines(end - start + 1);
             if let Some(r) = reg {
-                if let Some(v) = self.registers.get(&'"').cloned() {
-                    self.registers.insert(r, v);
-                }
+                self.selected_register = Some(r);
             }
+            self.yank_lines(end - start + 1);
             self.view_mut().cursor = saved;
             return Some(EngineAction::None);
         }
@@ -4389,7 +4390,12 @@ pub(crate) fn parse_reg_and_count(args: &str) -> Option<(Option<char>, Option<us
                 return None;
             }
             count = Some(n);
-        } else if tok.chars().count() == 1 && tok.chars().next()?.is_ascii_alphabetic() {
+        } else if tok.chars().count() == 1
+            && tok
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
             reg = Some(tok.chars().next()?);
         } else {
             return None;
