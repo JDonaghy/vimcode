@@ -5,6 +5,64 @@ impl Engine {
     // Visual mode helpers
     // =======================================================================
 
+    /// Length of `line` in characters, **excluding** its trailing newline.
+    ///
+    /// `Rope::line()` includes the `\n`, and every Visual-Block site used to
+    /// count it — which made the block one column too wide at end-of-line and
+    /// made a genuinely-empty short line look one char long (#807).
+    pub(crate) fn line_text_len(&self, line: usize) -> usize {
+        let raw = self.buffer().line_len_chars(line);
+        if raw > 0
+            && self
+                .buffer()
+                .content
+                .line(line)
+                .chars()
+                .last()
+                .map(|c| c == '\n')
+                .unwrap_or(false)
+        {
+            raw - 1
+        } else {
+            raw
+        }
+    }
+
+    /// Inclusive `(start_col, end_col)` of the active Visual-Block selection.
+    ///
+    /// `end_col` is [`usize::MAX`] when `$` extended the block to end-of-line,
+    /// so callers must clamp per line. The moving edge follows
+    /// `visual_block_want` (Vim's `curswant`), not the cursor's clamped
+    /// column — see that field's docs (#807).
+    pub(crate) fn visual_block_cols(&self) -> (usize, usize) {
+        let cursor = self.view().cursor;
+        let anchor = self.visual_anchor.unwrap_or(cursor);
+        if self.visual_dollar {
+            return (anchor.col.min(cursor.col), usize::MAX);
+        }
+        let want = match self.visual_block_want {
+            Some(w) if w != CURSWANT_EOL => w.max(cursor.col),
+            _ => cursor.col,
+        };
+        (anchor.col.min(want), anchor.col.max(want))
+    }
+
+    /// Half-open `[lo, hi)` char range of the block on `line`, or `None` when
+    /// the line is too short to reach the block at all.
+    pub(crate) fn visual_block_span(&self, line: usize) -> Option<(usize, usize)> {
+        let (start_col, end_col) = self.visual_block_cols();
+        let len = self.line_text_len(line);
+        if start_col >= len {
+            return None;
+        }
+        let hi = if end_col == usize::MAX {
+            len
+        } else {
+            (end_col + 1).min(len)
+        };
+        Some((start_col, hi))
+    }
+
     /// Get normalized visual selection range (start, end).
     /// Start is always before or equal to end.
     pub(crate) fn get_visual_selection_range(&self) -> Option<(Cursor, Cursor)> {
@@ -24,8 +82,9 @@ impl Engine {
     }
 
     /// Extract the text from the visual selection.
-    /// Returns (text, is_linewise).
-    pub(crate) fn get_visual_selection_text(&self) -> Option<(String, bool)> {
+    /// Returns `(text, register type)` — Visual-Block yields
+    /// [`RegType::Blockwise`] so a later `p`/`P` re-inserts a rectangle (#807).
+    pub(crate) fn get_visual_selection_text(&self) -> Option<(String, RegType)> {
         let (start, end) = self.get_visual_selection_range()?;
 
         match self.mode {
@@ -52,7 +111,7 @@ impl Engine {
                     format!("{}\n", text)
                 };
 
-                Some((text, true))
+                Some((text, RegType::Linewise))
             }
             Mode::Visual => {
                 // Character mode: extract from start to end (inclusive)
@@ -73,40 +132,27 @@ impl Engine {
                     .slice(start_char..end_char_inclusive)
                     .to_string();
 
-                Some((text, false))
+                Some((text, RegType::Charwise))
             }
             Mode::VisualBlock => {
-                // Block mode: extract rectangular region
-                // Use anchor and cursor columns directly for block selection
-                let anchor = self.visual_anchor?;
-                let cursor = self.view().cursor;
-                let start_col = anchor.col.min(cursor.col);
-                let end_col = anchor.col.max(cursor.col);
-
                 let mut lines = Vec::new();
-
                 for line_idx in start.line..=end.line {
-                    if let Some(line) = self.buffer().content.lines().nth(line_idx) {
-                        let line_str = line.to_string();
-                        let line_chars: Vec<char> = line_str.chars().collect();
-
-                        // Extract the block portion of this line
-                        let block_start = start_col.min(line_chars.len());
-                        let block_end = (end_col + 1).min(line_chars.len());
-
-                        let block_text: String = if block_start < line_chars.len() {
-                            line_chars[block_start..block_end].iter().collect()
-                        } else {
-                            // Line is too short, just use empty string
-                            String::new()
-                        };
-
-                        lines.push(block_text);
-                    }
+                    let block_text: String = match self.visual_block_span(line_idx) {
+                        Some((lo, hi)) => {
+                            let base = self.buffer().line_to_char(line_idx);
+                            self.buffer()
+                                .content
+                                .slice(base + lo..base + hi)
+                                .to_string()
+                        }
+                        // Line too short to reach the block: an empty row, not
+                        // a skipped one — the rectangle keeps its height.
+                        None => String::new(),
+                    };
+                    lines.push(block_text);
                 }
-
                 let text = lines.join("\n");
-                Some((text, false))
+                Some((text, RegType::Blockwise))
             }
             _ => None,
         }
@@ -119,13 +165,16 @@ impl Engine {
             (start, end, is_linewise)
         });
 
-        if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+        if let Some((text, ty)) = self.get_visual_selection_text() {
             // Store in selected register (or unnamed register)
             let reg = self.selected_register.unwrap_or('"');
-            self.set_yank_register(reg, text, is_linewise);
+            self.set_yank_register_typed(reg, text, ty);
 
             self.selected_register = None;
-            self.message = format!("{} yanked", if is_linewise { "Line(s)" } else { "Text" });
+            self.message = format!(
+                "{} yanked",
+                if ty.is_linewise() { "Line(s)" } else { "Text" }
+            );
 
             if let Some((start, end, lw)) = hl_region {
                 self.record_yank_highlight(start, end, lw);
@@ -150,10 +199,10 @@ impl Engine {
     }
 
     pub fn delete_visual_selection(&mut self, changed: &mut bool) {
-        if let Some((text, is_linewise)) = self.get_visual_selection_text() {
+        if let Some((text, ty)) = self.get_visual_selection_text() {
             // Store in register
             let reg = self.selected_register.unwrap_or('"');
-            self.set_delete_register(reg, text, is_linewise);
+            self.set_delete_register_typed(reg, text, ty);
             self.selected_register = None;
 
             // Delete the selection
@@ -195,25 +244,11 @@ impl Engine {
                 }
                 Mode::VisualBlock => {
                     // Delete rectangular block (work backwards to avoid offset issues)
-                    // Use anchor and cursor columns directly for block selection
-                    let anchor = self.visual_anchor.unwrap();
-                    let cursor = self.view().cursor;
-                    let start_col = anchor.col.min(cursor.col);
-                    let end_col = anchor.col.max(cursor.col);
-
+                    let (start_col, _) = self.visual_block_cols();
                     for line_idx in (start.line..=end.line).rev() {
-                        let line_start_char = self.buffer().line_to_char(line_idx);
-                        if let Some(line) = self.buffer().content.lines().nth(line_idx) {
-                            let line_str = line.to_string();
-                            let line_len = line_str.chars().count();
-
-                            // Only delete if the line is long enough to have characters in the block
-                            if start_col < line_len {
-                                let block_end = (end_col + 1).min(line_len);
-                                let del_start = line_start_char + start_col;
-                                let del_end = line_start_char + block_end;
-                                self.delete_with_undo(del_start, del_end);
-                            }
+                        if let Some((lo, hi)) = self.visual_block_span(line_idx) {
+                            let base = self.buffer().line_to_char(line_idx);
+                            self.delete_with_undo(base + lo, base + hi);
                         }
                     }
 
@@ -240,7 +275,7 @@ impl Engine {
     pub(crate) fn paste_visual_selection(&mut self, changed: &mut bool) {
         // 1. Read the register content BEFORE deleting (delete overwrites unnamed reg)
         let paste_reg = self.active_register();
-        let (paste_content, paste_linewise) = match self.get_register_content(paste_reg) {
+        let (paste_content, paste_type) = match self.get_register_content(paste_reg) {
             Some(pair) => pair,
             None => {
                 self.clear_selected_register();
@@ -249,6 +284,8 @@ impl Engine {
                 return;
             }
         };
+
+        let paste_linewise = paste_type.is_linewise();
 
         // 2. Get the selection text and range before deleting
         let sel_linewise = matches!(self.mode, Mode::VisualLine);
@@ -263,6 +300,17 @@ impl Engine {
         } else {
             return;
         };
+
+        if paste_type.is_blockwise() {
+            // A blockwise register replaces the selection with a rectangle
+            // anchored at the selection's own start column (#807,
+            // `vb:jjp block over block`).
+            self.view_mut().cursor.line = start.line;
+            self.view_mut().cursor.col = start.col;
+            self.paste_blockwise(&paste_content, 1, false, changed);
+            self.clamp_cursor_col();
+            return;
+        }
 
         self.start_undo_group();
 
@@ -442,29 +490,18 @@ impl Engine {
             }
             Mode::VisualBlock => {
                 // Transform rectangular block (work backwards to maintain positions)
-                let anchor = self.visual_anchor.unwrap();
-                let cursor = self.view().cursor;
-                let start_col = anchor.col.min(cursor.col);
-                let end_col = anchor.col.max(cursor.col);
-
+                let (start_col, _) = self.visual_block_cols();
                 for line_idx in (start.line..=end.line).rev() {
-                    let line_start_char = self.buffer().line_to_char(line_idx);
-                    if let Some(line) = self.buffer().content.lines().nth(line_idx) {
-                        let line_str = line.to_string();
-                        let line_chars: Vec<char> = line_str.chars().collect();
-
-                        // Extract and transform the block portion
-                        if start_col < line_chars.len() {
-                            let block_end = (end_col + 1).min(line_chars.len());
-                            let block_text: String =
-                                line_chars[start_col..block_end].iter().collect();
-                            let transformed = transform(&block_text);
-
-                            let del_start = line_start_char + start_col;
-                            let del_end = line_start_char + block_end;
-                            self.delete_with_undo(del_start, del_end);
-                            self.insert_with_undo(del_start, &transformed);
-                        }
+                    if let Some((lo, hi)) = self.visual_block_span(line_idx) {
+                        let base = self.buffer().line_to_char(line_idx);
+                        let block_text = self
+                            .buffer()
+                            .content
+                            .slice(base + lo..base + hi)
+                            .to_string();
+                        let transformed = transform(&block_text);
+                        self.delete_with_undo(base + lo, base + hi);
+                        self.insert_with_undo(base + lo, &transformed);
                     }
                 }
 
@@ -498,10 +535,7 @@ impl Engine {
             return;
         };
         let mode = self.mode;
-        let anchor = self.visual_anchor.unwrap_or(start);
-        let cursor = self.view().cursor;
-        let block_start = anchor.col.min(cursor.col);
-        let block_end = anchor.col.max(cursor.col);
+        let (block_start, block_end) = self.visual_block_cols();
         let dollar = self.visual_dollar;
 
         self.mode = Mode::Normal;

@@ -33,6 +33,7 @@ impl Engine {
             self.mode,
             Mode::Normal | Mode::Visual | Mode::VisualLine | Mode::VisualBlock
         ) {
+            self.latch_visual_block_want();
             self.curswant = None;
             return;
         }
@@ -41,6 +42,7 @@ impl Engine {
             || self.pending_text_object.is_some()
             || self.pending_key.is_some()
         {
+            self.latch_visual_block_want();
             self.curswant = None;
             return;
         }
@@ -55,7 +57,21 @@ impl Engine {
                 return; // count digit in progress; cursor hasn't moved
             }
         }
+        self.latch_visual_block_want();
         self.curswant = None;
+    }
+
+    /// #807: copy the current wanted column into `visual_block_want` before
+    /// `curswant` is dropped, so a Visual-Block operator keystroke (`y`, `d`,
+    /// `I`, …) still knows which column the block's moving edge is on after
+    /// `j`/`k` clamped the cursor onto a shorter line.
+    fn latch_visual_block_want(&mut self) {
+        if self.mode == Mode::VisualBlock {
+            let col = self.view().cursor.col;
+            self.visual_block_want = Some(self.curswant.unwrap_or(col));
+        } else {
+            self.visual_block_want = None;
+        }
     }
 
     /// Process a key event and return an action the UI should perform.
@@ -680,7 +696,8 @@ impl Engine {
         match key_name {
             "Return" => match Engine::eval_expr_register(&buf) {
                 Ok(result) => {
-                    self.registers.insert('=', (result.clone(), false));
+                    self.registers
+                        .insert('=', (result.clone(), RegType::Charwise));
                     if from_insert {
                         self.insert_register_content_at_cursor(&result);
                     }
@@ -8937,8 +8954,8 @@ impl Engine {
         let existing_lw = self
             .registers
             .get(&'"')
-            .map(|(reg_content, lw)| {
-                if !*lw {
+            .map(|(reg_content, ty)| {
+                if !ty.is_linewise() {
                     return false;
                 }
                 // Compare without trailing \n — clipboard may strip it
@@ -8955,9 +8972,11 @@ impl Engine {
             text
         };
 
-        self.registers.insert('"', (text.clone(), existing_lw));
-        self.registers.insert('+', (text.clone(), false));
-        self.registers.insert('*', (text, false));
+        self.registers
+            .insert('"', (text.clone(), RegType::from_linewise(existing_lw)));
+        self.registers
+            .insert('+', (text.clone(), RegType::Charwise));
+        self.registers.insert('*', (text, RegType::Charwise));
     }
 
     /// Returns `true` if the upcoming key is a paste that needs system clipboard
@@ -8989,8 +9008,9 @@ impl Engine {
     pub fn prepare_paste_clipboard(&mut self, clipboard_text: Option<String>) {
         if let Some(text) = clipboard_text.filter(|t| !t.is_empty()) {
             if self.is_vscode_mode() {
-                self.registers.insert('+', (text.clone(), false));
-                self.registers.insert('"', (text, false));
+                self.registers
+                    .insert('+', (text.clone(), RegType::Charwise));
+                self.registers.insert('"', (text, RegType::Charwise));
             } else {
                 self.load_clipboard_for_paste(text);
             }

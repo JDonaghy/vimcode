@@ -61,7 +61,7 @@ pub mod quadraui_pin;
 // Convenience re-exports so integration tests can write `use vimcode_core::Engine` etc.
 pub use core::buffer::Buffer;
 pub use core::cursor::Cursor;
-pub use core::engine::{Engine, EngineAction};
+pub use core::engine::{Engine, EngineAction, RegType};
 pub use core::mode::Mode;
 pub use core::settings::Settings;
 pub use core::view::View;
