@@ -581,6 +581,242 @@ pub fn render_markdown(input: &str) -> MdRendered {
     }
 }
 
+// ─── Hover-popup markdown (quadraui-backed, #821) ────────────────────────────
+//
+// `render_markdown` above (and the `MdRendered`/`MdSpan`/`MdStyle` types it
+// returns) remain the engine's markdown pipeline for the editor-buffer inline
+// highlighter (`src/render.rs`'s `md_inline_spans` — compensates for no
+// tree-sitter markdown injection, out of scope for #821) and for markdown
+// *preview* buffers (`Engine::open_markdown_preview*`). Neither of those
+// consumes styled colour, so they stay on the local pulldown-cmark pipeline.
+//
+// The **hover-popup** path (`EditorHoverPopup` / `PanelHoverPopup`) instead
+// adopts `quadraui::compose::markdown::render_markdown_to_styled` — the
+// shared, cross-backend markdown renderer quadraui ships (quadraui#262) —
+// rather than hand-rolling the markdown-style-enum-to-color span walk vimcode
+// used to do in `render.rs` (`hover_line_to_styled_text`,
+// `markdown_rendered_to_quadraui_lines`, now removed). Structure (plain line
+// text, link ranges) is theme-independent, so it's computed once here, at
+// hover-show time; the *styled* spans (which need the live `render::Theme`,
+// not available in `core::`) are recomputed at paint time in `render.rs` from
+// the same markdown string.
+//
+// One real feature gap vs. the local `render_markdown`: quadraui's parser
+// only recognizes `[text](url)` links, not bare `http://`/`https://`
+// autolinks (verified against the pinned rev — see `linkify_bare_urls`
+// below, which is the compatibility shim for that gap; a proper upstream
+// fix should still be filed against quadraui). Tree-sitter code-block syntax
+// highlighting is also quadraui-agnostic by design (its own doc: "Tree-sitter-
+// capable callers opt into per-language highlighting" via the `code_blocks`
+// side-channel) — `hover_markdown_structure` below does exactly that,
+// reusing the same `MdCodeHighlight`/`Syntax` machinery `render_markdown`
+// uses for markdown-preview code blocks. Distinct heading colors
+// (`Theme::md_heading1/2/3`) are *not* preserved — quadraui renders every
+// heading level as bold + a larger `line_scales` factor, with no per-level
+// color; this is an accepted, documented divergence, not a bug.
+
+/// Wrap bare `http://` / `https://` URLs in `[url](url)` markdown link
+/// syntax so quadraui's `render_markdown_to_styled` (which only recognizes
+/// bracketed links) still makes them clickable. A URL immediately preceded
+/// by `(` is assumed to already be a link destination (`[text](url)`) and is
+/// left alone. Fenced code blocks are skipped entirely (their contents
+/// should never be rewritten). Adapted from `scan_bare_urls` above, which
+/// performs the equivalent scan for the local pulldown-cmark pipeline.
+pub fn linkify_bare_urls(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_code_block = false;
+    for (i, line) in input.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            out.push_str(line);
+            continue;
+        }
+        if in_code_block {
+            out.push_str(line);
+            continue;
+        }
+        linkify_bare_urls_in_line(line, &mut out);
+    }
+    out
+}
+
+fn linkify_bare_urls_in_line(line: &str, out: &mut String) {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        let scheme_len = if bytes[i..].starts_with(b"https://") {
+            Some(8usize)
+        } else if bytes[i..].starts_with(b"http://") {
+            Some(7usize)
+        } else {
+            None
+        };
+        let Some(scheme_len) = scheme_len else {
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        };
+        if i > 0 && bytes[i - 1] == b'(' {
+            // Already a markdown link destination — leave untouched.
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let start = i;
+        let mut j = i + scheme_len;
+        while j < len && !bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        while j > start + scheme_len {
+            match bytes[j - 1] {
+                b'.' | b',' | b')' => j -= 1,
+                _ => break,
+            }
+        }
+        let url = &line[start..j];
+        out.push('[');
+        out.push_str(url);
+        out.push_str("](");
+        out.push_str(url);
+        out.push(')');
+        i = j;
+    }
+}
+
+/// `(line_text, links, code_highlights)` — see [`hover_markdown_structure`]'s
+/// doc for what each element means.
+pub type HoverMarkdownStructure = (
+    Vec<String>,
+    Vec<(usize, usize, usize, String)>,
+    Vec<Vec<MdCodeHighlight>>,
+);
+
+/// The theme-independent half of hover-popup markdown rendering: plain
+/// per-line text, validated+dispatch-ready link ranges, and per-line
+/// tree-sitter code-block highlights. Computed once when a hover popup is
+/// shown (`Engine::show_editor_hover` / `show_panel_hover`); the styled
+/// (theme-colored) `quadraui::StyledText` spans are computed separately, at
+/// paint time, in `render.rs`.
+///
+/// `markdown` should already have been passed through [`linkify_bare_urls`].
+///
+/// Returns `(line_text, links, code_highlights)`:
+/// - `line_text[i]` — plain text of rendered line `i` (markdown syntax
+///   stripped), used for scroll-bound math, clipboard copy, and selection
+///   extraction.
+/// - `links` — `(line_idx, start_byte, end_byte, url)`, byte ranges into
+///   `line_text[line_idx]`; only `is_safe_url`-passing schemes are kept.
+/// - `code_highlights[i]` — tree-sitter highlight spans for fenced
+///   code-block line `i` (empty for non-code-block lines or unrecognized
+///   languages). Byte offsets are relative to that line's own code text
+///   (no code-rail prefix) — see `render.rs`'s `overlay_code_highlights`,
+///   which applies these directly to the *last* span of a code-block
+///   `StyledText` line (always the raw code span; the two before it are the
+///   code-rail indent + bar, per quadraui's `render_code_content`).
+pub fn hover_markdown_structure(markdown: &str) -> HoverMarkdownStructure {
+    let rendered = quadraui::compose::markdown::render_markdown_to_styled(
+        markdown,
+        &quadraui::Theme::default(),
+    );
+
+    let links = rendered
+        .links
+        .iter()
+        .filter_map(|(line_idx, range, url)| {
+            // Command URIs are never displayed in shortened ":Name?args" form
+            // by any current producer, but restore the prefix defensively —
+            // matches the pre-#821 `extract_hover_links` behaviour.
+            let url = match url.strip_prefix(':') {
+                Some(rest) => format!("command:{rest}"),
+                None => url.clone(),
+            };
+            crate::core::engine::is_safe_url(&url).then_some((
+                *line_idx,
+                range.start,
+                range.end,
+                url,
+            ))
+        })
+        .collect();
+
+    let code_highlights = hover_code_highlights(&rendered);
+
+    (rendered.line_text, links, code_highlights)
+}
+
+/// Tree-sitter-highlight every fenced code block in `rendered` (via
+/// `rendered.code_blocks`), producing per-line highlight spans keyed to each
+/// code-content line's *own* raw text (i.e. the last span of that line's
+/// `StyledText` — see `hover_markdown_structure`'s doc).
+fn hover_code_highlights(
+    rendered: &quadraui::compose::markdown::RenderedMarkdown,
+) -> Vec<Vec<MdCodeHighlight>> {
+    let mut out: Vec<Vec<MdCodeHighlight>> = vec![Vec::new(); rendered.lines.len()];
+
+    for cb in &rendered.code_blocks {
+        let Some(lang) = cb.lang.as_deref().and_then(SyntaxLanguage::from_name) else {
+            continue;
+        };
+        let content_start = cb.fence_open + 1;
+        let content_end = cb.fence_close.unwrap_or(rendered.lines.len());
+        if content_start >= content_end {
+            continue;
+        }
+
+        let raw_lines: Vec<&str> = (content_start..content_end)
+            .map(|i| {
+                rendered
+                    .lines
+                    .get(i)
+                    .and_then(|st| st.spans.last())
+                    .map(|s| s.text.as_str())
+                    .unwrap_or("")
+            })
+            .collect();
+        let code_text = raw_lines.join("\n");
+
+        let mut syntax = Syntax::new_for_language(lang);
+        let highlights = syntax.parse(&code_text);
+
+        let mut line_byte_starts = Vec::with_capacity(raw_lines.len());
+        let mut offset = 0usize;
+        for raw in &raw_lines {
+            line_byte_starts.push(offset);
+            offset += raw.len() + 1; // +1 for the joining '\n'
+        }
+
+        for (start, end, scope) in &highlights {
+            let raw_line_idx = match line_byte_starts.binary_search(start) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            let out_line_idx = content_start + raw_line_idx;
+            if out_line_idx >= out.len() {
+                continue;
+            }
+            let line_start = line_byte_starts[raw_line_idx];
+            let local_start = start.saturating_sub(line_start);
+            let local_end = (*end - line_start).min(raw_lines[raw_line_idx].len());
+            if local_start >= local_end {
+                continue;
+            }
+            out[out_line_idx].push(MdCodeHighlight {
+                start_byte: local_start,
+                end_byte: local_end,
+                scope: scope.clone(),
+            });
+        }
+    }
+
+    out
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -755,6 +991,89 @@ mod tests {
             r.lines.len(),
             r.code_highlights.len(),
             "code_highlights length must match lines length"
+        );
+    }
+
+    // ─── Hover-popup markdown (quadraui-backed, #821) ───────────────────
+
+    #[test]
+    fn linkify_bare_urls_wraps_a_bare_url() {
+        let out = linkify_bare_urls("See https://example.com for details");
+        assert_eq!(
+            out,
+            "See [https://example.com](https://example.com) for details"
+        );
+    }
+
+    #[test]
+    fn linkify_bare_urls_leaves_existing_markdown_links_alone() {
+        let out = linkify_bare_urls("see [label](https://example.com) here");
+        assert_eq!(out, "see [label](https://example.com) here");
+    }
+
+    #[test]
+    fn linkify_bare_urls_skips_fenced_code_blocks() {
+        let out = linkify_bare_urls("```\nsee https://example.com\n```");
+        assert_eq!(out, "```\nsee https://example.com\n```");
+    }
+
+    #[test]
+    fn linkify_bare_urls_strips_trailing_punctuation() {
+        let out = linkify_bare_urls("visit https://example.com, please.");
+        assert_eq!(
+            out,
+            "visit [https://example.com](https://example.com), please."
+        );
+    }
+
+    #[test]
+    fn hover_markdown_structure_extracts_bold_code_and_link() {
+        let (line_text, links, _) =
+            hover_markdown_structure("**bold** and `code` and [label](https://example.com)");
+        assert_eq!(line_text.len(), 1);
+        assert_eq!(line_text[0], "bold and code and label");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].3, "https://example.com");
+        let (_, s, e) = (links[0].0, links[0].1, links[0].2);
+        assert_eq!(&line_text[0][s..e], "label");
+    }
+
+    #[test]
+    fn hover_markdown_structure_extracts_bare_url_after_linkify() {
+        let markdown = linkify_bare_urls("See https://example.com for details");
+        let (line_text, links, _) = hover_markdown_structure(&markdown);
+        assert_eq!(line_text[0], "See https://example.com for details");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].3, "https://example.com");
+    }
+
+    #[test]
+    fn hover_markdown_structure_rejects_unsafe_url_scheme() {
+        let (_, links, _) = hover_markdown_structure("[click](javascript:alert(1))");
+        assert!(
+            links.is_empty(),
+            "javascript: URLs must not become clickable links"
+        );
+    }
+
+    #[test]
+    fn hover_markdown_structure_highlights_fenced_code_block() {
+        let (line_text, _, code_highlights) =
+            hover_markdown_structure("```rust\nfn main() { let x = 42; }\n```");
+        let code_line_idx = line_text
+            .iter()
+            .position(|l| l.contains("fn main"))
+            .expect("expected code line");
+        assert!(
+            !code_highlights[code_line_idx].is_empty(),
+            "expected tree-sitter highlights for Rust code block, got none"
+        );
+        assert!(
+            code_highlights[code_line_idx]
+                .iter()
+                .any(|h| h.scope == "keyword"),
+            "expected 'keyword' scope in highlights: {:?}",
+            code_highlights[code_line_idx]
         );
     }
 }

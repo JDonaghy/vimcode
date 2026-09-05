@@ -628,12 +628,15 @@ impl Engine {
         item_index: usize,
         markdown: &str,
     ) {
-        let rendered = crate::core::markdown::render_markdown(markdown);
-        let links = Self::extract_hover_links(&rendered);
+        let markdown = crate::core::markdown::linkify_bare_urls(markdown);
+        let (line_text, links, code_highlights) =
+            crate::core::markdown::hover_markdown_structure(&markdown);
         // Dismiss any active editor hover to avoid overlapping popups.
         self.dismiss_editor_hover();
         self.panel_hover = Some(PanelHoverPopup {
-            rendered,
+            markdown,
+            line_text,
+            code_highlights,
             links,
             panel_name: panel_name.to_string(),
             item_id: item_id.to_string(),
@@ -1135,46 +1138,30 @@ impl Engine {
         take_focus: bool,
         add_goto_links: bool,
     ) {
-        let mut rendered = crate::core::markdown::render_markdown(markdown);
-        let mut links = Self::extract_hover_links(&rendered);
+        let mut full_markdown = markdown.to_string();
 
         // Append "Go to" navigation links after actual LSP content (vim mode only).
+        // Emitted as real `[label](url)` markdown — quadraui's renderer
+        // (adopted below, #821) parses these into clickable links itself,
+        // so no manual span bookkeeping is needed here.
         if add_goto_links && !self.is_vscode_mode() {
             let goto = self.lsp_goto_links();
             if !goto.is_empty() {
-                use crate::core::markdown::{MdSpan, MdStyle};
-                // Separator line.
-                rendered.lines.push(String::new());
-                rendered.spans.push(Vec::new());
-                rendered.code_highlights.push(Vec::new());
-                // Build: "Go to Definition (:gd) | Type Definition (:gy) | ..."
-                // "Go to" is default fg; labels are link-colored and clickable.
-                let nav_line_idx = rendered.lines.len();
-                let mut nav_text = String::from("Go to ");
-                let mut nav_spans = Vec::new();
+                full_markdown.push_str("\n\nGo to ");
                 for (i, (label, keybind, url)) in goto.iter().enumerate() {
                     if i > 0 {
-                        nav_text.push_str(" | ");
+                        full_markdown.push_str(" | ");
                     }
-                    let start = nav_text.len();
-                    nav_text.push_str(label);
-                    let end = nav_text.len();
-                    nav_spans.push(MdSpan {
-                        start_byte: start,
-                        end_byte: end,
-                        style: MdStyle::Link,
-                    });
-                    links.push((nav_line_idx, start, end, url.to_string()));
-                    nav_text.push_str(&format!(" (:{})", keybind));
+                    full_markdown.push_str(&format!("[{label}]({url}) (:{keybind})"));
                 }
-                rendered.lines.push(nav_text);
-                rendered.spans.push(nav_spans);
-                rendered.code_highlights.push(Vec::new());
             }
         }
 
-        let popup_width = rendered
-            .lines
+        let full_markdown = crate::core::markdown::linkify_bare_urls(&full_markdown);
+        let (line_text, links, code_highlights) =
+            crate::core::markdown::hover_markdown_structure(&full_markdown);
+
+        let popup_width = line_text
             .iter()
             .map(|l| l.chars().count())
             .max()
@@ -1187,7 +1174,9 @@ impl Engine {
         // Dismiss any active panel hover to avoid overlapping popups.
         self.dismiss_panel_hover_now();
         self.editor_hover = Some(EditorHoverPopup {
-            rendered,
+            markdown: full_markdown,
+            line_text,
+            code_highlights,
             links,
             anchor_line,
             anchor_col,
@@ -1283,7 +1272,7 @@ impl Engine {
             "j" | "Down" => {
                 // Scroll down — stop when last line is visible
                 if let Some(hover) = &mut self.editor_hover {
-                    let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+                    let max_scroll = hover.line_text.len().saturating_sub(20);
                     if hover.scroll_top < max_scroll {
                         hover.scroll_top += 1;
                     }
@@ -1413,7 +1402,7 @@ impl Engine {
     /// Returns true if the popup was scrolled.
     pub fn editor_hover_scroll(&mut self, delta: i32) -> bool {
         if let Some(hover) = &mut self.editor_hover {
-            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let max_scroll = hover.line_text.len().saturating_sub(20);
             if delta > 0 {
                 let new = (hover.scroll_top + delta as usize).min(max_scroll);
                 if new != hover.scroll_top {
@@ -1437,7 +1426,7 @@ impl Engine {
     /// from `quadraui::dispatch_mouse_drag` into this call (#215).
     pub fn editor_hover_set_scroll(&mut self, new_offset: usize) -> bool {
         if let Some(hover) = &mut self.editor_hover {
-            let max_scroll = hover.rendered.lines.len().saturating_sub(20);
+            let max_scroll = hover.line_text.len().saturating_sub(20);
             let clamped = new_offset.min(max_scroll);
             if clamped != hover.scroll_top {
                 hover.scroll_top = clamped;
@@ -1459,9 +1448,9 @@ impl Engine {
     pub fn hover_selection_text(&self) -> Option<String> {
         let hover = self.editor_hover.as_ref()?;
         let text = if let Some(ref sel) = hover.selection {
-            sel.extract_text(&hover.rendered.lines)
+            sel.extract_text(&hover.line_text)
         } else {
-            hover.rendered.lines.join("\n")
+            hover.line_text.join("\n")
         };
         if text.is_empty() {
             None

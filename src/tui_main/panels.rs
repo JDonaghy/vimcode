@@ -801,7 +801,7 @@ pub(super) fn render_panel_hover_popup(
         return (vec![], None);
     };
 
-    let lines = &ph.rendered.lines;
+    let lines = &ph.line_text;
     if lines.is_empty() {
         return (vec![], None);
     }
@@ -928,7 +928,7 @@ pub(super) fn render_editor_hover_popup(
     Option<(u16, u16, u16, u16)>,
     Option<render::PopupScrollbarHit>,
 ) {
-    if eh.rendered.lines.is_empty() {
+    if eh.line_text.is_empty() {
         return (vec![], None, None);
     }
     let popup = render::editor_hover_to_quadraui_rich_text(eh, theme);

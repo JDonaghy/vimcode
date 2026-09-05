@@ -16031,7 +16031,7 @@ fn test_panel_hover_show_and_dismiss() {
     assert_eq!(ph.panel_name, "test_panel");
     assert_eq!(ph.item_id, "item_1");
     assert_eq!(ph.item_index, 0);
-    assert!(!ph.rendered.lines.is_empty());
+    assert!(!ph.line_text.is_empty());
     e.dismiss_panel_hover_now();
     assert!(e.panel_hover.is_none());
 }
@@ -16043,7 +16043,7 @@ fn test_panel_hover_links_extracted() {
     let ph = e.panel_hover.as_ref().unwrap();
     // Should have at least one link extracted from the markdown
     assert!(
-        !ph.links.is_empty() || !ph.rendered.lines.is_empty(),
+        !ph.links.is_empty() || !ph.line_text.is_empty(),
         "hover should have rendered content"
     );
 }
