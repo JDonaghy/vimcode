@@ -168,11 +168,12 @@
 //!    but #604 closed it a different way — see gap 3 below, now resolved.
 //! 2. **Mouse handling (#602, largely resolved).** `mouse::handle_mouse`
 //!    (~4,100 lines) takes `&mut quadraui::DragState` + `&mut
-//!    quadraui::ModalStack` directly via `TuiBackend::drag_and_modal_mut()`
-//!    — a concrete-only method the `Backend` trait deliberately doesn't
-//!    expose, so it couldn't be called from `handle(&mut self, event,
-//!    backend: &mut dyn Backend, ...)` as-is. `Backend::drag_and_modal_mut`
-//!    (quadraui#467) landed a trait-level accessor, unblocking the fix:
+//!    quadraui::ModalStack` directly — once concrete-only state the
+//!    `Backend` trait deliberately didn't expose, so it couldn't be called
+//!    from `handle(&mut self, event, backend: &mut dyn Backend, ...)` as-is.
+//!    `Backend::{drag_state_handle, modal_stack_handle}` (quadraui#704,
+//!    superseding the `drag_and_modal_mut` accessor of quadraui#467) hand
+//!    out `Rc<RefCell<_>>` handles, unblocking the fix:
 //!    [`TuiShellApp::handle_mouse_event`] bridges a mouse-shaped [`UiEvent`]
 //!    back to a crossterm `MouseEvent` and dispatches through
 //!    `mouse::handle_mouse`, but *before* that it also ports the four panel
@@ -1206,8 +1207,11 @@ impl TuiShellApp {
     /// `last_click_time`/`last_click_pos` pair), then round-trip through
     /// [`super::events::uievent_to_crossterm`]. The one piece `event_loop`
     /// couldn't do — obtain `&mut DragState` *and* `&mut ModalStack` from a
-    /// `&mut dyn Backend` — is exactly what `Backend::drag_and_modal_mut`
-    /// (quadraui#467) was built for.
+    /// `&mut dyn Backend` — is exactly what
+    /// `Backend::{drag_state_handle, modal_stack_handle}` (quadraui#704,
+    /// which replaced the earlier `drag_and_modal_mut` of quadraui#467) are
+    /// for: they return independent `Rc<RefCell<_>>` handles, so the two
+    /// simultaneous `&mut` borrows fall out of `borrow_mut()`ing each.
     ///
     /// Every other `&mut` parameter `handle_mouse` needs is threaded from a
     /// `TuiShellApp` field the struct already carries 1:1 for this purpose —
@@ -1255,7 +1259,8 @@ impl TuiShellApp {
                 | UiEvent::DoubleClick { position, .. } => Some(*position),
                 _ => None,
             };
-            let (_, modal_stack) = backend.drag_and_modal_mut();
+            let modal_rc = backend.modal_stack_handle();
+            let modal_stack = modal_rc.borrow();
             event_pos.is_some_and(|p| modal_stack.hit_test(p).is_some())
         };
 
@@ -1538,7 +1543,14 @@ impl TuiShellApp {
         let context_menu_layout = self.context_menu_layout.borrow();
         let dialog_layout = self.dialog_layout.borrow();
         let editor_hover_scrollbar = *self.editor_hover_scrollbar.borrow();
-        let (drag_state, modal_stack) = backend.drag_and_modal_mut();
+        // quadraui#704 removed `Backend::drag_and_modal_mut`; the two states
+        // are now reached through independent `Rc<RefCell<_>>` handles, so
+        // the simultaneous `&mut` borrow it existed to provide comes for
+        // free — take both handles and `borrow_mut()` each.
+        let drag_rc = backend.drag_state_handle();
+        let modal_rc = backend.modal_stack_handle();
+        let mut drag_state = drag_rc.borrow_mut();
+        let mut modal_stack = modal_rc.borrow_mut();
 
         let new_sidebar_width = super::mouse::handle_mouse(
             mouse_event,
@@ -1550,8 +1562,8 @@ impl TuiShellApp {
             &mut self.dragging_terminal_resize,
             &mut self.dragging_terminal_split,
             &mut self.divider_grab,
-            drag_state,
-            modal_stack,
+            &mut drag_state,
+            &mut modal_stack,
             last_layout.as_ref(),
             &mut last_click_time,
             &mut last_click_pos,
@@ -1575,6 +1587,13 @@ impl TuiShellApp {
             *self.tab_switcher_popup_rect.borrow(),
         );
 
+        // quadraui#704: these two are `RefMut` guards on the backend's own
+        // `RefCell`s, not plain `&mut`. Release them as eagerly as the other
+        // borrows so any later code in this function (or a future addition)
+        // can touch `backend`'s drag/modal state without a double-borrow
+        // panic.
+        drop(drag_state);
+        drop(modal_stack);
         drop(last_layout);
         drop(hover_link_rects);
         drop(editor_hover_link_rects);
@@ -2467,9 +2486,10 @@ impl ShellApp for TuiShellApp {
                     Reaction::Redraw
                 }
                 // #602 (gap 2): dispatch through the legacy `mouse::handle_mouse`
-                // now that `Backend::drag_and_modal_mut` (quadraui#467) makes its
-                // `&mut DragState`/`&mut ModalStack` params reachable through
-                // `&mut dyn Backend`. See `Self::handle_mouse_event`.
+                // now that `Backend::{drag_state_handle, modal_stack_handle}`
+                // (quadraui#704) make its `&mut DragState`/`&mut ModalStack`
+                // params reachable through `&mut dyn Backend`.
+                // See `Self::handle_mouse_event`.
                 UiEvent::MouseDown { .. }
                 | UiEvent::MouseUp { .. }
                 | UiEvent::MouseMoved { .. }
@@ -8248,8 +8268,8 @@ mod tests {
 
         let mut backend = backend_at(80.0, 24.0);
         {
-            let (_, modal_stack) = backend.drag_and_modal_mut();
-            modal_stack.push(
+            let modal_rc = backend.modal_stack_handle();
+            modal_rc.borrow_mut().push(
                 quadraui::WidgetId::new("test:modal"),
                 quadraui::Rect::new(50.0, 1.0, 20.0, 10.0),
             );
@@ -8324,9 +8344,10 @@ mod tests {
 
         let mut backend = backend_at(80.0, 24.0);
         {
-            let (_, modal_stack) = backend.drag_and_modal_mut();
+            let modal_rc = backend.modal_stack_handle();
             assert!(
-                modal_stack
+                modal_rc
+                    .borrow()
                     .hit_test(quadraui::Point::new(55.0, 3.0))
                     .is_none(),
                 "test precondition: nothing may be on the modal stack, \
