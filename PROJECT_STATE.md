@@ -2,6 +2,22 @@
 
 **Last updated:** September 5, 2026 (issue #827 correction pass — the #47/44-call-site claims below were stale within hours of being written; see the corrected section); prior revisions September 4 (#801) and September 3 (the platform-neutrality chain drained, and the audit it mandated is now run). Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%** (though most of that miss is #731/#732 dead-code removal, not convergence — see `GOALS.md` §2/§3 for the corrected attribution). Nothing is in flight and nothing is queued for vimcode. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) was filed and closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction.
 
+## #822 — partially fixed; item 2 blocked on an unfiled quadraui gap (drafted, not yet submitted)
+
+Issue #822 listed three fix items. Item 1 (delete the `compute_tab_bar_hit_regions`
+downconversion shim, migrate both backends to consume `quadraui::TabBarLayout`
+directly) is **done**. Item 3 (a stale doc comment) was already gone before this
+PR's base commit — nothing needed there. Item 2 (adopt `TabGroupController` for
+tab drag/drop, deleting `TabDragState` and the local drop-zone code, ~460 lines)
+is **not done** — it isn't a like-for-like swap, because `TabGroupController` owns
+its own pane/tab model and vimcode would have to mirror `Engine`'s editor-group
+state into it. The upstream gap this implies is fully drafted, ready to file on
+`JDonaghy/quadraui`, in
+[`docs/PENDING_QUADRAUI_ISSUES.md`](docs/PENDING_QUADRAUI_ISSUES.md) — filing it
+needs `gh` access this worker session doesn't have. **Keep #822 open, scoped down
+to item 2, until that issue is filed** (per `GOALS.md`'s milestone-discipline
+rule); once filed, delete the drafted entry and link the real issue number here.
+
 ## #820 — blocked on an unfiled quadraui gap (drafted, not yet submitted)
 
 `BottomPanelController` adoption was investigated and correctly declined (a
