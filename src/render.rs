@@ -19552,6 +19552,64 @@ pub fn resolve_gutter_action(
     }
 }
 
+/// Execute the engine-side effect of a resolved [`GutterAction`] for a
+/// gutter click. Shared by both backends (#823 item 3) — GTK's
+/// `execute_gutter_action` (`gtk/click.rs`) and TUI's inline match
+/// (`tui_main/mouse.rs`) were an identical 5-arm match on
+/// [`resolve_gutter_action`]'s result, except TUI additionally gated
+/// `ToggleFold` on `gutter_text` actually containing a `+`/`-` fold
+/// indicator glyph and GTK didn't. Folded in here rather than dropped: in
+/// practice `Engine::toggle_fold_at_line`'s own `detect_fold_range` no-ops
+/// when nothing is foldable at that line, so the two were never observed to
+/// diverge in a live-reachable case, but the guard is one line to keep and
+/// removing it would be a needless behavior narrowing for GTK to carry.
+///
+/// `gutter_text` is the resolved line's painted gutter glyphs — pass
+/// `rw.lines[view_row].gutter_text.as_str()` (both backends already look
+/// this row up before calling in).
+pub fn apply_gutter_action(
+    engine: &mut Engine,
+    rw: &RenderedWindow,
+    window_id: WindowId,
+    line_idx: usize,
+    gutter_col: usize,
+    gutter_text: &str,
+) {
+    match resolve_gutter_action(rw, line_idx, gutter_col) {
+        Some(GutterAction::ToggleBreakpoint(line)) => {
+            let file = engine
+                .windows
+                .get(&window_id)
+                .and_then(|w| engine.buffer_manager.get(w.buffer_id))
+                .and_then(|bs| bs.file_path.as_ref())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            engine.dap_toggle_breakpoint(&file, line as u64 + 1);
+        }
+        Some(GutterAction::DiffPeek(line)) => {
+            engine.active_tab_mut().active_window = window_id;
+            engine.view_mut().cursor.line = line;
+            engine.open_diff_peek();
+        }
+        Some(GutterAction::DiagnosticHover(line)) => {
+            engine.active_tab_mut().active_window = window_id;
+            engine.view_mut().cursor.line = line;
+            engine.trigger_editor_hover_for_line(line);
+        }
+        Some(GutterAction::CodeAction(line)) => {
+            engine.active_tab_mut().active_window = window_id;
+            engine.view_mut().cursor.line = line;
+            engine.show_code_actions_popup();
+        }
+        Some(GutterAction::ToggleFold(line)) => {
+            if gutter_text.chars().any(|c| c == '+' || c == '-') {
+                engine.toggle_fold_at_line(line);
+            }
+        }
+        None => {}
+    }
+}
+
 /// Computed editor chrome layout — all heights in native units (pixels for
 /// GTK/macOS, rows for TUI with `line_height = 1.0`).
 #[derive(Debug, Clone, Copy)]

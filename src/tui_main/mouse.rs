@@ -2593,47 +2593,23 @@ pub(super) fn handle_mouse(
                     }
                 }
 
-                // Check gutter area — shared resolution via render::resolve_gutter_action (#344).
+                // Check gutter area — shared resolution + apply via
+                // render::resolve_gutter_action / render::apply_gutter_action
+                // (#344, #823 item 3: the match itself moved to
+                // render::apply_gutter_action — this was an identical 5-arm
+                // match to GTK's `execute_gutter_action`, gtk/click.rs).
                 let view_row = (row - wy) as usize;
                 if gutter > 0 && col >= wx && col < wx + gutter {
                     if let Some(rl) = rw.lines.get(view_row) {
                         let gutter_col = (col - wx) as usize;
-                        use crate::render::GutterAction;
-                        match crate::render::resolve_gutter_action(rw, rl.line_idx, gutter_col) {
-                            Some(GutterAction::ToggleBreakpoint(line)) => {
-                                let file = engine
-                                    .windows
-                                    .get(&rw.window_id)
-                                    .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-                                    .and_then(|bs| bs.file_path.as_ref())
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                engine.dap_toggle_breakpoint(&file, line as u64 + 1);
-                            }
-                            Some(GutterAction::DiffPeek(line)) => {
-                                engine.active_tab_mut().active_window = rw.window_id;
-                                engine.view_mut().cursor.line = line;
-                                engine.open_diff_peek();
-                            }
-                            Some(GutterAction::DiagnosticHover(line)) => {
-                                engine.active_tab_mut().active_window = rw.window_id;
-                                engine.view_mut().cursor.line = line;
-                                engine.trigger_editor_hover_for_line(line);
-                            }
-                            Some(GutterAction::CodeAction(line)) => {
-                                engine.active_tab_mut().active_window = rw.window_id;
-                                engine.view_mut().cursor.line = line;
-                                engine.show_code_actions_popup();
-                            }
-                            Some(GutterAction::ToggleFold(line)) => {
-                                let has_fold_indicator =
-                                    rl.gutter_text.chars().any(|c| c == '+' || c == '-');
-                                if has_fold_indicator {
-                                    engine.toggle_fold_at_line(line);
-                                }
-                            }
-                            None => {}
-                        }
+                        crate::render::apply_gutter_action(
+                            engine,
+                            rw,
+                            rw.window_id,
+                            rl.line_idx,
+                            gutter_col,
+                            &rl.gutter_text,
+                        );
                     }
                     return sidebar_width;
                 }

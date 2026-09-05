@@ -4,7 +4,7 @@ use crate::core::window::GroupId;
 use crate::core::WindowId;
 #[cfg(test)]
 use crate::render::Theme;
-use crate::render::{self as render_mod, GutterAction, ScreenZone, WindowZone};
+use crate::render::{self as render_mod, ScreenZone, WindowZone};
 #[cfg(test)]
 use std::cell::RefCell;
 #[cfg(test)]
@@ -143,9 +143,9 @@ pub(crate) fn pixel_to_click_target(
             };
             match render_mod::window_zone_hit_test(rw, rel_x, rel_y, line_height, char_width) {
                 WindowZone::Gutter {
+                    view_row,
                     line_idx,
                     gutter_col,
-                    ..
                 } => {
                     if !mutate_focus {
                         // A drag sweeping over another split's gutter must
@@ -153,7 +153,7 @@ pub(crate) fn pixel_to_click_target(
                         // there (#568).
                         return ClickTarget::None;
                     }
-                    execute_gutter_action(engine, rw, window_id, line_idx, gutter_col);
+                    execute_gutter_action(engine, rw, window_id, view_row, line_idx, gutter_col);
                     ClickTarget::Gutter
                 }
                 WindowZone::TextArea {
@@ -451,45 +451,26 @@ fn dispatch_tab_bar_target(
     }
 }
 
-/// Execute the engine-side action for a gutter click using shared resolution.
+/// Execute the engine-side action for a gutter click using shared
+/// resolution. The match itself moved to [`render::apply_gutter_action`]
+/// in #823 item 3 — it was an identical 5-arm match on
+/// [`render_mod::resolve_gutter_action`]'s result to TUI's copy
+/// (`tui_main/mouse.rs`), modulo TUI's `ToggleFold` fold-indicator guard
+/// (folded into the shared function too — see its doc comment).
 fn execute_gutter_action(
     engine: &mut Engine,
     rw: &render::RenderedWindow,
     window_id: WindowId,
+    view_row: usize,
     line_idx: usize,
     gutter_col: usize,
 ) {
-    match render_mod::resolve_gutter_action(rw, line_idx, gutter_col) {
-        Some(GutterAction::ToggleBreakpoint(line)) => {
-            let file = engine
-                .windows
-                .get(&window_id)
-                .and_then(|w| engine.buffer_manager.get(w.buffer_id))
-                .and_then(|bs| bs.file_path.as_ref())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            engine.dap_toggle_breakpoint(&file, line as u64 + 1);
-        }
-        Some(GutterAction::DiffPeek(line)) => {
-            engine.active_tab_mut().active_window = window_id;
-            engine.view_mut().cursor.line = line;
-            engine.open_diff_peek();
-        }
-        Some(GutterAction::DiagnosticHover(line)) => {
-            engine.active_tab_mut().active_window = window_id;
-            engine.view_mut().cursor.line = line;
-            engine.trigger_editor_hover_for_line(line);
-        }
-        Some(GutterAction::CodeAction(line)) => {
-            engine.active_tab_mut().active_window = window_id;
-            engine.view_mut().cursor.line = line;
-            engine.show_code_actions_popup();
-        }
-        Some(GutterAction::ToggleFold(line)) => {
-            engine.toggle_fold_at_line(line);
-        }
-        None => {}
-    }
+    let gutter_text = rw
+        .lines
+        .get(view_row)
+        .map(|rl| rl.gutter_text.as_str())
+        .unwrap_or_default();
+    render_mod::apply_gutter_action(engine, rw, window_id, line_idx, gutter_col, gutter_text);
 }
 
 /// Handle mouse click by converting coordinates to buffer position.
