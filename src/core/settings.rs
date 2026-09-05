@@ -514,6 +514,50 @@ pub enum ExplorerAction {
     MoveFile,
 }
 
+impl ExplorerAction {
+    /// Resolve an explorer context-menu/keyboard-shortcut action id string
+    /// to the `ExplorerAction` both backends dispatch through
+    /// `Engine::dispatch_explorer_crud`.
+    ///
+    /// #823 item 6: GTK's `App::explorer_action` (`app.rs`) and TUI's
+    /// `handle_explorer_context_action` (`tui_main/mod.rs`) map this same
+    /// 5-string table, but they are no longer safe to fully collapse — they
+    /// were re-verified against current `HEAD` per this issue's own
+    /// instruction, not just the line numbers recorded when the issue was
+    /// filed, and the two functions have drifted past what a mechanical
+    /// merge could do without changing behavior:
+    ///
+    /// * TUI's "delete" arm calls `Engine::confirm_delete_file` directly
+    ///   with the context menu's explicit target path; GTK's routes
+    ///   through `dispatch_explorer_crud(Delete)`, which acts on
+    ///   `explorer_tree`'s *selected row* instead — forcing GTK onto TUI's
+    ///   explicit-path behavior (or vice versa) is a real behavior change,
+    ///   not a refactor, and picks the wrong file if a context-menu click
+    ///   and the tree's selection ever disagree.
+    /// * TUI's match has no `"move_file"` arm at all — it silently no-ops
+    ///   today. Wiring it up via this table would be a new capability, not
+    ///   a dedup, and needs its own test/issue.
+    ///
+    /// What both sides still agree on byte-for-byte is the `new_file` /
+    /// `new_folder` / `rename` subset, both feeding the identical
+    /// `dispatch_explorer_crud` call — that's what this function shares.
+    /// `delete` / `move_file` are included for GTK's benefit (its own
+    /// `explorer_action` handles all five through one call to
+    /// `dispatch_explorer_crud`) but TUI's caller never reaches this
+    /// function for those two strings — its own arms handle `"delete"`
+    /// first and it has no `"move_file"` arm to reach here at all.
+    pub fn from_action_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "new_file" => Self::NewFile,
+            "new_folder" => Self::NewFolder,
+            "rename" => Self::Rename,
+            "delete" => Self::Delete,
+            "move_file" => Self::MoveFile,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplorerKeys {
     #[serde(default = "ek_new_file")]
