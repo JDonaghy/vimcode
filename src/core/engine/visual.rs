@@ -532,6 +532,56 @@ impl Engine {
         self.visual_dollar = false;
     }
 
+    /// Visual-Block `>` / `<` — shift the block itself, not the whole line.
+    ///
+    /// `>` inserts `shifts * 'shiftwidth'` spaces at the block's left column;
+    /// `<` removes up to that many white-space characters *starting at* that
+    /// column, which is why `<C-v>j<` with the block on the `a` of `    ab`
+    /// changes nothing (#807).
+    pub(crate) fn block_shift(&mut self, right: bool, shifts: usize, changed: &mut bool) {
+        let Some((start, end)) = self.get_visual_selection_range() else {
+            return;
+        };
+        let (col, _) = self.visual_block_cols();
+        let width = self.effective_shift_width() * shifts;
+        self.mode = Mode::Normal;
+        self.visual_anchor = None;
+        self.visual_dollar = false;
+        self.start_undo_group();
+        for line in start.line..=end.line {
+            if line >= self.buffer().len_lines() {
+                break;
+            }
+            let len = self.line_text_len(line);
+            if col > len {
+                continue;
+            }
+            let base = self.buffer().line_to_char(line);
+            if right {
+                if len == 0 {
+                    continue; // `:h >` — never indent an empty line
+                }
+                self.insert_with_undo(base + col, &" ".repeat(width));
+            } else {
+                let mut n = 0;
+                while n < width
+                    && col + n < len
+                    && matches!(self.buffer().content.char(base + col + n), ' ' | '\t')
+                {
+                    n += 1;
+                }
+                if n > 0 {
+                    self.delete_with_undo(base + col, base + col + n);
+                }
+            }
+        }
+        self.finish_undo_group();
+        self.view_mut().cursor.line = start.line;
+        self.view_mut().cursor.col = col;
+        self.clamp_cursor_col();
+        *changed = true;
+    }
+
     /// Visual-mode `<C-a>` / `<C-x>` / `g<C-a>` / `g<C-x>` — Vim's `op_addsub()`.
     ///
     /// Every line of the selection gets **its first number inside the selection**

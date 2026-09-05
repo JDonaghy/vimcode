@@ -7490,6 +7490,14 @@ impl Engine {
                     // 'shiftwidth's (`:h v_>`), it does not select 3 lines
                     // (#807 — the count used to be discarded entirely).
                     let shifts = self.take_count().max(1);
+                    if self.mode == Mode::VisualBlock {
+                        // A blockwise shift moves the BLOCK, not the line:
+                        // `<C-v>j>` on `abc`/`def` from column 2 gives
+                        // `a    bc`, inserting the shift at the block's left
+                        // edge (`:h v_b_>`; #807).
+                        self.block_shift(ch == '>', shifts, changed);
+                        return EngineAction::None;
+                    }
                     if let Some((start, end)) = self.get_visual_selection_range() {
                         let start_line = start.line;
                         let line_count = end.line - start_line + 1;
@@ -7792,6 +7800,17 @@ impl Engine {
                     }
                 }
                 return EngineAction::None;
+            } else if matches!(pending, 'f' | 'F' | 't' | 'T') {
+                if let Some(target) = unicode {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        if !self.find_char(pending, target) {
+                            break;
+                        }
+                    }
+                    self.last_find = Some((pending, target));
+                }
+                return EngineAction::None;
             } else if pending == 'r' {
                 // r{char}: replace all selected characters with the given character
                 if let Some(replacement) = unicode {
@@ -7808,7 +7827,11 @@ impl Engine {
                 } else {
                     self.view_mut().cursor.line = 0;
                 }
-                self.view_mut().cursor.col = 0;
+                // Neovim's 'startofline' is off by default, so `gg` keeps the
+                // column instead of snapping to 0 — `vggd` on `abc`/`def` from
+                // (2,2) must leave `af`, not `f` (#807; the Normal-mode `gg`
+                // was already fixed this way in #806).
+                self.clamp_cursor_col();
                 return EngineAction::None;
             } else if pending == 'g' && ctrl && (key_name == "a" || key_name == "x") {
                 // g Ctrl-A / g Ctrl-X in visual mode: sequential increment/decrement
@@ -7948,6 +7971,26 @@ impl Engine {
             Some('0') => {
                 self.view_mut().cursor.col = 0;
                 self.visual_dollar = false;
+            }
+            Some('^') => {
+                // `^` in Visual mode — was unbound before #807, so `v^d`
+                // deleted only the character under the cursor.
+                let line = self.view().cursor.line;
+                self.view_mut().cursor.col = self.first_non_blank_col(line);
+                self.visual_dollar = false;
+            }
+            Some('f') | Some('F') | Some('t') | Some('T') => {
+                // Character find motions extend the selection; the target
+                // character is inclusive for `f`/`F` (#807, `vis:vf,d`).
+                self.pending_key = unicode;
+                self.visual_dollar = false;
+            }
+            Some(';') | Some(',') => {
+                let count = self.take_count();
+                let reverse = unicode == Some(',');
+                for _ in 0..count {
+                    self.repeat_find(reverse);
+                }
             }
             Some('$') => {
                 let line = self.view().cursor.line;
