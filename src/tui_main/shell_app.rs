@@ -2731,10 +2731,7 @@ impl ShellApp for TuiShellApp {
                 self.sidebar.ext_panel_name = None;
                 self.engine.ext_panel_has_focus = false;
                 self.engine.ext_panel_active = None;
-                self.engine.app_shell.hide_sidebar();
-                self.engine.clear_sidebar_focus();
-                self.engine.session.explorer_visible = false;
-                let _ = self.engine.session.save();
+                self.engine.collapse_sidebar();
             }
             // ── #634 smoke retry: the Settings cog is registered as a
             // *bottom item* (`shell_config`), and `AppShell` doesn't run
@@ -3111,11 +3108,8 @@ fn handle_activity_bar_focused_key(
         ActivityBarKeyAction::FocusOut => engine.activity_bar_focus_out(),
         ActivityBarKeyAction::Collapse => {
             engine.activity_bar_focus_out();
-            engine.app_shell.hide_sidebar();
-            engine.clear_sidebar_focus();
+            engine.collapse_sidebar();
             sidebar.has_focus = false;
-            engine.session.explorer_visible = false;
-            let _ = engine.session.save();
         }
         ActivityBarKeyAction::Ignore => {}
     }
@@ -3254,11 +3248,8 @@ fn handle_focus_owner_key(
                     'x' => "x",
                     'd' => "d",
                     'b' if ctrl => {
-                        engine.app_shell.hide_sidebar();
                         sidebar.has_focus = false;
-                        engine.clear_sidebar_focus();
-                        engine.session.explorer_visible = false;
-                        let _ = engine.session.save();
+                        engine.collapse_sidebar();
                         ""
                     }
                     _ => "",
@@ -3421,11 +3412,8 @@ fn handle_focus_owner_key(
         // h/Left focus-to-activity-bar lives inside
         // `dispatch_sc_sidebar_key_unified`. Ctrl+b hides the sidebar.
         if ctrl && matches!(key_event.code, KeyCode::Char('b')) {
-            engine.app_shell.hide_sidebar();
             sidebar.has_focus = false;
-            engine.clear_sidebar_focus();
-            engine.session.explorer_visible = false;
-            let _ = engine.session.save();
+            engine.collapse_sidebar();
             return Reaction::Redraw;
         }
         // With keyboard enhancement (kitty protocol), Shift+s arrives as
@@ -3484,11 +3472,8 @@ fn handle_focus_owner_key(
     {
         use crate::core::engine::ExplorerKeyResult;
         if ctrl && key_event.code == KeyCode::Char('b') {
-            engine.app_shell.hide_sidebar();
             sidebar.has_focus = false;
-            engine.clear_sidebar_focus();
-            engine.session.explorer_visible = false;
-            let _ = engine.session.save();
+            engine.collapse_sidebar();
         } else {
             // `tui_key_to_engine_name` rather than a fourth bespoke copy of
             // the same table: it also supplies "BackSpace"/"Delete", which

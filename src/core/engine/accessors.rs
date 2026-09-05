@@ -586,13 +586,40 @@ impl Engine {
     pub fn clear_sidebar_focus(&mut self) {
         self.explorer_has_focus = false;
         self.search_has_focus = false;
-        self.sc_has_focus = false;
+        // #823 item 8: was a direct `self.sc_has_focus = false`, which
+        // skipped `sc_set_focus`'s other two effects — clearing
+        // `sc_button_focused` and syncing `sc_sidebar_system`'s own
+        // focus flag. TUI's mouse.rs open-coded this same 9-flag clear
+        // and, unlike this method, already called `sc_set_focus(false)`
+        // here — so GTK's two call sites (both "clicking the editor clears
+        // every sidebar's focus") were the ones carrying the bug: an SC
+        // action button could stay visually focused after focus moved to
+        // the editor.
+        self.sc_set_focus(false);
         self.dap_sidebar_has_focus = false;
         self.ext_sidebar_has_focus = false;
         self.ai_has_focus = false;
         self.settings_has_focus = false;
         self.ext_panel_has_focus = false;
         self.activity_bar_focused = false;
+    }
+
+    /// Collapse (hide) the sidebar: hide it in `app_shell`, clear every
+    /// sidebar panel's keyboard focus, mark the explorer no longer visible
+    /// in session state, and persist the session.
+    ///
+    /// Shared by both backends (#823 item 8) — this exact 4-statement
+    /// sequence (`app_shell.hide_sidebar()`, `clear_sidebar_focus()`,
+    /// `session.explorer_visible = false`, `session.save()`) was pasted at
+    /// five call sites in `tui_main/shell_app.rs` and once in `app.rs`.
+    /// TUI additionally resets its own `TuiSidebar::has_focus` around each
+    /// call — that's TUI-local UI state, not `Engine`'s, so it stays at the
+    /// call site rather than becoming a parameter here.
+    pub fn collapse_sidebar(&mut self) {
+        self.app_shell.hide_sidebar();
+        self.clear_sidebar_focus();
+        self.session.explorer_visible = false;
+        let _ = self.session.save();
     }
 
     /// Returns true if any user-focused modal popup is currently open

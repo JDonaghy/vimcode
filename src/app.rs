@@ -5603,10 +5603,7 @@ impl App {
             ActivityBarKeyAction::Collapse => {
                 let mut engine = self.engine.borrow_mut();
                 engine.activity_bar_focus_out();
-                engine.app_shell.hide_sidebar();
-                engine.clear_sidebar_focus();
-                engine.session.explorer_visible = false;
-                let _ = engine.session.save();
+                engine.collapse_sidebar();
             }
             ActivityBarKeyAction::Ignore => {}
         }

@@ -3230,6 +3230,87 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #823 item 8: `Engine::clear_sidebar_focus` used to set
+    /// `sc_has_focus = false` directly instead of calling
+    /// `Engine::sc_set_focus(false)` — skipping that method's other two
+    /// effects, one of which is clearing `sc_button_focused`. `sc_button_focused`
+    /// drives `draw_sc_sidebar_panel`'s `pressed` highlight
+    /// (`render.rs`: `let pressed = sc.button_focused.and_then(Engine::sc_button_id);`)
+    /// independently of `sc_has_focus`, so the bug was real and visible: a
+    /// Source Control toolbar button left "pressed" (e.g. via keyboard nav)
+    /// stayed highlighted even after focus moved to the editor.
+    ///
+    /// Reuses `source_control_toolbar_button_highlights_on_hover`'s
+    /// pixel-diff technique just above (same reasoning: asserting
+    /// `sc_button_focused.is_none()` would pass even if nothing ever
+    /// repainted).
+    ///
+    /// RED-verified: with `Engine::clear_sidebar_focus`'s `self.sc_set_focus
+    /// (false)` reverted to a direct `self.sc_has_focus = false`, this test
+    /// fails (the pressed highlight survives the editor click); restored
+    /// before committing.
+    #[test]
+    fn clicking_editor_clears_a_pressed_sc_toolbar_button_highlight() {
+        let mut h = panel_harness(PANEL_GIT);
+        h.driver.render();
+        match h.painted_sidebar_bounds.get() {
+            Some(_) if h.engine.borrow().sc_panel_layout.borrow().is_some() => {}
+            _ => return,
+        };
+
+        let button = {
+            let engine = h.engine.borrow();
+            let layout = engine.sc_panel_layout.borrow();
+            layout
+                .as_ref()
+                .and_then(|l| l.toolbar_layout.as_ref())
+                .and_then(|t| t.visible_items.iter().find(|i| i.clickable).cloned())
+        };
+        let Some(button) = button else {
+            return; // no clickable toolbar buttons painted in this repo state
+        };
+        let by = button.bounds.y + button.bounds.height / 2.0;
+        let sample = |h: &mut Harness<_>| -> Vec<(u8, u8, u8)> {
+            let x0 = (button.bounds.x + 3.0) as i32;
+            let x1 = (button.bounds.x + button.bounds.width - 3.0) as i32;
+            (x0..x1).map(|x| h.driver.pixel(x, by as i32)).collect()
+        };
+        let baseline = sample(&mut h);
+
+        // Arm: this button "pressed"/focused, as keyboard nav within the
+        // panel would leave it (`source_control.rs`'s Tab handling sets
+        // exactly this field).
+        h.engine.borrow_mut().sc_has_focus = true;
+        h.engine.borrow_mut().sc_button_focused = Some(button.item_idx);
+        h.driver.render();
+        let pressed = sample(&mut h);
+        assert_ne!(
+            baseline, pressed,
+            "test setup sanity: sc_button_focused must actually repaint a \
+             pressed highlight, or this test cannot tell a fixed bug from a \
+             no-op one"
+        );
+
+        // Click into the editor pane — the same "clicking the editor clears
+        // every sidebar's keyboard focus" rung `clear_sidebar_focus`'s own
+        // doc comment describes.
+        let win = h.engine.borrow().active_window_id();
+        let (ex, ey) = h
+            .window_center(win)
+            .expect("the editor pane must have painted a window rect");
+        h.driver.click(ex, ey);
+        h.driver.render();
+        let after = sample(&mut h);
+
+        assert_eq!(
+            after, baseline,
+            "clicking the editor must clear the Source Control toolbar's \
+             pressed/focused button highlight all the way back to baseline \
+             (Engine::clear_sidebar_focus must fully clear sc_button_focused \
+             via sc_set_focus, not just sc_has_focus)"
+        );
+    }
+
     /// #637/#754: switching to a plugin ("extension") panel from the
     /// activity bar must clear focus flags a previously-visited panel left
     /// set, on **this** backend too.
