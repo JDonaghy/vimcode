@@ -6276,37 +6276,53 @@ impl App {
                 let (key_name, unicode) = match key {
                     Key::Char(c) => (c.to_string(), Some(c)),
                     Key::Named(ref named) => {
-                        let n: &str = match named {
-                            NamedKey::Escape => "Escape",
-                            NamedKey::Tab => "Tab",
-                            NamedKey::BackTab => "BackTab",
-                            NamedKey::Enter => "Return",
-                            NamedKey::Backspace => "BackSpace",
-                            NamedKey::Delete => "Delete",
-                            NamedKey::Insert => "Insert",
-                            NamedKey::Home => "Home",
-                            NamedKey::End => "End",
-                            NamedKey::PageUp => "PageUp",
-                            NamedKey::PageDown => "PageDown",
-                            NamedKey::Up => "Up",
-                            NamedKey::Down => "Down",
-                            NamedKey::Left => "Left",
-                            NamedKey::Right => "Right",
-                            NamedKey::F(1) => "F1",
-                            NamedKey::F(2) => "F2",
-                            NamedKey::F(3) => "F3",
-                            NamedKey::F(4) => "F4",
-                            NamedKey::F(5) => "F5",
-                            NamedKey::F(6) => "F6",
-                            NamedKey::F(7) => "F7",
-                            NamedKey::F(8) => "F8",
-                            NamedKey::F(9) => "F9",
-                            NamedKey::F(10) => "F10",
-                            NamedKey::F(11) => "F11",
-                            NamedKey::F(12) => "F12",
-                            _ => "",
+                        // #826: `Escape`/`Enter`->`Return`/`Backspace`->
+                        // `BackSpace`/`Delete`/`Tab`/`Home`/`End`/the arrows/
+                        // F-keys are byte-identical to TUI's spelling, so
+                        // those go through the shared
+                        // `render::engine_key_from_ui` — the same decoder
+                        // TUI's dispatch now calls — instead of restating an
+                        // identical table a second time here.
+                        //
+                        // Four keys keep GTK's own spelling rather than
+                        // being folded into the shared call, because the two
+                        // backends' *current* behaviour genuinely diverges
+                        // here and swapping would be a silent regression,
+                        // not a cleanup:
+                        //  * `BackTab` → `"BackTab"`, not TUI's
+                        //    `"ISO_Left_Tab"` — `panels.rs`/`ext_panel.rs`/
+                        //    `search.rs` already dual-alias both spellings,
+                        //    but nothing forces GTK to switch.
+                        //  * `PageUp`/`PageDown` → `"PageUp"`/`"PageDown"`,
+                        //    not TUI's `"Page_Up"`/`"Page_Down"` —
+                        //    `source_control.rs`/`ext_panel.rs` accept only
+                        //    the TUI spelling (a pre-existing GTK gap, out of
+                        //    scope here), while `explorer_ops.rs` and the
+                        //    terminal rung's `canonical_terminal_key_name`
+                        //    already accept both; switching GTK's spelling
+                        //    needs its own audit, not a side effect of this
+                        //    decoder unification.
+                        //  * `Insert` → `"Insert"` — the shared decoder
+                        //    returns `None` for it (no engine binding from
+                        //    TUI, which never plumbed it through crossterm),
+                        //    but GTK's terminal PTY passthrough
+                        //    (`terminal_ops::key_to_pty_bytes`'s `"Insert"`
+                        //    arm) relies on receiving the name today; using
+                        //    the shared decoder here would silently drop
+                        //    Insert-key passthrough in a focused GTK
+                        //    terminal.
+                        // Reconciling all four is real follow-up work, not
+                        // this issue's "delete the TUI round trip" scope.
+                        let n = match named {
+                            NamedKey::BackTab => "BackTab".to_string(),
+                            NamedKey::PageUp => "PageUp".to_string(),
+                            NamedKey::PageDown => "PageDown".to_string(),
+                            NamedKey::Insert => "Insert".to_string(),
+                            _ => render::engine_key_from_ui(&key, modifiers, true)
+                                .map(|(name, _, _)| name)
+                                .unwrap_or_default(),
                         };
-                        (n.to_string(), None)
+                        (n, None)
                     }
                 };
                 if !key_name.is_empty() || unicode.is_some() {
