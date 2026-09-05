@@ -5155,8 +5155,15 @@ impl Engine {
             }
             self.finish_undo_group();
             self.view_mut().cursor = start;
+            if self.mode == Mode::VisualLine {
+                // A linewise `r` covers whole lines, so the cursor lands in
+                // column 0, not wherever the selection was anchored (#807,
+                // `vis:Vr-`).
+                self.view_mut().cursor.col = 0;
+            }
             self.mode = Mode::Normal;
             self.visual_anchor = None;
+            self.visual_dollar = false;
             *changed = true;
         }
     }
