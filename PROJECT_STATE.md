@@ -2,6 +2,18 @@
 
 **Last updated:** September 5, 2026 (issue #827 correction pass — the #47/44-call-site claims below were stale within hours of being written; see the corrected section); prior revisions September 4 (#801) and September 3 (the platform-neutrality chain drained, and the audit it mandated is now run). Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%** (though most of that miss is #731/#732 dead-code removal, not convergence — see `GOALS.md` §2/§3 for the corrected attribution). Nothing is in flight and nothing is queued for vimcode. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) was filed and closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction.
 
+## #820 — blocked on an unfiled quadraui gap (drafted, not yet submitted)
+
+`BottomPanelController` adoption was investigated and correctly declined (a
+single-drawer model can't cover vimcode's five independently-gated bottom
+bands — see `src/render.rs`'s bottom-band module doc). The upstream gap this
+implies ("multi-band bottom chrome") is fully drafted, ready to file on
+`JDonaghy/quadraui` into milestone #9, in
+[`docs/PENDING_QUADRAUI_ISSUES.md`](docs/PENDING_QUADRAUI_ISSUES.md) — filing
+it needs `gh` access this worker session doesn't have. **Keep #820 open until
+that issue is filed** (per `GOALS.md`'s milestone-discipline rule); once
+filed, delete the drafted entry and link the real issue number here.
+
 ## Active milestone: #7 Platform-Neutral — **complete (0 open)**
 
 **The north star is [`GOALS.md`](GOALS.md): eliminate all platform-specific code from
