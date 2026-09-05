@@ -7253,6 +7253,15 @@ impl Engine {
             }
         }
 
+        // Visual-mode <C-a> / <C-x>: increment every number in the selection by
+        // the same amount (the `g` prefixed variants step by line — see the
+        // `pending == 'g'` arm above).
+        if ctrl && self.pending_key.is_none() && (key_name == "a" || key_name == "x") {
+            let sign: i64 = if key_name == "a" { 1 } else { -1 };
+            self.visual_addsub(sign, false, changed);
+            return EngineAction::None;
+        }
+
         // Handle Ctrl-V for visual block mode switching
         if ctrl && key_name == "v" {
             if self.mode == Mode::VisualBlock {
@@ -7673,24 +7682,8 @@ impl Engine {
                 return EngineAction::None;
             } else if pending == 'g' && ctrl && (key_name == "a" || key_name == "x") {
                 // g Ctrl-A / g Ctrl-X in visual mode: sequential increment/decrement
-                let base_count = self.take_count().max(1) as i64;
-                let delta_sign: i64 = if key_name == "a" { 1 } else { -1 };
-                if let Some((start, end)) = self.get_visual_selection_range() {
-                    let saved_line = self.view().cursor.line;
-                    let saved_col = self.view().cursor.col;
-                    self.start_undo_group();
-                    for (i, line) in (start.line..=end.line).enumerate() {
-                        let delta = delta_sign * base_count * (i as i64 + 1);
-                        self.view_mut().cursor.line = line;
-                        self.view_mut().cursor.col = 0;
-                        self.increment_number_at_cursor(delta, changed);
-                    }
-                    self.finish_undo_group();
-                    self.view_mut().cursor.line = saved_line;
-                    self.view_mut().cursor.col = saved_col;
-                    self.mode = Mode::Normal;
-                    self.visual_anchor = None;
-                }
+                let sign: i64 = if key_name == "a" { 1 } else { -1 };
+                self.visual_addsub(sign, true, changed);
                 return EngineAction::None;
             } else if pending == 'g' && unicode == Some('c') {
                 // gc in visual mode: toggle comment on selected lines
