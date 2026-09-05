@@ -140,6 +140,86 @@ fn test_ctrl_d_count_sets_sticky_scroll_value() {
     assert_cursor(&e, 10, 0);
 }
 
+/// A 60-line buffer in a 22-row window — the exact fixture the `scroll:*`
+/// conformance cases use, so these expectations can be read straight off real
+/// interactive Neovim (`'scroll'` = 22 / 2 = 11).
+fn scroll_fixture() -> vimcode_core::Engine {
+    let mut e = engine_with(&(1..=60).map(|n| format!("L{n}\n")).collect::<String>());
+    e.set_viewport_lines(22);
+    e
+}
+
+// #805 review: the conformance labels `scroll:C-d C-d`, `scroll:5C-d C-d`,
+// `scroll:C-d twice then C-u` and `scroll:C-f C-f` stay in KNOWN_DEVIATIONS
+// because the *headless* nvim oracle mis-handles the second and later scroll
+// command of a single feedkeys burst (see the group-B comment block in
+// `tests/nvim_conformance.rs`). The expectations below are the values real
+// *interactive* Neovim produces for the same fixture — captured with
+// `scripts/nvim_headless_vs_interactive_repro.sh` — so a regression in
+// vimcode's own chained-scroll behaviour still fails a test rather than
+// hiding behind a deviation label.
+
+#[test]
+fn test_ctrl_d_chain_moves_a_full_scroll_each_time() {
+    // interactive nvim: <C-d><C-d> from line 1 lands on line 23 (1-indexed).
+    // headless nvim wrongly says 22.
+    let mut e = scroll_fixture();
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 11, 0);
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 22, 0);
+}
+
+#[test]
+fn test_ctrl_d_chain_then_ctrl_u_returns_one_scroll() {
+    // interactive nvim: <C-d><C-d><C-u> from line 1 lands back on line 12.
+    let mut e = scroll_fixture();
+    ctrl(&mut e, 'd');
+    ctrl(&mut e, 'd');
+    ctrl(&mut e, 'u');
+    assert_cursor(&e, 11, 0);
+}
+
+#[test]
+fn test_counted_ctrl_d_then_bare_ctrl_d_full_window() {
+    // interactive nvim: 5<C-d><C-d> from line 1 lands on line 11 — the count
+    // SETS 'scroll' to 5 and the bare <C-d> reuses it. headless says 10.
+    let mut e = scroll_fixture();
+    type_chars(&mut e, "5");
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 5, 0);
+    ctrl(&mut e, 'd');
+    assert_cursor(&e, 10, 0);
+}
+
+#[test]
+fn test_ctrl_f_chain_pages_forward_twice() {
+    // interactive nvim: <C-f><C-f> from line 1 lands on line 41. headless
+    // says 19 — i.e. *above* where a single <C-f> (line 21) lands.
+    let mut e = scroll_fixture();
+    ctrl(&mut e, 'f');
+    assert_cursor(&e, 20, 0);
+    ctrl(&mut e, 'f');
+    assert_cursor(&e, 40, 0);
+}
+
+#[test]
+fn test_dollar_sticks_through_ctrl_e_scrolloff_push() {
+    // #805 review: <C-e>/<C-y> are curswant-preserving, so when scrolloff
+    // forces the cursor onto a new line the column must be re-derived from
+    // the `$`-set CURSWANT_EOL, not clamped from the old column.
+    let mut e = engine_with("aaaaaaaa\nbb\ncccccccc\ndddddddd\neeeeeeee\n");
+    e.set_viewport_lines(3);
+    e.view_mut().scroll_top = 0;
+    e.view_mut().cursor.line = 0;
+    press(&mut e, '$'); // curswant = end-of-line
+    assert_cursor(&e, 0, 7);
+    ctrl(&mut e, 'e'); // scroll down: cursor pushed off the top onto line 1
+    assert_cursor(&e, 1, 1); // "bb" is short — clamped, but curswant survives
+    ctrl(&mut e, 'e'); // pushed onto line 2, a long line again
+    assert_cursor(&e, 2, 7); // back to end-of-line, not stuck at col 1
+}
+
 // ── Ctrl+e / Ctrl+y ──────────────────────────────────────────────────────────
 
 #[test]
