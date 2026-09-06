@@ -901,6 +901,18 @@ pub(super) fn render_panel_hover_popup(
         })
         .collect();
 
+    // `layout.bounds` is cached (and later hit-tested) as the raw `f32`
+    // `quadraui::Rect` the primitive returned — no `.round()`-to-cell step
+    // the way the pre-#831 hand-rolled `u16` cache had. That's only safe
+    // because every input feeding `RichTextPopup::layout` here is already
+    // integral in cell units: `padding: 0.0` (`panel_hover_to_quadraui_rich_text`,
+    // `render.rs`) and the primitive's own `border` (fixed at `1.0`,
+    // `rich_text_popup.rs`) are the only two offsets `layout()` adds beyond
+    // the whole-cell `popup_x`/`top_row` this function passes in. If either
+    // ever became fractional (e.g. a future padding tweak), the painted box
+    // and the cached hit-test rect would still agree with each other — both
+    // come from this one `layout` call — but would silently stop landing on
+    // whole terminal cells.
     (link_rects, Some(layout.bounds))
 }
 
