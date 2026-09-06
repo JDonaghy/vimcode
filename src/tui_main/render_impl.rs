@@ -88,7 +88,20 @@ pub(super) fn build_screen_for_tui(
         );
     }
     let bsl_t0 = std::time::Instant::now();
-    let result = build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true);
+    // TUI's `quadraui::Backend::scrollbar_reserve()` is always `0.0` (the
+    // trait default — TUI has no overlay scrollbar chrome to dodge), so
+    // this test-only helper states it directly rather than threading a
+    // `&dyn Backend` through just to ask a question with one known answer.
+    let result = build_screen_layout(
+        engine,
+        theme,
+        &window_rects,
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let bsl_elapsed = bsl_t0.elapsed();
     if bsl_elapsed.as_millis() > 10 {
         debug_log!(
@@ -136,6 +149,7 @@ pub(super) fn build_screen_for_shell_content(
     engine: &Engine,
     theme: &Theme,
     area: Rect,
+    backend: &dyn quadraui::Backend,
 ) -> render::ScreenLayout {
     let qf_height: u16 = if engine.quickfix_open { 6 } else { 0 };
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
@@ -181,7 +195,21 @@ pub(super) fn build_screen_for_shell_content(
     };
     let (window_rects, _dividers) =
         engine.calculate_group_window_rects(content_bounds, tui_tab_bar_height);
-    build_screen_layout(engine, theme, &window_rects, 1.0, 1.0, true)
+    // #828/quadraui#776: ask the real backend instead of sniffing
+    // `char_width` inside `render.rs` — always `0.0` for TUI today (the
+    // `Backend` trait's default, since TUI has no overlay scrollbar chrome
+    // to dodge), but this is the one call site whose value should track
+    // the trait, not restate the constant.
+    build_screen_layout(
+        engine,
+        theme,
+        &window_rects,
+        1.0,
+        1.0,
+        true,
+        backend.scrollbar_reserve() as f64,
+        render::TUI_MINIMAP_SIZING,
+    )
 }
 
 /// Quickfix panel + bottom panel (terminal/debug output) rects for
@@ -1343,15 +1371,14 @@ mod tests {
             width: width.saturating_sub(editor_x),
             height: height.saturating_sub(menu_h),
         };
-        let screen = build_screen_for_shell_content(engine, &theme, area);
+        let mut tui_backend = super::backend::TuiBackend::new();
+        let screen = build_screen_for_shell_content(engine, &theme, area, &tui_backend);
         let chrome = bottom_chrome_rects_for_shell_content(engine, &screen, area);
         let tui_tbh: f64 = if engine.settings.breadcrumbs && !engine.terminal_maximized {
             2.0
         } else {
             1.0
         };
-
-        let mut tui_backend = super::backend::TuiBackend::new();
         terminal
             .draw(|frame| {
                 super::with_frame_scope(&mut tui_backend, frame, |backend, _frame| {

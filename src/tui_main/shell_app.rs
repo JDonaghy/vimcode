@@ -1810,7 +1810,7 @@ impl ShellApp for TuiShellApp {
 
         backend.set_theme(super::quadraui_tui::q_theme(&theme));
 
-        let screen = build_screen_for_shell_content(&self.engine, &theme, area);
+        let screen = build_screen_for_shell_content(&self.engine, &theme, area, backend);
 
         // ══ Editor band (#764, #735 slice 3) ═════════════════════════════
         // See `paint_editor_band` for the rung ladder and why it is one shared

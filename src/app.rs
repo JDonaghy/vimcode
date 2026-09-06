@@ -6776,6 +6776,8 @@ impl quadraui::ShellApp for App {
             cw,
             false,
             render::BREADCRUMB_ROW_HEIGHT_PX,
+            backend.scrollbar_reserve() as f64,
+            render::gtk_minimap_sizing(),
         );
 
         // Cache for click handlers (move into RefCell, then borrow back for drawing).

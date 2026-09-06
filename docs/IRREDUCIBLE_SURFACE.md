@@ -167,7 +167,55 @@ the actual remaining work.
    deletion/rewire against `quadraui::compose::FolderPickerController` landed (§1b);
    both backends now share one picker.
 
-## 6. Regenerating this
+## 6. #828: minimap sizing stays two argument sets, not one
+
+`src/render.rs`'s two `char_width > 1.0` backend sniffs (`minimap_reserved_width`,
+`build_rendered_window`'s scrollbar-reserve line) were removed in #828 by adopting
+quadraui#776's `Backend::scrollbar_reserve()` and `MinimapSizing::VsCodeParity`. The
+scrollbar-reserve one converged cleanly: the value now comes from
+`quadraui::Backend::scrollbar_reserve()`, asked once by each real caller
+(`App::render_content`, `TuiShellApp::render_content` via
+`build_screen_for_shell_content`), and `render.rs` just subtracts whatever it's given.
+
+The minimap one did **not** converge to a single `MinimapSizing` value shared by both
+backends — tried, and reverted (see `gtk_minimap_sizing`'s doc comment in `render.rs`):
+
+- `MinimapSizing::VsCodeParity::resolve_width` normalises `pane_width` into character
+  columns via the caller's own `char_width`, then converts the clamped result back —
+  correct when `target_cols`/`min`/`max` genuinely mean "columns of the caller's own
+  font". They do for TUI (whose `char_width` is always `1.0` anyway). They do **not**
+  for GTK: VS Code's minimap renders in its own small font, decoupled from the editor's,
+  so vimcode's GTK minimap width was always meant as an VS-Code-parity ~120px target
+  *independent* of the editor's font size — not 120 columns of it.
+- Feeding a real editor `char_width` (7-9px) through the shared formula moved an
+  ordinary wide GTK pane's minimap from ~120px to ~178-240px.
+  `gtk::testing::minimap::minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`
+  — driven through the real paint path, not just the helper in isolation — caught this
+  before it shipped.
+- The fix: `TUI_MINIMAP_SIZING`/`gtk_minimap_sizing()` (named and shaped after this
+  file's existing `TUI_PICKER_SIZING`/`gtk_picker_sizing()` pair) state their bounds
+  directly in the caller's own native unit (columns / raw pixels), and
+  `minimap_reserved_width` resolves them with a **forced** `char_width` of `1.0` —
+  native-unit-in, native-unit-out — rather than a real one. Each backend's own
+  `render_content` (or, for `render.rs`'s tests, each fixture) passes the matching
+  constant explicitly; `render.rs` itself never asks `char_width` which one to use.
+
+**Verdict:** ❌ **Not converged — genuine design intent, argument-forked.** The two
+`MinimapSizing` values differ because GTK's minimap font and the editor's font are
+different scales; this is the same category as the `TUI_PICKER_SIZING` /
+`gtk_picker_sizing()` pair already in this file, not an accidental duplication. The
+`char_width > 1.0` *runtime branch* is still fully gone from `src/render.rs` — the
+fork moved to an explicit, caller-supplied argument (chosen by code that already knows
+its own backend by construction), which is what #828's acceptance criterion asks for.
+
+The five other paired sizing tables #828 flagged as "also worth folding in"
+(`TUI_PICKER_SIZING`/`gtk_picker_sizing`, `TUI_TAB_SWITCHER_SIZING`/
+`gtk_tab_switcher_sizing`, `TUI_FIND_REPLACE_ANCHOR`/`GTK_FIND_REPLACE_ANCHOR`,
+`TUI_PICKER_ROWS`/`gtk_picker_rows`, `GTK_DIVIDER_METRICS`/`tui_main/mouse.rs`'s inline
+build) were **not** audited in this pass — out of scope for the two sniffs #828
+requires; still open.
+
+## 7. Regenerating this
 
 ```bash
 grep -rn -iE "do not converge|not converged|one-sided|intrinsic difference" src/
