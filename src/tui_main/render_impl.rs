@@ -1058,14 +1058,7 @@ pub(super) fn draw_rule_row_themed(
     fg: Color,
     bg: Color,
 ) {
-    draw_rule_row_q(
-        backend,
-        x,
-        y,
-        text,
-        render::to_quadraui_color(fg),
-        render::to_quadraui_color(bg),
-    );
+    draw_rule_row_q(backend, x, y, text, fg, bg);
 }
 
 /// [`draw_rule_row_themed`] over already-converted `quadraui::Color`s.

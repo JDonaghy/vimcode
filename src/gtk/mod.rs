@@ -822,7 +822,7 @@ mod chrome_paint_tests {
         let data = surface.data().expect("surface data");
 
         let bg = {
-            let c = render::to_quadraui_color(theme.tab_bar_bg);
+            let c = theme.tab_bar_bg;
             (c.r, c.g, c.b)
         };
         let bg_lum = luminance(bg);

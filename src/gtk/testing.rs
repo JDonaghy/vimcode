@@ -4932,7 +4932,7 @@ mod command_center {
         // than on `GtkDriver::find`/`screen_contains`.
         let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
         let bg = {
-            let c = crate::render::to_quadraui_color(theme.tab_bar_bg);
+            let c = theme.tab_bar_bg;
             (c.r, c.g, c.b)
         };
         assert!(
@@ -5462,8 +5462,7 @@ mod vscode_dimming {
              {VSCODE_LINE_NUMBER_FG:?}. Dimming line_number_fg is only a win \
              if line_number_active_fg still lifts the cursor row out of it"
         );
-        let active_token =
-            crate::render::to_quadraui_color(crate::render::Theme::onedark().line_number_active_fg);
+        let active_token = crate::render::Theme::onedark().line_number_active_fg;
         assert!(
             near(active, (active_token.r, active_token.g, active_token.b)),
             "the cursor line's number must paint at line_number_active_fg \
@@ -6567,11 +6566,11 @@ mod scrollbar_paint {
 
         let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
         let bg = {
-            let c = crate::render::to_quadraui_color(theme.background);
+            let c = theme.background;
             (c.r, c.g, c.b)
         };
         let thumb = {
-            let c = crate::render::to_quadraui_color(theme.scrollbar_thumb);
+            let c = theme.scrollbar_thumb;
             (c.r, c.g, c.b)
         };
         assert_ne!(
