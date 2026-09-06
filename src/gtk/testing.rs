@@ -7835,6 +7835,66 @@ mod modal_rung {
             h.driver.painted_texts()
         );
     }
+
+    /// #831 acceptance: "picker popup outside-click" black-box coverage,
+    /// named explicitly in the issue and previously covered only by the
+    /// pure-function unit test `folder_picker_click_outside_popup_dismisses`
+    /// in `render.rs` (which exercises the *folder* picker's route function
+    /// directly, not a painted popup) — nothing asserted this against the
+    /// unified picker's actual rendered surface on either backend.
+    ///
+    /// `route_modal_overlay_click`'s `PickerRoute::Dismiss` arm (an outside
+    /// click) is exercised the same way
+    /// `click_inside_tab_switcher_popup_dismisses_it` exercises the
+    /// tab-switcher's inside-click arm just above: open the picker, locate
+    /// the painted popup's cached bounds, click a point the popup's own
+    /// geometry guarantees is outside it, and assert on the painted surface
+    /// (the title vanishing) rather than only on `engine.picker_open`
+    /// flipping — the #555/#587 rule this file's tests all follow.
+    #[test]
+    fn click_outside_picker_popup_dismisses_it() {
+        let mut engine = small_engine();
+        engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+        let mut h = harness(engine, 1400, 900);
+        let (px, py, pw, ph) = h
+            .picker_popup()
+            .expect("fixture must actually paint the command palette");
+        assert!(
+            h.driver.screen_contains("Select Line Ending Sequence"),
+            "precondition: the picker's title must paint"
+        );
+        // (700, 850): `gtk_picker_sizing` centres the popup with hundreds of
+        // pixels of margin on every side in a 1400x900 window, so this point
+        // (near the bottom of the content area) is outside the popup on the
+        // y axis regardless of preview state. Deliberately NOT the window's
+        // (0, 0)/(5, 5) corner — `App::handle`'s CSD-titlebar rung
+        // (`ctx.in_title_bar`) claims a `MouseDown` there for window-drag
+        // *before* `handle_mouse_click_msg` (and therefore the modal-overlay
+        // rung this test targets) ever runs, the same chrome-ownership trap
+        // TUI's row-0 tab strip sets for
+        // `click_outside_picker_popup_dismisses_it_via_shell_app`.
+        let (ox, oy) = (700.0_f64, 850.0_f64);
+        assert!(
+            oy < py || oy >= py + ph,
+            "sanity: ({ox}, {oy}) must fall outside the painted popup bounds \
+             ({px}, {py}, {pw}, {ph})"
+        );
+
+        h.driver.click(ox as f32, oy as f32);
+        h.driver.render();
+
+        assert!(
+            h.picker_popup().is_none(),
+            "a click outside the painted popup must dismiss the picker \
+             (route_modal_overlay_click's PickerRoute::Dismiss arm)"
+        );
+        assert!(
+            !h.driver.screen_contains("Select Line Ending Sequence"),
+            "the dismissed popup's title must be gone from the painted \
+             surface, not just the cached rect cleared; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
 
 /// #815 — adopting `quadraui::FolderPickerController` on GTK, replacing the

@@ -11130,6 +11130,54 @@ mod tests {
         );
     }
 
+    /// #831 acceptance: "picker popup outside-click" black-box coverage —
+    /// the TUI half of the pair with GTK's
+    /// `click_outside_picker_popup_dismisses_it` in `src/gtk/testing.rs`.
+    /// Both backends route this click through the same
+    /// `render::route_modal_overlay_click` / `PickerRoute::Dismiss` arm, but
+    /// nothing previously drove it end to end through a `TuiDriver` and
+    /// asserted on the painted surface — only the pure-function unit test
+    /// `folder_picker_click_outside_popup_dismisses` in `render.rs`, which
+    /// exercises the unrelated *folder* picker's route function directly.
+    ///
+    /// `PickerGeometry::compute` centres the popup with `min_w: (55.0,
+    /// 60.0)`/`min_h: (16.0, 18.0)` in a 100x24 terminal at `popup_x = 22.5,
+    /// popup_y = 4.0, popup_w = 55.0, popup_h = 16.0` (no preview pane for
+    /// `LineEndings`), so column 5 is outside the popup's `x` range on every
+    /// row. Column 5 row 10 (rather than the terminal's (0, 0) corner) is
+    /// deliberate: row 0 is the `AppShell` tab strip, which the shell
+    /// adapter's own chrome click-handling claims *before* the event ever
+    /// reaches `TuiShellApp::handle` — clicking it exercises tab-bar
+    /// dispatch, not the modal-overlay rung this test targets. Row 10 is
+    /// plain editor body, matching how
+    /// `driver_click_outside_tab_switcher_popup_dismisses_and_propagates`
+    /// (this file) picks its outside point.
+    #[test]
+    fn click_outside_picker_popup_dismisses_it_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::LineEndings);
+        let title = app.engine.picker_title.clone();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen_contains(&title),
+            "precondition: the picker's title must paint; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.click(5.0, 10.0);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&title),
+            "a click outside the painted popup must dismiss the picker \
+             (route_modal_overlay_click's PickerRoute::Dismiss arm); \
+             screen:\n{screen}"
+        );
+    }
+
     /// Black-box regression for #815 (adopting
     /// `quadraui::FolderPickerController`, replacing the deleted TUI-local
     /// `FolderPickerState`): the open picker must actually *paint* its
