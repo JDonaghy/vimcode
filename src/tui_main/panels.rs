@@ -793,7 +793,10 @@ pub(super) fn render_ext_panel(
 ///
 /// The popup displays rendered markdown content and appears to the right of
 /// the sidebar at the vertical position of the hovered item.
-/// Returns (link_rects, popup_rect) where popup_rect is (x, y, w, h).
+/// Returns `(link_rects, popup_rect)`, both `quadraui::Rect`-based (#831) —
+/// the same type GTK's `render::panel_hover_popup_paint` returns, so the
+/// mouse router (`render::route_sidebar_hover` and friends) never has to
+/// know which backend painted the popup.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn render_panel_hover_popup(
     backend: &mut dyn quadraui::Backend,
@@ -803,10 +806,7 @@ pub(super) fn render_panel_hover_popup(
     sidebar_y: u16,
     sidebar_height: u16,
     term_area: Rect,
-) -> (
-    Vec<(u16, u16, u16, u16, String)>,
-    Option<(u16, u16, u16, u16)>,
-) {
+) -> (Vec<(quadraui::Rect, String)>, Option<quadraui::Rect>) {
     let Some(ref ph) = screen.panel_hover else {
         return (vec![], None);
     };
@@ -888,7 +888,7 @@ pub(super) fn render_panel_hover_popup(
     backend.set_theme(super::quadraui_tui::q_theme(theme));
     backend.draw_rich_text_popup(&popup, &layout);
 
-    let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
+    let link_rects: Vec<(quadraui::Rect, String)> = layout
         .link_hit_regions
         .iter()
         .map(|(rect, idx)| {
@@ -897,35 +897,28 @@ pub(super) fn render_panel_hover_popup(
                 .get(*idx)
                 .map(|l| l.url.clone())
                 .unwrap_or_default();
-            (
-                rect.x.round() as u16,
-                rect.y.round() as u16,
-                rect.width.round() as u16,
-                rect.height.round() as u16,
-                url,
-            )
+            (*rect, url)
         })
         .collect();
 
-    let popup_rect = Some((
-        layout.bounds.x.round() as u16,
-        layout.bounds.y.round() as u16,
-        layout.bounds.width.round() as u16,
-        layout.bounds.height.round() as u16,
-    ));
-
-    (link_rects, popup_rect)
+    (link_rects, Some(layout.bounds))
 }
 
 // ─── Editor hover popup ─────────────────────────────────────────────────────
 
-/// Render an editor hover popup via the `quadraui::RichTextPopup`
-/// primitive. Returns `(link_rects, popup_bounds, scrollbar_hit)` for
-/// mouse hit-testing — derived from the primitive's resolved layout.
+/// Render an editor hover popup via the shared `render::editor_hover_popup_paint`
+/// (#831) — this used to be its own ~90-line copy of that function's
+/// `RichTextPopup::layout` + hit-region-extraction, differing from GTK's only
+/// in rounding the result to `u16` cells instead of keeping `quadraui::Rect`'s
+/// native `f32`. Now that the caches on both backends are `quadraui::Rect`
+/// (there is no unit parameter in quadraui's layout API — TUI's cell
+/// coordinates and GTK's pixel coordinates are both plain `f32`), TUI calls
+/// the exact same paint step GTK does, with `unit_w`/`unit_h` = `1.0, 1.0`.
+///
 /// `backend` is `&mut dyn quadraui::Backend` (not the concrete `TuiBackend`)
 /// so this is callable from `TuiShellApp::render_content` (#601) — see
 /// `render_impl.rs::render_tab_bar`'s doc comment for the general rationale.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 pub(super) fn render_editor_hover_popup(
     backend: &mut dyn quadraui::Backend,
     eh: &render::EditorHoverPopupData,
@@ -934,80 +927,27 @@ pub(super) fn render_editor_hover_popup(
     term_area: Rect,
     theme: &Theme,
 ) -> (
-    Vec<(u16, u16, u16, u16, String)>,
-    Option<(u16, u16, u16, u16)>,
+    Vec<(quadraui::Rect, String)>,
+    Option<quadraui::Rect>,
     Option<render::PopupScrollbarHit>,
 ) {
-    if eh.line_text.is_empty() {
-        return (vec![], None, None);
-    }
-    let popup = render::editor_hover_to_quadraui_rich_text(eh, theme);
-    // Content width: precomputed by engine (popup_width chars) clamped to
-    // viewport - 4 to leave space for borders + minimum padding.
-    let content_w = (eh.popup_width as f32)
-        .max(10.0)
-        .min((term_area.width as f32 - 4.0).max(10.0));
     let viewport = quadraui::Rect::new(
         term_area.x as f32,
         term_area.y as f32,
         term_area.width as f32,
         term_area.height as f32,
     );
-    let measure = quadraui::RichTextPopupMeasure::new(content_w, 1.0);
-    // TUI link widths: 1 cell per char.
-    let layout = popup.layout(
+    backend.set_theme(super::quadraui_tui::q_theme(theme));
+    render::editor_hover_popup_paint(
+        backend,
+        eh,
         popup_x as f32,
         popup_y as f32,
         viewport,
-        measure,
-        |line_idx, start_byte, end_byte| {
-            popup
-                .line_text
-                .get(line_idx)
-                .map(|t| {
-                    t[start_byte.min(t.len())..end_byte.min(t.len())]
-                        .chars()
-                        .count() as f32
-                })
-                .unwrap_or(0.0)
-        },
-    );
-
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_rich_text_popup(&popup, &layout);
-
-    let link_rects: Vec<(u16, u16, u16, u16, String)> = layout
-        .link_hit_regions
-        .iter()
-        .map(|(rect, idx)| {
-            let url = popup
-                .links
-                .get(*idx)
-                .map(|l| l.url.clone())
-                .unwrap_or_default();
-            (
-                rect.x.round() as u16,
-                rect.y.round() as u16,
-                rect.width.round() as u16,
-                rect.height.round() as u16,
-                url,
-            )
-        })
-        .collect();
-
-    let popup_rect = Some((
-        layout.bounds.x.round() as u16,
-        layout.bounds.y.round() as u16,
-        layout.bounds.width.round() as u16,
-        layout.bounds.height.round() as u16,
-    ));
-    let scrollbar_hit = layout.scrollbar.map(|sb| render::PopupScrollbarHit {
-        track: sb.track,
-        thumb: sb.thumb,
-        visible_rows: render::EDITOR_HOVER_MAX_ROWS,
-        total: popup.lines.len(),
-    });
-    (link_rects, popup_rect, scrollbar_hit)
+        theme,
+        1.0,
+        1.0,
+    )
 }
 
 // ─── Extensions sidebar panel ─────────────────────────────────────────────────

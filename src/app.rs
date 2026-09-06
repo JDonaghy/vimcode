@@ -512,26 +512,23 @@ pub(crate) struct App {
     pub(crate) title_bar_interaction: RefCell<quadraui::StatusBarInteraction>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     pub(crate) last_sc_refresh: std::time::Instant,
-    /// Link hit rects populated during hover popup draw: (x, y, w, h, url, is_native).
-    #[allow(clippy::type_complexity)]
-    pub(crate) panel_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String, bool)>>>,
-    /// Popup bounding rect (x, y, w, h) — set during draw, used for motion hit-testing.
-    #[allow(dead_code, clippy::type_complexity)]
-    pub(crate) panel_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
-    /// Editor hover popup bounding rect (x, y, w, h) — set during draw, used for click hit-testing.
-    #[allow(clippy::type_complexity)]
-    pub(crate) editor_hover_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    /// Link hit rects populated during hover popup draw: (rect, url, is_native).
+    pub(crate) panel_hover_link_rects: Rc<RefCell<Vec<(quadraui::Rect, String, bool)>>>,
+    /// Popup bounding rect — set during draw, used for motion hit-testing.
+    #[allow(dead_code)]
+    pub(crate) panel_hover_popup_rect: Rc<Cell<Option<quadraui::Rect>>>,
+    /// Editor hover popup bounding rect — set during draw, used for click hit-testing.
+    pub(crate) editor_hover_popup_rect: Rc<Cell<Option<quadraui::Rect>>>,
     /// Completion popup layout — set during draw, used for hit-test in
     /// the click handler. None when the popup isn't visible.
     pub(crate) completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
     /// Context menu layout — set during draw, used for hit-test in
     /// both click and motion handlers. None when no menu is visible.
     pub(crate) context_menu_layout: Rc<RefCell<Option<quadraui::ContextMenuLayout>>>,
-    /// Tab-switcher popup bounding rect (x, y, w, h) — set during
+    /// Tab-switcher popup bounding rect — set during
     /// draw, used for `ModalStack` registration in the click
     /// handler. (B.5b Stage 7.)
-    #[allow(clippy::type_complexity)]
-    pub(crate) tab_switcher_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    pub(crate) tab_switcher_popup_rect: Rc<Cell<Option<quadraui::Rect>>>,
     /// The frame rungs this frame actually composed, in composition order
     /// (#735, folded into one sequence by #766).
     ///
@@ -568,18 +565,16 @@ pub(crate) struct App {
     /// where it could neither paint nor *clear its own click-routing cache*
     /// once the sidebar collapsed.
     pub(crate) composed_bottom_band: Rc<RefCell<Vec<render::BottomOp>>>,
-    /// Picker/command-palette popup rect `(x, y, w, h)` **as the last frame
+    /// Picker/command-palette popup rect **as the last frame
     /// actually painted it** — see [`App::compute_picker_popup_bounds`] for
     /// why the click path must not re-derive it (#555).
-    #[allow(clippy::type_complexity)]
-    pub(crate) picker_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
-    /// Folder-picker popup rect `(x, y, w, h)` **as the last frame actually
-    /// painted it** (#815) — same `(x, y, w, h)` shape and the same "click
+    pub(crate) picker_popup_rect: Rc<Cell<Option<quadraui::Rect>>>,
+    /// Folder-picker popup rect **as the last frame actually
+    /// painted it** (#815) — same shape and the same "click
     /// path reads the painted rect, never re-derives it" rationale as
     /// [`Self::picker_popup_rect`] just above. Cleared whenever the picker
     /// is closed, alongside the other overlay-tail caches (#766).
-    #[allow(clippy::type_complexity)]
-    pub(crate) folder_picker_popup_rect: Rc<Cell<Option<(f64, f64, f64, f64)>>>,
+    pub(crate) folder_picker_popup_rect: Rc<Cell<Option<quadraui::Rect>>>,
     /// Line height the last frame actually painted with, published by
     /// `render_content` — see [`App::painted_line_height`] (#555).
     pub(crate) painted_line_height: Rc<Cell<Option<f64>>>,
@@ -602,9 +597,8 @@ pub(crate) struct App {
     /// offsets — the same "locate targets, never hardcode coords" rule
     /// `screen_layout` / `tab_slots_abs` exist for (#544).
     pub(crate) painted_sidebar_bounds: Rc<Cell<Option<quadraui::Rect>>>,
-    /// Link hit rects populated during editor hover popup draw: (x, y, w, h, url).
-    #[allow(clippy::type_complexity)]
-    pub(crate) editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
+    /// Link hit rects populated during editor hover popup draw: (rect, url).
+    pub(crate) editor_hover_link_rects: Rc<RefCell<Vec<(quadraui::Rect, String)>>>,
     /// Editor hover popup scrollbar geometry (#215). Populated by
     /// `draw_editor_hover_popup`; consumed by click + drag handlers
     /// in this file.
@@ -2188,23 +2182,11 @@ impl App {
             let engine = self.engine.borrow();
             (engine.editor_hover.is_some(), engine.editor_hover_has_focus)
         };
-        let links: Vec<(quadraui::Rect, String)> = self
-            .editor_hover_link_rects
-            .borrow()
-            .iter()
-            .map(|(lx, ly, lw, lh, uri)| {
-                (
-                    quadraui::Rect::new(*lx as f32, *ly as f32, *lw as f32, *lh as f32),
-                    uri.clone(),
-                )
-            })
-            .collect();
+        let links = self.editor_hover_link_rects.borrow();
         let route = render::route_editor_hover_popup_click(
             visible,
             &render::EditorHoverPopupState {
-                popup: self.editor_hover_popup_rect.get().map(|(px, py, pw, ph)| {
-                    quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
-                }),
+                popup: self.editor_hover_popup_rect.get(),
                 links: &links,
                 scrollbar: self.editor_hover_scrollbar.get(),
                 has_focus,
@@ -2279,16 +2261,8 @@ impl App {
         let stack_rc = self.backend.borrow().modal_stack_handle();
         let mut stack = stack_rc.borrow_mut();
         match (visible, rect) {
-            (true, Some((px, py, pw, ph))) => {
-                stack.push(
-                    editor_hover_id,
-                    quadraui::Rect {
-                        x: px as f32,
-                        y: py as f32,
-                        width: pw as f32,
-                        height: ph as f32,
-                    },
-                );
+            (true, Some(rect)) => {
+                stack.push(editor_hover_id, rect);
             }
             _ => {
                 stack.pop(&editor_hover_id);
@@ -2903,14 +2877,8 @@ impl App {
                     cw as f32,
                     lh as f32,
                 );
-                self.editor_hover_popup_rect
-                    .set(rect.map(|(rx, ry, rw, rh)| (rx as f64, ry as f64, rw as f64, rh as f64)));
-                *self.editor_hover_link_rects.borrow_mut() = links
-                    .into_iter()
-                    .map(|(lx, ly, lw, lh2, url)| {
-                        (lx as f64, ly as f64, lw as f64, lh2 as f64, url)
-                    })
-                    .collect();
+                self.editor_hover_popup_rect.set(rect);
+                *self.editor_hover_link_rects.borrow_mut() = links;
                 self.editor_hover_scrollbar.set(sb);
             }
         }
@@ -3434,15 +3402,8 @@ impl App {
                         main.width,
                         lh as f32,
                     );
-                    self.panel_hover_popup_rect.set(
-                        rect.map(|(rx, ry, rw, rh)| (rx as f64, ry as f64, rw as f64, rh as f64)),
-                    );
-                    *self.panel_hover_link_rects.borrow_mut() = links
-                        .into_iter()
-                        .map(|(lx, ly, lw, lh2, url, is_native)| {
-                            (lx as f64, ly as f64, lw as f64, lh2 as f64, url, is_native)
-                        })
-                        .collect();
+                    self.panel_hover_popup_rect.set(rect);
+                    *self.panel_hover_link_rects.borrow_mut() = links;
                     composed_bottom.push(render::BottomOp::PanelHover);
                 }
             }
@@ -3603,16 +3564,14 @@ impl App {
         let dialog = self.dialog_layout.borrow().clone();
         let completion = self.completion_layout.borrow().clone();
         let context_menu = self.context_menu_layout.borrow().clone();
-        let tab_switcher_bounds = self.tab_switcher_popup_rect.get().map(|(px, py, pw, ph)| {
-            quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
-        });
+        let tab_switcher_bounds = self.tab_switcher_popup_rect.get();
         let lh = self.painted_line_height() as f32;
         // Both geometries come from what the last frame PAINTED — the picker's
         // own published rect, and the `FindReplacePanel` the frame was built
         // from — never a re-derivation off the drawing-area size (#555/#582).
-        let picker = self.picker_popup_rect.get().map(|(px, py, pw, ph)| {
+        let picker = self.picker_popup_rect.get().map(|rect| {
             render::PickerHitGeometry::new(
-                quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32),
+                rect,
                 lh,
                 engine_ref.picker_preview.is_some(),
                 &render::gtk_picker_rows(lh),
@@ -3669,14 +3628,14 @@ impl App {
     /// GTK.
     fn apply_picker_route(&mut self, route: render::PickerRoute) {
         let picker_id = quadraui::WidgetId::new("picker");
-        let Some((px, py, pw, ph)) = self.picker_popup_rect.get() else {
+        let Some(rect) = self.picker_popup_rect.get() else {
             return;
         };
         let lh = self.painted_line_height() as f32;
         let geo = {
             let engine = self.engine.borrow();
             render::PickerHitGeometry::new(
-                quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32),
+                rect,
                 lh,
                 engine.picker_preview.is_some(),
                 &render::gtk_picker_rows(lh),
@@ -4416,7 +4375,7 @@ impl App {
     /// dropdown either missed the modal entirely or resolved to the wrong
     /// result row. That is what made the breadcrumb dropdown look inert once
     /// it finally started painting.
-    fn compute_picker_popup_bounds(&self, width: f64, height: f64) -> (f64, f64, f64, f64) {
+    fn compute_picker_popup_bounds(&self, width: f64, height: f64) -> quadraui::Rect {
         if let Some(rect) = self.picker_popup_rect.get() {
             return rect;
         }
@@ -4430,12 +4389,7 @@ impl App {
         };
         let geo =
             render::PickerGeometry::compute(width as f32, height as f32, has_preview, &sizing);
-        (
-            geo.popup_x as f64,
-            geo.popup_y as f64,
-            geo.popup_w as f64,
-            geo.popup_h as f64,
-        )
+        quadraui::Rect::new(geo.popup_x, geo.popup_y, geo.popup_w, geo.popup_h)
     }
 
     // ── Drag-follow-through rung (#756, mouse-ladder slice 6) ────────────────
@@ -4457,16 +4411,8 @@ impl App {
             let stack_rc = self.backend.borrow().modal_stack_handle();
             let mut stack = stack_rc.borrow_mut();
             if picker_open {
-                let (px, py, pw, ph) = self.compute_picker_popup_bounds(width, height);
-                stack.push(
-                    picker_id,
-                    quadraui::Rect {
-                        x: px as f32,
-                        y: py as f32,
-                        width: pw as f32,
-                        height: ph as f32,
-                    },
-                );
+                let rect = self.compute_picker_popup_bounds(width, height);
+                stack.push(picker_id, rect);
             } else {
                 stack.pop(&picker_id);
             }
@@ -4579,7 +4525,11 @@ impl App {
                 }
             }
             render::MouseDragRoute::HoverPopupSelection => {
-                if let Some((px, py, _pw, _ph)) = self.editor_hover_popup_rect.get() {
+                if let Some(quadraui::Rect { x: px, y: py, .. }) =
+                    self.editor_hover_popup_rect.get()
+                {
+                    let px = px as f64;
+                    let py = py as f64;
                     let padding = 4.0;
                     let lh = self.cached_line_height.max(1.0);
                     let scroll = self
@@ -5767,10 +5717,9 @@ impl App {
     /// `Backend::viewport()` call, since this method has no live `backend`
     /// handle.
     fn apply_folder_picker_event(&mut self, event: &quadraui::UiEvent) {
-        let Some((x, y, w, h)) = self.folder_picker_popup_rect.get() else {
+        let Some(popup_rect) = self.folder_picker_popup_rect.get() else {
             return;
         };
-        let popup_rect = quadraui::Rect::new(x as f32, y as f32, w as f32, h as f32);
         let lh = self.cached_line_height.max(1.0) as f32;
         let visible_rows = render::folder_picker_visible_rows(popup_rect, lh);
         let outcome = {
@@ -5799,7 +5748,7 @@ impl App {
     /// / `render::set_folder_picker_selected`, same "select row" / "consume"
     /// / "dismiss" outcomes.
     fn route_and_apply_folder_picker_click(&mut self, x: f64, y: f64) {
-        let Some((rx, ry, rw, rh)) = self.folder_picker_popup_rect.get() else {
+        let Some(rect) = self.folder_picker_popup_rect.get() else {
             // No painted rect to hit-test against (shouldn't happen while
             // `folder_picker` is open, since `render_content` always caches
             // one when it paints) — dismiss defensively rather than leave an
@@ -5808,7 +5757,6 @@ impl App {
             self.draw_needed.set(true);
             return;
         };
-        let rect = quadraui::Rect::new(rx as f32, ry as f32, rw as f32, rh as f32);
         let lh = self.cached_line_height.max(1.0) as f32;
         let Some((scroll_top, total_filtered)) = self
             .folder_picker
@@ -6156,13 +6104,12 @@ impl App {
         if let UiEvent::MouseMoved { position, .. } = &event {
             if let Some(sb) = ctx.layout.sidebar_content_bounds {
                 let lh = backend.line_height();
-                let on_popup = self
-                    .panel_hover_popup_rect
-                    .get()
-                    .is_some_and(|(px, py, pw, ph)| {
-                        let (mx, my) = (position.x as f64, position.y as f64);
-                        mx >= px && mx < px + pw && my >= py && my < py + ph
-                    });
+                let on_popup = self.panel_hover_popup_rect.get().is_some_and(|r| {
+                    position.x >= r.x
+                        && position.x < r.x + r.width
+                        && position.y >= r.y
+                        && position.y < r.y + r.height
+                });
                 let owner = render::sidebar_owner(&self.engine.borrow());
                 let changed = render::route_sidebar_hover(
                     &mut self.engine.borrow_mut(),
@@ -7103,12 +7050,7 @@ impl quadraui::ShellApp for App {
                         picker.render(popup_rect, backend);
                         // Cache the *painted* rect (#582/#646) — key/mouse
                         // handling read this instead of re-deriving it.
-                        self.folder_picker_popup_rect.set(Some((
-                            popup_rect.x as f64,
-                            popup_rect.y as f64,
-                            popup_rect.width as f64,
-                            popup_rect.height as f64,
-                        )));
+                        self.folder_picker_popup_rect.set(Some(popup_rect));
                         composed.push(render::FrameOp::FolderPicker);
                     }
                 }
@@ -7214,12 +7156,7 @@ impl quadraui::ShellApp for App {
                             &render::gtk_picker_sizing(lh as f32),
                         );
                         // Hand the *painted* rect to the click/drag handlers (#555).
-                        self.picker_popup_rect.set(Some((
-                            rect.x as f64,
-                            rect.y as f64,
-                            rect.width as f64,
-                            rect.height as f64,
-                        )));
+                        self.picker_popup_rect.set(Some(rect));
                         composed.push(render::FrameOp::UnifiedPicker);
                     }
                 }
@@ -7251,12 +7188,7 @@ impl quadraui::ShellApp for App {
                             let list =
                                 render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
                             backend.draw_list(geo.bounds, &list);
-                            self.tab_switcher_popup_rect.set(Some((
-                                geo.bounds.x as f64,
-                                geo.bounds.y as f64,
-                                geo.bounds.width as f64,
-                                geo.bounds.height as f64,
-                            )));
+                            self.tab_switcher_popup_rect.set(Some(geo.bounds));
                             composed.push(render::FrameOp::TabSwitcher);
                         }
                     }

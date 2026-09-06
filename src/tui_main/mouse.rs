@@ -273,10 +273,10 @@ pub(super) fn handle_mouse(
     explorer_drag_src: &mut Option<usize>,
     explorer_drag_active: &mut Option<(usize, Option<usize>)>,
     tab_drag: &mut render::TabDragState,
-    hover_link_rects: &[(u16, u16, u16, u16, String)],
-    hover_popup_rect: Option<(u16, u16, u16, u16)>,
-    editor_hover_popup_rect: Option<(u16, u16, u16, u16)>,
-    editor_hover_link_rects: &[(u16, u16, u16, u16, String)],
+    hover_link_rects: &[(quadraui::Rect, String)],
+    hover_popup_rect: Option<quadraui::Rect>,
+    editor_hover_popup_rect: Option<quadraui::Rect>,
+    editor_hover_link_rects: &[(quadraui::Rect, String)],
     editor_hover_scrollbar: Option<crate::render::PopupScrollbarHit>,
     hover_selecting: &mut bool,
     fr_input_dragging: &mut bool,
@@ -326,13 +326,20 @@ pub(super) fn handle_mouse(
     // Check if the mouse cursor is currently inside or adjacent to the hover
     // popup bounding rect. We include 1 column to the left (the sidebar
     // separator) so the popup doesn't dismiss while the mouse crosses to it.
-    let mouse_on_hover_popup = hover_popup_rect.is_some_and(|(px, py, pw, ph)| {
-        col >= px.saturating_sub(1) && col < px + pw && row >= py && row < py + ph
+    let mouse_on_hover_popup = hover_popup_rect.is_some_and(|r| {
+        (col as f32) >= r.x - 1.0
+            && (col as f32) < r.x + r.width
+            && (row as f32) >= r.y
+            && (row as f32) < r.y + r.height
     });
 
     // Check if mouse is on the editor hover popup (exact bounds).
-    let mouse_on_editor_hover = editor_hover_popup_rect
-        .is_some_and(|(px, py, pw, ph)| col >= px && col < px + pw && row >= py && row < py + ph);
+    let mouse_on_editor_hover = editor_hover_popup_rect.is_some_and(|r| {
+        (col as f32) >= r.x
+            && (col as f32) < r.x + r.width
+            && (row as f32) >= r.y
+            && (row as f32) < r.y + r.height
+    });
 
     // Reconcile the editor hover popup with the modal stack (#216).
     // Push whenever the popup is visible — even unfocused. Right-click
@@ -341,16 +348,8 @@ pub(super) fn handle_mouse(
     {
         let editor_hover_id = quadraui::WidgetId::new("editor_hover");
         match (engine.editor_hover.is_some(), editor_hover_popup_rect) {
-            (true, Some((px, py, pw, ph))) => {
-                modal_stack.push(
-                    editor_hover_id,
-                    quadraui::Rect {
-                        x: px as f32,
-                        y: py as f32,
-                        width: pw as f32,
-                        height: ph as f32,
-                    },
-                );
+            (true, Some(rect)) => {
+                modal_stack.push(editor_hover_id, rect);
             }
             _ => {
                 modal_stack.pop(&editor_hover_id);
@@ -619,8 +618,11 @@ pub(super) fn handle_mouse(
     // ── Hover link click-to-copy ────────────────────────────────────────────────
     if !hover_link_rects.is_empty() {
         if let MouseEventKind::Down(MouseButton::Left) = ev.kind {
-            for &(lx, ly, lw, _lh, ref url) in hover_link_rects {
-                if row == ly && col >= lx && col < lx + lw {
+            for (rect, url) in hover_link_rects {
+                if (row as f32) == rect.y
+                    && (col as f32) >= rect.x
+                    && (col as f32) < rect.x + rect.width
+                {
                     if url.starts_with("command:") {
                         engine.execute_command_uri(url);
                     } else {
@@ -850,7 +852,8 @@ pub(super) fn handle_mouse(
                     apply_scrollbar_drag(drag_state, point, engine, sidebar);
                 }
                 render::MouseDragRoute::HoverPopupSelection => {
-                    if let Some((px, py, _pw, _ph)) = editor_hover_popup_rect {
+                    if let Some(rect) = editor_hover_popup_rect {
+                        let (px, py) = (rect.x.round() as u16, rect.y.round() as u16);
                         let scroll = engine
                             .editor_hover
                             .as_ref()
@@ -1539,14 +1542,11 @@ pub(super) fn handle_mouse(
     // did not: the popup paints on top of the editor, so it must also win the
     // click that lands on it (#229/#486).
     {
-        let popup_links = editor_hover_popup_link_rects(editor_hover_link_rects);
         let route = render::route_editor_hover_popup_click(
             engine.editor_hover.is_some(),
             &render::EditorHoverPopupState {
-                popup: editor_hover_popup_rect.map(|(px, py, pw, ph)| {
-                    quadraui::Rect::new(px as f32, py as f32, pw as f32, ph as f32)
-                }),
-                links: &popup_links,
+                popup: editor_hover_popup_rect,
+                links: editor_hover_link_rects,
                 scrollbar: editor_hover_scrollbar,
                 has_focus: engine.editor_hover_has_focus,
                 // TUI measures in whole cells: the popup's border eats one
@@ -2657,27 +2657,6 @@ pub(super) fn handle_mouse(
     }
 
     sidebar_width
-}
-
-/// Lift the TUI's cached `(col, row, w, h, uri)` hover-link tuples into the
-/// `(Rect, String)` pairs the shared hover-popup rung takes.
-///
-/// A zero-height rect is widened to one cell: `render_impl` only ever paints
-/// links on a single row, and the old TUI hit test encoded that by comparing
-/// `row == ly` and ignoring the height outright. The shared router does a real
-/// half-open rect test, so the height has to be honest.
-fn editor_hover_popup_link_rects(
-    rects: &[(u16, u16, u16, u16, String)],
-) -> Vec<(quadraui::Rect, String)> {
-    rects
-        .iter()
-        .map(|(lx, ly, lw, lh, uri)| {
-            (
-                quadraui::Rect::new(*lx as f32, *ly as f32, *lw as f32, (*lh).max(1) as f32),
-                uri.clone(),
-            )
-        })
-        .collect()
 }
 
 /// The bits of `handle_mouse`'s own layout arithmetic the chrome rung needs to
