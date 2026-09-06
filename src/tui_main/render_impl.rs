@@ -349,8 +349,8 @@ pub(super) fn paint_editor_popups(
     area: Rect,
     theme: &Theme,
     completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
-    editor_hover_link_rects_out: &mut Vec<(u16, u16, u16, u16, String)>,
-    editor_hover_popup_rect_out: &mut Option<(u16, u16, u16, u16)>,
+    editor_hover_link_rects_out: &mut Vec<(quadraui::Rect, String)>,
+    editor_hover_popup_rect_out: &mut Option<quadraui::Rect>,
     editor_hover_scrollbar_out: &mut Option<render::PopupScrollbarHit>,
 ) {
     let viewport = quadraui::Rect::new(

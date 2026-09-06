@@ -366,11 +366,14 @@ use quadraui::{Reaction, ShellApp, ShellContext, UiEvent};
 
 use super::*;
 
-/// Link hit rects from a hover popup render: `(x, y, w, h, url)`, matching
+/// Link hit rects from a hover popup render: `(rect, url)`, matching
 /// `event_loop`'s `hover_link_rects`/`editor_hover_link_rects` locals
 /// verbatim. Named alias so the `TuiShellApp` fields below don't trip
-/// clippy's `type_complexity` lint.
-type HoverLinkRects = Vec<(u16, u16, u16, u16, String)>;
+/// clippy's `type_complexity` lint. `quadraui::Rect` (#831) — TUI passes
+/// cell coordinates as `f32`, same as GTK's pixel coordinates; there is no
+/// unit parameter in quadraui's layout API, so both backends share this
+/// exact type.
+type HoverLinkRects = Vec<(quadraui::Rect, String)>;
 
 /// Activity-bar item id for the menu hamburger.
 ///
@@ -434,8 +437,8 @@ pub struct TuiShellApp {
     pending_startup_msg: Option<String>,
     had_popup_overlay: Cell<bool>,
     hover_link_rects: RefCell<HoverLinkRects>,
-    hover_popup_rect: Cell<Option<(u16, u16, u16, u16)>>,
-    editor_hover_popup_rect: Cell<Option<(u16, u16, u16, u16)>>,
+    hover_popup_rect: Cell<Option<quadraui::Rect>>,
+    editor_hover_popup_rect: Cell<Option<quadraui::Rect>>,
     editor_hover_link_rects: RefCell<HoverLinkRects>,
     editor_hover_scrollbar: RefCell<Option<render::PopupScrollbarHit>>,
     completion_layout: RefCell<Option<quadraui::CompletionsLayout>>,
@@ -694,13 +697,13 @@ impl TuiShellApp {
                 //
                 // The rasteriser stays per-backend here — the `EditorOp
                 // ::Windows` precedent. TUI's `hover_popup_rect` /
-                // `hover_link_rects` caches are `u16` cell tuples that the
-                // mouse router reads directly, where GTK's are `f64` pixels
-                // carrying an extra `is_native` flag; converging the two cache
-                // *shapes* is a mouse-routing change, not a composition one,
-                // and belongs with whichever slice owns that. What #765 fixes
-                // is that the rung is now composed — and cleared — at the top
-                // level on both backends.
+                // `hover_link_rects` caches are `quadraui::Rect` now (#831),
+                // same as GTK's — GTK's link rects still carry a trailing
+                // `is_native` flag TUI's don't need, so the two `Vec` element
+                // shapes aren't byte-identical, but both express the rect
+                // itself in the one shared type rather than two backend-local
+                // tuple layouts. What #765 fixes is that the rung is now
+                // composed — and cleared — at the top level on both backends.
                 render::BottomOp::PanelHover => {
                     let Some(sb) = layout.sidebar_content_bounds else {
                         continue;

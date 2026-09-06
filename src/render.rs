@@ -1504,9 +1504,10 @@ pub fn editor_hover_to_quadraui_rich_text(
 /// `char_width, line_height` in pixels for GTK. `popup_x` / `popup_y` /
 /// `viewport` must already be expressed in that same space.
 ///
-/// Returns `(link_rects, popup_bounds, scrollbar_hit)` in the caller's
-/// units, for mouse hit-testing — mirrors
-/// `tui_main::panels::render_editor_hover_popup`'s return shape.
+/// Returns `(link_rects, popup_bounds, scrollbar_hit)` — all `quadraui::Rect`,
+/// in the caller's units — for mouse hit-testing. TUI calls this directly
+/// too (`render_impl.rs::paint_editor_popups`, unit_w/unit_h = 1.0); there is
+/// no per-backend copy of this geometry any more (#831).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn editor_hover_popup_paint(
     backend: &mut dyn quadraui::Backend,
@@ -1518,8 +1519,8 @@ pub fn editor_hover_popup_paint(
     unit_w: f32,
     unit_h: f32,
 ) -> (
-    Vec<(f32, f32, f32, f32, String)>,
-    Option<(f32, f32, f32, f32)>,
+    Vec<(quadraui::Rect, String)>,
+    Option<quadraui::Rect>,
     Option<PopupScrollbarHit>,
 ) {
     if eh.line_text.is_empty() {
@@ -1551,7 +1552,7 @@ pub fn editor_hover_popup_paint(
 
     backend.draw_rich_text_popup(&popup, &layout);
 
-    let link_rects: Vec<(f32, f32, f32, f32, String)> = layout
+    let link_rects: Vec<(quadraui::Rect, String)> = layout
         .link_hit_regions
         .iter()
         .map(|(rect, idx)| {
@@ -1560,16 +1561,11 @@ pub fn editor_hover_popup_paint(
                 .get(*idx)
                 .map(|l| l.url.clone())
                 .unwrap_or_default();
-            (rect.x, rect.y, rect.width, rect.height, url)
+            (*rect, url)
         })
         .collect();
 
-    let popup_rect = Some((
-        layout.bounds.x,
-        layout.bounds.y,
-        layout.bounds.width,
-        layout.bounds.height,
-    ));
+    let popup_rect = Some(layout.bounds);
     let scrollbar_hit = layout.scrollbar.map(|sb| PopupScrollbarHit {
         track: sb.track,
         thumb: sb.thumb,
@@ -8773,10 +8769,7 @@ pub fn panel_hover_popup_paint(
     viewport: quadraui::Rect,
     unit_w: f32,
     unit_h: f32,
-) -> (
-    Vec<(f32, f32, f32, f32, String, bool)>,
-    Option<(f32, f32, f32, f32)>,
-) {
+) -> (Vec<(quadraui::Rect, String, bool)>, Option<quadraui::Rect>) {
     let Some(ref hover) = screen.panel_hover else {
         return (vec![], None);
     };
@@ -8821,7 +8814,7 @@ pub fn panel_hover_popup_paint(
 
     backend.draw_rich_text_popup(&popup, &layout);
 
-    let link_rects: Vec<(f32, f32, f32, f32, String, bool)> = layout
+    let link_rects: Vec<(quadraui::Rect, String, bool)> = layout
         .link_hit_regions
         .iter()
         .map(|(rect, idx)| {
@@ -8830,16 +8823,11 @@ pub fn panel_hover_popup_paint(
                 .get(*idx)
                 .map(|l| l.url.clone())
                 .unwrap_or_default();
-            (rect.x, rect.y, rect.width, rect.height, url, is_native)
+            (*rect, url, is_native)
         })
         .collect();
 
-    let popup_rect = Some((
-        layout.bounds.x,
-        layout.bounds.y,
-        layout.bounds.width,
-        layout.bounds.height,
-    ));
+    let popup_rect = Some(layout.bounds);
     (link_rects, popup_rect)
 }
 

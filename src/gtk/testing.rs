@@ -78,11 +78,10 @@ pub struct Harness<A: AppLogic> {
     /// — the source for per-editor-window pixel rects (see
     /// [`Self::window_center`]).
     pub screen_layout: Rc<RefCell<Option<crate::render::ScreenLayout>>>,
-    /// Picker/command-palette popup rect `(x, y, w, h)` the last frame
+    /// Picker/command-palette popup rect the last frame
     /// actually painted, or `None` if that frame drew no picker — see
     /// [`Self::picker_popup`] (#555).
-    #[allow(clippy::type_complexity)]
-    pub picker_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    pub picker_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// Line height the last frame actually painted with (#555).
     pub painted_line_height: Rc<std::cell::Cell<Option<f64>>>,
     /// Character-cell advance (pixels) the shell last reported to `App`.
@@ -94,30 +93,26 @@ pub struct Harness<A: AppLogic> {
     /// frame drew no completion popup — the completion twin of
     /// [`Self::picker_popup_rect`] (#669).
     pub completion_layout: Rc<RefCell<Option<quadraui::CompletionsLayout>>>,
-    /// Editor hover (rich markdown) popup bounds `(x, y, w, h)` the last
+    /// Editor hover (rich markdown) popup bounds the last
     /// frame painted, or `None` if that frame drew no editor hover popup
     /// (#669).
-    #[allow(clippy::type_complexity)]
-    pub editor_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    pub editor_hover_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// The editor hover popup's painted scrollbar track/thumb, or `None` when
     /// its content fits. Exposed for #755's scrollbar-rung coverage: tests
     /// aim at the *painted* thumb rather than hardcoding a pixel.
     pub editor_hover_scrollbar: Rc<std::cell::Cell<Option<crate::render::PopupScrollbarHit>>>,
-    /// The editor hover popup's painted link rects `(x, y, w, h, uri)`.
+    /// The editor hover popup's painted link rects (rect, uri).
     /// Exposed for #755's link-rung coverage, for the same reason as the
     /// scrollbar above: aim at what was painted, never at a hardcoded pixel.
-    #[allow(clippy::type_complexity)]
-    pub editor_hover_link_rects: Rc<RefCell<Vec<(f64, f64, f64, f64, String)>>>,
-    /// Sidebar-item hover popup bounds `(x, y, w, h)` the last frame painted,
+    pub editor_hover_link_rects: Rc<RefCell<Vec<(quadraui::Rect, String)>>>,
+    /// Sidebar-item hover popup bounds the last frame painted,
     /// or `None` if that frame drew no panel-hover popup (#670).
-    #[allow(clippy::type_complexity)]
-    pub panel_hover_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
-    /// Tab-switcher popup bounds `(x, y, w, h)` the last frame painted, or
+    pub panel_hover_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
+    /// Tab-switcher popup bounds the last frame painted, or
     /// `None` if that frame drew no tab switcher (#671). Same field
     /// `handle_mouse_press`'s "Tab switcher modal arbitration" block reads
     /// for click routing (`App::tab_switcher_popup_rect`).
-    #[allow(clippy::type_complexity)]
-    pub tab_switcher_popup_rect: Rc<std::cell::Cell<Option<(f64, f64, f64, f64)>>>,
+    pub tab_switcher_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// The frame rungs the last frame actually composed, in composition order
     /// (#735, folded into one sequence by #766). The GTK half of the
     /// cross-backend sequence-equality assertion — `TuiShellApp` carries the
@@ -358,7 +353,9 @@ impl<A: AppLogic> Harness<A> {
     /// `engine.picker_open` flipped (#555).
     #[allow(clippy::type_complexity)]
     pub fn picker_popup(&self) -> Option<(f64, f64, f64, f64)> {
-        self.picker_popup_rect.get()
+        self.picker_popup_rect
+            .get()
+            .map(|r| (r.x as f64, r.y as f64, r.width as f64, r.height as f64))
     }
 
     /// Line height the last frame painted with — the value every painted-
@@ -3930,10 +3927,10 @@ mod editor_popups {
             false,
         );
         let h = harness(engine, 1400, 900);
-        let (_, _, pw, ph) = h.editor_hover_popup_rect.get().expect(
+        let rect = h.editor_hover_popup_rect.get().expect(
             "editor hover popup must cache its bounds for the click + drag handlers (#215)",
         );
-        assert!(pw > 0.0 && ph > 0.0);
+        assert!(rect.width > 0.0 && rect.height > 0.0);
     }
 
     /// #821: hover popups adopt `quadraui::compose::markdown::render_markdown_to_styled`
@@ -3989,7 +3986,7 @@ mod editor_popups {
         assert!(
             link_rects
                 .iter()
-                .any(|(_, _, _, _, uri)| uri == "https://example.com/docs821"),
+                .any(|(_, uri)| uri == "https://example.com/docs821"),
             "the bare URL must be linkified into a real clickable link rect; got {link_rects:?}"
         );
     }
@@ -4165,10 +4162,16 @@ mod panel_surfaces {
             "**M** `src/main.rs` — modified",
         );
         let mut with_h = harness(engine, 1400, 900);
-        let (px, py, pw, ph) = with_h
+        let rect = with_h
             .panel_hover_popup_rect
             .get()
             .expect("panel hover popup must cache its bounds for a future click handler");
+        let (px, py, pw, ph) = (
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+        );
         assert!(pw > 0.0 && ph > 0.0);
 
         let mut without_h = harness(small_engine(), 1400, 900);
@@ -4354,10 +4357,16 @@ mod chrome_surfaces {
             "fixture must actually open the switcher"
         );
         let mut with_h = harness(engine, 1400, 900);
-        let (px, py, pw, ph) = with_h
+        let rect = with_h
             .tab_switcher_popup_rect
             .get()
             .expect("tab switcher popup must cache its bounds for click routing (#671)");
+        let (px, py, pw, ph) = (
+            rect.x as f64,
+            rect.y as f64,
+            rect.width as f64,
+            rect.height as f64,
+        );
         assert!(pw > 0.0 && ph > 0.0);
 
         let mut without_h = harness(engine_with_two_tabs(), 1400, 900);
@@ -4509,7 +4518,7 @@ mod chrome_surfaces {
         let mut engine = engine_with_two_tabs();
         engine.open_tab_switcher();
         let mut h = harness(engine, 1400, 900);
-        let (px, py, pw, ph) = h
+        let rect = h
             .tab_switcher_popup_rect
             .get()
             .expect("the painted popup must cache its bounds for the router");
@@ -4519,7 +4528,7 @@ mod chrome_surfaces {
         );
 
         h.driver
-            .click((px + pw / 2.0) as f32, (py + ph / 2.0) as f32);
+            .click(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
         h.driver.render();
 
         assert!(
@@ -7599,7 +7608,7 @@ mod bottom_band_order {
             .get()
             .expect("the composed hover rung must publish the rect it painted");
         assert!(
-            rect.2 > 0.0 && rect.3 > 0.0,
+            rect.width > 0.0 && rect.height > 0.0,
             "the popup must paint a non-degenerate box, got {rect:?}"
         );
     }
@@ -8374,7 +8383,7 @@ mod editor_mouse_rungs {
             h.driver.painted_texts()
         );
 
-        let (lx, ly, lw, lh, uri) = h
+        let (rect, uri) = h
             .editor_hover_link_rects
             .borrow()
             .first()
@@ -8383,7 +8392,7 @@ mod editor_mouse_rungs {
         assert_eq!(uri, "command:definition");
         h.driver.dispatch(quadraui::UiEvent::DoubleClick {
             widget: None,
-            position: quadraui::Point::new((lx + lw / 2.0) as f32, (ly + lh / 2.0) as f32),
+            position: quadraui::Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0),
         });
         h.driver.render();
 
