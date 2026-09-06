@@ -10646,6 +10646,80 @@ mod tests {
         );
     }
 
+    /// #828 acceptance (driver tier): "minimap width at narrow and wide
+    /// viewports" — the TUI half. Measures the real painted braille strip's
+    /// *column width* (via `braille_col`, this module's own "locate the
+    /// strip by its paint signature" helper) at two different terminal
+    /// widths and cross-checks each against `TUI_MINIMAP_SIZING`'s own
+    /// `resolve_width` fed the same real pane width — the same "driven
+    /// through the real paint path, cross-checked against the formula"
+    /// shape as GTK's
+    /// `minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one` /
+    /// `minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`
+    /// (`src/gtk/testing.rs`).
+    ///
+    /// A future call-site miswiring (e.g. `build_screen_for_shell_content`
+    /// accidentally forwarding [`crate::render::gtk_minimap_sizing`] instead
+    /// of [`crate::render::TUI_MINIMAP_SIZING`]) would be caught here: GTK's
+    /// sizing table is pixel-denominated (floor 48, ceiling 240) but this
+    /// call always forwards `char_width = 1.0`, so a wrongly-wired GTK table
+    /// would paint a *48-column-wide* strip on the 40-column-wide pane below
+    /// — more than the entire pane — instead of the expected 6.
+    ///
+    /// **Verified RED**: hand-editing `build_screen_for_shell_content`'s
+    /// (`tui_main/render_impl.rs`) `render::TUI_MINIMAP_SIZING` argument to
+    /// `render::gtk_minimap_sizing()` paints a strip wide enough to consume
+    /// the entire 40-column pane (no room left for `"line "` text at all,
+    /// as `braille_col` finds braille starting immediately after the
+    /// gutter) — the `assert_eq!` fails on the 40-column iteration —
+    /// confirmed by hand, reverted before landing this test.
+    #[test]
+    fn minimap_strip_width_matches_the_formula_at_narrow_and_wide_terminal_widths_via_shell_app() {
+        /// One row's real, painted strip width in columns: the distance from
+        /// [`braille_col`]'s hit to the row's own right edge (the strip
+        /// paints flush against it, with no sidebar/activity-bar chrome to
+        /// its right — `app_with_shaped_buffer_no_sidebar`).
+        fn painted_strip_width(screen: &str, row: usize, total_cols: usize) -> usize {
+            let start = braille_col(screen, row).unwrap_or_else(|| {
+                panic!("row {row} must paint minimap braille; screen:\n{screen}")
+            });
+            total_cols - start
+        }
+
+        for total_cols in [40u16, 160u16] {
+            let mut driver = driver_with_shell(
+                app_with_shaped_buffer_no_sidebar(),
+                config(),
+                total_cols,
+                24,
+            );
+            // Warm-up dispatch — see `minimap_strip_does_not_double_the_scrollbar_via_shell_app`'s
+            // doc comment on `app_with_shaped_buffer_no_sidebar`: the pinned
+            // hidden sidebar only takes effect after one dispatch.
+            driver.press_named(quadraui::NamedKey::Escape);
+            let screen = driver.screen();
+
+            let row = 12usize;
+            let got = painted_strip_width(&screen, row, total_cols as usize);
+            // `resolve_width` alone (not the `minimap_reserved_width`
+            // wrapper, which additionally needs an `&Engine` to consult
+            // `settings.minimap` and the suppress-if-too-narrow check) is
+            // enough here: both widths below are comfortably wide enough to
+            // show the strip, and the fixture's minimap setting is on
+            // (`Settings::default`), so the wrapper's extra gating is a
+            // known no-op for this test.
+            let expected = crate::render::TUI_MINIMAP_SIZING
+                .resolve_width(total_cols as f32, 1.0)
+                .unwrap_or(0.0) as usize;
+            assert_eq!(
+                got, expected,
+                "at a {total_cols}-column terminal the real painted strip \
+                 width ({got}) must match minimap_reserved_width's answer \
+                 for the same pane width ({expected}); screen:\n{screen}"
+            );
+        }
+    }
+
     // ── #733 slice 1: the shared modal-overlay mouse rung ────────────────
     //
     // `handle_mouse`'s top rung is now `render::route_modal_overlay_click`,

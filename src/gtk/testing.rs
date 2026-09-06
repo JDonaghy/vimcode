@@ -5769,6 +5769,67 @@ mod minimap {
         );
     }
 
+    /// #828 acceptance (driver tier): on a narrow pane the minimap strip
+    /// settles well *below* the wide-pane plateau
+    /// (`minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`'s
+    /// ~120px) instead of a fixed width regardless of pane size — the two
+    /// tests together are "minimap width at narrow and wide viewports"
+    /// (issue #828's acceptance bullet), each driven through the real paint
+    /// path (`ScreenLayout` from an actual `window_center` call, not
+    /// `minimap_reserved_width` in isolation) so a future call-site
+    /// miswiring (e.g. GTK's `App::render_content` accidentally forwarding
+    /// [`crate::render::TUI_MINIMAP_SIZING`] instead of
+    /// [`crate::render::gtk_minimap_sizing`]) would be caught here: TUI's
+    /// sizing table clamps to a 30-*column* ceiling, which at this pane's
+    /// real pixel width would produce a strip an order of magnitude
+    /// narrower than GTK's own pixel-denominated formula computes below.
+    #[test]
+    fn minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one() {
+        let h = harness(engine_with_shaped_buffer(), 900, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win)
+            .expect("editor pane must paint with the default settings");
+
+        let (strip_width, pane_width) = {
+            let layout = h.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let mm = l.minimap.iter().find(|m| m.window_id == win).expect(
+                "a 900px-wide harness must still be roomy enough for the \
+                     minimap to show — if this fails, narrow the test's own \
+                     margin assumptions rather than widening the harness \
+                     past what makes it a *narrow*-pane test",
+            );
+            let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
+            (mm.rect.width, rw.rect.width + mm.rect.width)
+        };
+        let char_width = h.painted_char_width();
+        let expected = crate::render::minimap_reserved_width(
+            &h.engine.borrow(),
+            pane_width,
+            char_width,
+            crate::render::gtk_minimap_sizing(),
+        );
+
+        assert_eq!(
+            strip_width, expected,
+            "the real paint path must reserve exactly what \
+             minimap_reserved_width computes"
+        );
+        assert!(
+            strip_width < 100.0,
+            "a narrow (900px) pane's minimap must settle noticeably below \
+             the wide-pane plateau of ~120px (got {strip_width}px)"
+        );
+        assert!(
+            strip_width > 48.0,
+            "a 900px pane should still be comfortably clear of the \
+             absolute pixel floor (48px) — this test is about the ordinary \
+             fraction-scaled case, not the floor clamp itself (that's \
+             `minimap_reserved_width_uses_the_explicit_sizing_not_char_width` \
+             in render.rs); got {strip_width}px"
+        );
+    }
+
     /// #728 acceptance: on an ordinary wide pane the minimap strip settles
     /// at VS Code's own ~120px width instead of scaling up with the pane —
     /// the pre-fix `rect_width * MINIMAP_WIDTH_FRACTION` formula reached
@@ -6607,6 +6668,171 @@ mod scrollbar_paint {
              re-diagnosis of #723) — if this now fails, GTK has grown a \
              live scrollbar paint and this test's doc comment needs \
              updating to match, not silently deleting"
+        );
+    }
+
+    /// #828 acceptance (driver tier): "editor viewport width with the
+    /// scrollbar present". GTK does not clip painted glyphs to
+    /// `text_viewport_cols` at the pixel level — a long line's characters
+    /// are drawn continuously and simply run to the pane's own edge (no
+    /// live native scrollbar widget currently exists to protect; see
+    /// `no_scrollbar_pixels_paint_for_an_overflowing_editor_pane`'s doc
+    /// comment above) — so a pixel-clipping assertion would not be testing
+    /// real behaviour. What *is* real, observable behaviour driven by the
+    /// exact column count is `Engine::ensure_cursor_visible`
+    /// (`core/engine/search.rs`), which reads `paint_viewport_cols` —
+    /// populated *only* by a real `build_screen_layout` call
+    /// (`render.rs`'s `windows` map, written during `App::render_content`)
+    /// — to decide when a rightward cursor move must start scrolling the
+    /// window horizontally. That boundary sits exactly at the real,
+    /// `backend.scrollbar_reserve()`-aware `text_viewport_cols`, short of
+    /// where it would sit (`cols_without_reserve`, this test's own
+    /// counterfactual) if a future call site dropped the real reserve back
+    /// to a hardcoded `0.0`.
+    ///
+    /// Drives the boundary crossing with real `l` (move-right) keypresses
+    /// through the full `GtkDriver` dispatch path, then reads
+    /// `Engine::scroll_left()` — state, but state that only the *painted*
+    /// `paint_viewport_cols` map (never a hand-fed value) can have produced,
+    /// since nothing else writes it (`render.rs`, `build_screen_layout`'s
+    /// doc comment).
+    ///
+    /// **Verified RED**: hand-reverting `App::render_content`'s
+    /// `backend.scrollbar_reserve() as f64` argument (`app.rs`) to a
+    /// hardcoded `0.0` moves the real, painted `text_viewport_cols` up to
+    /// equal this test's own `cols_without_reserve` counterfactual — the
+    /// "setup sanity" assertion (which exists precisely to catch this) fails
+    /// with `without_reserve=149, with_reserve=149` — confirmed by hand,
+    /// reverted before landing this test.
+    #[test]
+    fn cursor_past_the_scrollbar_reserved_viewport_triggers_a_horizontal_scroll_at_the_real_boundary(
+    ) {
+        let mut engine = Engine::new_for_test();
+        // Sidebar pinned hidden rather than left ambient: the runner only
+        // reconciles its own shadow copy of `sidebar_visible` against the
+        // engine's at the tail of a *key* dispatch
+        // (`App::run_post_key_epilogue`'s "Runner <-> shadow
+        // sidebar-visibility sync", `app.rs`), never on construction — so
+        // without this settle, the very first `l` keypress below could be
+        // the one that first reconciles a mismatched ambient sidebar state,
+        // silently resizing the pane (and `text_viewport_cols` with it)
+        // mid-walk.
+        engine.app_shell.hide_sidebar();
+        engine.session.explorer_visible = false;
+        engine.settings.minimap = false;
+        engine.settings.cursorline = false;
+        engine.settings.wrap = false;
+        // Alternating ink/blank columns (not a solid run of `X`) so this
+        // test's own `measure_char_width_px` below can locate each glyph's
+        // left edge unambiguously — a solid run's glyphs can visually touch,
+        // which would undercount the real cell pitch.
+        let text = format!("{}\n", "X ".repeat(200));
+        engine.buffer_mut().insert(0, &text);
+        let mut h = harness(engine, 1400, 900);
+        // Settle the sidebar-visibility sync once, up front (see the field
+        // comment above) — a single no-op `Escape` in Normal mode, the same
+        // technique `tui_editor_text_drag_paints_a_selection_through_the_shared_drag_router`
+        // (`tui_main/shell_app.rs`) uses for the identical settle on TUI.
+        h.driver.press_named(quadraui::NamedKey::Escape);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win)
+            .expect("editor pane must paint with the default settings");
+
+        let (rect, gutter, viewport_cols) = {
+            let layout = h.screen_layout.borrow();
+            let l = layout.as_ref().unwrap();
+            let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
+            (rw.rect, rw.gutter_char_width, rw.text_viewport_cols)
+        };
+        let lh = h
+            .painted_line_height()
+            .expect("render_content must publish the painted line height");
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = {
+            let c = theme.background;
+            (c.r, c.g, c.b)
+        };
+
+        // `Harness::painted_char_width` (`app.char_width_cell`) can lag one
+        // frame behind the exact `cw` `render_content` actually laid this
+        // frame's columns out with (a separate `App::painted_char_width`
+        // cell — distinct despite the name — is what really tracks it, and
+        // `Harness` doesn't expose it), so this test measures the real
+        // per-glyph pixel pitch directly off the painted row instead of
+        // trusting that accessor for the precision `cols_without_reserve`
+        // below needs. Scans the *right* half of the pane (comfortably past
+        // any gutter) for `X`/blank rising edges — one every two cells,
+        // given the `"X "` fixture above — and averages their spacing.
+        let cw = {
+            let row_y = (rect.y + lh / 2.0) as i32;
+            let x0 = (rect.x + rect.width * 0.5) as i32;
+            let x1 = (rect.x + rect.width - 2.0) as i32;
+            let mut edges = Vec::new();
+            let mut prev_ink = h.driver.pixel(x0 - 1, row_y) != bg;
+            for x in x0..x1 {
+                let ink = h.driver.pixel(x, row_y) != bg;
+                if ink && !prev_ink {
+                    edges.push(x);
+                }
+                prev_ink = ink;
+            }
+            let diffs: Vec<i32> = edges.windows(2).map(|w| w[1] - w[0]).collect();
+            assert!(
+                diffs.len() >= 4,
+                "setup sanity: the alternating `X `/blank fixture must paint \
+                 several detectable glyph edges in the pane's right half to \
+                 measure the real character pitch from, found {} \
+                 (edges={edges:?})",
+                diffs.len()
+            );
+            let avg_period = diffs.iter().sum::<i32>() as f64 / diffs.len() as f64;
+            avg_period / 2.0 // one `X`/blank pair per two cells
+        };
+
+        let cols_without_reserve = ((rect.width / cw).floor() as usize)
+            .saturating_sub(gutter)
+            .max(1);
+        assert!(
+            cols_without_reserve > viewport_cols,
+            "setup sanity: a real, non-zero scrollbar_reserve must shrink \
+             the painted viewport below what the same pane width would \
+             allow with no reserve at all (without_reserve={cols_without_reserve}, \
+             with_reserve={viewport_cols}, measured cw={cw}px) — otherwise \
+             this test cannot distinguish the two boundaries at all"
+        );
+        assert_eq!(
+            h.engine.borrow().cursor().col,
+            0,
+            "fixture sanity: the cursor must start at column 0"
+        );
+
+        // Walk right to the last column the real, reserved viewport
+        // declares visible — one short of the boundary — with no scroll
+        // yet.
+        for _ in 0..viewport_cols.saturating_sub(1) {
+            h.driver.type_char('l');
+        }
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().scroll_left(),
+            0,
+            "the cursor must still fit inside the real, painted \
+             viewport_cols ({viewport_cols}) without any horizontal scroll"
+        );
+
+        // One more step crosses the real boundary.
+        h.driver.type_char('l');
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().scroll_left(),
+            1,
+            "crossing the real scrollbar-reserved viewport boundary \
+             (text_viewport_cols={viewport_cols}) must scroll by exactly \
+             one column; a caller that dropped scrollbar_reserve back to \
+             0.0 would place this boundary {} column(s) further out \
+             (cols_without_reserve={cols_without_reserve}) and this move \
+             would not have scrolled at all",
+            cols_without_reserve - viewport_cols
         );
     }
 }
