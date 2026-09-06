@@ -87,7 +87,7 @@ gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "4ff2a645023637bba7229e0aeee5968a9c6f3652", features = ["tui", "terminal"] }
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "9eede7fd9061794584306e3e4dbccbf71fb06300", features = ["tui", "terminal"] }
 gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
 pangocairo = { version = "0.18", optional = true }
 ropey = "1.6.1"
@@ -134,22 +134,16 @@ insta = "1.39"
 [build-dependencies]
 cc = "1.0"
 
-# quadraui#452: quadraui's develop tip pulls in vt100 0.16, whose upstream
-# manifest exact-pins its own `unicode-width` floor to "^0.2.1" — mutually
-# exclusive with `ratatui = "0.29"` above, which upstream-pins
-# `unicode-width` to exactly "=0.2.0". quadraui vendored a copy of vt100
-# 0.16.2 with only that bound loosened (no source changes) and patches it
-# via `[patch.crates-io]` in its OWN Cargo.toml — but Cargo only honors a
-# `[patch]` section declared in the root manifest of the workspace actually
-# being built, so quadraui's patch has zero effect here; this repo's own
-# `[patch.crates-io]` entry (pointing at the same vendored copy, which
-# lives at the quadraui monorepo root) is required too. See
-# vendor/vt100-0.16.2-patched/README-PATCH.md (in the quadraui repo, at the
-# rev pinned above) and quadraui's docs/LESSONS.md for the full rationale —
-# do not remove this without reading both first. #691: same rev as the
-# `quadraui` dep above, resolved via git instead of a sibling path.
-[patch.crates-io]
-vt100 = { git = "https://github.com/JDonaghy/quadraui.git", rev = "4ff2a645023637bba7229e0aeee5968a9c6f3652" }
+# quadraui#452 / #691 used to need a `[patch.crates-io]` vt100 shim here
+# (see git history) because vt100 0.16's own manifest exact-pinned
+# `unicode-width` to a bound incompatible with `ratatui`'s. quadraui#795
+# removed that vendored shim upstream — its own Cargo.toml now documents
+# the conflict as resolved — and the rev bumped for #829 (quadraui#775,
+# `Theme::from_vscode_json` / `Color::try_from_hex_over`) postdates that
+# fix, so the matching patch here is gone too: keeping it pointed at a
+# rev whose repo root no longer vendors `vt100-0.16.2-patched/` broke
+# `cargo check` outright ("patch location ... does not contain packages
+# matching `vt100`").
 
 # Optimize dependencies in dev builds — GTK/Relm4/Cairo/Pango FFI calls and
 # Tree-sitter parsing are 10-50× slower without optimization, causing visible

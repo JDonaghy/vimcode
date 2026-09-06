@@ -55,8 +55,8 @@ pub(super) fn render_explorer_sidebar_content(
         id: quadraui::WidgetId::new("explorer:bg"),
         left_segments: vec![quadraui::StatusBarSegment {
             text: String::new(),
-            fg: render::to_quadraui_color(theme.explorer_file_fg),
-            bg: render::to_quadraui_color(theme.tab_bar_bg),
+            fg: theme.explorer_file_fg,
+            bg: theme.tab_bar_bg,
             bold: false,
             action_id: None,
         }],
@@ -201,15 +201,7 @@ fn fill_row(
     fg: Color,
     bg: Color,
 ) {
-    fill_row_q(
-        backend,
-        x,
-        y,
-        width,
-        text,
-        render::to_quadraui_color(fg),
-        render::to_quadraui_color(bg),
-    );
+    fill_row_q(backend, x, y, width, text, fg, bg);
 }
 
 /// Clear `area` to `bg` — the trait-only equivalent of the nested
@@ -746,8 +738,8 @@ pub(super) fn render_ext_panel(
         let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
         let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
 
-        let q_popup_fg = render::to_quadraui_color(theme.completion_fg);
-        let q_key_fg = render::to_quadraui_color(theme.function);
+        let q_popup_fg = theme.completion_fg;
+        let q_key_fg = theme.function;
         let mut lines: Vec<quadraui::StyledText> = vec![quadraui::StyledText::plain("Keybindings")];
         for (key, desc) in bindings.iter() {
             lines.push(quadraui::StyledText {
@@ -761,7 +753,7 @@ pub(super) fn render_ext_panel(
         let mut tooltip =
             render::quadraui_tooltip(quadraui::WidgetId::new("ext_panel:help"), String::new());
         tooltip.styled_lines = Some(lines);
-        tooltip.bg = Some(render::to_quadraui_color(theme.completion_bg));
+        tooltip.bg = Some(theme.completion_bg);
         tooltip.fg = Some(q_popup_fg);
         let layout = quadraui::TooltipLayout {
             bounds: quadraui::Rect::new(

@@ -2219,7 +2219,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=4ff2a645023637bba7229e0aeee5968a9c6f3652#4ff2a645023637bba7229e0aeee5968a9c6f3652"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=9eede7fd9061794584306e3e4dbccbf71fb06300#9eede7fd9061794584306e3e4dbccbf71fb06300"
 dependencies = [
  "arboard",
  "gtk4",
@@ -2227,6 +2227,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "serde",
+ "serde_json",
  "unicode-width",
  "vt100",
 ]
@@ -3382,7 +3383,8 @@ dependencies = [
 [[package]]
 name = "vt100"
 version = "0.16.2"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=4ff2a645023637bba7229e0aeee5968a9c6f3652#4ff2a645023637bba7229e0aeee5968a9c6f3652"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
 dependencies = [
  "itoa",
  "unicode-width",
