@@ -10113,76 +10113,84 @@ pub struct ScreenLayout {
 // ─── Minimap (#35) ────────────────────────────────────────────────────────────
 
 /// Fraction of a pane's own width the minimap strip may reserve, as an
-/// *upper bound* only (#728).
-///
-/// #722 made this fraction the primary driver of `minimap_reserved_width`'s
-/// `want`, which is what let the strip grow to ~240px (`MINIMAP_MAX_PX`) in
-/// an ordinary wide pane — roughly twice VS Code's own strip. VS Code does
-/// not scale its minimap with window width at all: it derives a *fixed*
-/// width from `minimap.maxColumn` (120, one pixel per assumed column — see
-/// `MINIMAP_TARGET_COLS`). #728 makes that fixed target the primary driver
-/// instead, and demotes this fraction to a cap that only matters for a pane
-/// too narrow to afford the full 120px/cols (so the strip still shrinks
-/// smoothly with the pane rather than snapping straight from 120 to
-/// suppressed at `MINIMAP_MIN_TEXT_COLS`).
+/// *upper bound* only (#728) — shared by both backends' `MinimapSizing`
+/// below. VS Code does not scale its minimap with window width at all: it
+/// derives a *fixed* width from `minimap.maxColumn` (`MINIMAP_TARGET_COLS`),
+/// and this fraction only matters as a cap for a pane too narrow to afford
+/// the full target (so the strip still shrinks smoothly with the pane
+/// rather than snapping straight from the target to suppressed at
+/// `MINIMAP_MIN_TEXT_COLS`).
 pub const MINIMAP_WIDTH_FRACTION: f64 = 0.15;
 
-/// Target minimap width, in the caller's own unit (px for GTK, columns for
-/// TUI) — VS Code's `minimap.maxColumn` default (#728). VS Code renders its
+/// Target minimap width, in the caller's own native unit (px for GTK,
+/// columns for TUI) — VS Code's `minimap.maxColumn` default (#728), shared
+/// by both backends' `MinimapSizing` below since VS Code renders its
 /// minimap at one pixel per assumed source column, so at 120px this is
-/// "precisely 1px per column", matching quadraui's own colour-bar heuristic
-/// (`aggregate_spans`'s `MINIMAP_SPAN_COLS` window), and TUI's column-native
-/// units make the same constant trivially the column count directly.
-/// `minimap_reserved_width` takes `min(MINIMAP_TARGET_COLS, pane-fraction
-/// cap)`, so this is a ceiling a wide pane settles at, not something a wider
-/// pane keeps growing past (unlike the old fraction-only formula).
+/// "precisely 1px per column", and TUI's column-native units make the same
+/// constant trivially the column count directly.
 const MINIMAP_TARGET_COLS: f64 = 120.0;
 
-/// Floor on the reserved width for TUI, in cell columns directly. TUI is
-/// cell-native and always passes `char_width == 1.0` into
-/// [`minimap_reserved_width`], so multiplying by it is a no-op and this
-/// constant is trivially font-invariant (TUI has no font size to vary).
-/// Stops the strip shrinking to an unreadable sliver in a merely-narrow
-/// pane, before `MINIMAP_MIN_TEXT_COLS` suppresses it outright in a very
-/// narrow one.
+/// Floor on the reserved width for TUI, in cell columns directly — see
+/// `gtk_minimap_sizing`'s doc comment for why GTK needs its own, separate
+/// floor rather than this one scaled by `char_width`.
 const MINIMAP_MIN_COLS: f64 = 6.0;
 
 /// Ceiling on the reserved width for TUI, same units/caveats as
-/// `MINIMAP_MIN_COLS`. Stops the strip from eating an ever-growing share of
-/// a very wide pane.
+/// `MINIMAP_MIN_COLS`.
 const MINIMAP_MAX_COLS: f64 = 30.0;
 
 /// Floor on the reserved width for GTK, in **raw pixels** — deliberately
-/// *not* `MINIMAP_MIN_COLS * char_width`. #722 made the un-clamped `want`
-/// term font-invariant (a fraction of the pane's own pixel width), but an
-/// earlier version of this fix left the clamp bounds multiplied by
-/// `char_width`, which reintroduces font-dependence exactly where a
-/// `:vsplit` pushes panes into: once a pane is narrow enough that `want`
-/// falls below the floor, the *clamped* result is `MINIMAP_MIN_COLS *
-/// char_width` again — doubling the editor font doubles the minimap width
-/// in that regime (a ~300px pane went 48px→96px), which is precisely the
-/// backwards behaviour #722 exists to prevent. Chosen to match the old
-/// per-column floor at a representative 8px/char default font (6 cols *
-/// 8px), but as a fixed pixel amount rather than something derived from
-/// `char_width` at call time — see
-/// `minimap_reserved_width_clamp_floor_is_font_invariant` below, which pins
-/// this in the regime the un-clamped scaling test deliberately avoids.
+/// *not* `MINIMAP_MIN_COLS * char_width`; see `gtk_minimap_sizing`'s doc
+/// comment.
 const MINIMAP_MIN_PX: f64 = 48.0;
 
 /// Ceiling on the reserved width for GTK, same units/rationale as
-/// `MINIMAP_MIN_PX` (30 cols * 8px at the same representative font).
-///
-/// #728: since `MINIMAP_TARGET_COLS` (120) is now `want`'s primary driver
-/// and is itself below this ceiling, `want` no longer reaches 240px in
-/// practice — this remains only as a defensive bound (e.g. if
-/// `MINIMAP_TARGET_COLS` is ever raised above it) rather than the everyday
-/// cap it used to be. The strip's everyday ceiling is `MINIMAP_TARGET_COLS`
-/// itself.
+/// `MINIMAP_MIN_PX`.
 const MINIMAP_MAX_PX: f64 = 240.0;
 
 /// Text columns that must survive after reserving the strip. Below this the
 /// minimap suppresses itself rather than squeezing the editor into a sliver.
 const MINIMAP_MIN_TEXT_COLS: f64 = 30.0;
+
+/// TUI's VS-Code-parity minimap width policy, in cell columns — see
+/// `minimap_reserved_width`'s doc comment for why this and
+/// [`gtk_minimap_sizing`] stay two backend-specific values (chosen by the
+/// caller, who already knows its own backend) rather than one shared
+/// column-based formula selected by a runtime `char_width` check. Named and
+/// shaped after [`TUI_PICKER_SIZING`]/[`gtk_picker_sizing`] above — the same
+/// established pattern for a genuine per-backend sizing difference.
+pub const TUI_MINIMAP_SIZING: quadraui::MinimapSizing = quadraui::MinimapSizing::VsCodeParity {
+    target_cols: MINIMAP_TARGET_COLS as f32,
+    fraction: MINIMAP_WIDTH_FRACTION as f32,
+    min: MINIMAP_MIN_COLS as f32,
+    max: MINIMAP_MAX_COLS as f32,
+};
+
+/// GTK's VS-Code-parity minimap width policy, in raw pixels — see
+/// `minimap_reserved_width`'s doc comment.
+///
+/// A single column-based `MinimapSizing` (`resolve_width(pane_width,
+/// real_char_width)`) was tried first and reverted: `resolve_width`
+/// normalises `pane_width` into columns via the *editor's* `char_width`
+/// before applying `fraction`/`min`/`max`, then converts back — correct
+/// when the bounds genuinely mean "columns of the editor's own font", but
+/// VS Code's minimap renders in its *own*, much smaller font, decoupled
+/// from the editor's. Feeding a real editor `char_width` (7-9px) through
+/// that formula moved an ordinary wide GTK pane's strip from VS Code's
+/// ~120px to ~180-240px —
+/// `gtk::testing::minimap::minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`
+/// (driven through the real paint path) caught it. So GTK's bounds stay
+/// stated directly in raw pixels, and `minimap_reserved_width` resolves
+/// them with a forced `char_width` of `1.0` (native-unit-in, native-unit
+/// out) rather than the real one — see docs/IRREDUCIBLE_SURFACE.md.
+pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
+    quadraui::MinimapSizing::VsCodeParity {
+        target_cols: MINIMAP_TARGET_COLS as f32,
+        fraction: MINIMAP_WIDTH_FRACTION as f32,
+        min: MINIMAP_MIN_PX as f32,
+        max: MINIMAP_MAX_PX as f32,
+    }
+}
 
 /// Buffer lines sampled per *display* row of minimap height.
 ///
@@ -10253,41 +10261,38 @@ pub struct RenderedMinimap {
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
 ///
-/// #728: `want` is `min(MINIMAP_TARGET_COLS, rect_width *
-/// MINIMAP_WIDTH_FRACTION)`, clamped to a floor/ceiling. The fixed target is
-/// VS Code parity — its minimap does not grow with the window — and the
-/// fraction only caps `want` down for a pane too narrow to afford the full
-/// target, still as a proportion of *this pane's* width rather than a fixed
-/// column count multiplied by the editor's font metrics (#722). That keeps
-/// the strip narrowing smoothly in a narrow/split pane while holding steady
-/// at the VS Code-sized target in an ordinary or wide one, and — since
-/// neither term depends on `char_width` — still holds steady across a
-/// font-size change.
+/// #828/quadraui#776: `sizing` — [`TUI_MINIMAP_SIZING`] or
+/// [`gtk_minimap_sizing`] — is supplied by the caller, who already knows its
+/// own backend by construction, instead of being selected here from a
+/// `char_width > 1.0` runtime check. This function itself no longer
+/// branches on backend identity at all; it only asks `sizing` to resolve a
+/// width and applies the on/off decision.
 ///
-/// The clamp bounds themselves must be font-invariant too, or the *clamped*
-/// result reintroduces #722's defect B in exactly the narrow-pane regime a
-/// split pushes panes into (see `MINIMAP_MIN_PX`'s doc comment). TUI is
-/// cell-native (`char_width == 1.0` always) so `MINIMAP_MIN_COLS` /
-/// `MINIMAP_MAX_COLS` are already font-invariant there; GTK gets separate
-/// raw-pixel bounds (`MINIMAP_MIN_PX` / `MINIMAP_MAX_PX`) that do not scale
-/// with `char_width` at all. `char_width > 1.0` is this file's existing
-/// convention for "this call is GTK, not TUI" (see the `#515` comment on
-/// the `bar_width` hit-region conversion above).
+/// `sizing`'s `min`/`max`/`target_cols` are already stated in the caller's
+/// own native unit (columns for TUI, raw pixels for GTK — see
+/// `gtk_minimap_sizing`'s doc comment for why GTK needs pixels, not a real
+/// `char_width` conversion), so `resolve_width` is called with a forced
+/// `char_width` of `1.0` rather than the real one: a real `char_width`
+/// would convert `sizing`'s bounds a *second* time, which is only correct
+/// when they're stated in columns of the *caller's* font — true for TUI
+/// (whose real `char_width` is `1.0` anyway) but not for GTK's minimap,
+/// which VS Code parity keeps decoupled from the editor's own font size.
+/// The real `char_width` (`cw` below) is still used for the
+/// `MINIMAP_MIN_TEXT_COLS` suppression check, which genuinely does want the
+/// editor's own font metric.
 ///
 /// Delegates the on/off decision to `quadraui::reserved_width` so both
 /// backends (and `build_screen_layout`, which shrinks each window rect by
 /// exactly this much) reclaim identical geometry when `:set nominimap`
 /// turns the strip off.
-pub fn minimap_reserved_width(engine: &Engine, rect_width: f64, char_width: f64) -> f64 {
+pub fn minimap_reserved_width(
+    engine: &Engine,
+    rect_width: f64,
+    char_width: f64,
+    sizing: quadraui::MinimapSizing,
+) -> f64 {
+    let want = sizing.resolve_width(rect_width as f32, 1.0).unwrap_or(0.0) as f64;
     let cw = if char_width > 0.0 { char_width } else { 1.0 };
-    let (min_w, max_w) = if char_width > 1.0 {
-        (MINIMAP_MIN_PX, MINIMAP_MAX_PX)
-    } else {
-        (MINIMAP_MIN_COLS * cw, MINIMAP_MAX_COLS * cw)
-    };
-    let want = MINIMAP_TARGET_COLS
-        .min(rect_width * MINIMAP_WIDTH_FRACTION)
-        .clamp(min_w, max_w);
     let has = engine.settings.minimap && rect_width >= want + MINIMAP_MIN_TEXT_COLS * cw;
     quadraui::reserved_width(want as f32, has) as f64
 }
@@ -12731,8 +12736,19 @@ pub fn window_status_row_reserved(engine: &Engine) -> bool {
 /// - `line_height` — pixel height of one text line (from Pango font metrics)
 /// - `char_width` — pixel width of one character (from Pango font metrics),
 ///   used to compute gutter width
+/// - `scrollbar_reserve` — width, in the caller's own unit, the *caller's*
+///   backend reserves for its native scrollbar overlay alongside the
+///   editor's text (#828/quadraui#776: `quadraui::Backend::scrollbar_reserve()`
+///   — `0.0` for TUI, GTK's `ScrolledWindow` overlay's own reserve for GTK).
+///   This function only subtracts it from the viewport-column computation;
+///   it never decides what the value is, so it carries no backend identity
+///   of its own.
+/// - `minimap_sizing` — the caller's own [`TUI_MINIMAP_SIZING`] or
+///   [`gtk_minimap_sizing`] (#828/quadraui#776), forwarded verbatim to
+///   `minimap_reserved_width` — again supplied, not decided, here.
 ///
 /// This function is intentionally *pure* — no side effects, no GTK/Cairo calls.
+#[allow(clippy::too_many_arguments)]
 pub fn build_screen_layout(
     engine: &Engine,
     theme: &Theme,
@@ -12740,6 +12756,8 @@ pub fn build_screen_layout(
     line_height: f64,
     char_width: f64,
     color_headings: bool,
+    scrollbar_reserve: f64,
+    minimap_sizing: quadraui::MinimapSizing,
 ) -> ScreenLayout {
     // Breadcrumb row height defaults to `line_height` — correct for TUI's
     // row-based model (`line_height` is always `1.0`, i.e. exactly one row)
@@ -12753,6 +12771,8 @@ pub fn build_screen_layout(
         char_width,
         color_headings,
         line_height,
+        scrollbar_reserve,
+        minimap_sizing,
     )
 }
 
@@ -12768,6 +12788,7 @@ pub fn build_screen_layout(
 /// reflects that; this variant makes the breadcrumb bar's own painted
 /// `bounds` agree, instead of assuming (as plain `line_height` would) that
 /// the reserved breadcrumb space is exactly one editor text line tall.
+#[allow(clippy::too_many_arguments)]
 pub fn build_screen_layout_with_breadcrumb_row(
     engine: &Engine,
     theme: &Theme,
@@ -12776,6 +12797,8 @@ pub fn build_screen_layout_with_breadcrumb_row(
     char_width: f64,
     color_headings: bool,
     breadcrumb_row_h: f64,
+    scrollbar_reserve: f64,
+    minimap_sizing: quadraui::MinimapSizing,
 ) -> ScreenLayout {
     let active_window_id = engine.active_window_id();
     let multi_window = engine.windows.len() > 1;
@@ -12807,7 +12830,12 @@ pub fn build_screen_layout_with_breadcrumb_row(
     // panes legitimately get differently-sized strips.
     let minimap_widths: std::collections::HashMap<WindowId, f64> = window_rects
         .iter()
-        .map(|(id, r)| (*id, minimap_reserved_width(engine, r.width, char_width)))
+        .map(|(id, r)| {
+            (
+                *id,
+                minimap_reserved_width(engine, r.width, char_width, minimap_sizing),
+            )
+        })
         .collect();
 
     let windows = window_rects
@@ -12836,6 +12864,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 is_active,
                 multi_window,
                 color_headings,
+                scrollbar_reserve,
             );
             if own_status_row {
                 rw.status_line = Some(build_window_status_line(
@@ -16390,6 +16419,7 @@ fn build_rendered_window(
     is_active: bool,
     multi_window: bool,
     color_headings: bool,
+    scrollbar_reserve: f64,
 ) -> RenderedWindow {
     let empty = |id: WindowId| RenderedWindow {
         window_id: id,
@@ -16504,12 +16534,15 @@ fn build_rendered_window(
     // hardcoded char_width_approx of 9.0 px and a fixed gutter offset of 5).
     // For the TUI backend, rect.width is already in cell columns and char_width=1.0,
     // so the formula reduces to rect.width - gutter_char_width, which is exact.
-    // In the GTK backend (char_width > 1.0) reserve pixels for the vertical
-    // scrollbar overlay so text never renders behind it.  CSS requests 4px
-    // but GTK may allocate slightly more; 8px is a safe reserve.
-    let scrollbar_px: f64 = if char_width > 1.0 { 8.0 } else { 0.0 };
+    //
+    // `scrollbar_reserve` is the caller's own backend's
+    // `quadraui::Backend::scrollbar_reserve()` (#828/quadraui#776) — width
+    // reserved alongside the text for a native scrollbar overlay (GTK's
+    // `ScrolledWindow`; TUI has none, so its backend returns `0.0`). This
+    // function has no opinion on what that value is; it only subtracts
+    // whatever the caller measured.
     let render_viewport_cols = if char_width > 0.0 {
-        let total_chars = ((rect.width - scrollbar_px) / char_width).floor() as usize;
+        let total_chars = ((rect.width - scrollbar_reserve) / char_width).floor() as usize;
         total_chars.saturating_sub(gutter_char_width).max(1)
     } else {
         view.viewport_cols.max(1)
@@ -21111,7 +21144,16 @@ mod tests {
     fn bare_screen_layout() -> ScreenLayout {
         let engine = crate::core::Engine::new();
         let theme = Theme::from_name(&engine.settings.colorscheme);
-        build_screen_layout(&engine, &theme, &[], 1.0, 1.0, false)
+        build_screen_layout(
+            &engine,
+            &theme,
+            &[],
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        )
     }
 
     /// An `AppShellLayout` with every optional band absent — the shape a shell
@@ -21914,7 +21956,16 @@ mod tests {
         let content_bounds = WindowRect::new(0.0, 1.0, 80.0, 24.0);
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, 1.0);
         let theme = Theme::onedark();
-        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
 
         // Both group tab bars should have diff_toolbar populated.
         assert!(
@@ -21948,7 +21999,16 @@ mod tests {
             WindowRect::new(0.0, 0.0, 80.0, 24.0),
         )];
         let theme = Theme::onedark();
-        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
 
         // The first window's first line should have a spell error on "quik".
         let window = &layout.windows[0];
@@ -22144,7 +22204,16 @@ mod tests {
         let wid = engine.active_window_id();
         let rects = vec![(wid, WindowRect::new(0.0, 0.0, 80.0, 24.0))];
         let theme = Theme::onedark();
-        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
 
         // Each window should have a status_line
         assert!(layout.windows[0].status_line.is_some());
@@ -22172,7 +22241,16 @@ mod tests {
         let wid = engine.active_window_id();
         let rects = vec![(wid, WindowRect::new(0.0, 0.0, 80.0, 24.0))];
         let theme = Theme::onedark();
-        let layout = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
 
         // No per-window status line
         assert!(layout.windows[0].status_line.is_none());
@@ -22896,7 +22974,16 @@ mod tests {
         let bounds = WindowRect::new(0.0, 0.0, width, height);
         let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);
         let theme = Theme::onedark();
-        build_screen_layout(engine, &theme, &rects, 1.0, 1.0, true)
+        build_screen_layout(
+            engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            true,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        )
     }
 
     fn test_engine(text: &str) -> Engine {
@@ -23061,7 +23148,7 @@ mod tests {
             1,
             "the minimap must be present when the setting is on"
         );
-        let expected_cols = minimap_reserved_width(&e, 120.0, 1.0) as usize;
+        let expected_cols = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) as usize;
 
         e.settings.minimap = false;
         let without = render_engine(&e, 120.0, 30.0);
@@ -23118,7 +23205,8 @@ mod tests {
             // `w_without.rect.width` is the same pane's un-narrowed width
             // (minimap off ⇒ no narrowing), which is what
             // `minimap_reserved_width` expects to be fed back in.
-            let expected_cols = minimap_reserved_width(&e, w_without.rect.width, 1.0) as usize;
+            let expected_cols =
+                minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING) as usize;
             assert_eq!(
                 w_without.text_viewport_cols - w_with.text_viewport_cols,
                 expected_cols,
@@ -23183,11 +23271,52 @@ mod tests {
     fn minimap_reserved_width_is_zero_when_the_setting_is_off() {
         let mut e = minimap_engine();
         e.settings.minimap = true;
-        assert!(minimap_reserved_width(&e, 120.0, 1.0) > 0.0);
-        assert!(minimap_reserved_width(&e, 1200.0, 8.0) > 0.0);
+        assert!(minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) > 0.0);
+        assert!(minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing()) > 0.0);
         e.settings.minimap = false;
-        assert_eq!(minimap_reserved_width(&e, 120.0, 1.0), 0.0);
-        assert_eq!(minimap_reserved_width(&e, 1200.0, 8.0), 0.0);
+        assert_eq!(
+            minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING),
+            0.0
+        );
+        assert_eq!(
+            minimap_reserved_width(&e, 1200.0, 8.0, gtk_minimap_sizing()),
+            0.0
+        );
+    }
+
+    /// #828 acceptance: `sizing` is an explicit parameter now, honored
+    /// exactly as given — not re-derived from `char_width` via the old
+    /// `if char_width > 1.0 { MINIMAP_MIN_PX/MAX_PX } else {
+    /// MINIMAP_MIN_COLS/MAX_COLS }` convention this file used to hardcode
+    /// inside `minimap_reserved_width` itself.
+    ///
+    /// RED against that pre-#828 shape: there was no `sizing` parameter to
+    /// pass at all — the function *always* picked its constant set from
+    /// `char_width`, so a caller could never say "use GTK's pixel bounds"
+    /// while passing a TUI-shaped `char_width`. This pins that passing
+    /// `gtk_minimap_sizing()` alongside `char_width == 1.0` (TUI's own
+    /// signal under the old convention) still resolves against GTK's
+    /// pixel-denominated floor (`MINIMAP_MIN_PX`), not TUI's much smaller
+    /// column-denominated one (`MINIMAP_MIN_COLS`) — proving the sizing
+    /// comes from the explicit argument, never from `char_width`.
+    #[test]
+    fn minimap_reserved_width_uses_the_explicit_sizing_not_char_width() {
+        let e = minimap_engine();
+        // Narrow enough that TUI's own sizing would clamp to
+        // MINIMAP_MIN_COLS (6.0), but GTK's pixel floor (48.0) is what a
+        // sniff-free implementation must produce here instead, since
+        // `gtk_minimap_sizing()` is what's explicitly passed. Wide enough
+        // that the `char_width == 1.0` passed alongside it (TUI's own
+        // MINIMAP_MIN_TEXT_COLS suppression check) doesn't itself suppress
+        // the strip.
+        let pane_width = 100.0;
+        let got = minimap_reserved_width(&e, pane_width, 1.0, gtk_minimap_sizing());
+        assert_eq!(
+            got, MINIMAP_MIN_PX,
+            "an explicit gtk_minimap_sizing() must clamp to GTK's own \
+             pixel floor even at char_width == 1.0, not TUI's column floor \
+             (MINIMAP_MIN_COLS = {MINIMAP_MIN_COLS}): got {got}"
+        );
     }
 
     /// A window too narrow to spare the strip suppresses the minimap rather
@@ -23196,7 +23325,7 @@ mod tests {
     fn minimap_suppresses_itself_in_a_narrow_window() {
         let e = minimap_engine();
         assert_eq!(
-            minimap_reserved_width(&e, 20.0, 1.0),
+            minimap_reserved_width(&e, 20.0, 1.0, TUI_MINIMAP_SIZING),
             0.0,
             "a 20-column window cannot spare the minimap's floor width plus \
              MINIMAP_MIN_TEXT_COLS of surviving text"
@@ -23206,17 +23335,16 @@ mod tests {
     /// #722 acceptance: the reserved width is a proportion of the *pane's*
     /// width, so widening the pane must widen the strip too — unlike the
     /// old fixed `MINIMAP_COLS` constant, which stayed put as the window
-    /// grew. Both widths chosen well inside `[MINIMAP_MIN_COLS,
-    /// MINIMAP_MAX_COLS]` so the clamp never masks the scaling.
+    /// grew. `char_width == 1.0` (TUI-shaped) keeps `resolve_width`'s
+    /// column-normalisation a no-op, so both widths land `want = width *
+    /// MINIMAP_WIDTH_FRACTION` strictly inside `[MINIMAP_MIN_COLS,
+    /// MINIMAP_MAX_COLS]` (9 and 18, against a 6..30 band) and the clamp
+    /// can't be masking the scaling either assertion exercises.
     #[test]
     fn minimap_reserved_width_scales_with_pane_width() {
         let e = minimap_engine();
-        // Both widths land `want = width * MINIMAP_WIDTH_FRACTION` strictly
-        // inside `[MINIMAP_MIN_COLS, MINIMAP_MAX_COLS]` (9 and 18, against a
-        // 6..30 band) so the clamp can't be masking the scaling either test
-        // exercises.
-        let narrow = minimap_reserved_width(&e, 60.0, 1.0);
-        let wide = minimap_reserved_width(&e, 120.0, 1.0);
+        let narrow = minimap_reserved_width(&e, 60.0, 1.0, TUI_MINIMAP_SIZING);
+        let wide = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING);
         assert_eq!(narrow, 60.0 * MINIMAP_WIDTH_FRACTION);
         assert_eq!(wide, 120.0 * MINIMAP_WIDTH_FRACTION);
         assert!(
@@ -23226,20 +23354,24 @@ mod tests {
         );
     }
 
-    /// #722 acceptance: bumping the editor font (`char_width`) must NOT
-    /// change the reserved width at a fixed pane width — the old formula
-    /// multiplied `MINIMAP_COLS` by `char_width` directly, so a larger font
-    /// made the strip wider, which is backwards (VS Code's minimap width is
-    /// independent of the editor font). Pane wide enough that `want` is
-    /// driven by `MINIMAP_TARGET_COLS` (#728) rather than the fraction, for
-    /// every `char_width` tested, so the clamp/fraction can't be the reason
-    /// the widths happen to match.
+    /// #722 acceptance, unchanged in shape by #828: bumping the editor font
+    /// (`char_width`) must NOT change the reserved width at a fixed pane
+    /// width — VS Code's minimap width is independent of the editor font.
+    /// `gtk_minimap_sizing`'s bounds are stated in raw pixels and resolved
+    /// with a *forced* `char_width` of `1.0` (see `minimap_reserved_width`'s
+    /// doc comment), so the real `char_width` argument here only feeds the
+    /// `MINIMAP_MIN_TEXT_COLS` suppression check, never `want` itself — this
+    /// pins that font-invariance survives #828's move from an internal
+    /// `char_width > 1.0` branch to a caller-supplied `MinimapSizing`. Pane
+    /// wide enough that `want` is driven by `MINIMAP_TARGET_COLS` rather
+    /// than the fraction, for every `char_width` tested, so the
+    /// clamp/fraction can't be the reason the widths happen to match.
     #[test]
     fn minimap_reserved_width_is_unchanged_by_font_size() {
         let e = minimap_engine();
         let pane_width = 1200.0;
-        let small_font = minimap_reserved_width(&e, pane_width, 8.0);
-        let large_font = minimap_reserved_width(&e, pane_width, 16.0);
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing());
         assert_eq!(
             small_font, large_font,
             "reserved width must not depend on char_width: \
@@ -23248,30 +23380,31 @@ mod tests {
         assert_eq!(small_font, MINIMAP_TARGET_COLS);
     }
 
-    /// #722 review regression: `minimap_reserved_width_is_unchanged_by_font_size`
-    /// above deliberately keeps `want` inside the clamp band, so it cannot
-    /// catch font-dependence in the clamp *bounds* themselves. A first pass
-    /// of #722 made the un-clamped `want` term font-invariant but left the
-    /// floor/ceiling as `MINIMAP_MIN_COLS * char_width` /
-    /// `MINIMAP_MAX_COLS * char_width` — so once a pane is narrow enough to
-    /// actually hit the floor (exactly the regime a `:vsplit` produces),
-    /// the *clamped* result was font-dependent again. This pins the fixed
-    /// scenario from the review finding: a ~300px pane, at two GTK font
-    /// sizes close enough together that neither hits
-    /// `MINIMAP_MIN_TEXT_COLS`'s separate (and correct — #722 keeps it)
-    /// suppression floor, so any difference in the result can only be the
-    /// clamp bound moving with the font.
+    /// #722 review regression, unchanged in shape by #828:
+    /// `minimap_reserved_width_is_unchanged_by_font_size` above deliberately
+    /// keeps `want` inside the clamp band, so it cannot catch font-dependence
+    /// in the clamp *bounds* themselves. This pins the fixed scenario from
+    /// the original review finding: a ~300px pane, at two GTK font sizes
+    /// close enough together that neither hits `MINIMAP_MIN_TEXT_COLS`'s
+    /// separate (and correct) suppression floor, so any difference in the
+    /// result can only be the clamp bound moving with the font.
     ///
-    /// RED against the pre-fix formula: at `rect_width = 300.0`,
-    /// `char_width = 6.0` gives `min_w = 36.0` (want=45 not clamped → 45),
-    /// while `char_width = 8.0` gives `min_w = 48.0` (want=45 clamped →
-    /// 48) — two different widths for the same pane at two font sizes.
+    /// RED against a `resolve_width(pane_width, real_char_width)` formula
+    /// fed `gtk_minimap_sizing`'s pixel-denominated bounds directly as
+    /// columns (the version tried and reverted — see
+    /// `gtk_minimap_sizing`'s doc comment): at `rect_width = 300.0`,
+    /// `char_width = 6.0` gives a floor of `36.0` (want=45, not clamped →
+    /// 45), while `char_width = 8.0` gives a floor of `48.0` (want=45,
+    /// clamped → 48) — two different widths for the same pane at two font
+    /// sizes. Forcing `resolve_width`'s own `char_width` to `1.0` (this
+    /// function's actual behaviour) keeps the floor at the fixed
+    /// `MINIMAP_MIN_PX` regardless.
     #[test]
     fn minimap_reserved_width_clamp_floor_is_font_invariant() {
         let e = minimap_engine();
         let pane_width = 300.0; // want = 300 * 0.15 = 45px, below the 48px floor
-        let small_font = minimap_reserved_width(&e, pane_width, 6.0);
-        let large_font = minimap_reserved_width(&e, pane_width, 8.0);
+        let small_font = minimap_reserved_width(&e, pane_width, 6.0, gtk_minimap_sizing());
+        let large_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
         assert!(
             small_font > 0.0 && large_font > 0.0,
             "test setup sanity: neither font size may trip \
@@ -23291,21 +23424,17 @@ mod tests {
         );
     }
 
-    /// Same regression, at the ceiling: an old formula whose `max_w` scaled
-    /// with `char_width` let a large font effectively lift the cap (a giant
-    /// font's `MINIMAP_MAX_COLS * char_width` ceiling can exceed a
-    /// merely-wide pane's `want`, so the clamp never engages) — precisely
-    /// backwards, since VS Code's minimap cap does not grow with the
-    /// editor font. Pane wide enough that the pane-fraction cap alone would
-    /// exceed `MINIMAP_TARGET_COLS` at every font size tested, so `want`
-    /// settles at the fixed target rather than either the fraction or
-    /// `MINIMAP_MAX_PX`.
+    /// Same regression, at the ceiling — see
+    /// `minimap_reserved_width_clamp_floor_is_font_invariant`'s doc comment.
+    /// Pane wide enough that the pane-fraction cap alone would exceed
+    /// `MINIMAP_TARGET_COLS` at every font size tested, so `want` settles at
+    /// the fixed target rather than either the fraction or `MINIMAP_MAX_PX`.
     #[test]
     fn minimap_reserved_width_clamp_ceiling_is_font_invariant() {
         let e = minimap_engine();
         let pane_width = 2000.0; // fraction = 2000 * 0.15 = 300px, above the 120px target
-        let small_font = minimap_reserved_width(&e, pane_width, 8.0);
-        let large_font = minimap_reserved_width(&e, pane_width, 16.0);
+        let small_font = minimap_reserved_width(&e, pane_width, 8.0, gtk_minimap_sizing());
+        let large_font = minimap_reserved_width(&e, pane_width, 16.0, gtk_minimap_sizing());
         assert_eq!(
             small_font, large_font,
             "the clamped (ceiling-hitting) reserved width must not depend \
@@ -23318,21 +23447,81 @@ mod tests {
         );
     }
 
-    /// #728 acceptance: the old formula (`want = rect_width *
-    /// MINIMAP_WIDTH_FRACTION`, clamped only at 240px) let an ordinary wide
-    /// GTK pane reach ~240px — roughly twice VS Code's own ~120px minimap,
-    /// which does not grow with window width at all. A representative
-    /// 1600px pane at an 8px font is exactly the case #728 reported: RED
-    /// against the pre-fix formula (`1600 * 0.15 = 240`, hitting
-    /// `MINIMAP_MAX_PX` — double the VS Code-parity width asserted here).
+    /// #728 acceptance: an ordinary wide GTK pane must settle at VS Code's
+    /// ~120px minimap width, not scale up with the pane — the whole reason
+    /// `gtk_minimap_sizing` keeps GTK's bounds in raw pixels, resolved with
+    /// a forced `char_width` of `1.0`, rather than routing a real editor
+    /// `char_width` through `resolve_width`'s column normalisation (see its
+    /// doc comment: that version moved this exact scenario from ~120px to
+    /// ~178px, caught by
+    /// `gtk::testing::minimap::minimap_strip_settles_at_vs_code_parity_width_on_a_wide_pane`
+    /// driven through the real paint path).
     #[test]
     fn minimap_reserved_width_matches_vs_code_parity_on_a_wide_pane() {
         let e = minimap_engine();
-        let want = minimap_reserved_width(&e, 1600.0, 8.0);
+        let want = minimap_reserved_width(&e, 1600.0, 8.0, gtk_minimap_sizing());
         assert_eq!(
             want, MINIMAP_TARGET_COLS,
             "an ordinary wide GTK pane must settle at VS Code's ~120px \
              minimap width, not scale up with the pane: got {want}"
+        );
+    }
+
+    // ─── scrollbar_reserve (#828) ──────────────────────────────────────────
+
+    /// #828 acceptance: `build_screen_layout`'s `scrollbar_reserve` is an
+    /// explicit parameter now, honored exactly as given — not re-derived
+    /// from `char_width` via the old `if char_width > 1.0 { 8.0 } else {
+    /// 0.0 }` convention this file used to hardcode at the call site inside
+    /// `build_rendered_window`.
+    ///
+    /// RED against that pre-#828 shape: a `char_width == 1.0` call (the old
+    /// convention's "this is TUI" signal) always mapped to a hardcoded
+    /// `0.0` reserve, with no way for a caller to say otherwise — there was
+    /// no `scrollbar_reserve` parameter to pass a non-zero value through in
+    /// the first place. This pins that a real, non-default
+    /// `quadraui::Backend::scrollbar_reserve()` answer is now genuinely
+    /// subtracted regardless of `char_width`, by comparing the painted
+    /// `text_viewport_cols` with and without a non-zero reserve at
+    /// `char_width == 1.0`.
+    #[test]
+    fn build_screen_layout_honors_an_explicit_scrollbar_reserve_even_at_char_width_one() {
+        let engine = test_engine(
+            "a line of text long enough to fill the whole pane width and then some more text",
+        );
+        let theme = Theme::onedark();
+        let bounds = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);
+
+        let without_reserve = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
+        let with_reserve = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            10.0,
+            TUI_MINIMAP_SIZING,
+        );
+
+        let cols_without = without_reserve.windows[0].text_viewport_cols;
+        let cols_with = with_reserve.windows[0].text_viewport_cols;
+        assert_eq!(
+            cols_without.saturating_sub(cols_with),
+            10,
+            "a 10-unit scrollbar_reserve at char_width == 1.0 must shrink \
+             the viewport by exactly 10 columns: without={cols_without}, \
+             with={cols_with}"
         );
     }
 
@@ -24998,7 +25187,16 @@ mod tests {
         let wid = engine.active_window_id();
         let rects = vec![(wid, WindowRect::new(0.0, tbh, 800.0, 600.0 - tbh))];
         let theme = Theme::onedark();
-        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
 
         assert!(!layout.breadcrumbs.is_empty());
         let bc = &layout.breadcrumbs[0];
@@ -25060,7 +25258,16 @@ mod tests {
             WindowRect::new(content_x, content_y + tbh, 800.0, 600.0),
         )];
         let theme = Theme::onedark();
-        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
         let single_tab_hidden = engine.is_tab_bar_hidden(engine.active_group);
 
         // A click at the tab row's actual (offset) position must resolve to
@@ -25130,7 +25337,16 @@ mod tests {
         let mut engine = Engine::new();
         engine.new_tab(None); // 2 tabs, so `hide_single_tab` can't suppress the bar
         let (rects, _) = engine.calculate_group_window_rects(content, tbh);
-        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
         let bands = tab_bar_hit_bands(
             &layout,
             tbh,
@@ -25153,7 +25369,16 @@ mod tests {
         // ── Split groups ──────────────────────────────────────────────────
         engine.open_editor_group(SplitDirection::Vertical);
         let (rects, _) = engine.calculate_group_window_rects(content, tbh);
-        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
         let split_bands = tab_bar_hit_bands(
             &layout,
             tbh,
@@ -25210,8 +25435,16 @@ mod tests {
             let tbh = 2.0;
             let content_bounds = WindowRect::new(0.0, 0.0, 80.0, 24.0);
             let (rects, _) = engine.calculate_group_window_rects(content_bounds, tbh);
-            let layout =
-                build_screen_layout(&engine, &theme, &rects, line_height, char_width, true);
+            let layout = build_screen_layout(
+                &engine,
+                &theme,
+                &rects,
+                line_height,
+                char_width,
+                true,
+                0.0,
+                TUI_MINIMAP_SIZING,
+            );
             assert!(!layout.breadcrumbs.is_empty());
             layout.breadcrumbs[0].bounds.y
         };
@@ -25254,7 +25487,16 @@ mod tests {
             // through absolute bounds untouched rather than assuming (0,0).
             let content_bounds = WindowRect::new(10.0, 20.0, 800.0, 600.0);
             let (rects, _) = engine.calculate_group_window_rects(content_bounds, tbh);
-            build_screen_layout(&engine, &theme, &rects, line_height, char_width, true)
+            build_screen_layout(
+                &engine,
+                &theme,
+                &rects,
+                line_height,
+                char_width,
+                true,
+                8.0,
+                gtk_minimap_sizing(),
+            )
         };
 
         let screen = build_screen();
@@ -25328,7 +25570,16 @@ mod tests {
         let mut engine = Engine::new();
         let content_bounds = WindowRect::new(10.0, 20.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, reserved_h);
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
         assert!(screen.editor_group_split.is_none());
         // #551: the per-group chrome is populated even with a single group.
         assert_eq!(
@@ -25353,8 +25604,16 @@ mod tests {
 
         // Hiding the single group's tab bar suppresses the target entirely.
         engine.settings.hide_single_tab = true;
-        let screen_hidden =
-            build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen_hidden = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
         let targets = tab_bar_draw_targets(&engine, &screen_hidden, tab_row_h, reserved_h);
         assert!(
             targets.is_empty(),
@@ -25369,7 +25628,16 @@ mod tests {
         assert_eq!(engine.group_layout.leaf_count(), 2);
         let content_bounds = WindowRect::new(5.0, 7.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, reserved_h);
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
         assert!(
             screen.editor_group_split.is_some(),
             "2 groups must produce Some(editor_group_split)"
@@ -25401,8 +25669,16 @@ mod tests {
 
         // Zero-width bounds (the `min_x == f64::MAX` fallback) are filtered
         // out too, mirroring `breadcrumb_draw_targets`.
-        let mut screen_zero_width =
-            build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let mut screen_zero_width = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            gtk_minimap_sizing(),
+        );
         screen_zero_width.group_tab_bars[0].bounds.width = 0.0;
         let targets = tab_bar_draw_targets(&engine, &screen_zero_width, tab_row_h, reserved_h);
         assert_eq!(
@@ -25432,7 +25708,16 @@ mod tests {
 
         let content_bounds = WindowRect::new(3.0, 4.0, 120.0, 40.0);
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, 1.0);
-        let screen = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
 
         assert_eq!(screen.group_tab_bars.len(), 1);
         let gtb = &screen.group_tab_bars[0];
@@ -25480,7 +25765,16 @@ mod tests {
         let content_bounds = WindowRect::new(6.0, 2.0, 90.0, 30.0);
         let tab_bar_height = 1.0;
         let (rects, _) = engine.calculate_group_window_rects(content_bounds, tab_bar_height);
-        let screen = build_screen_layout(&engine, &theme, &rects, 1.0, 1.0, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
 
         let bounds = screen_to_drop_group_bounds(&screen);
         assert_eq!(bounds.len(), 1);
@@ -25803,12 +26097,33 @@ mod mouse_drag_router_tests {
     /// for a GTK font's advance/line height. The *same* logical 80×24 screen is
     /// described in both, which is what makes the parity assertion below mean
     /// "the two backends see one screen", not "two screens happen to agree".
-    fn frame(engine: &Engine, cell: (f64, f64)) -> ScreenLayout {
+    ///
+    /// `scrollbar_reserve`/`minimap_sizing` are the caller-stated stand-ins
+    /// for whichever backend `cell` represents' own
+    /// `quadraui::Backend::scrollbar_reserve()` / `TUI_MINIMAP_SIZING` or
+    /// `gtk_minimap_sizing()` (#828) — stated explicitly by each call site
+    /// below, not derived from `cell` here, so this helper carries no
+    /// backend sniff of its own.
+    fn frame(
+        engine: &Engine,
+        cell: (f64, f64),
+        scrollbar_reserve: f64,
+        minimap_sizing: quadraui::MinimapSizing,
+    ) -> ScreenLayout {
         let (cw, ch) = cell;
         let bounds = WindowRect::new(0.0, 0.0, 80.0 * cw, 24.0 * ch);
         let (rects, _) = engine.calculate_group_window_rects(bounds, ch);
         let theme = Theme::onedark();
-        build_screen_layout(engine, &theme, &rects, ch, cw, true)
+        build_screen_layout(
+            engine,
+            &theme,
+            &rects,
+            ch,
+            cw,
+            true,
+            scrollbar_reserve,
+            minimap_sizing,
+        )
     }
 
     /// Every rung, in the order [`route_mouse_drag`] must resolve them, paired
@@ -25908,7 +26223,7 @@ mod mouse_drag_router_tests {
     #[test]
     fn a_held_drag_over_the_minimap_strip_keeps_seeking() {
         let engine = drag_engine();
-        let layout = frame(&engine, (1.0, 1.0));
+        let layout = frame(&engine, (1.0, 1.0), 0.0, TUI_MINIMAP_SIZING);
         let mm = layout
             .minimap
             .first()
@@ -25951,7 +26266,7 @@ mod mouse_drag_router_tests {
     #[test]
     fn a_selection_already_extending_beats_the_minimap_and_terminal_geometry() {
         let engine = drag_engine();
-        let layout = frame(&engine, (1.0, 1.0));
+        let layout = frame(&engine, (1.0, 1.0), 0.0, TUI_MINIMAP_SIZING);
         let mm = layout
             .minimap
             .first()
@@ -26003,8 +26318,8 @@ mod mouse_drag_router_tests {
     fn both_backends_resolve_the_same_layout_and_point_to_the_same_rung() {
         const GTK_CELL: (f64, f64) = (9.0, 18.0);
         let engine = drag_engine();
-        let tui = frame(&engine, (1.0, 1.0));
-        let gtk = frame(&engine, GTK_CELL);
+        let tui = frame(&engine, (1.0, 1.0), 0.0, TUI_MINIMAP_SIZING);
+        let gtk = frame(&engine, GTK_CELL, 8.0, gtk_minimap_sizing());
 
         assert_eq!(
             tui.windows.len(),

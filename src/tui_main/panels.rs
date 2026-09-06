@@ -443,7 +443,16 @@ pub(super) fn render_source_control(
     let dim_fg = theme.line_number_fg;
 
     // Build SC data from engine state via the render abstraction.
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let Some(ref sc) = screen.source_control else {
         return;
     };
@@ -623,7 +632,16 @@ pub(super) fn render_ext_panel(
     if area.height == 0 {
         return;
     }
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let Some(ref panel) = screen.ext_panel else {
         return;
     };
@@ -1020,7 +1038,16 @@ pub(super) fn render_ext_sidebar(
         return;
     }
 
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let Some(ref ext) = screen.ext_sidebar else {
         return;
     };
@@ -1139,7 +1166,16 @@ pub(super) fn render_debug_sidebar(
     }
 
     // Build minimal screen layout to get debug_sidebar data.
-    let screen = render::build_screen_layout(engine, theme, &[], 1.0, 1.0, true);
+    let screen = render::build_screen_layout(
+        engine,
+        theme,
+        &[],
+        1.0,
+        1.0,
+        true,
+        0.0,
+        render::TUI_MINIMAP_SIZING,
+    );
     let sidebar = &screen.debug_sidebar;
 
     // ── Chrome rows (panel-specific): header + Run/Stop button via StatusBar. ──

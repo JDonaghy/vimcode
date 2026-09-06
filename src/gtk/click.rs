@@ -675,7 +675,16 @@ mod emoji_click_column_tests {
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, 24.0);
-        let layout = build_screen_layout(&engine, &theme, &rects, line_height, char_width, true);
+        let layout = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            true,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw = &layout.windows[0];
         assert_eq!(
             rw.lines[0].raw_text, text,
@@ -795,7 +804,16 @@ mod emoji_click_column_tests {
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw = &screen.windows[0];
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
@@ -932,7 +950,16 @@ mod emoji_click_column_tests {
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 2000.0, 400.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, paint_cw, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            paint_cw,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw = &screen.windows[0];
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
@@ -1041,7 +1068,16 @@ mod cross_split_drag_focus_tests {
         let line_height: f64 = 18.0;
         let char_width: f64 = 9.0;
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
         let rw_b = screen
             .windows
             .iter()
@@ -1157,7 +1193,16 @@ mod frame_hit_map_tests {
     ) {
         let bounds = WindowRect::new(0.0, 0.0, 800.0, 600.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, (line_height * 1.6).ceil());
-        let screen = build_screen_layout(engine, theme, &rects, line_height, char_width, false);
+        let screen = build_screen_layout(
+            engine,
+            theme,
+            &rects,
+            line_height,
+            char_width,
+            false,
+            8.0,
+            crate::render::gtk_minimap_sizing(),
+        );
 
         let window_editors: Vec<quadraui::Editor> =
             screen.windows.iter().map(render_mod::to_q_editor).collect();
@@ -1421,8 +1466,16 @@ mod single_group_tab_click_dispatch_tests {
                 render_mod::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
             let content = core::WindowRect::new(CONTENT_X, CONTENT_Y, CONTENT_W, CONTENT_H);
             let (rects, _) = engine.calculate_group_window_rects(content, tab_bar_height);
-            let screen =
-                build_screen_layout(&engine, &theme, &rects, line_height, char_width, false);
+            let screen = build_screen_layout(
+                &engine,
+                &theme,
+                &rects,
+                line_height,
+                char_width,
+                false,
+                8.0,
+                crate::render::gtk_minimap_sizing(),
+            );
             assert!(
                 screen.editor_group_split.is_none(),
                 "these tests must exercise the single-group arm; a split layout would \

@@ -5794,8 +5794,12 @@ mod minimap {
             (mm.rect.width, rw.rect.width + mm.rect.width)
         };
         let char_width = h.painted_char_width();
-        let expected =
-            crate::render::minimap_reserved_width(&h.engine.borrow(), pane_width, char_width);
+        let expected = crate::render::minimap_reserved_width(
+            &h.engine.borrow(),
+            pane_width,
+            char_width,
+            crate::render::gtk_minimap_sizing(),
+        );
 
         assert_eq!(
             strip_width, expected,
