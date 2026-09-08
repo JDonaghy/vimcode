@@ -46,8 +46,16 @@
 //!   means "not recorded", not necessarily "not drawn".
 //! - **No window.** `App::window` stays `None`
 //!   (`capture_window_and_apply_csd` finds no mapped toplevel), so CSD
-//!   minimise/maximise/close and anything else routed through
-//!   `gtk4::Window` is inert under test.
+//!   minimise and anything else routed through `gtk4::Window` is inert
+//!   under test. Close is the one CSD control that is *not* on this list
+//!   any more (#857): `window_close` used to call `w.close()` directly,
+//!   which is exactly the inert-under-test, only-testable-live pattern
+//!   this bullet describes — and also the reason its
+//!   `w.close()` → GTK `close-request` re-entrancy bug went unnoticed by
+//!   this harness. It now routes through `show_quit_confirm` instead
+//!   (same fix shape as maximize's #813 `toggle_window_maximize`), which
+//!   never touches `self.window`, so `issue_857_titlebar_close_button`'s
+//!   tests below observe it fully headlessly.
 //! - **No display-dependent init.** No CSS is attached to a `GdkDisplay`, no
 //!   icon theme search path, no clipboard provider, no
 //!   `Engine::startup`/session restore. Behaviour that depends on any of
@@ -9320,6 +9328,158 @@ mod issue_813_exit_via_reaction {
             repeat: false,
         });
         assert_eq!(reaction, quadraui::Reaction::Exit);
+    }
+}
+
+#[cfg(test)]
+mod issue_857_titlebar_close_button {
+    //! #857: the inline titlebar × button (`App::window_close`) used to
+    //! call `w.close()` directly. `gtk_window_close` emits GTK's
+    //! `close-request` signal *synchronously, on the same stack* —
+    //! quadraui's handler for that signal re-enters `backend.borrow_mut()`
+    //! while `activate::{closure#3}` (quadraui `run.rs:616`) still holds
+    //! it across `dispatch_event`, so the re-entrant borrow panics with
+    //! `BorrowMutError` inside `close_request_trampoline`, an `extern "C"`
+    //! frame that cannot unwind — which aborts the whole process
+    //! (`SIGABRT`) instead of raising the "Unsaved Changes" confirmation
+    //! the OS/WM close path (`UiEvent::WindowClose`, same file) already
+    //! shows. See the issue for the full annotated stack.
+    //!
+    //! `quit_unsaved` (the dialog `show_quit_confirm` opens) has no
+    //! `DialogTable`/text input, so it is natively-expressible (#727) and
+    //! never paints in-canvas — same as
+    //! `menu_quit_with_unsaved_changes_opens_confirm_dialog` above,
+    //! `native_dialog_shown`/`pending_native_dialog` are the proof here
+    //! too, not `screen_contains`.
+    //!
+    //! `window_close` now routes through `show_quit_confirm` instead — the
+    //! same fix shape #813 already applied to the maximize button's
+    //! sibling (`window_toggle_maximize`) — so it never touches the real
+    //! OS window handle at all. That is what makes this headlessly
+    //! testable: no live GTK window (or its `close-request` signal) is
+    //! involved in either test below, only the button's `handle_dispatch`
+    //! path, exactly the seam the issue's "Regression test" note points
+    //! at.
+    use super::*;
+
+    /// Presses then releases the left mouse button over the last-painted
+    /// window-control band's rightmost segment. The three controls
+    /// (minimize/maximize/close) paint left-to-right
+    /// (`render::window_controls_status_bar`'s `right_segments` order),
+    /// so landing a couple of pixels in from the band's right edge always
+    /// lands inside the close segment's padded `"  X  "` text regardless
+    /// of exact glyph width — this derives the click point from the last
+    /// *painted* `title_bar_rect` rather than a hardcoded pixel (CLAUDE.md's
+    /// "locate targets, never hardcode coordinates" rule), the same rect
+    /// `command_center_paints_between_menu_labels_and_window_controls`
+    /// above asserts against.
+    ///
+    /// Down+up (not `GtkDriver::click`, which is a bare press with no
+    /// release) because `StatusBarInteraction` fires `Clicked` only on a
+    /// mouse-up over the same segment a mouse-down pressed — see
+    /// `quadraui::StatusBarInteraction::handle`'s doc.
+    fn click_titlebar_close_button<A: AppLogic>(h: &mut Harness<A>) -> quadraui::Reaction {
+        let controls = h.title_bar_rect.get();
+        assert!(
+            controls.width > 0.0,
+            "window controls must have painted a non-degenerate rect \
+             before a click can be aimed at them"
+        );
+        let x = controls.x + controls.width - 2.0;
+        let y = controls.y + controls.height / 2.0;
+        h.driver.mouse_down(x, y);
+        h.driver.mouse_up(x, y)
+    }
+
+    /// **Verified RED against unfixed `develop`:** reverting
+    /// `window_close` to `if let Some(ref w) = self.window { w.close(); }`
+    /// leaves this red — under this headless harness `self.window` is
+    /// always `None` (per this module's own doc, "No window"), so the old
+    /// body was a silent no-op here: no quit-confirm dialog opens and
+    /// neither `native_dialog_shown` nor `pending_native_dialog` ever
+    /// flips. On a live window the same old code instead aborts the
+    /// process before the dialog can open, which is strictly worse — see
+    /// the issue.
+    #[test]
+    fn titlebar_close_with_unsaved_changes_raises_quit_confirm() {
+        let mut engine = Engine::new_for_test();
+        engine.set_dirty(true);
+        assert!(engine.has_any_unsaved(), "sanity: fixture must be dirty");
+
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+        assert!(
+            !h.native_dialog_shown.get(),
+            "sanity: no quit-confirm dialog should be open before the click"
+        );
+
+        let reaction = click_titlebar_close_button(&mut h);
+        h.driver.render();
+
+        assert!(
+            h.native_dialog_shown.get(),
+            "clicking the inline titlebar close button with unsaved \
+             changes must raise the same quit-confirmation dialog the \
+             OS/WM close path (`UiEvent::WindowClose`) shows"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "clicking the inline titlebar close button with unsaved \
+             changes must queue the native quit-confirm present"
+        );
+        assert_ne!(
+            reaction,
+            quadraui::Reaction::Exit,
+            "the process must not exit while the quit-confirmation \
+             dialog is still awaiting an answer"
+        );
+        assert!(
+            !h.driver.exited(),
+            "GtkDriver::exited() must stay false: the click must not \
+             abort/exit the process while unsaved changes are pending"
+        );
+    }
+
+    /// The clean half of #857: with nothing unsaved, the inline titlebar
+    /// × must behave exactly like `save_session_and_exit` — set
+    /// `exit_requested` so the runner tears the window down through
+    /// `Reaction::Exit`/`destroy()` (the same latch
+    /// `qall_bang_returns_reaction_exit_on_gtk` above exercises), never
+    /// through a direct `w.close()` that re-enters `close-request`
+    /// mid-dispatch.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `w.close()` body, `self.window` is `None` in this harness so
+    /// nothing happens at all — `reaction` stays `Reaction::Continue` (no
+    /// state changed for the interaction to redraw over) and `exited()`
+    /// stays `false` forever, instead of the process actually exiting
+    /// (live) or aborting (real window, per the issue).
+    #[test]
+    fn titlebar_close_with_no_unsaved_changes_exits_cleanly() {
+        let engine = Engine::new_for_test();
+        assert!(
+            !engine.has_any_unsaved(),
+            "sanity: fixture must start clean"
+        );
+
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+
+        let reaction = click_titlebar_close_button(&mut h);
+
+        assert_eq!(
+            reaction,
+            quadraui::Reaction::Exit,
+            "clicking the inline titlebar close button with nothing \
+             unsaved must surface as Reaction::Exit, not a direct \
+             w.close() that re-enters GTK's close-request handler \
+             mid-dispatch and aborts the process"
+        );
+        assert!(
+            h.driver.exited(),
+            "GtkDriver::exited() must latch — the black-box stand-in \
+             for the process actually exiting cleanly"
+        );
     }
 }
 

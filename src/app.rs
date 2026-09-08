@@ -5650,10 +5650,23 @@ impl App {
     }
 
     /// Close the application window (inline window-control button).
+    ///
+    /// Routes through `show_quit_confirm` (#857) instead of driving the real
+    /// OS window's `close()` directly: `close()` emits GTK's `close-request`
+    /// signal *synchronously, on the same stack* — quadraui's handler for
+    /// that signal re-enters `backend.borrow_mut()` while this dispatch path
+    /// still holds it (see quadraui `run.rs:616`/`896`), which panics with
+    /// `BorrowMutError` inside a signal trampoline that cannot unwind and so
+    /// aborts the process instead of just panicking. `window_toggle_maximize`
+    /// above already avoids the equivalent trap for maximize (#813) by
+    /// routing through the engine instead of the OS window handle; this is
+    /// the same fix applied to close. `show_quit_confirm` either raises the
+    /// unsaved-changes dialog or sets `exit_requested`, which
+    /// `ShellApp::handle` turns into `quadraui::Reaction::Exit` — the runner
+    /// then tears the window down with `destroy()`, which does not re-enter
+    /// `close-request`.
     fn window_close(&mut self) {
-        if let Some(ref w) = self.window {
-            w.close();
-        }
+        self.show_quit_confirm();
     }
 
     /// User triggered quit; exit straight away when nothing is unsaved,
