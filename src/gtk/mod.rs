@@ -487,7 +487,17 @@ pub fn run(file_path: Option<PathBuf>) {
     // Create the App and run via the quadraui ShellApp runner.
     // The runner creates its own GTK Application + window; vimcode's engine
     // and event handling are wired in via impl ShellApp for App above.
-    let vimcode_app = App::new(file_path);
+    //
+    // The concrete backend is chosen here, at the GTK entry point, and
+    // handed to `App::new` rather than `App` constructing one itself
+    // (#861) — this is the seam a future non-GTK wrapper (#859) would pass
+    // a different `TextMetricsBackend` impl through.
+    let text_metrics_backend: std::rc::Rc<
+        std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>,
+    > = std::rc::Rc::new(std::cell::RefCell::new(
+        Box::new(backend::GtkBackend::new()),
+    ));
+    let vimcode_app = App::new(file_path, text_metrics_backend);
     let config = build_shell_config(&vimcode_app);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
 }
