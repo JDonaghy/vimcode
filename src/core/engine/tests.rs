@@ -23137,6 +23137,120 @@ fn test_set_option_scrolloff_behavior() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 'startofline' (#876) — off by default (matches Neovim and vimcode's
+// pre-existing hardcoded behavior; Vim's own default is on). `nvim_conformance`
+// carries four labels (`scroll:C-d col sol`, `word:gg indented (sol)`, `word:G
+// indented (sol)`, `word:5G then j col (sol)`) that pin `startofline=true` via
+// Lua `setup` to probe this — but that harness's `run_in_vimcode` never reads
+// a case's `setup` (#875), so those labels can't observe this option no
+// matter how correct it is. These are the option's own tests, driving the
+// engine directly instead of through that harness gap.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_startofline_default_off_keeps_column() {
+    // Sanity check: turning the setting into a real, toggleable field must not
+    // change the existing (off) default for anyone who never sets it.
+    let mut engine = setup_engine("  a\nb", 1, 0);
+    assert!(!engine.settings.startofline);
+    send_keys(&mut engine, "gg");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0, "off: gg keeps column 0");
+}
+
+#[test]
+fn test_startofline_on_gg_lands_on_first_non_blank() {
+    let mut engine = setup_engine("  a\nb", 1, 0);
+    engine.settings.startofline = true;
+    send_keys(&mut engine, "gg");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: gg lands on the first non-blank of \"  a\""
+    );
+}
+
+#[test]
+fn test_startofline_on_g_lands_on_first_non_blank() {
+    let mut engine = setup_engine("a\n  b", 0, 0);
+    engine.settings.startofline = true;
+    send_keys(&mut engine, "G");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: G lands on the first non-blank of \"  b\""
+    );
+}
+
+#[test]
+fn test_startofline_on_hml_land_on_first_non_blank() {
+    let mut engine = setup_engine("  a\n  b\n  c", 0, 0);
+    engine.settings.startofline = true;
+    engine.set_viewport_lines(3);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, "L");
+    assert_eq!(engine.view().cursor.line, 2);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: L lands on first non-blank"
+    );
+    send_keys(&mut engine, "H");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: H lands on first non-blank"
+    );
+    send_keys(&mut engine, "M");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "on: M lands on first non-blank"
+    );
+}
+
+#[test]
+fn test_startofline_on_ctrl_d_lands_on_first_non_blank_and_sticks() {
+    // Mirrors the oracle's "scroll:C-d col sol" case, plus the extra step
+    // (a second <C-d>) that proves the option's landing column becomes the
+    // new remembered `curswant` — confirmed against real Neovim: after one
+    // <C-d> with 'startofline' on, a second <C-d> keeps returning to the
+    // first-non-blank column, not the pre-jump one.
+    let lines: Vec<String> = (1..=60).map(|i| format!("L{i:02} x")).collect();
+    let mut engine = setup_engine(&lines.join("\n"), 0, 2);
+    engine.settings.startofline = true;
+    engine.set_viewport_lines(10);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, "<C-d>");
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "on: <C-d> lands on first non-blank, not the pre-jump column 2"
+    );
+    let line_after_first = engine.view().cursor.line;
+    send_keys(&mut engine, "<C-d>");
+    assert!(engine.view().cursor.line > line_after_first);
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "on: a second <C-d> keeps landing on first non-blank (curswant reset)"
+    );
+}
+
+#[test]
+fn test_set_startofline_via_colon_set() {
+    let mut engine = setup_engine("  a\nb", 1, 0);
+    engine.execute_command("set startofline");
+    assert!(engine.settings.startofline);
+    engine.execute_command("set nostartofline");
+    assert!(!engine.settings.startofline);
+}
+
 #[test]
 fn test_set_option_splitbelow_behavior() {
     // splitbelow: :split puts new window below current
