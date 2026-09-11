@@ -3651,9 +3651,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "op:<< mixed tab space",
     "op:o esc removes indent",
     "op:cw on empty line",
-    "op:dvj charwise force",
-    "op:dve exclusive force",
-    "op:dv$",
     // Remaining `dot:` deviations: each fails for a reason outside `.` itself
     // -- linewise-`p` cursor placement (see "op:p linewise cursor first
     // nonblank"), past-eol cursor clamping on entering insert, and `2>>`
