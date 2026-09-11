@@ -1446,8 +1446,7 @@ impl Engine {
                 let count = self.take_count().max(1);
                 let target = self.screen_top_target(count);
                 self.push_jump_location();
-                self.view_mut().cursor.line = target;
-                self.clamp_cursor_col();
+                self.land_line_jump_cursor(target);
             }
             Some('M') => {
                 // M: jump to the middle of the lines actually visible.
@@ -1457,8 +1456,7 @@ impl Engine {
                 let _ = self.take_count();
                 let mid = self.middle_visible_line();
                 self.push_jump_location();
-                self.view_mut().cursor.line = mid;
-                self.clamp_cursor_col();
+                self.land_line_jump_cursor(mid);
             }
             Some('L') => {
                 // L: jump to line [count] from bottom of visible screen,
@@ -1466,8 +1464,7 @@ impl Engine {
                 let count = self.take_count().max(1);
                 let target = self.screen_bottom_target(count);
                 self.push_jump_location();
-                self.view_mut().cursor.line = target;
-                self.clamp_cursor_col();
+                self.land_line_jump_cursor(target);
             }
             Some('R') => {
                 // R: enter Replace mode
@@ -1707,17 +1704,15 @@ impl Engine {
             }
             Some('G') => {
                 self.push_jump_location();
-                if self.peek_count().is_some() {
+                let target_line = if self.peek_count().is_some() {
                     // Count provided: go to line N (1-indexed)
                     let count = self.take_count();
-                    let target_line = (count - 1).min(self.buffer().len_lines().saturating_sub(1));
-                    self.view_mut().cursor.line = target_line;
+                    (count - 1).min(self.buffer().len_lines().saturating_sub(1))
                 } else {
                     // No count: go to last line
-                    let last = self.buffer().len_lines().saturating_sub(1);
-                    self.view_mut().cursor.line = last;
-                }
-                self.clamp_cursor_col();
+                    self.buffer().len_lines().saturating_sub(1)
+                };
+                self.land_line_jump_cursor(target_line);
             }
             Some('~') => {
                 // Toggle case of char(s) under cursor
@@ -2031,18 +2026,18 @@ impl Engine {
                         } else {
                             0
                         };
-                        self.view_mut().cursor.line = target_line;
                         // `gg` is a curswant-preserving vertical motion, exactly
-                        // like `G`/`j`/`k` — Neovim's 'startofline' defaults OFF
-                        // (unlike Vim's default-on), so `gg` never jumps to
-                        // column 0/first-non-blank; it keeps the column the
-                        // cursor already had, clamped to the target line's
-                        // length (verified against `nvim --headless`, the
-                        // conformance oracle this repo's tests run against;
-                        // see #806 review — a real `vim` binary's `col('.')`
-                        // after `gg` is not a substitute for the actual nvim
-                        // oracle used by `tests/nvim_conformance.rs`).
-                        self.clamp_cursor_col();
+                        // like `G`/`j`/`k` — `'startofline'` (`Settings::startofline`,
+                        // #876) is OFF by default (Neovim's default; Vim's is ON),
+                        // so out of the box `gg` never jumps to column
+                        // 0/first-non-blank; it keeps the column the cursor
+                        // already had, clamped to the target line's length
+                        // (verified against `nvim --headless`, the conformance
+                        // oracle this repo's tests run against; see #806 review —
+                        // a real `vim` binary's `col('.')` after `gg` is not a
+                        // substitute for the actual nvim oracle used by
+                        // `tests/nvim_conformance.rs`).
+                        self.land_line_jump_cursor(target_line);
                     }
                 }
                 Some('e') => {

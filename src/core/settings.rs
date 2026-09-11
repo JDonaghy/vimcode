@@ -185,6 +185,19 @@ pub struct Settings {
     #[serde(default)]
     pub scrolloff: usize,
 
+    /// When true, commands that move the cursor to a different line
+    /// (`<C-d>`, `<C-u>`, `<C-b>`, `<C-f>`, `G`, `gg`, `H`, `M`, `L`) park the
+    /// cursor on the first non-blank column of the destination line instead
+    /// of keeping the current column. Corresponds to Vim's `'startofline'` /
+    /// `'sol'`. Default **false**, matching Neovim (real Vim defaults this
+    /// **on** — see `:h 'startofline'`); vimcode's existing hardcoded
+    /// column-preserving behavior for these commands already matched
+    /// Neovim's default before this option existed, so flipping the default
+    /// would silently change behavior for every user who never touches this
+    /// setting.
+    #[serde(default)]
+    pub startofline: bool,
+
     /// Highlight the line the cursor is on (default true).
     #[serde(default = "default_cursorline")]
     pub cursorline: bool,
@@ -867,6 +880,7 @@ impl Default for Settings {
             ignorecase: false,
             smartcase: false,
             scrolloff: 0,
+            startofline: false,
             cursorline: default_cursorline(),
             window_status_line: default_window_status_line(),
             status_line_above_terminal: default_status_line_above_terminal(),
@@ -1148,8 +1162,13 @@ impl Settings {
         } else {
             "nonerdfonts"
         };
+        let sol = if self.startofline {
+            "startofline"
+        } else {
+            "nostartofline"
+        };
         format!(
-            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}  {}",
+            "{}  {}  ts={}  sw={}  {}  {}  {}  {}  {}  {}  {}  {}  {}  {}  so={}  tw={}  {}  {}",
             num,
             et,
             self.tabstop,
@@ -1166,7 +1185,8 @@ impl Settings {
             sc,
             self.scrolloff,
             self.textwidth,
-            nf
+            nf,
+            sol
         )
     }
 
@@ -1207,6 +1227,7 @@ impl Settings {
             "hlsearch" | "hls" => self.hlsearch = enable,
             "ignorecase" | "ic" => self.ignorecase = enable,
             "smartcase" | "scs" => self.smartcase = enable,
+            "startofline" | "sol" => self.startofline = enable,
             "cursorline" | "cul" => self.cursorline = enable,
             "windowstatusline" | "wsl" => self.window_status_line = enable,
             "statuslineaboveterminal" | "slat" => self.status_line_above_terminal = enable,
@@ -1419,6 +1440,11 @@ impl Settings {
                 "nosmartcase".to_string()
             }),
             "scrolloff" | "so" => Ok(format!("scrolloff={}", self.scrolloff)),
+            "startofline" | "sol" => Ok(if self.startofline {
+                "startofline".to_string()
+            } else {
+                "nostartofline".to_string()
+            }),
             "cursorline" | "cul" => Ok(if self.cursorline {
                 "cursorline".to_string()
             } else {
@@ -1588,6 +1614,7 @@ impl Settings {
             "spell" => self.spell.to_string(),
             "spelllang" => self.spelllang.clone(),
             "scrolloff" => self.scrolloff.to_string(),
+            "startofline" | "sol" => self.startofline.to_string(),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
             "hlsearch" => self.hlsearch.to_string(),
@@ -1683,6 +1710,7 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid scrolloff: {value}"))?;
             }
+            "startofline" | "sol" => self.startofline = value == "true",
             "colorcolumn" => self.colorcolumn = value.to_string(),
             "textwidth" => {
                 self.textwidth = value
@@ -1978,6 +2006,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Minimum lines to keep visible above and below the cursor",
         category: "Editor",
         setting_type: SettingType::Integer { min: 0, max: 30 },
+    },
+    SettingDef {
+        key: "startofline",
+        label: "Start Of Line",
+        description: "Land on the first non-blank column after G, gg, H, M, L, <C-d>, <C-u>, <C-b>, <C-f> (Vim's default; Neovim's is off)",
+        category: "Editor",
+        setting_type: SettingType::Bool,
     },
     SettingDef {
         key: "colorcolumn",

@@ -3383,9 +3383,33 @@ impl Engine {
             .unwrap_or_else(|| (self.viewport_lines() / 2).max(1))
     }
 
+    /// Land the cursor on `line` after one of the curswant-preserving
+    /// vertical-scroll motions (`<C-d>`/`<C-u>`/`<C-b>`/`<C-f>`). Vim's
+    /// `'startofline'` option (see `Settings::startofline`) names these four
+    /// among the commands it governs: when set, park on the first non-blank
+    /// column instead of the remembered `curswant`, and make that column the
+    /// new `curswant` — confirmed against real Neovim (`vim.o.startofline =
+    /// true`), a plain `<C-d>` afterwards keeps returning to the
+    /// first-non-blank column, not the pre-jump one. `G`/`gg`/`H`/`M`/`L` are
+    /// the other 'startofline' commands but don't use `curswant` at all in
+    /// their off-state (they just leave the actual column untouched), so
+    /// they honor the option directly at their own call sites instead of
+    /// through this helper.
+    pub(crate) fn land_vertical_scroll_cursor(&mut self, line: usize) {
+        self.view_mut().cursor.line = line;
+        if self.settings.startofline {
+            self.move_cursor_to_first_non_blank(line);
+            self.curswant = Some(self.view().cursor.col);
+        } else {
+            let want = self.curswant();
+            self.apply_curswant(want);
+        }
+    }
+
     /// `<C-d>`/`<C-u>`: scroll the viewport AND move the cursor by the same
     /// `delta` lines (positive = down), fold-aware and clamped to the
-    /// buffer. Column follows `curswant` like any other vertical motion.
+    /// buffer. Column follows `curswant` like any other vertical motion
+    /// (or `'startofline'`, when set — see `land_vertical_scroll_cursor`).
     pub(crate) fn scroll_and_move_by(&mut self, delta: isize) {
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let count = delta.unsigned_abs();
@@ -3403,10 +3427,8 @@ impl Engine {
                 self.view().prev_visible_line(self.view().scroll_top, count),
             )
         };
-        self.view_mut().cursor.line = new_line;
         self.view_mut().scroll_top = new_top;
-        let want = self.curswant();
-        self.apply_curswant(want);
+        self.land_vertical_scroll_cursor(new_line);
     }
 
     /// `<C-f>`: scroll a full page forward, keeping a 2-line overlap with
@@ -3428,9 +3450,7 @@ impl Engine {
         let old_top = self.view().scroll_top;
         if (old_top + viewport).saturating_sub(1) >= max_line {
             self.view_mut().scroll_top = max_line;
-            self.view_mut().cursor.line = max_line;
-            let want = self.curswant();
-            self.apply_curswant(want);
+            self.land_vertical_scroll_cursor(max_line);
             return;
         }
         let overlap = 2usize.min(viewport.saturating_sub(1));
@@ -3438,9 +3458,8 @@ impl Engine {
         let new_top = self.view().next_visible_line(old_top, step, max_line);
         self.view_mut().scroll_top = new_top;
         let scrolloff = self.settings.scrolloff;
-        self.view_mut().cursor.line = self.view().next_visible_line(new_top, scrolloff, max_line);
-        let want = self.curswant();
-        self.apply_curswant(want);
+        let target = self.view().next_visible_line(new_top, scrolloff, max_line);
+        self.land_vertical_scroll_cursor(target);
     }
 
     /// `<C-b>`: scroll a full page backward, keeping a 2-line overlap with
@@ -3467,9 +3486,8 @@ impl Engine {
         let new_top = self.view().prev_visible_line(old_top, step);
         self.view_mut().scroll_top = new_top;
         let scrolloff = self.settings.scrolloff;
-        self.view_mut().cursor.line = (old_top + scrolloff + 1).min(max_line);
-        let want = self.curswant();
-        self.apply_curswant(want);
+        let target = (old_top + scrolloff + 1).min(max_line);
+        self.land_vertical_scroll_cursor(target);
     }
 
     // ── Indent / completion helpers ───────────────────────────────────────────
@@ -6180,6 +6198,22 @@ impl Engine {
         let line = line.min(self.buffer().len_lines().saturating_sub(1));
         self.view_mut().cursor.line = line;
         self.view_mut().cursor.col = self.first_non_blank_col(line);
+    }
+
+    /// Land the cursor on `line` for `G`/`gg`/`H`/`M`/`L` — Vim's
+    /// `'startofline'` option names all five. `curswant` is already `None`
+    /// here (these keys aren't in `update_curswant_for_key`'s preserved
+    /// list), so unlike the `<C-d>`-family helper
+    /// (`land_vertical_scroll_cursor`) there is no remembered column to fall
+    /// back on when the option is off — the baseline behavior is simply
+    /// "leave the actual column alone, clamped to the new line".
+    pub(crate) fn land_line_jump_cursor(&mut self, line: usize) {
+        if self.settings.startofline {
+            self.move_cursor_to_first_non_blank(line);
+        } else {
+            self.view_mut().cursor.line = line;
+            self.clamp_cursor_col();
+        }
     }
 }
 
