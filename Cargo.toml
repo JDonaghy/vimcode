@@ -104,11 +104,13 @@ gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
 # GTK4 anywhere in the dependency graph (macmini carries no Homebrew/gtk4/
 # pkg-config by policy).
 #
-# The vimcode-side wrapper this gates is `src/macos/mod.rs` — ~50 lines of
+# The vimcode-side wrapper this gates is `src/macos/mod.rs` — ~30 lines of
 # runner wiring with no layout, hit-test, paint or dispatch decision in it.
-# It wraps `TuiShellApp` rather than `crate::app::App`, because `App` is
-# still `#[cfg(feature = "gui")]` and still GTK-typed; see that file's
-# "Which `ShellApp` this wraps" section and `src/app.rs`'s module doc.
+# It wraps `crate::app::App` directly: #861/#862 type-erased `App`'s last
+# GTK-only seams (the `TextMetricsBackend` context setter and the three
+# platform-resource fields), so `App` is no longer `#[cfg(feature = "gui")]`
+# and the macOS runner drives the same `impl quadraui::ShellApp for App` the
+# GTK runner does — see that file's module doc and `src/app.rs`'s.
 macos = ["quadraui/macos"]
 
 [dependencies]

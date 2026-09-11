@@ -46,18 +46,11 @@ enum GuiBackend {
     /// GTK4 via `vimcode_core::gtk::run` — the `gui` feature, on by default.
     Gtk,
     /// Native AppKit via `vimcode_core::macos::run` — the `macos` feature on
-    /// a macOS host (#859). Wins over `Gtk` when both are available: a
-    /// `--features gui,macos` build on a Mac (Homebrew GTK4 alongside the
-    /// native backend) should run the *native* one, since preferring GTK
-    /// there would make the native backend unreachable without a rebuild.
-    ///
-    /// That combination is untested and not a supported configuration —
-    /// `App::render_content` still has a few `#[cfg(feature = "gui")]`
-    /// blocks that reach for Pango (`click::build_editor_click_context`),
-    /// and with `gui` compiled in they would run against a `MacBackend`.
-    /// Build the native app as `--no-default-features --features macos`,
-    /// which is also the only shape macmini can build (no Homebrew/gtk4/
-    /// pkg-config there by policy).
+    /// a macOS host (#859). See [`COMPILED_GUI_BACKEND`]'s doc comment for
+    /// the precedence rule against `Gtk` and why `--features gui,macos` is
+    /// untested; build the native app as `--no-default-features --features
+    /// macos`, which is also the only shape macmini can build (no Homebrew/
+    /// gtk4/pkg-config there by policy).
     MacOs,
     /// No GUI backend was compiled in. The binary still builds and still
     /// works — as a terminal editor, which is what the `vcd` bin is.
@@ -70,6 +63,11 @@ enum GuiBackend {
 /// build on a Mac (GTK4 from Homebrew alongside the native backend) should
 /// run the *native* one, since choosing GTK there would make the native
 /// backend unreachable without a rebuild.
+///
+/// That combination is untested and not a supported configuration —
+/// `App::render_content` still has a few `#[cfg(feature = "gui")]` blocks
+/// that reach for Pango (`click::build_editor_click_context`), and with
+/// `gui` compiled in they would run against a `MacBackend`.
 #[cfg(all(feature = "macos", target_os = "macos"))]
 const COMPILED_GUI_BACKEND: GuiBackend = GuiBackend::MacOs;
 #[cfg(all(feature = "gui", not(all(feature = "macos", target_os = "macos"))))]
