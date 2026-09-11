@@ -23,10 +23,32 @@ assets = [
 name = "vimcode_core"
 path = "src/lib.rs"
 
+# #859: `required-features` used to be `["gui"]`. That list is an **AND**, so
+# ANY feature set without `gui` — including `--no-default-features` and
+# `--no-default-features --features macos` — made cargo **silently omit this
+# whole bin target**: no error, no warning, and none of its tests compiled or
+# ran. That is the #645 trap in its purest form, and it was measured, not
+# hypothetical: on macmini (2026-09-10) `cargo test --no-default-features`
+# exited 0 having built only 2 test binaries, because the app bin was dropped
+# on the floor rather than reported as unbuildable.
+#
+# It is now empty, and `src/main.rs` gates *internally* on which GUI backend
+# was compiled in (`cfg(feature = "gui")` / `cfg(all(feature = "macos",
+# target_os = "macos"))`), falling back to the terminal UI — loudly, on
+# stderr — when neither is. Deliberately NOT a `compile_error!`: CI's
+# `Test (Linux, headless)` job runs `cargo build/clippy/test
+# --no-default-features`, so a hard error there would turn a green lane red
+# for a build configuration that is genuinely supported (vimcode-as-TUI, the
+# same thing the `vcd` bin is). The omission can no longer be silent because
+# the target now builds in *every* feature set — see
+# `src/main.rs::gui_backend_tests`.
+#
+# #645's gui-on invariant is untouched: `default = ["gui"]`, so a plain
+# `cargo build` / `cargo test` still compiles the GTK backend exactly as
+# before.
 [[bin]]
 name = "vimcode"
 path = "src/main.rs"
-required-features = ["gui"]
 
 [[bin]]
 name = "vcd"
@@ -66,6 +88,28 @@ test-support = []
 # (#223). vimcode adopts them one primitive at a time inside
 # `src/gtk/quadraui_gtk.rs`.
 gui = ["gtk4", "pangocairo", "gio", "quadraui/gtk"]
+
+# #859 (stage 2 of #47): the native macOS backend.
+#
+# Enables `quadraui/macos` — AppKit + Core Graphics + Core Text rasterisers
+# plus `quadraui::macos::shell_runner::run_with_shell`, the AppKit sibling of
+# the GTK/TUI shell runners. quadraui gates its own module
+# `#[cfg(all(feature = "macos", target_os = "macos"))]`, so on a non-macOS
+# host this feature compiles NONE of `quadraui/src/macos/` — enabling it on
+# Linux is resolvable and harmless (it pulls no Linux-side code at all), which
+# is exactly what makes it usable as the "does the bin still build without
+# `gui`?" probe in `src/main.rs`'s tests.
+#
+# Deliberately does NOT imply `gui`: the whole point is a macOS binary with no
+# GTK4 anywhere in the dependency graph (macmini carries no Homebrew/gtk4/
+# pkg-config by policy).
+#
+# The vimcode-side wrapper this gates is `src/macos/mod.rs` — ~50 lines of
+# runner wiring with no layout, hit-test, paint or dispatch decision in it.
+# It wraps `TuiShellApp` rather than `crate::app::App`, because `App` is
+# still `#[cfg(feature = "gui")]` and still GTK-typed; see that file's
+# "Which `ShellApp` this wraps" section and `src/app.rs`'s module doc.
+macos = ["quadraui/macos"]
 
 [dependencies]
 # `quadraui/tui` enables the public `quadraui::tui::draw_*` rasterisers
