@@ -68,6 +68,23 @@ pub mod gtk;
 /// doc for the full inventory.
 pub mod app;
 
+/// The native macOS (AppKit) backend — a thin wrapper over
+/// `quadraui::macos::shell_runner::run_with_shell` (#859, stage 2 of #47).
+///
+/// Double-gated, on the `macos` feature **and** `target_os = "macos"`, for
+/// the same reason quadraui gates its own `macos` module that way
+/// (`quadraui/src/lib.rs:128`): the module's whole dependency surface —
+/// `MacBackend`, AppKit, Core Graphics, Core Text — does not exist off a
+/// Mach-O host, so `--features macos` on Linux resolves cleanly and compiles
+/// none of it. That makes the feature safe to enable anywhere (it is what
+/// the `vimcode` bin's GUI-less build test in `src/main.rs` leans on) at the
+/// price that a Linux build proves nothing about this code. See
+/// `src/macos/mod.rs`'s "Verifying this file without a Mac" section for what
+/// was done about that and why the obvious `--target aarch64-apple-darwin`
+/// cross-check does not work here (`tree-sitter`'s C build script).
+#[cfg(all(feature = "macos", target_os = "macos"))]
+pub mod macos;
+
 /// Process-wide working-directory arbitration for the test run (#785) — the
 /// lock that keeps a `chdir`-ing test from moving the ground under a
 /// concurrently painting harness. Test-only; never compiled into a release

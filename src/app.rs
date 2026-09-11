@@ -1062,6 +1062,153 @@ impl App {
         )
     }
 
+    /// Backend-neutral twin of [`App::new`] (#859) — what a wrapper over a
+    /// non-GTK quadraui backend calls to get the *same* `App`, and therefore
+    /// the same `impl ShellApp`, the GTK entry point runs.
+    ///
+    /// This is [`App::new`] minus exactly the four steps in its prologue that
+    /// need a live GTK display, each of which is a platform *resource* rather
+    /// than a decision:
+    ///
+    /// | skipped | why | what replaces it |
+    /// |---|---|---|
+    /// | `gdk::Display` icon-theme search path + `install_bundled_icon_font` | GDK-only; the font install writes to `~/.local/share/fonts` and shells out to `fc-cache` | the backend's own font stack (macOS: Core Text) |
+    /// | `crate::gtk::css::load_css` | `unwrap()`s `gdk::Display::default()` | `css_provider: None` — a GTK stylesheet styles nothing on another toolkit |
+    /// | `gtk4::Settings::set_gtk_application_prefer_dark_theme` | GTK-only | the backend's own light/dark handling |
+    /// | the `gio::FileMonitor` on `settings.json` | GIO-only | `settings_monitor: None` — settings hot-reload is a known gap off GTK, tracked as the file-watcher half of the quadraui-side surface `src/app.rs`'s module doc item 2 names |
+    ///
+    /// Everything else — engine construction and startup, nerd-font
+    /// selection, the clipboard provider (`setup_gtk_clipboard` names no
+    /// toolkit type and already `cfg`s its X11 branch off on macOS), the
+    /// emergency-engine registration the panic hook's swap flush needs, and
+    /// the whole of [`App::assemble`] — is shared verbatim, so the two
+    /// constructors cannot drift on anything that affects behaviour.
+    ///
+    /// `backend` is the caller's [`TextMetricsBackend`], the seam #861 opened
+    /// and `src/gtk/mod.rs::run` names in its own comment as "the seam a
+    /// future non-GTK wrapper (#859) would pass a different
+    /// `TextMetricsBackend` impl through".
+    ///
+    /// The `allow(dead_code)` is feature-shaped, not a silencer: the only
+    /// caller is `crate::macos::run`, which is double-gated on `macos` +
+    /// `target_os = "macos"`. Keeping the function itself **un**gated means
+    /// every lane still type-checks it.
+    #[cfg_attr(not(all(feature = "macos", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn new_portable(
+        file_path: Option<PathBuf>,
+        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    ) -> Self {
+        let mut engine = {
+            let mut e = Engine::new();
+            crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts);
+            e.startup(file_path.as_deref());
+            e
+        };
+        setup_gtk_clipboard(&mut engine);
+
+        let last_colorscheme = engine.settings.colorscheme.clone();
+
+        let engine = Rc::new(RefCell::new(engine));
+        // SAFETY: identical contract to `App::new`'s own call — the `Rc` is
+        // moved into the returned `App`, which the caller hands straight to
+        // a `run_with_shell` that owns it for the rest of the process, so
+        // the pointer never dangles. `crate::macos::run` is the only caller
+        // and does exactly that.
+        unsafe {
+            crate::core::swap::register_emergency_engine(
+                engine.as_ptr() as *const crate::core::Engine
+            );
+        }
+
+        Self::assemble(
+            engine,
+            DeferredQueue::new(),
+            None,
+            last_colorscheme,
+            None,
+            backend,
+        )
+    }
+
+    /// Derive the runner's [`quadraui::ShellConfig`] from this `App`'s engine
+    /// state — the backend-neutral core of what every GUI entry point needs
+    /// before it can call `run_with_shell` (#859).
+    ///
+    /// The engine's `AppShell` initialises every `PanelDefinition.icon` to
+    /// `""` because the engine is backend-agnostic, so *somebody* has to map
+    /// panel ID → glyph; doing it here rather than per-backend is the whole
+    /// point, since the mapping is a product decision, not a platform one.
+    ///
+    /// **Known duplication, deliberately not collapsed here.**
+    /// `src/gtk/mod.rs::build_shell_config` is the same code plus two
+    /// GTK/WM-only builders (`with_app_id` / `with_icon_name`, which carry
+    /// `crate::gtk::util::APP_ID` — an X11/Wayland identity string with no
+    /// macOS meaning, where the bundle identifier comes from `Info.plist`).
+    /// It should be deleted in favour of `app.shell_config().with_app_id(…)`,
+    /// but #859 is explicitly forbidden from touching `src/gtk/`: that
+    /// directory matches a `smoke_tests.capability_rules` entry requiring the
+    /// `gtk` capability, rules compose as a union one machine must satisfy in
+    /// full, and no machine in this fleet has gtk **and** macOS — a diff
+    /// spanning both would retry forever at the Test stage. Collapsing them
+    /// is a one-file follow-up on a gtk-capable box.
+    #[cfg_attr(not(all(feature = "macos", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn shell_config(&self) -> quadraui::ShellConfig {
+        // The engine stores all panels (including "bottom:settings") in a
+        // single `panels()` slice; `ShellConfig` wants top-pinned panels in
+        // its first arg and bottom-pinned items via `with_bottom_items()`, so
+        // split on the "bottom:" ID prefix.
+        let panels_with_icons: Vec<_> = self
+            .engine
+            .borrow()
+            .app_shell
+            .panels()
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                p.icon = match p.id.as_str() {
+                    "panel:explorer" => crate::icons::EXPLORER.s().to_string(),
+                    "panel:search" => crate::icons::SEARCH_COD.s().to_string(),
+                    "panel:debug" => crate::icons::DEBUG.s().to_string(),
+                    "panel:git" => crate::icons::GIT_BRANCH.s().to_string(),
+                    "panel:extensions" => crate::icons::EXTENSIONS.s().to_string(),
+                    "panel:ai" => crate::icons::AI_CHAT.s().to_string(),
+                    "bottom:settings" => crate::icons::SETTINGS.s().to_string(),
+                    _ => p.icon,
+                };
+                p
+            })
+            .collect();
+        let (mut top_panels, bottom_items): (Vec<_>, Vec<_>) = panels_with_icons
+            .into_iter()
+            .partition(|p| !p.id.as_str().starts_with("bottom:"));
+        // #557: plugin-provided panels (e.g. the Git Insights extension) live
+        // in `engine.ext_panels`, not in the engine's `AppShell` — nothing
+        // registers them there — so they have to be appended explicitly or
+        // the runner's activity bar renders no icon for them at all.
+        // `ext_activity_panels` already carries each panel's resolved icon,
+        // so the id→glyph match above deliberately needs no arm for them.
+        top_panels.extend(self.engine.borrow().ext_activity_panels());
+
+        // (#552/#710) Reserve a full-width title-bar band across the top of
+        // the shell. `App::render_content` paints vimcode's own menu bar and
+        // inline window controls into it, so a GUI backend that does not
+        // reserve it loses the menu bar entirely. `height_lh` is a
+        // line-height *multiple* (no fixed-px reservation API exists yet);
+        // 1.7 measures ~31px, close to VS Code's 35px title bar.
+        let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
+            .with_bottom_items(bottom_items)
+            .with_title_bar(1.7)
+            // #719/quadraui#657: the activity bar's row height is the fixed
+            // `ACTIVITY_ROW_PX = 48.0` (VS Code parity), so sizing its
+            // *width* from the editor font makes it oblong. Pin to 48px.
+            .with_activity_bar_width_px(48.0);
+        // #759: the shared Alt rung clamps sidebar width, so Alt+Left/Right
+        // resolve identically on every backend.
+        cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
+        cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
+        cfg
+    }
+
     /// Build the `App` struct itself from already-prepared, display-*independent*
     /// inputs.
     ///
@@ -7553,5 +7700,86 @@ impl quadraui::ShellApp for App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod portable_entry_point_tests {
+    //! #859: coverage for the two backend-neutral seams the macOS wrapper
+    //! (`src/macos/mod.rs`) runs through. Both are un-gated, so these run in
+    //! the ordinary Linux lanes even though `crate::macos` itself compiles
+    //! only on a Mach-O host — which is the point: this fleet has no macOS
+    //! cross-toolchain (see `src/macos/mod.rs`'s "Verifying this file without
+    //! a Mac"), so without these the wrapper's inputs would be unguarded
+    //! everywhere vimcode actually builds.
+
+    use super::*;
+
+    /// Any quadraui shell runner — `gtk::`, `tui::` or `macos::` — takes
+    /// `A: ShellApp + 'static`. `crate::macos::run` relies on `App`
+    /// satisfying it, and that call site is invisible to every lane this
+    /// fleet can compile, so pin the bound here instead: `App` gaining a
+    /// borrowed field would kill `'static` while leaving every existing GTK
+    /// test green.
+    ///
+    /// Deliberately a bound assertion rather than a call — `run_with_shell`
+    /// enters an event loop and never returns.
+    #[test]
+    fn app_is_runnable_by_any_quadraui_shell_runner() {
+        fn assert_runnable<A: quadraui::ShellApp + 'static>() {}
+        assert_runnable::<App>();
+    }
+
+    /// [`App::shell_config`] must hand the runner an activity bar that can
+    /// actually be painted: every panel resolved to a non-empty glyph (the
+    /// engine leaves `PanelDefinition.icon` empty because it is
+    /// backend-agnostic), settings split out as a *bottom* item rather than
+    /// left in the top list, and the title-bar band reserved — without it
+    /// `render_content` has nowhere to paint the menu bar and the app opens
+    /// with no menus at all.
+    ///
+    /// Needs a constructed `App`, so it rides the `gui`-gated headless
+    /// constructor; the function under test is not `gui`-gated.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn shell_config_resolves_every_activity_bar_icon_and_reserves_the_title_bar() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(engine);
+        let cfg = app.shell_config();
+
+        assert!(
+            !cfg.panels.is_empty(),
+            "no top-pinned panels: the activity bar would paint nothing"
+        );
+        for p in cfg.panels.iter().chain(cfg.bottom_items.iter()) {
+            assert!(
+                !p.icon.is_empty(),
+                "panel {:?} reached the runner with an unresolved icon",
+                p.id
+            );
+        }
+        assert!(
+            cfg.panels.iter().any(|p| p.id.as_str() == "panel:explorer"),
+            "explorer missing from the top-pinned panels"
+        );
+        assert!(
+            cfg.bottom_items
+                .iter()
+                .any(|p| p.id.as_str() == "bottom:settings"),
+            "settings must be bottom-pinned, not left in the top list"
+        );
+        assert!(
+            !cfg.panels
+                .iter()
+                .any(|p| p.id.as_str().starts_with("bottom:")),
+            "a bottom: panel leaked into the top-pinned list"
+        );
+
+        assert!(
+            cfg.has_title_bar && cfg.title_bar_height_lh > 1.0,
+            "title-bar band not reserved: render_content paints the menu bar into it"
+        );
+        assert_eq!(cfg.min_sidebar_width, render::ALT_SIDEBAR_WIDTH_MIN as f32);
+        assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);
     }
 }
