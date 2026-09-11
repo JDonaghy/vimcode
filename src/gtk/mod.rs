@@ -4,8 +4,6 @@
 
 use std::path::PathBuf;
 
-use crate::render;
-
 pub(crate) mod backend;
 pub(crate) mod click;
 pub(crate) mod css;
@@ -100,90 +98,26 @@ pub fn run(file_path: Option<PathBuf>) {
 /// live runner uses, instead of a hand-written approximation that would drift
 /// from it silently (the failure mode the TUI side's `config()` test helper
 /// already has to work around).
-fn build_shell_config(app: &App) -> quadraui::ShellConfig {
-    // Mirror the engine's AppShell panel list into the ShellConfig so the
-    // quadraui runner renders the activity bar icons.  The engine stores all
-    // panels (including "bottom:settings") in a single `panels()` slice;
-    // ShellConfig wants top-pinned panels in its first arg and bottom-pinned
-    // items via `with_bottom_items()`, so split on the "bottom:" ID prefix.
-    // Fill in activity-bar icons before building ShellConfig.  The engine's
-    // AppShell initialises all PanelDefinition.icon fields to "" because the
-    // engine itself is backend-agnostic; the GTK runner is responsible for
-    // mapping each panel ID to the correct Nerd-Font / fallback glyph.
-    let panels_with_icons: Vec<_> = app
-        .engine
-        .borrow()
-        .app_shell
-        .panels()
-        .iter()
-        .cloned()
-        .map(|mut p| {
-            p.icon = match p.id.as_str() {
-                "panel:explorer" => crate::icons::EXPLORER.s().to_string(),
-                "panel:search" => crate::icons::SEARCH_COD.s().to_string(),
-                "panel:debug" => crate::icons::DEBUG.s().to_string(),
-                "panel:git" => crate::icons::GIT_BRANCH.s().to_string(),
-                "panel:extensions" => crate::icons::EXTENSIONS.s().to_string(),
-                "panel:ai" => crate::icons::AI_CHAT.s().to_string(),
-                "bottom:settings" => crate::icons::SETTINGS.s().to_string(),
-                _ => p.icon,
-            };
-            p
-        })
-        .collect();
-    let (mut top_panels, bottom_items): (Vec<_>, Vec<_>) = panels_with_icons
-        .into_iter()
-        .partition(|p| !p.id.as_str().starts_with("bottom:"));
-    // #557: plugin-provided panels (e.g. the Git Insights extension) live in
-    // `engine.ext_panels`, not in the engine's `AppShell` — nothing registers
-    // them there — so they have to be appended explicitly or the runner's
-    // activity bar renders no icon for them at all. `ext_activity_panels`
-    // already carries each panel's resolved icon, so the id→glyph match above
-    // deliberately doesn't need an arm for them.
-    top_panels.extend(app.engine.borrow().ext_activity_panels());
-    // (#552) Reserve a full-width title-bar band across the top of the shell
-    // (above activity bar + sidebar + main content, not just main content) —
-    // GTK draws its own client-side menu bar + inline window controls into
-    // it since `run_with_shell` creates an undecorated-chrome-free window.
-    // Always on: GTK's menu bar acts as its titlebar (matches pre-#540
-    // behaviour), unlike TUI where it's optional.
-    //
-    // #710 item 2: `height_lh` is a line-height *multiple* of the editor's
-    // `current_line_height` (`AppShell::compute_layout`, quadraui
-    // `compose/app_shell.rs`) — there is no fixed-px reservation API yet, so
-    // this band is unavoidably coupled to editor font metrics until one
-    // exists (see the doc comment on `quadraui::ShellConfig::with_title_bar`
-    // and file a quadraui px-based-reservation issue if this residual needs
-    // closing — #710's PR should note whether that filing happened). 1.0
-    // measured ~18px in the headless GTK test harness — one editor text
-    // line, visibly squat next to VS Code's 35px title bar / ~26px command
-    // centre pill (`quadraui::gtk::command_center::draw_command_center`
-    // paints the pill at `band_height - 4`). 1.7 measures ~31px band / 27px
-    // pill here — much closer to parity without needing the fixed-px API.
-    let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
-        .with_bottom_items(bottom_items)
-        .with_title_bar(1.7)
+///
+/// #866: used to carry its own full copy of the panel-icon-mapping/
+/// title-bar/sidebar-clamp logic — see [`App::shell_config`]'s doc comment
+/// for why that duplication existed and why it's gone now. This is a thin
+/// wrapper adding only the two builders that are genuinely X11/Wayland-WM
+/// concepts with no cross-platform meaning (a macOS/Windows app identifies
+/// itself to its WM/shell through a different mechanism entirely —
+/// `Info.plist` / the executable's embedded manifest, not a runtime string).
+/// `pub(crate)` (not private) so `src/win/mod.rs::run` and a future
+/// `src/win/testing.rs` harness can reach it without copying it a third
+/// time, even though today's Win-GUI/macOS entry points call
+/// `app.shell_config()` directly and never need the WM-only extras this
+/// adds.
+pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
+    app.shell_config()
         // #719: quadraui#656 builders — route the WM app id / icon name
         // through the single `APP_ID` constant #716 introduced, rather than
         // a fresh string literal, so there's exactly one identity string.
         .with_app_id(util::APP_ID)
         .with_icon_name(util::APP_ID)
-        // #719: quadraui#657 fixed-px form. The activity bar's row height is
-        // already the fixed `ACTIVITY_ROW_PX = 48.0` (VS Code parity), so
-        // sizing the bar's *width* from the editor font (the old default)
-        // made it oblong; pin the width to the same 48px instead of using
-        // the font-relative unit form.
-        .with_activity_bar_width_px(48.0);
-    // #759: the shared Alt rung's sidebar clamps, so Alt+Left/Right resolve
-    // identically on both backends. TUI has set exactly this pair since #634
-    // (with a comment naming the failure — "Alt+Right would silently stop at
-    // 50"); GTK kept quadraui's generic 8/50 because it had no Alt rung to
-    // stop short in the first place. `default_sidebar_width` is deliberately
-    // left at quadraui's 20: GTK's unit is a line-height, not a column, so
-    // TUI's 30-*column* default is not the same quantity.
-    cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
-    cfg.max_sidebar_width = render::ALT_SIDEBAR_WIDTH_MAX as f32;
-    cfg
 }
 
 // #731: the `native_scrollbar_placement_tests` module that used to live

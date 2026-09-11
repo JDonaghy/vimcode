@@ -92,6 +92,8 @@ use crate::core::engine::sidebar::*;
 use crate::css::*;
 #[cfg(feature = "gui")]
 use crate::gtk::backend;
+#[cfg(feature = "win")]
+use crate::win::backend as win_backend;
 
 // ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
@@ -258,6 +260,34 @@ impl TextMetricsBackend for backend::GtkBackend {
     }
 }
 
+/// [`TextMetricsBackend`] for quadraui's `WinBackend` (#866, the Win-GUI
+/// twin of #859's `MacBackend` impl in `src/macos/mod.rs`).
+///
+/// - `set_text_measurement_context` is a no-op, same reasoning as the
+///   `MacBackend` impl: DirectWrite measurement
+///   (`WinBackend::measure_text`/`draw_text`) takes the string per call
+///   rather than storing a context, and the trait's one context producer
+///   (`click::build_editor_click_context`) is GTK-only and its call site in
+///   `render_content` is `#[cfg(feature = "gui")]`, so nothing ever calls
+///   this here.
+/// - The two metric setters forward to `WinBackend`'s own public
+///   `set_current_line_height`/`set_current_char_width` (`f32`, matching
+///   DirectWrite's unit — GTK's are `f64` Pango units), the Win-GUI
+///   counterparts of `GtkBackend`'s methods of the same name at the pinned
+///   rev `9eede7fd`.
+#[cfg(feature = "win")]
+impl TextMetricsBackend for win_backend::WinBackend {
+    fn set_text_measurement_context(&mut self, _ctx: Box<dyn std::any::Any>) {}
+
+    fn set_current_line_height(&mut self, line_height: f64) {
+        win_backend::WinBackend::set_current_line_height(self, line_height as f32);
+    }
+
+    fn set_current_char_width(&mut self, char_width: f64) {
+        win_backend::WinBackend::set_current_char_width(self, char_width as f32);
+    }
+}
+
 /// Narrow seam over the OS top-level window handle (#862), the same shape as
 /// [`TextMetricsBackend`] above and `Engine::clipboard_read`/`clipboard_write`
 /// (#417): `App::window` stores one of these type-erased, so the shared
@@ -300,6 +330,22 @@ impl PlatformWindowHandle for gtk4::Window {
         gtk4::prelude::GtkWindowExt::set_decorated(self, decorated);
     }
 }
+
+// #866: deliberately no `impl PlatformWindowHandle for` any Win-GUI type.
+// quadraui's `win` module (pinned rev `9eede7fd`) exposes no public
+// top-level-window handle at all — `WinBackend`'s `hwnd` field is private
+// and `#[cfg(target_os = "windows")]`-gated, and nothing in `win::run` or
+// `win::services` hands one back to a `ShellApp` caller. This is the same
+// gap `src/macos/mod.rs` documents for `MacBackend` (no `PlatformWindowHandle`
+// impl there either) — window *discovery* has no portable equivalent yet on
+// either backend, matching this trait's own doc comment above
+// (`win_set_decorated`'s `allow(dead_code)` already prices that in). `App`'s
+// `window` field simply stays `None` on the `new_portable` path both
+// backends use, exactly as it does for macOS today. Writing raw `windows`-
+// crate calls here to invent a handle would be new per-backend feature
+// logic — CLAUDE.md's Platform-Neutrality Rule says that gap belongs in a
+// quadraui issue (a public window-handle accessor next to `WinBackend`),
+// not in this file.
 
 /// Narrow seam over the platform stylesheet provider (#862) — same shape as
 /// [`PlatformWindowHandle`] above. `App::css_provider` stores one of these
@@ -1089,11 +1135,15 @@ impl App {
     /// future non-GTK wrapper (#859) would pass a different
     /// `TextMetricsBackend` impl through".
     ///
-    /// The `allow(dead_code)` is feature-shaped, not a silencer: the only
-    /// caller is `crate::macos::run`, which is double-gated on `macos` +
-    /// `target_os = "macos"`. Keeping the function itself **un**gated means
-    /// every lane still type-checks it.
-    #[cfg_attr(not(all(feature = "macos", target_os = "macos")), allow(dead_code))]
+    /// The `allow(dead_code)` is feature-shaped, not a silencer: the callers
+    /// are `crate::macos::run` (double-gated on `macos` + `target_os =
+    /// "macos"`) and, since #866, `crate::win::run` (`win`, un-target-gated
+    /// — see that module's doc comment for why). Keeping the function itself
+    /// **un**gated means every lane still type-checks it.
+    #[cfg_attr(
+        not(any(feature = "win", all(feature = "macos", target_os = "macos"))),
+        allow(dead_code)
+    )]
     pub(crate) fn new_portable(
         file_path: Option<PathBuf>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
@@ -1139,19 +1189,29 @@ impl App {
     /// panel ID → glyph; doing it here rather than per-backend is the whole
     /// point, since the mapping is a product decision, not a platform one.
     ///
-    /// **Known duplication, deliberately not collapsed here.**
-    /// `src/gtk/mod.rs::build_shell_config` is the same code plus two
+    /// **The duplication this used to have with `src/gtk/mod.rs` is gone
+    /// (#866).** Through #859, `src/gtk/mod.rs::build_shell_config` carried
+    /// its own full copy of the panel-icon-mapping logic below plus two
     /// GTK/WM-only builders (`with_app_id` / `with_icon_name`, which carry
     /// `crate::gtk::util::APP_ID` — an X11/Wayland identity string with no
-    /// macOS meaning, where the bundle identifier comes from `Info.plist`).
-    /// It should be deleted in favour of `app.shell_config().with_app_id(…)`,
-    /// but #859 is explicitly forbidden from touching `src/gtk/`: that
-    /// directory matches a `smoke_tests.capability_rules` entry requiring the
-    /// `gtk` capability, rules compose as a union one machine must satisfy in
-    /// full, and no machine in this fleet has gtk **and** macOS — a diff
-    /// spanning both would retry forever at the Test stage. Collapsing them
-    /// is a one-file follow-up on a gtk-capable box.
-    #[cfg_attr(not(all(feature = "macos", target_os = "macos")), allow(dead_code))]
+    /// macOS/Windows meaning) — left unmerged because #859 was explicitly
+    /// forbidden from touching `src/gtk/` (a `smoke_tests.capability_rules`
+    /// boundary; see that issue). #866's Files list lifts that specific
+    /// restriction for exactly this one function: `build_shell_config` is
+    /// now a thin `app.shell_config().with_app_id(…).with_icon_name(…)`
+    /// wrapper, so this method is the *only* place the panel/title-bar/
+    /// sidebar-clamp logic lives — every GUI entry point (GTK, macOS, and
+    /// now Win-GUI) calls through it, and a future change here can no
+    /// longer silently miss one backend the way three independent copies
+    /// could have.
+    #[cfg_attr(
+        not(any(
+            feature = "gui",
+            feature = "win",
+            all(feature = "macos", target_os = "macos")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn shell_config(&self) -> quadraui::ShellConfig {
         // The engine stores all panels (including "bottom:settings") in a
         // single `panels()` slice; `ShellConfig` wants top-pinned panels in

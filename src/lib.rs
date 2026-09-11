@@ -85,6 +85,28 @@ pub mod app;
 #[cfg(all(feature = "macos", target_os = "macos"))]
 pub mod macos;
 
+/// The native Windows GUI (Direct2D/DirectWrite) backend — a thin wrapper
+/// over `quadraui::win::shell_runner::run_with_shell` (#866, stage 3 of
+/// #47, the Win-GUI twin of `macos` above).
+///
+/// Gated on the `win` feature **alone** — unlike `macos`, which is also
+/// gated on `target_os = "macos"` because quadraui gates its own `macos`
+/// module that way. quadraui's `win` module (`quadraui/src/lib.rs`, next to
+/// the `macos` arm) deliberately does **not** target-gate itself: every real
+/// WinAPI call inside it is individually `cfg(target_os = "windows")`-gated
+/// with a `todo!()` fallback everywhere else, specifically so `cargo check
+/// --features win` type-checks `WinBackend` on an ordinary Linux CI runner
+/// (see that module's own doc comment and `Cargo.toml`'s `win` feature
+/// comment here). `src/win/mod.rs` inherits the same posture, so this line
+/// mirrors it rather than diverging — target-gating this module too would
+/// make `--features win` on Linux compile nothing, silently reintroducing
+/// the #645 trap `macos`'s own `target_os` gate deliberately avoids getting
+/// near for the "does the bin still build without `gui`?" probe. What *is*
+/// `target_os`-gated is where `src/main.rs::launch_gui` actually calls
+/// `vimcode_core::win::run` — see that file's doc comment.
+#[cfg(feature = "win")]
+pub mod win;
+
 /// Process-wide working-directory arbitration for the test run (#785) — the
 /// lock that keeps a `chdir`-ing test from moving the ground under a
 /// concurrently painting harness. Test-only; never compiled into a release
