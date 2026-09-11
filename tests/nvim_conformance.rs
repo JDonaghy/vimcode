@@ -40,6 +40,16 @@
 //! literals) instead of asserting.  Never regenerate to paper over a regression:
 //! the point of the list is that it does not grow.
 //!
+//! ## `HARNESS_LIMITED` (#875)
+//!
+//! A separate, smaller list next to `KNOWN_DEVIATIONS` for cases this *test*
+//! cannot faithfully probe — a harness gap or a broken headless oracle, not a
+//! vimcode bug. These are reported but never enter the bidirectional gate: they
+//! can fail forever without being a regression, and cannot force an entry
+//! deletion by passing. See the array's own doc comment for the two harness
+//! gaps it currently covers (`run_in_vimcode` dropping a case's `setup`, and
+//! the headless-scroll artifact).
+//!
 //! ## Debugging a single area
 //!
 //! `PROBE_FILTER=<label-substring>` restricts the run; `PROBE_VERBOSE=1` prints
@@ -3693,37 +3703,20 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "ex:ce 10",
     "ex:r !echo",
     "ex:*d after visual",
-    // These two are a matched pair (#804): the paired `nvim`-side Lua
-    // `setup` toggles 'smarttab' for the oracle only — `run_in_vimcode`
-    // never reads `setup`, so both cases drive the *same* vimcode keys
-    // against two different Neovim configurations. VimCode has no
-    // 'smarttab' setting; it always behaves as Vim's actual default
-    // (smarttab **on**), so it matches the "(nvim smarttab)" case and, by
-    // construction, cannot also match "(nosmarttab)" — implementing a
-    // `nosmarttab` toggle nobody has asked for is not worth doing just to
-    // chase this pair to zero. If vimcode ever grows a real 'smarttab'
-    // setting, wire it through `run_in_vimcode` and delete this comment.
-    "ins:BS over indent (nosmarttab)",
-    "ins:Tab at start (nosmarttab)",
+    // "ins:BS over indent (nosmarttab)" and "ins:Tab at start (nosmarttab)"
+    // moved to HARNESS_LIMITED (#875) — the harness gap they were pinned to,
+    // not vimcode's Vim-compat, is the reason they fail. See that array.
     "vis:vip then ip extends",
     "vis:v'a? mark d",
     "vis:vjc then u",
     "vis:v_r CR",
     "vis:v ap trailing",
     "vis:vip on last para no trailing",
-    // The last two `num:` deviations, and the only two that survive #807.
-    // Both are the same class as the `ins:*(nosmarttab)` pair above:
-    // `run_in_vimcode` never reads a case's `setup`, so a case whose whole
-    // point is a non-default 'nrformats' cannot be matched by an engine that
-    // has no 'nrformats' setting. VimCode pins **Neovim's default**,
-    // `bin,hex` (see `NrFormats::default()` in `src/core/engine/motions.rs`) —
-    // note Vim's own default additionally includes `octal`, which is why
-    // "num:octal not default 007" (no setup, so plain Neovim defaults) now
-    // passes as `008` while this one wants the octal `010`. If vimcode ever
-    // grows a real 'nrformats' setting, wire it through `run_in_vimcode` and
-    // delete these two.
-    "num:octal nf=octal 007",
-    "num:alpha",
+    // "num:octal nf=octal 007" and "num:alpha" moved to HARNESS_LIMITED
+    // (#875) — same `setup`-is-dropped harness gap as the `nosmarttab` pair
+    // above. See that array. (Note "num:octal not default 007" — no
+    // `setup`, plain Neovim defaults — is unaffected and still passes as
+    // `008`; only the two `setup`-dependent cases are excused.)
     // ── #805: headless-oracle scroll artifacts ──────────────────────────
     //
     // The `scroll:*` entries from here down to "word:gg indented (sol)" are
@@ -3736,33 +3729,11 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // first version of this comment (see #805 review) described the second
     // group wrongly.
     //
-    // Everything here was measured, not assumed: `scripts/
-    // nvim_headless_vs_interactive_repro.sh` runs the same buffer + cursor +
-    // keys through headless nvim (exactly as `run_in_neovim` above does) and
-    // through a *real* interactive nvim in a tmux pane with an 80x24
-    // terminal attached, so the window genuinely redraws. Both sides report
-    // the same window height (22) and the same `'scroll'` (11), so the
-    // comparison is apples-to-apples. In every case below vimcode's value
-    // matches the **interactive** column and never the headless one, so
-    // "fixing" these would mean deliberately breaking vimcode's real,
-    // correctly-tracked scroll position to imitate a broken oracle.
-    //
-    // ── Group A: window-relative *reads* after any cursor move ──
-    //
-    // `H`/`M`/`L`/`<C-b>`/`<C-f>`/`zz`/`zt`/`zb`/`z.`/`z-` all answer "where
-    // is the top/bottom/middle of the window?". Headless nvim's topline
-    // silently collapses to *the cursor's own line*, so these behave as if
-    // the window had never scrolled. Directly observable, no vimcode
-    // involved (60-line buffer, 22-row window, start at line 1):
-    //
-    //     keys    headless line('w0')    interactive line('w0')
-    //     22j            23  (== cursor)          2
-    //     G              60  (== cursor)         39
-    //     50%            30  (== cursor)          9
-    //
-    // which is why e.g. `H` right after `30G` is a no-op in the oracle where
-    // real Vim jumps to the window's actual top line.
-    "scroll:2<C-b>",
+    // "Group A" — window-relative *reads* right after any cursor move
+    // (`H`/`M`/`L`/`<C-b>`/`zz`/etc.) — was the other half of this and is
+    // fully excused; its sole surviving case, "scroll:2<C-b>", moved to
+    // HARNESS_LIMITED (#875) along with the measurements backing it. See
+    // that array.
     //
     // ── Group B: the 2nd and later scroll command in one burst ──
     //
@@ -3839,6 +3810,80 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "misc:c3c",
     "misc:2dd on last",
     "misc:cc with count beyond",
+];
+
+// ---------------------------------------------------------------------------
+// HARNESS_LIMITED (#875) — cases this harness cannot faithfully probe.
+//
+// Distinct from KNOWN_DEVIATIONS: an entry here is not a claim that vimcode
+// differs from Vim. It is a claim that *this test* cannot tell — the failure
+// traces to a gap in the harness (`run_in_vimcode` / `run_in_neovim`) or to
+// the oracle process itself, not to `Engine`. Counting these against the
+// "how far from Neovim is vimcode" number would be dishonest bookkeeping, so
+// the runner reports them separately and excludes them from the
+// KNOWN_DEVIATIONS bidirectional gate entirely — they can fail forever
+// without being a regression, and pass without being "a fix landed" that
+// forces an entry deletion.
+//
+// This array must only ever change for one of two reasons: the harness gap
+// it names gets closed (fix the harness, delete the entry, and the case
+// rejoins the ordinary pass/regress accounting), or a case gets removed from
+// the corpus (delete the stale entry). Like KNOWN_DEVIATIONS, never add an
+// entry to paper over a real regression.
+// ---------------------------------------------------------------------------
+
+const HARNESS_LIMITED: &[&str] = &[
+    // #875: `run_in_vimcode` never reads a case's Lua `setup` — only
+    // `run_in_neovim` (the oracle side) does. A `cs(..)` case exists
+    // specifically to pin a Vim-vs-Neovim option default that differs from
+    // vimcode's hardcoded behaviour, so any such case drives the *same*
+    // vimcode keys against a Neovim configured differently than vimcode is.
+    // It cannot pass by construction, regardless of vimcode's correctness.
+    //
+    // "ins:BS over indent (nosmarttab)" / "ins:Tab at start (nosmarttab)":
+    // vimcode has no 'smarttab' setting; it always behaves as Vim's actual
+    // default (smarttab **on**), matching the "(nvim smarttab)" sibling case
+    // and never "(nosmarttab)". Implementing a real 'smarttab' toggle nobody
+    // has asked for is not worth doing just to chase this pair to zero — if
+    // vimcode ever grows one, wire `setup` through `run_in_vimcode` and move
+    // these back to ordinary cases (deleting the entries here).
+    "ins:BS over indent (nosmarttab)",
+    "ins:Tab at start (nosmarttab)",
+    // "num:octal nf=octal 007" / "num:alpha": same shape, for 'nrformats'.
+    // VimCode pins Neovim's default, `bin,hex` (see `NrFormats::default()`
+    // in `src/core/engine/motions.rs`) — note Vim's own default additionally
+    // includes `octal`, which is why "num:octal not default 007" (no
+    // `setup`, so plain Neovim defaults) passes as `008` while this one
+    // wants the `setup`-pinned octal `010`. Same resolution path as above.
+    "num:octal nf=octal 007",
+    "num:alpha",
+    // #875 (originally #805): "scroll:2<C-b>" is the sole survivor of the
+    // #805 headless-scroll-artifact group. `nvim --headless -l script.lua`
+    // never attaches a UI, so no redraw ever runs and the window's scroll
+    // bookkeeping (`w_topline` / `w_botline` / `w_empty_rows`) is never
+    // validated between the keystrokes of one `nvim_feedkeys()` burst.
+    // Concretely (60-line buffer, 22-row window, start at line 1) headless
+    // nvim's topline silently collapses to *the cursor's own line* after any
+    // cursor move, so window-relative reads like `<C-b>` behave as if the
+    // window had never scrolled:
+    //
+    //     keys    headless line('w0')    interactive line('w0')
+    //     22j            23  (== cursor)          2
+    //     G              60  (== cursor)         39
+    //     50%            30  (== cursor)          9
+    //
+    // Measured, not assumed: `scripts/nvim_headless_vs_interactive_repro.sh`
+    // runs the same buffer + cursor + keys through headless nvim (exactly as
+    // `run_in_neovim` above does) and through a *real* interactive nvim in a
+    // tmux pane with an 80x24 terminal attached, so the window genuinely
+    // redraws. Both sides report the same window height (22) and the same
+    // `'scroll'` (11), so the comparison is apples-to-apples. vimcode's
+    // value matches the **interactive** column and never the headless one —
+    // "fixing" this would mean deliberately breaking vimcode's real,
+    // correctly-tracked scroll position to imitate a broken oracle. Closing
+    // it for real needs a non-headless oracle for window-relative state,
+    // which is a much bigger piece of work than this issue.
+    "scroll:2<C-b>",
 ];
 
 // ---------------------------------------------------------------------------
@@ -4248,6 +4293,22 @@ fn nvim_conformance() {
         );
     }
 
+    // #875: KNOWN_DEVIATIONS and HARNESS_LIMITED are mutually exclusive
+    // buckets — a label wired into both would silently take whichever branch
+    // the loop below checks first, masking the other array's accounting.
+    {
+        let known_set: std::collections::HashSet<&str> = KNOWN_DEVIATIONS.iter().copied().collect();
+        let both: Vec<&str> = HARNESS_LIMITED
+            .iter()
+            .copied()
+            .filter(|l| known_set.contains(l))
+            .collect();
+        assert!(
+            both.is_empty(),
+            "label(s) listed in both KNOWN_DEVIATIONS and HARNESS_LIMITED: {both:?}"
+        );
+    }
+
     let filter = std::env::var("PROBE_FILTER").ok();
     let dump_to = std::env::var("CONFORMANCE_DUMP_DEVIATIONS").ok();
     let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
@@ -4286,13 +4347,41 @@ fn nvim_conformance() {
     results.sort_by_key(|(ci, _, _)| *ci);
 
     let known: std::collections::HashSet<&str> = KNOWN_DEVIATIONS.iter().copied().collect();
+    let harness_limited: std::collections::HashSet<&str> =
+        HARNESS_LIMITED.iter().copied().collect();
     let mut totals = vec![(0usize, 0usize, 0usize); CATEGORIES.len()]; // (pass, known-fail, unexpected-fail)
     let mut outcomes: Vec<(&str, bool)> = Vec::new();
     let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     let mut deviating: Vec<&str> = Vec::new();
     let mut nvim_broke: Vec<&str> = Vec::new();
+    // #875: harness-limited cases are tracked in a wholly separate bucket —
+    // (pass, fail) — and never touch `outcomes`/`totals`/`deviating`, so they
+    // cannot become a regression, cannot force a KNOWN_DEVIATIONS deletion,
+    // and cannot inflate the deviation count. See the HARNESS_LIMITED doc
+    // comment for why.
+    let mut harness_totals = (0usize, 0usize);
+    let mut harness_seen: Vec<&str> = Vec::new();
 
     for (ci, case, outcome) in &results {
+        if harness_limited.contains(case.label) {
+            harness_seen.push(case.label);
+            match outcome {
+                Outcome::NvimBroke => {
+                    nvim_broke.push(case.label);
+                    if in_ci {
+                        harness_totals.1 += 1;
+                    }
+                }
+                Outcome::Pass => harness_totals.0 += 1,
+                Outcome::Fail(msg) => {
+                    harness_totals.1 += 1;
+                    if verbose {
+                        println!("HARNESS-LIMITED-FAIL {msg}");
+                    }
+                }
+            }
+            continue;
+        }
         let listed = known.contains(case.label);
         match outcome {
             Outcome::NvimBroke => {
@@ -4369,6 +4458,18 @@ fn nvim_conformance() {
             nvim_broke
         );
     }
+    if !harness_seen.is_empty() {
+        // #875: reported, but deliberately excluded from every column above
+        // and from the deviation gate below — see the HARNESS_LIMITED doc
+        // comment for why these don't count as "how far from Neovim".
+        println!(
+            "\n{} case(s) excluded as HARNESS_LIMITED (not counted as deviations — see doc \
+             comment): {} pass, {} fail",
+            harness_seen.len(),
+            harness_totals.0,
+            harness_totals.1
+        );
+    }
 
     if let Some(path) = dump_to {
         let mut out = String::new();
@@ -4396,6 +4497,20 @@ fn nvim_conformance() {
         KNOWN_DEVIATIONS,
         filter.is_none().then_some(all_labels.as_slice()),
     );
+
+    // #875: HARNESS_LIMITED gets the same stale-entry hygiene as
+    // KNOWN_DEVIATIONS — a label matching no case would silently exclude
+    // nothing and nobody would notice. Only meaningful on an unfiltered run;
+    // reuse `verdict.stale` so it goes through the existing reporting path.
+    if filter.is_none() {
+        let all_set: std::collections::HashSet<&str> = all_labels.iter().copied().collect();
+        verdict.stale.extend(
+            HARNESS_LIMITED
+                .iter()
+                .copied()
+                .filter(|l| !all_set.contains(l)),
+        );
+    }
 
     // #868: on a Neovim that is not the one the list was captured against,
     // "this listed label now passes" is ambiguous — it is far more often the
