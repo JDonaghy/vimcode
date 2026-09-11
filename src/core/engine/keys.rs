@@ -3871,7 +3871,7 @@ impl Engine {
                 if start_pos >= line_end {
                     return EngineAction::None;
                 }
-                self.apply_charwise_operator(operator, start_pos, line_end, changed);
+                self.apply_charwise_operator_inclusive(operator, start_pos, line_end, changed);
             }
             Some('0') => {
                 // y0/d0: from start of line to (not including) cursor
@@ -3957,7 +3957,13 @@ impl Engine {
                     return EngineAction::None;
                 }
                 let end_line = (current_line + count).min(last_line);
-                self.apply_linewise_operator(operator, current_line, end_line, changed);
+                self.apply_vertical_operator_motion(
+                    operator,
+                    count,
+                    true,
+                    (current_line, end_line),
+                    changed,
+                );
             }
             Some('k') => {
                 // dk: delete current line + count lines above (linewise).
@@ -3970,7 +3976,13 @@ impl Engine {
                     return EngineAction::None;
                 }
                 let start_line = current_line.saturating_sub(count);
-                self.apply_linewise_operator(operator, start_line, current_line, changed);
+                self.apply_vertical_operator_motion(
+                    operator,
+                    count,
+                    false,
+                    (start_line, current_line),
+                    changed,
+                );
             }
             Some('G') => {
                 // dG: delete from current line to end (or to line N if count given)
@@ -4307,13 +4319,51 @@ impl Engine {
         }
     }
 
-    /// Apply a charwise operator on a byte/char range [start..end).
+    /// Apply a charwise operator on a byte/char range [start..end), where
+    /// the motion that produced the range is naturally *exclusive*
+    /// (`end` is not itself included) — the common case.  See
+    /// `apply_charwise_operator_kind` for `v`-forcing details.
     pub(crate) fn apply_charwise_operator(
         &mut self,
         operator: char,
         start: usize,
         end: usize,
         changed: &mut bool,
+    ) {
+        self.apply_charwise_operator_kind(operator, start, end, changed, false);
+    }
+
+    /// Apply a charwise operator on a byte/char range [start..end), where
+    /// the motion that produced the range is naturally *inclusive* of its
+    /// last character (`end` already points one past that character, e.g.
+    /// `e`/`$`). See `apply_charwise_operator_kind`.
+    pub(crate) fn apply_charwise_operator_inclusive(
+        &mut self,
+        operator: char,
+        start: usize,
+        end: usize,
+        changed: &mut bool,
+    ) {
+        self.apply_charwise_operator_kind(operator, start, end, changed, true);
+    }
+
+    /// Apply a charwise operator on a byte/char range [start..end).
+    ///
+    /// `natural_inclusive` records whether, absent any `v` forcing, this
+    /// range is inclusive of its last character (`e`, `$`, …) or exclusive
+    /// (`w`, most others) — the two callers above are the only entry
+    /// points, so every existing call site keeps its prior behavior
+    /// unchanged. It exists so `v` forcing (`:help o_v`) has something to
+    /// toggle: forcing a charwise motion with `v` flips inclusive <->
+    /// exclusive in place, without touching which characters were
+    /// selected in the first place.
+    pub(crate) fn apply_charwise_operator_kind(
+        &mut self,
+        operator: char,
+        start: usize,
+        end: usize,
+        changed: &mut bool,
+        natural_inclusive: bool,
     ) {
         // One-shot; consume unconditionally so it can never leak into a
         // later, unrelated command regardless of which branch below runs.
@@ -4349,7 +4399,23 @@ impl Engine {
             );
             return;
         }
-        self.force_motion_mode = None;
+        // Force charwise mode (`v`): the motion is already charwise, so
+        // this just toggles inclusive <-> exclusive (:help o_v) by
+        // shrinking or growing the range by one character.
+        let (start, end) = if self.force_motion_mode == Some('v') {
+            self.force_motion_mode = None;
+            if natural_inclusive {
+                (start, end.saturating_sub(1).max(start))
+            } else {
+                (start, (end + 1).min(self.buffer().len_chars()))
+            }
+        } else {
+            self.force_motion_mode = None;
+            (start, end)
+        };
+        if start >= end {
+            return;
+        }
         match operator {
             'y' => {
                 let text: String = self.buffer().content.slice(start..end).chars().collect();
@@ -4971,6 +5037,72 @@ impl Engine {
         self.apply_charwise_operator('c', start_pos, end, changed);
     }
 
+    /// Shared body for the `j`/`k` operator-pending handlers (`dj`/`dk` and
+    /// their `v`-forced charwise variants `dvj`/`dvk`).
+    ///
+    /// `j`/`k` are ordinarily linewise, so the un-forced case just uses the
+    /// caller-computed whole-line `line_range`. But `:help o_v` says
+    /// forcing a linewise motion charwise takes "the cursor position" as
+    /// one end and "the position the motion would move the cursor to" as
+    /// the other — i.e. the *exact* landing column, not the whole target
+    /// line. Rather than reimplementing that column (curswant, folds via
+    /// `is_line_hidden`, …), this runs the real `move_down`/`move_up` to
+    /// find it, then rewinds the cursor before either operator applies
+    /// (#881, `op:dvj charwise force`).
+    fn apply_vertical_operator_motion(
+        &mut self,
+        operator: char,
+        count: usize,
+        down: bool,
+        line_range: (usize, usize),
+        changed: &mut bool,
+    ) {
+        if self.force_motion_mode != Some('v') {
+            self.apply_linewise_operator(operator, line_range.0, line_range.1, changed);
+            return;
+        }
+        let start_cursor = self.view().cursor;
+        let start_pos = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+        let mut moved = false;
+        for _ in 0..count {
+            let did_move = if down {
+                self.move_down()
+            } else {
+                self.move_up()
+            };
+            if !did_move {
+                break;
+            }
+            moved = true;
+        }
+        if !moved {
+            // Motion couldn't move at all: the whole operator is a no-op,
+            // same as the un-forced case (checked by the callers before
+            // they even get here, but a forced count-0 move can still
+            // land here if a future caller stops checking that).
+            self.view_mut().cursor = start_cursor;
+            self.force_motion_mode = None;
+            return;
+        }
+        let end_cursor = self.view().cursor;
+        let end_pos = self.buffer().line_to_char(end_cursor.line) + end_cursor.col;
+        self.view_mut().cursor = start_cursor;
+        // This range is already the fully-resolved forced-exclusive
+        // range; clear the force flag now so `apply_charwise_operator`'s
+        // own `v`-toggle (meant for motions that are natively charwise)
+        // does not fire a second time on top of it.
+        self.force_motion_mode = None;
+        let (lo, hi) = if start_pos <= end_pos {
+            (start_pos, end_pos)
+        } else {
+            (end_pos, start_pos)
+        };
+        let lo_line = self.buffer().content.char_to_line(lo);
+        self.view_mut().cursor.line = lo_line;
+        self.view_mut().cursor.col = lo - self.buffer().line_to_char(lo_line);
+        self.apply_charwise_operator(operator, lo, hi, changed);
+    }
+
     pub(crate) fn apply_operator_with_motion(
         &mut self,
         operator: char,
@@ -5095,7 +5227,15 @@ impl Engine {
             self.view_mut().cursor = end_cursor;
         }
 
-        self.apply_charwise_operator(operator, delete_start, delete_end, changed);
+        // `e` is naturally inclusive of its last character (`delete_end`
+        // above already accounts for that with `+1`); `w`/`b` are
+        // naturally exclusive. This only matters when `v` forces the
+        // motion charwise-toggled (#881, `dve`); otherwise it's a no-op.
+        if motion == 'e' {
+            self.apply_charwise_operator_inclusive(operator, delete_start, delete_end, changed);
+        } else {
+            self.apply_charwise_operator(operator, delete_start, delete_end, changed);
+        }
     }
 
     /// Apply `operator` over an *exclusive* charwise range `[lo, hi)`,

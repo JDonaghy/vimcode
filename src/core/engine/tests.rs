@@ -21873,6 +21873,49 @@ fn test_matrix_delete_linewise_motions() {
 }
 
 #[test]
+fn test_matrix_delete_forced_motion_kind() {
+    // `v` in operator-pending position forces the motion's kind
+    // (`:help o_v`, #881): a linewise motion becomes charwise exclusive,
+    // and an already-charwise motion has its inclusive/exclusive flipped.
+    // Expected values verified against Neovim 0.12.5 (mirrors
+    // `tests/nvim_conformance.rs`'s "op:dvj charwise force",
+    // "op:dve exclusive force" and "op:dv$").
+    let cases: &[(&str, &str, usize, usize, &str, &str, usize, usize)] = &[
+        // dvj: `j` is ordinarily linewise (whole-line dj would delete both
+        // lines). Forced charwise-exclusive, it runs from the cursor to
+        // the same column on the next line, exclusive of that column.
+        ("dvj", "abc\ndef", 0, 1, "dvj", "aef", 0, 1),
+        // dve: `e` is ordinarily charwise *inclusive* (de includes the
+        // last char of the word). Forced exclusive, the last char of the
+        // word survives.
+        ("dve", "abc def", 0, 0, "dve", "c def", 0, 0),
+        // dv$: `$` is ordinarily charwise inclusive of the last char on
+        // the line. Forced exclusive, that last char survives.
+        ("dv$", "abc def", 0, 1, "dv$", "af", 0, 1),
+    ];
+
+    for &(label, buf, cline, ccol, keys, expected_buf, eline, ecol) in cases {
+        let mut engine = setup_engine(buf, cline, ccol);
+        send_keys(&mut engine, keys);
+        assert_eq!(
+            engine.buffer().to_string(),
+            expected_buf,
+            "FAIL [{label}]: buffer mismatch"
+        );
+        assert_eq!(
+            engine.view().cursor.line,
+            eline,
+            "FAIL [{label}]: cursor line mismatch"
+        );
+        assert_eq!(
+            engine.view().cursor.col,
+            ecol,
+            "FAIL [{label}]: cursor col mismatch"
+        );
+    }
+}
+
+#[test]
 fn test_matrix_delete_special_motions() {
     let cases: &[(&str, &str, usize, usize, &str, &str, usize, usize)] = &[
         // % brace match
