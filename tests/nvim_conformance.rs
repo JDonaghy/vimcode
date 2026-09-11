@@ -90,21 +90,21 @@
 //! resolved binary path and its version, so "which nvim produced this verdict" is
 //! answerable from a log.
 //!
-//! ## Oracle version skew (#868, #865)
+//! ## Oracle version skew (#868, #865, #872)
 //!
-//! `KNOWN_DEVIATIONS` was captured against the Neovim that `ubuntu-24.04`'s apt
-//! ships (0.9.x) — see [`DEVIATIONS_ORACLE`], which sits next to the list itself
-//! precisely because the two are one fact.  A markedly different Neovim can
-//! legitimately disagree on a handful of labels; that is oracle-version skew,
-//! not a regression, and is **not** a reason to edit the list.
+//! `KNOWN_DEVIATIONS` was captured against Neovim [`DEVIATIONS_ORACLE`], which
+//! sits next to the list itself precisely because the two are one fact.  A
+//! markedly different Neovim can legitimately disagree on a handful of labels;
+//! that is oracle-version skew, not a regression, and is **not** a reason to
+//! edit the list.
 //!
 //! That policy used to be advice the runner then contradicted: the "a listed
 //! label now passes" direction panicked unconditionally, so a dev on a newer
 //! Neovim was *forced* to delete entries that CI would immediately re-report as
-//! regressions.  Concretely, on Neovim 0.12 thirty-seven entries "pass" — all
-//! but one of them a `scroll:` label excused by the headless-topline bug
-//! documented in Group A below, which upstream has since fixed.  Measured with
-//! the same 60-line/22-row probe as that comment:
+//! regressions.  Concretely, going from the 0.9.x baseline to 0.12 thirty-seven
+//! entries "pass" — all but one of them a `scroll:` label excused by the
+//! headless-topline bug documented in Group A below, which upstream has since
+//! fixed.  Measured with the same 60-line/22-row probe as that comment:
 //!
 //! ```text
 //!     keys    0.9.x headless w0    0.12 headless w0    interactive w0
@@ -120,14 +120,15 @@
 //! **regression** direction and the stale-entry check stay fatal everywhere —
 //! they are the ones that catch real bugs.
 //!
-//! #865 raised the floor to 0.12 and moved CI onto the pinned fleet oracle, so
-//! *no* lane currently runs [`DEVIATIONS_ORACLE`] and the fixed direction is
-//! advisory everywhere.  That is a deliberate, temporary state: #865 was
-//! explicitly forbidden from regenerating the list, and every run now prints a
-//! loud `ORACLE VERSION SKEW` banner naming both versions so the gap cannot be
-//! forgotten.  Closing it means regenerating `KNOWN_DEVIATIONS` against 0.12.5
-//! and bumping [`DEVIATIONS_ORACLE`] in the same commit — at which point the
-//! fixed direction becomes enforcing again on CI and on every standard host.
+//! #865 raised the floor to 0.12 and moved CI onto the pinned fleet oracle,
+//! which left a gap: no lane ran [`DEVIATIONS_ORACLE`] (still 0.9 at that
+//! point), so the fixed direction was advisory everywhere.  #867 then deleted
+//! the 37 entries measured to pass under 0.12.5 (114 -> 77), and #872 closed
+//! the remaining gap: regenerating the 77-entry list against 0.12.5 changed
+//! nothing — same 77 labels, byte-for-byte, confirming #867's manual deletion
+//! had already found everything 0.12 fixed — and bumped [`DEVIATIONS_ORACLE`]
+//! to `(0, 12)` in that same commit.  The fixed direction is enforcing again on
+//! every standard host and both CI jobs.
 
 mod common;
 
@@ -3841,18 +3842,20 @@ const KNOWN_DEVIATIONS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Oracle version (#865) — deliberately adjacent to KNOWN_DEVIATIONS above,
-// because a deviation list is only meaningful against the oracle that produced
-// it. If you regenerate the list, move `DEVIATIONS_ORACLE` in the same commit.
+// Oracle version (#865, #872) — deliberately adjacent to KNOWN_DEVIATIONS
+// above, because a deviation list is only meaningful against the oracle that
+// produced it. If you regenerate the list, move `DEVIATIONS_ORACLE` in the
+// same commit.
 // ---------------------------------------------------------------------------
 
 /// The `(major, minor)` Neovim that [`KNOWN_DEVIATIONS`] was last regenerated
-/// against — `ubuntu-24.04` apt's 0.9.x, which is what CI ran until #865 moved
-/// it to the pinned fleet oracle. See the "Oracle version skew" section of the
-/// module docs: a run against anything else prints a loud banner, and the
-/// "a listed label now passes" direction of the gate is downgraded to an
-/// advisory (see [`fixes_are_enforced`]).
-const DEVIATIONS_ORACLE: (u32, u32) = (0, 9);
+/// against — the fleet-standard Homebrew/upstream `v0.12.5` that every agent
+/// host and both CI jobs run (#872; `ubuntu-24.04` apt's 0.9.5 is below
+/// [`MIN_NVIM_VERSION`] and was replaced as CI's oracle by #865). See the
+/// "Oracle version skew" section of the module docs: a run against anything
+/// else prints a loud banner, and the "a listed label now passes" direction of
+/// the gate is downgraded to an advisory (see [`fixes_are_enforced`]).
+const DEVIATIONS_ORACLE: (u32, u32) = (0, 12);
 
 /// The minimum `(major, minor)` Neovim this suite will accept as an oracle
 /// (#865). The fleet standard — every agent host, and both CI jobs — is
@@ -4007,11 +4010,8 @@ fn parse_nvim_version(version_output: &str) -> Option<(u32, u32)> {
 ///
 /// #865 removed the former `in_ci ||` short-circuit: it was correct only while
 /// CI *was* the capture oracle. CI now runs the pinned fleet oracle (v0.12.5)
-/// and the list is still 0.9-captured, so a `CI` special case would fail every
-/// CI run on ~37 version-skew "fixes". The enforcing lane is "whichever lane
-/// runs [`DEVIATIONS_ORACLE`]", and regenerating the list against 0.12 is
-/// tracked separately — until then the skew banner keeps the gap visible on
-/// every single run.
+/// and, as of #872, so does [`DEVIATIONS_ORACLE`] — the enforcing lane is
+/// "whichever lane runs [`DEVIATIONS_ORACLE`]", which is every lane again.
 ///
 /// Note this only ever relaxes the *fixed* direction. Regressions and stale
 /// entries stay fatal on every machine, CI included.
@@ -4506,9 +4506,10 @@ fn known_deviation_gate_is_bidirectional() {
 /// against. Every other case stays enforcing.
 #[test]
 fn fixed_direction_is_advisory_only_on_a_different_nvim() {
-    // The relaxed case: a newer Neovim than the capture oracle (0.12.5 is what
-    // surfaced #868 — 37 `scroll:` entries "passed" locally).
-    assert!(!fixes_are_enforced(Some((0, 12))));
+    // The relaxed case: a newer Neovim than the capture oracle (0.12.5, as of
+    // #872 — the version 0.12.5 that surfaced #868's 37 `scroll:` "passes" is
+    // now the oracle itself, so a still-newer minor is used here instead).
+    assert!(!fixes_are_enforced(Some((0, 13))));
     // ...and an *older* one skews just as legitimately.
     assert!(!fixes_are_enforced(Some((0, 8))));
 
@@ -4605,31 +4606,33 @@ fn unparseable_nvim_version_is_refused_not_trusted() {
 /// version other than the capture oracle is loudly (but non-fatally) flagged.
 #[test]
 fn a_usable_oracle_runs_and_the_banner_names_path_version_and_skew() {
-    let fleet = "NVIM v0.12.5\nBuild type: Release\n";
+    // A minor above the capture oracle ((0, 12) as of #872) — legitimate skew,
+    // not the fleet standard itself.
+    let fleet = "NVIM v0.13.5\nBuild type: Release\n";
     let Preflight::Run { banner, version } =
         preflight(Some(("/home/x/.local/bin/nvim", fleet)), false)
     else {
-        panic!("the fleet-standard oracle must be runnable");
+        panic!("a Neovim above the floor must be runnable");
     };
-    assert_eq!(version, (0, 12));
+    assert_eq!(version, (0, 13));
     assert!(banner.contains("/home/x/.local/bin/nvim"), "path: {banner}");
-    assert!(banner.contains("NVIM v0.12.5"), "version: {banner}");
-    // 0.12.5 is not the capture oracle, so the skew banner must be there and
+    assert!(banner.contains("NVIM v0.13.5"), "version: {banner}");
+    // 0.13.5 is not the capture oracle, so the skew banner must be there and
     // must name both versions.
     assert!(
         banner.contains("ORACLE VERSION SKEW"),
         "skew banner: {banner}"
     );
     assert!(
-        banner.contains("0.12.x") && banner.contains("0.9.x"),
+        banner.contains("0.13.x") && banner.contains("0.12.x"),
         "{banner}"
     );
 
-    // Now the capture oracle itself. Note that as of #865 it is *below* the
-    // floor — the list has not been regenerated since the floor was raised, so
-    // no supported host can currently enforce the "fixed" direction of the
-    // gate. That gap is tracked and loudly printed, not papered over; this
-    // branch keeps the assertion honest either way.
+    // Now the capture oracle itself. As of #872 it sits exactly at the floor
+    // (both are 0.12), so the branch below always takes the "runnable, no
+    // skew" arm today — kept as an if/else rather than collapsed so a future
+    // DEVIATIONS_ORACLE bump that again falls below MIN_NVIM_VERSION is still
+    // caught by this same assertion instead of silently going untested.
     let capture = format!("NVIM v{}.{}.5\n", DEVIATIONS_ORACLE.0, DEVIATIONS_ORACLE.1);
     let verdict = preflight(Some(("/usr/bin/nvim", &capture)), false);
     if DEVIATIONS_ORACLE < MIN_NVIM_VERSION {
@@ -4735,12 +4738,11 @@ fn nvim_conformance_end_to_end_refuses_a_missing_or_ancient_oracle() {
 /// which CI and the coordinator's Test leg never pass. Neither proves the
 /// banner is visible on the run that actually ships: a PASSING run of a
 /// plain `cargo test` (no flags). Prove that here: re-invoke the real
-/// `nvim_conformance` test against a fake-but-healthy oracle, filtered to
-/// match zero cases (fast, and doesn't need a real `nvim --headless`),
-/// *without* `--nocapture`, and confirm the banner — including the
-/// version-skew warning, since the fleet floor (0.12) is still above
-/// `DEVIATIONS_ORACLE` (0.9) on every host — reached the child's real
-/// stdout/stderr anyway.
+/// `nvim_conformance` test against a fake-but-healthy oracle running a minor
+/// above `DEVIATIONS_ORACLE` ((0, 12) as of #872) so the skew banner fires,
+/// filtered to match zero cases (fast, and doesn't need a real `nvim
+/// --headless`), *without* `--nocapture`, and confirm the banner — including
+/// the version-skew warning — reached the child's real stdout/stderr anyway.
 #[cfg(unix)]
 #[test]
 fn nvim_conformance_end_to_end_banner_visible_on_a_passing_uncaptured_run() {
@@ -4755,7 +4757,7 @@ fn nvim_conformance_end_to_end_banner_visible_on_a_passing_uncaptured_run() {
     let fake = dir.join("nvim");
     std::fs::write(
         &fake,
-        "#!/bin/sh\necho 'NVIM v0.12.5'\necho 'Build type: Release'\n",
+        "#!/bin/sh\necho 'NVIM v0.13.5'\necho 'Build type: Release'\n",
     )
     .expect("write fake oracle");
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
@@ -4790,7 +4792,7 @@ fn nvim_conformance_end_to_end_banner_visible_on_a_passing_uncaptured_run() {
          is passed, and neither CI nor the coordinator's Test leg passes \
          them):\n{text}"
     );
-    assert!(text.contains("NVIM v0.12.5"), "{text}");
+    assert!(text.contains("NVIM v0.13.5"), "{text}");
     assert!(
         text.contains("ORACLE VERSION SKEW"),
         "the skew warning must be visible on a passing, uncaptured run too:\n{text}"
