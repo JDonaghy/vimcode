@@ -17,10 +17,18 @@
 //! concrete GTK backend struct, which is what forced every one of the ~19
 //! modal-stack/drag-state handle call sites — and by extension this whole
 //! file — to depend on it. It is now typed against [`TextMetricsBackend`],
-//! a narrow local trait that names the two GTK/Pango-only hooks (text
-//! measurement) that still have no portable equivalent; see that trait's
-//! doc comment. #813 also adopted `quadraui::Reaction::Exit` for process
-//! exit (previously an idle-callback hack) and ported the 200 ms
+//! a narrow local trait for the text-measurement hooks that still have no
+//! portable `quadraui::Backend` equivalent; see that trait's doc comment.
+//! #861 closed the trait's remaining GTK leak: its context-setter used to
+//! take a `pango::Context` by name, which meant the trait — and so
+//! `App::backend`'s field type — could never be implemented by a non-GTK
+//! backend no matter what that backend could measure. It now takes the
+//! context type-erased, so the trait itself names no toolkit type; `impl
+//! TextMetricsBackend for backend::GtkBackend` still downcasts to
+//! `pango::Context` internally, which is real, acknowledged coupling (item
+//! 3 below), not something this trait pretends to solve. #813 also adopted
+//! `quadraui::Reaction::Exit` for process exit (previously an idle-callback
+//! hack) and ported the 200 ms
 //! yank-highlight one-shot to a portable poll-in-`tick` deadline
 //! (`yank_hl_deadline`) — the same pattern TUI already used. Neither hook
 //! needs a toolkit timer any more.
@@ -175,33 +183,50 @@ impl DeferredQueue {
     }
 }
 
-/// Narrow extension trait for the two GTK/Pango-only hooks that
-/// `quadraui::Backend` has no portable equivalent for yet (#813):
-/// `GtkBackend::set_pango_context`/`set_current_line_height`/
-/// `set_current_char_width` are inherent methods on the concrete struct,
-/// not trait methods, because they're Pango text-measurement plumbing with
-/// no TUI/macOS/Win analogue.
+/// Narrow extension trait for the text-measurement hooks that
+/// `quadraui::Backend` has no portable equivalent for yet (#813): a backend
+/// needs some way to be told the current line height / char width, and (for
+/// backends whose click-time hit-testing wants per-glyph accuracy, like
+/// GTK's Pango) some way to be handed a fresh measurement context each
+/// frame.
 ///
 /// `App::backend` used to be typed as the concrete `backend::GtkBackend` —
 /// the sole reason `struct App` couldn't compile without the GTK toolkit
-/// in scope — purely so these three calls would resolve. Retyping the field
-/// to a bare `Box<dyn quadraui::Backend>` would drop them; this supertrait
-/// lets `App::backend` hold one trait object that still exposes both the
-/// 19 generic `modal_stack_handle`/`drag_state_handle` call sites (via the
-/// `Backend` supertrait bound) *and* the three narrow ones, without naming
-/// `GtkBackend` anywhere outside its single `impl` below. Only `GtkBackend`
-/// implements it — that remains real, acknowledged coupling (the module
-/// doc's "Pango measurement context" item), not something this trait
-/// pretends to solve.
+/// in scope — purely so these calls would resolve. Retyping the field to a
+/// bare `Box<dyn quadraui::Backend>` would drop them; this supertrait lets
+/// `App::backend` hold one trait object that still exposes both the 19
+/// generic `modal_stack_handle`/`drag_state_handle` call sites (via the
+/// `Backend` supertrait bound) *and* these narrow ones, without naming a
+/// concrete backend type anywhere outside its `impl` below.
+///
+/// #861: `set_text_measurement_context` used to be `set_pango_context(ctx:
+/// pango::Context)`, which meant *no non-GTK backend could implement this
+/// trait at all* — the signature named a GTK/Pango type, so `App` could
+/// never hold a macOS or Win backend regardless of what that backend could
+/// actually measure. The context is now passed type-erased
+/// (`Box<dyn Any>`): the only caller that produces one
+/// (`click::build_editor_click_context`, GTK-only) and the only
+/// implementation that consumes one (`GtkBackend` below, via `downcast`)
+/// agree on the concrete type out of band, so the trait itself never names
+/// it. A backend with no persistent-context concept — TUI's fixed-width
+/// grid needs none; quadraui's macOS text measurement
+/// (`quadraui::macos::text::measure_text(&CTFont, &str)`) takes the font
+/// per call instead of storing one — can implement this as a no-op.
 pub(crate) trait TextMetricsBackend: quadraui::Backend {
-    fn set_pango_context(&mut self, ctx: pango::Context);
+    fn set_text_measurement_context(&mut self, ctx: Box<dyn std::any::Any>);
     fn set_current_line_height(&mut self, line_height: f64);
     fn set_current_char_width(&mut self, char_width: f64);
 }
 
 impl TextMetricsBackend for backend::GtkBackend {
-    fn set_pango_context(&mut self, ctx: pango::Context) {
-        backend::GtkBackend::set_pango_context(self, ctx);
+    fn set_text_measurement_context(&mut self, ctx: Box<dyn std::any::Any>) {
+        // The only producer (`click::build_editor_click_context`) hands us
+        // a `pango::Context`; anything else is a caller bug, not something
+        // this backend can act on, so it's silently dropped rather than
+        // panicking.
+        if let Ok(pango_ctx) = ctx.downcast::<pango::Context>() {
+            backend::GtkBackend::set_pango_context(self, *pango_ctx);
+        }
     }
 
     fn set_current_line_height(&mut self, line_height: f64) {
@@ -852,7 +877,18 @@ fn dialog_btn_index(id: &quadraui::WidgetId) -> Option<usize> {
 /// All widget-dependent setup (window handle, CSS) is deferred to
 /// `ShellApp::setup()`, called by the runner once the window exists.
 impl App {
-    pub(crate) fn new(file_path: Option<PathBuf>) -> Self {
+    /// `backend` is supplied by the caller rather than constructed here
+    /// (#861): before this, `App::assemble` hardcoded
+    /// `Box::new(backend::GtkBackend::new())`, so nothing upstream of this
+    /// function — including `App::new` itself — had any seam to hand
+    /// `App` a different `TextMetricsBackend` impl. `src/gtk/mod.rs::run`
+    /// is the only caller today and it still passes a `GtkBackend`, but
+    /// the choice of concrete type now lives at the call site instead of
+    /// being baked into `App`.
+    pub(crate) fn new(
+        file_path: Option<PathBuf>,
+        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    ) -> Self {
         // Icon search path setup.
         if let Some(home) = std::env::var_os("HOME") {
             let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
@@ -912,6 +948,7 @@ impl App {
             css_provider,
             last_colorscheme,
             settings_monitor,
+            backend,
         )
     }
 
@@ -926,18 +963,17 @@ impl App {
     /// process-global once a short-lived test's `App` is dropped (the same
     /// soundness trap #635 documented on `TuiShellApp::live`).
     ///
-    /// Everything below this line is plain `Rc`/`Cell`/`RefCell` allocation
-    /// plus a `GtkBackend::new()`; none of it touches GDK.
+    /// Everything below this line is plain `Rc`/`Cell`/`RefCell` allocation;
+    /// none of it touches GDK. `backend` is taken as a parameter rather than
+    /// constructed here (#861) — see [`App::new`]'s doc comment.
     fn assemble(
         engine: Rc<RefCell<Engine>>,
         deferred: DeferredQueue,
         css_provider: Option<gtk4::CssProvider>,
         last_colorscheme: String,
         settings_monitor: Option<gio::FileMonitor>,
+        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
     ) -> Self {
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
-            Rc::new(RefCell::new(Box::new(backend::GtkBackend::new())));
-
         App {
             engine,
             draw_needed: Rc::new(Cell::new(false)),
@@ -1048,7 +1084,16 @@ impl App {
             (e.settings.use_nerd_fonts, e.settings.colorscheme.clone())
         };
         icons::set_nerd_fonts(use_nerd_fonts);
-        Self::assemble(engine, DeferredQueue::new(), None, last_colorscheme, None)
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(backend::GtkBackend::new())));
+        Self::assemble(
+            engine,
+            DeferredQueue::new(),
+            None,
+            last_colorscheme,
+            None,
+            backend,
+        )
     }
 }
 
@@ -6780,7 +6825,9 @@ impl quadraui::ShellApp for App {
         // growing with `x`, on plain/bold/italic/scrolled lines alike.
         // `build_editor_click_context` matches by measuring against `cw`.
         if let Some(click_ctx) = click::build_editor_click_context(cw) {
-            self.backend.borrow_mut().set_pango_context(click_ctx);
+            self.backend
+                .borrow_mut()
+                .set_text_measurement_context(Box::new(click_ctx));
         }
 
         // ══ Editor band (#764, #735 slice 3) ═════════════════════════════════
