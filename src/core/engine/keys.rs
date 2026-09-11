@@ -2026,10 +2026,12 @@ impl Engine {
                         } else {
                             0
                         };
-                        // `gg` is a curswant-preserving vertical motion, exactly
-                        // like `G`/`j`/`k` — `'startofline'` (`Settings::startofline`,
-                        // #876) is OFF by default (Neovim's default; Vim's is ON),
-                        // so out of the box `gg` never jumps to column
+                        // `gg`, like `G`/`H`/`M`/`L`, doesn't use `curswant` at
+                        // all — there's no remembered column to fall back on
+                        // (see `land_line_jump_cursor`'s own doc comment).
+                        // `'startofline'` (`Settings::startofline`, #876) is
+                        // OFF by default (Neovim's default; Vim's is ON), so
+                        // out of the box `gg` never jumps to column
                         // 0/first-non-blank; it keeps the column the cursor
                         // already had, clamped to the target line's length
                         // (verified against `nvim --headless`, the conformance
@@ -8524,6 +8526,8 @@ impl Engine {
             "ic",
             "smartcase",
             "scs",
+            "startofline",
+            "sol",
             "cursorline",
             "cul",
             "autoread",

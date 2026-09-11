@@ -12510,4 +12510,108 @@ mod tests {
             driver.screen()
         );
     }
+
+    /// #876 review fix: the engine-side `'startofline'` tests in
+    /// `engine::tests` all drive a raw `Engine` and assert on
+    /// `engine.view().cursor` directly — none of them render a frame, so a
+    /// future regression in `land_line_jump_cursor`'s wiring (or the
+    /// `SETTING_DEFS`/`:set` plumbing feeding it) would go uncaught by this
+    /// crate's tests, exactly the gap CLAUDE.md's "Testing (CRITICAL)"
+    /// section calls out. This drives `G` through the real `TuiShellApp`
+    /// (Normal mode paints a `Block` cursor — an inverted cell, not the
+    /// `Bar` shape `terminal_cursor_position` reports on — see
+    /// `insert_mode_bar_cursor_reaches_terminal_frame_via_shell_app`'s doc
+    /// comment), locating the painted cursor cell by its background colour,
+    /// the same `cursor_cell`-by-style pattern
+    /// `focus_cycling_does_not_reflow_either_pane_via_shell_app` (`<C-w>w`)
+    /// already uses for a `Block` cursor. `:set startofline` is typed
+    /// through the driver's command line rather than poked on
+    /// `engine.settings` directly, so the `:set`/`SETTING_DEFS` wiring is
+    /// exercised too, not just the motion helper.
+    ///
+    /// RED-first: reverting `land_line_jump_cursor` to unconditionally
+    /// `clamp_cursor_col()` (dropping the `settings.startofline` branch)
+    /// makes `col_on` equal `col_off` below instead of `col_off - 3` —
+    /// confirmed by hand before restoring the fix.
+    #[test]
+    fn startofline_setting_moves_the_rendered_cursor_to_first_non_blank_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        assert!(
+            !app.engine.settings.startofline,
+            "precondition: startofline defaults off"
+        );
+        app.engine.buffer_mut().insert(0, "ZQXWTOP\n   ZQXWBOT");
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        fn cursor_col(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> u16 {
+            for y in 0..24u16 {
+                for x in 0..80u16 {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return x;
+                    }
+                }
+            }
+            panic!("no block cursor cell painted; screen:\n{}", driver.screen());
+        }
+
+        // "ZQXWTOP" is 7 chars (indices 0..=6); six `l` motions from (0,0)
+        // land on its last column, index 6.
+        for _ in 0..6 {
+            driver.type_char('l');
+        }
+        driver.render();
+        let col_before_g = cursor_col(&driver, cursor_bg);
+
+        driver.type_char('G');
+        driver.render();
+        let col_off = cursor_col(&driver, cursor_bg);
+        assert_eq!(
+            col_off,
+            col_before_g,
+            "startofline off (the default) must keep G's column unchanged \
+             when it already fits the destination line ('   ZQXWBOT' is 10 \
+             columns wide, so column 6 needs no clamping); screen:\n{}",
+            driver.screen()
+        );
+
+        // Back to line 0, same column (sanity: `gg` with the setting still
+        // off must not itself move the column), then flip the setting on
+        // through the real command line.
+        driver.type_char('g');
+        driver.type_char('g');
+        driver.render();
+        assert_eq!(
+            cursor_col(&driver, cursor_bg),
+            col_before_g,
+            "sanity: gg with startofline off must return to the same column; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        for c in ":set startofline".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('G');
+        driver.render();
+        let col_on = cursor_col(&driver, cursor_bg);
+
+        assert_eq!(
+            col_on,
+            col_off - 3,
+            "with startofline on, G must land on the first non-blank column \
+             of '   ZQXWBOT' (index 3), three cells left of the column kept \
+             when the option is off; screen:\n{}",
+            driver.screen()
+        );
+    }
 }
