@@ -21892,6 +21892,28 @@ fn test_matrix_delete_forced_motion_kind() {
         // dv$: `$` is ordinarily charwise inclusive of the last char on
         // the line. Forced exclusive, that last char survives.
         ("dv$", "abc def", 0, 1, "dv$", "af", 0, 1),
+        // dvE: `E` is naturally inclusive, same as `e` above (#881 review —
+        // `E` was left on the exclusive-assuming path, so `v`-forcing grew
+        // the range instead of shrinking it). Verified against Neovim
+        // 0.12.5: `dE` on "abc def" from col 0 deletes "abc", `dvE` deletes
+        // only "ab".
+        ("dvE", "abc def", 0, 0, "dvE", "c def", 0, 0),
+        // dvf): `f`/`t` are naturally inclusive of the found/till character
+        // (#881 review — left on the exclusive-assuming path). Verified
+        // against Neovim 0.12.5: this is the review's own repro — `dvf)` on
+        // "a(bcd)e" from col 0 must leave ")e", not delete the whole buffer.
+        ("dvf)", "a(bcd)e", 0, 0, "dvf)", ")e", 0, 0),
+        // dvt): same naturally-inclusive fix, via the "till" variant.
+        // Neovim 0.12.5: `dt)` on "a(bcd)e" from col 0 deletes "a(bcd"
+        // (inclusive of the char just before ')'); `dvt)` deletes one less,
+        // "a(bc", leaving "d)e".
+        ("dvt)", "a(bcd)e", 0, 0, "dvt)", "d)e", 0, 0),
+        // dvge / dvgE: `ge`/`gE` are naturally inclusive backward motions
+        // (#881 review). Neovim 0.12.5: from col 6 ('f') on "abc def",
+        // `dge`/`dgE` both delete "c def" leaving "ab"; forced exclusive,
+        // `dvge`/`dvgE` delete one less character ("c de"), leaving "abf".
+        ("dvge", "abc def", 0, 6, "dvge", "abf", 0, 2),
+        ("dvgE", "abc def", 0, 6, "dvgE", "abf", 0, 2),
     ];
 
     for &(label, buf, cline, ccol, keys, expected_buf, eline, ecol) in cases {
