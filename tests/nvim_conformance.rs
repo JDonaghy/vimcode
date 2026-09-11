@@ -4087,8 +4087,61 @@ fn resolve_on_path(exe: &str) -> Option<std::path::PathBuf> {
         candidates
             .iter()
             .map(|name| dir.join(name))
-            .find(|p| p.is_file())
+            .find(|p| p.is_file() && is_executable(p))
     })
+}
+
+/// A regular file ahead of the real oracle on `PATH` but lacking the
+/// executable bit would never actually be picked by the real `execvp`-style
+/// lookup [`std::process::Command`] performs — only `is_file()` would still
+/// name it as "resolved", which is misleading in a reporting-only helper
+/// whose entire job is "which binary produced this verdict" (review finding
+/// on #865). Windows has no executable bit in this sense; `.exe`/no-extension
+/// matching in [`resolve_on_path`] is already the whole story there.
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_p: &std::path::Path) -> bool {
+    true
+}
+
+/// Write `s` straight to the real OS-level stderr, bypassing libtest's
+/// stdout/stderr capture.
+///
+/// libtest intercepts `print!`/`eprintln!` via a thread-local sink
+/// (`io::set_output_capture`) and *discards* it for a passing test unless
+/// `--nocapture`/`--show-output` was passed — see the rustc source for
+/// `libtest::helpers::concurrency` capture handling. Neither of CI's `Run
+/// tests` steps nor the coordinator's plain `cargo test` Test leg passes
+/// either flag, and `nvim_conformance` passes on a healthy run — exactly the
+/// common case this banner exists to narrate (#865 review finding: a
+/// `println!` banner is invisible on precisely the lanes it was built for).
+/// Opening `/dev/stderr` writes to fd 2 directly, underneath that capture, so
+/// the banner reaches the log on a plain `cargo test` too.
+#[cfg(unix)]
+fn print_unmissable(s: &str) {
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+        Ok(mut f) => {
+            let _ = f.write_all(s.as_bytes());
+            let _ = f.flush();
+        }
+        // No /dev/stderr (sandboxed or unusual environment) — fall back to
+        // the macro. Still correct on a failing run; better than nothing on
+        // a passing one.
+        Err(_) => eprintln!("{s}"),
+    }
+}
+
+#[cfg(not(unix))]
+fn print_unmissable(s: &str) {
+    eprintln!("{s}");
 }
 
 // ---------------------------------------------------------------------------
@@ -4207,7 +4260,11 @@ fn nvim_conformance() {
             return;
         }
         Preflight::Run { banner, version } => {
-            println!("{banner}");
+            // #865 review: println! is captured-and-discarded by libtest on a
+            // passing test unless --nocapture/--show-output is passed, which
+            // neither CI nor the coordinator's Test leg does — so this must
+            // bypass that capture, not just write through it.
+            print_unmissable(&banner);
             Some(version)
         }
     };
@@ -4706,6 +4763,74 @@ fn nvim_conformance_end_to_end_refuses_a_missing_or_ancient_oracle() {
     assert!(
         output.contains(&format!(">= {}.{}", MIN_NVIM_VERSION.0, MIN_NVIM_VERSION.1)),
         "must name what it requires:\n{output}"
+    );
+}
+
+/// #865 review finding: every other assertion on the banner (path, version,
+/// skew warning) either calls `preflight()` directly — which never goes
+/// through libtest at all — or re-invokes the binary with `--nocapture`,
+/// which CI and the coordinator's Test leg never pass. Neither proves the
+/// banner is visible on the run that actually ships: a PASSING run of a
+/// plain `cargo test` (no flags). Prove that here: re-invoke the real
+/// `nvim_conformance` test against a fake-but-healthy oracle, filtered to
+/// match zero cases (fast, and doesn't need a real `nvim --headless`),
+/// *without* `--nocapture`, and confirm the banner — including the
+/// version-skew warning, since the fleet floor (0.12) is still above
+/// `DEVIATIONS_ORACLE` (0.9) on every host — reached the child's real
+/// stdout/stderr anyway.
+#[cfg(unix)]
+#[test]
+fn nvim_conformance_end_to_end_banner_visible_on_a_passing_uncaptured_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+        "vimcode-nvim-oracle-banner-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp PATH dir");
+    let fake = dir.join("nvim");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho 'NVIM v0.12.5'\necho 'Build type: Release'\n",
+    )
+    .expect("write fake oracle");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake oracle");
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["nvim_conformance", "--exact"]) // deliberately no --nocapture
+        .env("PATH", &dir)
+        // Matches no case label, so zero cases actually run — the fake
+        // oracle only needs to answer `--version`, and the run stays fast.
+        .env("PROBE_FILTER", "zzz-no-such-conformance-case-zzz")
+        .env_remove("PROBE_VERBOSE")
+        .env_remove("CONFORMANCE_DUMP_DEVIATIONS")
+        .env_remove(ALLOW_SKIP_VAR)
+        .output()
+        .expect("re-invoke the test binary");
+    std::fs::remove_dir_all(&dir).ok();
+
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+
+    assert!(
+        out.status.success(),
+        "a healthy oracle with no matching cases must pass:\n{text}"
+    );
+    assert!(
+        text.contains(&fake.display().to_string()),
+        "the resolved path must reach a plain, uncaptured `cargo test` run \
+         even though the test PASSED (#865 review finding — libtest discards \
+         println! output for passing tests unless --nocapture/--show-output \
+         is passed, and neither CI nor the coordinator's Test leg passes \
+         them):\n{text}"
+    );
+    assert!(text.contains("NVIM v0.12.5"), "{text}");
+    assert!(
+        text.contains("ORACLE VERSION SKEW"),
+        "the skew warning must be visible on a passing, uncaptured run too:\n{text}"
     );
 }
 
