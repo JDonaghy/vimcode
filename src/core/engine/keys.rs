@@ -2057,8 +2057,16 @@ impl Engine {
                         let end_pos = self.buffer().line_to_char(self.view().cursor.line)
                             + self.view().cursor.col;
                         if end_pos < start_pos {
-                            // Include the character at end_pos
-                            self.apply_charwise_operator(op, end_pos, start_pos + 1, changed);
+                            // Include the character at end_pos: ge is naturally
+                            // inclusive of its landing character (:help ge), so
+                            // `v`-forcing must shrink this range, not grow it
+                            // (#881 review).
+                            self.apply_charwise_operator_inclusive(
+                                op,
+                                end_pos,
+                                start_pos + 1,
+                                changed,
+                            );
                         }
                     } else {
                         let count = self.take_count();
@@ -2079,7 +2087,14 @@ impl Engine {
                         let end_pos = self.buffer().line_to_char(self.view().cursor.line)
                             + self.view().cursor.col;
                         if end_pos < start_pos {
-                            self.apply_charwise_operator(op, end_pos, start_pos + 1, changed);
+                            // gE is naturally inclusive too (:help gE), same as
+                            // ge above.
+                            self.apply_charwise_operator_inclusive(
+                                op,
+                                end_pos,
+                                start_pos + 1,
+                                changed,
+                            );
                         }
                     } else {
                         let count = self.take_count();
@@ -3837,7 +3852,9 @@ impl Engine {
                 self.view_mut().cursor = start_cursor;
                 if end_pos >= start_pos {
                     let end = (end_pos + 1).min(self.buffer().len_chars());
-                    self.apply_charwise_operator(operator, start_pos, end, changed);
+                    // E is naturally inclusive of its landing character, same
+                    // as e (:help E, #881 review).
+                    self.apply_charwise_operator_inclusive(operator, start_pos, end, changed);
                 }
             }
             Some('b') => {
@@ -4350,13 +4367,16 @@ impl Engine {
     /// Apply a charwise operator on a byte/char range [start..end).
     ///
     /// `natural_inclusive` records whether, absent any `v` forcing, this
-    /// range is inclusive of its last character (`e`, `$`, …) or exclusive
-    /// (`w`, most others) — the two callers above are the only entry
-    /// points, so every existing call site keeps its prior behavior
-    /// unchanged. It exists so `v` forcing (`:help o_v`) has something to
-    /// toggle: forcing a charwise motion with `v` flips inclusive <->
-    /// exclusive in place, without touching which characters were
-    /// selected in the first place.
+    /// range is inclusive of its last character (`e`, `E`, `ge`, `gE`, `$`,
+    /// `f`/`t`, the `/pat/e` search offset, …) or exclusive (`w`, `b`, `F`/
+    /// `T`, most others). Every caller of `apply_charwise_operator` /
+    /// `apply_charwise_operator_inclusive` goes through this, so `v`-forcing
+    /// applies uniformly — each call site must pick the flag that matches
+    /// how its own range was built, or `v`-forcing will grow/shrink the
+    /// range in the wrong direction (#881 review). It exists so `v` forcing
+    /// (`:help o_v`) has something to toggle: forcing a charwise motion with
+    /// `v` flips inclusive <-> exclusive in place, without touching which
+    /// characters were selected in the first place.
     pub(crate) fn apply_charwise_operator_kind(
         &mut self,
         operator: char,
@@ -4725,7 +4745,16 @@ impl Engine {
             start_col
         };
 
-        self.apply_charwise_operator(operator, range_start, range_end, changed);
+        // f/t are naturally inclusive of the found character (`range_end`
+        // above already accounts for that with `+1`); F/T are naturally
+        // exclusive of the cursor's original position (:help f, :help F).
+        // This only matters when `v` forces the motion charwise-toggled
+        // (#881 review) — otherwise it's a no-op.
+        if find_type == 'f' || find_type == 't' {
+            self.apply_charwise_operator_inclusive(operator, range_start, range_end, changed);
+        } else {
+            self.apply_charwise_operator(operator, range_start, range_end, changed);
+        }
     }
 
     /// gn: find next (or prev if `backward`) search match, enter Visual mode selecting it.
@@ -5348,7 +5377,9 @@ impl Engine {
         // exclusive-linewise adjustment entirely and just extend the range.
         if self.search_offset.trim().starts_with('e') {
             let hi = (hi + 1).min(self.buffer().len_chars());
-            self.apply_charwise_operator(operator, lo, hi, changed);
+            // The `e` search offset is naturally inclusive of the last
+            // matched character (:help search-offset, #881 review).
+            self.apply_charwise_operator_inclusive(operator, lo, hi, changed);
         } else {
             self.apply_operator_exclusive_range(operator, lo, hi, changed);
         }
