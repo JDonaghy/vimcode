@@ -1,44 +1,7 @@
-use super::*;
-use std::fs;
-
-/// Open a URL in the default browser (only https/http).
-pub(crate) fn open_url(url: &str) {
-    crate::core::engine::open_url_in_browser(url);
-}
-
-/// Install the bundled Nerd Font icon subset to `~/.local/share/fonts/` so
-/// GTK/Pango can resolve the Nerd Font glyphs without a user-installed Nerd Font.
-/// The font file is embedded in the binary via `include_bytes!` and only written
-/// to disk if it's missing or has the wrong size.
-pub(crate) fn install_bundled_icon_font() {
-    static FONT_BYTES: &[u8] = include_bytes!("../../data/fonts/vimcode-icons.ttf");
-
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return;
-    };
-    let fonts_dir = home.join(".local/share/fonts");
-    let _ = fs::create_dir_all(&fonts_dir);
-    let dest = fonts_dir.join("vimcode-icons.ttf");
-
-    // Skip write if the file already exists with the correct size.
-    if dest.exists() {
-        if let Ok(meta) = fs::metadata(&dest) {
-            if meta.len() == FONT_BYTES.len() as u64 {
-                return;
-            }
-        }
-    }
-
-    if fs::write(&dest, FONT_BYTES).is_ok() {
-        // Trigger fontconfig cache rebuild so the font is available immediately.
-        let _ = std::process::Command::new("fc-cache")
-            .arg("-f")
-            .arg(&fonts_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-}
+// `open_url`/`install_bundled_icon_font` moved to the backend-neutral
+// `crate::app_support` (#862) — neither named a `gtk4`/`gio` type. Nothing
+// under `crate::gtk` referenced them by this path (only `crate::app` did, and
+// it now imports `crate::app_support` directly), so no re-export is needed.
 
 /// The single VimCode application identity: app id, `Icon=`/`StartupWMClass=`
 /// value, and the stem of the installed icon files. Must match the shipped

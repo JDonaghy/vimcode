@@ -1,6 +1,43 @@
 # VimCode Project State
 
-**Last updated:** September 5, 2026 (issue #827 correction pass — the #47/44-call-site claims below were stale within hours of being written; see the corrected section); prior revisions September 4 (#801) and September 3 (the platform-neutrality chain drained, and the audit it mandated is now run). Milestone #7 is **0 open**: everything the 2026-09-01 audit filed landed, including 16 slices it never named (#751–#766). The post-#735 sizing audit — which the previous revision explicitly warned not to skip — is below, and it **missed its projection by roughly 60%** (though most of that miss is #731/#732 dead-code removal, not convergence — see `GOALS.md` §2/§3 for the corrected attribution). Nothing is in flight and nothing is queued for vimcode. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) was filed and closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction.
+**Last updated:** September 10, 2026 (issue #862 — `src/app.rs` no longer needs the `gui` feature to compile). Prior revisions: September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **0 open**. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #862 — `src/app.rs` compiles without `gui` (prerequisite for #859)
+
+`pub mod app;` in `src/lib.rs` was `#[cfg(feature = "gui")]`-gated even though
+`App`'s trait surface (`impl quadraui::ShellApp for App`) is backend-neutral —
+`cargo check --no-default-features` couldn't even resolve `crate::app`. Fixed:
+
+- The three remaining platform-typed fields (`window`, `css_provider`,
+  `settings_monitor`) are now type-erased: `window`/`css_provider` behind new
+  local traits `PlatformWindowHandle`/`PlatformCssProvider` (same shape as the
+  existing `TextMetricsBackend` and `Engine::clipboard_read`/`clipboard_write`,
+  #417), `settings_monitor` behind a `Box<dyn Any>` drop-guard.
+- The portable majority of `crate::gtk::{click, css, util}` — pixel→click-target
+  resolution, tab-bar pixel-geometry, UI-font helpers, theme CSS text
+  generation, `open_url`/bundled-font install — moved to three new
+  unconditionally-compiled modules: `src/click.rs`, `src/app_support.rs`,
+  `src/css.rs`. `src/gtk/{click,mod,css}.rs` re-export everything so nothing
+  else in `crate::gtk` (or their own tests) had to change.
+- What's left behind inline `#[cfg(feature = "gui")]` *inside* `src/app.rs` is
+  genuinely platform-bound: `App::new`/`App::assemble`'s display-dependent
+  prologue, the `TextMetricsBackend`/`PlatformWindowHandle`/`PlatformCssProvider`
+  impls for the concrete GTK types, window *discovery*
+  (`find_visible_window` — quadraui has no portable equivalent yet), and a
+  handful of literal `gtk4::Settings`/`gio::File` call sites.
+
+Pure refactor, no behavior change — exempt from the black-box test bar per
+CLAUDE.md. Verified: `cargo build`/`cargo check --no-default-features`/
+`cargo clippy -- -D warnings`/`cargo clippy --no-default-features -- -D
+warnings`/`cargo fmt --check` all clean; the 155 `gtk::` tests + `gtk::click`'s
+11 + `gtk::util`'s 4 + `gtk::mod`'s `h_scrollbar`/`shell_config`/`chrome_paint`
+tests (6) + 159 `tui_main::shell_app` tests under `--no-default-features` all
+still pass.
+
+Does **not** pair with the `TextMetricsBackend` de-Pango work (already done,
+#861) — the issue's "don't chain in parallel" warning no longer applies since
+that work landed first. Next: #859 (the vimcode-side adoption this and #861
+were prerequisites for).
 
 ## #825 — partially done: click-path scroll-offset table converged + one dead arm deleted; the other four fix items need more design work than mechanical dedup
 

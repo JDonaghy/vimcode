@@ -12,7 +12,7 @@ binaries are thin shims that parse argv and call in:
 
 | Target | File | Role |
 |---|---|---|
-| `[lib] vimcode_core` | `src/lib.rs` | every module; `pub mod gtk` and `pub mod app` are `#[cfg(feature = "gui")]` |
+| `[lib] vimcode_core` | `src/lib.rs` | every module; only `pub mod gtk` is `#[cfg(feature = "gui")]` — `pub mod app` (#862) and its `click`/`app_support`/`css` support modules compile unconditionally |
 | `[[bin]] vimcode` | `src/main.rs` | `required-features = ["gui"]`; `use vimcode_core::{gtk, tui_main}` |
 | `[[bin]] vcd` | `src/tui_bin.rs` | TUI-only; `use vimcode_core::tui_main` |
 
@@ -56,22 +56,44 @@ they don't.
 mappers. #785 (stage 1 of #47, the native macOS GUI) hoisted all ~6,900 lines
 out of `src/gtk/mod.rs`, which shrank from 9,650 to ~2,580 production lines.
 
-The module is **still `#[cfg(feature = "gui")]`** — the move is the mechanical
-half of the split, not the end of it. `src/app.rs`'s own module doc enumerates
-the three things that still tie it to GTK (four platform-typed fields, ~11
-platform hook call sites, and the `crate::gtk::{click, css, util}` dependency)
-so the next stage does not have to re-derive them.
+#862 dropped the `#[cfg(feature = "gui")]` gate `pub mod app;` carried in
+`src/lib.rs`: the three platform-typed fields (`window`, `css_provider`,
+`settings_monitor`) are now type-erased (a small local trait for the first
+two — `PlatformWindowHandle`/`PlatformCssProvider`, the same shape as
+`TextMetricsBackend` and `Engine::clipboard_read`/`clipboard_write` — and a
+`Box<dyn Any>` drop-guard for the third), and the portable majority of
+`crate::gtk::{click, css, util}` moved to the backend-neutral `crate::click`/
+`crate::css`/`crate::app_support` (below). What is still behind inline
+`#[cfg(feature = "gui")]` *inside* `src/app.rs` is genuinely platform-bound:
+`App::new`/`App::assemble`'s display-dependent prologue, the
+`TextMetricsBackend`/`PlatformWindowHandle`/`PlatformCssProvider` impls for the
+concrete GTK types, window *discovery* (`find_visible_window` — quadraui has
+no portable "find the runner's window" surface yet), and a few literal
+`gtk4::Settings`/`gio::File` call sites. `src/app.rs`'s own module doc has the
+full inventory.
 
 ### GTK directory (`src/gtk/`)
 
 | File | What goes here |
 |------|---------------|
-| `mod.rs` | `run()`, `build_shell_config()`, tab-bar/scrollbar geometry helpers, GTK font + close-glyph metrics. `App` itself moved to `src/app.rs` (#785) and is re-exported here as `crate::gtk::App` so the submodules keep resolving `super::App`. |
-| `click.rs` | `pixel_to_click_target()`, tab-bar hit resolution (Pango vs char-cell), gutter actions, mouse click/double-click/drag entry points |
-| `css.rs` | `make_theme_css()`, `STATIC_CSS`, `load_css()` — genuinely GTK-only |
-| `util.rs` | `open_url()`, bundled Nerd Font install, GTK utilities |
+| `mod.rs` | `run()`, `build_shell_config()`, GTK-only test fixtures. `App` itself moved to `src/app.rs` (#785) and is re-exported here as `crate::gtk::App`; the tab-bar/scrollbar geometry helpers and UI-font consts that used to live here moved on to `crate::app_support` (#862) and are re-exported the same way, so the submodules keep resolving `super::X` unchanged. |
+| `click.rs` | `build_editor_click_context()` — genuinely GTK-only (builds a `pango::Context`). `pixel_to_click_target()` and the rest of the click-resolution/tab-bar-hit-geometry functions moved to `crate::click` (#862); re-exported here. |
+| `css.rs` | `load_css()` — genuinely GTK-only (constructs a `gtk4::CssProvider`). `make_theme_css()`/`STATIC_CSS` moved to `crate::css` (#862); re-exported here. |
+| `util.rs` | `app_icon_image()`'s PNG rasterisation, `install_icon_and_desktop()`, the GLib log-writer — genuinely GTK-only. `open_url()`/`install_bundled_icon_font()` moved to `crate::app_support` (#862). |
 | `testing.rs` | The headless `GtkDriver` black-box harness (#646), behind `test-support` |
 | `backend.rs`, `events.rs`, `services.rs`, `explorer.rs` | Re-export / placeholder shims only — the real implementations were lifted into `quadraui::gtk::*` (#270) and `engine/explorer_ops.rs` |
+
+### Backend-neutral `App` support modules (`src/click.rs`, `src/app_support.rs`, `src/css.rs`)
+
+Split out of `src/gtk/{click,mod,css}.rs` by #862 so `crate::app` can resolve
+them without the `gui` feature: none of them name a `gtk4`/`pango`/`gio` type.
+`src/click.rs` has the pixel→click-target resolution and tab-bar pixel-geometry
+types (`TabBarPixelHits`/`TabPixelHitMap`); `src/app_support.rs` has the
+UI-font helpers, `StatusSegmentMap`/`compute_editor_window_rects`/h-scrollbar
+geometry, and `open_url`/`install_bundled_icon_font`; `src/css.rs` has the
+theme CSS text generation. `src/gtk/{click,mod,css}.rs` re-export everything
+so the rest of `crate::gtk` (and their own tests) keep resolving the same
+names.
 
 > `draw.rs` and `tree.rs` no longer exist. `draw.rs` (all the `draw_*` free
 > functions) was deleted by #669–#672 once GTK's live path painted every

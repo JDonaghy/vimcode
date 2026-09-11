@@ -150,6 +150,17 @@ the shrinkage is code that was simply dead.
 > module doc enumerates the four platform-typed fields, ~11 platform hook call
 > sites and the `crate::gtk::{click, css, util}` dependency that have to go
 > before the gate can.
+>
+> **#862 (2026-09-10) dropped that gate.** `pub mod app;` in `src/lib.rs` no
+> longer carries `#[cfg(feature = "gui")]` — the three remaining
+> platform-typed fields are type-erased behind small local traits / a
+> `Box<dyn Any>` drop-guard, and the portable majority of
+> `crate::gtk::{click, css, util}` moved to the new backend-neutral
+> `src/click.rs`/`src/app_support.rs`/`src/css.rs` (`src/gtk/{click,mod,css}.rs`
+> re-export so nothing else in `crate::gtk` had to change). This does **not**
+> shrink `src/app.rs` or `src/gtk/` in the table above — it is a
+> compile-boundary fix, not a line-count fix; re-run the script if you need a
+> fresh column. Re-measure before trusting either bullet's line counts.
 
 > **Correcting the record.** The figure this file previously carried as
 > "`src/gtk/` = 12,588 at 2026-09-01" was measured *before* #727/#728/#730 landed;
