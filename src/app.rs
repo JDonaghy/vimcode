@@ -10,57 +10,64 @@
 //! keeps everything a second backend would otherwise have had to
 //! re-implement.
 //!
-//! # Why this module is still `#[cfg(feature = "gui")]`
+//! # Why this module no longer needs `#[cfg(feature = "gui")]` (#862)
 //!
-//! It is *not* yet compiled without a toolkit, but #813 retired the biggest
-//! blocker the #47 re-audit found: `backend` used to be typed as the
-//! concrete GTK backend struct, which is what forced every one of the ~19
-//! modal-stack/drag-state handle call sites — and by extension this whole
-//! file — to depend on it. It is now typed against [`TextMetricsBackend`],
-//! a narrow local trait for the text-measurement hooks that still have no
-//! portable `quadraui::Backend` equivalent; see that trait's doc comment.
-//! #861 closed the trait's remaining GTK leak: its context-setter used to
-//! take a `pango::Context` by name, which meant the trait — and so
-//! `App::backend`'s field type — could never be implemented by a non-GTK
-//! backend no matter what that backend could measure. It now takes the
-//! context type-erased, so the trait itself names no toolkit type; `impl
-//! TextMetricsBackend for backend::GtkBackend` still downcasts to
-//! `pango::Context` internally, which is real, acknowledged coupling (item
-//! 3 below), not something this trait pretends to solve. #813 also adopted
-//! `quadraui::Reaction::Exit` for process exit (previously an idle-callback
-//! hack) and ported the 200 ms
-//! yank-highlight one-shot to a portable poll-in-`tick` deadline
-//! (`yank_hl_deadline`) — the same pattern TUI already used. Neither hook
-//! needs a toolkit timer any more.
+//! #813 retired the biggest blocker the #47 re-audit found: `backend` used
+//! to be typed as the concrete GTK backend struct, which is what forced
+//! every one of the ~19 modal-stack/drag-state handle call sites — and by
+//! extension this whole file — to depend on it. It is now typed against
+//! [`TextMetricsBackend`], a narrow local trait for the text-measurement
+//! hooks that still have no portable `quadraui::Backend` equivalent; see
+//! that trait's doc comment. #861 closed the trait's remaining GTK leak:
+//! its context-setter used to take a `pango::Context` by name, which meant
+//! the trait — and so `App::backend`'s field type — could never be
+//! implemented by a non-GTK backend no matter what that backend could
+//! measure. It now takes the context type-erased, so the trait itself names
+//! no toolkit type.
 //!
-//! What's left, recorded here so the next stage does not have to re-derive
-//! it:
+//! #862 closed the three items the previous revision of this doc comment
+//! listed as the remaining blockers to dropping the `gui` gate:
 //!
-//! 1. **Three platform-typed fields.** `settings_monitor` (a file-watcher
-//!    handle), `window` (the OS window handle) and `css_provider` (the
-//!    stylesheet provider) — window-chrome, colorscheme reload, and
-//!    settings hot-reload.
-//! 2. **A handful of platform hook call sites** in otherwise-portable
-//!    methods: colorscheme reload, OS window title / default size /
-//!    minimize / close, CSD capture (`find_visible_window`), and the native
-//!    folder picker.
-//! 3. **`crate::gtk::{click, css, util}`.** These are `use super::*`
-//!    submodules of the GTK backend that `App` leans on heavily. They are
-//!    *mostly* portable, but `click::build_editor_click_context` (the
-//!    Pango/Cairo text-measurement context — see [`TextMetricsBackend`]),
-//!    `css::load_css` and `util`'s pixbuf + log helpers are not — so the
-//!    modules cannot be lifted wholesale without being split first.
+//! 1. **The three platform-typed fields** (`settings_monitor`, `window`,
+//!    `css_provider`) are now type-erased: `window`/`css_provider` behind
+//!    the small local traits [`PlatformWindowHandle`]/[`PlatformCssProvider`]
+//!    (the same shape as [`TextMetricsBackend`] and
+//!    `Engine::clipboard_read`/`clipboard_write`, #417), `settings_monitor`
+//!    behind a `Box<dyn Any>` drop-guard (nothing ever calls a method on it).
+//! 2. **The platform hook call sites** (colorscheme reload, OS window title /
+//!    default size / minimize / maximized-check, CSD capture) now go through
+//!    those same traits and compile for every feature set; only window
+//!    *discovery* (`find_visible_window` — quadraui has no portable "find the
+//!    runner's window" surface yet) and the handful of literal
+//!    `gtk4::Settings`/`gtk4::IconTheme`/`gio::File` calls inside
+//!    `App::new`/`handle_poll_tick` stay behind inline `#[cfg(feature =
+//!    "gui")]`.
+//! 3. **`crate::gtk::{click, css, util}`.** The portable majority of these —
+//!    `pixel_to_click_target` and the rest of the click-resolution/tab-bar
+//!    pixel-geometry functions, `make_theme_css`/`STATIC_CSS`, `open_url`/
+//!    `install_bundled_icon_font` — moved to the backend-neutral
+//!    `crate::click`/`crate::css`/`crate::app_support`, which `src/gtk/{click,
+//!    css,mod,util}.rs` now re-export so nothing else in `crate::gtk` had to
+//!    change. The genuinely GTK-only remainder —
+//!    `click::build_editor_click_context` (the Pango/Cairo text-measurement
+//!    context, see [`TextMetricsBackend`]), `css::load_css` and `util`'s
+//!    pixbuf/log helpers — stayed in `crate::gtk` and is reached from here
+//!    through explicit `#[cfg(feature = "gui")]` call sites
+//!    (`app_icon_image_for_paint`, `App::new`, the `TextMetricsBackend` impl).
 //!
-//! Items 1-3 are the real remaining blockers for dropping the `gui` gate,
-//! and none of them is a "route around it" job: per `CLAUDE.md`'s
-//! Platform-Neutrality Rule they want quadraui-side infrastructure (a
-//! backend-neutral window-chrome/file-watcher/file-picker surface, and a
-//! backend-neutral text-measurement context) rather than new per-backend
-//! code here.
+//! None of this was a "route around it" job: per `CLAUDE.md`'s
+//! Platform-Neutrality Rule, the parts that stayed behind the `gui` feature
+//! are exactly the parts that still need quadraui-side infrastructure (a
+//! backend-neutral window-chrome/file-watcher/file-picker surface) rather
+//! than new per-backend code — see `docs/IRREDUCIBLE_SURFACE.md`.
 
+#[cfg(feature = "gui")]
 use gio::prelude::{FileExt, FileMonitorExt};
+#[cfg(feature = "gui")]
 use gtk4::gdk;
+#[cfg(feature = "gui")]
 use gtk4::pango;
+#[cfg(feature = "gui")]
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -69,6 +76,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::core;
+#[cfg(feature = "gui")]
 use crate::icons;
 use crate::render;
 
@@ -78,12 +86,12 @@ use render::Theme;
 
 use copypasta_ext::ClipboardProviderExt;
 
+use crate::app_support::*;
+use crate::click::*;
 use crate::core::engine::sidebar::*;
+use crate::css::*;
+#[cfg(feature = "gui")]
 use crate::gtk::backend;
-use crate::gtk::click::*;
-use crate::gtk::css::*;
-use crate::gtk::util::*;
-use crate::gtk::*;
 
 // ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
@@ -148,7 +156,12 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
 enum DeferredAction {
     /// Redraw after an accelerator mutated engine state directly.
     Resize,
-    /// `settings.json` changed on disk.
+    /// `settings.json` changed on disk. Only `App::new`'s (`gui`-gated) `gio`
+    /// file-watcher callback ever constructs this variant, so a
+    /// `--no-default-features` build never does — allowed rather than
+    /// `#[cfg]`-gating the variant, since the match arm that handles it
+    /// (`tick_dispatch`) is itself portable.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     SettingsFileChanged,
     /// Toggle focus between the explorer and the editor.
     ToggleFocusExplorer,
@@ -167,6 +180,8 @@ enum DeferredAction {
 pub(crate) struct DeferredQueue(Rc<RefCell<VecDeque<DeferredAction>>>);
 
 impl DeferredQueue {
+    // Only `App::new`/`App::new_headless` (both `gui`-gated) call this today.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     fn new() -> Self {
         DeferredQueue(Rc::new(RefCell::new(VecDeque::new())))
     }
@@ -213,11 +228,16 @@ impl DeferredQueue {
 /// (`quadraui::macos::text::measure_text(&CTFont, &str)`) takes the font
 /// per call instead of storing one — can implement this as a no-op.
 pub(crate) trait TextMetricsBackend: quadraui::Backend {
+    // Only called from the `gui`-gated editor-click-context block in
+    // `render_content` today (its one producer,
+    // `click::build_editor_click_context`, is GTK-only).
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     fn set_text_measurement_context(&mut self, ctx: Box<dyn std::any::Any>);
     fn set_current_line_height(&mut self, line_height: f64);
     fn set_current_char_width(&mut self, char_width: f64);
 }
 
+#[cfg(feature = "gui")]
 impl TextMetricsBackend for backend::GtkBackend {
     fn set_text_measurement_context(&mut self, ctx: Box<dyn std::any::Any>) {
         // The only producer (`click::build_editor_click_context`) hands us
@@ -235,6 +255,64 @@ impl TextMetricsBackend for backend::GtkBackend {
 
     fn set_current_char_width(&mut self, char_width: f64) {
         backend::GtkBackend::set_current_char_width(self, char_width);
+    }
+}
+
+/// Narrow seam over the OS top-level window handle (#862), the same shape as
+/// [`TextMetricsBackend`] above and `Engine::clipboard_read`/`clipboard_write`
+/// (#417): `App::window` stores one of these type-erased, so the shared
+/// paint/title-sync/minimize methods can call it without naming a toolkit
+/// type. Method names are prefixed `win_*` to avoid colliding with the
+/// `gtk4::prelude` extension-trait methods of the same name on the one
+/// concrete impl below (both would otherwise be applicable to `&gtk4::Window`
+/// inside that impl, which is an ambiguous call, not a recursive one).
+pub(crate) trait PlatformWindowHandle {
+    fn win_default_width(&self) -> i32;
+    fn win_default_height(&self) -> i32;
+    fn win_set_title(&self, title: &str);
+    fn win_is_maximized(&self) -> bool;
+    fn win_minimize(&self);
+    // Only called from `capture_window_and_apply_csd`'s `gui`-gated inner
+    // block today — window *discovery* has no portable equivalent yet (see
+    // that method's doc comment), so nothing calls this outside `gui`.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    fn win_set_decorated(&self, decorated: bool);
+}
+
+#[cfg(feature = "gui")]
+impl PlatformWindowHandle for gtk4::Window {
+    fn win_default_width(&self) -> i32 {
+        gtk4::prelude::GtkWindowExt::default_width(self)
+    }
+    fn win_default_height(&self) -> i32 {
+        gtk4::prelude::GtkWindowExt::default_height(self)
+    }
+    fn win_set_title(&self, title: &str) {
+        gtk4::prelude::GtkWindowExt::set_title(self, Some(title));
+    }
+    fn win_is_maximized(&self) -> bool {
+        gtk4::prelude::GtkWindowExt::is_maximized(self)
+    }
+    fn win_minimize(&self) {
+        gtk4::prelude::GtkWindowExt::minimize(self);
+    }
+    fn win_set_decorated(&self, decorated: bool) {
+        gtk4::prelude::GtkWindowExt::set_decorated(self, decorated);
+    }
+}
+
+/// Narrow seam over the platform stylesheet provider (#862) — same shape as
+/// [`PlatformWindowHandle`] above. `App::css_provider` stores one of these
+/// type-erased so the colorscheme-reload/`setup` methods can reload it
+/// without naming `gtk4::CssProvider`.
+pub(crate) trait PlatformCssProvider {
+    fn load_css_data(&self, css: &str);
+}
+
+#[cfg(feature = "gui")]
+impl PlatformCssProvider for gtk4::CssProvider {
+    fn load_css_data(&self, css: &str) {
+        self.load_from_data(css);
     }
 }
 
@@ -333,8 +411,13 @@ pub(crate) struct App {
     pub(crate) h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
     /// True while user is drag-selecting text inside a find/replace input field.
     pub(crate) fr_input_dragging: bool,
+    /// Type-erased platform file-watcher handle (`gio::FileMonitor` on GTK),
+    /// kept alive only to continue monitoring `settings.json` — nothing here
+    /// ever calls a method on it, so a `Box<dyn Any>` drop-guard names no
+    /// toolkit type (#862), unlike `window`/`css_provider` below which do
+    /// need call-through and so go via a small local trait instead.
     #[allow(dead_code)] // Kept alive to continue monitoring settings.json
-    pub(crate) settings_monitor: Option<gio::FileMonitor>,
+    pub(crate) settings_monitor: Option<Box<dyn std::any::Any>>,
     pub(crate) deferred: DeferredQueue,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
@@ -477,8 +560,11 @@ pub(crate) struct App {
     /// `tab_drag_source`, `tab_drag_drop_zone`) with the shared
     /// [`render::TabDragState`], which TUI holds too.
     pub(crate) tab_drag: render::TabDragState,
-    /// GTK window handle — set in `ShellApp::setup` once the runner creates the window.
-    pub(crate) window: Option<gtk4::Window>,
+    /// OS top-level window handle, type-erased behind [`PlatformWindowHandle`]
+    /// (#862) so the shared paint/title-sync/minimize methods below can call
+    /// it without naming `gtk4::Window` — set in `ShellApp::setup` once the
+    /// runner creates the window.
+    pub(crate) window: Option<Box<dyn PlatformWindowHandle>>,
     /// Editor content bounds + tab-bar height as used by the LAST
     /// `render_content` pass, in the same **absolute** DA coordinate frame
     /// that mouse events arrive in (#550, #582).
@@ -634,7 +720,7 @@ pub(crate) struct App {
     /// `gtk4::CssProvider::new()` asserts `gtk::init` has run, which it cannot
     /// with no display, and a provider that is attached to no `GdkDisplay`
     /// styles nothing anyway. Always `Some` in a live run.
-    pub(crate) css_provider: Option<gtk4::CssProvider>,
+    pub(crate) css_provider: Option<Box<dyn PlatformCssProvider>>,
     /// Colorscheme name at the time the CSS was last applied.
     pub(crate) last_colorscheme: String,
     /// A second, standalone `quadraui::Backend`-impl handle, distinct from
@@ -765,6 +851,11 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
 /// On X11 we prefer `x11_bin` (xclip/xsel subprocesses) over `try_context`'s
 /// default `x11_fork`: the fork variant opens its own in-process X11 connection
 /// and contends with GTK's main-thread X11 event loop. Subprocess reads do not.
+///
+/// Only `App::new` (`gui`-gated) calls this today; it names no toolkit type
+/// (`copypasta_ext` is a plain, unconditional dependency) so it stays
+/// un-gated itself, allowed rather than `#[cfg]`-gated.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 fn setup_gtk_clipboard(engine: &mut Engine) {
     let ctx: Option<Box<dyn ClipboardProviderExt>> = {
         #[cfg(all(
@@ -872,6 +963,23 @@ fn dialog_btn_index(id: &quadraui::WidgetId) -> Option<usize> {
         .and_then(|s| s.parse::<usize>().ok())
 }
 
+/// The app icon to paint in the menu row. Under `gui`, defers to
+/// `crate::gtk::util::app_icon_image` (the once-rasterised PNG — see its doc
+/// comment for why the raw SVG must never reach `Backend::draw_image`
+/// directly). No non-GTK backend paints this yet, so the fallback is the
+/// plain, un-rasterised builder — never exercised in production today, but
+/// keeps this function (and so `render_content`) resolving without `gui`.
+fn app_icon_image_for_paint() -> quadraui::Image {
+    #[cfg(feature = "gui")]
+    {
+        crate::gtk::util::app_icon_image()
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        crate::render::app_icon_image()
+    }
+}
+
 /// Create a new `App` instance.
 ///
 /// All widget-dependent setup (window handle, CSS) is deferred to
@@ -885,6 +993,7 @@ impl App {
     /// is the only caller today and it still passes a `GtkBackend`, but
     /// the choice of concrete type now lives at the call site instead of
     /// being baked into `App`.
+    #[cfg(feature = "gui")]
     pub(crate) fn new(
         file_path: Option<PathBuf>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
@@ -908,7 +1017,8 @@ impl App {
         setup_gtk_clipboard(&mut engine);
 
         let initial_theme = Theme::from_name(&engine.settings.colorscheme);
-        let css_provider = Some(load_css(&initial_theme));
+        let css_provider: Option<Box<dyn PlatformCssProvider>> =
+            Some(Box::new(crate::gtk::css::load_css(&initial_theme)));
         let last_colorscheme = engine.settings.colorscheme.clone();
         if let Some(gtk_settings) = gtk4::Settings::default() {
             gtk_settings.set_gtk_application_prefer_dark_theme(!initial_theme.is_light());
@@ -928,7 +1038,7 @@ impl App {
             .map(|h| format!("{}/.config/vimcode/settings.json", h))
             .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
         let file = gio::File::for_path(&settings_path);
-        let settings_monitor =
+        let settings_monitor: Option<Box<dyn std::any::Any>> =
             match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
                 Ok(monitor) => {
                     let deferred_for_monitor = deferred.clone();
@@ -937,7 +1047,7 @@ impl App {
                             deferred_for_monitor.send(DeferredAction::SettingsFileChanged);
                         }
                     });
-                    Some(monitor)
+                    Some(Box::new(monitor))
                 }
                 Err(_) => None,
             };
@@ -966,12 +1076,18 @@ impl App {
     /// Everything below this line is plain `Rc`/`Cell`/`RefCell` allocation;
     /// none of it touches GDK. `backend` is taken as a parameter rather than
     /// constructed here (#861) — see [`App::new`]'s doc comment.
+    ///
+    /// Named no toolkit type in its own signature even before #862 (#861
+    /// already erased `backend`'s concrete type), so it stays un-gated
+    /// itself; only `App::new`/`App::new_headless` — its sole callers today,
+    /// both `gui`-gated — construct the arguments this needs.
+    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
     fn assemble(
         engine: Rc<RefCell<Engine>>,
         deferred: DeferredQueue,
-        css_provider: Option<gtk4::CssProvider>,
+        css_provider: Option<Box<dyn PlatformCssProvider>>,
         last_colorscheme: String,
-        settings_monitor: Option<gio::FileMonitor>,
+        settings_monitor: Option<Box<dyn std::any::Any>>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
     ) -> Self {
         App {
@@ -1077,7 +1193,7 @@ impl App {
     /// assertions — `GtkDriver` only exposes the opaque `ShellAdapter`, with no
     /// accessor back to the concrete `App` (the same constraint the TUI tests
     /// document on `driver_with_shell`).
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(feature = "gui", any(test, feature = "test-support")))]
     pub(super) fn new_headless(engine: Rc<RefCell<Engine>>) -> Self {
         let (use_nerd_fonts, last_colorscheme) = {
             let e = engine.borrow();
@@ -1531,12 +1647,12 @@ impl App {
         engine.session.window.width = self
             .window
             .as_ref()
-            .map(|w| w.default_width())
+            .map(|w| w.win_default_width())
             .unwrap_or(800);
         engine.session.window.height = self
             .window
             .as_ref()
-            .map(|w| w.default_height())
+            .map(|w| w.win_default_height())
             .unwrap_or(600);
         engine.save_session_state();
         engine.cleanup_all_swaps();
@@ -2084,9 +2200,10 @@ impl App {
                 let theme = Theme::from_name(&current);
                 let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
                 if let Some(p) = &self.css_provider {
-                    p.load_from_data(&combined);
+                    p.load_css_data(&combined);
                 }
                 // Update GTK dark/light preference for native widgets & menus.
+                #[cfg(feature = "gui")]
                 if let Some(gtk_settings) = gtk4::Settings::default() {
                     gtk_settings.set_gtk_application_prefer_dark_theme(!theme.is_light());
                 }
@@ -2193,7 +2310,7 @@ impl App {
             .map(|n| format!("VimCode \u{2014} {}", n))
             .unwrap_or_else(|| "VimCode".to_string());
         if let Some(ref w) = self.window {
-            w.set_title(Some(&win_title));
+            w.win_set_title(&win_title);
         }
     }
 
@@ -5134,7 +5251,13 @@ impl App {
 
     /// Find the runner-created top-level window once it is mapped/visible.
     /// Returns `None` until then — see `capture_window_and_apply_csd`. (#552)
-    fn find_visible_window() -> Option<gtk4::Window> {
+    ///
+    /// Window discovery is inherently platform-specific (quadraui has no
+    /// portable "find the runner's window" surface yet — #862 module doc item
+    /// 2), so unlike `window`'s other call sites this one has no non-GTK
+    /// branch to fall back to; it stays behind the `gui` feature entirely.
+    #[cfg(feature = "gui")]
+    fn find_visible_window() -> Option<Box<dyn PlatformWindowHandle>> {
         // `list_toplevels` asserts GTK is initialized, which it never is under
         // the headless test harness (#646). `run()` calls `gtk4::init()` before
         // building the `App`, so this is unconditionally `true` in a live run
@@ -5146,6 +5269,7 @@ impl App {
             .into_iter()
             .filter_map(|obj| obj.downcast::<gtk4::Window>().ok())
             .find(|w| w.is_visible())
+            .map(|w| Box::new(w) as Box<dyn PlatformWindowHandle>)
     }
 
     /// Capture the runner's GTK window (if not already captured) and drop
@@ -5155,12 +5279,15 @@ impl App {
     /// (reliable path — retried every frame until the window is mapped).
     /// (#552)
     fn capture_window_and_apply_csd(&mut self) {
-        if self.window.is_some() {
-            return;
-        }
-        if let Some(w) = Self::find_visible_window() {
-            w.set_decorated(false);
-            self.window = Some(w);
+        #[cfg(feature = "gui")]
+        {
+            if self.window.is_some() {
+                return;
+            }
+            if let Some(w) = Self::find_visible_window() {
+                w.win_set_decorated(false);
+                self.window = Some(w);
+            }
         }
     }
 
@@ -5677,7 +5804,7 @@ impl App {
     /// Minimize the application window (inline window-control button).
     fn window_minimize(&mut self) {
         if let Some(ref w) = self.window {
-            w.minimize();
+            w.win_minimize();
         }
     }
 
@@ -5974,12 +6101,13 @@ impl App {
                     ),
                     &filler,
                 );
-                // `util::app_icon_image`, not `render::app_icon_image`: the
-                // former hands over a once-rasterised small PNG instead of the
-                // 1024x1024 SVG, which `Backend::draw_image` would otherwise
-                // re-render through librsvg on *every* frame (+16.5ms per
-                // repaint — see that function's doc comment).
-                let _ = backend.draw_image(app_icon_rect, &util::app_icon_image());
+                // `app_icon_image_for_paint` (this file), not
+                // `render::app_icon_image`: the former hands over a
+                // once-rasterised small PNG instead of the 1024x1024 SVG,
+                // which `Backend::draw_image` would otherwise re-render
+                // through librsvg on *every* frame (+16.5ms per repaint —
+                // see `crate::gtk::util::app_icon_image`'s doc comment).
+                let _ = backend.draw_image(app_icon_rect, &app_icon_image_for_paint());
             }
         }
 
@@ -5998,7 +6126,7 @@ impl App {
         // "modal" means, and it is what TUI already did with everything it
         // painted into its own title-bar row.
         if let Some(controls_rect) = controls_rect {
-            let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+            let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
             let controls_bar = render::window_controls_status_bar(theme, maximized);
             let interaction = self.title_bar_interaction.borrow();
             let hits = backend.draw_status_bar(
@@ -6692,7 +6820,7 @@ impl quadraui::ShellApp for App {
         if let Some(p) = &self.css_provider {
             let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
             let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
-            p.load_from_data(&combined);
+            p.load_css_data(&combined);
         }
 
         // Register the panel-keys accelerator set (toggle sidebar, fuzzy
@@ -6824,7 +6952,8 @@ impl quadraui::ShellApp for App {
         // scaled columns by the wrong cell width and drifted left, the drift
         // growing with `x`, on plain/bold/italic/scrolled lines alike.
         // `build_editor_click_context` matches by measuring against `cw`.
-        if let Some(click_ctx) = click::build_editor_click_context(cw) {
+        #[cfg(feature = "gui")]
+        if let Some(click_ctx) = crate::gtk::click::build_editor_click_context(cw) {
             self.backend
                 .borrow_mut()
                 .set_text_measurement_context(Box::new(click_ctx));
@@ -7017,7 +7146,7 @@ impl quadraui::ShellApp for App {
                     menu_items_rect = items_rect;
                     self.menu_items_rect.set(menu_items_rect);
 
-                    let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
+                    let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
                     let controls_bar = render::window_controls_status_bar(&theme, maximized);
                     let bar = engine.menu_system.borrow().menu_bar();
                     let bands = render::measure_title_bar_bands(

@@ -28,21 +28,44 @@ pub mod icons;
 pub mod render;
 pub mod tui_main;
 
+/// Backend-neutral pixel→click-target resolution shared by `crate::app`
+/// (#862). Split out of the formerly `gui`-gated `src/gtk/click.rs`, which
+/// re-exports these names so its own tests and the rest of `crate::gtk` keep
+/// resolving them unchanged.
+pub(crate) mod click;
+
+/// Backend-neutral shell support functions (UI-font helpers, tab-bar pixel
+/// geometry, h-scrollbar geometry, ...) shared by `crate::app` (#862). Split
+/// out of the formerly `gui`-gated `src/gtk/mod.rs`, which re-exports these
+/// names so the rest of `crate::gtk` keeps resolving them unchanged.
+pub(crate) mod app_support;
+
+/// Backend-neutral theme CSS text generation shared by `crate::app` (#862).
+/// Split out of the formerly `gui`-gated `src/gtk/css.rs`, which re-exports
+/// `make_theme_css`/`STATIC_CSS` and keeps the GTK-only `load_css`.
+pub(crate) mod css;
+
 /// The GTK backend, behind the `gui` feature exactly as it was in the
 /// `vimcode` bin — so `--no-default-features` still builds on a machine with
 /// no GTK4 dev libs.
 #[cfg(feature = "gui")]
 pub mod gtk;
 
-/// `struct App` — the editor shell application, hoisted out of
-/// `src/gtk/mod.rs` by #785 (stage 1 of #47) so a second native backend can
-/// reuse it instead of re-implementing ~6,900 lines of portable shell logic.
-///
-/// Still `gui`-gated: `App` retains four platform-typed fields, ~11 platform
-/// hook call sites and a dependency on `crate::gtk::{click, css, util}`. The
-/// module doc in `src/app.rs` enumerates all three so the next stage does not
-/// have to re-derive them.
-#[cfg(feature = "gui")]
+/// `struct App` — the backend-neutral editor shell application, hoisted out
+/// of `src/gtk/mod.rs` by #785 (stage 1 of #47) so a second native backend
+/// can reuse it instead of re-implementing ~6,900 lines of portable shell
+/// logic. #862 dropped the `gui` gate itself: the three remaining
+/// platform-typed fields (`window`, `css_provider`, `settings_monitor`) are
+/// now type-erased (a small local trait for `window`/`css_provider`, an
+/// opaque `Box<dyn Any>` drop-guard for `settings_monitor`), and the
+/// `crate::gtk::{click, css, util}` reliance moved to the neutral
+/// `crate::click`/`crate::app_support`/`crate::css` above. What's left
+/// behind `#[cfg(feature = "gui")]` *inside* `src/app.rs` is the handful of
+/// items that are genuinely platform-bound: `App::new`/`App::assemble`'s
+/// display-dependent prologue, the `TextMetricsBackend`/window-handle/
+/// css-provider trait impls for the concrete GTK types, and a few inline
+/// `gtk4::Settings`/window-discovery call sites. See `src/app.rs`'s module
+/// doc for the full inventory.
 pub mod app;
 
 /// Process-wide working-directory arbitration for the test run (#785) — the
