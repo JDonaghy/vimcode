@@ -11152,9 +11152,22 @@ mod tests {
     /// plain editor body, matching how
     /// `driver_click_outside_tab_switcher_popup_dismisses_and_propagates`
     /// (this file) picks its outside point.
+    ///
+    /// Uses [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#868): the latter is ambient in exactly the way that method's own
+    /// doc comment warns about — `Engine::new()` reads the developer's real
+    /// `~/.config/vimcode/{settings,session}.json` and shows the sidebar
+    /// whenever that machine has ever had the explorer open. This test's
+    /// "column 5 is plain editor body" assumption only holds with the
+    /// sidebar hidden; with it visible, column 5 row 10 lands on the
+    /// explorer tree instead, which claims the click in `handle_mouse_event`
+    /// before it ever reaches the modal-overlay rung — so the picker never
+    /// gets a chance to dismiss. That's exactly why this was red on two
+    /// real dev boxes (both had a persisted `explorer_visible: true`) and
+    /// green in CI and in a fresh checkout (no ambient config to read).
     #[test]
     fn click_outside_picker_popup_dismisses_it_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.buffer_mut().insert(0, "fn main() {}\n");
         app.engine
             .open_picker(crate::core::engine::PickerSource::LineEndings);
