@@ -16,16 +16,27 @@
 //! [`COMPILED_GUI_BACKEND`], so the target compiles in *every* feature set
 //! and its disappearance can never again be mistaken for success.
 //!
-//! Three backends, resolved at compile time:
+//! Four backends, resolved at compile time:
 //!
 //! | build | [`GuiBackend`] | runs |
 //! |---|---|---|
 //! | `--features macos` on macOS | `MacOs` | `vimcode_core::macos::run` (AppKit) |
+//! | `--features win` on Windows | `Win` | `vimcode_core::win::run` (Direct2D/Win32) |
 //! | `--features gui` (the default) | `Gtk` | `vimcode_core::gtk::run` |
-//! | neither | `None` | terminal UI, with a one-line stderr notice |
+//! | none of the above | `None` | terminal UI, with a one-line stderr notice |
 //!
 //! `--tui` / `-t` short-circuits all of that and runs the terminal UI
 //! regardless, exactly as before.
+//!
+//! `Win`'s row reads "on Windows", not "with `win`", because unlike `macos`
+//! (target-gated inside quadraui itself, so `--features macos` compiles
+//! nothing on Linux), quadraui's `win` module type-checks on every host
+//! (#866 — see `Cargo.toml`'s `win` feature comment). `--features win` alone
+//! therefore compiles `vimcode_core::win` everywhere, but this file still
+//! only ever *launches* it on `target_os = "windows"` — launching it
+//! anywhere else would reach `quadraui::win::run::run_with`'s non-Windows
+//! stub, which `todo!()`s rather than degrading gracefully the way the GTK/
+//! TUI paths do.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -37,9 +48,9 @@ use std::process::ExitCode;
 /// `match` that tests can exercise, rather than a thicket of `cfg!` at the
 /// call site.
 ///
-/// All three variants exist in every build, but only one is ever
+/// All four variants exist in every build, but only one is ever
 /// *constructed* (whichever arm of the `cfg` cascade below is live), so the
-/// other two would otherwise trip `dead_code` — hence the blanket allow.
+/// other three would otherwise trip `dead_code` — hence the blanket allow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum GuiBackend {
@@ -52,27 +63,53 @@ enum GuiBackend {
     /// macos`, which is also the only shape macmini can build (no Homebrew/
     /// gtk4/pkg-config there by policy).
     MacOs,
-    /// No GUI backend was compiled in. The binary still builds and still
-    /// works — as a terminal editor, which is what the `vcd` bin is.
+    /// Native Direct2D/Win32 via `vimcode_core::win::run` — the `win`
+    /// feature on a Windows host (#866). Same precedence posture as
+    /// `MacOs`: wins over `Gtk` when both are compiled in, untested and
+    /// unsupported as a combination for the same Pango-vs-native-backend
+    /// reason. Unlike `MacOs`, `win` alone compiles on every host (quadraui
+    /// does not target-gate its `win` module — see `Cargo.toml`'s `win`
+    /// comment), so this variant additionally requires `target_os =
+    /// "windows"` before it is ever *selected* — see
+    /// [`COMPILED_GUI_BACKEND`]'s cascade.
+    Win,
+    /// No GUI backend was compiled in, or one was compiled in but not for
+    /// this `target_os` (e.g. `--features win` on Linux). The binary still
+    /// builds and still works — as a terminal editor, which is what the
+    /// `vcd` bin is.
     None,
 }
 
 /// What this build will actually launch.
 ///
-/// macOS wins over GTK when both are available: a `--features gui,macos`
-/// build on a Mac (GTK4 from Homebrew alongside the native backend) should
-/// run the *native* one, since choosing GTK there would make the native
-/// backend unreachable without a rebuild.
+/// Precedence when more than one backend is compiled in: `MacOs` and `Win`
+/// each win over `Gtk` on their respective `target_os` — a `--features
+/// gui,macos` build on a Mac (GTK4 from Homebrew alongside the native
+/// backend) should run the *native* one, since choosing GTK there would
+/// make the native backend unreachable without a rebuild; same reasoning
+/// for `--features gui,win` on Windows (GTK4 has a Windows port too, via
+/// MSYS2/gvsbuild).
 ///
-/// That combination is untested and not a supported configuration —
-/// `App::render_content` still has a few `#[cfg(feature = "gui")]` blocks
-/// that reach for Pango (`click::build_editor_click_context`), and with
-/// `gui` compiled in they would run against a `MacBackend`.
+/// Every multi-backend combination here is untested and not a supported
+/// configuration — `App::render_content` still has a few `#[cfg(feature =
+/// "gui")]` blocks that reach for Pango (`click::build_editor_click_context`),
+/// and with `gui` compiled in they would run against a `MacBackend`/
+/// `WinBackend` instead.
 #[cfg(all(feature = "macos", target_os = "macos"))]
 const COMPILED_GUI_BACKEND: GuiBackend = GuiBackend::MacOs;
-#[cfg(all(feature = "gui", not(all(feature = "macos", target_os = "macos"))))]
+#[cfg(all(feature = "win", target_os = "windows"))]
+const COMPILED_GUI_BACKEND: GuiBackend = GuiBackend::Win;
+#[cfg(all(
+    feature = "gui",
+    not(all(feature = "macos", target_os = "macos")),
+    not(all(feature = "win", target_os = "windows"))
+))]
 const COMPILED_GUI_BACKEND: GuiBackend = GuiBackend::Gtk;
-#[cfg(not(any(feature = "gui", all(feature = "macos", target_os = "macos"))))]
+#[cfg(not(any(
+    feature = "gui",
+    all(feature = "macos", target_os = "macos"),
+    all(feature = "win", target_os = "windows")
+)))]
 const COMPILED_GUI_BACKEND: GuiBackend = GuiBackend::None;
 
 /// The parsed command line.
@@ -129,13 +166,14 @@ impl Args {
 
 /// The version banner, including which quadraui this binary is made of
 /// (#638 — the dependency is a pinned git rev, so nothing else in the build
-/// records which one was used) and which GUI backend is compiled in (#859 —
-/// with three possible backends and a silent-omission history, "which one is
-/// this?" needs to be answerable from the binary).
+/// records which one was used) and which GUI backend is compiled in (#859/
+/// #866 — with four possible backends and a silent-omission history, "which
+/// one is this?" needs to be answerable from the binary).
 fn version_banner(backend: GuiBackend) -> String {
     let backend = match backend {
         GuiBackend::Gtk => "gtk",
         GuiBackend::MacOs => "macos",
+        GuiBackend::Win => "win",
         GuiBackend::None => "no-gui",
     };
     format!(
@@ -148,11 +186,20 @@ fn version_banner(backend: GuiBackend) -> String {
 
 /// Launch the compiled-in GUI backend, or the terminal UI if there isn't one.
 ///
-/// The `cfg` lives on three alternative definitions rather than inside the
+/// The `cfg` lives on four alternative definitions rather than inside the
 /// body so that each build only ever *names* the modules it actually has:
-/// `vimcode_core::gtk` does not exist without `gui`, and
-/// `vimcode_core::macos` does not exist without `macos` on a Mac.
-#[cfg(all(feature = "gui", not(all(feature = "macos", target_os = "macos"))))]
+/// `vimcode_core::gtk` does not exist without `gui`, `vimcode_core::macos`
+/// does not exist without `macos` on a Mac, and while `vimcode_core::win`
+/// exists on every host under `win` (#866 — quadraui does not target-gate
+/// its own `win` module, see `Cargo.toml`'s `win` feature comment), this
+/// function only ever *calls* `vimcode_core::win::run` on `target_os =
+/// "windows"` — calling it elsewhere would reach
+/// `quadraui::win::run::run_with`'s non-Windows `todo!()` stub.
+#[cfg(all(
+    feature = "gui",
+    not(all(feature = "macos", target_os = "macos")),
+    not(all(feature = "win", target_os = "windows"))
+))]
 fn launch_gui(args: Args) -> ExitCode {
     vimcode_core::gtk::run(args.file_path);
     ExitCode::SUCCESS
@@ -166,11 +213,24 @@ fn launch_gui(args: Args) -> ExitCode {
     vimcode_core::macos::run(args.file_path)
 }
 
-#[cfg(not(any(feature = "gui", all(feature = "macos", target_os = "macos"))))]
+#[cfg(all(feature = "win", target_os = "windows"))]
+fn launch_gui(args: Args) -> ExitCode {
+    // Same reasoning as the macOS arm above: propagate
+    // `quadraui::win::shell_runner::run_with_shell`'s real exit status
+    // rather than flattening to success.
+    vimcode_core::win::run(args.file_path)
+}
+
+#[cfg(not(any(
+    feature = "gui",
+    all(feature = "macos", target_os = "macos"),
+    all(feature = "win", target_os = "windows")
+)))]
 fn launch_gui(args: Args) -> ExitCode {
     eprintln!(
-        "vimcode: built without a GUI backend (no `gui`, no `macos`); \
-         starting the terminal UI instead. Pass --tui to skip this notice."
+        "vimcode: built without a GUI backend for this platform (no `gui`, \
+         no matching `macos`/`win`); starting the terminal UI instead. Pass \
+         --tui to skip this notice."
     );
     vimcode_core::tui_main::run(args.file_path, args.debug_log);
     ExitCode::SUCCESS
@@ -259,7 +319,7 @@ mod gui_backend_tests {
         // target. The body just pins that exactly one backend is selected.
         assert!(matches!(
             COMPILED_GUI_BACKEND,
-            GuiBackend::Gtk | GuiBackend::MacOs | GuiBackend::None
+            GuiBackend::Gtk | GuiBackend::MacOs | GuiBackend::Win | GuiBackend::None
         ));
     }
 
@@ -269,6 +329,8 @@ mod gui_backend_tests {
     fn compiled_backend_matches_the_feature_set() {
         let expected = if cfg!(all(feature = "macos", target_os = "macos")) {
             GuiBackend::MacOs
+        } else if cfg!(all(feature = "win", target_os = "windows")) {
+            GuiBackend::Win
         } else if cfg!(feature = "gui") {
             GuiBackend::Gtk
         } else {
@@ -285,6 +347,7 @@ mod gui_backend_tests {
         for (backend, tag) in [
             (GuiBackend::Gtk, "gtk"),
             (GuiBackend::MacOs, "macos"),
+            (GuiBackend::Win, "win"),
             (GuiBackend::None, "no-gui"),
         ] {
             let banner = version_banner(backend);
