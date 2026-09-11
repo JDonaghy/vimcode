@@ -54,8 +54,8 @@
 //! are un-gated and type-checked everywhere, and
 //! `app.rs::portable_entry_point_tests` pins both the `A: ShellApp +
 //! 'static` bound `run_with_shell` requires and the `ShellConfig`
-//! `shell_config()` produces. The residue this
-//! file adds on top is ~20 lines with no branches. See #859 for stage 3
+//! `shell_config()` produces. The residue this file adds on top is ~20
+//! lines with no branches. See #859 for stage 3
 //! (the `MacDriver` black-box test), which needs a Mach-O host and is gated
 //! on vimcode's `test_command` becoming macOS-satisfiable.
 
