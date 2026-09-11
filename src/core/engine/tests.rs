@@ -25113,6 +25113,38 @@ fn test_nvim_ex_delete_line() {
 }
 
 #[test]
+fn test_nvim_ex_put_bang_before_current_line() {
+    // :pu! puts the default register *before* the current line (`:put`
+    // without `!` puts after) — issue #877.
+    nvim_case("a\nb\n", 0, 0, "yy:pu!<CR>", "a\na\nb\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_ex_put_with_line_address() {
+    // :2put puts after line 2, not after the cursor line — issue #877.
+    nvim_case("a\nb\nc\n", 0, 0, "yy:2put<CR>", "a\nb\na\nc\n", 2, 0);
+}
+
+#[test]
+fn test_nvim_ex_put_address_zero() {
+    // Address 0 is legal for :put and means "before the first line".
+    nvim_case("a\nb\n", 1, 0, "yy:0put<CR>", "b\na\nb\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_ex_k_with_line_address() {
+    // :2ka (the no-space :k spelling of :mark) sets mark 'a' on line 2, not
+    // the cursor line — issue #877.
+    nvim_case("a\nb\nc\n", 0, 0, ":2ka<CR>'a", "a\nb\nc\n", 1, 0);
+}
+
+#[test]
+fn test_nvim_ex_mark_with_line_address() {
+    // :2mark a sets mark 'a' on line 2, not the cursor line — issue #877.
+    nvim_case("a\nb\nc\n", 0, 0, ":2mark a<CR>'a", "a\nb\nc\n", 1, 0);
+}
+
+#[test]
 fn test_nvim_ex_substitute() {
     // :s/foo/bar/ replaces first occurrence on current line
     let mut engine = Engine::new();

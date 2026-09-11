@@ -1583,16 +1583,7 @@ impl Engine {
             if let Some(ch) = arg.chars().next() {
                 if arg.len() == 1 && ch.is_ascii_alphabetic() {
                     let cursor = self.view().cursor;
-                    if ch.is_ascii_lowercase() {
-                        let buf_id = self.active_buffer_id();
-                        self.marks.entry(buf_id).or_default().insert(ch, cursor);
-                    } else {
-                        let path = self.file_path().map(|p| p.to_path_buf());
-                        self.global_marks
-                            .insert(ch, (path, cursor.line, cursor.col));
-                    }
-                    self.message = format!("Mark '{ch}' set");
-                    return EngineAction::None;
+                    return self.set_ex_mark(ch, cursor);
                 }
             }
             self.message = "Usage: :mark {a-zA-Z}".to_string();
@@ -2215,44 +2206,6 @@ impl Engine {
                 self.registers.insert('0', (text, RegType::Linewise));
                 EngineAction::None
             }
-            "put" => {
-                // :pu[t] — put default register after current line
-                if let Some((content, _)) = self.registers.get(&'"').cloned() {
-                    let line = self.view().cursor.line;
-                    let num_lines = self.buffer().len_lines();
-                    let insert_pos = if line + 1 < num_lines {
-                        self.buffer().line_to_char(line + 1)
-                    } else {
-                        let end = self.buffer().len_chars();
-                        if end > 0 && self.buffer().content.char(end - 1) != '\n' {
-                            self.start_undo_group();
-                            self.insert_with_undo(end, "\n");
-                            let text = if content.ends_with('\n') {
-                                content
-                            } else {
-                                format!("{content}\n")
-                            };
-                            self.insert_with_undo(end + 1, &text);
-                            self.finish_undo_group();
-                            return EngineAction::None;
-                        }
-                        end
-                    };
-                    let text = if content.ends_with('\n') {
-                        content
-                    } else {
-                        format!("{content}\n")
-                    };
-                    self.start_undo_group();
-                    self.insert_with_undo(insert_pos, &text);
-                    self.finish_undo_group();
-                    self.view_mut().cursor.line = line + 1;
-                    self.view_mut().cursor.col = 0;
-                } else {
-                    self.message = "Register is empty".to_string();
-                }
-                EngineAction::None
-            }
             "pwd" => {
                 self.message = self.cwd.to_string_lossy().to_string();
                 EngineAction::None
@@ -2362,31 +2315,6 @@ impl Engine {
                         .insert(reg, (text.clone(), RegType::Linewise));
                     if reg != '"' {
                         self.registers.insert('"', (text, RegType::Linewise));
-                    }
-                    return EngineAction::None;
-                }
-                if let Some(arg) = cmd.strip_prefix("put ") {
-                    let reg = arg.trim().chars().next().unwrap_or('"');
-                    if let Some((content, _)) = self.registers.get(&reg).cloned() {
-                        let line = self.view().cursor.line;
-                        let num_lines = self.buffer().len_lines();
-                        let insert_pos = if line + 1 < num_lines {
-                            self.buffer().line_to_char(line + 1)
-                        } else {
-                            self.buffer().len_chars()
-                        };
-                        let text = if content.ends_with('\n') {
-                            content
-                        } else {
-                            format!("{content}\n")
-                        };
-                        self.start_undo_group();
-                        self.insert_with_undo(insert_pos, &text);
-                        self.finish_undo_group();
-                        self.view_mut().cursor.line = line + 1;
-                        self.view_mut().cursor.col = 0;
-                    } else {
-                        self.message = format!("Register '{reg}' is empty");
                     }
                     return EngineAction::None;
                 }
@@ -2785,6 +2713,80 @@ impl Engine {
 
     /// :m[ove] {dest} — move current line to after line {dest}.
     /// dest: absolute line number (1-based), 0 = before first line, . = current, $ = last, +N/-N = relative.
+    /// `:[range]pu[t][!] [x]` — put register `x` linewise after the 0-based
+    /// line `target` (or before it, with `bang`). `target == -1` is Vim's
+    /// address `0`, "before the first line" (`:0put`).
+    pub(crate) fn execute_put(&mut self, target: isize, bang: bool, reg: char) -> EngineAction {
+        let Some((content, _)) = self.registers.get(&reg).cloned() else {
+            self.message = if reg == '"' {
+                "Register is empty".to_string()
+            } else {
+                format!("Register '{reg}' is empty")
+            };
+            return EngineAction::None;
+        };
+        let text = if content.ends_with('\n') {
+            content
+        } else {
+            format!("{content}\n")
+        };
+        let n_lines = text.matches('\n').count().max(1);
+        let num_lines = self.buffer().len_lines();
+        let last_line = num_lines.saturating_sub(1);
+
+        self.start_undo_group();
+        let first_new_line = if bang {
+            // `:put!` — insert *before* `target` (clamped to the top line).
+            let base = target.max(0) as usize;
+            let insert_pos = self.buffer().line_to_char(base.min(last_line));
+            self.insert_with_undo(insert_pos, &text);
+            base
+        } else {
+            // `:put` — insert *after* `target`; `-1` means "before line 1".
+            let base = (target + 1).max(0) as usize;
+            if base < num_lines {
+                let insert_pos = self.buffer().line_to_char(base);
+                self.insert_with_undo(insert_pos, &text);
+            } else {
+                // Appending past the true end of the buffer: if the last
+                // char isn't a newline, insert one first so the put text
+                // lands on its own line(s) instead of extending the last one.
+                let end = self.buffer().len_chars();
+                if end > 0 && self.buffer().content.char(end - 1) != '\n' {
+                    self.insert_with_undo(end, "\n");
+                    self.insert_with_undo(end + 1, &text);
+                } else {
+                    self.insert_with_undo(end, &text);
+                }
+            }
+            base
+        };
+        self.finish_undo_group();
+        let new_last = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = (first_new_line + n_lines - 1).min(new_last);
+        self.view_mut().cursor.col = 0;
+        EngineAction::None
+    }
+
+    /// Set mark `ch` to `cursor` — shared by the plain `:mark {a-zA-Z}` /
+    /// `:k{a-zA-Z}` form (mark at the cursor, full column) and the ranged
+    /// form (`:{addr}mark {a-zA-Z}` / `:{addr}k{a-zA-Z}`, mark at `{addr}`
+    /// column 0).
+    pub(crate) fn set_ex_mark(&mut self, ch: char, cursor: Cursor) -> EngineAction {
+        let line = cursor.line.min(self.buffer().len_lines().saturating_sub(1));
+        let cursor = Cursor { line, ..cursor };
+        if ch.is_ascii_lowercase() {
+            let buf_id = self.active_buffer_id();
+            self.marks.entry(buf_id).or_default().insert(ch, cursor);
+        } else {
+            let path = self.file_path().map(|p| p.to_path_buf());
+            self.global_marks
+                .insert(ch, (path, cursor.line, cursor.col));
+        }
+        self.message = format!("Mark '{ch}' set");
+        EngineAction::None
+    }
+
     /// `:[range]m[ove] {addr}` — move lines to after `{addr}`.
     pub(crate) fn execute_move_command(&mut self, dest: &str) -> EngineAction {
         let cur = self.view().cursor.line;
@@ -4146,6 +4148,46 @@ impl Engine {
             return Some(EngineAction::None);
         }
 
+        // `:[range]pu[t][!] [x]` — put register `x` after `[range]`'s last
+        // address (or before it, with `!`). Default address is the cursor
+        // line; address `0` (`-1` in our 0-based/-1 addressing) means "before
+        // the first line", which is what makes `:0put` legal (`:h :put`).
+        if is("put", 2) {
+            let reg = if args.is_empty() {
+                '"'
+            } else {
+                let (r, count) = parse_reg_and_count(args)?;
+                if count.is_some() {
+                    return None;
+                }
+                r.unwrap_or('"')
+            };
+            let target = range
+                .map(|(_, end)| end)
+                .unwrap_or(self.view().cursor.line as isize);
+            return Some(self.execute_put(target, bang, reg));
+        }
+
+        // `:[range]ma[rk] {a-zA-Z}` and `:[range]k{a-zA-Z}` (the `k` spelling
+        // takes its mark letter directly, with no space) — set mark `x` on
+        // `[range]`'s last address rather than the cursor line.
+        let mark_arg = if is("mark", 2) && args.chars().count() == 1 {
+            args.chars().next()
+        } else if rest.len() == 2 && rest.starts_with('k') {
+            rest.chars().nth(1)
+        } else {
+            None
+        };
+        if let Some(ch) = mark_arg {
+            if ch.is_ascii_alphabetic() {
+                let target = range
+                    .map(|(_, end)| end)
+                    .unwrap_or(self.view().cursor.line as isize);
+                let line = target.max(0) as usize;
+                return Some(self.set_ex_mark(ch, Cursor { line, col: 0 }));
+            }
+        }
+
         // `:t`, `:co[py]` and `:m[ove]` take a destination address.
         let dest_kind = if name == "t" || is("copy", 2) {
             Some(false)
@@ -4351,7 +4393,7 @@ pub(crate) fn is_ranged_ex_name(cmd: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    ["delete", "yank", "join", "copy", "move"]
+    ["delete", "yank", "join", "copy", "move", "put"]
         .iter()
         .any(|full| full.starts_with(name))
         || name == "t"
