@@ -173,8 +173,20 @@ win = ["quadraui/win"]
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "dbb3023a904deaef3f0d01eeb99682c17674b684", features = ["tui", "terminal"] }
-gtk4 = { version = "0.7", features = ["v4_10"], optional = true }
-pangocairo = { version = "0.18", optional = true }
+# #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
+# gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
+# `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
+# dependency graph — and that check is feature-independent (the lockfile
+# resolves optional deps too), so a mismatch fails `cargo check
+# --no-default-features` *before compiling anything*, not just the `gui`
+# lane.  quadraui moved to gtk4 0.11 / pangocairo 0.22 in quadraui#796;
+# vimcode has to move in lockstep or no lane resolves at all.  When the
+# quadraui pin above moves across another gtk4-rs bump, these three lines
+# move with it — and `gio` must stay in the same gtk-rs release family
+# (gtk4 0.11 ↔ glib/gio 0.22), because pairing it with an older major
+# resolves two incompatible `glib` majors side by side.
+gtk4 = { version = "0.11", features = ["v4_10"], optional = true }
+pangocairo = { version = "0.22", optional = true }
 ropey = "1.6.1"
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
@@ -199,7 +211,8 @@ tree-sitter-language = "0.1"
 # tree-sitter-latex: vendored from latex-lsp/tree-sitter-latex v0.3.0 (language version 14)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-gio = { version = "0.17", optional = true }
+# Same gtk-rs release family as `gtk4`/`pangocairo` above — see #896.
+gio = { version = "0.22", optional = true }
 ratatui = "0.30"
 ignore = "0.4"
 regex = "1"

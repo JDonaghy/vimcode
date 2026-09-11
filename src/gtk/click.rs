@@ -84,9 +84,9 @@ pub(crate) fn build_editor_click_context(paint_char_width: f64) -> Option<pango:
         size = (size * paint_char_width / w0).clamp(1.0, 400.0);
     }
 
-    ctx.set_font_description(Some(&pango::FontDescription::from_string(&format!(
+    ctx.set_font_description(&pango::FontDescription::from_string(&format!(
         "{family} {size}"
-    ))));
+    )));
     Some(ctx)
 }
 
@@ -123,7 +123,7 @@ mod emoji_click_column_tests {
         let surface = ImageSurface::create(Format::ARgb32, 900, 60).expect("create ImageSurface");
         let cr = Context::new(&surface).expect("Context::new");
         let ctx = pangocairo::create_context(&cr);
-        ctx.set_font_description(Some(&pango::FontDescription::from_string("Monospace 12")));
+        ctx.set_font_description(&pango::FontDescription::from_string("Monospace 12"));
         pango::Layout::new(&ctx)
     }
 
@@ -262,7 +262,7 @@ mod emoji_click_column_tests {
         let cr = Context::new(&surface).expect("Context::new");
         let pango_ctx = pangocairo::create_context(&cr);
         let font_desc = pango::FontDescription::from_string("Monospace 12");
-        pango_ctx.set_font_description(Some(&font_desc));
+        pango_ctx.set_font_description(&font_desc);
         let layout = pango::Layout::new(&pango_ctx);
         layout.set_font_description(Some(&font_desc));
         let metrics = pango_ctx.metrics(Some(&font_desc), None);
@@ -295,7 +295,7 @@ mod emoji_click_column_tests {
                 ImageSurface::create(Format::ARgb32, 1, 1).expect("click ImageSurface");
             let click_cr = Context::new(&click_surface).expect("click Context");
             let click_ctx = pangocairo::create_context(&click_cr);
-            click_ctx.set_font_description(Some(&font_desc));
+            click_ctx.set_font_description(&font_desc);
             backend.borrow_mut().set_pango_context(click_ctx);
         }
 
@@ -391,7 +391,7 @@ mod emoji_click_column_tests {
         let pcr = Context::new(&paint_surface).expect("paint Context");
         let pctx = pangocairo::create_context(&pcr);
         let paint_font = pango::FontDescription::from_string("Monospace 11");
-        pctx.set_font_description(Some(&paint_font));
+        pctx.set_font_description(&paint_font);
         let probe = pango::Layout::new(&pctx);
         probe.set_font_description(Some(&paint_font));
         probe.set_text("0");
@@ -447,7 +447,7 @@ mod emoji_click_column_tests {
         let bad_surface = ImageSurface::create(Format::ARgb32, 1, 1).expect("bad ImageSurface");
         let bad_cr = Context::new(&bad_surface).expect("bad Context");
         let bad_ctx = pangocairo::create_context(&bad_cr);
-        bad_ctx.set_font_description(Some(&pango::FontDescription::from_string("Monospace 14")));
+        bad_ctx.set_font_description(&pango::FontDescription::from_string("Monospace 14"));
         let bad_layout = pango::Layout::new(&bad_ctx);
 
         let mut bad_drift_seen = false;

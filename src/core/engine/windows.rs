@@ -676,11 +676,6 @@ impl Engine {
 
     /// Open the system file manager at the given path's parent directory.
     pub fn reveal_in_file_manager(&self, path: &Path) {
-        let dir = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("open")
@@ -690,8 +685,18 @@ impl Engine {
                 .stderr(std::process::Stdio::null())
                 .spawn();
         }
+        // `dir` is only consulted by the xdg-open leg — macOS's `open -R`
+        // takes the file itself and reveals it in its parent.  Binding it
+        // outside this block made it an unused variable on macOS, i.e. a
+        // `-D warnings` failure that only ever fired on the platform #896
+        // is about (Linux CI uses it, so CI stayed green).
         #[cfg(not(target_os = "macos"))]
         {
+            let dir = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
             let _ = std::process::Command::new("xdg-open")
                 .arg(dir)
                 .stdout(std::process::Stdio::null())
