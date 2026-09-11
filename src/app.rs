@@ -1402,13 +1402,40 @@ impl App {
     /// document on `driver_with_shell`).
     #[cfg(all(feature = "gui", any(test, feature = "test-support")))]
     pub(super) fn new_headless(engine: Rc<RefCell<Engine>>) -> Self {
+        Self::new_headless_with_backend(
+            engine,
+            Rc::new(RefCell::new(Box::new(backend::GtkBackend::new()))),
+        )
+    }
+
+    /// Backend-parameterised core of [`App::new_headless`] — the same seam
+    /// [`App::new_portable`] is to [`App::new`], for the *test* constructors
+    /// (#896).
+    ///
+    /// `new_headless` hardcoded `GtkBackend`, which made it unusable from the
+    /// macOS driver-tier test that `src/macos/mod.rs`'s "Verifying this file
+    /// without a Mac" note defers to #859 stage 3: that test has to hand the
+    /// same `App` a `MacBackend` instead, because the whole point is to paint
+    /// through quadraui's macOS rasterisers. Taking the backend as a
+    /// parameter keeps **one** headless constructor rather than a second copy
+    /// per backend — the `TextMetricsBackend` trait object is already the
+    /// only place either backend's concrete type appears.
+    ///
+    /// Ungated on `gui` deliberately: every caller is a test lane, and the
+    /// macOS lane (`--no-default-features --features macos`) compiles no GTK
+    /// at all.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new_headless_with_backend(
+        engine: Rc<RefCell<Engine>>,
+        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    ) -> Self {
         let (use_nerd_fonts, last_colorscheme) = {
             let e = engine.borrow();
             (e.settings.use_nerd_fonts, e.settings.colorscheme.clone())
         };
-        icons::set_nerd_fonts(use_nerd_fonts);
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
-            Rc::new(RefCell::new(Box::new(backend::GtkBackend::new())));
+        // Path-qualified rather than via the `use` at the top of this file —
+        // that import is `gui`-gated and this constructor is not (#896).
+        crate::icons::set_nerd_fonts(use_nerd_fonts);
         Self::assemble(
             engine,
             DeferredQueue::new(),
