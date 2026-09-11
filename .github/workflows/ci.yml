@@ -8,6 +8,12 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # #865: the Neovim that tests/nvim_conformance.rs uses as its oracle. Must be
+  # >= `MIN_NVIM_VERSION` in that file (0.12), and should match the fleet
+  # standard installed on every agent host so CI and the fleet judge Vim
+  # behaviour with the same binary. `ubuntu-24.04`'s apt ships 0.9.5, which is
+  # below the floor, so both jobs install this pinned upstream tarball instead.
+  NVIM_ORACLE_VERSION: v0.12.5
 
 jobs:
   test:
@@ -24,15 +30,23 @@ jobs:
     # dep pinned out-of-band via `quadraui-pin.txt`; see git history / #638 /
     # #625 for why that existed and why it was retired.)
 
-    # #795: tests/nvim_conformance.rs is the only test that validates VimCode
-    # against real Vim behaviour. It's a default integration test compiled in
-    # this (`--no-default-features`) lane too, and it hard-fails under CI (the
-    # `CI` env var GitHub Actions always sets) if nvim is missing rather than
-    # silently skipping — so this install step is load-bearing, not optional.
-    - name: Install Neovim (oracle for tests/nvim_conformance.rs)
+    # #795/#865: tests/nvim_conformance.rs is the only test that validates
+    # VimCode against real Vim behaviour. It's a default integration test
+    # compiled in this (`--no-default-features`) lane too, and since #865 it
+    # hard-fails on EVERY lane if nvim is missing or older than its declared
+    # `MIN_NVIM_VERSION` — so this install step is load-bearing, not optional.
+    # Do not swap it back to `apt-get install neovim`: ubuntu-24.04 apt ships
+    # 0.9.5, which is below the floor and would fail the job.
+    - name: Install Neovim ${{ env.NVIM_ORACLE_VERSION }} (oracle for tests/nvim_conformance.rs)
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends neovim
+        set -euo pipefail
+        curl -fsSL -o /tmp/nvim.tar.gz \
+          "https://github.com/neovim/neovim/releases/download/${NVIM_ORACLE_VERSION}/nvim-linux-x86_64.tar.gz"
+        sudo tar -C /opt -xzf /tmp/nvim.tar.gz
+        echo "/opt/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+    - name: Verify the conformance oracle
+      run: nvim --version | head -1
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -97,11 +111,25 @@ jobs:
         # tests (src/gtk/testing.rs, src/gtk/util.rs) hard-fail rather than
         # exercising real rasterised pixels.
         #
-        # #795: neovim is the oracle for tests/nvim_conformance.rs, a default
-        # integration test this (default-features) lane also compiles and
-        # runs. It hard-fails under CI (the `CI` env var GitHub Actions always
-        # sets) if nvim is missing, so this install is load-bearing.
-        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common neovim
+        sudo apt-get install -y --no-install-recommends libgtk-4-dev librsvg2-common
+
+    # #795/#865: neovim is the oracle for tests/nvim_conformance.rs, a default
+    # integration test this (default-features) lane also compiles and runs. It
+    # hard-fails on every lane if nvim is missing or below its declared
+    # `MIN_NVIM_VERSION`, so this install is load-bearing. It is a pinned
+    # upstream tarball rather than `apt-get install neovim` because
+    # ubuntu-24.04 apt ships 0.9.5, below the floor — and because CI and the
+    # agent fleet must judge Vim behaviour with the same binary.
+    - name: Install Neovim ${{ env.NVIM_ORACLE_VERSION }} (oracle for tests/nvim_conformance.rs)
+      run: |
+        set -euo pipefail
+        curl -fsSL -o /tmp/nvim.tar.gz \
+          "https://github.com/neovim/neovim/releases/download/${NVIM_ORACLE_VERSION}/nvim-linux-x86_64.tar.gz"
+        sudo tar -C /opt -xzf /tmp/nvim.tar.gz
+        echo "/opt/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+    - name: Verify the conformance oracle
+      run: nvim --version | head -1
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable

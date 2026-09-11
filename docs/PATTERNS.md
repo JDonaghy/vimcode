@@ -169,5 +169,23 @@ PROBE_FILTER=<label-substring> cargo test --test nvim_conformance -- --nocapture
 ```
 
 Never regenerate to paper over a regression — the list not growing is the whole
-point. Requires `nvim` on PATH; CI installs it (#795) and hard-fails if it's
-missing, so a skip locally is not a green light.
+point.
+
+**Requires Neovim >= 0.12 on PATH, and failing is the default (#865).** A missing
+or too-old oracle is not a pass — it is 1,436 cases that did not run — so the
+suite hard-fails on *every* lane: CI, a coordinator Test leg, and your laptop
+alike. (The old `CI`-env-var-only guard from #795 missed the fleet entirely: `CI`
+is set by GitHub Actions but not by the coordinator's Test stage.) Skipping is
+still possible but must be deliberate and visible on the command line:
+
+```sh
+NVIM_CONFORMANCE_ALLOW_SKIP=1 cargo test
+```
+
+The floor exists because Neovim's own defaults and headless behaviour move
+between releases, so a `KNOWN_DEVIATIONS` verdict from 0.9.x is not comparable
+with one from 0.12.x. The fleet standard — every agent host and both CI jobs —
+is upstream stable **v0.12.5**; CI installs it from a pinned release tarball
+(`NVIM_ORACLE_VERSION` in `.github/workflows/ci.yml`) because `ubuntu-24.04`'s
+apt ships 0.9.5. Every run prints the resolved `nvim` path and version, and
+shouts if that version is not the one the deviation list was captured against.

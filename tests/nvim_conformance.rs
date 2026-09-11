@@ -58,25 +58,45 @@
 //! | `engine.ensure_cursor_visible()` after placing the start cursor | `nvim_win_set_cursor` scrolls the window; a raw engine cursor write does not (12 spurious scroll failures) |
 //! | pump `macro_playback_queue` after every key | the UI normally pumps it, so the harness must too, or `@a` never executes on the VimCode side |
 //!
-//! ## Requires `nvim` on PATH
+//! ## Requires `nvim` >= 0.12 on PATH — failing is the default (#865)
 //!
-//! Locally, the suite is skipped (not failed) if nvim is missing — that
-//! ergonomics choice is intentional so contributors without Neovim installed
-//! aren't blocked.  **CI is the enforcing lane** (#795): both `.github/workflows/ci.yml`
-//! jobs install `neovim` via apt, and the runner below treats a missing/broken
-//! `nvim` as a hard failure whenever the `CI` env var is set (GitHub Actions sets
-//! it on every job) rather than silently skipping.  Before #795, CI never
-//! installed nvim, so this suite's "SKIP" was reported as `ok` on every PR — a
-//! regression in `d}`, `ciw`, `da"`, etc. would have sailed through with a green
-//! check.  Do not remove the CI install step or loosen the `CI` guard below.
+//! A missing oracle is **not** a pass: it is 1,436 cases that did not run.  The
+//! runner therefore *fails* on every lane — CI, a coordinator Test leg, a
+//! developer laptop — when `nvim` is absent, unparseable, or older than
+//! [`MIN_NVIM_VERSION`].  Skipping is still possible, but must be deliberate and
+//! visible on the command line:
 //!
-//! ## Oracle version skew (#868)
+//! ```sh
+//! NVIM_CONFORMANCE_ALLOW_SKIP=1 cargo test
+//! ```
+//!
+//! This replaced a `CI`-env-var-only guard (#795).  That guard was right about
+//! the danger and wrong about the lane: `CI` is set by GitHub Actions but **not**
+//! by the coordinator's Test stage, so on a fleet Test leg a host with no `nvim`
+//! on its service-unit PATH was indistinguishable from 1,436 passing cases —
+//! measured across three agent hosts, one of which could not see its own
+//! Homebrew `nvim` at all.  Before #795, CI never installed nvim, so this suite's
+//! "SKIP" was reported as `ok` on every PR — a regression in `d}`, `ciw`, `da"`,
+//! etc. would have sailed through with a green check.  Do not reintroduce an
+//! implicit skip, and do not remove the CI install steps
+//! (`.github/workflows/ci.yml`, both jobs).
+//!
+//! The version floor exists for the same reason the `cs(..)` Lua `setup` hook
+//! does: Neovim's own option defaults and headless behaviour move between
+//! releases, so a verdict from 0.9.x is not comparable with one from 0.12.x.  The
+//! fleet standard — every agent host and both CI jobs — is upstream stable
+//! **v0.12.5**, which CI installs from a pinned release tarball rather than apt
+//! (`ubuntu-24.04` apt ships 0.9.5, below the floor).  Every run prints the
+//! resolved binary path and its version, so "which nvim produced this verdict" is
+//! answerable from a log.
+//!
+//! ## Oracle version skew (#868, #865)
 //!
 //! `KNOWN_DEVIATIONS` was captured against the Neovim that `ubuntu-24.04`'s apt
-//! ships (0.9.x), which is what CI runs — see [`DEVIATIONS_ORACLE`].  A markedly
-//! different local Neovim can legitimately disagree on a handful of labels; that
-//! is a local-tooling skew, not a regression, and is **not** a reason to edit the
-//! list.
+//! ships (0.9.x) — see [`DEVIATIONS_ORACLE`], which sits next to the list itself
+//! precisely because the two are one fact.  A markedly different Neovim can
+//! legitimately disagree on a handful of labels; that is oracle-version skew,
+//! not a regression, and is **not** a reason to edit the list.
 //!
 //! That policy used to be advice the runner then contradicted: the "a listed
 //! label now passes" direction panicked unconditionally, so a dev on a newer
@@ -93,12 +113,21 @@
 //!     50%            30 (== cursor)              9                  9
 //! ```
 //!
-//! So the runner now applies the documented policy itself: the *fixed* direction
-//! is enforcing under `CI`, or when the local Neovim's major.minor matches
-//! [`DEVIATIONS_ORACLE`], and is otherwise downgraded to a printed advisory (see
-//! [`fixes_are_enforced`]).  The **regression** direction and the stale-entry
-//! check stay fatal everywhere — they are the ones that catch real bugs, and a
-//! genuinely stale entry is still caught by CI on the very next push.
+//! So the runner applies the documented policy itself: the *fixed* direction is
+//! enforcing when the running Neovim's major.minor matches [`DEVIATIONS_ORACLE`]
+//! (or cannot be determined at all — failing closed), and is otherwise
+//! downgraded to a printed advisory (see [`fixes_are_enforced`]).  The
+//! **regression** direction and the stale-entry check stay fatal everywhere —
+//! they are the ones that catch real bugs.
+//!
+//! #865 raised the floor to 0.12 and moved CI onto the pinned fleet oracle, so
+//! *no* lane currently runs [`DEVIATIONS_ORACLE`] and the fixed direction is
+//! advisory everywhere.  That is a deliberate, temporary state: #865 was
+//! explicitly forbidden from regenerating the list, and every run now prints a
+//! loud `ORACLE VERSION SKEW` banner naming both versions so the gap cannot be
+//! forgotten.  Closing it means regenerating `KNOWN_DEVIATIONS` against 0.12.5
+//! and bumping [`DEVIATIONS_ORACLE`] in the same commit — at which point the
+//! fixed direction becomes enforcing again on CI and on every standard host.
 
 mod common;
 
@@ -3849,6 +3878,33 @@ const KNOWN_DEVIATIONS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Oracle version (#865) — deliberately adjacent to KNOWN_DEVIATIONS above,
+// because a deviation list is only meaningful against the oracle that produced
+// it. If you regenerate the list, move `DEVIATIONS_ORACLE` in the same commit.
+// ---------------------------------------------------------------------------
+
+/// The `(major, minor)` Neovim that [`KNOWN_DEVIATIONS`] was last regenerated
+/// against — `ubuntu-24.04` apt's 0.9.x, which is what CI ran until #865 moved
+/// it to the pinned fleet oracle. See the "Oracle version skew" section of the
+/// module docs: a run against anything else prints a loud banner, and the
+/// "a listed label now passes" direction of the gate is downgraded to an
+/// advisory (see [`fixes_are_enforced`]).
+const DEVIATIONS_ORACLE: (u32, u32) = (0, 9);
+
+/// The minimum `(major, minor)` Neovim this suite will accept as an oracle
+/// (#865). The fleet standard — every agent host, and both CI jobs — is
+/// Homebrew's / upstream's current stable `v0.12.5`; `0.12` is the floor that
+/// pins. A host below it fails loudly rather than quietly producing verdicts
+/// from a different Vim.
+const MIN_NVIM_VERSION: (u32, u32) = (0, 12);
+
+/// Opt out of the whole suite on a machine that cannot supply a usable oracle
+/// (#865). Deliberately an explicit, greppable env var rather than an implicit
+/// "`CI` is unset" skip: skipping must be a visible act on the command line,
+/// not the default a coordinator Test leg silently inherits.
+const ALLOW_SKIP_VAR: &str = "NVIM_CONFORMANCE_ALLOW_SKIP";
+
+// ---------------------------------------------------------------------------
 // Test runner
 // ---------------------------------------------------------------------------
 
@@ -3962,11 +4018,6 @@ fn classify<'a>(
     verdict
 }
 
-/// The `(major, minor)` Neovim that [`KNOWN_DEVIATIONS`] was captured against —
-/// what `ubuntu-24.04`'s apt ships, and therefore what both CI jobs run. See the
-/// "Oracle version skew" section of the module docs.
-const DEVIATIONS_ORACLE: (u32, u32) = (0, 9);
-
 /// Parse `(major, minor)` out of `nvim --version`'s first line, which looks like
 /// `NVIM v0.12.5` (or `NVIM v0.9.5` / `NVIM v0.11.0-dev+1234-gabcdef`).
 /// `None` when the line isn't in that shape — an unknown version is treated as
@@ -3984,16 +4035,25 @@ fn parse_nvim_version(version_output: &str) -> Option<(u32, u32)> {
 
 /// Is the "a listed label now PASSES" direction of the gate enforcing?
 ///
-/// Yes under `CI` (always — CI is the lane that owns the list), and yes when the
-/// local Neovim is the one the list was captured against, or when its version
-/// could not be determined. Otherwise the local oracle legitimately disagrees on
-/// some labels (#868) and deleting them would hand CI a pile of false
-/// regressions, so the direction is downgraded to a printed advisory.
+/// Yes when the running Neovim is the one [`KNOWN_DEVIATIONS`] was captured
+/// against, or when its version could not be determined (failing closed, so a
+/// `nvim --version` format change cannot silently disable the gate). Otherwise
+/// the oracle legitimately disagrees on some labels (#868) and deleting them
+/// would hand the capture oracle the same count back as false regressions, so
+/// the direction is downgraded to a printed advisory.
+///
+/// #865 removed the former `in_ci ||` short-circuit: it was correct only while
+/// CI *was* the capture oracle. CI now runs the pinned fleet oracle (v0.12.5)
+/// and the list is still 0.9-captured, so a `CI` special case would fail every
+/// CI run on ~37 version-skew "fixes". The enforcing lane is "whichever lane
+/// runs [`DEVIATIONS_ORACLE`]", and regenerating the list against 0.12 is
+/// tracked separately — until then the skew banner keeps the gap visible on
+/// every single run.
 ///
 /// Note this only ever relaxes the *fixed* direction. Regressions and stale
-/// entries stay fatal on every machine.
-fn fixes_are_enforced(in_ci: bool, nvim: Option<(u32, u32)>) -> bool {
-    in_ci || nvim.is_none_or(|v| v == DEVIATIONS_ORACLE)
+/// entries stay fatal on every machine, CI included.
+fn fixes_are_enforced(nvim: Option<(u32, u32)>) -> bool {
+    nvim.is_none_or(|v| v == DEVIATIONS_ORACLE)
 }
 
 fn bullet_list(labels: &[&str]) -> String {
@@ -4004,6 +4064,121 @@ fn bullet_list(labels: &[&str]) -> String {
         .join("\n")
 }
 
+/// First line of `nvim --version` (`NVIM v0.12.5`), trimmed — what the runner
+/// echoes so a log names the exact oracle it used.
+fn version_banner_line(version_output: &str) -> &str {
+    version_output
+        .lines()
+        .next()
+        .unwrap_or("(no output)")
+        .trim()
+}
+
+/// Resolve `nvim` against `PATH` the way the OS would, for *reporting* only —
+/// [`std::process::Command`] does its own lookup, but it will not tell us which
+/// binary it picked, and "which nvim did this verdict come from" is exactly the
+/// question #865 exists to answer. Platform-neutral: no `which`/`where` shell-out.
+fn resolve_on_path(exe: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    // Windows carries the extension; trying both on every platform is harmless
+    // because the miss simply doesn't exist on disk.
+    let candidates = [exe.to_string(), format!("{exe}.exe")];
+    std::env::split_paths(&path).find_map(|dir| {
+        candidates
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|p| p.is_file())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Preflight (#865) — decide what to do about the oracle BEFORE running 1,436
+// cases. Pure, so the decision (and the exact wording of every message) is
+// testable on a machine with no nvim at all; `nvim_conformance` only probes
+// the environment and then does what this says.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, PartialEq, Eq)]
+enum Preflight {
+    /// Oracle is usable. `banner` names the resolved path and version, and
+    /// carries the skew warning when it is not [`DEVIATIONS_ORACLE`].
+    Run { banner: String, version: (u32, u32) },
+    /// Oracle is unusable but [`ALLOW_SKIP_VAR`] was set — skip deliberately.
+    Skip { reason: String },
+    /// Oracle is unusable and no opt-out was given — fail the run.
+    Refuse { reason: String },
+}
+
+/// `probe` is `None` when `nvim` could not be run at all, otherwise the
+/// resolved path (for the message) and the raw `nvim --version` output.
+fn preflight(probe: Option<(&str, &str)>, allow_skip: bool) -> Preflight {
+    let required = format!("{}.{}", MIN_NVIM_VERSION.0, MIN_NVIM_VERSION.1);
+    let refuse = |reason: String| {
+        if allow_skip {
+            Preflight::Skip { reason }
+        } else {
+            Preflight::Refuse { reason }
+        }
+    };
+
+    let Some((path, version_output)) = probe else {
+        return refuse(format!(
+            "nvim not found on PATH (or `nvim --version` failed).\n\n\
+             tests/nvim_conformance.rs is this repo's only oracle-backed \
+             Vim-behaviour suite — a missing `nvim` is NOT a pass, it is 1,436 \
+             cases that did not run. Install Neovim >= {required} (the fleet \
+             standard is v0.12.5) and make sure the `nvim` binary is on the PATH \
+             this process inherits.\n\n\
+             To skip this suite deliberately instead, set {ALLOW_SKIP_VAR}=1."
+        ));
+    };
+
+    let banner_line = version_banner_line(version_output);
+    let Some(version) = parse_nvim_version(version_output) else {
+        return refuse(format!(
+            "could not parse a version out of `nvim --version` for the oracle at \
+             {path}.\n  first line: {banner_line:?}\n  required:   >= {required}\n\n\
+             Refusing to run the conformance corpus against an oracle of unknown \
+             vintage — KNOWN_DEVIATIONS is only meaningful against a known \
+             version. Set {ALLOW_SKIP_VAR}=1 to skip this suite instead."
+        ));
+    };
+
+    if version < MIN_NVIM_VERSION {
+        return refuse(format!(
+            "oracle Neovim is too old.\n  path:     {path}\n  found:    {banner_line} \
+             (parsed {}.{}.x)\n  required: >= {required}\n\n\
+             Neovim's own option defaults and headless behaviour move between \
+             versions, so a verdict from {}.{}.x is not comparable with the fleet's \
+             (v0.12.5) — see the \"Oracle version skew\" section of the module docs. \
+             Upgrade, or set {ALLOW_SKIP_VAR}=1 to skip this suite.",
+            version.0, version.1, version.0, version.1
+        ));
+    }
+
+    let mut banner = format!(
+        "\nnvim conformance oracle: {path}\n  version: {banner_line}\n  \
+         KNOWN_DEVIATIONS captured against: {}.{}.x\n",
+        DEVIATIONS_ORACLE.0, DEVIATIONS_ORACLE.1
+    );
+    if version != DEVIATIONS_ORACLE {
+        banner.push_str(&format!(
+            "\n\
+             !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\
+             !! ORACLE VERSION SKEW: running {}.{}.x, but KNOWN_DEVIATIONS was\n\
+             !! last regenerated against {}.{}.x. Verdicts that move are far more\n\
+             !! likely to be the oracle having changed than vimcode. The \"a listed\n\
+             !! label now passes\" direction is therefore ADVISORY on this run —\n\
+             !! do NOT delete entries to make it green. Regenerate the list and\n\
+             !! bump DEVIATIONS_ORACLE in one deliberate commit instead.\n\
+             !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n",
+            version.0, version.1, DEVIATIONS_ORACLE.0, DEVIATIONS_ORACLE.1
+        ));
+    }
+
+    Preflight::Run { banner, version }
+}
+
 #[test]
 fn nvim_conformance() {
     let version_output = std::process::Command::new("nvim")
@@ -4012,19 +4187,31 @@ fn nvim_conformance() {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-    let nvim_ok = version_output.is_some();
-    let nvim_version = version_output.as_deref().and_then(parse_nvim_version);
-    let in_ci = std::env::var_os("CI").is_some();
-    if !nvim_ok {
-        if in_ci {
-            panic!(
-                "nvim not found on PATH. The conformance oracle must run in CI \
-                 — install Neovim in the workflow rather than letting this skip."
-            );
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    // #865: a missing/too-old oracle must never read as 1,436 passing cases.
+    // Failing is the default on every lane — CI, a coordinator Test leg and a
+    // developer laptop alike; skipping requires the explicit opt-out.
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
         }
-        eprintln!("SKIP: nvim not found on PATH");
-        return;
-    }
+        Preflight::Run { banner, version } => {
+            println!("{banner}");
+            Some(version)
+        }
+    };
+    let in_ci = std::env::var_os("CI").is_some();
 
     // Labels are the identity used by KNOWN_DEVIATIONS, so they must be unique.
     {
@@ -4190,16 +4377,16 @@ fn nvim_conformance() {
         filter.is_none().then_some(all_labels.as_slice()),
     );
 
-    // #868: off CI, on a Neovim that is not the one the list was captured
-    // against, "this listed label now passes" is ambiguous — it is far more
-    // often the local oracle having improved than vimcode having. Deleting the
-    // entries to satisfy a local run would hand CI the same count back as false
-    // regressions. Report, don't fail. See the module docs.
-    if !verdict.fixed.is_empty() && !fixes_are_enforced(in_ci, nvim_version) {
+    // #868: on a Neovim that is not the one the list was captured against,
+    // "this listed label now passes" is ambiguous — it is far more often the
+    // oracle having improved than vimcode having. Deleting the entries to
+    // satisfy such a run would hand the capture oracle the same count back as
+    // false regressions. Report, don't fail. See the module docs.
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
         println!(
-            "\nNOTE: {} KNOWN_DEVIATIONS entr(y/ies) pass against this machine's \
-             Neovim {} but the list was captured against {}.{}.x (what CI runs), \
-             so this is local-tooling skew, not a landed fix — do NOT delete them \
+            "\nNOTE: {} KNOWN_DEVIATIONS entr(y/ies) pass against this run's \
+             Neovim {} but the list was captured against {}.{}.x, \
+             so this is oracle-version skew, not a landed fix — do NOT delete them \
              (see the module docs). Not failing the run:\n{}",
             verdict.fixed.len(),
             nvim_version
@@ -4294,31 +4481,232 @@ fn known_deviation_gate_is_bidirectional() {
     assert!(filtered.is_clean());
 }
 
-/// #868: the oracle-version escape hatch must relax the *fixed* direction only,
-/// and only off CI on a Neovim that is not the one the list was captured
-/// against. Every other combination stays enforcing — in particular CI, which
-/// is the lane that owns `KNOWN_DEVIATIONS`.
+/// #868/#865: the oracle-version escape hatch must relax the *fixed* direction
+/// only, and only on a Neovim that is not the one the list was captured
+/// against. Every other case stays enforcing.
 #[test]
-fn fixed_direction_is_advisory_only_off_ci_on_a_different_nvim() {
-    // The one relaxed combination: off CI, newer Neovim than the capture oracle
-    // (0.12.5 is what surfaced #868 — 37 `scroll:` entries "passed" locally).
-    assert!(!fixes_are_enforced(false, Some((0, 12))));
+fn fixed_direction_is_advisory_only_on_a_different_nvim() {
+    // The relaxed case: a newer Neovim than the capture oracle (0.12.5 is what
+    // surfaced #868 — 37 `scroll:` entries "passed" locally).
+    assert!(!fixes_are_enforced(Some((0, 12))));
     // ...and an *older* one skews just as legitimately.
-    assert!(!fixes_are_enforced(false, Some((0, 8))));
+    assert!(!fixes_are_enforced(Some((0, 8))));
 
-    // CI always enforces, whatever Neovim it happens to be running. If this
-    // ever flips, the list stops shrinking and the gate is decoration.
-    assert!(fixes_are_enforced(true, Some((0, 12))));
-    assert!(fixes_are_enforced(true, Some(DEVIATIONS_ORACLE)));
-    assert!(fixes_are_enforced(true, None));
-
-    // A local dev running exactly CI's Neovim gets CI's verdict, so a genuinely
-    // landed fix is still caught before push.
-    assert!(fixes_are_enforced(false, Some(DEVIATIONS_ORACLE)));
+    // Running exactly the Neovim the list was captured against: enforcing, so a
+    // genuinely landed fix is still forced to delete its entry.
+    assert!(fixes_are_enforced(Some(DEVIATIONS_ORACLE)));
 
     // An unparseable version is treated as "assume it matches" — failing closed,
     // so a `nvim --version` format change cannot silently disable the gate.
-    assert!(fixes_are_enforced(false, None));
+    assert!(fixes_are_enforced(None));
+}
+
+// ---------------------------------------------------------------------------
+// #865 preflight: a missing or too-old oracle must never read as a pass. These
+// assert on the exact text the runner emits (the messages are the product here
+// — an operator reading a CI log is the consumer), not on some internal flag.
+// ---------------------------------------------------------------------------
+
+/// Acceptance #1: nvim absent, no opt-out → FAIL, and the message names both the
+/// missing binary and the opt-out variable so the reader knows the way out.
+#[test]
+fn missing_nvim_fails_by_default_and_names_the_binary_and_the_opt_out() {
+    let Preflight::Refuse { reason } = preflight(None, false) else {
+        panic!(
+            "a missing nvim with no opt-out must REFUSE, not skip: {:?}",
+            preflight(None, false)
+        );
+    };
+    assert!(reason.contains("nvim"), "must name the binary: {reason}");
+    assert!(
+        reason.contains(ALLOW_SKIP_VAR),
+        "must name the opt-out variable: {reason}"
+    );
+    // The floor is part of "what would make this work".
+    assert!(
+        reason.contains(&format!("{}.{}", MIN_NVIM_VERSION.0, MIN_NVIM_VERSION.1)),
+        "must name the required version: {reason}"
+    );
+}
+
+/// Acceptance #2: with the opt-out set, a missing nvim skips as it used to.
+#[test]
+fn missing_nvim_skips_when_the_opt_out_is_set() {
+    let Preflight::Skip { reason } = preflight(None, true) else {
+        panic!("{ALLOW_SKIP_VAR}=1 with no nvim must SKIP");
+    };
+    assert!(reason.contains(ALLOW_SKIP_VAR));
+}
+
+/// Acceptance #3: an nvim below the floor fails naming path, found and required.
+#[test]
+fn nvim_below_the_declared_minimum_fails_naming_path_found_and_required() {
+    let old = "NVIM v0.9.5\nBuild type: Release\nLuaJIT 2.1.0\n";
+    let Preflight::Refuse { reason } = preflight(Some(("/usr/bin/nvim", old)), false) else {
+        panic!("an oracle below {MIN_NVIM_VERSION:?} must REFUSE");
+    };
+    assert!(reason.contains("/usr/bin/nvim"), "resolved path: {reason}");
+    assert!(reason.contains("NVIM v0.9.5"), "found version: {reason}");
+    assert!(
+        reason.contains(&format!(">= {}.{}", MIN_NVIM_VERSION.0, MIN_NVIM_VERSION.1)),
+        "required version: {reason}"
+    );
+
+    // Exactly at the floor is fine — the check is `<`, not `<=`.
+    let floor = format!("NVIM v{}.{}.0\n", MIN_NVIM_VERSION.0, MIN_NVIM_VERSION.1);
+    assert!(matches!(
+        preflight(Some(("/usr/bin/nvim", &floor)), false),
+        Preflight::Run { .. }
+    ));
+
+    // And the opt-out covers this case too, for a host that genuinely can't
+    // upgrade — but only when it is asked for explicitly.
+    assert!(matches!(
+        preflight(Some(("/usr/bin/nvim", old)), true),
+        Preflight::Skip { .. }
+    ));
+}
+
+/// An oracle whose version can't be parsed is of unknown vintage, so it is
+/// refused rather than trusted — otherwise renaming the banner would silently
+/// re-open the hole #865 closed.
+#[test]
+fn unparseable_nvim_version_is_refused_not_trusted() {
+    let Preflight::Refuse { reason } = preflight(Some(("/opt/nvim", "NVIM vX.Y.Z\n")), false)
+    else {
+        panic!("an unparseable oracle version must REFUSE");
+    };
+    assert!(reason.contains("/opt/nvim"));
+    assert!(reason.contains("NVIM vX.Y.Z"));
+    assert!(reason.contains(ALLOW_SKIP_VAR));
+}
+
+/// Acceptance #4: a normal run names the binary it used and its version, and a
+/// version other than the capture oracle is loudly (but non-fatally) flagged.
+#[test]
+fn a_usable_oracle_runs_and_the_banner_names_path_version_and_skew() {
+    let fleet = "NVIM v0.12.5\nBuild type: Release\n";
+    let Preflight::Run { banner, version } =
+        preflight(Some(("/home/x/.local/bin/nvim", fleet)), false)
+    else {
+        panic!("the fleet-standard oracle must be runnable");
+    };
+    assert_eq!(version, (0, 12));
+    assert!(banner.contains("/home/x/.local/bin/nvim"), "path: {banner}");
+    assert!(banner.contains("NVIM v0.12.5"), "version: {banner}");
+    // 0.12.5 is not the capture oracle, so the skew banner must be there and
+    // must name both versions.
+    assert!(
+        banner.contains("ORACLE VERSION SKEW"),
+        "skew banner: {banner}"
+    );
+    assert!(
+        banner.contains("0.12.x") && banner.contains("0.9.x"),
+        "{banner}"
+    );
+
+    // Now the capture oracle itself. Note that as of #865 it is *below* the
+    // floor — the list has not been regenerated since the floor was raised, so
+    // no supported host can currently enforce the "fixed" direction of the
+    // gate. That gap is tracked and loudly printed, not papered over; this
+    // branch keeps the assertion honest either way.
+    let capture = format!("NVIM v{}.{}.5\n", DEVIATIONS_ORACLE.0, DEVIATIONS_ORACLE.1);
+    let verdict = preflight(Some(("/usr/bin/nvim", &capture)), false);
+    if DEVIATIONS_ORACLE < MIN_NVIM_VERSION {
+        assert!(
+            matches!(verdict, Preflight::Refuse { .. }),
+            "a capture oracle below MIN_NVIM_VERSION must still be refused: {verdict:?}"
+        );
+    } else {
+        let Preflight::Run { banner, .. } = verdict else {
+            panic!("the capture oracle must be runnable once it meets the floor");
+        };
+        // Running exactly what the list was captured against: named, but no shout.
+        assert!(banner.contains("/usr/bin/nvim"));
+        assert!(!banner.contains("ORACLE VERSION SKEW"), "{banner}");
+    }
+}
+
+/// The same three acceptance cases, end-to-end on the *real* `nvim_conformance`
+/// test rather than on `preflight` alone: re-invoke this very test binary with a
+/// PATH that contains no `nvim` (or a deliberately ancient fake one) and assert
+/// on the exit status and the operator-visible output. A gate that has only ever
+/// been exercised through a helper is not known to be wired up (#553).
+///
+/// `cfg(unix)`: the fake-oracle arm writes a `#!/bin/sh` stub. The `preflight`
+/// tests above carry the same coverage on every platform.
+#[cfg(unix)]
+#[test]
+fn nvim_conformance_end_to_end_refuses_a_missing_or_ancient_oracle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A directory that is the entire PATH of the child process.
+    let dir = std::env::temp_dir().join(format!(
+        "vimcode-nvim-oracle-gate-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp PATH dir");
+
+    let run_child = |allow_skip: bool| -> (bool, String) {
+        let exe = std::env::current_exe().expect("test binary path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["nvim_conformance", "--exact", "--nocapture"])
+            .env("PATH", &dir)
+            .env_remove("PROBE_FILTER")
+            .env_remove("PROBE_VERBOSE")
+            .env_remove("CONFORMANCE_DUMP_DEVIATIONS")
+            .env_remove(ALLOW_SKIP_VAR);
+        if allow_skip {
+            cmd.env(ALLOW_SKIP_VAR, "1");
+        }
+        let out = cmd.output().expect("re-invoke the test binary");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), text)
+    };
+
+    // 1. No nvim anywhere on PATH, no opt-out → the test FAILS (before #865 it
+    //    printed "SKIP" and reported `ok`).
+    let (ok, output) = run_child(false);
+    assert!(
+        !ok,
+        "a missing nvim must fail the suite, not pass it:\n{output}"
+    );
+    assert!(output.contains("nvim not found on PATH"), "{output}");
+    assert!(output.contains(ALLOW_SKIP_VAR), "{output}");
+
+    // 2. Same, with the opt-out set → skips, and the run is green.
+    let (ok, output) = run_child(true);
+    assert!(ok, "{ALLOW_SKIP_VAR}=1 must skip cleanly:\n{output}");
+    assert!(output.contains("SKIP"), "{output}");
+
+    // 3. An nvim that is present but below the floor → FAILS, naming the
+    //    resolved path, the version it found and the one it needs.
+    let fake = dir.join("nvim");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho 'NVIM v0.9.5'\necho 'Build type: Release'\n",
+    )
+    .expect("write fake oracle");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake oracle");
+
+    let (ok, output) = run_child(false);
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(!ok, "an oracle below the floor must fail:\n{output}");
+    assert!(
+        output.contains(&fake.display().to_string()),
+        "must name the resolved path:\n{output}"
+    );
+    assert!(
+        output.contains("NVIM v0.9.5"),
+        "must name what it found:\n{output}"
+    );
+    assert!(
+        output.contains(&format!(">= {}.{}", MIN_NVIM_VERSION.0, MIN_NVIM_VERSION.1)),
+        "must name what it requires:\n{output}"
+    );
 }
 
 #[test]
