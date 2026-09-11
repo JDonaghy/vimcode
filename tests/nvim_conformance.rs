@@ -3667,7 +3667,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "undo:u after visual d",
     "undo:u restores cursor after :g",
     "undo:2u after insert ×3",
-    "undo:u after :t",
     "reg:\": last cmd",
     "mac:\"ay then @a executes text",
     "mac:q register letter uppercase Q",
@@ -3762,38 +3761,7 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     //
     // which is why e.g. `H` right after `30G` is a no-op in the oracle where
     // real Vim jumps to the window's actual top line.
-    "scroll:C-b",
-    "scroll:G C-y",
-    "scroll:H from 30",
-    "scroll:M from 30",
-    "scroll:L from 30",
-    "scroll:3H",
-    "scroll:3L",
-    "scroll:zzH",
-    "scroll:zbH",
-    "scroll:z.H",
-    "scroll:z-H",
-    "scroll:G H",
-    "scroll:G M",
-    "scroll:dH",
-    "scroll:so=5 30G H",
-    "scroll:so=5 30G L",
-    "scroll:25j H",
-    "scroll:25j L",
-    "scroll:G C-y C-y H",
-    "scroll:zb j L",
-    "scroll:C-d then H L",
-    "scroll:C-d then L",
-    "scroll:C-f then H",
-    "scroll:C-f then L",
-    "scroll:C-b after G then H",
-    "scroll:C-b after G then L",
-    "scroll:50% H",
-    "scroll:30G zz H L",
-    "scroll:j at bottom scrolls one",
-    "scroll:G then k ×5 H",
     "scroll:2<C-b>",
-    "scroll:H on short buffer",
     //
     // ── Group B: the 2nd and later scroll command in one burst ──
     //
@@ -3832,10 +3800,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // It explains why an *isolated* `<C-d>` conforms, but it predicts that a
     // pure `<C-d>` chain would conform too, and the table above shows it
     // does not.
-    "scroll:C-d C-d",
-    "scroll:5C-d C-d",
-    "scroll:C-f C-f",
-    "scroll:C-d twice then C-u",
     //
     // `page_up`/`page_down`/`scroll_cursor_center` in
     // `src/core/engine/motions.rs` carry the #805 fixes that *were* real
@@ -3860,7 +3824,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "word:gg indented (sol)",
     "word:G indented (sol)",
     "word:5G then j col (sol)",
-    "word:H then j col",
     "to:das last sentence",
     "to:dis on whitespace between",
     "to:d5aw too many",
