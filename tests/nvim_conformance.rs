@@ -70,10 +70,35 @@
 //! regression in `d}`, `ciw`, `da"`, etc. would have sailed through with a green
 //! check.  Do not remove the CI install step or loosen the `CI` guard below.
 //!
+//! ## Oracle version skew (#868)
+//!
 //! `KNOWN_DEVIATIONS` was captured against the Neovim that `ubuntu-24.04`'s apt
-//! ships (0.9.x), which is what CI runs.  A markedly different local Neovim can
-//! legitimately disagree on a handful of labels; that is a local-tooling skew,
-//! not a regression, and is not a reason to edit the list.
+//! ships (0.9.x), which is what CI runs — see [`DEVIATIONS_ORACLE`].  A markedly
+//! different local Neovim can legitimately disagree on a handful of labels; that
+//! is a local-tooling skew, not a regression, and is **not** a reason to edit the
+//! list.
+//!
+//! That policy used to be advice the runner then contradicted: the "a listed
+//! label now passes" direction panicked unconditionally, so a dev on a newer
+//! Neovim was *forced* to delete entries that CI would immediately re-report as
+//! regressions.  Concretely, on Neovim 0.12 thirty-seven entries "pass" — all
+//! but one of them a `scroll:` label excused by the headless-topline bug
+//! documented in Group A below, which upstream has since fixed.  Measured with
+//! the same 60-line/22-row probe as that comment:
+//!
+//! ```text
+//!     keys    0.9.x headless w0    0.12 headless w0    interactive w0
+//!     22j            23 (== cursor)              2                  2
+//!     G              60 (== cursor)             39                 39
+//!     50%            30 (== cursor)              9                  9
+//! ```
+//!
+//! So the runner now applies the documented policy itself: the *fixed* direction
+//! is enforcing under `CI`, or when the local Neovim's major.minor matches
+//! [`DEVIATIONS_ORACLE`], and is otherwise downgraded to a printed advisory (see
+//! [`fixes_are_enforced`]).  The **regression** direction and the stale-entry
+//! check stay fatal everywhere — they are the ones that catch real bugs, and a
+//! genuinely stale entry is still caught by CI on the very next push.
 
 mod common;
 
@@ -3937,6 +3962,40 @@ fn classify<'a>(
     verdict
 }
 
+/// The `(major, minor)` Neovim that [`KNOWN_DEVIATIONS`] was captured against —
+/// what `ubuntu-24.04`'s apt ships, and therefore what both CI jobs run. See the
+/// "Oracle version skew" section of the module docs.
+const DEVIATIONS_ORACLE: (u32, u32) = (0, 9);
+
+/// Parse `(major, minor)` out of `nvim --version`'s first line, which looks like
+/// `NVIM v0.12.5` (or `NVIM v0.9.5` / `NVIM v0.11.0-dev+1234-gabcdef`).
+/// `None` when the line isn't in that shape — an unknown version is treated as
+/// "assume it matches", so a parse failure can only ever make the gate stricter.
+fn parse_nvim_version(version_output: &str) -> Option<(u32, u32)> {
+    let first = version_output.lines().next()?;
+    let v = first.split_whitespace().nth(1)?.strip_prefix('v')?;
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor_field = parts.next()?;
+    // `0.11.0-dev+123` → the dash belongs to the patch field, but be tolerant.
+    let minor = minor_field.split(['-', '+']).next()?.parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
+/// Is the "a listed label now PASSES" direction of the gate enforcing?
+///
+/// Yes under `CI` (always — CI is the lane that owns the list), and yes when the
+/// local Neovim is the one the list was captured against, or when its version
+/// could not be determined. Otherwise the local oracle legitimately disagrees on
+/// some labels (#868) and deleting them would hand CI a pile of false
+/// regressions, so the direction is downgraded to a printed advisory.
+///
+/// Note this only ever relaxes the *fixed* direction. Regressions and stale
+/// entries stay fatal on every machine.
+fn fixes_are_enforced(in_ci: bool, nvim: Option<(u32, u32)>) -> bool {
+    in_ci || nvim.is_none_or(|v| v == DEVIATIONS_ORACLE)
+}
+
 fn bullet_list(labels: &[&str]) -> String {
     labels
         .iter()
@@ -3947,11 +4006,14 @@ fn bullet_list(labels: &[&str]) -> String {
 
 #[test]
 fn nvim_conformance() {
-    let nvim_ok = std::process::Command::new("nvim")
+    let version_output = std::process::Command::new("nvim")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let nvim_ok = version_output.is_some();
+    let nvim_version = version_output.as_deref().and_then(parse_nvim_version);
     let in_ci = std::env::var_os("CI").is_some();
     if !nvim_ok {
         if in_ci {
@@ -4122,11 +4184,34 @@ fn nvim_conformance() {
         .flat_map(|(_, g)| g.iter())
         .map(|c| c.label)
         .collect();
-    let verdict = classify(
+    let mut verdict = classify(
         &outcomes,
         KNOWN_DEVIATIONS,
         filter.is_none().then_some(all_labels.as_slice()),
     );
+
+    // #868: off CI, on a Neovim that is not the one the list was captured
+    // against, "this listed label now passes" is ambiguous — it is far more
+    // often the local oracle having improved than vimcode having. Deleting the
+    // entries to satisfy a local run would hand CI the same count back as false
+    // regressions. Report, don't fail. See the module docs.
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(in_ci, nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS entr(y/ies) pass against this machine's \
+             Neovim {} but the list was captured against {}.{}.x (what CI runs), \
+             so this is local-tooling skew, not a landed fix — do NOT delete them \
+             (see the module docs). Not failing the run:\n{}",
+            verdict.fixed.len(),
+            nvim_version
+                .map(|(a, b)| format!("{a}.{b}.x"))
+                .unwrap_or_else(|| "(unknown)".into()),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
     if verdict.is_clean() {
         return;
     }
@@ -4207,4 +4292,56 @@ fn known_deviation_gate_is_bidirectional() {
     let filtered = classify(&[("a:one", true)], &["a:gone"], None);
     assert!(filtered.stale.is_empty());
     assert!(filtered.is_clean());
+}
+
+/// #868: the oracle-version escape hatch must relax the *fixed* direction only,
+/// and only off CI on a Neovim that is not the one the list was captured
+/// against. Every other combination stays enforcing — in particular CI, which
+/// is the lane that owns `KNOWN_DEVIATIONS`.
+#[test]
+fn fixed_direction_is_advisory_only_off_ci_on_a_different_nvim() {
+    // The one relaxed combination: off CI, newer Neovim than the capture oracle
+    // (0.12.5 is what surfaced #868 — 37 `scroll:` entries "passed" locally).
+    assert!(!fixes_are_enforced(false, Some((0, 12))));
+    // ...and an *older* one skews just as legitimately.
+    assert!(!fixes_are_enforced(false, Some((0, 8))));
+
+    // CI always enforces, whatever Neovim it happens to be running. If this
+    // ever flips, the list stops shrinking and the gate is decoration.
+    assert!(fixes_are_enforced(true, Some((0, 12))));
+    assert!(fixes_are_enforced(true, Some(DEVIATIONS_ORACLE)));
+    assert!(fixes_are_enforced(true, None));
+
+    // A local dev running exactly CI's Neovim gets CI's verdict, so a genuinely
+    // landed fix is still caught before push.
+    assert!(fixes_are_enforced(false, Some(DEVIATIONS_ORACLE)));
+
+    // An unparseable version is treated as "assume it matches" — failing closed,
+    // so a `nvim --version` format change cannot silently disable the gate.
+    assert!(fixes_are_enforced(false, None));
+}
+
+#[test]
+fn nvim_version_parses_release_and_dev_banners() {
+    // The two that matter: CI's apt build, and the local build that hit #868.
+    assert_eq!(
+        parse_nvim_version("NVIM v0.9.5\nBuild type: Release\n"),
+        Some((0, 9))
+    );
+    assert_eq!(
+        parse_nvim_version("NVIM v0.12.5\nBuild type: Release\nLuaJIT 2.1\n"),
+        Some((0, 12))
+    );
+    // Nightly/dev banners carry a suffix on the patch field; the minor is still
+    // the thing we key on, and `0.11` must not be mistaken for `0.1`.
+    assert_eq!(
+        parse_nvim_version("NVIM v0.11.0-dev+1234-gabcdef\n"),
+        Some((0, 11))
+    );
+    // Anything not in that shape is "unknown", which `fixes_are_enforced`
+    // deliberately treats as enforcing rather than as a free pass.
+    assert_eq!(parse_nvim_version(""), None);
+    assert_eq!(parse_nvim_version("NVIM\n"), None);
+    assert_eq!(parse_nvim_version("some other tool 1.2.3\n"), None);
+    assert_eq!(parse_nvim_version("NVIM vX.Y.Z\n"), None);
 }
