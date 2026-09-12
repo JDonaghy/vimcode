@@ -3044,13 +3044,19 @@ fn config_dir_helper_returns_vimcode() {
 // via Homebrew) installed successfully and then was never found when
 // vimcode ran as a native `.app` bundle with launchd's minimal PATH.
 //
-// These tests can't touch real `/opt/homebrew` from this Linux box (and
+// These tests can't touch real `/opt/homebrew` from a Linux box (and
 // shouldn't touch it even on a real Mac), so they drive the exact same
-// macOS-only code path through `VIMCODE_TEST_HOMEBREW_PREFIXES` — an
-// override `resolve_command`'s `homebrew_prefixes()` only honours on
-// non-macOS targets, specifically so this behaviour is exercised on every
-// CI host rather than going untested forever because this repo's CI has no
-// macOS runner.
+// resolution path through `VIMCODE_TEST_HOMEBREW_PREFIXES` — an override
+// `resolve_command`'s `homebrew_prefixes()` honours on *every* target,
+// substituting a fake prefix for the real ones. That way this behaviour is
+// exercised on every CI host rather than going untested forever because this
+// repo's CI has no macOS runner.
+//
+// The override was originally `cfg(not(macos))`-gated, which made both tests
+// unconditionally fail when the suite ran on an actual Mac: the fake prefix
+// was ignored and `clangd` resolved to the host's `/usr/bin/clangd`. Keep it
+// ungated — a test that only passes on the OS the feature *isn't* for is not
+// coverage.
 //
 // A `Mutex` serializes the two tests below since both mutate process-global
 // `PATH` / `VIMCODE_TEST_HOMEBREW_PREFIXES` state; an RAII guard restores

@@ -341,13 +341,26 @@ const HOMEBREW_KEG_ONLY_FORMULAS: &[(&str, &str)] = &[("clangd", "llvm")];
 /// both architectures (only one will ever exist on a given machine).
 ///
 /// On non-macOS targets this returns an empty list — Windows/Linux discovery
-/// order is intentionally unchanged by #917 — *unless* the
-/// `VIMCODE_TEST_HOMEBREW_PREFIXES` environment variable is set to a
-/// `PATH`-style (`:`-separated) list of directories. That override exists
-/// solely so `tests/extensions.rs` can drive this macOS-only resolution
-/// logic against a fake Homebrew layout on any host OS; real builds never
-/// set it and macOS builds never read it.
+/// order is intentionally unchanged by #917.
+///
+/// The `VIMCODE_TEST_HOMEBREW_PREFIXES` environment variable overrides the
+/// probed prefixes with a `PATH`-style (`:`-separated) list of directories,
+/// on **every** target including macOS. That override exists solely so
+/// `tests/extensions.rs` can drive this resolution logic against a fake
+/// Homebrew layout without touching (or depending on the contents of) a real
+/// `/opt/homebrew`; real builds never set it.
+///
+/// #918 follow-up: the override used to be `cfg(not(macos))`-gated, which
+/// meant the two `resolve_command_finds_*_homebrew_*` tests silently probed
+/// the host's *real* Homebrew prefixes when the suite ran on a Mac and could
+/// never pass there (the fake prefix was ignored; `clangd` resolved to
+/// `/usr/bin/clangd`). The override is deliberately *exclusive* — when set,
+/// the real prefixes are not probed — so a test can assert on exactly the
+/// layout it created.
 fn homebrew_prefixes() -> Vec<PathBuf> {
+    if let Some(val) = std::env::var_os("VIMCODE_TEST_HOMEBREW_PREFIXES") {
+        return std::env::split_paths(&val).filter(|p| p.is_dir()).collect();
+    }
     #[cfg(target_os = "macos")]
     {
         ["/opt/homebrew", "/usr/local"]
@@ -358,10 +371,7 @@ fn homebrew_prefixes() -> Vec<PathBuf> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        match std::env::var_os("VIMCODE_TEST_HOMEBREW_PREFIXES") {
-            Some(val) => std::env::split_paths(&val).filter(|p| p.is_dir()).collect(),
-            None => Vec::new(),
-        }
+        Vec::new()
     }
 }
 
