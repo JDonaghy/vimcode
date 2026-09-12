@@ -29511,3 +29511,98 @@ fn test_ctrl_o_r_p_does_not_get_bare_p_cursor_shift() {
          (`r` leaves the cursor ON the replaced character, it doesn't advance past it)"
     );
 }
+
+/// #892: `S`'s deleted line content must go into the unnamed register
+/// *linewise* (`:h registers`), same as `cc` (#806) — even though the buffer
+/// edit itself only clears the line's content and leaves the newline in
+/// place. If it were recorded charwise, a subsequent `P` would paste it back
+/// inline instead of as a whole line above the cursor.
+#[test]
+fn test_s_register_is_linewise() {
+    let mut engine = setup_engine("a\nb", 0, 0);
+    send_keys(&mut engine, "SX<Esc>");
+    let (content, ty) = engine
+        .registers
+        .get(&'"')
+        .expect("FAIL: no register content after S");
+    assert_eq!(content, "a\n", "FAIL: S register content mismatch");
+    assert!(
+        ty.is_linewise(),
+        "FAIL: S register must be linewise, was charwise"
+    );
+}
+
+/// #892: `S` then `P` — `S` yanks the substituted line linewise, so `P` must
+/// put it back as a whole line above the cursor, not splice it into the
+/// following line's text.
+#[test]
+fn test_s_then_p_pastes_whole_line() {
+    let mut engine = setup_engine("a\nb", 0, 0);
+    send_keys(&mut engine, "SX<Esc>jP");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "X\na\nb",
+        "FAIL: `S` then `P` must paste the substituted line back as its own line"
+    );
+}
+
+/// #892: `cw` on trailing whitespace at the very end of the buffer (no word
+/// and no further line to land on). The shared `dw`-style `w`-motion clamps
+/// back onto the same last character instead of advancing (nothing to move
+/// to), which used to make `cw` a total no-op here — it must still consume
+/// the trailing whitespace and enter insert mode, matching a plain `dw`'s
+/// deletion but *not* joining any line (there is none to join).
+#[test]
+fn test_cw_on_trailing_space_at_eol() {
+    let mut engine = setup_engine("ab ", 0, 2);
+    send_keys(&mut engine, "cwX<Esc>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "abX",
+        "FAIL: cw on trailing eol whitespace should replace just that whitespace"
+    );
+}
+
+/// #892: `cw` on a completely empty line must not delete anything (there is
+/// nothing to change) and must NOT join the empty line with the next one —
+/// unlike plain `dw`, which does join an empty line with the next (real
+/// Neovim behavior). `cw` just enters insert mode on the still-empty line.
+#[test]
+fn test_cw_on_empty_line_does_not_join_next_line() {
+    let mut engine = setup_engine("\na", 0, 0);
+    send_keys(&mut engine, "cwX<Esc>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "X\na",
+        "FAIL: cw on an empty line must not join it with the next line"
+    );
+}
+
+/// #892: `gp` with a charwise register spanning multiple lines must leave
+/// the cursor just after the pasted text — which, when the last pasted
+/// character is immediately followed by what used to continue the original
+/// line, lands on that line's own trailing newline. A normal-mode cursor can
+/// never rest on/after a newline, so it must clamp back to the last real
+/// column instead (here: the pasted-in "c", not one past it).
+#[test]
+fn test_gp_charwise_multiline_cursor_lands_after_pasted_text() {
+    let mut engine = setup_engine("ab\ncd", 0, 0);
+    // vjy$: visually select "ab\nc" and yank it charwise, then `$` to the
+    // last column of line 0, then `gp` to paste after and land past it.
+    send_keys(&mut engine, "vjy$gp");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "abab\nc\ncd",
+        "FAIL: gp charwise multi-line paste produced the wrong buffer"
+    );
+    assert_eq!(
+        engine.view().cursor.line,
+        1,
+        "FAIL: gp should land on the line holding the last pasted char"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "FAIL: gp must not leave the cursor resting on the line's trailing newline"
+    );
+}
