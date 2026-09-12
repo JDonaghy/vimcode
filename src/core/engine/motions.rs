@@ -6021,11 +6021,90 @@ impl Engine {
     // Indent / Dedent (>> / <<)
     // =======================================================================
 
+    /// The virtual-column span `[start, end]` (0-indexed, `end` inclusive)
+    /// that the character at `col` on `line` occupies on screen, honoring
+    /// `'tabstop'` — a tab widens to the next tabstop, everything else is
+    /// exactly one column wide. `col` at or past the line's content lands on
+    /// an empty zero-width span at the line's total display width, which is
+    /// what "cursor past the last char" needs when there's no character to
+    /// measure. Mirrors Vim's `virtcol()` (`:h virtcol()`: "for a TAB the
+    /// last column is used"), which `>>`/`<<` need so `col_for_vcol` can put
+    /// the cursor back on the same screen column after the indent's tab/
+    /// space makeup changes shape underneath it (#883, "op:<< mixed tab
+    /// space").
+    fn char_vcol_span(&self, line: usize, col: usize) -> (usize, usize) {
+        let ts = (self.settings.tabstop as usize).max(1);
+        let line_start = self.buffer().line_to_char(line);
+        let content_len = self.line_content_len(line);
+        let mut vcol = 0usize;
+        for i in 0..col.min(content_len) {
+            let ch = self.buffer().content.char(line_start + i);
+            vcol += if ch == '\t' { ts - (vcol % ts) } else { 1 };
+        }
+        if col >= content_len {
+            return (vcol, vcol);
+        }
+        let ch = self.buffer().content.char(line_start + col);
+        let width = if ch == '\t' { ts - (vcol % ts) } else { 1 };
+        (vcol, vcol + width - 1)
+    }
+
+    /// Inverse of [`Engine::char_vcol_span`]: the character column on `line`
+    /// whose span contains `target_vcol`, clamped to the line's last
+    /// character when `target_vcol` falls past the end — Vim's
+    /// `coladvance()` behavior, and what actually lands the cursor after a
+    /// `>>`/`<<` shift (see `char_vcol_span`'s doc comment for why).
+    fn col_for_vcol(&self, line: usize, target_vcol: usize) -> usize {
+        let ts = (self.settings.tabstop as usize).max(1);
+        let line_start = self.buffer().line_to_char(line);
+        let content_len = self.line_content_len(line);
+        if content_len == 0 {
+            return 0;
+        }
+        let mut vcol = 0usize;
+        for i in 0..content_len {
+            let ch = self.buffer().content.char(line_start + i);
+            let width = if ch == '\t' { ts - (vcol % ts) } else { 1 };
+            if target_vcol < vcol + width {
+                return i;
+            }
+            vcol += width;
+        }
+        content_len - 1
+    }
+
+    /// A line's length in characters, excluding the trailing `\n` if any —
+    /// the "content" length several indent helpers above need instead of
+    /// the raw `line_len_chars` (which counts the newline).
+    fn line_content_len(&self, line: usize) -> usize {
+        let line_len = self.buffer().line_len_chars(line);
+        if line_len > 0
+            && self
+                .buffer()
+                .content
+                .char(self.buffer().line_to_char(line) + line_len - 1)
+                == '\n'
+        {
+            line_len - 1
+        } else {
+            line_len
+        }
+    }
+
     /// Indent `count` lines starting at `start_line` by shift_width.
     pub(crate) fn indent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
         let sw = self.effective_shift_width();
         let ts = (self.settings.tabstop as usize).max(1);
         let expand = self.settings.expand_tab;
+
+        // Capture the cursor's on-screen column (as a virtual column, so a
+        // tab in the existing indent is measured the same way Vim's cursor
+        // rendering does) before editing touches the line — restored after
+        // the shift via `col_for_vcol` (#883, "op:>> cursor sol" and the
+        // general "leave the column where the eye sees it" case it's a
+        // special case of).
+        let orig_col = self.view().cursor.col;
+        let (_, target_vcol) = self.char_vcol_span(start_line, orig_col);
 
         self.start_undo_group();
         let total = self.buffer().len_lines();
@@ -6088,6 +6167,17 @@ impl Engine {
         let end_line = (start_line + count.saturating_sub(1)).min(total.saturating_sub(1));
         let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
         self.last_change_end = Some((end_line, end_col));
+        // `:h 'startofline'`: ">>" is one of the commands the option names —
+        // when set, land on the first non-blank of the (first) shifted line
+        // instead of the screen column the cursor was sitting on (#883,
+        // "op:>> cursor sol"). Off (the default, matching Neovim) restores
+        // that screen column via `col_for_vcol`/`target_vcol` above.
+        self.view_mut().cursor.line = start_line;
+        if self.settings.startofline {
+            self.move_cursor_to_first_non_blank(start_line);
+        } else {
+            self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+        }
         *changed = true;
     }
 
@@ -6097,31 +6187,45 @@ impl Engine {
     /// relative nesting structure.
     pub(crate) fn dedent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
         let sw = self.effective_shift_width();
+        let ts = (self.settings.tabstop as usize).max(1);
+        let expand = self.settings.expand_tab;
         let total = self.buffer().len_lines();
 
-        // First pass: find minimum leading whitespace (visual columns) across
-        // all non-blank lines in the selection.
+        // Capture the cursor's on-screen column before editing — see
+        // `indent_lines`'s matching comment (#883).
+        let orig_col = self.view().cursor.col;
+        let (_, target_vcol) = self.char_vcol_span(start_line, orig_col);
+
+        // First pass: find minimum leading whitespace across all non-blank
+        // lines in the selection, measured in *display columns honouring
+        // 'tabstop'* — a tab's width is set by 'tabstop', not 'shiftwidth'
+        // (using `sw` here used to under/over-count a tab's true width
+        // whenever the two options differ, #883).
         let mut min_indent = usize::MAX;
         for i in 0..count {
             let line_idx = start_line + i;
             if line_idx >= total {
                 break;
             }
-            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
-            let trimmed = line_content.trim_end_matches(['\n', '\r']);
-            // Skip blank/whitespace-only lines — they shouldn't constrain removal
-            if trimmed.trim().is_empty() {
-                continue;
-            }
-            let mut visual_indent = 0;
-            for ch in trimmed.chars() {
-                match ch {
-                    ' ' => visual_indent += 1,
-                    '\t' => visual_indent += sw - (visual_indent % sw),
-                    _ => break,
+            let content_len = self.line_content_len(line_idx);
+            let line_start = self.buffer().line_to_char(line_idx);
+            let mut cols = 0usize;
+            let mut all_blank = true;
+            for j in 0..content_len {
+                match self.buffer().content.char(line_start + j) {
+                    ' ' => cols += 1,
+                    '\t' => cols += ts - (cols % ts),
+                    _ => {
+                        all_blank = false;
+                        break;
+                    }
                 }
             }
-            min_indent = min_indent.min(visual_indent);
+            // Blank/whitespace-only lines shouldn't constrain removal.
+            if all_blank {
+                continue;
+            }
+            min_indent = min_indent.min(cols);
         }
 
         if min_indent == usize::MAX || min_indent == 0 {
@@ -6133,38 +6237,49 @@ impl Engine {
         let remove_cols = sw.min(min_indent);
 
         self.start_undo_group();
-        // Work backwards to avoid invalidating char positions
-        for i in (0..count).rev() {
+        for i in 0..count {
             let line_idx = start_line + i;
             if line_idx >= total {
-                continue;
+                break;
             }
+            let content_len = self.line_content_len(line_idx);
             let line_start = self.buffer().line_to_char(line_idx);
-            let line_content: String = self.buffer().content.line(line_idx).chars().collect();
-            let mut removed_visual = 0;
-            let mut removed_chars = 0;
-            for ch in line_content.chars() {
-                if removed_visual >= remove_cols {
-                    break;
-                }
-                match ch {
+            let mut cols = 0usize;
+            let mut ws_chars = 0usize;
+            for j in 0..content_len {
+                match self.buffer().content.char(line_start + j) {
                     ' ' => {
-                        removed_visual += 1;
-                        removed_chars += 1;
+                        cols += 1;
+                        ws_chars += 1;
                     }
                     '\t' => {
-                        let tab_width = sw - (removed_visual % sw);
-                        if removed_visual + tab_width > remove_cols {
-                            break; // don't partially remove a tab
-                        }
-                        removed_visual += tab_width;
-                        removed_chars += 1;
+                        cols += ts - (cols % ts);
+                        ws_chars += 1;
                     }
                     _ => break,
                 }
             }
-            if removed_chars > 0 {
-                self.delete_with_undo(line_start, line_start + removed_chars);
+            if ws_chars == 0 {
+                continue;
+            }
+            // Re-emit the reduced indent from scratch — like `indent_lines`,
+            // never incrementally strip characters — so a remaining tab gets
+            // converted to spaces under 'expandtab' instead of surviving
+            // untouched just because it wasn't the character actually
+            // removed (#883).
+            let new_cols = cols.saturating_sub(remove_cols);
+            let new_indent = if expand {
+                " ".repeat(new_cols)
+            } else {
+                format!(
+                    "{}{}",
+                    "\t".repeat(new_cols / ts),
+                    " ".repeat(new_cols % ts)
+                )
+            };
+            self.delete_with_undo(line_start, line_start + ws_chars);
+            if !new_indent.is_empty() {
+                self.insert_with_undo(line_start, &new_indent);
             }
         }
         self.finish_undo_group();
@@ -6175,6 +6290,13 @@ impl Engine {
             let end_line = (start_line + count.saturating_sub(1)).min(total.saturating_sub(1));
             let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
             self.last_change_end = Some((end_line, end_col));
+            // See `indent_lines`'s matching 'startofline' comment (#883).
+            self.view_mut().cursor.line = start_line;
+            if self.settings.startofline {
+                self.move_cursor_to_first_non_blank(start_line);
+            } else {
+                self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+            }
         }
     }
 

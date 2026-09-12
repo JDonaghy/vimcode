@@ -9451,6 +9451,127 @@ fn test_dedent_normal_mode_preserves_nesting() {
     assert_eq!(lines[2], "        line3");
 }
 
+// ─── #883: >> cursor landing, << with mixed tabs/spaces, o<Esc> autoindent ──
+
+#[test]
+fn test_shift_right_leaves_cursor_screen_column_alone_by_default() {
+    // `:h 'startofline'` names ">>" among the commands it governs; off (the
+    // default, matching Neovim) leaves the cursor on the same *screen*
+    // column rather than jumping to the first non-blank (confirmed against
+    // real Neovim: `>>` on "  abc" from column 4 stays at column 4, now
+    // sitting in the grown indent rather than on "b").
+    let mut e = engine_with_text("  abc\n");
+    e.settings.shift_width = 4;
+    e.settings.expand_tab = true;
+    e.settings.tabstop = 4;
+    e.view_mut().cursor.col = 3; // 0-indexed: the 'b' in "  abc"
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(e.buffer().to_string(), "      abc\n");
+    assert_eq!(
+        e.view().cursor.col,
+        3,
+        ">> should leave the cursor's raw screen column untouched"
+    );
+}
+
+#[test]
+fn test_shift_right_startofline_lands_on_first_non_blank() {
+    // With 'startofline' on, the same shift instead parks on the first
+    // non-blank of the line (verified against real Neovim with
+    // `vim.o.startofline = true`).
+    let mut e = engine_with_text("  abc\n");
+    e.settings.shift_width = 4;
+    e.settings.expand_tab = true;
+    e.settings.tabstop = 4;
+    e.settings.startofline = true;
+    e.view_mut().cursor.col = 3;
+    press_char(&mut e, '>');
+    press_char(&mut e, '>');
+    assert_eq!(e.buffer().to_string(), "      abc\n");
+    assert_eq!(
+        e.view().cursor.col,
+        6,
+        ">> with 'startofline' should land on 'a'"
+    );
+}
+
+#[test]
+fn test_shift_left_measures_tabs_by_tabstop_not_shiftwidth() {
+    // Dedent has to measure a tab's *existing* display width using
+    // 'tabstop', not 'shiftwidth' — the two commonly differ. With ts=8 but
+    // sw=4, a single leading tab is 8 columns wide; removing one
+    // 'shiftwidth' (4) should leave 4 columns of indent behind, not zero
+    // (confirmed against real Neovim). The old implementation used `sw` for
+    // both the width *measurement* and the removal amount, so with ts != sw
+    // it silently mismeasured the tab and either over- or under-dedented.
+    let mut e = engine_with_text("\tabc\n");
+    e.settings.shift_width = 4;
+    e.settings.tabstop = 8;
+    e.settings.expand_tab = false;
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    abc\n",
+        "<< should leave 4 of the tab's 8 display columns, as 4 spaces (noet)"
+    );
+}
+
+#[test]
+fn test_shift_left_reexpresses_remaining_tab_under_expandtab() {
+    // A tab that survives the shift still has to be re-expressed as spaces
+    // when 'expandtab' is on — it wasn't the character actually deleted, so
+    // an implementation that just trims characters off the front leaves it
+    // as a literal tab instead (confirmed wrong against real Neovim, which
+    // always re-emits the whole indent from scratch).
+    let mut e = engine_with_text("\t\tabc\n"); // two tabs, ts=4 => 8 display columns
+    e.settings.shift_width = 4;
+    e.settings.tabstop = 4;
+    e.settings.expand_tab = true;
+    press_char(&mut e, '<');
+    press_char(&mut e, '<');
+    assert_eq!(
+        e.buffer().to_string(),
+        "    abc\n",
+        "the remaining 4 columns of indent must be spaces under 'expandtab', not a literal tab"
+    );
+}
+
+#[test]
+fn test_o_then_escape_with_no_text_leaves_a_truly_empty_line() {
+    // `:h 'autoindent'`: opening a line with `o` inserts the auto-indent;
+    // leaving insert mode without typing anything removes it again, leaving
+    // a genuinely empty line — not one padded with the untyped indent's
+    // whitespace (confirmed against real Neovim). This previously only
+    // worked for the `<CR>`-created case; `o`/`O` never armed the same
+    // "untouched indent-only line" tracking.
+    let mut e = engine_with_text("    foo\nbar\n");
+    e.settings.auto_indent = true;
+    press_char(&mut e, 'o');
+    press_special(&mut e, "Escape");
+    assert_eq!(
+        e.buffer().to_string(),
+        "    foo\n\nbar\n",
+        "o<Esc> with nothing typed should leave a bare empty line, no trailing whitespace"
+    );
+}
+
+#[test]
+fn test_capital_o_then_escape_with_no_text_leaves_a_truly_empty_line() {
+    // Same as above, for `O` (open above).
+    let mut e = engine_with_text("    foo\n");
+    e.settings.auto_indent = true;
+    e.view_mut().cursor.line = 0;
+    press_char(&mut e, 'O');
+    press_special(&mut e, "Escape");
+    assert_eq!(
+        e.buffer().to_string(),
+        "\n    foo\n",
+        "O<Esc> with nothing typed should leave a bare empty line above"
+    );
+}
+
 // ─── Tag text objects (it / at) ──────────────────────────────────────────
 
 fn make_tag_engine(html: &str) -> Engine {

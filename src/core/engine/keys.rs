@@ -1252,6 +1252,16 @@ impl Engine {
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.line += 1;
                 self.view_mut().cursor.col = indent_len;
+                // `o` opens a brand-new line containing nothing but the
+                // auto-indent, so it's always "untouched" at this point —
+                // mirrors the `<CR>` path's tracking so a bare `<Esc>`
+                // removes the indent again instead of leaving a
+                // whitespace-only line (`:h 'autoindent'`, #883).
+                self.insert_indent_only_line = if !indent.is_empty() {
+                    Some(self.view().cursor.line)
+                } else {
+                    None
+                };
                 self.mode = Mode::Insert;
                 self.count = None; // Clear count when entering insert mode
                 *changed = true;
@@ -1274,6 +1284,12 @@ impl Engine {
                 self.insert_with_undo(line_start, &text);
                 self.insert_text_buffer.clear();
                 self.view_mut().cursor.col = indent_len;
+                // Same tracking as `o` above, on the new (now-current) line.
+                self.insert_indent_only_line = if !indent.is_empty() {
+                    Some(self.view().cursor.line)
+                } else {
+                    None
+                };
                 self.mode = Mode::Insert;
                 self.count = None; // Clear count when entering insert mode
                 *changed = true;
