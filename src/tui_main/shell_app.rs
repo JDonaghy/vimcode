@@ -5080,6 +5080,157 @@ mod tests {
         );
     }
 
+    /// #880: `J` inserts one space in place of the joined `<EOL>` **unless**
+    /// the next line starts with `)` (`:h J`), and in that no-space case the
+    /// cursor lands on the `)` itself — the join point — not on the last
+    /// char of the first line. Verified against `nvim --headless -u NONE`
+    /// (0.12.5) as the `tests/nvim_conformance.rs` oracle case
+    /// "op:J next starts with )".
+    ///
+    /// The cursor column is made visible in *painted text* rather than read
+    /// out of the view state: after the join the test presses `x`, which
+    /// deletes the character under the cursor, so which character disappears
+    /// from the row reports where the cursor actually was.
+    ///
+    /// **Verified RED against unfixed `develop`:** the old join left the
+    /// cursor one column early, on the `(`, so `x` painted `ZQXW880P)` —
+    /// it ate the paren that should have survived.
+    #[test]
+    fn j_join_before_close_paren_leaves_cursor_on_paren_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXW880P(\n  )\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('J');
+        driver.render();
+
+        let joined = driver.screen();
+        assert!(
+            joined.contains("ZQXW880P()"),
+            "J onto a line starting with ')' must not insert a space; screen:\n{joined}"
+        );
+        assert!(
+            !joined.contains("ZQXW880P( )"),
+            "J must not paint a space before the ')'; screen:\n{joined}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW880P("),
+            "the cursor should have landed on the ')', so `x` removes it and leaves \
+             the '(' painted; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXW880P)"),
+            "the cursor must not land on the '(' — `x` would then eat the paren that \
+             should survive; screen:\n{screen}"
+        );
+    }
+
+    /// #880: `J` inserts no second space when the current line already ends
+    /// in whitespace (`:h J`), and the cursor lands on the appended line's
+    /// first character rather than on the pre-existing trailing space.
+    /// Verified against `nvim --headless -u NONE` (0.12.5) as the
+    /// `tests/nvim_conformance.rs` oracle case
+    /// "op:J current ends with space".
+    ///
+    /// As above, `x` after the join makes the cursor column readable from
+    /// the painted row: the character it removes is the one the cursor was
+    /// on.
+    ///
+    /// **Verified RED against unfixed `develop`:** the cursor sat one column
+    /// early, on the reused trailing space, so `x` closed the gap and
+    /// painted `ZQXW880S_AZQXW880S_B` instead of `ZQXW880S_A QXW880S_B`.
+    #[test]
+    fn j_join_after_trailing_space_leaves_cursor_on_next_char_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "ZQXW880S_A \nZQXW880S_B\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('J');
+        driver.render();
+
+        let joined = driver.screen();
+        assert!(
+            joined.contains("ZQXW880S_A ZQXW880S_B"),
+            "J onto a line whose predecessor already ends in a space must reuse that \
+             space, painting exactly one gap; screen:\n{joined}"
+        );
+        assert!(
+            !joined.contains("ZQXW880S_A  ZQXW880S_B"),
+            "J must not paint a second space; screen:\n{joined}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW880S_A QXW880S_B"),
+            "the cursor should have landed on the appended line's first char, so `x` \
+             removes that char and leaves the single gap intact; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXW880S_AZQXW880S_B"),
+            "the cursor must not land on the reused trailing space — `x` would then \
+             close the gap between the two markers; screen:\n{screen}"
+        );
+    }
+
+    /// #880: `J` onto a **blank** next line inserts no space and leaves none
+    /// behind — verified against `nvim --headless -u NONE` (0.12.5), which
+    /// leaves `"hello"` (not `"hello "`) and clamps the cursor onto the last
+    /// char of the merged line.
+    ///
+    /// A trailing space is invisible in painted text on its own, so the test
+    /// makes it visible: after the join it types `A!` (append at end of
+    /// line). The `!` lands immediately after the last character iff no
+    /// trailing space survived the join.
+    ///
+    /// **Verified RED against unfixed `develop`:** the old join read the
+    /// blank line's own `\n` as a "next non-whitespace char" and inserted a
+    /// space, so `A!` painted `ZQXW880B_A !` instead of `ZQXW880B_A!`.
+    #[test]
+    fn j_join_onto_blank_line_leaves_no_trailing_space_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "ZQXW880B_A\n\nZQXW880B_C\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('J');
+        driver.type_char('A');
+        driver.type_char('!');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW880B_A!"),
+            "J onto a blank line must leave no trailing space, so an appended '!' \
+             abuts the last char; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXW880B_A !"),
+            "J onto a blank line must not insert a space; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ZQXW880B_C"),
+            "the third line must survive the join untouched; screen:\n{screen}"
+        );
+    }
+
     /// #892: `S` (substitute line) yanks the deleted line **linewise** into
     /// the unnamed register (`:h registers`, matching `cc` per #806), so a
     /// following `P` must put it back as a whole line above the cursor
