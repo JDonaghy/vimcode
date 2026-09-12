@@ -3657,9 +3657,20 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "op:J next starts with )",
     "op:J next blank",
     "op:J current ends with space",
+    // #883: this is a `cs(..)` case pinning `vim.o.startofline = true` on the
+    // Neovim oracle side. `run_in_vimcode` never reads a case's `setup` (see
+    // the `HARNESS_LIMITED` doc comment below and #875) — the vimcode side
+    // always runs with `startofline` at its default (off), so this case
+    // drives the *same* keys against a Neovim configured differently than
+    // vimcode is. It cannot pass by construction regardless of vimcode's
+    // 'startofline' support, which `indent_lines`/`dedent_lines` do
+    // correctly implement now (verified directly against a real Neovim, not
+    // through this harness: `nvim --headless` with `startofline` on lands
+    // `>>`/`<<` on the first non-blank, matching vimcode). Left here rather
+    // than moved to `HARNESS_LIMITED` — that reclassification is judged out
+    // of scope for this label; a future pass wiring `setup` through
+    // `run_in_vimcode` should move it there or delete it outright.
     "op:>> cursor sol",
-    "op:<< mixed tab space",
-    "op:o esc removes indent",
     // Remaining `dot:` deviations: each fails for a reason outside `.` itself
     // -- linewise-`p` cursor placement (see "op:p linewise cursor first
     // nonblank"), past-eol cursor clamping on entering insert, and `2>>`
