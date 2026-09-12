@@ -26690,14 +26690,14 @@ fn test_nvim_J_last_line_noop() {
 
 #[test]
 fn test_nvim_J_with_empty_next_line() {
-    // J joining with an empty next line
-    let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "hello\n\nworld\n");
-    engine.update_syntax();
-    engine.feed_keys("J");
-    // Vim joins "hello" with empty line, producing "hello " (trailing space)
-    // then "world" remains on the next line
-    assert_eq!(engine.buffer().to_string(), "hello \nworld\n");
+    // J joining with an empty next line inserts NO space — the previous
+    // expectation here ("hello " with a trailing space) encoded the #880
+    // bug, not Vim. Verified directly against `nvim --headless -u NONE`
+    // (0.12.5) on this exact buffer: the result is "hello\nworld\n" and the
+    // cursor clamps back onto the last char of the merged line (1-based
+    // line 1, col 5 → 0-based line 0, col 4). Same case as the
+    // `tests/nvim_conformance.rs` oracle case "op:J next blank".
+    nvim_case("hello\n\nworld\n", 0, 0, "J", "hello\nworld\n", 0, 4);
 }
 
 #[test]
