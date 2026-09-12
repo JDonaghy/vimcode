@@ -18,11 +18,12 @@ impl Engine {
         let cmd: &str = &normalized;
 
         // Handle `:{range}{cmd}` — the line-oriented ex commands that take a
-        // general address range (`:2d`, `:'a,'by`, `:.,+1j`, `:2,3>`, `:/foo/`).
+        // general address range (`:2d`, `:'a,'by`, `:.,+1j`, `:2,3>`, `:/foo/`,
+        // `:*d` — `*` is `'<,'>`, the last visual selection).
         if cmd
             .as_bytes()
             .first()
-            .is_some_and(|b| b.is_ascii_digit() || b".$'%+-/?<>,;".contains(b))
+            .is_some_and(|b| b.is_ascii_digit() || b".$'%*+-/?<>,;".contains(b))
             || is_ranged_ex_name(cmd)
         {
             if let Some(action) = self.try_execute_ranged_command(cmd) {
@@ -1397,22 +1398,20 @@ impl Engine {
         }
 
         // :sort [flags] — sort lines in buffer.
-        // Accept both ":sort" with space-separated flags and the Vim ":sort!" bang
-        // (synonym for the 'r' reverse flag).
+        // Accept both ":sort" with space-separated flags and the Vim ":sort!" bang.
+        // `!` reverses the sort direction; it is a separate axis from the `r`
+        // letter flag (which selects the pattern *match* as the sort key
+        // instead of the text after it) — the two used to be conflated here,
+        // which broke `:sort /pat/ r` (#879).
         if cmd == "sort" || cmd == "sort!" || cmd.starts_with("sort ") || cmd.starts_with("sort!") {
-            // Normalize: strip "sort" and an optional '!', then treat the '!' as
-            // a reverse flag appended to whatever flags remain.
+            // Normalize: strip "sort" and an optional '!'.
             let after = cmd.strip_prefix("sort").unwrap_or("");
             let (bang, after) = if let Some(rest) = after.strip_prefix('!') {
                 (true, rest)
             } else {
                 (false, after)
             };
-            let mut flags = after.trim().to_string();
-            if bang && !flags.contains('r') {
-                flags.push('r');
-            }
-            return self.execute_sort_command(&flags);
+            return self.execute_sort_command(None, bang, after.trim());
         }
 
         // :m[ove] {dest} / :t {dest} / :co[py] {dest} — operate on current line.
@@ -1471,37 +1470,39 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :r[ead] {file} — read file and insert after cursor line
-        if let Some(file_arg) = cmd.strip_prefix("read ").map(|s| s.trim()) {
-            let path = if Path::new(file_arg).is_absolute() {
-                PathBuf::from(file_arg)
+        // Handle :r[ead] {file} / :r[ead] !{cmd} — read a file, or the stdout
+        // of a shell command, and insert it after the cursor line (#879).
+        if let Some(arg) = cmd.strip_prefix("read ").map(|s| s.trim()) {
+            if let Some(shell_cmd) = arg.strip_prefix('!') {
+                let shell_cmd = shell_cmd.trim();
+                if shell_cmd.is_empty() {
+                    self.message = "Usage: :r !command".to_string();
+                    return EngineAction::None;
+                }
+                match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(shell_cmd)
+                    .output()
+                {
+                    Ok(output) => {
+                        let content = String::from_utf8_lossy(&output.stdout).to_string();
+                        let inserted_lines = self.insert_read_content(&content);
+                        self.message = format!("{} line(s) read", inserted_lines);
+                    }
+                    Err(e) => {
+                        self.message = format!("Cannot run shell command: {}", e);
+                    }
+                }
+                return EngineAction::None;
+            }
+            let path = if Path::new(arg).is_absolute() {
+                PathBuf::from(arg)
             } else {
-                self.cwd.join(file_arg)
+                self.cwd.join(arg)
             };
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
-                    let line = self.view().cursor.line;
-                    let num_lines = self.buffer().len_lines();
-                    let insert_pos = if line + 1 < num_lines {
-                        self.buffer().line_to_char(line + 1)
-                    } else {
-                        let end = self.buffer().len_chars();
-                        // Ensure there's a newline before inserting
-                        if end > 0 && self.buffer().content.char(end - 1) != '\n' {
-                            self.start_undo_group();
-                            self.insert_with_undo(end, "\n");
-                            self.insert_with_undo(end + 1, &content);
-                            self.finish_undo_group();
-                            let inserted_lines = content.lines().count();
-                            self.message = format!("{} line(s) read", inserted_lines);
-                            return EngineAction::None;
-                        }
-                        end
-                    };
-                    let inserted_lines = content.lines().count();
-                    self.start_undo_group();
-                    self.insert_with_undo(insert_pos, &content);
-                    self.finish_undo_group();
+                    let inserted_lines = self.insert_read_content(&content);
                     self.message = format!("{} line(s) read", inserted_lines);
                 }
                 Err(e) => {
@@ -2631,20 +2632,52 @@ impl Engine {
         EngineAction::None
     }
 
-    /// :sort [flags] — sort all lines, with optional flags (n=numeric, r=reverse, u=unique, i=ignorecase).
-    pub(crate) fn execute_sort_command(&mut self, flags: &str) -> EngineAction {
-        let numeric = flags.contains('n');
-        let reverse = flags.contains('r');
-        let unique = flags.contains('u');
-        let ignorecase = flags.contains('i');
+    /// `:[range]sor[t][!] [i][u][r][n] [/{pattern}/]` — sort lines.
+    ///
+    /// `range` is a 0-based inclusive `(start, end)` line span, or `None` for
+    /// the whole buffer. `bang` reverses the sort direction (Vim's `:sort!`);
+    /// it is a separate axis from the `r` letter flag inside `spec`, which
+    /// (only meaningful together with a `/pattern/`) selects the *matched*
+    /// text as the sort key instead of the text following the match — mixing
+    /// the two up is what made `:sort /pat/ r` sort on whole lines (#879).
+    pub(crate) fn execute_sort_command(
+        &mut self,
+        range: Option<(usize, usize)>,
+        bang: bool,
+        spec: &str,
+    ) -> EngineAction {
+        let (letter_flags, pattern) = parse_sort_spec(spec);
+        let numeric = letter_flags.contains('n');
+        let unique = letter_flags.contains('u');
+        let ignorecase = letter_flags.contains('i');
+        let use_match = letter_flags.contains('r');
+        let reverse = bang;
 
         let num_lines = self.buffer().len_lines();
         if num_lines == 0 {
             return EngineAction::None;
         }
+        let (start, end) = match range {
+            Some((s, e)) => (s.min(num_lines - 1), e.min(num_lines - 1)),
+            None => (0, num_lines - 1),
+        };
+        if start > end {
+            return EngineAction::None;
+        }
 
-        // Collect all lines (excluding trailing newline per line)
-        let mut lines: Vec<String> = (0..num_lines)
+        let compiled = match pattern.as_deref() {
+            Some(pat) if !pat.is_empty() => match self.compile_vim_pattern(pat, true) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    self.message = e;
+                    return EngineAction::None;
+                }
+            },
+            _ => None,
+        };
+
+        // Collect the lines in range (excluding trailing newline per line).
+        let mut lines: Vec<String> = (start..=end)
             .map(|i| {
                 let s: String = self.buffer().content.line(i).chars().collect();
                 if s.ends_with('\n') {
@@ -2655,11 +2688,30 @@ impl Engine {
             })
             .collect();
 
-        // Sort
+        // The sort key is the whole line, unless `/pattern/` narrows it to
+        // either the matched text (`r`) or the text after the match. A line
+        // the pattern doesn't match sorts as the empty key.
+        let key_of = |line: &str| -> String {
+            match &compiled {
+                Some(compiled) => match compiled.regex.captures(line) {
+                    Some(caps) => {
+                        let (s, e) = compiled.span(&caps);
+                        if use_match {
+                            line[s..e].to_string()
+                        } else {
+                            line[e..].to_string()
+                        }
+                    }
+                    None => String::new(),
+                },
+                None => line.to_string(),
+            }
+        };
+
         if numeric {
             lines.sort_by(|a, b| {
-                let na: i64 = a.trim().parse().unwrap_or(i64::MIN);
-                let nb: i64 = b.trim().parse().unwrap_or(i64::MIN);
+                let na: i64 = key_of(a).trim().parse().unwrap_or(i64::MIN);
+                let nb: i64 = key_of(b).trim().parse().unwrap_or(i64::MIN);
                 let ord = na.cmp(&nb);
                 if reverse {
                     ord.reverse()
@@ -2669,15 +2721,11 @@ impl Engine {
             });
         } else {
             lines.sort_by(|a, b| {
-                let ka = if ignorecase {
-                    a.to_lowercase()
+                let (ka, kb) = (key_of(a), key_of(b));
+                let (ka, kb) = if ignorecase {
+                    (ka.to_lowercase(), kb.to_lowercase())
                 } else {
-                    a.clone()
-                };
-                let kb = if ignorecase {
-                    b.to_lowercase()
-                } else {
-                    b.clone()
+                    (ka, kb)
                 };
                 let ord = ka.cmp(&kb);
                 if reverse {
@@ -2690,25 +2738,75 @@ impl Engine {
 
         if unique {
             lines.dedup_by(|a, b| {
+                let (ka, kb) = (key_of(a), key_of(b));
                 if ignorecase {
-                    a.to_lowercase() == b.to_lowercase()
+                    ka.to_lowercase() == kb.to_lowercase()
                 } else {
-                    a == b
+                    ka == kb
                 }
             });
         }
 
-        // Replace buffer content
-        let new_content = lines.join("\n") + "\n";
-        let total_chars = self.buffer().len_chars();
+        // Replace only the sorted range, leaving the rest of the buffer
+        // untouched — `lines.join("\n")` reproduces every interior newline;
+        // only the trailing one (present unless `end` is the buffer's final,
+        // newline-less line) needs to be re-added explicitly.
+        let last_raw: String = self.buffer().content.line(end).chars().collect();
+        let trailing = if last_raw.ends_with('\n') { "\n" } else { "" };
+        let replacement = format!("{}{trailing}", lines.join("\n"));
+
+        let range_start_char = self.buffer().line_to_char(start);
+        let range_end_char = if end + 1 < num_lines {
+            self.buffer().line_to_char(end + 1)
+        } else {
+            self.buffer().len_chars()
+        };
         self.start_undo_group();
-        self.delete_with_undo(0, total_chars);
-        self.insert_with_undo(0, &new_content);
+        if range_end_char > range_start_char {
+            self.delete_with_undo(range_start_char, range_end_char);
+        }
+        self.insert_with_undo(range_start_char, &replacement);
         self.finish_undo_group();
-        self.view_mut().cursor.line = 0;
+        self.view_mut().cursor.line = start;
         self.view_mut().cursor.col = 0;
         self.message = format!("{} lines sorted", lines.len());
         EngineAction::None
+    }
+
+    /// Insert `content` (a file's contents, or a shell command's stdout) after
+    /// the cursor line, the way `:r[ead]` does, and leave the cursor on the
+    /// *last* inserted line at column 0 — the same place `:put` lands, per
+    /// Vim (`:h :read` cursor behaviour differs from a plain paste only in
+    /// having no register to consult). Returns the number of lines inserted.
+    pub(crate) fn insert_read_content(&mut self, content: &str) -> usize {
+        if content.is_empty() {
+            return 0;
+        }
+        let line = self.view().cursor.line;
+        let num_lines = self.buffer().len_lines();
+        let inserted_lines = content.lines().count().max(1);
+        self.start_undo_group();
+        let first_new_line = if line + 1 < num_lines {
+            let insert_pos = self.buffer().line_to_char(line + 1);
+            self.insert_with_undo(insert_pos, content);
+            line + 1
+        } else {
+            let end = self.buffer().len_chars();
+            // Ensure there's a newline before inserting, so the new text
+            // lands on its own line(s) instead of extending the last one.
+            if end > 0 && self.buffer().content.char(end - 1) != '\n' {
+                self.insert_with_undo(end, "\n");
+                self.insert_with_undo(end + 1, content);
+            } else {
+                self.insert_with_undo(end, content);
+            }
+            num_lines
+        };
+        self.finish_undo_group();
+        let new_last = self.buffer().len_lines().saturating_sub(1);
+        self.view_mut().cursor.line = (first_new_line + inserted_lines - 1).min(new_last);
+        self.view_mut().cursor.col = 0;
+        inserted_lines
     }
 
     /// :m[ove] {dest} — move current line to after line {dest}.
@@ -3100,6 +3198,18 @@ impl Engine {
         if chars.get(i) == Some(&'%') {
             let last = self.buffer().len_lines().saturating_sub(1) as isize;
             return (Some((0, last)), i + 1);
+        }
+        // `*` is shorthand for `'<,'>` — the last visual selection — and,
+        // like `%`, stands for a whole range rather than a single address
+        // (`:h :star`).
+        if chars.get(i) == Some(&'*') {
+            return match (self.ex_mark_line('<'), self.ex_mark_line('>')) {
+                (Some(s), Some(e)) => {
+                    let (s, e) = if s <= e { (s, e) } else { (e, s) };
+                    (Some((s as isize, e as isize)), i + 1)
+                }
+                _ => (None, 0),
+            };
         }
         let current = self.view().cursor.line;
         let Some(first) = self.parse_ex_address(chars, &mut i, current) else {
@@ -4069,6 +4179,13 @@ impl Engine {
             name.len() >= min && name.len() <= canonical.len() && canonical.starts_with(name)
         };
 
+        // `:[range]sor[t][!] [flags] [/pattern/]` — sort just the given range.
+        // `sor` is Vim's minimum abbreviation (`so` is `:source`).
+        if is("sort", 3) {
+            let (start, end) = self.range_with_count(range, None, last_line);
+            return Some(self.execute_sort_command(Some((start, end)), bang, args));
+        }
+
         if is("delete", 1) {
             let (reg, count) = parse_reg_and_count(args)?;
             let (start, end) = self.range_with_count(range, count, last_line);
@@ -4397,6 +4514,52 @@ pub(crate) fn is_ranged_ex_name(cmd: &str) -> bool {
         .iter()
         .any(|full| full.starts_with(name))
         || name == "t"
+}
+
+/// Split a `:sort` argument string into its letter flags and optional
+/// `/{pattern}/`.
+///
+/// Vim lets the pattern and the letter flags appear in either order and
+/// interleaved (`:sort /pat/ r` puts `r` *after* the pattern), so this scans
+/// the whole string rather than splitting once: any ASCII letter is a flag,
+/// and any other non-blank character opens a delimited pattern that runs
+/// (honouring `\`-escapes) to the next unescaped occurrence of that same
+/// delimiter.
+pub(crate) fn parse_sort_spec(spec: &str) -> (String, Option<String>) {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    let mut flags = String::new();
+    let mut pattern: Option<String> = None;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if ch.is_ascii_alphabetic() {
+            flags.push(ch);
+            i += 1;
+            continue;
+        }
+        let delim = ch;
+        i += 1;
+        let mut pat = String::new();
+        while i < chars.len() && chars[i] != delim {
+            if chars[i] == '\\' && i + 1 < chars.len() {
+                pat.push(chars[i]);
+                pat.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            pat.push(chars[i]);
+            i += 1;
+        }
+        if i < chars.len() {
+            i += 1; // skip the closing delimiter
+        }
+        pattern = Some(pat);
+    }
+    (flags, pattern)
 }
 
 /// Split `rest` into an ex command name and its argument.
