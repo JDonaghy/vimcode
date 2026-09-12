@@ -13730,4 +13730,180 @@ mod tests {
              screen:\n{screen}"
         );
     }
+
+    /// #888 (`to:cip`): `cip`/`cap` are linewise like `cc` — the selected
+    /// lines disappear entirely and a single new (indented) line opens for
+    /// the typed replacement, leaving any lines *after* the object (e.g. a
+    /// following blank line) untouched. Before this fix vimcode treated `c`
+    /// like `d` here and the blank line got swallowed along with the
+    /// paragraph, so the replacement text landed directly above the next
+    /// paragraph with no blank line between them. Verified against
+    /// `nvim --headless -u NONE` (0.12.5) as the `tests/nvim_conformance.rs`
+    /// oracle case "to:cip".
+    ///
+    /// This is the driver-level counterpart to
+    /// `test_cip_leaves_trailing_blank_line_intact` in
+    /// `src/core/engine/tests.rs`: that test drives a bare `Engine` and
+    /// reads `buffer().content` directly; this one drives the real
+    /// `TuiShellApp` through `TuiDriver` and asserts on rendered screen
+    /// rows, per this repo's "assert on rendered output, not state" rule.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the
+    /// `is_linewise_paragraph_change` branch in
+    /// `Engine::apply_operator_text_object` (`motions.rs`) removed so `cip`
+    /// falls through to the plain charwise-substitution path `d` uses, this
+    /// test failed — the replacement landed as `ZQXW888CIPX` immediately
+    /// followed by `ZQXW888CIPC` with the blank row between them gone (the
+    /// two markers' painted rows were adjacent instead of two apart), and
+    /// the `INSERT` assertion still held (so the failure was specifically
+    /// the swallowed blank line, not a missing insert-mode entry). Restored
+    /// before this commit.
+    #[test]
+    fn cip_replaces_paragraph_with_one_line_and_keeps_trailing_blank_via_shell_app() {
+        const P1: &str = "ZQXW888CIPA";
+        const P2: &str = "ZQXW888CIPB";
+        const P3: &str = "ZQXW888CIPC";
+        const REPL: &str = "ZQXW888CIPX";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{P1}\n{P2}\n\n{P3}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in "cip".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+        assert!(
+            driver.screen().contains("INSERT"),
+            "cip must enter Insert mode for the typed replacement; screen:\n{}",
+            driver.screen()
+        );
+
+        for c in REPL.chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(P1) && !screen.contains(P2),
+            "cip must delete both lines of the paragraph it replaces; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(REPL) && screen.contains(P3),
+            "cip's typed replacement and the following paragraph must both \
+             survive; screen:\n{screen}"
+        );
+
+        let repl_bounds = driver
+            .find_bounds(REPL)
+            .expect("replacement text must paint");
+        let p3_bounds = driver
+            .find_bounds(P3)
+            .expect("trailing paragraph must paint");
+        assert_eq!(
+            p3_bounds.y as u16,
+            repl_bounds.y as u16 + 2,
+            "cip must leave exactly one blank row between the replacement \
+             line and the following paragraph (the blank line that used to \
+             separate the two paragraphs), not zero (swallowed) or more; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #888 (`to:d5aw too many`): `aw`/`aW` always need a neighbouring word
+    /// to pair with; a count asking for more words than exist aborts the
+    /// operator with no edit, but the cursor has already been walked to the
+    /// end of the line during the abandoned search — unlike bracket/quote/
+    /// tag text objects, which leave the cursor untouched on failure.
+    /// Verified against `nvim --headless -u NONE` (0.12.5) as the
+    /// `tests/nvim_conformance.rs` oracle case "to:d5aw too many".
+    ///
+    /// This is the driver-level counterpart to
+    /// `test_d5aw_too_many_aborts_but_moves_cursor_to_eol` in
+    /// `src/core/engine/tests.rs`, asserting on the rendered block cursor
+    /// cell (by background colour, the same `cursor_cell`-by-style pattern
+    /// `startofline_setting_moves_the_rendered_cursor_to_first_non_blank_via_shell_app`
+    /// uses) and the rendered buffer text instead of engine-internal state.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `if modifier
+    /// == 'a' && matches!(obj_type, 'w' | 'W') { .. }` cursor-walk arm in
+    /// `Engine::apply_operator_text_object`'s `None` match branch
+    /// (`motions.rs`) removed (reverting to the bare `return`), this test
+    /// failed — the cursor stayed at column 0 instead of walking to the
+    /// line's last column, while the buffer content assertion still held
+    /// (so the failure was specifically the missing cursor walk, not a
+    /// spurious delete). Restored before this commit.
+    #[test]
+    fn d5aw_too_many_aborts_edit_but_walks_cursor_to_eol_via_shell_app() {
+        const LINE: &str = "ZQXW888AW ZQXW888BW";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, LINE);
+        // `driver_with_shell` wraps `app` in an opaque shell adapter with no
+        // accessor back to `TuiShellApp`'s own fields (#765), so the theme
+        // (needed below to locate the painted cursor cell by colour) has to
+        // be read off `app` before it moves into the driver.
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        fn cursor_col(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<u16> {
+            for y in 0..24u16 {
+                for x in 0..100u16 {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some(x);
+                    }
+                }
+            }
+            None
+        }
+
+        // The editor's text column doesn't start at screen column 0 (there's
+        // a line-number gutter), so anchor both the before and after
+        // measurements to where the line itself paints rather than an
+        // assumed absolute column.
+        let line_start_col = driver
+            .find_bounds(LINE)
+            .expect("the line must paint before d5aw")
+            .x as u16;
+
+        let col_before = cursor_col(&driver, cursor_bg)
+            .expect("a Normal-mode block cursor must paint before d5aw");
+        assert_eq!(
+            col_before, line_start_col,
+            "sanity: cursor starts at the first column of the line"
+        );
+
+        driver.type_char('5');
+        driver.type_char('d');
+        driver.type_char('a');
+        driver.type_char('w');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(LINE),
+            "d5aw with only two words on the line must not delete anything; \
+             screen:\n{screen}"
+        );
+
+        let col_after = cursor_col(&driver, cursor_bg)
+            .expect("the block cursor must still paint after the aborted d5aw");
+        assert_eq!(
+            col_after,
+            line_start_col + (LINE.chars().count() - 1) as u16,
+            "d5aw must abort with no edit but still walk the cursor to the \
+             line's last column; screen:\n{screen}"
+        );
+    }
 }
