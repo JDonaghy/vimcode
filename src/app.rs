@@ -1112,16 +1112,26 @@ impl App {
     /// non-GTK quadraui backend calls to get the *same* `App`, and therefore
     /// the same `impl ShellApp`, the GTK entry point runs.
     ///
-    /// This is [`App::new`] minus exactly the four steps in its prologue that
-    /// need a live GTK display, each of which is a platform *resource* rather
-    /// than a decision:
+    /// This is [`App::new`] minus exactly three steps in its prologue that
+    /// need a live GTK display, each of which is a platform *resource*
+    /// rather than a decision:
     ///
     /// | skipped | why | what replaces it |
     /// |---|---|---|
-    /// | `gdk::Display` icon-theme search path + `install_bundled_icon_font` | GDK-only; the font install writes to `~/.local/share/fonts` and shells out to `fc-cache` | the backend's own font stack (macOS: Core Text) |
+    /// | `gdk::Display` icon-theme search path | GDK-only; no portable icon-theme concept exists off GTK | nothing — no other backend has an icon theme to seed |
     /// | `crate::gtk::css::load_css` | `unwrap()`s `gdk::Display::default()` | `css_provider: None` — a GTK stylesheet styles nothing on another toolkit |
     /// | `gtk4::Settings::set_gtk_application_prefer_dark_theme` | GTK-only | the backend's own light/dark handling |
     /// | the `gio::FileMonitor` on `settings.json` | GIO-only | `settings_monitor: None` — settings hot-reload is a known gap off GTK, tracked as the file-watcher half of the quadraui-side surface `src/app.rs`'s module doc item 2 names |
+    ///
+    /// **`install_bundled_icon_font()` is *not* in that skipped list (#920).**
+    /// It used to be — `App::new` called it and this constructor didn't, so
+    /// every non-GTK backend (macOS first, per #920's repro) silently shipped
+    /// no icon font at all. The function itself now picks its destination and
+    /// cache-refresh step per platform (`~/.local/share/fonts` + `fc-cache`
+    /// off macOS, `~/Library/Fonts` and no cache step on macOS — see
+    /// `app_support::icon_font_dest_dir`), so calling it here is correct for
+    /// every backend this constructor serves, the same way it already was for
+    /// GTK.
     ///
     /// Everything else — engine construction and startup, nerd-font
     /// selection, the clipboard provider (`setup_gtk_clipboard` names no
@@ -1148,6 +1158,12 @@ impl App {
         file_path: Option<PathBuf>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
     ) -> Self {
+        // #920: `App::new` calls this too (for GTK/Pango); it has to happen
+        // here as well or every non-GTK backend — macOS first — ships a
+        // bundled icon font that never reaches disk. The function itself
+        // picks the right destination and cache-refresh step per platform.
+        install_bundled_icon_font();
+
         let mut engine = {
             let mut e = Engine::new();
             crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts);
