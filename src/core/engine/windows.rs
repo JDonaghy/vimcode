@@ -1111,7 +1111,9 @@ impl Engine {
             ContextMenuItem {
                 label: "Go to Definition".into(),
                 action: "goto_definition".into(),
-                shortcut: if vsc { "F12" } else { "gd" }.into(),
+                // `gd` is Vim's local-declaration motion, not this LSP
+                // command (:h gd) — no plain-Vim-mode key triggers it.
+                shortcut: if vsc { "F12" } else { "" }.into(),
                 separator_after: false,
                 enabled: has_lsp,
             },

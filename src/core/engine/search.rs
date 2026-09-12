@@ -1359,6 +1359,108 @@ impl Engine {
         self.search_word_under_cursor_generic(forward, true);
     }
 
+    /// `gd` — go to local declaration (`:h gd`).
+    ///
+    /// This is a pure motion: it does not touch the language server. Vim's
+    /// documented algorithm is:
+    ///   1. Search backward for the start of the current function, exactly
+    ///      like `[[` (a line whose first character is `{`). If none is
+    ///      found, start at line 1.
+    ///   2. If one *was* found, keep walking further back until a blank
+    ///      line is found (skips attributes/doc-comments above the brace).
+    ///   3. From that position, search forward for the first whole-word
+    ///      match of the identifier under the cursor, like `*`.
+    ///
+    /// After `gd` lands, `n` repeats the same search forward (`:h gd`), so
+    /// this seeds `search_query`/`search_direction` exactly like `*` does.
+    pub(crate) fn cmd_gd(&mut self) {
+        self.take_count(); // no count variant of `gd` is implemented; discard cleanly
+        let Some((word, _start_col)) = self.star_word_under_cursor() else {
+            self.message = "E349: No identifier under cursor".to_string();
+            return;
+        };
+
+        let cur_line = self.view().cursor.line;
+
+        // Step 1: search backward, like `[[`, for a line starting with `{`.
+        let func_brace_line = (0..cur_line).rev().find(|&line| {
+            self.buffer().line_len_chars(line) > 0
+                && self.buffer().content.char(self.buffer().line_to_char(line)) == '{'
+        });
+
+        // Step 2: if found, keep going back to the nearest blank line above it.
+        let search_start_line = match func_brace_line {
+            Some(brace_line) => {
+                let mut line = brace_line;
+                while line > 0 {
+                    let prev = line - 1;
+                    let is_blank = self
+                        .buffer()
+                        .content
+                        .line(prev)
+                        .chars()
+                        .all(|c| c.is_whitespace());
+                    if is_blank {
+                        break;
+                    }
+                    line = prev;
+                }
+                line
+            }
+            None => 0,
+        };
+
+        // Step 3: search forward for the first whole-word match.
+        let total_lines = self.buffer().len_lines();
+        for line in search_start_line..total_lines {
+            let line_content: String = self.buffer().content.line(line).chars().collect();
+            if let Some(col) = Self::find_whole_word_col(&line_content, &word) {
+                self.push_jump_location();
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = col;
+
+                // Seed the search register so `n` continues forward from here.
+                let escaped = crate::core::vim_regex::escape_vim_literal(&word);
+                self.search_query = format!("\\<{}\\>", escaped);
+                self.search_offset.clear();
+                self.search_smartcase_applies = false;
+                self.search_direction = SearchDirection::Forward;
+                self.run_search();
+                let cursor_char = self.buffer().line_to_char(line) + col;
+                self.search_index = self
+                    .search_matches
+                    .iter()
+                    .position(|(start, _)| *start == cursor_char);
+                return;
+            }
+        }
+        self.message = format!("E387: Match not found for {}", word);
+    }
+
+    /// First whole-word (`\<word\>`) match of `word` in `line`; returns the
+    /// (char) column of the match start.
+    fn find_whole_word_col(line: &str, word: &str) -> Option<usize> {
+        let chars: Vec<char> = line.chars().collect();
+        let wchars: Vec<char> = word.chars().collect();
+        if wchars.is_empty() || chars.len() < wchars.len() {
+            return None;
+        }
+        'outer: for start in 0..=(chars.len() - wchars.len()) {
+            for (i, &wc) in wchars.iter().enumerate() {
+                if chars[start + i] != wc {
+                    continue 'outer;
+                }
+            }
+            let before_ok = start == 0 || !Self::is_word_char(chars[start - 1]);
+            let end = start + wchars.len();
+            let after_ok = end >= chars.len() || !Self::is_word_char(chars[end]);
+            if before_ok && after_ok {
+                return Some(start);
+            }
+        }
+        None
+    }
+
     // ===================================================================
     // Find/Replace overlay (Ctrl+F)
     // ===================================================================

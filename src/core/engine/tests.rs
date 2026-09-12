@@ -783,6 +783,68 @@ fn test_search_n_and_N() {
 }
 
 #[test]
+fn test_gd_jumps_to_first_occurrence_before_cursor() {
+    // `gd` (:h gd) is a pure motion: it jumps to the first occurrence of the
+    // word under the cursor, searching from the top of the enclosing
+    // function (or the top of the file, absent one) — never via LSP.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "int x = 1;\ny = x;");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 4; // the `x` in `y = x;`
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'd');
+
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 4); // the `x` in `int x = 1;`
+}
+
+#[test]
+fn test_gd_no_identifier_under_cursor_is_a_no_op() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "   ");
+    engine.view_mut().cursor.col = 1; // sitting on whitespace, not a word
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'd');
+
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 1);
+    assert!(engine.message.contains("No identifier"));
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn test_gN_reselects_match_cursor_is_already_on() {
+    // `:h gN` — "If the cursor is on the match, visually selects it." When
+    // `/foo<CR>` wraps back onto the *first* match, a plain backward `gN`
+    // must reselect that same match rather than skipping past it to wrap
+    // around to the last one (the bug this test guards against, #889).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo bar foo");
+    engine.view_mut().cursor.col = 10; // last char of the second "foo"
+
+    press_char(&mut engine, '/');
+    for ch in "foo".chars() {
+        press_char(&mut engine, ch);
+    }
+    press_special(&mut engine, "Return");
+    // Search wrapped back to the first "foo".
+    assert_eq!(engine.view().cursor.col, 0);
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'N');
+    assert_eq!(engine.mode, Mode::Visual);
+    // Selection anchor must be the first match (cols 0..3), not the second.
+    assert_eq!(engine.visual_anchor, Some(Cursor { line: 0, col: 0 }));
+    assert_eq!(engine.view().cursor.col, 2);
+
+    press_char(&mut engine, 'd');
+    assert_eq!(engine.buffer().to_string(), " bar foo");
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
 fn test_search_escape_cancels() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "hello");
