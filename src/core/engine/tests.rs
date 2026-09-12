@@ -1839,6 +1839,92 @@ fn test_undo_after_visual_delete_restores_cursor_to_selection_start() {
     assert_eq!(engine.view().cursor.col, 1);
 }
 
+// ---------------------------------------------------------------------------
+// #887: visual-mode selection semantics (text objects, marks, undo, `r`,
+// paragraph edges). Each case mirrors an nvim-oracle case removed from
+// `KNOWN_DEVIATIONS` in tests/nvim_conformance.rs; the expected buffer/cursor
+// were independently re-verified against `nvim --headless -u NONE` 0.12.5,
+// not copied from what the engine happened to produce.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_visual_ip_repeated_extends_to_next_paragraph() {
+    // Oracle case "vis:vip then ip extends": a second `ip` while already
+    // inside a `vip` selection must *grow* the selection to swallow the
+    // next paragraph block, the way `2ip` already does, rather than
+    // reselecting the same paragraph it started with.
+    let mut engine = setup_engine("a\n\nb\n\nc", 0, 0);
+    send_keys(&mut engine, "vipipd");
+    assert_eq!(engine.buffer().to_string(), "b\n\nc");
+}
+
+#[test]
+fn test_visual_backtick_mark_extends_and_deletes() {
+    // Oracle case "vis:v'a? mark d": Visual mode must handle `` ` `` as a
+    // mark-target motion (it previously had no handler for it at all), so
+    // `v\`a` extends the charwise selection to the mark and `d` deletes
+    // through it inclusive.
+    let mut engine = setup_engine("abc\ndef", 1, 1);
+    send_keys(&mut engine, "magg0v`ad");
+    assert_eq!(engine.buffer().to_string(), "f");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_visual_change_then_undo_is_one_step() {
+    // Oracle case "vis:vjc then u": `c`'s delete-then-insert must be a
+    // single undo group, so one `u` fully restores the pre-change buffer
+    // and cursor, not just the typed replacement text.
+    let mut engine = setup_engine("abc\ndef", 0, 1);
+    send_keys(&mut engine, "vjcX<Esc>u");
+    assert_eq!(engine.buffer().to_string(), "abc\ndef");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+#[test]
+fn test_visual_r_cr_inserts_literal_carriage_return() {
+    // Oracle case "vis:v_r CR": real Neovim's Visual (char/line-wise) `r`
+    // with <CR> replaces the selection with a literal carriage-return
+    // *byte*, not an actual line split — confirmed empirically against the
+    // live nvim 0.12.5 oracle (`nvim_buf_get_lines` returns one line
+    // containing an embedded `\r`, not two lines). VisualBlock's `r<CR>`
+    // is the one that really splits lines (`:h v_b_r`; #807); plain Visual
+    // `r<CR>` does not get that special case.
+    let mut engine = setup_engine("abc", 0, 1);
+    send_keys(&mut engine, "vr<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\rc");
+}
+
+#[test]
+fn test_visual_ap_on_last_paragraph_takes_leading_blank() {
+    // Oracle case "vis:v ap trailing": `ap` prefers a *trailing* blank
+    // block, but the cursor's paragraph here is the last one in the
+    // buffer (no trailing blank exists), so `ap` must fall back to the
+    // *leading* blank block instead of selecting no blank at all.
+    let mut engine = setup_engine("a\n\nb\nc", 2, 0);
+    send_keys(&mut engine, "vapd");
+    assert_eq!(engine.buffer().to_string(), "a\n");
+}
+
+#[test]
+fn test_visual_ip_on_last_paragraph_excludes_blank() {
+    // Oracle case "vis:vip on last para no trailing": unlike `ap`, `ip`
+    // never falls back to an adjacent blank block — even on the last
+    // paragraph with nothing trailing, `ip` deletes only the non-blank
+    // lines and leaves the leading blank line untouched.
+    let mut engine = setup_engine("a\n\nb\nc", 3, 0);
+    send_keys(&mut engine, "vipd");
+    // Ropey's trailing-line bookkeeping differs from Neovim's (same
+    // asymmetry `run_case` in tests/nvim_conformance.rs works around with
+    // `trim_end_matches('\n')`): the leading blank line survives either way,
+    // which is the behaviour under test.
+    assert_eq!(engine.buffer().to_string().trim_end_matches('\n'), "a");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
 #[test]
 fn test_undo_after_global_command_reverts_all_lines_in_one_step() {
     // `:g/pat/cmd` is one undo block covering every matched line — a
