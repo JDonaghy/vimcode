@@ -4557,6 +4557,14 @@ impl Engine {
                 // Last inserted text (read-only)
                 Some((self.last_inserted_text.clone(), RegType::Charwise))
             }
+            ':' => {
+                // Last command-line (read-only, `:h quote_:`) — the command
+                // text itself, with no leading `:` (matches `last_ex_command`,
+                // which is already stored that way for `@:`; #890).
+                self.last_ex_command
+                    .clone()
+                    .map(|cmd| (cmd, RegType::Charwise))
+            }
             _ => self.registers.get(&reg).cloned(),
         }
     }

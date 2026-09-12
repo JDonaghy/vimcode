@@ -2889,6 +2889,13 @@ impl Engine {
                     } else if ch.is_ascii_lowercase() {
                         let count = self.take_count();
                         let _ = self.play_macro_with_count(ch, count);
+                    } else if ch.is_ascii_uppercase() {
+                        // @Q plays the same register as @q: register names
+                        // read case-insensitively (`:h quote_alpha`) — only
+                        // *writing* (`qA`, `"Ayy`) distinguishes upper from
+                        // lower as overwrite-vs-append (#890).
+                        let count = self.take_count();
+                        let _ = self.play_macro_with_count(ch.to_ascii_lowercase(), count);
                     } else {
                         self.message = "Invalid register for macro playback".to_string();
                     }

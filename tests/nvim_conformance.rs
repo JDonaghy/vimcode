@@ -3698,9 +3698,26 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // buffer, which is wrong for actual usage.
     "undo:U",
     "undo:UU",
-    "reg:\": last cmd",
+    // "mac:\"ay then @a executes text" (#890): the buffer edit already
+    // matches the oracle exactly — `@a` has always executed whatever text
+    // sits in register `a`, yanked or recorded, so that half of this
+    // label's premise was never a bug. Only the final cursor differs by one
+    // column, and it's a harness artifact, not a vimcode bug: this macro's
+    // register content ends mid-Insert-mode with no real `<Esc>` (the
+    // literal string "<Esc>" was yanked as ordinary text, not typed as a
+    // keystroke), and `nvim_feedkeys(.., "ntx")` shares Neovim's
+    // `exec_normal()`/`:normal!` machinery, which force-exits an
+    // unterminated Insert/Replace mode with a synthetic `<Esc>` once
+    // typeahead drains (shifting the cursor left by one). Verified against
+    // a real interactive Neovim session (headless `--listen` + `tmux
+    // send-keys`, not this harness's `feedkeys`) that a live `"ay$j@a`
+    // leaves the editor genuinely in Insert mode with the cursor exactly
+    // where vimcode puts it — matching the long-documented "a macro that
+    // ends mid-insert leaves you in Insert mode" Vim behaviour. Adding a
+    // matching force-Escape-on-drain to vimcode's own macro playback would
+    // "fix" this label by breaking that real, load-bearing behaviour for
+    // every other macro that intentionally ends in Insert mode.
     "mac:\"ay then @a executes text",
-    "mac:q register letter uppercase Q",
     "mark:`] after yank",
     "jump:g; g; g,",
     "jump:g; after 2 changes same line",

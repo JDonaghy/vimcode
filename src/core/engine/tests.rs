@@ -6465,6 +6465,40 @@ fn test_macro_recording_saves_to_register() {
     assert_eq!(unnamed_content, "ix\x1b");
 }
 
+/// Runs the macro playback queue to completion (mirrors the conformance
+/// harness's `pump` helper — production UI backends pump every frame).
+fn drain_macro_playback(engine: &mut Engine) {
+    let mut iterations = 0;
+    while !engine.macro_playback_queue.is_empty() && iterations < 10_000 {
+        let _ = engine.advance_macro_playback();
+        iterations += 1;
+    }
+}
+
+#[test]
+fn test_macro_uppercase_register_playback_reads_lowercase() {
+    // `qQ` records into register 'q' (uppercase just selects append-vs-
+    // overwrite, `:h q`), and `@Q` must read back that same register:
+    // register names are case-insensitive for *reads*, only writes
+    // distinguish upper (append) from lower (overwrite) (#890).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab\ncd");
+
+    press_char(&mut engine, 'q');
+    press_char(&mut engine, 'Q'); // qQ: record, appending into register 'q'
+    press_char(&mut engine, 'x'); // delete 'a' -> "b"
+    press_char(&mut engine, 'q'); // stop recording
+
+    let (content, _) = engine.registers.get(&'q').unwrap();
+    assert_eq!(content, "x");
+
+    press_char(&mut engine, '@');
+    press_char(&mut engine, 'Q'); // @Q: replay register 'q' -> delete 'b'
+    drain_macro_playback(&mut engine);
+
+    assert_eq!(engine.buffer().to_string(), "\ncd");
+}
+
 #[test]
 fn test_macro_records_navigation_keys() {
     let mut engine = Engine::new();
@@ -25459,6 +25493,21 @@ fn test_nvim_dot_register() {
     engine.update_syntax();
     engine.feed_keys("iABC<Esc>");
     assert_eq!(engine.last_inserted_text, "ABC");
+}
+
+#[test]
+fn test_nvim_last_command_register() {
+    // ": holds the most recent `:` command line, with no leading colon
+    // (`:h quote_:`, #890).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a a\n");
+    engine.update_syntax();
+    engine.feed_keys(":s/a/b/<CR>");
+    let (content, _) = engine.get_register_content(':').unwrap();
+    assert_eq!(content, "s/a/b/");
+    // And it pastes like any other charwise register.
+    engine.feed_keys("\":p");
+    assert_eq!(engine.buffer().to_string(), "bs/a/b/ a\n");
 }
 
 #[test]
