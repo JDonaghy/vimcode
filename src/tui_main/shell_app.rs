@@ -4835,6 +4835,141 @@ mod tests {
         );
     }
 
+    /// Type `text` into the running shell one character at a time, then
+    /// press Enter — the way a user actually runs an Ex command. Used by
+    /// the `:retab` / `:left` / `:center` driver tests below so they drive
+    /// the real command-line pipeline rather than calling `Engine::execute`.
+    fn run_ex_command<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        text: &str,
+    ) {
+        for ch in text.chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+    }
+
+    /// #878: `:retab {n}` must measure whitespace already in the buffer with
+    /// the *old* `'tabstop'` and only re-emit it under the new one. That is
+    /// precisely a statement about **painted geometry**: `:retab` is defined
+    /// to preserve how the indent *looks*, so the first non-blank character
+    /// of the line must stay in the same screen column across the command.
+    ///
+    /// Asserts on rendered output per `CLAUDE.md` — the painted column of the
+    /// marker via `find_bounds`, never `engine.settings.tabstop` or the
+    /// buffer string, either of which can be right while the screen is wrong
+    /// (the #587/#592 failure shape). The column is *measured* before and
+    /// after rather than hardcoded, per the same rule.
+    ///
+    /// **Verified RED against unfixed `develop`:** the old implementation
+    /// re-measured the existing tab with the *new* tabstop, turning `"\ta"`
+    /// at `ts=4` into two spaces instead of four, so the marker visibly
+    /// jumped two columns left instead of holding position.
+    #[test]
+    fn retab_with_arg_preserves_the_painted_indent_column_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = true;
+        app.engine.settings.tabstop = 4;
+        app.engine
+            .buffer_mut()
+            .insert(0, "\tZQXW878_RETAB_MARKER\n");
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let before = driver
+            .find_bounds("ZQXW878_RETAB_MARKER")
+            .expect("the fixture line should be painted before :retab")
+            .x;
+
+        run_ex_command(&mut driver, ":retab 2");
+
+        let after = driver
+            .find_bounds("ZQXW878_RETAB_MARKER")
+            .expect("the fixture line should still be painted after :retab")
+            .x;
+        assert_eq!(
+            after,
+            before,
+            ":retab must preserve the rendered width of the indent — the marker \
+             was painted at column {before} before `:retab 2` and column {after} \
+             after; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #878: `:center {width}` must indent the line so it is centred in
+    /// `width` columns — a purely visual effect, so the acceptance assertion
+    /// is the painted column of the text moving right, and `:left` putting it
+    /// back at the left margin.
+    ///
+    /// Rendered-output only (`find_bounds`), with both reference columns
+    /// measured from the screen rather than hardcoded.
+    ///
+    /// **Verified RED against unfixed `develop`:** `ex:ce 10` / `ex:le` were
+    /// both listed in `KNOWN_DEVIATIONS` before this branch — `:center` did
+    /// not shift the line at all, so the marker never left the left margin.
+    #[test]
+    fn center_then_left_moves_the_painted_column_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = true;
+        app.engine.settings.tabstop = 4;
+        app.engine.buffer_mut().insert(0, "ZQXW878_CENTER\n");
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let margin = driver
+            .find_bounds("ZQXW878_CENTER")
+            .expect("the fixture line should be painted before :center")
+            .x;
+
+        // "ZQXW878_CENTER" is 14 columns, so centring it in 40 leaves
+        // (40 - 14) / 2 = 13 columns of indent.
+        run_ex_command(&mut driver, ":center 40");
+
+        let centred = driver
+            .find_bounds("ZQXW878_CENTER")
+            .expect("the fixture line should still be painted after :center")
+            .x;
+        assert_eq!(
+            centred - margin,
+            13.0,
+            ":center 40 must paint a 14-column line indented by 13 columns; it \
+             moved from column {margin} to {centred}; screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":left");
+
+        let unindented = driver
+            .find_bounds("ZQXW878_CENTER")
+            .expect("the fixture line should still be painted after :left")
+            .x;
+        assert_eq!(
+            unindented,
+            margin,
+            ":left must paint the line back at the left margin (column {margin}), \
+             not column {unindented}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #601: `render_content` must also paint per-editor-group tab bars —
     /// exercise the multi-window code path (`render_all_windows` +
     /// `render::tab_bar_draw_targets` for `screen.editor_group_split`) by
