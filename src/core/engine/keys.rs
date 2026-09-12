@@ -1764,7 +1764,15 @@ impl Engine {
                 self.pending_operator = Some('!');
             }
             Some('u') => {
-                self.undo();
+                // `[count]u` undoes `count` changes (`:h u`), not just one —
+                // stop early if we run out of history rather than looping
+                // past the oldest change.
+                let count = self.take_count();
+                for _ in 0..count {
+                    if !self.undo() {
+                        break;
+                    }
+                }
                 self.refresh_md_previews();
             }
             Some('U') => {

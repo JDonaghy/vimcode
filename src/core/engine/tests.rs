@@ -1600,6 +1600,43 @@ fn test_undo_x_delete() {
 }
 
 #[test]
+fn test_undo_counted_3u_undoes_three_changes() {
+    // `[count]u` undoes `count` changes (#885), not just one. Four separate
+    // `x` presses are four separate undo groups; `3u` must unwind exactly
+    // three of them, leaving the *first* x's effect in place.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "ef");
+
+    press_char(&mut engine, '3');
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "bcdef");
+}
+
+#[test]
+fn test_undo_counted_2u_stops_when_history_runs_out() {
+    // A count larger than the available history undoes everything there is
+    // and stops cleanly, matching Vim's `u` behaviour of not erroring past
+    // the oldest change.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "bc");
+
+    press_char(&mut engine, '9');
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "abc");
+}
+
+#[test]
 fn test_undo_dd_delete_line() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "line1\nline2\nline3");
