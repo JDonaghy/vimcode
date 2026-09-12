@@ -8163,10 +8163,19 @@ impl Engine {
                 // special-cases it: instead of inserting a literal character,
                 // each selected line is split into two at the block column
                 // (`:h v_b_r`; #807, `vb:jr<CR>`). Char/line-wise Visual `r`
-                // does NOT get that special-case — verified against real
-                // Neovim (#887, "vis:v_r CR"): it replaces the whole selection
-                // with a literal carriage-return character, same as any other
-                // single-character replacement, not an actual line split.
+                // does NOT get that special-case — this was re-verified
+                // empirically against the live nvim 0.12.5 oracle while fixing
+                // #887 review feedback that assumed the opposite: running
+                // `["abc"]` with `b` selected via `v` and `r<CR>` through
+                // `nvim_buf_get_lines` returns a *single* line containing a
+                // literal embedded `\r` byte (`"a\rc"`), not two lines split
+                // on a real `\n` (`"a"`, `"c"`). So despite `:h v_r`'s "a line
+                // break is inserted instead" wording, real Neovim's Visual `r`
+                // does not actually split the line — it inserts the literal
+                // carriage-return character, same as any other
+                // single-character replacement. Do not change this to `'\n'`
+                // without re-running the oracle; a prior review claimed `'\n'`
+                // was required and was wrong (see PROBE_FILTER="v_r CR").
                 if self.mode == Mode::VisualBlock && matches!(key_name, "Return" | "KP_Enter") {
                     self.replace_visual_block_with_newline(changed);
                 } else if matches!(key_name, "Return" | "KP_Enter") {

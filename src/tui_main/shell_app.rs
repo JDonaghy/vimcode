@@ -13498,4 +13498,236 @@ mod tests {
             driver.screen()
         );
     }
+
+    /// #887: pressing a paragraph text object a second time while already
+    /// inside an active Visual selection must *grow* the selection to the
+    /// next paragraph block, not reselect the current one. Verified against
+    /// `nvim --headless -u NONE` (0.12.5) as the `tests/nvim_conformance.rs`
+    /// oracle case "vis:vip then ip extends" (`vipipd`): starting on the
+    /// first of three one-line paragraphs, `vip` selects just that line;
+    /// a second `ip` grows it to also swallow the following blank line, so
+    /// `d` deletes exactly the first paragraph plus the blank line after it.
+    ///
+    /// **Verified RED against unfixed `develop`:** the second `ip` re-found
+    /// the same single-line paragraph from the cursor, so `vipipd` behaved
+    /// identically to a single `vipd` — leaving the blank line in place.
+    #[test]
+    fn visual_ip_repeated_extends_to_next_paragraph_via_shell_app() {
+        const P1: &str = "ZQXW887A1";
+        const P2: &str = "ZQXW887A2";
+        const P3: &str = "ZQXW887A3";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{P1}\n\n{P2}\n\n{P3}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in "vipipd".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(P1),
+            "vipipd must delete the first paragraph; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(P2) && screen.contains(P3),
+            "vipipd must not touch paragraphs beyond the one it grew into; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #887: Visual mode previously had no handler for `` ` `` at all, so
+    /// `` v`a `` could not extend a charwise selection to a mark. Verified
+    /// against `nvim --headless -u NONE` (0.12.5) as the
+    /// `tests/nvim_conformance.rs` oracle case "vis:v'a? mark d"
+    /// (`magg0v\`ad`): mark `a` at the second character of line 2, jump back
+    /// to the buffer start, extend a charwise Visual selection to the mark,
+    /// and delete — the deletion spans from the very first character
+    /// through the marked one, inclusive.
+    ///
+    /// **Verified RED against unfixed `develop`:** `` ` `` inside Visual
+    /// mode had no effect at all, so `d` deleted only the single character
+    /// under the cursor at the buffer start.
+    #[test]
+    fn visual_backtick_mark_extends_selection_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXW887B1\nZQXW887B2");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Move to line 2, column 2 (1-indexed) to match the oracle case's
+        // starting cursor, then run the real key sequence.
+        driver.type_char('j');
+        driver.type_char('l');
+        for c in "magg0v`ad".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW887B1") && !screen.contains("ZQXW887B2"),
+            "v`ad must delete through the mark, removing both original \
+             lines' full text; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("XW887B2"),
+            "v`ad must leave everything after the marked column intact; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #887: Visual `c`'s delete-then-insert used to open two separate undo
+    /// groups (the delete finished its own, then a fresh one opened for the
+    /// typed replacement text), so a single `u` only undid the typed text
+    /// and left the deletion applied. Verified against
+    /// `nvim --headless -u NONE` (0.12.5) as the `tests/nvim_conformance.rs`
+    /// oracle case "vis:vjc then u" (`vjcX<Esc>u`): one `u` must restore the
+    /// buffer to exactly its pre-change state, cursor included.
+    ///
+    /// Cursor position is read back via a following `x`, matching this
+    /// file's established convention for driver tests (see #880's join
+    /// tests above) — whichever character vanishes reports where the
+    /// cursor actually landed after `u`.
+    ///
+    /// **Verified RED against unfixed `develop`:** `u` only undid the typed
+    /// `X`, so the buffer stayed at the post-delete state instead of fully
+    /// restoring the original two lines.
+    #[test]
+    fn visual_change_then_undo_is_one_step_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXW887C1\nZQXW887C2");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Column 2 (1-indexed), matching the oracle case's starting cursor.
+        driver.type_char('l');
+        for c in "vjcX".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.type_char('u');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW887C1") && screen.contains("ZQXW887C2"),
+            "a single u after vjcX<Esc> must fully restore both original \
+             lines, not just undo the typed replacement; screen:\n{screen}"
+        );
+
+        // Cursor must be back at column index 1 (the 'Q'): `x` there
+        // removes the 'Q', leaving "ZXW887C1".
+        driver.type_char('x');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZXW887C1") && !screen.contains("ZQXW887C1"),
+            "cursor after u must be back at the selection start (column 1), \
+             so x deletes 'Q'; screen:\n{screen}"
+        );
+    }
+
+    /// #887: `ap`'s trailing-blank-block preference must fall back to the
+    /// *leading* blank block when the cursor's paragraph is the last one in
+    /// the buffer (no trailing blank exists to select instead). Verified
+    /// against `nvim --headless -u NONE` (0.12.5) as the
+    /// `tests/nvim_conformance.rs` oracle case "vis:v ap trailing"
+    /// (`vapd`): with a leading paragraph, a blank line, then a two-line
+    /// trailing paragraph and no trailing blank, `ap` from the last
+    /// paragraph must also take the leading blank line.
+    ///
+    /// **Verified RED against unfixed `develop`:** `ap` selected only the
+    /// non-blank lines with no blank fallback, leaving the blank line (and
+    /// the asymmetry with the mirrored oracle case "vip on last para no
+    /// trailing" below) unexercised.
+    #[test]
+    fn visual_ap_on_last_paragraph_takes_leading_blank_via_shell_app() {
+        const D1: &str = "ZQXW887D1";
+        const D2: &str = "ZQXW887D2";
+        const D3: &str = "ZQXW887D3";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{D1}\n\n{D2}\n{D3}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Line 3 (1-indexed), the start of the trailing (last) paragraph.
+        driver.type_char('j');
+        driver.type_char('j');
+        for c in "vapd".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(D2) && !screen.contains(D3),
+            "vapd on the last paragraph must delete both its lines; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(D1),
+            "vapd on the last paragraph must also take the leading blank \
+             line, but must not touch the paragraph before it; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #887: unlike `ap`, `ip` never falls back to an adjacent blank block
+    /// — even on the last paragraph with nothing trailing, `ip` must delete
+    /// only the non-blank lines and leave a leading blank line untouched.
+    /// This is the direct counterpart to the `ap` case above: same buffer
+    /// shape, different text object, different (correct) outcome. Verified
+    /// against `nvim --headless -u NONE` (0.12.5) as the
+    /// `tests/nvim_conformance.rs` oracle case "vis:vip on last para no
+    /// trailing" (`vipd`).
+    ///
+    /// **Verified RED against unfixed `develop`:** this label shared the
+    /// same cursor-clamp bug as the `ap` case (a charwise Visual delete
+    /// that consumes the buffer's trailing lines left the cursor's line
+    /// index pointing past the shortened buffer).
+    #[test]
+    fn visual_ip_on_last_paragraph_excludes_blank_via_shell_app() {
+        const E1: &str = "ZQXW887E1";
+        const E2: &str = "ZQXW887E2";
+        const E3: &str = "ZQXW887E3";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{E1}\n\n{E2}\n{E3}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Line 4 (1-indexed), the last line of the trailing paragraph.
+        driver.type_char('j');
+        driver.type_char('j');
+        driver.type_char('j');
+        for c in "vipd".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(E2) && !screen.contains(E3),
+            "vipd must delete both lines of the last paragraph; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(E1),
+            "vipd must not touch the paragraph before the blank line; \
+             screen:\n{screen}"
+        );
+    }
 }
