@@ -13906,4 +13906,133 @@ mod tests {
              line's last column; screen:\n{screen}"
         );
     }
+
+    // ── #889 (Vim compat: gd / gN) ─────────────────────────────────────────
+
+    /// `gd` is Vim's **local declaration** motion (`:h gd`), not an LSP
+    /// request: it searches back to the start of the enclosing function (or
+    /// the top of the file when there is none) and jumps to the first
+    /// whole-word occurrence of the identifier under the cursor. Verified
+    /// against `nvim --headless -u NONE` as the `tests/nvim_conformance.rs`
+    /// oracle case "search:gd".
+    ///
+    /// The landing position is read back through a following `x`, this
+    /// file's established convention for driver tests (see the #880 join
+    /// tests above): whichever character vanishes from the *painted* screen
+    /// reports where the cursor actually is.
+    ///
+    /// **Verified RED against unfixed `develop`:** `gd` was wired to
+    /// `lsp_request_definition()`, which with no language server attached
+    /// moves nothing — so `x` deleted from the *use* site on line 2,
+    /// painting "use QXW889A" and leaving "int ZQXW889A" intact, the exact
+    /// inverse of the assertions below.
+    #[test]
+    fn gd_jumps_to_the_local_declaration_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "int ZQXW889A = 1;\nuse ZQXW889A here");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Put the cursor on the *second* occurrence (line 2, second word).
+        driver.type_char('j');
+        driver.type_char('w');
+        // gd → jump to the declaration; x → delete the char landed on.
+        driver.type_char('g');
+        driver.type_char('d');
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("int QXW889A"),
+            "gd must land on the first whole-word occurrence (line 1), so x \
+             deletes its leading 'Z'; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("use ZQXW889A"),
+            "gd must move the cursor off the use site, leaving line 2 \
+             untouched; screen:\n{screen}"
+        );
+    }
+
+    /// `:h gN` — "If the cursor is on the match, visually selects it." That
+    /// clause outranks the backward search, so `gN` while sitting inside a
+    /// match must reselect *that* match rather than skipping past it to the
+    /// previous one. Verified against `nvim --headless -u NONE` as the
+    /// `tests/nvim_conformance.rs` oracle case "search:gN".
+    ///
+    /// **Verified RED against unfixed `develop`:** the backward branch used
+    /// a strict `start < cursor` comparison, so `gN` skipped the match under
+    /// the cursor and selected the earlier one — `d` then deleted the
+    /// *first* occurrence, painting "A gap ZQXW889PB" instead of the
+    /// "ZQXW889PA gap B" asserted below.
+    #[test]
+    #[allow(non_snake_case)]
+    fn gN_reselects_the_match_under_the_cursor_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXW889PA gap ZQXW889PB");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Search forward: the cursor starts inside the first match, so this
+        // lands it on the second one.
+        driver.type_char('/');
+        for c in "ZQXW889P".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen_contains("ZQXW889PA gap ZQXW889PB"),
+            "sanity: the search must not have edited the line; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('g');
+        driver.type_char('N');
+        driver.type_char('d');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW889PA gap B"),
+            "gN on a match must reselect that match, so d removes the second \
+             occurrence and leaves its trailing 'B'; screen:\n{screen}"
+        );
+    }
+
+    /// The editor context menu's "Go to Definition" row advertises a key
+    /// that actually invokes the language server. Since #889 gave `gd` back
+    /// to Vim's local-declaration motion, that key is the tag jump
+    /// `Ctrl-]` (`keys.rs`, the `"bracketright"` arm) — the menu must paint
+    /// the new hint, not the stale `gd`.
+    ///
+    /// **Verified RED against unfixed `develop`:** the painted shortcut
+    /// column read `gd`, so the `Ctrl+]` assertion below failed.
+    #[test]
+    fn editor_context_menu_paints_the_ctrl_bracket_definition_hint_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.right_click(40.0, 6.0);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Go to Definition"),
+            "right-clicking the editor must paint the editor context menu; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ctrl+]"),
+            "the Go to Definition row must advertise the tag-jump key that \
+             actually reaches the LSP (#889); screen:\n{screen}"
+        );
+    }
 }

@@ -1152,11 +1152,7 @@ impl Engine {
                     if i > 0 {
                         full_markdown.push_str(" | ");
                     }
-                    if keybind.is_empty() {
-                        full_markdown.push_str(&format!("[{label}]({url})"));
-                    } else {
-                        full_markdown.push_str(&format!("[{label}]({url}) (:{keybind})"));
-                    }
+                    full_markdown.push_str(&format!("[{label}]({url}) (:{keybind})"));
                 }
             }
         }

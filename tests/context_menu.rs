@@ -1310,7 +1310,9 @@ fn test_editor_context_menu_shortcuts_vim_mode() {
     let cm = e.context_menu.as_ref().unwrap();
 
     // Vim-style shortcuts.
-    assert_eq!(cm.items[0].shortcut, "gd");
+    // `gd` is Vim's local-declaration motion (#889); the LSP go-to-definition
+    // key in Vim mode is the tag jump `Ctrl-]`.
+    assert_eq!(cm.items[0].shortcut, "Ctrl+]");
     assert_eq!(cm.items[1].shortcut, "gr");
     assert_eq!(cm.items[2].shortcut, "<leader>rn");
     assert_eq!(cm.items[3].shortcut, "gD");
