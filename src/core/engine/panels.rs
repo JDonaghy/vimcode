@@ -1533,7 +1533,9 @@ impl Engine {
             return result;
         };
         if mgr.server_supports(&path, "definitionProvider") {
-            result.push(("Definition", "gd", "command:definition"));
+            // `gd` is Vim's local-declaration motion, not this LSP command
+            // (:h gd) — no plain-Vim-mode key triggers it, so no hint here.
+            result.push(("Definition", "", "command:definition"));
         }
         if mgr.server_supports(&path, "typeDefinitionProvider") {
             result.push(("Type Definition", "gy", "command:type_definition"));

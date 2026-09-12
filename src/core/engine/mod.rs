@@ -600,7 +600,9 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
     PaletteCommand {
         label: "Go: Go to Definition",
-        shortcut: "gd",
+        // `gd` is Vim's local-declaration motion, not this LSP command (:h gd)
+        // — no plain-Vim-mode key triggers this palette action.
+        shortcut: "",
         vscode_shortcut: "F12",
         action: "lsp_definition",
     },
@@ -1890,7 +1892,7 @@ it at               Inner / around HTML/XML tag
 
 ── g-Commands ──────────────────────────────────────────
 gg                  Go to first line
-gd                  Go to definition (LSP)                :def
+gd                  Go to local declaration
 gr                  Find references (LSP)                 :refs
 gy                  Go to type definition (LSP)           :LspTypedef
 gi                  Insert at last insert position

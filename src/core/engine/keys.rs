@@ -2250,8 +2250,9 @@ impl Engine {
                     return self.cmd_git_stage_hunk();
                 }
                 Some('d') => {
-                    self.push_jump_location();
-                    self.lsp_request_definition();
+                    // gd: go to local declaration — pure motion, no LSP
+                    // involved (:h gd). See `Engine::cmd_gd`.
+                    self.cmd_gd();
                 }
                 Some('D') => {
                     self.open_diff_peek();
@@ -4820,7 +4821,20 @@ impl Engine {
         let col = self.view().cursor.col;
         let cursor_char = self.buffer().line_to_char(line) + col;
 
-        let idx = if backward {
+        // `:h gn` / `:h gN` — "If the cursor is on the match, visually
+        // selects it." This applies regardless of direction, and takes
+        // priority over searching forward/backward: a strict `<`/`>=`
+        // comparison against the cursor would otherwise skip straight past
+        // the match the cursor is already sitting in (wrapping `gN` to the
+        // *last* match instead of reselecting the current one, #889).
+        let on_match = self
+            .search_matches
+            .iter()
+            .position(|&(start, end)| cursor_char >= start && cursor_char < end);
+
+        let idx = if let Some(i) = on_match {
+            i
+        } else if backward {
             self.search_matches
                 .iter()
                 .rposition(|(start, _)| *start < cursor_char)
