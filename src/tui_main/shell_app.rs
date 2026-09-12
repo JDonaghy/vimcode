@@ -4970,6 +4970,254 @@ mod tests {
         );
     }
 
+    /// #892: `cw` on trailing whitespace at the end of a line, with no word
+    /// after it and no further line to land on, used to be a total no-op —
+    /// the shared `dw`-style `w`-motion clamped back onto the same last
+    /// character instead of advancing, so the range `cw` computed was empty.
+    /// `cw` must still consume the trailing whitespace and enter insert mode,
+    /// same as a plain `dw` would delete, just without joining any line.
+    ///
+    /// Asserts on rendered output (`screen.contains`), not engine/buffer
+    /// state, per `CLAUDE.md`.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the no-op bug, `cw`
+    /// never entered insert mode, so the trailing `X` was consumed as a
+    /// stray Normal-mode keystroke instead of typed text — the screen never
+    /// painted `ZQXW892abX`, only the unchanged marker with its trailing
+    /// space.
+    #[test]
+    fn cw_on_trailing_eol_whitespace_replaces_only_whitespace_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXW892ab ");
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('$'); // land on the trailing space, the line's last char
+        driver.type_char('c');
+        driver.type_char('w');
+        driver.type_char('X');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW892abX"),
+            "cw on trailing EOL whitespace should replace just that whitespace \
+             with 'X', painting 'ZQXW892abX'; screen:\n{screen}"
+        );
+    }
+
+    /// #892: `cw` on a completely empty line must not join it with the next
+    /// line — unlike a plain `dw`, which does join an empty line with the
+    /// next one (real Neovim behavior, matched by
+    /// `apply_operator_with_motion`). There is nothing on the line to
+    /// change, so `cw` just enters insert mode on the still-empty line, like
+    /// `s` would.
+    ///
+    /// Drives the real key pipeline and asserts on the painted rows: the
+    /// marker on line 2 must stay on its own screen row, with the typed `X`
+    /// painted alone on the row above it — never spliced onto the same row
+    /// as the marker.
+    ///
+    /// **Verified RED against unfixed `develop`:** `cw` on the empty first
+    /// line joined it with line 2, painting `XZQXW892_L2MARKER` on a single
+    /// row instead of `X` and `ZQXW892_L2MARKER` on two separate rows.
+    #[test]
+    fn cw_on_empty_line_does_not_join_next_line_via_shell_app() {
+        const MARKER: &str = "ZQXW892_L2MARKER";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, &format!("\n{MARKER}"));
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let marker_row_before = driver
+            .find_bounds(MARKER)
+            .expect("the fixture marker should be painted before cw")
+            .y;
+
+        driver.type_char('c');
+        driver.type_char('w');
+        driver.type_char('X');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        let marker_row_after = driver
+            .find_bounds(MARKER)
+            .expect("the fixture marker should still be painted, on its own row, after cw")
+            .y;
+
+        assert_eq!(
+            marker_row_after, marker_row_before,
+            "cw on an empty line must not join it with the next line — the marker's \
+             row should not move; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains(&format!("X{MARKER}")),
+            "cw on an empty line must not splice the typed text onto the next line; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains('X'),
+            "cw on an empty line should still enter insert mode and paint the typed \
+             'X' on the (still separate) first line; screen:\n{screen}"
+        );
+    }
+
+    /// #892: `S` (substitute line) yanks the deleted line **linewise** into
+    /// the unnamed register (`:h registers`, matching `cc` per #806), so a
+    /// following `P` must put it back as a whole line above the cursor
+    /// rather than splicing it inline into the following line's text.
+    ///
+    /// Drives `S` then `j` then `P` through the real key pipeline and
+    /// asserts on the painted rows: after the sequence there must be three
+    /// separate rows — the typed `X`, then the two original marker lines
+    /// restored in order — never the substituted marker spliced into the
+    /// second line's text.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `S`'s deletion
+    /// recorded charwise, `P` pasted the first marker inline at the cursor
+    /// column of the second marker's line, painting them concatenated on a
+    /// single row instead of on two separate rows.
+    #[test]
+    fn s_then_p_pastes_whole_line_via_shell_app() {
+        const LINE1: &str = "ZQXW892_SA";
+        const LINE2: &str = "ZQXW892_SB";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}"));
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let line2_row_before = driver
+            .find_bounds(LINE2)
+            .expect("the second fixture line should be painted before S")
+            .y;
+
+        driver.type_char('S');
+        driver.type_char('X');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.type_char('j');
+        driver.type_char('P');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&format!("{LINE1}{LINE2}")),
+            "S then P must not splice the substituted line inline into the \
+             following line's text; screen:\n{screen}"
+        );
+
+        let line1_after = driver
+            .find_bounds(LINE1)
+            .expect("the first fixture line should be repainted as its own row after P")
+            .y;
+        let line2_after = driver
+            .find_bounds(LINE2)
+            .expect("the second fixture line should still be painted after P")
+            .y;
+        assert_eq!(
+            line1_after, line2_row_before,
+            "P should paste the substituted line back where line 2 used to be, \
+             pushing line 2 down by one row; screen:\n{screen}"
+        );
+        assert_eq!(
+            line2_after,
+            line2_row_before + 1.0,
+            "line 2 should have been pushed down exactly one row by P's linewise \
+             paste; screen:\n{screen}"
+        );
+    }
+
+    /// #892: `gp` with a charwise register spanning multiple lines must
+    /// leave the cursor just after the pasted text. When the last pasted
+    /// character is immediately followed by what used to continue the
+    /// original line, "just after" lands exactly on that line's own
+    /// trailing newline — a Normal-mode cursor can never rest there, so it
+    /// must clamp back onto the last real column instead.
+    ///
+    /// Verifies the *rendered* cursor cell rather than engine state: after
+    /// `gp`, typing `i` (insert-before-cursor) and a marker reveals exactly
+    /// where the cursor landed, because the marker paints immediately in
+    /// front of whatever cell the cursor was on.
+    ///
+    /// **Verified RED against unfixed `develop`:** the cursor rested one
+    /// column into the following line's trailing newline, so the `i`-typed
+    /// marker painted attached to the wrong text (spliced into "cd" instead
+    /// of landing in front of the lone "c" line).
+    #[test]
+    fn gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app() {
+        const MARKER: &str = "ZQXW892GP";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ab\ncd");
+        assert_eq!(
+            app.engine.windows.len(),
+            1,
+            "setup sanity: this test measures editor-pane geometry, so it needs \
+             exactly one unsplit window"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // v j y $: visually select "ab\nc" and yank it charwise, then move to
+        // the last column of line 0.
+        driver.type_char('v');
+        driver.type_char('j');
+        driver.type_char('y');
+        driver.type_char('$');
+        // gp: paste after cursor, landing the cursor just past the pasted text.
+        driver.type_char('g');
+        driver.type_char('p');
+        // Reveal the landed cursor cell by inserting a marker right there.
+        driver.type_char('i');
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(&format!("{MARKER}c")),
+            "gp should land the cursor on the pasted-in 'c' line (not past it), \
+             so inserting a marker there should paint '{MARKER}c' on its own row; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains(&format!("{MARKER}cd")),
+            "gp must not leave the cursor resting on/after the line's trailing \
+             newline — the marker must not land in front of the original 'cd' \
+             line; screen:\n{screen}"
+        );
+    }
+
     /// #601: `render_content` must also paint per-editor-group tab bars —
     /// exercise the multi-window code path (`render_all_windows` +
     /// `render::tab_bar_draw_targets` for `screen.editor_group_split`) by
