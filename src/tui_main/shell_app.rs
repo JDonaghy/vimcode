@@ -5231,6 +5231,212 @@ mod tests {
         );
     }
 
+    /// #882: `2cc` changes exactly the two lines the count names, not just
+    /// the first one. Verified against `nvim --headless -u NONE` (0.12.5) as
+    /// the `tests/nvim_conformance.rs` oracle case "op:2cc".
+    ///
+    /// **Verified RED against unfixed `develop`:** the old multi-line path
+    /// deleted the first line's content then `break`'d out of the loop, so
+    /// `2cc` behaved exactly like plain `cc` and left the second line's
+    /// original text painted on screen.
+    #[test]
+    fn operator_count_2cc_changes_two_lines_via_shell_app() {
+        const LINE1: &str = "ZQXW882_2CC_A";
+        const LINE2: &str = "ZQXW882_2CC_B";
+        const LINE3: &str = "ZQXW882_2CC_C";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}\n{LINE3}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('2');
+        driver.type_char('c');
+        driver.type_char('c');
+        for c in "REPLACED2CC".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("REPLACED2CC"),
+            "2cc must drop into insert mode over the deleted lines; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains(LINE1) && !screen.contains(LINE2),
+            "2cc must delete the content of both named lines, not just the first; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(LINE3),
+            "2cc must not touch the line beyond the count; screen:\n{screen}"
+        );
+    }
+
+    /// #882: `c3c` — the count placed *between* the operator and its
+    /// doubled letter — means the same as `3cc`. Verified against
+    /// `nvim --headless -u NONE` (0.12.5) as the `tests/nvim_conformance.rs`
+    /// oracle case "misc:c3c".
+    ///
+    /// **Verified RED against unfixed `develop`:** the mid-doubled count
+    /// parsed correctly, but the multi-line deletion loop it fed still hit
+    /// the same first-line-then-`break` bug as `2cc`, so only the first of
+    /// the three named lines was actually changed.
+    #[test]
+    fn operator_count_c3c_changes_three_lines_via_shell_app() {
+        const LINE1: &str = "ZQXW882_C3C_A";
+        const LINE2: &str = "ZQXW882_C3C_B";
+        const LINE3: &str = "ZQXW882_C3C_C";
+        const LINE4: &str = "ZQXW882_C3C_D";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}\n{LINE3}\n{LINE4}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('c');
+        driver.type_char('3');
+        driver.type_char('c');
+        for c in "REPLACEDC3C".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("REPLACEDC3C"),
+            "c3c must drop into insert mode over the deleted lines; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains(LINE1) && !screen.contains(LINE2) && !screen.contains(LINE3),
+            "c3c must delete the content of all three named lines; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(LINE4),
+            "c3c must not touch the line beyond the count; screen:\n{screen}"
+        );
+    }
+
+    /// #882: `[count]dd` aborts the whole command — deleting nothing — when
+    /// the cursor is already on the last line and the count would require
+    /// moving past it, the same "motion can't move at all" rule already
+    /// applied to `dj`/`dk`. Verified against `nvim --headless -u NONE`
+    /// (0.12.5) as the `tests/nvim_conformance.rs` oracle case
+    /// "op:5dd from last line".
+    ///
+    /// **Verified RED against unfixed `develop`:** `dd`'s count clamped
+    /// unconditionally, so `5dd` from the last line still deleted that one
+    /// line instead of beeping and leaving the buffer untouched.
+    #[test]
+    fn operator_count_5dd_from_last_line_aborts_via_shell_app() {
+        const LINE1: &str = "ZQXW882_5DD_A";
+        const LINE2: &str = "ZQXW882_5DD_B";
+        const LINE3: &str = "ZQXW882_5DD_C";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}\n{LINE3}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('G');
+        driver.type_char('5');
+        driver.type_char('d');
+        driver.type_char('d');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(LINE1) && screen.contains(LINE2) && screen.contains(LINE3),
+            "5dd from the last line must abort and delete nothing; screen:\n{screen}"
+        );
+    }
+
+    /// #882: same abort rule as `5dd from last line`, but with the smallest
+    /// count that can trigger it. Verified against
+    /// `nvim --headless -u NONE` (0.12.5) as the `tests/nvim_conformance.rs`
+    /// oracle case "misc:2dd on last".
+    ///
+    /// **Verified RED against unfixed `develop`:** `2dd` on the last line of
+    /// a two-line buffer deleted that line instead of aborting.
+    #[test]
+    fn operator_count_2dd_on_last_line_aborts_via_shell_app() {
+        const LINE1: &str = "ZQXW882_2DD_A";
+        const LINE2: &str = "ZQXW882_2DD_B";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('G');
+        driver.type_char('2');
+        driver.type_char('d');
+        driver.type_char('d');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(LINE1) && screen.contains(LINE2),
+            "2dd on the last line must abort and delete nothing; screen:\n{screen}"
+        );
+    }
+
+    /// #882: unlike `[count]dd`, `[count]cc` never aborts — a count that
+    /// overruns the buffer just clamps to however many lines exist and
+    /// changes all of them. Verified against `nvim --headless -u NONE`
+    /// (0.12.5) as the `tests/nvim_conformance.rs` oracle case
+    /// "misc:cc with count beyond": `5cc` on a two-line buffer changes both
+    /// lines rather than beeping.
+    ///
+    /// **Verified RED against unfixed `develop`:** the old multi-line path
+    /// deleted only the first line's content then `break`'d, so `5cc` here
+    /// behaved like plain `cc` and left the second line's original text
+    /// painted on screen.
+    #[test]
+    fn operator_count_5cc_beyond_buffer_clamps_via_shell_app() {
+        const LINE1: &str = "ZQXW882_5CC_A";
+        const LINE2: &str = "ZQXW882_5CC_B";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('5');
+        driver.type_char('c');
+        driver.type_char('c');
+        for c in "REPLACED5CC".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("REPLACED5CC"),
+            "5cc beyond the buffer must still drop into insert mode over the \
+             clamped range; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains(LINE1) && !screen.contains(LINE2),
+            "5cc beyond the buffer must clamp and change every line, not abort; \
+             screen:\n{screen}"
+        );
+    }
+
     /// #892: `S` (substitute line) yanks the deleted line **linewise** into
     /// the unnamed register (`:h registers`, matching `cc` per #806), so a
     /// following `P` must put it back as a whole line above the cursor
