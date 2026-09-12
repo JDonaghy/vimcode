@@ -5712,16 +5712,23 @@ impl Engine {
             // The newline is the last char of the current line
             let newline_pos = cur_line_start + cur_line_len - 1;
 
-            // Count leading whitespace on next line
+            // Count leading whitespace on next line. Strip the trailing
+            // newline first — `Rope::line()` includes it, and without
+            // stripping it a blank (or all-whitespace) next line reads its
+            // own line terminator as a "next non-whitespace char", wrongly
+            // triggering a space insert (#880, "op:J next blank").
             let next_line_start = self.buffer().line_to_char(next_line);
             let next_line_content: String = self.buffer().content.line(next_line).chars().collect();
-            let leading_ws = next_line_content
+            let next_line_text = next_line_content
+                .strip_suffix('\n')
+                .unwrap_or(&next_line_content);
+            let leading_ws = next_line_text
                 .chars()
                 .take_while(|c| *c == ' ' || *c == '\t')
                 .count();
 
             // Determine what char comes after the whitespace on the next line
-            let next_non_ws = next_line_content.chars().nth(leading_ws);
+            let next_non_ws = next_line_text.chars().nth(leading_ws);
 
             // Delete: newline + leading whitespace of next line
             let del_end = next_line_start + leading_ws;
@@ -5754,13 +5761,18 @@ impl Engine {
                 ins_len,
             );
 
-            if insert_space {
-                // Cursor at the inserted space
-                join_col = newline_pos - cur_line_start;
-            } else {
-                // No space inserted — cursor at last char before where next line starts
-                join_col = (newline_pos - cur_line_start).saturating_sub(1);
-            }
+            // Cursor lands at the join point: where the space was inserted,
+            // or — when no space is inserted — where the next line's first
+            // surviving character now sits (e.g. landing on `)` for
+            // "foo(" + ")"，or on the char after an already-trailing space).
+            // That's the same offset either way: `newline_pos` is exactly
+            // where the deleted newline+leading-whitespace region started,
+            // so whatever now occupies that position (inserted space, or
+            // the next line's first non-ws char) is the join point. When
+            // the next line was blank there's nothing to land on there —
+            // `clamp_cursor_col` below pulls the cursor back onto the last
+            // char of the (now merged) line, matching Vim (#880).
+            join_col = newline_pos - cur_line_start;
         }
         self.finish_undo_group();
 

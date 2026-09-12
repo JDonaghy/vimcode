@@ -8880,6 +8880,37 @@ fn test_join_lines_last_line_noop() {
     assert_eq!(engine.buffer().to_string(), "only line");
 }
 
+// #880: cursor placement on the three "no space inserted" J variants —
+// each verified against `nvim --headless` (0.12.5) via `tests/nvim_conformance.rs`
+// ("op:J next starts with )", "op:J next blank", "op:J current ends with
+// space"). Vim leaves the cursor at the join point: the position that
+// either receives the inserted space, or — when nothing is inserted — is
+// occupied by the next line's first surviving character (clamped back onto
+// the last char of the merged line when there is no such character, i.e.
+// the next line was blank).
+
+#[test]
+fn test_join_lines_no_space_before_paren_cursor_on_paren() {
+    // Cursor lands ON the ')', not on the last char of the first line.
+    nvim_case("foo(\n  )\n", 0, 0, "J", "foo()\n", 0, 4);
+}
+
+#[test]
+fn test_join_lines_blank_next_line_no_trailing_space() {
+    // Joining onto a blank line adds no space and leaves none behind; the
+    // cursor clamps onto the last char of the (now merged, still one-char)
+    // line rather than landing past it.
+    nvim_case("a\n\nb\n", 0, 0, "J", "a\nb\n", 0, 0);
+}
+
+#[test]
+fn test_join_lines_current_ends_with_space_cursor_on_next_char() {
+    // First line already ends with a space: no second space is added, and
+    // the cursor lands on the next line's first char, not on the trailing
+    // space that was already there.
+    nvim_case("a \nb\n", 0, 0, "J", "a b\n", 0, 2);
+}
+
 // =======================================================================
 // Tests: Search word under cursor (* / #)
 // =======================================================================
@@ -25453,9 +25484,11 @@ fn test_nvim_j_join_strips_indent() {
 
 #[test]
 fn test_nvim_j_join_trailing_space() {
-    // J on line with trailing spaces: Neovim doesn't add another space.
-    // VimCode adds one, giving "aaa    bbb" instead of "aaa   bbb".
-    nvim_case("aaa   \nbbb\n", 0, 0, "J", "aaa   bbb\n", 0, 5);
+    // J on line with trailing spaces: Neovim doesn't add another space, and
+    // the cursor lands on the first char of the appended line (col 6, on
+    // 'b'), not on the last of the pre-existing trailing spaces (#880;
+    // verified directly against `nvim --headless` with this exact buffer).
+    nvim_case("aaa   \nbbb\n", 0, 0, "J", "aaa   bbb\n", 0, 6);
 }
 
 // ── Phase 4 Batch 6: Tilde at EOL ───────────────────────────────────────

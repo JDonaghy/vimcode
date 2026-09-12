@@ -3653,10 +3653,15 @@ const CATEGORIES: &[(&str, &[Case])] = &[
 const KNOWN_DEVIATIONS: &[&str] = &[
     "op:2cc",
     "op:5dd from last line",
+    // #880: `run_in_vimcode` never reads a case's Lua `setup` (see
+    // `HARNESS_LIMITED`/#875 below) — this case's `setup` turns on
+    // `vim.o.joinspaces` on the Neovim oracle side only, so vimcode always
+    // runs with `joinspaces` at its default (off) regardless of whether the
+    // engine implements the option. It cannot pass by construction until
+    // `setup` is wired through `run_in_vimcode`. The other three "op:J"
+    // labels this issue owned (next starts with `)`, next blank, current
+    // ends with space) are fixed and deleted from this list.
     "op:J after period (vim joinspaces)",
-    "op:J next starts with )",
-    "op:J next blank",
-    "op:J current ends with space",
     // #883: this is a `cs(..)` case pinning `vim.o.startofline = true` on the
     // Neovim oracle side. `run_in_vimcode` never reads a case's `setup` (see
     // the `HARNESS_LIMITED` doc comment below and #875) — the vimcode side
