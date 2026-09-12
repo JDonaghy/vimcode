@@ -2267,43 +2267,6 @@ impl Engine {
                 self.switch_window_buffer(new_id);
                 EngineAction::None
             }
-            "retab" => {
-                let tab_size = self.settings.tabstop as usize;
-                let expand = self.settings.expand_tab;
-                self.start_undo_group();
-                let num_lines = self.buffer().len_lines();
-                for line_idx in 0..num_lines {
-                    let text: String = self.buffer().content.line(line_idx).chars().collect();
-                    let new_text = if expand {
-                        // tabs → spaces
-                        text.replace('\t', &" ".repeat(tab_size))
-                    } else {
-                        // Leading spaces → tabs
-                        let leading: usize = text.chars().take_while(|c| *c == ' ').count();
-                        if leading >= tab_size {
-                            let tabs = leading / tab_size;
-                            let spaces = leading % tab_size;
-                            format!(
-                                "{}{}{}",
-                                "\t".repeat(tabs),
-                                " ".repeat(spaces),
-                                &text[leading..]
-                            )
-                        } else {
-                            continue;
-                        }
-                    };
-                    if new_text != text {
-                        let start = self.buffer().line_to_char(line_idx);
-                        let end = start + text.len();
-                        self.delete_with_undo(start, end);
-                        self.insert_with_undo(start, &new_text);
-                    }
-                }
-                self.finish_undo_group();
-                self.message = "Retabbed".to_string();
-                EngineAction::None
-            }
             "cquit" | "cquit!" => EngineAction::QuitWithError,
             _ => {
                 // Handle :y[ank] {register} and :pu[t] {register} with args
@@ -2318,12 +2281,6 @@ impl Engine {
                         self.registers.insert('"', (text, RegType::Linewise));
                     }
                     return EngineAction::None;
-                }
-                if let Some(arg) = cmd.strip_prefix("retab ") {
-                    if let Ok(ts) = arg.trim().parse::<u8>() {
-                        self.settings.tabstop = ts;
-                    }
-                    return self.execute_command("retab");
                 }
                 // Built-in :Comment / :Commentary command
                 if cmd == "Comment"
@@ -4325,6 +4282,61 @@ impl Engine {
             });
         }
 
+        // `:[range]ret[ab][!] [new_tabstop]` — unlike the other commands
+        // above, an *omitted* range means the whole buffer (`:h :retab`),
+        // not the current line.
+        if is("retab", 3) {
+            let new_tabstop = if args.is_empty() {
+                None
+            } else {
+                match args.parse::<usize>() {
+                    Ok(n) => Some(n),
+                    Err(_) => return None,
+                }
+            };
+            let (start, end) = match range {
+                Some((a, b)) => (a.max(0) as usize, (b.max(0) as usize).min(last_line)),
+                None => (0, last_line),
+            };
+            return Some(self.execute_retab(start, end, bang, new_tabstop));
+        }
+
+        // `:[range]le[ft] [indent]`, `:[range]ri[ght] [width]`,
+        // `:[range]ce[nter] [width]` — re-indent the range. The numeric
+        // argument is an indent/width, not a `:d`-style trailing count, and
+        // the default range is the current line (`:h :left`).
+        let reindent_kind = if is("left", 2) {
+            Some(0)
+        } else if is("right", 2) {
+            Some(1)
+        } else if is("center", 2) {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(kind) = reindent_kind {
+            let arg = if args.is_empty() {
+                None
+            } else {
+                match args.parse::<usize>() {
+                    Ok(n) => Some(n),
+                    Err(_) => return None,
+                }
+            };
+            let (start, end) = match range {
+                Some((a, b)) => (a.max(0) as usize, (b.max(0) as usize).min(last_line)),
+                None => {
+                    let cur = self.view().cursor.line;
+                    (cur, cur)
+                }
+            };
+            return Some(match kind {
+                0 => self.execute_left(start, end, arg),
+                1 => self.execute_right(start, end, arg),
+                _ => self.execute_center(start, end, arg),
+            });
+        }
+
         None
     }
 
@@ -4346,6 +4358,335 @@ impl Engine {
             Some(n) if n > 0 => (b.min(last_line), (b + n - 1).min(last_line)),
             _ => (a.min(last_line), b.min(last_line)),
         }
+    }
+
+    /// `:[range]ret[ab][!] [new_tabstop]` (`:h :retab`).
+    ///
+    /// Without `!`, only whitespace runs that contain a <Tab> are touched:
+    /// with `'expandtab'` they become spaces, without it they are
+    /// re-expressed using the (possibly new) `'tabstop'`. With `!`, runs of
+    /// plain spaces are considered too, which only matters with
+    /// `'noexpandtab'` (with `'expandtab'` a plain-space run's replacement is
+    /// always itself). The existing `'tabstop'` — not the new one — is
+    /// always used to measure the *current* width of a run; the new value
+    /// only controls how that width is re-emitted.
+    fn execute_retab(
+        &mut self,
+        start: usize,
+        end: usize,
+        bang: bool,
+        new_tabstop: Option<usize>,
+    ) -> EngineAction {
+        let old_ts = (self.settings.tabstop as usize).max(1);
+        let new_ts = new_tabstop.filter(|&n| n > 0).unwrap_or(old_ts);
+        let expand = self.settings.expand_tab;
+        let cursor_line = self.view().cursor.line;
+        let cursor_col = self.view().cursor.col;
+        let mut new_cursor_col = None;
+
+        self.start_undo_group();
+        let total = self.buffer().len_lines();
+        for line_idx in start..=end.min(total.saturating_sub(1)) {
+            let chars: Vec<char> = self.buffer().content.line(line_idx).chars().collect();
+            // Drop a trailing line terminator before processing — it is never
+            // whitespace `retab` should touch, and re-appending it verbatim
+            // keeps `\r\n` intact.
+            let eol_len = chars
+                .iter()
+                .rev()
+                .take_while(|c| **c == '\n' || **c == '\r')
+                .count();
+            let body = &chars[..chars.len() - eol_len];
+            let (new_body, runs) = retab_line(body, old_ts, new_ts, expand, bang);
+            if runs.is_empty() {
+                continue;
+            }
+            if line_idx == cursor_line {
+                new_cursor_col = Some(retab_adjust_col(&runs, cursor_col));
+            }
+            let line_start = self.buffer().line_to_char(line_idx);
+            self.delete_with_undo(line_start, line_start + body.len());
+            self.insert_with_undo(line_start, &new_body);
+        }
+        self.finish_undo_group();
+        self.settings.tabstop = new_ts.min(u8::MAX as usize) as u8;
+        if let Some(col) = new_cursor_col {
+            self.view_mut().cursor.col = col;
+            self.clamp_cursor_col();
+        }
+        self.message = "Retabbed".to_string();
+        EngineAction::None
+    }
+
+    /// `:[range]le[ft] [indent]` — strip existing leading white space and
+    /// replace it with exactly `indent` columns (0 when omitted).
+    fn execute_left(
+        &mut self,
+        start: usize,
+        end: usize,
+        indent_arg: Option<usize>,
+    ) -> EngineAction {
+        let ts = (self.settings.tabstop as usize).max(1);
+        let expand = self.settings.expand_tab;
+        let indent_cols = indent_arg.unwrap_or(0);
+        let new_indent = make_indent_string(indent_cols, ts, expand);
+
+        self.start_undo_group();
+        let total = self.buffer().len_lines();
+        let last = end.min(total.saturating_sub(1));
+        for line_idx in start..=last {
+            let chars: Vec<char> = self.buffer().content.line(line_idx).chars().collect();
+            let eol_len = chars
+                .iter()
+                .rev()
+                .take_while(|c| **c == '\n' || **c == '\r')
+                .count();
+            let body = &chars[..chars.len() - eol_len];
+            let leading = body
+                .iter()
+                .take_while(|c| **c == ' ' || **c == '\t')
+                .count();
+            let rest: String = body[leading..].iter().collect();
+            let new_body = format!("{new_indent}{rest}");
+            if new_body.chars().eq(body.iter().copied()) {
+                continue;
+            }
+            let line_start = self.buffer().line_to_char(line_idx);
+            self.delete_with_undo(line_start, line_start + body.len());
+            self.insert_with_undo(line_start, &new_body);
+        }
+        self.finish_undo_group();
+        self.finish_reindent_cursor(last);
+        EngineAction::None
+    }
+
+    /// `:[range]ri[ght] [width]` — right-align the trimmed line content so it
+    /// ends at column `width` (`'textwidth'`, or 80 when that is 0).
+    fn execute_right(
+        &mut self,
+        start: usize,
+        end: usize,
+        width_arg: Option<usize>,
+    ) -> EngineAction {
+        let width = width_arg.unwrap_or_else(|| self.reindent_default_width());
+        self.reindent_range(start, end, |content_width| {
+            width.saturating_sub(content_width)
+        });
+        EngineAction::None
+    }
+
+    /// `:[range]ce[nter] [width]` — center the trimmed line content within a
+    /// field `width` columns wide (`'textwidth'`, or 80 when that is 0).
+    fn execute_center(
+        &mut self,
+        start: usize,
+        end: usize,
+        width_arg: Option<usize>,
+    ) -> EngineAction {
+        let width = width_arg.unwrap_or_else(|| self.reindent_default_width());
+        self.reindent_range(start, end, |content_width| {
+            width.saturating_sub(content_width) / 2
+        });
+        EngineAction::None
+    }
+
+    fn reindent_default_width(&self) -> usize {
+        if self.settings.textwidth > 0 {
+            self.settings.textwidth
+        } else {
+            80
+        }
+    }
+
+    /// Shared body of `:right` and `:center`: trim each line in the range and
+    /// re-pad its left side with `pad_for(content_width)` columns of
+    /// indentation. Blank lines are left untouched, matching `:h :left`'s
+    /// treatment of an empty indent.
+    fn reindent_range(&mut self, start: usize, end: usize, pad_for: impl Fn(usize) -> usize) {
+        let ts = (self.settings.tabstop as usize).max(1);
+        let expand = self.settings.expand_tab;
+
+        self.start_undo_group();
+        let total = self.buffer().len_lines();
+        let last = end.min(total.saturating_sub(1));
+        for line_idx in start..=last {
+            let chars: Vec<char> = self.buffer().content.line(line_idx).chars().collect();
+            let eol_len = chars
+                .iter()
+                .rev()
+                .take_while(|c| **c == '\n' || **c == '\r')
+                .count();
+            let body = &chars[..chars.len() - eol_len];
+            let trimmed_start = body
+                .iter()
+                .take_while(|c| **c == ' ' || **c == '\t')
+                .count();
+            let trimmed_end = body.len()
+                - body
+                    .iter()
+                    .rev()
+                    .take_while(|c| **c == ' ' || **c == '\t')
+                    .count();
+            if trimmed_start >= trimmed_end {
+                continue; // blank line — leave it as-is
+            }
+            let content: String = body[trimmed_start..trimmed_end].iter().collect();
+            let pad = pad_for(content.chars().count());
+            let new_body = format!("{}{}", make_indent_string(pad, ts, expand), content);
+            if new_body.chars().eq(body.iter().copied()) {
+                continue;
+            }
+            let line_start = self.buffer().line_to_char(line_idx);
+            self.delete_with_undo(line_start, line_start + body.len());
+            self.insert_with_undo(line_start, &new_body);
+        }
+        self.finish_undo_group();
+        self.finish_reindent_cursor(last);
+    }
+
+    /// `:left`/`:right`/`:center` leave the cursor on the range's last line,
+    /// at its first non-blank (`:h :left` and friends; verified against
+    /// Neovim — unlike `:retab`, which tracks the edited run instead).
+    fn finish_reindent_cursor(&mut self, last_line: usize) {
+        let line = last_line.min(self.buffer().len_lines().saturating_sub(1));
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = self.first_non_blank_col(line);
+        self.clamp_cursor_col();
+    }
+}
+
+/// One whitespace run `:retab` rewrote on a line, in char offsets — used to
+/// re-derive where the cursor should land afterward.
+struct RetabRun {
+    old_start: usize,
+    old_len: usize,
+    new_start: usize,
+    new_len: usize,
+}
+
+/// The column just past `col` on the current line (`:h 'tabstop'`).
+fn next_tabstop(col: usize, ts: usize) -> usize {
+    (col / ts + 1) * ts
+}
+
+/// Rewrite the whitespace runs of one line for `:retab`, mirroring Vim's
+/// `do_retab`: each run's *old* width is measured with `old_ts` (a tab
+/// advances to the next `old_ts` stop; a space always costs 1), then
+/// re-emitted at that same width — as spaces when `expand`, else as the
+/// fewest tabs-then-spaces `new_ts` allows. A run is only rewritten when it
+/// contains a tab, or (with `bang`) unconditionally; a plain-space run under
+/// `expand` always re-emits itself, so `bang` only has visible effect with
+/// `'noexpandtab'`. All non-whitespace characters are treated as one column
+/// wide (matches this codebase's existing tab/indent handling elsewhere).
+fn retab_line(
+    chars: &[char],
+    old_ts: usize,
+    new_ts: usize,
+    expand: bool,
+    bang: bool,
+) -> (String, Vec<RetabRun>) {
+    let old_ts = old_ts.max(1);
+    let new_ts = new_ts.max(1);
+    let mut out = String::new();
+    let mut runs = Vec::new();
+    let mut i = 0;
+    let mut vcol = 0usize;
+    let n = chars.len();
+    while i < n {
+        let c = chars[i];
+        if c == ' ' || c == '\t' {
+            let run_start = i;
+            let run_start_vcol = vcol;
+            let mut has_tab = false;
+            let mut j = i;
+            while j < n && (chars[j] == ' ' || chars[j] == '\t') {
+                if chars[j] == '\t' {
+                    has_tab = true;
+                    vcol = next_tabstop(vcol, old_ts);
+                } else {
+                    vcol += 1;
+                }
+                j += 1;
+            }
+            let run_len = j - run_start;
+            let end_vcol = vcol;
+            if has_tab || bang {
+                let width = end_vcol - run_start_vcol;
+                let new_text = if expand {
+                    " ".repeat(width)
+                } else {
+                    let mut cur = run_start_vcol;
+                    let mut tabs = 0usize;
+                    loop {
+                        let nt = next_tabstop(cur, new_ts);
+                        if nt <= end_vcol {
+                            tabs += 1;
+                            cur = nt;
+                        } else {
+                            break;
+                        }
+                    }
+                    format!("{}{}", "\t".repeat(tabs), " ".repeat(end_vcol - cur))
+                };
+                let new_start = out.chars().count();
+                let new_len = new_text.chars().count();
+                if !new_text.chars().eq(chars[run_start..j].iter().copied()) {
+                    runs.push(RetabRun {
+                        old_start: run_start,
+                        old_len: run_len,
+                        new_start,
+                        new_len,
+                    });
+                }
+                out.push_str(&new_text);
+            } else {
+                out.extend(&chars[run_start..j]);
+            }
+            i = j;
+        } else {
+            vcol += 1;
+            out.push(c);
+            i += 1;
+        }
+    }
+    (out, runs)
+}
+
+/// Re-derive a line's cursor column after `retab_line` rewrote it, mirroring
+/// `do_retab`'s own cursor tracking: a column strictly before a rewritten run
+/// is unaffected by it; one at or inside the run's old span lands at the end
+/// of that run's replacement; one strictly after is shifted by the run's net
+/// length change. Verified against Neovim (`ex:retab`, `ex:retab!`): typing
+/// `:retab<CR>` through the command line moves the cursor this way even
+/// though the equivalent scripted `nvim_cmd` call does not — a real
+/// command-line-only quirk, not a harness artifact, so vimcode (which has no
+/// separate scripted path) always applies it.
+fn retab_adjust_col(runs: &[RetabRun], old_col: usize) -> usize {
+    let mut col = old_col as isize;
+    for run in runs {
+        let old_end = run.old_start + run.old_len;
+        if old_col < run.old_start {
+            continue;
+        } else if old_col < old_end {
+            col = (run.new_start + run.new_len).saturating_sub(1) as isize;
+            break;
+        } else {
+            col += run.new_len as isize - run.old_len as isize;
+        }
+    }
+    col.max(0) as usize
+}
+
+/// Build an indent string of exactly `cols` display columns, using tabs where
+/// `'noexpandtab'` allows a whole `ts`-wide stop and spaces for the
+/// remainder — the same representation `>>`/`<<` use (`:h :left`, `:h :right`,
+/// `:h :center` all delegate to this for their leading white space).
+fn make_indent_string(cols: usize, ts: usize, expand: bool) -> String {
+    let ts = ts.max(1);
+    if expand {
+        " ".repeat(cols)
+    } else {
+        format!("{}{}", "\t".repeat(cols / ts), " ".repeat(cols % ts))
     }
 }
 
@@ -4510,9 +4851,11 @@ pub(crate) fn is_ranged_ex_name(cmd: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    ["delete", "yank", "join", "copy", "move", "put"]
-        .iter()
-        .any(|full| full.starts_with(name))
+    [
+        "delete", "yank", "join", "copy", "move", "put", "retab", "left", "right", "center",
+    ]
+    .iter()
+    .any(|full| full.starts_with(name))
         || name == "t"
 }
 
