@@ -28096,6 +28096,105 @@ fn test_nvim_retab_converts_tabs_to_spaces() {
     assert_eq!(engine.buffer().to_string(), "    hello\n");
 }
 
+#[test]
+fn test_nvim_retab_bang_converts_spaces_to_tabs() {
+    // With noexpandtab, `:retab!` (but not bare `:retab`) turns a
+    // tabstop-wide run of spaces into a tab.
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = false;
+    engine.settings.tabstop = 4;
+    engine.buffer_mut().insert(0, "    hello\n");
+    engine.update_syntax();
+    engine.feed_keys(":retab<CR>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "    hello\n",
+        "bare :retab must not touch a pure-space run"
+    );
+    engine.feed_keys(":retab!<CR>");
+    assert_eq!(engine.buffer().to_string(), "\thello\n");
+}
+
+#[test]
+fn test_nvim_retab_arg_uses_old_tabstop_to_measure_existing_tabs() {
+    // `:retab N` sets 'tabstop' to N, but must use the *old* tabstop to
+    // measure the width of tabs already in the buffer, not the new one
+    // (the old vimcode bug this guards: retabbing "\ta" at ts=4 to ts=2
+    // produced "  a" instead of nvim's "    a").
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.buffer_mut().insert(0, "\ta\n");
+    engine.update_syntax();
+    engine.feed_keys(":retab 2<CR>");
+    assert_eq!(engine.buffer().to_string(), "    a\n");
+    assert_eq!(engine.settings.tabstop, 2, ":retab N must set 'tabstop'");
+}
+
+#[test]
+fn test_nvim_retab_only_touches_given_range() {
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.buffer_mut().insert(0, "\ta\n\tb\n\tc\n");
+    engine.update_syntax();
+    engine.feed_keys(":2retab<CR>");
+    assert_eq!(engine.buffer().to_string(), "\ta\n    b\n\tc\n");
+}
+
+// -- :left / :right / :center --
+
+#[test]
+fn test_nvim_left_strips_indent() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "    a\n");
+    engine.update_syntax();
+    engine.feed_keys(":le<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\n");
+}
+
+#[test]
+fn test_nvim_left_with_arg_sets_exact_indent() {
+    let mut engine = Engine::new();
+    engine.settings.expand_tab = true;
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    engine.feed_keys(":le 4<CR>");
+    assert_eq!(engine.buffer().to_string(), "    a\n");
+    assert_eq!(
+        engine.view().cursor.col,
+        4,
+        ":left leaves the cursor at the first non-blank"
+    );
+}
+
+#[test]
+fn test_nvim_right_aligns_to_width() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    engine.feed_keys(":ri 10<CR>");
+    assert_eq!(engine.buffer().to_string(), "         a\n");
+}
+
+#[test]
+fn test_nvim_center_pads_left_half() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    engine.feed_keys(":ce 10<CR>");
+    assert_eq!(engine.buffer().to_string(), "    a\n");
+}
+
+#[test]
+fn test_nvim_left_over_range() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "  a\n  b\n  c\n");
+    engine.update_syntax();
+    engine.feed_keys(":1,2le<CR>");
+    assert_eq!(engine.buffer().to_string(), "a\nb\n  c\n");
+}
+
 // -- Marks --
 
 #[test]
