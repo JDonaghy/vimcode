@@ -61,6 +61,19 @@ impl Engine {
     /// Start a new undo group for the active buffer.
     pub fn start_undo_group(&mut self) {
         let cursor = *self.cursor();
+        self.start_undo_group_at(cursor);
+    }
+
+    /// Like [`start_undo_group`](Self::start_undo_group), but records an
+    /// explicit `cursor_before` instead of the engine's current cursor.
+    ///
+    /// Vim restores the cursor to the position of the *first* change an undo
+    /// group reverts, which is not always where the (real, on-screen) cursor
+    /// happened to be when the group started — e.g. a Visual delete restores
+    /// to the start of the selection even though the cursor was sitting at
+    /// the end of it when `d` was pressed (#886). Callers use this to record
+    /// that "correct" position without disturbing the actual view cursor.
+    pub fn start_undo_group_at(&mut self, cursor: Cursor) {
         // Save line state before modification (for U command)
         self.save_line_for_undo();
         // Record the "before" state in the timeline on first edit

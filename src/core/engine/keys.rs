@@ -1192,10 +1192,14 @@ impl Engine {
             }
             Some('A') => {
                 self.insert_repeat_count = self.take_count();
-                self.start_undo_group();
                 self.insert_text_buffer.clear();
                 let line = self.view().cursor.line;
                 self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+                // Undo group must start AFTER the cursor moves to the append
+                // position: `cursor_before` is what `u` restores to (clamped
+                // back into the line), and Vim restores to where the insert
+                // began, not to the pre-`A` cursor position (#886).
+                self.start_undo_group();
                 self.set_mode(Mode::Insert);
             }
             Some('I') => {

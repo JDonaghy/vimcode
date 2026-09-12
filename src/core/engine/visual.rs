@@ -208,7 +208,10 @@ impl Engine {
             // Delete the selection
             let (start, end) = self.get_visual_selection_range().unwrap();
 
-            self.start_undo_group();
+            // `u` restores the cursor to the start of the deleted selection,
+            // not wherever the (real) cursor was sitting when `d` was
+            // pressed — which, for a forward selection, is the end (#886).
+            self.start_undo_group_at(start);
 
             match self.mode {
                 Mode::VisualLine => {
