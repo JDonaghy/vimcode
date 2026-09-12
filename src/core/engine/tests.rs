@@ -27871,7 +27871,8 @@ fn test_nvim_co_concat_form() {
 
 #[test]
 fn test_nvim_sort_bang_reverses() {
-    // :sort! reverses alphabetical order (synonym for :sort r)
+    // :sort! reverses alphabetical order. The bang is the *only* way to
+    // reverse — `r` is the "sort on the /pattern/ match" flag (#879).
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
     engine.update_syntax();
