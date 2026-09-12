@@ -269,4 +269,83 @@ mod mac_driver_tests {
             "the viewport should have scrolled away from the top of the buffer"
         );
     }
+
+    // ── #901: native menu bar adoption ──────────────────────────────────
+
+    /// A plain engine, safe to drive through `MacBackend` — same
+    /// nerd-fonts-off rationale as [`engine_with_minimap`] (the tab-icon
+    /// `debug_assert!`, unrelated to menus), without the minimap/500-line
+    /// buffer that test doesn't need here.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+    }
+
+    /// #901: a backend declaring `BackendCaps::native_menu` (macOS's
+    /// `MacBackend`) must not *also* paint the in-window `MenuSystem` row —
+    /// that was the bug (a menu bar drawn inside the window on top of the
+    /// real system one). `App::setup` installs the native bar and sets
+    /// `menu_bar_visible = false` when this cap is set.
+    ///
+    /// RED against the pre-#901 body (`App::setup` set
+    /// `menu_bar_visible = true` unconditionally): the drawn menu row
+    /// paints its first label, "File", every frame — confirmed by
+    /// temporarily reverting the gate and re-running this test, which then
+    /// fails on this exact assertion.
+    #[test]
+    fn native_menu_backend_suppresses_the_drawn_menu_row() {
+        let (_guards, driver) = driver(plain_engine());
+
+        assert!(
+            !driver.screen_contains("File"),
+            "the in-window menu row must not paint when the backend has a \
+             native menu bar; painted text was {:?}",
+            driver.painted_texts()
+        );
+    }
+
+    /// #901: `UiEvent::MenuActivated` (fired by the native NSMenu installed
+    /// via `Backend::install_menu_bar`) must reach the exact same
+    /// `App::handle_menu_action` dispatch the drawn `MenuSystem` dropdown's
+    /// `MenuEvent::Activated` already uses — one action path, not two.
+    ///
+    /// Drives this through `MacDriver::dispatch`, which calls
+    /// `AppLogic::handle` directly — it does not depend on
+    /// `Backend::install_menu_bar` actually having installed a real NSMenu
+    /// (impossible off the main thread AppKit requires; see `App::setup`'s
+    /// comment), only on the *routing* once an activation arrives.
+    ///
+    /// Uses the View menu's "Command Palette" (`action: "palette"`,
+    /// `MENU_STRUCTURE` in `render.rs`) because its effect is unmistakably
+    /// observable in painted output: activating it must open the palette
+    /// overlay, which paints a "Command Palette" title and the full command
+    /// list — none of which exists on screen beforehand.
+    ///
+    /// RED against a build with no `UiEvent::MenuActivated` arm in
+    /// `App::handle` (the pre-#901 body — `grep -rn MenuActivated src/` was
+    /// empty): the event falls through unhandled, the palette never opens,
+    /// and this assertion fails.
+    #[test]
+    fn menu_activated_reaches_the_same_action_as_the_drawn_menu() {
+        let (_guards, mut driver) = driver(plain_engine());
+        assert!(
+            !driver.screen_contains("Command Palette"),
+            "bad fixture: the palette should start closed; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        driver.dispatch(quadraui::UiEvent::MenuActivated(quadraui::WidgetId::new(
+            "palette",
+        )));
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Command Palette"),
+            "MenuActivated(\"palette\") must open the command palette the \
+             same way the drawn menu's identical action string does; \
+             painted text was {:?}",
+            driver.painted_texts()
+        );
+    }
 }

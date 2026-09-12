@@ -6744,6 +6744,21 @@ impl App {
                 }
                 self.draw_needed.set(true);
             }
+            UiEvent::MenuActivated(id) => {
+                // #901: fired by a *native* OS menu bar (macOS `NSMenu` via
+                // `Backend::install_menu_bar`) — see the doc comment on
+                // `UiEvent::MenuActivated` distinguishing it from the drawn
+                // `MenuSystem`'s click path, which resolves to
+                // `quadraui::MenuEvent::Activated` further up in this same
+                // method and calls this identical dispatcher. One action
+                // path for both, not two: `render::build_menu_defs` gave
+                // every leaf item's `WidgetId` the same string as its
+                // `MENU_STRUCTURE` `action` field, so `id.as_str()` here is
+                // exactly the command string `handle_menu_action` expects.
+                self.handle_menu_action(id.as_str().to_string());
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
             UiEvent::MouseDown {
                 button,
                 position,
@@ -7041,13 +7056,57 @@ impl quadraui::ShellApp for App {
         // only shows it in vscode-mode or via Alt). Historical GTK behaviour
         // pre-#540; menu defs were never re-populated after the ShellApp
         // migration deleted the Relm4 headerbar wiring. (#552)
+        //
+        // #901: a backend that declares `BackendCaps::native_menu` (macOS's
+        // `MacBackend`) has a real OS menu bar — installing the *drawn* row
+        // on top of it would paint a redundant in-window menu underneath the
+        // system one (the bug this issue exists to fix). Same `MenuDef`s
+        // either way — `render::menu_defs_to_menu_bar` just reshapes them —
+        // so the two paths can never disagree about what's in the menu.
         let is_vscode_mode = self.engine.borrow().is_vscode_mode();
-        self.engine.borrow_mut().menu_bar_visible = true;
+        let menu_defs = render::build_menu_defs(is_vscode_mode);
+        if backend.backend_caps().native_menu {
+            let bar = render::menu_defs_to_menu_bar(&menu_defs);
+            // `install_menu_bar`'s only in-tree implementation (macOS's
+            // `MacBackend`) asserts it is called on the real AppKit main
+            // thread and panics otherwise — a documented quadraui
+            // limitation with no portable pre-check exposed through the
+            // `Backend` trait. Every real invocation of `ShellApp::setup`
+            // *is* on the main thread (`quadraui::macos::shell_runner`'s
+            // only entry point), so this never fires outside a test
+            // harness — but `quadraui::macos::testing::driver_with_shell`
+            // (used by `src/macos/mod.rs::mac_driver_tests`) necessarily
+            // calls `setup` from a spawned test thread, same as every
+            // other `#[test]` fn, per Rust's own test runner. Catching it
+            // here keeps `setup()` — which every backend, including the
+            // ones with no native menu, must be able to complete without
+            // aborting the process — from taking the whole test process
+            // down over a call this method doesn't otherwise depend on.
+            // Filed upstream: `install_menu_bar` should degrade
+            // gracefully off-main-thread the way its own sibling test
+            // helpers already do (`menu_bar_install.rs`'s `let Some(mtm)
+            // = MainThreadMarker::new() else { return }`), not hard
+            // `.expect()`.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                backend.install_menu_bar(&bar);
+            }))
+            .is_err()
+            {
+                eprintln!(
+                    "vimcode: Backend::install_menu_bar panicked (quadraui \
+                     main-thread assertion, see vimcode#901) -- the native \
+                     menu bar may be missing"
+                );
+            }
+            self.engine.borrow_mut().menu_bar_visible = false;
+        } else {
+            self.engine.borrow_mut().menu_bar_visible = true;
+        }
         self.engine
             .borrow()
             .menu_system
             .borrow_mut()
-            .set_menus(render::build_menu_defs(is_vscode_mode));
+            .set_menus(menu_defs);
 
         // Apply initial CSS (no-op under the headless test harness, which has
         // no display to attach a provider to — see the field's doc, #646).
