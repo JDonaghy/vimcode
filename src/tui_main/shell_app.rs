@@ -5719,6 +5719,135 @@ mod tests {
         );
     }
 
+    /// #890: `@` with an **uppercase** register letter plays back the same
+    /// register as its lowercase form — register names are case-insensitive
+    /// for *reads* (`:h quote_alpha`); only *writing* (`qA`, `"Ayy`)
+    /// distinguishes upper (append) from lower (overwrite). `qQ...q` records
+    /// into register `q` (the uppercase `Q` just means "append", and there's
+    /// nothing to append to yet, so it behaves like an overwrite), and `@Q`
+    /// must replay that same register rather than erroring out. Verified
+    /// against `nvim --headless -u NONE` (0.12.5) as the
+    /// `tests/nvim_conformance.rs` oracle case "mac:q register letter
+    /// uppercase Q".
+    ///
+    /// This is the driver-level counterpart to
+    /// `test_macro_uppercase_register_playback_reads_lowercase` in
+    /// `src/core/engine/tests.rs`: that test drives a bare `Engine` and
+    /// reads `buffer().content` directly; this one drives the real
+    /// `TuiShellApp` through `TuiDriver` and asserts on rendered screen rows.
+    ///
+    /// Records `x` (delete-char-under-cursor) into register `q` via `qQxq`
+    /// on line 1's leading `X`, then moves to line 2's leading `X` and plays
+    /// the recording back with `@Q`. Both leading `X`s must be gone from the
+    /// rendered screen — if `@Q` were rejected as an invalid register, only
+    /// the first `X` (removed by the recording itself) would disappear.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the
+    /// `ch.is_ascii_uppercase()` arm removed from the `@` handler in
+    /// `keys.rs`, `@Q` fell through to "Invalid register for macro
+    /// playback", line 2's leading `X` was never deleted, and the screen
+    /// still contained `"XZQXW890L2"`. Restored before this commit.
+    #[test]
+    fn at_uppercase_register_plays_back_lowercase_macro_via_shell_app() {
+        const LINE1: &str = "XZQXW890L1";
+        const LINE2: &str = "XZQXW890L2";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // qQxq: record "x" into register q (uppercase Q selects append,
+        // which behaves like overwrite on an empty register).
+        driver.type_char('q');
+        driver.type_char('Q');
+        driver.type_char('x');
+        driver.type_char('q');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW890L1") && !screen.contains(LINE1),
+            "qQxq must have already deleted line 1's leading X while \
+             recording; screen:\n{screen}"
+        );
+
+        // Move to line 2's leading X, then replay the recording with @Q.
+        driver.type_char('j');
+        driver.type_char('0');
+        driver.type_char('@');
+        driver.type_char('Q');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW890L2") && !screen.contains(LINE2),
+            "@Q must replay register q's recording (deleting line 2's \
+             leading X) instead of rejecting Q as an invalid register; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #890: `":` is a read-only register holding the text of the most
+    /// recent `:` command line, with no leading colon (`:h quote_:`),
+    /// mirroring the already-tracked `last_ex_command` used by `@:`. It
+    /// pastes like any other charwise register. Verified against
+    /// `nvim --headless -u NONE` (0.12.5) as the `tests/nvim_conformance.rs`
+    /// oracle case "reg:": last cmd".
+    ///
+    /// This is the driver-level counterpart to
+    /// `test_nvim_last_command_register` in `src/core/engine/tests.rs`:
+    /// that test drives a bare `Engine` and reads `buffer().content`
+    /// directly; this one drives the real `TuiShellApp` through `TuiDriver`
+    /// and asserts on rendered screen rows.
+    ///
+    /// Runs `:s/a/b/<CR>` (substituting the line's leading `a`), then feeds
+    /// `":p` to paste the just-run command text right after the cursor,
+    /// which `:s` leaves on the substituted character.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `':' => ...`
+    /// arm removed from `Engine::get_register_content` in `motions.rs`,
+    /// `":p` pasted nothing (register `:` had never been populated), so the
+    /// screen still read `"bZQXW890P"` with no `s/a/b/` text inserted.
+    /// Restored before this commit.
+    #[test]
+    fn last_command_register_pastes_last_ex_command_via_shell_app() {
+        const MARKER: &str = "ZQXW890P";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, &format!("a{MARKER}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "s/a/b/".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(&format!("b{MARKER}")),
+            ":s/a/b/<CR> must substitute the leading 'a'; screen:\n{screen}"
+        );
+
+        driver.type_char('"');
+        driver.type_char(':');
+        driver.type_char('p');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(&format!("bs/a/b/{MARKER}")),
+            "\":p must paste the last `:` command's text ('s/a/b/', no \
+             leading colon) right after the cursor left by :s; \
+             screen:\n{screen}"
+        );
+    }
+
     /// #601: `render_content` must also paint per-editor-group tab bars —
     /// exercise the multi-window code path (`render_all_windows` +
     /// `render::tab_bar_draw_targets` for `screen.editor_group_split`) by
