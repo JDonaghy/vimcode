@@ -40,7 +40,14 @@ const NERD_RANGE_START: u32 = 0xE000;
 /// never drift from the actual constants -- mirrors
 /// `scripts/gen_icon_font.py::referenced_codepoints`.
 fn referenced_nerd_codepoints() -> Vec<u32> {
-    let re = Regex::new(r#"Icon::new\(\s*"\\u\{([0-9a-fA-F]+)\}""#).unwrap();
+    // The `[^"]*` after the `\u{...}` escape tolerates trailing literal
+    // characters before the closing quote (e.g. `"\u{f0da} "` -- a trailing
+    // space, as used by EXPAND_DOWN/COLLAPSE_RIGHT in src/icons.rs to pad the
+    // rendered glyph). Requiring the closing `"` to immediately follow `}`
+    // silently dropped those codepoints from the "wanted" set (#197
+    // fix-iteration-1 review finding). Keep in sync with
+    // `scripts/gen_icon_font.py::ICON_NEW_RE`.
+    let re = Regex::new(r#"Icon::new\(\s*"\\u\{([0-9a-fA-F]+)\}[^"]*""#).unwrap();
     let mut codepoints: Vec<u32> = re
         .captures_iter(ICONS_RS_SOURCE)
         .map(|caps| u32::from_str_radix(&caps[1], 16).expect("hex codepoint"))

@@ -52,7 +52,13 @@ NERD_RANGE_START = 0xE000
 # Matches only the first ("nerd") string literal argument of `Icon::new(...)`
 # -- the second (fallback) argument is deliberately not captured here, so
 # this can never accidentally require a PUA glyph to cover a fallback char.
-ICON_NEW_RE = re.compile(r'Icon::new\(\s*"\\u\{([0-9a-fA-F]+)\}"')
+#
+# The `[^"]*` after the `\u{...}` escape tolerates trailing literal characters
+# before the closing quote (e.g. `"\u{f0da} "` -- a trailing space, as used by
+# EXPAND_DOWN/COLLAPSE_RIGHT in src/icons.rs to pad the rendered glyph).
+# Requiring the closing `"` to immediately follow `}` silently dropped those
+# codepoints from the "wanted" set (#197 fix-iteration-1 review finding).
+ICON_NEW_RE = re.compile(r'Icon::new\(\s*"\\u\{([0-9a-fA-F]+)\}[^"]*"')
 
 
 def referenced_codepoints() -> list[int]:
@@ -67,9 +73,39 @@ def nerd_codepoints() -> list[int]:
     return [cp for cp in referenced_codepoints() if cp >= NERD_RANGE_START]
 
 
+# Hardcoded expectation for the count `nerd_codepoints()` currently returns
+# (#197 review nit). This and `tests/icon_font_coverage.rs`'s
+# `referenced_nerd_codepoints()` duplicate the same regex by design (that
+# Rust test must have zero Python dependency), and duplicated fragile
+# string-literal parsing is exactly how the `0xF0DA` gap escaped detection in
+# both places at once rather than being caught by one and not the other. This
+# self-check gives *this* file an independent signal: if a future edit to
+# `ICON_NEW_RE` silently changes what it matches, `_self_check()` fails loudly
+# with a specific count mismatch instead of the drift only surfacing later as
+# an unrelated-looking coverage failure (or, worse, not failing at all because
+# the same mis-parse is mirrored on the Rust side). Update this constant
+# whenever `src/icons.rs` gains or loses an `Icon::new` call whose nerd
+# literal is >= U+E000.
+EXPECTED_NERD_CODEPOINT_COUNT = 62
+
+
+def _self_check() -> None:
+    actual = len(nerd_codepoints())
+    if actual != EXPECTED_NERD_CODEPOINT_COUNT:
+        raise SystemExit(
+            f"nerd_codepoints() returned {actual} codepoint(s), expected "
+            f"{EXPECTED_NERD_CODEPOINT_COUNT}. If this is because src/icons.rs "
+            "gained or lost a nerd Icon::new(...) call, update "
+            "EXPECTED_NERD_CODEPOINT_COUNT above to match. If icons.rs did not "
+            "change, ICON_NEW_RE's parsing may have silently changed what it "
+            "matches -- investigate before trusting this script's output."
+        )
+
+
 def verify(font_path: Path) -> int:
     from fontTools.ttLib import TTFont
 
+    _self_check()
     font = TTFont(str(font_path))
     cmap = font.getBestCmap()
     wanted = nerd_codepoints()
@@ -159,6 +195,7 @@ def generate(source: Path, output: Path, legacy_source: Path | None = None) -> i
     from fontTools import subset
     from fontTools.ttLib import TTFont
 
+    _self_check()
     codepoints = nerd_codepoints()
 
     actual_source = source
