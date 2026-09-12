@@ -276,24 +276,55 @@ pub(crate) fn open_url(url: &str) {
     crate::core::engine::open_url_in_browser(url);
 }
 
-/// Install the bundled Nerd Font icon subset to `~/.local/share/fonts/` so
-/// GTK/Pango can resolve the Nerd Font glyphs without a user-installed Nerd Font.
-/// The font file is embedded in the binary via `include_bytes!` and only written
-/// to disk if it's missing or has the wrong size.
+/// Install the bundled Nerd Font icon subset so the platform's text-shaping
+/// stack can resolve the Nerd Font glyphs without a user-installed Nerd Font.
+/// The font file is embedded in the binary via `include_bytes!` and only
+/// written to disk if it's missing or has the wrong size.
 ///
-/// Only `App::new` (`gui`-gated) calls this today, so a `--no-default-features`
-/// build sees it as dead code — allowed rather than `#[cfg]`-gating the
-/// function itself, since it names no toolkit type and a future non-GTK
-/// backend that also ships a bundled icon font could reuse it as-is.
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+/// Called from both `App::new` (`gui`-gated, GTK/Pango) and
+/// `App::new_portable` (un-gated — every other GUI backend, including
+/// macOS, goes through it), so every backend that ships this font actually
+/// installs it (#920: before this, `new_portable` skipped the call
+/// entirely, so `--features macos` builds never wrote the font at all).
 pub(crate) fn install_bundled_icon_font() {
-    static FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
-
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return;
     };
-    let fonts_dir = home.join(".local/share/fonts");
-    let _ = std::fs::create_dir_all(&fonts_dir);
+    install_bundled_icon_font_into(&icon_font_dest_dir(&home));
+}
+
+/// Per-platform directory the OS's text-shaping stack searches for
+/// user-installed fonts (#920).
+///
+/// - **macOS**: Core Text resolves fonts from `~/Library/Fonts` (and
+///   process-local `CTFontManagerRegisterFontsForURL` registration, which
+///   this does not use — see the issue for why that route was deferred).
+///   `~/.local/share/fonts` means nothing to Core Text.
+/// - **everything else**: fontconfig's `~/.local/share/fonts`, refreshed by
+///   [`refresh_font_cache`] after a write.
+fn icon_font_dest_dir(home: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Fonts")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local/share/fonts")
+    }
+}
+
+/// Write the bundled font into `fonts_dir` (creating it if needed) unless a
+/// same-sized copy is already there, then refresh whatever cache the
+/// platform needs. Takes the destination directly, rather than reading
+/// `$HOME` itself, so it can be exercised by a test with a throwaway
+/// `tempdir` instead of mutating the process's real `$HOME` (which
+/// `core::paths::home_dir`/`vimcode_config_dir` read live all over the
+/// engine — see `src/test_cwd.rs`'s doc comment for the shape of trouble a
+/// process-wide env mutation causes under `cargo test`'s parallel threads).
+fn install_bundled_icon_font_into(fonts_dir: &std::path::Path) {
+    static FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
+
+    let _ = std::fs::create_dir_all(fonts_dir);
     let dest = fonts_dir.join("vimcode-icons.ttf");
 
     // Skip write if the file already exists with the correct size.
@@ -306,12 +337,157 @@ pub(crate) fn install_bundled_icon_font() {
     }
 
     if std::fs::write(&dest, FONT_BYTES).is_ok() {
-        // Trigger fontconfig cache rebuild so the font is available immediately.
+        refresh_font_cache(fonts_dir);
+    }
+}
+
+/// Nudge the platform's font cache after writing a new font file so it's
+/// available immediately, without waiting for a restart.
+///
+/// fontconfig (Linux/BSD) caches font metadata separately from the font
+/// files themselves and needs `fc-cache` re-run to notice a new file.
+/// Core Text has no equivalent cache to refresh — macOS's font server
+/// watches `~/Library/Fonts` directly — so this is a no-op there.
+fn refresh_font_cache(fonts_dir: &std::path::Path) {
+    #[cfg(not(target_os = "macos"))]
+    {
         let _ = std::process::Command::new("fc-cache")
             .arg("-f")
-            .arg(&fonts_dir)
+            .arg(fonts_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = fonts_dir;
+    }
+}
+
+#[cfg(test)]
+mod icon_font_install_tests {
+    //! #920: unit coverage for the write/skip/refresh logic, isolated from
+    //! `$HOME` and from `App::new_portable`'s engine construction — see
+    //! [`install_bundled_icon_font_into`]'s doc comment for why those are
+    //! deliberately not exercised together in a test.
+    //!
+    //! `App::new_portable` actually calling [`install_bundled_icon_font`]
+    //! (the #920 bug: it didn't) is covered structurally rather than by a
+    //! runtime test — `src/app.rs`'s `new_portable` now has the call inline,
+    //! un-gated, and that function's `'static`/`ShellApp` shape is already
+    //! pinned by `app_is_runnable_by_any_quadraui_shell_runner`. Driving
+    //! `new_portable` itself here would call `Engine::startup`, which
+    //! restores *this machine's real last session* off the real `$HOME` —
+    //! exactly what `App::new_headless`'s doc comment says a test must not
+    //! do.
+
+    use super::*;
+
+    /// Fresh directory, no existing font: the bytes must land on disk
+    /// exactly as embedded.
+    ///
+    /// RED before #920 restructured `install_bundled_icon_font` around an
+    /// injectable directory: there was no seam to call this without
+    /// touching `$HOME`, so the write path had zero test coverage at all.
+    #[test]
+    fn writes_the_full_font_into_a_fresh_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode-icon-font-test-fresh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        install_bundled_icon_font_into(&dir);
+
+        let dest = dir.join("vimcode-icons.ttf");
+        let written = std::fs::read(&dest).expect("font file must be written");
+        assert_eq!(
+            written,
+            include_bytes!("../data/fonts/vimcode-icons.ttf"),
+            "written bytes must match the embedded font exactly"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A same-sized file already at the destination is left alone — the
+    /// "skip if correct size" fast path must not needlessly rewrite (and
+    /// thus not needlessly shell out to refresh the cache) on every launch.
+    #[test]
+    fn leaves_a_same_sized_file_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode-icon-font-test-skip-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("vimcode-icons.ttf");
+        // Wrong content, right size: proves the skip is byte-size based
+        // (matching the doc comment) rather than a content comparison.
+        let decoy = vec![0u8; include_bytes!("../data/fonts/vimcode-icons.ttf").len()];
+        std::fs::write(&dest, &decoy).unwrap();
+
+        install_bundled_icon_font_into(&dir);
+
+        let after = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            after, decoy,
+            "a same-sized file must be left alone, not overwritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wrong-sized file at the destination (a stale, truncated, or
+    /// corrupted previous install) must be replaced with the current bytes.
+    #[test]
+    fn replaces_a_wrong_sized_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode-icon-font-test-replace-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("vimcode-icons.ttf");
+        std::fs::write(&dest, b"stale").unwrap();
+
+        install_bundled_icon_font_into(&dir);
+
+        let after = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            after,
+            include_bytes!("../data/fonts/vimcode-icons.ttf"),
+            "a wrong-sized existing file must be replaced with the real font"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #920 reason 2: on macOS the destination must be Core Text's
+    /// `~/Library/Fonts`, never fontconfig's `~/.local/share/fonts` — the
+    /// two are unrelated directories and Core Text does not consult the
+    /// latter at all.
+    ///
+    /// Only meaningful on a Mach-O host (the `target_os = "macos"` branch of
+    /// `icon_font_dest_dir` doesn't exist in the binary this test itself
+    /// runs in otherwise), mirroring `src/macos/mod.rs`'s own
+    /// double-gated driver tests: absent, not weakened, on every other lane.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dest_dir_is_library_fonts_on_macos() {
+        let home = std::path::Path::new("/Users/example");
+        assert_eq!(icon_font_dest_dir(home), home.join("Library/Fonts"));
+    }
+
+    /// The non-macOS mirror of the test above: fontconfig's directory,
+    /// which is what every lane that actually compiles this test runs.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn dest_dir_is_local_share_fonts_off_macos() {
+        let home = std::path::Path::new("/home/example");
+        assert_eq!(icon_font_dest_dir(home), home.join(".local/share/fonts"));
     }
 }
