@@ -600,9 +600,9 @@ pub static PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
     PaletteCommand {
         label: "Go: Go to Definition",
-        // `gd` is Vim's local-declaration motion, not this LSP command (:h gd)
-        // — no plain-Vim-mode key triggers this palette action.
-        shortcut: "",
+        // `gd` is Vim's local-declaration motion, not this LSP command
+        // (:h gd) — the tag-jump `Ctrl-]` is what invokes the server.
+        shortcut: "Ctrl+]",
         vscode_shortcut: "F12",
         action: "lsp_definition",
     },
@@ -1837,6 +1837,7 @@ Ctrl+D  Ctrl+U      Half-page down / up
 Ctrl+F  Ctrl+B      Page down / up
 Ctrl+E  Ctrl+Y      Scroll one line down / up (cursor stays)
 Ctrl+O  Ctrl+I      Jump list back / forward
+Ctrl+]              Go to definition (LSP)                :def
 
 ── Editing ─────────────────────────────────────────────
 i I                 Insert before cursor / at first non-blank

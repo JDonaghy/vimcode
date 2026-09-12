@@ -9642,8 +9642,8 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
             MenuItemData {
                 label: "Go to Definition",
                 // `gd` is Vim's local-declaration motion, not this LSP
-                // command (:h gd) — no plain-Vim-mode key triggers it.
-                shortcut: "",
+                // command (:h gd) — the tag-jump `Ctrl-]` invokes the server.
+                shortcut: "Ctrl+]",
                 vscode_shortcut: "F12",
                 action: "def",
                 enabled: true,
