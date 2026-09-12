@@ -1926,6 +1926,17 @@ impl Engine {
                 self.mode = Mode::Command;
                 self.command_buffer.clear();
                 self.command_cursor = 0;
+                // A count typed before `:` pre-fills the command line with a
+                // range of that many lines starting at the cursor
+                // (`:h cmdline-ranges`): `3:` -> `:.,.+2`, `1:` -> `:.,.`.
+                if let Some(n) = self.count.take() {
+                    self.command_buffer = if n > 1 {
+                        format!(".,.+{}", n - 1)
+                    } else {
+                        ".,.".to_string()
+                    };
+                    self.command_cursor = self.command_buffer.chars().count();
+                }
                 self.count = None; // Clear count when entering command mode
             }
             Some('/') => {

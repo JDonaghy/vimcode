@@ -18969,6 +18969,47 @@ fn test_colon_dot_stays() {
     assert_eq!(e.view().cursor.line, 1);
 }
 
+// ── Issue #884: count before `:` pre-fills a range ───────────────────
+
+#[test]
+fn test_count_before_colon_prefills_range() {
+    // `3:` -> `:.,.+2` (`:h cmdline-ranges`).
+    let mut e = engine_with_text("a\nb\nc\nd\n");
+    send_keys(&mut e, "3:");
+    assert_eq!(e.command_buffer, ".,.+2");
+}
+
+#[test]
+fn test_count_one_before_colon_prefills_degenerate_range() {
+    // `1:` -> `:.,.`, not a bare `:` — the degenerate case still ranges.
+    let mut e = engine_with_text("a\nb\nc\n");
+    send_keys(&mut e, "1:");
+    assert_eq!(e.command_buffer, ".,.");
+}
+
+#[test]
+fn test_bare_colon_has_no_prefilled_range() {
+    let mut e = engine_with_text("a\nb\nc\n");
+    send_keys(&mut e, ":");
+    assert_eq!(e.command_buffer, "");
+}
+
+#[test]
+fn test_count_before_colon_delete_spans_lines() {
+    // `3:d<CR>` deletes the 3 lines starting at the cursor, not just one.
+    let mut e = engine_with_text("a\nb\nc\nd\n");
+    send_keys(&mut e, "3:d<CR>");
+    assert_eq!(e.buffer().to_string(), "d\n");
+}
+
+#[test]
+fn test_count_before_colon_substitute_spans_lines() {
+    // `3:s/a/b/<CR>` — the pre-filled range carries into `:s`.
+    let mut e = engine_with_text("a\na\na\na\n");
+    send_keys(&mut e, "3:s/a/b/<CR>");
+    assert_eq!(e.buffer().to_string(), "b\nb\nb\na\n");
+}
+
 // ── Bicep comment style ────────────────────────────────────────────────
 
 #[test]
