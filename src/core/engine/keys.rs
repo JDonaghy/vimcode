@@ -3550,9 +3550,9 @@ impl Engine {
                 let count = self.take_count();
                 let line = self.view().cursor.line;
                 if operator == '>' {
-                    self.indent_lines(line, count, changed);
+                    self.indent_lines(line, count, changed, true);
                 } else {
-                    self.dedent_lines(line, count, changed);
+                    self.dedent_lines(line, count, changed, true);
                 }
                 return EngineAction::None;
             }
@@ -4541,9 +4541,9 @@ impl Engine {
                     .char_to_line(end.saturating_sub(1).max(start));
                 let count = end_line - start_line + 1;
                 if operator == '>' {
-                    self.indent_lines(start_line, count, changed);
+                    self.indent_lines(start_line, count, changed, true);
                 } else if operator == '<' {
-                    self.dedent_lines(start_line, count, changed);
+                    self.dedent_lines(start_line, count, changed, true);
                 } else {
                     self.auto_indent_lines(start_line, count, changed);
                 }
@@ -4672,10 +4672,10 @@ impl Engine {
                 *changed = true;
             }
             '>' => {
-                self.indent_lines(start_line, count, changed);
+                self.indent_lines(start_line, count, changed, true);
             }
             '<' => {
-                self.dedent_lines(start_line, count, changed);
+                self.dedent_lines(start_line, count, changed, true);
             }
             '=' => {
                 self.auto_indent_lines(start_line, count, changed);
@@ -7743,9 +7743,9 @@ impl Engine {
                         self.visual_anchor = None;
                         for _ in 0..shifts {
                             if ch == '>' {
-                                self.indent_lines(start_line, line_count, changed);
+                                self.indent_lines(start_line, line_count, changed, true);
                             } else {
-                                self.dedent_lines(start_line, line_count, changed);
+                                self.dedent_lines(start_line, line_count, changed, true);
                             }
                         }
                         self.view_mut().cursor.line = start_line;

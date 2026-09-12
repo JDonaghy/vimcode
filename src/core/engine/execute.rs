@@ -1603,7 +1603,7 @@ impl Engine {
         if cmd == ">" {
             let line = self.view().cursor.line;
             let mut changed = false;
-            self.indent_lines(line, 1, &mut changed);
+            self.indent_lines(line, 1, &mut changed, true);
             return EngineAction::None;
         }
 
@@ -1611,7 +1611,7 @@ impl Engine {
         if cmd == "<" {
             let line = self.view().cursor.line;
             let mut changed = false;
-            self.dedent_lines(line, 1, &mut changed);
+            self.dedent_lines(line, 1, &mut changed, true);
             return EngineAction::None;
         }
 
@@ -4115,9 +4115,9 @@ impl Engine {
             self.view_mut().cursor.line = start;
             for _ in 0..levels {
                 if shift_char == '>' {
-                    self.indent_lines(start, n, &mut changed);
+                    self.indent_lines(start, n, &mut changed, true);
                 } else {
-                    self.dedent_lines(start, n, &mut changed);
+                    self.dedent_lines(start, n, &mut changed, true);
                 }
             }
             self.view_mut().cursor.line = end.min(self.buffer().len_lines().saturating_sub(1));
