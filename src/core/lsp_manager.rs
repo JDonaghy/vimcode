@@ -477,11 +477,7 @@ pub fn missing_dependency_message(
     manifest: &extensions::ExtensionManifest,
     missing: &[&str],
 ) -> String {
-    let name = if manifest.display_name.is_empty() {
-        &manifest.name
-    } else {
-        &manifest.display_name
-    };
+    let name = manifest.display_or_name();
     // #918: naming the missing binary alone ("requires npm — install npm
     // and try again") tells the user what's missing but not what to
     // actually run. Attach a runnable, platform-specific command for the
@@ -848,29 +844,38 @@ impl LspManager {
                     extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
                 {
                     let install_cmd = manifest.lsp.install_cmd_for_platform();
-                    let name = if manifest.display_name.is_empty() {
-                        &manifest.name
-                    } else {
-                        &manifest.display_name
-                    };
-                    self.last_start_error = Some(
-                        if !install_cmd.is_empty() && !manifest.lsp.binary.is_empty() {
-                            format!("{} not found. Run: {}", manifest.lsp.binary, install_cmd)
+                    let name = manifest.display_or_name();
+                    self.last_start_error = Some(if !install_cmd.is_empty() {
+                        // #918 review follow-up: branch only on `install_cmd`
+                        // being present, not also on `manifest.lsp.binary`
+                        // being non-empty. The old `&&` condition discarded a
+                        // real, resolvable install command whenever a
+                        // manifest happened to have an empty `lsp.binary`
+                        // field, silently falling to the generic "no install
+                        // command" message below even though one *was*
+                        // known. Fall back to the extension's display name
+                        // for the "not found" label in that edge case
+                        // instead of printing an empty binary name.
+                        let binary_label = if manifest.lsp.binary.is_empty() {
+                            name
                         } else {
-                            // #918: previously this branch fell through to
-                            // `return None` with `last_start_error` left
-                            // untouched, so the user saw the generic "No
-                            // LSP server found" with no hint an extension
-                            // was even involved (`java` hits this on every
-                            // platform — no install command anywhere in
-                            // its manifest). Always name the extension and
-                            // say plainly that it has no installer here.
-                            format!(
-                                "{name} extension declares no LSP install command for this \
-                                 platform — install its language server manually."
-                            )
-                        },
-                    );
+                            manifest.lsp.binary.as_str()
+                        };
+                        format!("{binary_label} not found. Run: {install_cmd}")
+                    } else {
+                        // #918: previously this branch fell through to
+                        // `return None` with `last_start_error` left
+                        // untouched, so the user saw the generic "No
+                        // LSP server found" with no hint an extension
+                        // was even involved (`java` hits this on every
+                        // platform — no install command anywhere in
+                        // its manifest). Always name the extension and
+                        // say plainly that it has no installer here.
+                        format!(
+                            "{name} extension declares no LSP install command for this \
+                             platform — install its language server manually."
+                        )
+                    });
                 }
                 return None;
             }

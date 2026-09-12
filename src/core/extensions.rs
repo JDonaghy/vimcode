@@ -344,6 +344,20 @@ impl ExtensionManifest {
     pub fn matches_language_id(&self, lang: &str) -> bool {
         self.language_ids.iter().any(|l| l == lang)
     }
+
+    /// The name to show the user: `display_name` when set, falling back to
+    /// the internal `name` otherwise. Several install-failure messages
+    /// (`lsp_manager.rs`'s `missing_dependency_message` and the two
+    /// `ensure_server_for_language` error branches, #918) all needed this
+    /// exact fallback independently — pulled out once here so it can't drift
+    /// between call sites.
+    pub fn display_or_name(&self) -> &str {
+        if self.display_name.is_empty() {
+            &self.name
+        } else {
+            &self.display_name
+        }
+    }
 }
 
 // ─── Lookup helpers (operate on a slice of manifests) ─────────────────────────
