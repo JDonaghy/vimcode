@@ -6,9 +6,11 @@
 > line. The `Platform-Neutrality Rule` at the top of `CLAUDE.md` is the *operational
 > rule*; **this file is the source of truth for *intent* and *sequencing*.**
 >
-> _Last updated: 2026-09-05 (issue #827 correction pass — the 2026-09-03 revision
-> went stale within 81 minutes of its own edit and stayed that way for two days;
-> see "#47 was closed without its blocker" below). Milestone #7 is **0 open**._
+> _Last updated: 2026-09-11 (macOS native-menu audit — milestone #7 reopened with
+> #901/#902; the "0 open" claim had itself gone stale the moment quadraui#184's
+> supply side landed. The 2026-09-05 entry it replaces recorded the *previous*
+> staleness incident; see "#47 was closed without its blocker" below).
+> Milestone #7 is **2 open** (#901, #902)._
 
 ## 🎯 North star
 
@@ -52,9 +54,44 @@ adoption issue never gets picked up**, so the bespoke code lingers as tech debt.
 **It just happened again in a new shape — see "#47 was closed without its blocker"
 below.**
 
-## ✅ Milestone #7 is drained — 0 open
+## ⚠️ Milestone #7 is NOT drained — 2 open (2026-09-11)
 
-Everything the 2026-09-01 audit filed has landed. `#730` (`ai_panel` paint),
+The 2026-09-11 macOS audit found the failure mode this file exists to catch, in
+its purest form: **quadraui shipped an API and vimcode never adopted it.**
+
+| Issue | Adoption gap |
+|---|---|
+| **#901** | `Backend::install_menu_bar` — the native macOS build paints its menu bar *inside the window*. quadraui's NSMenu installer, `MenuBarItem.submenu` and `BackendCaps::native_menu` are all shipped in the pinned rev; vimcode references none of them. |
+| **#902** | `Backend::show_context_menu` — same capability flag, same suppression gap, for right-click menus. Scoped to mirror VS Code's `window.menuStyle` setting. |
+
+quadraui#184 is still open, and that is precisely why this went unnoticed: **its
+supply side had already landed**, so the tracking issue staying open made it look
+like the consume side could not start yet. *An open quadraui issue is not evidence
+that its API is unavailable — check the pinned rev, not the issue state.*
+
+**The rule the audit produced — keep it.** vimcode's platform-service adoption is
+otherwise healthy, because *additive* services are called unconditionally on
+`backend` in `src/app.rs` and the trait's default no-op absorbs backends that lack
+them (`show_message_dialog`, `show_file_open_dialog`, `set_cursor`,
+`toggle_window_maximize`, `begin_window_drag`). That pattern needs no capability
+check and should stay.
+
+It breaks only for **substitutive** services — where the native call *replaces*
+something vimcode paints itself. There the no-op default is not enough: vimcode
+must suppress its own rasteriser, which requires `backend.capabilities()`. As of
+2026-09-11 vimcode queries `BackendCaps` **nowhere**, and quadraui's surface has
+exactly two substitutive services — both unadopted, both now filed.
+
+**So audit by asking "which quadraui calls would *replace* something we draw?"** —
+not "which methods are unreferenced?" Most unreferenced methods are correctly
+unreferenced. Deliberately *not* filed: `send_notification` (macOS/Windows
+advertise `notifications: true`), because VS Code uses in-window toasts on every
+platform and never OS notifications — vimcode's `draw_toast_stack` already
+matches. Rationale recorded in #902 so a future audit does not re-flag it.
+
+## ✅ The 2026-09-01 audit's issues have all landed
+
+Everything that audit filed has landed. `#730` (`ai_panel` paint),
 `#593` (GTK `Ctrl+V`), `#731` (orphan Relm4 handles), `#732` (the GTK `Msg` bus),
 `#733`/`#734`/`#735` (mouse, keyboard, frame composition — each split into the
 slice chains below), `#657` (the oracle loop), `#658` (preview tier), plus `#480`,
@@ -310,9 +347,12 @@ every fix ahead of #657 was verified by tests its own author wrote. It is now
 follow-up is to decide whether any of #751–#766 warrants a retro-fitted
 oracle-authored test, rather than re-litigating the sequencing.
 
-## Status (2026-09-05, corrected per #827)
+## Status (2026-09-11, macOS native-menu audit)
 
-- ✅ **Milestone #7 is 0 open.** The 09-01 critical path plus 16 slices all landed.
+- ⚠️ **Milestone #7 is 2 open** (#901, #902) — the 09-01 critical path plus 16
+  slices all landed, but the 2026-09-11 audit reopened the milestone: quadraui
+  shipped `install_menu_bar` / `show_context_menu` and vimcode adopted neither.
+  See the milestone section above for the additive-vs-substitutive rule.
 - ✅ **The oracle loop is live here** (#657) and `draw_frame` is gone (#766).
 - 📉 **The audit is run and it missed its projection** — backends −3,656 against a
   −8,700…−9,500 projection; the three files net **+2,740** lines. But ~−2,825 of

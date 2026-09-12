@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** September 10, 2026 (issue #862 — `src/app.rs` no longer needs the `gui` feature to compile). Prior revisions: September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **0 open**. **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 11, 2026 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened). Prior revisions: September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
 
 ## #862 — `src/app.rs` compiles without `gui` (prerequisite for #859)
 
@@ -200,7 +200,7 @@ it needs `gh` access this worker session doesn't have. **Keep #820 open until
 that issue is filed** (per `GOALS.md`'s milestone-discipline rule); once
 filed, delete the drafted entry and link the real issue number here.
 
-## Active milestone: #7 Platform-Neutral — **complete (0 open)**
+## Active milestone: #7 Platform-Neutral — **2 open** (#901, #902)
 
 **The north star is [`GOALS.md`](GOALS.md): eliminate all platform-specific code from
 vimcode and lift it into quadraui.** Milestone **#7 Platform-Neutral** is the consume
@@ -358,7 +358,8 @@ Stage 1** (the GTK-side `App` move), not a re-filing task — see `PLAN.md` and
 
 ### Milestone hygiene
 
-- **#7 is 0 open.** #146 moved to #4 Editor Features; #47 sits in #5 Cross-Platform UI
+- **#7 is 2 open** (#901 `install_menu_bar`, #902 `show_context_menu` — both macOS
+  native-menu adoption, filed 2026-09-11). #146 moved to #4 Editor Features; #47 sits in #5 Cross-Platform UI
   Crate, which `GOALS.md` defines as covering the macOS/Windows backends, and is
   **open** (reopened 2026-09-03).
 - **quadraui milestone #9** ("vimcode Platform-Neutral blockers") is **open** (0
