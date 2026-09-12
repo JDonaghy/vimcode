@@ -5848,6 +5848,50 @@ mod tests {
         );
     }
 
+    /// #890: every TuiDriver test in this module builds its app with
+    /// [`TuiShellApp::new_for_test`], which runs
+    /// `Engine::startup_without_session_restore`. That path must not load
+    /// the *developer's* real `~/.config/vimcode/{plugins,extensions}` Lua,
+    /// nor spawn the networked extension-registry fetch.
+    ///
+    /// Why this matters at the driver tier specifically: plugin hooks
+    /// (`ModeChanged`, `InsertEnter`, `InsertLeave`, `cursor_move`) run
+    /// *synchronously inside keystroke handling*, and Lua can call
+    /// `vimcode.buf.set_cursor` / `set_lines`. So a plugin installed on the
+    /// machine running the tests rewrites what these tests type — the
+    /// keystroke path under test stops being vimcode's and becomes
+    /// vimcode-plus-whatever-is-installed. Dropping a two-line
+    /// `ModeChanged` plugin into `$HOME/.config/vimcode/plugins/` makes
+    /// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`
+    /// fail 100 % of the time, which is how that test failed on one machine
+    /// while passing on every other.
+    ///
+    /// **Verified RED against unfixed `develop`:** `new_for_test` used to
+    /// call `plugin_init()` + `ext_refresh()` unconditionally, so
+    /// `ext_registry_fetching` was `true` here on every machine (and
+    /// `plugin_manager` was `Some` on any machine with a plugins/extensions
+    /// directory, i.e. any machine where vimcode has ever been used).
+    #[test]
+    fn new_for_test_loads_no_ambient_plugins_and_starts_no_registry_fetch() {
+        let app = TuiShellApp::new_for_test();
+        assert!(
+            app.engine.plugin_manager.is_none(),
+            "TuiShellApp::new_for_test must not load or execute the user's \
+             installed plugins/extensions — their hooks run inside keystroke \
+             handling and can move the cursor or rewrite lines mid-test"
+        );
+        assert!(
+            !app.engine.ext_registry_fetching,
+            "TuiShellApp::new_for_test must not spawn the networked \
+             extension-registry fetch"
+        );
+        assert!(
+            app.engine.ext_registry_rx.is_none(),
+            "TuiShellApp::new_for_test must not leave a registry-fetch \
+             channel behind"
+        );
+    }
+
     /// #601: `render_content` must also paint per-editor-group tab bars —
     /// exercise the multi-window code path (`render_all_windows` +
     /// `render::tab_bar_draw_targets` for `screen.editor_group_split`) by
