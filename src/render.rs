@@ -9869,12 +9869,68 @@ pub fn build_menu_defs(is_vscode_mode: bool) -> Vec<quadraui::MenuDef> {
                             Some(quadraui::StyledText::plain(shortcut.to_string()))
                         },
                         disabled: !item.enabled,
+                        // #901: every `shortcut`/`vscode_shortcut` in
+                        // `MENU_STRUCTURE` is already plus-style
+                        // (`"Ctrl+S"`) — exactly what
+                        // `quadraui::parse_key_binding` accepts — so this
+                        // is free once parseable. `detail` above still wins
+                        // for the *drawn* dropdown's display text (an
+                        // in-window `ContextMenuItem`'s doc comment says
+                        // so); `key_equivalent` is what the macOS NSMenu
+                        // installer (`Backend::install_menu_bar`) reads to
+                        // wire the real Cmd-key shortcut, so a native menu
+                        // bar's items get working accelerators without
+                        // GTK/TUI's drawn dropdown changing at all.
+                        key_equivalent: if shortcut.is_empty() {
+                            None
+                        } else {
+                            quadraui::parse_key_binding(shortcut).map(|_| quadraui::Accelerator {
+                                id: quadraui::AcceleratorId::new(item.action),
+                                binding: quadraui::KeyBinding::Literal(shortcut.to_string()),
+                                scope: quadraui::AcceleratorScope::Global,
+                                label: None,
+                            })
+                        },
                         ..Default::default()
                     }
                 })
                 .collect(),
         })
         .collect()
+}
+
+/// Convert [`build_menu_defs`]'s output into a [`quadraui::MenuBar`] for
+/// [`quadraui::Backend::install_menu_bar`] (#901).
+///
+/// Pure and backend-neutral: any backend that declares
+/// `BackendCaps::native_menu` (macOS's `MacBackend` today) can hand its
+/// result straight to `install_menu_bar` instead of the app drawing its own
+/// in-window `MenuSystem` row. Each top-level `MenuDef` becomes a
+/// `MenuBarItem` whose `submenu` is the *same* `ContextMenuItem` list the
+/// drawn dropdown already uses — including the `key_equivalent` populated
+/// above — so the native menu and the in-window one can never drift apart
+/// (one source of truth, not two).
+///
+/// #902 (native right-click context menus via `Backend::show_context_menu`)
+/// can reuse a `MenuDef`'s `items: Vec<ContextMenuItem>` directly for its own
+/// conversion — the per-item shape (including `key_equivalent`) is already
+/// exactly what `show_context_menu` needs; nothing here is menu-bar-specific
+/// below the top level.
+pub fn menu_defs_to_menu_bar(defs: &[quadraui::MenuDef]) -> quadraui::MenuBar {
+    quadraui::MenuBar {
+        id: quadraui::WidgetId::new("menu_bar"),
+        items: defs
+            .iter()
+            .map(|def| quadraui::MenuBarItem {
+                id: def.id.clone(),
+                label: def.label.clone(),
+                disabled: def.disabled,
+                submenu: Some(def.items.clone()),
+            })
+            .collect(),
+        open_item: None,
+        focused_item: None,
+    }
 }
 
 /// Static debug toolbar button definitions.
@@ -26898,5 +26954,85 @@ mod slice7_router_tests {
             false
         )
         .is_some());
+    }
+
+    // ── #901: menu defs → native MenuBar conversion ─────────────────────
+
+    /// `build_menu_defs` must populate `key_equivalent` from any parseable
+    /// shortcut, alongside the pre-existing `detail` display text — RED
+    /// against the pre-#901 body (which only ever set `detail`, so this
+    /// field was `None` for every item, and the native macOS menu installer
+    /// had no accelerator to wire).
+    #[test]
+    fn build_menu_defs_populates_key_equivalent_from_shortcut() {
+        let defs = build_menu_defs(false);
+        let file = defs.iter().find(|d| d.id.as_str() == "File").unwrap();
+        let save = file
+            .items
+            .iter()
+            .find(|i| i.id.as_ref().map(|id| id.as_str()) == Some("w"))
+            .expect("Save item present");
+        let acc = save
+            .key_equivalent
+            .as_ref()
+            .expect("Save's \"Ctrl+S\" shortcut must parse into key_equivalent");
+        assert_eq!(acc.binding, quadraui::KeyBinding::Literal("Ctrl+S".into()));
+        // `detail` (the drawn dropdown's display text) is untouched.
+        assert!(save
+            .detail
+            .as_ref()
+            .unwrap()
+            .spans
+            .iter()
+            .any(|s| s.text == "Ctrl+S"));
+    }
+
+    /// Items with no shortcut (most of the menu) get no `key_equivalent` —
+    /// this isn't a blanket accelerator grab, only real shortcuts convert.
+    #[test]
+    fn build_menu_defs_leaves_key_equivalent_none_without_a_shortcut() {
+        let defs = build_menu_defs(false);
+        let file = defs.iter().find(|d| d.id.as_str() == "File").unwrap();
+        let open = file
+            .items
+            .iter()
+            .find(|i| i.id.as_ref().map(|id| id.as_str()) == Some("open_file_dialog"))
+            .expect("Open File item present");
+        assert!(open.key_equivalent.is_none());
+    }
+
+    /// `menu_defs_to_menu_bar` preserves top-level order and reuses each
+    /// `MenuDef`'s `ContextMenuItem` list verbatim as the `MenuBarItem`'s
+    /// submenu — the native NSMenu installer and the drawn `MenuSystem`
+    /// dropdown must never be able to disagree about what's in the menu.
+    #[test]
+    fn menu_defs_to_menu_bar_preserves_order_and_submenu_contents() {
+        let defs = build_menu_defs(false);
+        let bar = menu_defs_to_menu_bar(&defs);
+
+        assert_eq!(bar.items.len(), defs.len());
+        for (bar_item, def) in bar.items.iter().zip(defs.iter()) {
+            assert_eq!(bar_item.id, def.id);
+            assert_eq!(bar_item.label, def.label);
+            assert_eq!(bar_item.disabled, def.disabled);
+            assert_eq!(bar_item.submenu.as_deref(), Some(def.items.as_slice()));
+        }
+    }
+
+    /// A separator in `MENU_STRUCTURE` round-trips into the `MenuBar`
+    /// conversion as a genuine separator (`id: None`), not a blank action
+    /// item — the native installer treats `id: None` as
+    /// `NSMenuItem::separatorItem`, so getting this wrong would either drop
+    /// the divider or install a dead clickable row in its place.
+    #[test]
+    fn menu_defs_to_menu_bar_keeps_separators_as_separators() {
+        let defs = build_menu_defs(false);
+        let bar = menu_defs_to_menu_bar(&defs);
+        let file = bar.items.iter().find(|i| i.id.as_str() == "File").unwrap();
+        let submenu = file.submenu.as_ref().unwrap();
+        assert!(
+            submenu.iter().any(|item| item.id.is_none()),
+            "File menu should still contain at least one separator"
+        );
     }
 }
