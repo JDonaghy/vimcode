@@ -3006,3 +3006,113 @@ fn config_dir_helper_returns_vimcode() {
         "config dir should contain 'vimcode': {s}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #917: macOS Homebrew LSP-binary resolution
+// ---------------------------------------------------------------------------
+//
+// `resolve_command` probes a fixed set of directories before falling back to
+// `which` (which inherits this process's PATH). On macOS neither
+// `/opt/homebrew/bin` nor `/usr/local/bin` was ever in that list, so a
+// Homebrew-installed language server (7 of 19 registry extensions install
+// via Homebrew) installed successfully and then was never found when
+// vimcode ran as a native `.app` bundle with launchd's minimal PATH.
+//
+// These tests can't touch real `/opt/homebrew` from this Linux box (and
+// shouldn't touch it even on a real Mac), so they drive the exact same
+// macOS-only code path through `VIMCODE_TEST_HOMEBREW_PREFIXES` — an
+// override `resolve_command`'s `homebrew_prefixes()` only honours on
+// non-macOS targets, specifically so this behaviour is exercised on every
+// CI host rather than going untested forever because this repo's CI has no
+// macOS runner.
+//
+// A `Mutex` serializes the two tests below since both mutate process-global
+// `PATH` / `VIMCODE_TEST_HOMEBREW_PREFIXES` state; an RAII guard restores
+// both on drop (including on panic) so they can't leak into other tests.
+static HOMEBREW_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard: snapshot + restore an environment variable across a test.
+struct EnvVarGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+#[test]
+fn resolve_command_finds_binary_under_fake_homebrew_prefix() {
+    let _lock = HOMEBREW_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let prefix =
+        std::env::temp_dir().join(format!("vimcode_test_brew_prefix_{}", std::process::id()));
+    let bin_dir = prefix.join("bin");
+    let _ = std::fs::remove_dir_all(&prefix);
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    // Uniquely named so this can't accidentally resolve via some unrelated
+    // binary that happens to already sit on the test host's real PATH.
+    let binary_name = "vimcode-test-fake-lsp-917";
+    let binary_path = bin_dir.join(binary_name);
+    std::fs::write(&binary_path, "#!/bin/sh\necho fake\n").unwrap();
+
+    let _prefix_guard = EnvVarGuard::set("VIMCODE_TEST_HOMEBREW_PREFIXES", prefix.as_os_str());
+    // launchd's PATH for a GUI-launched app has no Homebrew prefix on it —
+    // simulate that exactly, so this test cannot pass merely because the
+    // developer's login shell (or CI runner) has brew, or anything else, on
+    // PATH already.
+    let _path_guard = EnvVarGuard::set("PATH", std::ffi::OsStr::new("/usr/bin:/bin"));
+
+    let resolved = vimcode_core::core::lsp_manager::resolve_command(binary_name);
+    assert_eq!(
+        resolved,
+        Some(binary_path.clone()),
+        "should resolve {binary_name} via the fake Homebrew prefix bin/ dir"
+    );
+
+    let _ = std::fs::remove_dir_all(&prefix);
+}
+
+#[test]
+fn resolve_command_finds_keg_only_clangd_under_homebrew_opt() {
+    let _lock = HOMEBREW_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Homebrew's `llvm` formula (which ships `clangd`) is keg-only — its
+    // binaries are never symlinked into `<prefix>/bin`, only into
+    // `<prefix>/opt/llvm/bin`. Deliberately leave `bin/` empty here so this
+    // only passes if resolution goes through the keg-only probe, not the
+    // ordinary `<prefix>/bin` lookup.
+    let prefix =
+        std::env::temp_dir().join(format!("vimcode_test_brew_kegonly_{}", std::process::id()));
+    let kegged_bin_dir = prefix.join("opt").join("llvm").join("bin");
+    let _ = std::fs::remove_dir_all(&prefix);
+    std::fs::create_dir_all(&kegged_bin_dir).unwrap();
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    let clangd_path = kegged_bin_dir.join("clangd");
+    std::fs::write(&clangd_path, "#!/bin/sh\necho fake\n").unwrap();
+
+    let _prefix_guard = EnvVarGuard::set("VIMCODE_TEST_HOMEBREW_PREFIXES", prefix.as_os_str());
+    let _path_guard = EnvVarGuard::set("PATH", std::ffi::OsStr::new("/usr/bin:/bin"));
+
+    let resolved = vimcode_core::core::lsp_manager::resolve_command("clangd");
+    assert_eq!(
+        resolved,
+        Some(clangd_path.clone()),
+        "clangd should resolve via <prefix>/opt/llvm/bin since llvm is keg-only"
+    );
+
+    let _ = std::fs::remove_dir_all(&prefix);
+}
