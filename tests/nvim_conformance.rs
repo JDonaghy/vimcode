@@ -3684,8 +3684,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "search:/\\(foo\\)\\1",
     "search:gd",
     "search:gN",
-    "ex:2,3sort",
-    "ex:sort /pat/ r",
     "ex:retab",
     "ex:retab!",
     "ex:retab 2",
@@ -3693,8 +3691,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "ex:le 4",
     "ex:ri 10",
     "ex:ce 10",
-    "ex:r !echo",
-    "ex:*d after visual",
     // "ins:BS over indent (nosmarttab)" and "ins:Tab at start (nosmarttab)"
     // moved to HARNESS_LIMITED (#875) — the harness gap they were pinned to,
     // not vimcode's Vim-compat, is the reason they fail. See that array.

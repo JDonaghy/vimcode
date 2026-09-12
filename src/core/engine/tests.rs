@@ -27484,13 +27484,18 @@ fn test_nvim_sort_basic() {
 }
 
 #[test]
-fn test_nvim_sort_reverse_r_flag() {
-    // :sort r (VimCode flag form) reverses alphabetical order
+fn test_nvim_sort_r_flag_without_pattern_is_a_no_op() {
+    // Real Vim's `r` flag only means anything alongside a `/pattern/` (sort
+    // on the match itself rather than the text after it) — with no pattern
+    // there's nothing to select, so `r` has no effect and the sort is a
+    // plain alphabetical one. Reversing is `:sort!`, a separate axis (#879 —
+    // this repo used to conflate the two, so `:sort /pat/ r` sorted on whole
+    // lines instead of the match).
     let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+    engine.buffer_mut().insert(0, "charlie\nalpha\nbravo\n");
     engine.update_syntax();
     engine.feed_keys(":sort r<CR>");
-    assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+    assert_eq!(engine.buffer().to_string(), "alpha\nbravo\ncharlie\n");
 }
 
 #[test]
@@ -27501,6 +27506,55 @@ fn test_nvim_sort_unique() {
     engine.update_syntax();
     engine.feed_keys(":sort u<CR>");
     assert_eq!(engine.buffer().to_string(), "a\nb\nc\n");
+}
+
+// -- :r[ead] {file} / :r[ead] !{cmd} --
+//
+// The shell-out itself is only exercised by the real `nvim --headless`
+// oracle case (`ex:r !echo` in tests/nvim_conformance.rs, which is not built
+// with `cfg(test)` and so actually spawns the process) — mirroring how
+// `try_execute_filter_command`'s `%!cmd` shell-out is `#[cfg(test)]`-gated
+// to a no-op so unit tests stay hermetic. These tests instead drive
+// `insert_read_content` directly, which is the part of #879's fix that
+// isn't the subprocess call: reusing `:put`'s "land on the last inserted
+// line" cursor rule (`:h :read` says the same, verified against nvim above).
+
+#[test]
+fn test_insert_read_content_leaves_cursor_on_last_inserted_line() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\n");
+    engine.update_syntax();
+    let inserted = engine.insert_read_content("hi\n");
+    assert_eq!(inserted, 1);
+    assert_eq!(engine.buffer().to_string(), "a\nhi\n");
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_insert_read_content_multiple_lines_lands_on_the_last_one() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x\ny\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 0;
+    let inserted = engine.insert_read_content("l1\nl2\nl3\n");
+    assert_eq!(inserted, 3);
+    assert_eq!(engine.buffer().to_string(), "x\nl1\nl2\nl3\ny\n");
+    assert_eq!(engine.view().cursor.line, 3);
+}
+
+// -- `*` ex range: shorthand for `'<,'>`, the last visual selection --
+
+#[test]
+fn test_star_range_is_last_visual_selection() {
+    // `*` must still resolve after leaving visual mode, the same way `'<`
+    // and `'>` do (`test_substitute_visual_range` above) — #879.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\n");
+    engine.update_syntax();
+    engine.feed_keys("Vj<Esc>:*d<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\n");
+    assert_eq!(engine.view().cursor.line, 0);
 }
 
 // -- gi: restart insert at last position --
@@ -27849,13 +27903,35 @@ fn test_nvim_colon_zero_still_goes_to_first() {
 }
 
 #[test]
-fn test_nvim_sort_with_existing_r_flag_still_works() {
-    // :sort r (old form) should keep working unchanged.
+fn test_nvim_sort_pattern_r_flag_sorts_on_the_match() {
+    // :sort /pat/ r sorts on the text the pattern *matches*, not on the text
+    // after the match (that's the plain, `r`-less `:sort /pat/` case, see
+    // `test_nvim_sort_pattern_sorts_on_text_after_match` below). #879.
     let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "alpha\nbravo\ncharlie\n");
+    engine.buffer_mut().insert(0, "b 2\na 1\n");
     engine.update_syntax();
-    engine.feed_keys(":sort r<CR>");
-    assert_eq!(engine.buffer().to_string(), "charlie\nbravo\nalpha\n");
+    engine.feed_keys(":sort /\\d/ r<CR>");
+    assert_eq!(engine.buffer().to_string(), "a 1\nb 2\n");
+}
+
+#[test]
+fn test_nvim_sort_pattern_sorts_on_text_after_match() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "x2 b\nx1 a\n");
+    engine.update_syntax();
+    engine.feed_keys(":sort /x\\d /<CR>");
+    assert_eq!(engine.buffer().to_string(), "x1 a\nx2 b\n");
+}
+
+#[test]
+fn test_nvim_sort_range_leaves_lines_outside_it_untouched() {
+    // :2,3sort sorts only lines 2-3, leaving line 1 where it is.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "c\nb\na\n");
+    engine.update_syntax();
+    engine.feed_keys(":2,3sort<CR>");
+    assert_eq!(engine.buffer().to_string(), "c\na\nb\n");
+    assert_eq!(engine.view().cursor.line, 1);
 }
 
 // ── #114 follow-up: 1-based line addresses ─────────────────────────────
