@@ -7669,6 +7669,17 @@ impl Engine {
             }
         }
 
+        // Handle `` `{mark} `` — jump the cursor to the exact mark position,
+        // extending the active Visual selection (the anchor is untouched).
+        // Normal mode's backtick handling (the `pending == '`'` arm further
+        // up in `handle_key`) only ever runs there; Visual mode fell through
+        // to the catch-all and treated `` ` `` as a no-op, so `v\`ad` never
+        // extended the selection (#887).
+        if !ctrl && self.pending_key.is_none() && unicode == Some('`') {
+            self.pending_key = Some('`');
+            return EngineAction::None;
+        }
+
         // Handle operators: d (delete), y (yank), c (change), u (lowercase), U (uppercase)
         // Note: count is NOT applied to visual operators - they operate on the selection
         if let Some(ch) = unicode {
@@ -8034,7 +8045,42 @@ impl Engine {
                     let cursor = self.view().cursor;
                     let cursor_pos = self.buffer().line_to_char(cursor.line) + cursor.col;
 
-                    let count = self.take_count().max(1);
+                    let mut count = self.take_count().max(1);
+
+                    // Paragraph objects have no "next occurrence" for the cursor
+                    // to land on the way brackets/quotes do — re-finding `ip`
+                    // from a cursor still inside the same paragraph returns the
+                    // identical range, so the naive "always recompute from the
+                    // cursor" approach below can't grow the selection. Vim's
+                    // actual behaviour: pressing the same paragraph object again
+                    // while the active Visual selection is *exactly* that
+                    // object grows it — it pairs in the next block (blank run
+                    // or paragraph), same as `find_paragraph_object`'s
+                    // count>1 path already does for an explicit `2ip`/`2ap`.
+                    // Detect that by walking `try_count` up while it keeps
+                    // reproducing the current selection (#887).
+                    if obj_type == 'p' && count == 1 {
+                        if let Some(anchor) = self.visual_anchor {
+                            let anchor_pos = self.buffer().line_to_char(anchor.line) + anchor.col;
+                            let (sel_lo, sel_hi_incl) = if anchor_pos <= cursor_pos {
+                                (anchor_pos, cursor_pos)
+                            } else {
+                                (cursor_pos, anchor_pos)
+                            };
+                            let max_tries = self.buffer().len_lines().max(1);
+                            let mut try_count = 1;
+                            while try_count <= max_tries {
+                                match self.find_paragraph_object(pending, cursor_pos, try_count) {
+                                    Some((s, e)) if s == sel_lo && e == sel_hi_incl + 1 => {
+                                        try_count += 1;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            count = try_count;
+                        }
+                    }
+
                     if let Some((start_pos, end_pos)) =
                         self.find_text_object_range(pending, obj_type, cursor_pos, count)
                     {
@@ -8073,16 +8119,58 @@ impl Engine {
                     self.last_find = Some((pending, target));
                 }
                 return EngineAction::None;
+            } else if pending == '`' {
+                // `` `{a-z|A-Z|`|.|<|>} ``: jump the cursor to the exact mark
+                // position, extending the Visual selection (anchor unchanged).
+                // Mirrors the Normal-mode `` ` `` resolution above but only
+                // moves the cursor — Visual mode's own operators (`d`, `y`,
+                // ...) apply to the resulting anchor..cursor span afterwards.
+                if let Some(ch) = unicode {
+                    let target: Option<(usize, usize)> = match ch {
+                        '`' => self.last_jump_pos,
+                        '.' => self.last_edit_pos,
+                        '<' => self.visual_mark_start,
+                        '>' => self.visual_mark_end,
+                        _ if ch.is_ascii_lowercase() => {
+                            let buffer_id = self.active_window().buffer_id;
+                            self.marks
+                                .get(&buffer_id)
+                                .and_then(|m| m.get(&ch))
+                                .map(|c| (c.line, c.col))
+                        }
+                        _ if ch.is_ascii_uppercase() => self
+                            .global_marks
+                            .get(&ch)
+                            .map(|&(_, line, col)| (line, col)),
+                        _ => None,
+                    };
+                    if let Some((target_line, target_col)) = target {
+                        let max_line = self.buffer().len_lines().saturating_sub(1);
+                        let target_line = target_line.min(max_line);
+                        let target_col = target_col.min(self.buffer().line_len_chars(target_line));
+                        self.view_mut().cursor.line = target_line;
+                        self.view_mut().cursor.col = target_col;
+                    } else {
+                        self.message = format!("Mark `{}` not set", ch);
+                    }
+                }
+                return EngineAction::None;
             } else if pending == 'r' {
                 // r{char}: replace all selected characters with the given character.
                 // <CR> has no `unicode` (it arrives as key_name "Return" with
                 // unicode: None — see `press_special` in the conformance
-                // harness and the Normal-mode `'r'` handler above), and in
-                // VisualBlock mode Vim special-cases it: instead of inserting
-                // a literal character, each selected line is split into two
-                // at the block column (`:h v_b_r`; #807, `vb:jr<CR>`).
+                // harness and the Normal-mode `'r'` handler above). VisualBlock
+                // special-cases it: instead of inserting a literal character,
+                // each selected line is split into two at the block column
+                // (`:h v_b_r`; #807, `vb:jr<CR>`). Char/line-wise Visual `r`
+                // does NOT get that special-case — verified against real
+                // Neovim (#887, "vis:v_r CR"): it replaces the whole selection
+                // with a literal carriage-return character, same as any other
+                // single-character replacement, not an actual line split.
                 if self.mode == Mode::VisualBlock && matches!(key_name, "Return" | "KP_Enter") {
                     self.replace_visual_block_with_newline(changed);
+                } else if matches!(key_name, "Return" | "KP_Enter") {
+                    self.replace_visual_selection('\r', changed);
                 } else if let Some(replacement) = unicode {
                     self.replace_visual_selection(replacement, changed);
                 }

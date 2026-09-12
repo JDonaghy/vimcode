@@ -3710,12 +3710,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // "ins:BS over indent (nosmarttab)" and "ins:Tab at start (nosmarttab)"
     // moved to HARNESS_LIMITED (#875) — the harness gap they were pinned to,
     // not vimcode's Vim-compat, is the reason they fail. See that array.
-    "vis:vip then ip extends",
-    "vis:v'a? mark d",
-    "vis:vjc then u",
-    "vis:v_r CR",
-    "vis:v ap trailing",
-    "vis:vip on last para no trailing",
     // "num:octal nf=octal 007" and "num:alpha" moved to HARNESS_LIMITED
     // (#875) — same `setup`-is-dropped harness gap as the `nosmarttab` pair
     // above. See that array. (Note "num:octal not default 007" — no
