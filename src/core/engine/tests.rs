@@ -9449,6 +9449,81 @@ fn test_jump_list_truncates_forward_on_new_jump() {
     assert_eq!(engine.view().cursor.line, 14);
 }
 
+// ─── #891: changelist (g;/g,) and `] after yank ────────────────────────────
+
+#[test]
+fn test_changelist_g_semi_then_g_comma_lands_on_second_newest() {
+    // Oracle case "jump:g; g; g," — two changes on different lines, then
+    // `gg` off the changelist entirely, then g; g; g,. The walk is a stable
+    // pointer into the list: two steps back then one step forward must land
+    // back on the second-most-recent change, not re-visit the oldest one.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc");
+    send_keys(&mut engine, "xjjxggg;g;g,");
+    // The change on line 2 ("c") deletes that line's only char, which makes
+    // the buffer's content end in "\n" — ropey (unlike Neovim) does not count
+    // a trailing newline as introducing an extra empty final line, so this
+    // engine's line 2 reads as vimcode-line-1 here (`tests/nvim_conformance.rs`
+    // carries the same +1 leniency for exactly this convention gap; it isn't
+    // part of what #891 owns). The changelist entry is still (line 2, col 0)
+    // — `change_list` — and g; g; g, must land back on it, not on line 0.
+    assert_eq!(engine.change_list, vec![(0, 0), (2, 0)]);
+    assert_eq!(
+        engine.view().cursor.line,
+        1,
+        "g; g; g, should land back on the newer of the two changes"
+    );
+}
+
+#[test]
+fn test_changelist_collapses_same_line_changes() {
+    // Oracle case "jump:g; after 2 changes same line" — a second change on
+    // the line already at the head of the changelist must update that entry
+    // in place rather than appending a second one, so a single g; jumps
+    // straight to it and a further g; reports "already at oldest" instead
+    // of walking to a (nonexistent) earlier duplicate.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef");
+    send_keys(&mut engine, "x$xgg0g;");
+    assert_eq!(
+        engine.change_list.len(),
+        1,
+        "same-line changes must collapse"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "g; should land on the column of the second (collapsed) change"
+    );
+    let msg_before = engine.message.clone();
+    send_keys(&mut engine, "g;");
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "a second g; must not move the cursor — there is only one entry"
+    );
+    assert_ne!(
+        engine.message, msg_before,
+        "a second g; with no earlier entry should report already-at-oldest"
+    );
+}
+
+#[test]
+fn test_backtick_close_bracket_after_yank_lands_on_last_char() {
+    // Oracle case "mark:`] after yank" — `[`/`] bracket the last changed
+    // *or yanked* text (`:h '[`). `] must land on the last character of the
+    // yanked region, not one past it.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc def");
+    send_keys(&mut engine, "wyiw0`]");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(
+        engine.view().cursor.col,
+        6,
+        "`] should land on the 'f' in \"def\", the last yanked char"
+    );
+}
+
 #[test]
 fn test_jump_list_paragraph_motion() {
     let mut engine = Engine::new();

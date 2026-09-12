@@ -3026,6 +3026,18 @@ impl Engine {
                     self.view_mut().cursor.line = line;
                     self.view_mut().cursor.col = start_pos - self.buffer().line_to_char(line);
                 }
+                // `` `[ ``/`` `] `` bracket the last changed *or yanked* text
+                // (`:h '[`) — a text-object yank is exactly the case #806's
+                // narrower tracking (indent-shift only) missed (#891,
+                // "mark:`] after yank"). `end_pos` is exclusive, so the `]`
+                // mark sits on its last *contained* char, not one past it.
+                let start_line = self.buffer().content.char_to_line(start_pos);
+                let start_col = start_pos - self.buffer().line_to_char(start_line);
+                self.last_change_start = Some((start_line, start_col));
+                let last_char_pos = end_pos.saturating_sub(1).max(start_pos);
+                let end_line = self.buffer().content.char_to_line(last_char_pos);
+                let end_col = last_char_pos - self.buffer().line_to_char(end_line);
+                self.last_change_end = Some((end_line, end_col));
             }
             'd' | 'c' => {
                 // Delete or change
@@ -5888,12 +5900,20 @@ impl Engine {
     // =======================================================================
 
     /// Push (line, col) to the change list, capped at 100 entries.
+    ///
+    /// A change on the same line as the list's most recent entry replaces
+    /// that entry rather than adding a new one — Vim does not grow the
+    /// changelist for a second change to a line already at its head (#891,
+    /// "jump:g; after 2 changes same line"; `:h changelist`).
     pub(crate) fn push_change_location(&mut self, line: usize, col: usize) {
         // Truncate any forward entries (if we navigated back with g;)
         self.change_list.truncate(self.change_list_pos);
-        // Avoid duplicate consecutive entries
-        if self.change_list.last() == Some(&(line, col)) {
-            return;
+        if let Some(last) = self.change_list.last_mut() {
+            if last.0 == line {
+                *last = (line, col);
+                self.change_list_pos = self.change_list.len();
+                return;
+            }
         }
         self.change_list.push((line, col));
         if self.change_list.len() > 100 {

@@ -2414,19 +2414,22 @@ impl Engine {
                     }
                 }
                 Some(',') => {
-                    // g,: jump to next change position
+                    // g,: jump to next (newer) change position. Symmetric with
+                    // g; above: g; decrements-then-looks-up, so g, must
+                    // increment-then-look-up too, or it just re-visits the
+                    // entry the last g; already landed on instead of
+                    // advancing past it (#891, "jump:g; g; g,").
                     if self.change_list.is_empty() {
                         self.message = "Change list is empty".to_string();
-                    } else if self.change_list_pos >= self.change_list.len() {
+                    } else if self.change_list_pos + 1 >= self.change_list.len() {
                         self.message = "Already at newest change".to_string();
                     } else {
+                        self.change_list_pos += 1;
                         let (line, col) = self.change_list[self.change_list_pos];
                         let max_line = self.buffer().len_lines().saturating_sub(1);
                         self.view_mut().cursor.line = line.min(max_line);
                         self.view_mut().cursor.col = col;
                         self.clamp_cursor_col();
-                        self.change_list_pos =
-                            (self.change_list_pos + 1).min(self.change_list.len());
                     }
                 }
                 Some('m') => {
@@ -3238,6 +3241,32 @@ impl Engine {
                                 self.clamp_cursor_col();
                             } else {
                                 self.message = "No previous visual selection".to_string();
+                            }
+                        }
+                        '[' => {
+                            // `` `[ ``: jump to the exact start of the last
+                            // change/yank (#891, sibling of `'[` above, which
+                            // lands on first-non-blank instead of the exact
+                            // column — `:h '[`).
+                            if let Some((line, col)) = self.last_change_start {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
+                            }
+                        }
+                        ']' => {
+                            // `` `] ``: jump to the exact end of the last
+                            // change/yank (#891).
+                            if let Some((line, col)) = self.last_change_end {
+                                let max_line = self.buffer().len_lines().saturating_sub(1);
+                                self.view_mut().cursor.line = line.min(max_line);
+                                self.view_mut().cursor.col = col;
+                                self.clamp_cursor_col();
+                            } else {
+                                self.message = "No previous change".to_string();
                             }
                         }
                         _ if ch.is_ascii_lowercase() => {

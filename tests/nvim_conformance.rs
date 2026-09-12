@@ -3718,9 +3718,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // "fix" this label by breaking that real, load-bearing behaviour for
     // every other macro that intentionally ends in Insert mode.
     "mac:\"ay then @a executes text",
-    "mark:`] after yank",
-    "jump:g; g; g,",
-    "jump:g; after 2 changes same line",
     "search:/\\(foo\\)\\1",
     // "ins:BS over indent (nosmarttab)" and "ins:Tab at start (nosmarttab)"
     // moved to HARNESS_LIMITED (#875) — the harness gap they were pinned to,
