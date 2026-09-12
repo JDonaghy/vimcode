@@ -318,9 +318,60 @@ fn mason_bin_dir() -> Option<PathBuf> {
     }
 }
 
+/// Homebrew formulas that are **keg-only** — Homebrew does not symlink their
+/// binaries into `<prefix>/bin`, so the binary a manifest names doesn't match
+/// the formula that ships it. `clangd` ships in the `llvm` formula, which is
+/// keg-only because symlinking it into the prefix would shadow the
+/// system-provided `/usr/bin/clang` (#917). Extend this list if another
+/// registry extension's `install_macos` hits the same problem.
+///
+/// Not `#[cfg(macos)]`-gated: it's inert data, and leaving it compiled on
+/// every target lets the `VIMCODE_TEST_HOMEBREW_PREFIXES` test override (see
+/// `homebrew_prefixes()`) exercise the exact same keg-only probe on any host
+/// OS instead of a duplicated copy.
+const HOMEBREW_KEG_ONLY_FORMULAS: &[(&str, &str)] = &[("clangd", "llvm")];
+
+/// Homebrew prefix directories to probe for LSP/DAP binaries (#917).
+///
+/// A native macOS `.app` launched from Finder/Dock/launchd gets launchd's
+/// minimal PATH, which contains neither Homebrew prefix — Apple Silicon
+/// symlinks into `/opt/homebrew`, Intel Macs into `/usr/local`. `brew
+/// --prefix` is authoritative but costs a subprocess spawn on every LSP
+/// resolve; checking both fixed candidates with a stat is cheap and covers
+/// both architectures (only one will ever exist on a given machine).
+///
+/// On non-macOS targets this returns an empty list — Windows/Linux discovery
+/// order is intentionally unchanged by #917 — *unless* the
+/// `VIMCODE_TEST_HOMEBREW_PREFIXES` environment variable is set to a
+/// `PATH`-style (`:`-separated) list of directories. That override exists
+/// solely so `tests/extensions.rs` can drive this macOS-only resolution
+/// logic against a fake Homebrew layout on any host OS; real builds never
+/// set it and macOS builds never read it.
+fn homebrew_prefixes() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        ["/opt/homebrew", "/usr/local"]
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .collect()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match std::env::var_os("VIMCODE_TEST_HOMEBREW_PREFIXES") {
+            Some(val) => std::env::split_paths(&val).filter(|p| p.is_dir()).collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
 /// Resolve a command to an absolute path.
 /// Checks Mason bin directory first (if it exists), then falls back to PATH.
-fn resolve_command(cmd: &str) -> Option<PathBuf> {
+///
+/// `pub` (rather than crate-private) specifically so `tests/extensions.rs`
+/// — a separate integration-test crate — can drive it directly for #917's
+/// black-box Homebrew-resolution coverage.
+pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Split on whitespace to get just the binary name
     let binary = cmd.split_whitespace().next().unwrap_or(cmd);
 
@@ -335,13 +386,24 @@ fn resolve_command(cmd: &str) -> Option<PathBuf> {
     // Check common tool directories that may not be in PATH when launched
     // from a desktop environment (not a login shell).
     let home = super::paths::home_dir();
-    let tool_dirs = [
+    let mut tool_dirs = vec![
         home.join(".dotnet/tools"),
         home.join(".cargo/bin"),
         home.join(".local/bin"),
         home.join("go/bin"),
         home.join(".npm-global/bin"),
     ];
+    // #917: Homebrew prefixes (macOS only — see `homebrew_prefixes()`).
+    for prefix in homebrew_prefixes() {
+        tool_dirs.push(prefix.join("bin"));
+        // Keg-only formulas (e.g. clangd/llvm) never reach `<prefix>/bin`;
+        // probe `<prefix>/opt/<formula>/bin` too.
+        for (kegged_binary, formula) in HOMEBREW_KEG_ONLY_FORMULAS {
+            if *kegged_binary == binary {
+                tool_dirs.push(prefix.join("opt").join(formula).join("bin"));
+            }
+        }
+    }
     for dir in &tool_dirs {
         let candidate = dir.join(binary);
         if candidate.exists() && cargo_bin_probe_ok(&candidate, binary) {
