@@ -5437,6 +5437,150 @@ mod tests {
         );
     }
 
+    /// #884: a count typed before `:` pre-fills the command line with a
+    /// range of that many lines starting at the cursor (`:h cmdline-ranges`):
+    /// `3:` -> `:.,.+2`. Verified against `nvim --headless -u NONE` (0.12.5)
+    /// as the `tests/nvim_conformance.rs` oracle case "misc:: with count"
+    /// (`3:d<CR>`).
+    ///
+    /// Asserts on the painted command line *before* Enter (the bare
+    /// mechanism), then finishes the command and asserts on the resulting
+    /// buffer content — `3:d<CR>` must delete exactly the 3 lines named by
+    /// the range, not just the one line a bare `:d<CR>` would touch.
+    ///
+    /// **Verified RED against unfixed `develop`:** `:` cleared the count
+    /// without consulting it, so the command line pre-filled empty and
+    /// `3:d<CR>` behaved exactly like `:d<CR>` — deleting only the first
+    /// named line.
+    #[test]
+    fn count_before_colon_prefills_range_via_shell_app() {
+        const LINE1: &str = "ZQXW884D_L1";
+        const LINE2: &str = "ZQXW884D_L2";
+        const LINE3: &str = "ZQXW884D_L3";
+        const LINE4: &str = "ZQXW884D_L4";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}\n{LINE3}\n{LINE4}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('3');
+        driver.type_char(':');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(":.,.+2"),
+            "3: must pre-fill the command line with the `.,.+2` range before \
+             any further typing; screen:\n{screen}"
+        );
+
+        driver.type_char('d');
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(LINE1) && !screen.contains(LINE2) && !screen.contains(LINE3),
+            "3:d<CR> must delete all 3 lines named by the pre-filled range; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(LINE4),
+            "3:d<CR> must not touch the line beyond the range; screen:\n{screen}"
+        );
+    }
+
+    /// #884: the pre-filled range carries into `:s`, so `3:s/…/…/<CR>`
+    /// substitutes over the three named lines, not just the first one a
+    /// bare `:s` would touch. Verified against `nvim --headless -u NONE`
+    /// (0.12.5) as the `tests/nvim_conformance.rs` oracle case "misc:3:s"
+    /// (`3:s/a/b/<CR>`).
+    ///
+    /// **Verified RED against unfixed `develop`:** with no range pre-filled,
+    /// `3:s/884A/884B/<CR>` behaved like a bare `:s`, substituting only the
+    /// first named line and leaving the second and third untouched.
+    #[test]
+    fn count_before_colon_substitute_spans_lines_via_shell_app() {
+        const LINE1: &str = "ZQXW884A_L1";
+        const LINE2: &str = "ZQXW884A_L2";
+        const LINE3: &str = "ZQXW884A_L3";
+        const LINE4: &str = "ZQXW884A_L4";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}\n{LINE3}\n{LINE4}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('3');
+        driver.type_char(':');
+        for c in "s/884A/884B/".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW884B_L1")
+                && screen.contains("ZQXW884B_L2")
+                && screen.contains("ZQXW884B_L3"),
+            "3:s/884A/884B/<CR> must substitute over all 3 named lines; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(LINE4) && !screen.contains("ZQXW884B_L4"),
+            "3:s/884A/884B/<CR> must not touch the line beyond the range; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #884: the pre-filled range also carries into a full ex command name
+    /// typed after the colon, not just a single-letter command like `d`.
+    /// Verified against `nvim --headless -u NONE` (0.12.5) as the
+    /// `tests/nvim_conformance.rs` oracle case "misc:count then : then
+    /// range" (`2:normal Ax<CR>`).
+    ///
+    /// **Verified RED against unfixed `develop`:** with no range pre-filled,
+    /// `2:normal Ax<CR>` ran `:normal Ax` over only the first named line,
+    /// appending `x` there and leaving the second line untouched.
+    #[test]
+    fn count_before_colon_then_ex_command_follows_range_via_shell_app() {
+        const LINE1: &str = "ZQXW884N_L1";
+        const LINE2: &str = "ZQXW884N_L2";
+        const LINE3: &str = "ZQXW884N_L3";
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &format!("{LINE1}\n{LINE2}\n{LINE3}"));
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('2');
+        driver.type_char(':');
+        for c in "normal Ax".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(&format!("{LINE1}x")) && screen.contains(&format!("{LINE2}x")),
+            "2:normal Ax<CR> must append x to both named lines; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(LINE3) && !screen.contains(&format!("{LINE3}x")),
+            "2:normal Ax<CR> must not touch the line beyond the range; \
+             screen:\n{screen}"
+        );
+    }
+
     /// #892: `S` (substitute line) yanks the deleted line **linewise** into
     /// the unnamed register (`:h registers`, matching `cc` per #806), so a
     /// following `P` must put it back as a whole line above the cursor

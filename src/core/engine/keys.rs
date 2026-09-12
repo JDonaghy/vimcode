@@ -1937,7 +1937,8 @@ impl Engine {
                     };
                     self.command_cursor = self.command_buffer.chars().count();
                 }
-                self.count = None; // Clear count when entering command mode
+                // `.take()` above already leaves `self.count` as `None`
+                // whether or not a count was present.
             }
             Some('/') => {
                 self.mode = Mode::Search;
