@@ -3651,8 +3651,6 @@ const CATEGORIES: &[(&str, &[Case])] = &[
 // ---------------------------------------------------------------------------
 
 const KNOWN_DEVIATIONS: &[&str] = &[
-    "op:2cc",
-    "op:5dd from last line",
     // #880: `run_in_vimcode` never reads a case's Lua `setup` (see
     // `HARNESS_LIMITED`/#875 below) — this case's `setup` turns on
     // `vim.o.joinspaces` on the Neovim oracle side only, so vimcode always
@@ -3814,9 +3812,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "misc:: with count",
     "misc:3:s",
     "misc:count then : then range",
-    "misc:c3c",
-    "misc:2dd on last",
-    "misc:cc with count beyond",
 ];
 
 // ---------------------------------------------------------------------------

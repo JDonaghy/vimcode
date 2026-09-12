@@ -3115,6 +3115,17 @@ impl Engine {
         }
 
         let start_line = self.view().cursor.line;
+        // `[count]dd` behaves like `dd` plus `count - 1` applications of the
+        // `j` motion under the hood: if the cursor is already on the last
+        // line, that `j` component cannot move at all, and per the same
+        // "motion fails entirely, no partial fallback" rule already applied
+        // to `dj`/`dk` above, the whole operator aborts — Vim beeps and
+        // deletes nothing (#882, "op:5dd from last line", "misc:2dd on
+        // last"). If at least one line below is reachable, the count still
+        // clamps to whatever's available, same as before.
+        if count > 1 && start_line == num_lines - 1 {
+            return;
+        }
         let end_line = (start_line + count).min(num_lines);
         let actual_count = end_line - start_line;
 
