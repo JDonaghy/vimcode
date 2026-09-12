@@ -3809,9 +3809,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "to:d5aw too many",
     "to:cip",
     "to:daw on only whitespace line",
-    "misc:: with count",
-    "misc:3:s",
-    "misc:count then : then range",
 ];
 
 // ---------------------------------------------------------------------------
