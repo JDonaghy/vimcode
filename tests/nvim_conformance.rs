@@ -3794,11 +3794,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "word:gg indented (sol)",
     "word:G indented (sol)",
     "word:5G then j col (sol)",
-    "to:das last sentence",
-    "to:dis on whitespace between",
-    "to:d5aw too many",
-    "to:cip",
-    "to:daw on only whitespace line",
 ];
 
 // ---------------------------------------------------------------------------

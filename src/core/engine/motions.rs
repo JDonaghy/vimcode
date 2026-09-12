@@ -2323,11 +2323,18 @@ impl Engine {
 
         // --- Find start of current sentence (scan backward) ---
         let mut sent_start = 0usize;
+        // Whether `sent_start` was set because the previous sentence actually
+        // ended in punctuation right there — as opposed to a paragraph break
+        // or the start of the buffer. Only in that case is the whitespace
+        // between `sent_start` and `inner_start` a genuine inter-sentence gap
+        // (see the `is` cursor-on-whitespace handling below).
+        let mut start_after_punct = false;
         if cursor_pos > 0 {
             let mut pos = cursor_pos - 1;
             loop {
                 if is_sentence_end_punct(pos) {
                     sent_start = pos + 1;
+                    start_after_punct = true;
                     break;
                 }
                 if is_blank_line(pos) {
@@ -2373,7 +2380,18 @@ impl Engine {
         }
 
         let (start, end) = if modifier == 'i' {
-            (inner_start, sent_end)
+            if start_after_punct && cursor_pos < inner_start {
+                // `is` with the cursor sitting on the whitespace *between* two
+                // sentences selects that whitespace run itself, not either
+                // neighbouring sentence (oracle: `to:dis on whitespace
+                // between`). This only applies when the gap is a genuine
+                // inter-sentence one — leading whitespace after a paragraph
+                // break or at the start of the buffer still belongs to the
+                // sentence that follows it.
+                (sent_start, inner_start)
+            } else {
+                (inner_start, sent_end)
+            }
         } else {
             // `as`: include trailing whitespace (spaces/tabs only, not newlines).
             let mut e = sent_end;
@@ -2384,7 +2402,17 @@ impl Engine {
                 }
                 e += 1;
             }
-            (inner_start, e)
+            if e > sent_end {
+                (inner_start, e)
+            } else if sent_start < inner_start {
+                // No trailing whitespace to absorb (e.g. the last sentence in
+                // a paragraph/buffer) — Vim falls back to the whitespace
+                // *before* the sentence instead (oracle: `to:das last
+                // sentence`).
+                (sent_start, sent_end)
+            } else {
+                (inner_start, sent_end)
+            }
         };
 
         if start < end {
@@ -2919,7 +2947,22 @@ impl Engine {
         let count = self.take_count().max(1);
         let range = match self.find_text_object_range(modifier, obj_type, cursor_pos, count) {
             Some(r) => r,
-            None => return, // No matching text object found
+            None => {
+                // `aw`/`aW` always need a neighbouring word to pair with; when
+                // that fails — the count asks for more words than exist, or
+                // the line is pure whitespace — Vim aborts the operator with
+                // no edit, but the cursor has already been walked to the end
+                // of the line during the (abandoned) search (oracle:
+                // `to:d5aw too many`, `to:daw on only whitespace line`).
+                // Other text objects (brackets, quotes, tags, …) leave the
+                // cursor untouched on failure (`to:di( count 3 too many`).
+                if modifier == 'a' && matches!(obj_type, 'w' | 'W') {
+                    let line = self.view().cursor.line;
+                    let max_col = self.get_max_cursor_col(line);
+                    self.view_mut().cursor.col = max_col;
+                }
+                return; // No matching text object found
+            }
         };
 
         let (mut start_pos, end_pos) = range;
@@ -3010,7 +3053,17 @@ impl Engine {
                     && start_pos == self.buffer().line_to_char(start_line)
                     && end_pos == self.buffer().line_to_char(end_line);
 
-                if is_linewise_inner_bracket_change {
+                // `ip`/`ap` are always linewise (a run of blank or non-blank
+                // lines), so `cip`/`cap` follow `cc`'s rule rather than a
+                // plain charwise substitution: the selected lines disappear
+                // entirely and a single new — indented — line is opened for
+                // the typed replacement, leaving any lines after the object
+                // (e.g. a following blank line) untouched (oracle: `to:cip`;
+                // before this, `cip` on `a`/`b`/``/`c` swallowed the blank
+                // line that `dip` correctly leaves behind).
+                let is_linewise_paragraph_change = operator == 'c' && obj_type == 'p';
+
+                if is_linewise_inner_bracket_change || is_linewise_paragraph_change {
                     let indent = self.get_line_indent_str(start_line);
                     self.delete_with_undo(start_pos, end_pos);
                     self.insert_with_undo(start_pos, &format!("{indent}\n"));
