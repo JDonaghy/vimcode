@@ -19010,6 +19010,17 @@ fn test_count_before_colon_substitute_spans_lines() {
     assert_eq!(e.buffer().to_string(), "b\nb\nb\na\n");
 }
 
+#[test]
+fn test_count_before_colon_then_explicit_ex_command_follows_range() {
+    // `2:normal Ax<CR>` — oracle case "misc:count then : then range". The
+    // pre-filled `.,.+1` range is immediately followed by a full ex command
+    // name (`normal Ax`), not just a bare `d`/`s` letter; `:normal` runs
+    // `Ax` (append `x` at end of line) over both named lines.
+    let mut e = engine_with_text("a\nb\nc\n");
+    send_keys(&mut e, "2:normal Ax<CR>");
+    assert_eq!(e.buffer().to_string(), "ax\nbx\nc\n");
+}
+
 // ── Bicep comment style ────────────────────────────────────────────────
 
 #[test]
