@@ -4321,7 +4321,7 @@ impl Engine {
     /// registry, then either open the CLI-supplied path or restore the
     /// previous session.  Both TUI and GTK call this identically.
     pub fn startup(&mut self, file_path: Option<&Path>) {
-        self.startup_inner(file_path, true);
+        self.startup_inner(file_path, true, true);
     }
 
     /// [`Engine::startup`] minus the per-workspace session restore — the
@@ -4347,15 +4347,43 @@ impl Engine {
     /// This entry point skips the restore entirely, so the resulting engine
     /// depends on nothing but its in-memory defaults and the explicit
     /// `file_path` argument.
+    ///
+    /// #890: for the same reason it also skips the *other* two ambient reads
+    /// `startup` performs — `plugin_init()` (loads and **executes** every
+    /// `.lua` script in the developer's real
+    /// `~/.config/vimcode/{plugins,extensions}/`, then fires `VimEnter`) and
+    /// `ext_refresh()` (spawns a thread that fetches the remote extension
+    /// registry over the network). Both make driver-tier tests depend on the
+    /// machine they run on: a user plugin that hooks `ModeChanged` /
+    /// `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
+    /// `set_lines` *synchronously inside a keystroke*, so an installed
+    /// plugin silently rewrites what a `TuiDriver` test types. That is how
+    /// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`
+    /// failed on one machine while passing on every other — reproduced
+    /// exactly by pointing `$HOME` at a config dir holding a two-line
+    /// `ModeChanged` plugin. Tests must exercise vimcode, not vimcode plus
+    /// whatever the developer happens to have installed.
     pub fn startup_without_session_restore(&mut self, file_path: Option<&Path>) {
-        self.startup_inner(file_path, false);
+        self.startup_inner(file_path, false, false);
     }
 
     /// Shared body of [`Engine::startup`] and
     /// [`Engine::startup_without_session_restore`].
-    fn startup_inner(&mut self, file_path: Option<&Path>, restore_session: bool) {
-        self.plugin_init();
-        self.ext_refresh();
+    ///
+    /// `load_ambient_state` covers the two startup steps that read (and
+    /// run) whatever is on the host machine — user plugins/extensions and
+    /// the remote extension registry. Production startup wants them; the
+    /// deterministic test entry point must not have them.
+    fn startup_inner(
+        &mut self,
+        file_path: Option<&Path>,
+        restore_session: bool,
+        load_ambient_state: bool,
+    ) {
+        if load_ambient_state {
+            self.plugin_init();
+            self.ext_refresh();
+        }
         if let Some(path) = file_path {
             if path.is_dir() {
                 self.open_folder(path);

@@ -432,6 +432,63 @@ fn test_startup_without_session_restore_ignores_workspace_session() {
     let _ = std::fs::remove_dir(&workspace_dir);
 }
 
+/// #890: `startup_without_session_restore` must skip the *other two* ambient
+/// reads `startup` performs, for the same machine-independence reason it
+/// already skips the workspace session:
+///
+/// - `plugin_init()` loads and **executes** every `.lua` file in the
+///   developer's real `~/.config/vimcode/{plugins,extensions}/`, then fires
+///   `VimEnter` into them. A plugin that hooks `ModeChanged` /
+///   `InsertEnter` / `cursor_move` can call `vimcode.buf.set_cursor` or
+///   `vimcode.buf.set_lines` *synchronously inside a keystroke*, so an
+///   installed plugin silently rewrites what a driver-tier test types.
+/// - `ext_refresh()` spawns a thread that fetches the remote extension
+///   registry over the network, per constructed app.
+///
+/// This is not hypothetical: with a two-line `ModeChanged` plugin dropped
+/// into `$HOME/.config/vimcode/plugins/`,
+/// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`
+/// fails 100 % of the time — which is how it failed on one machine while
+/// passing everywhere else.
+///
+/// The first half is the control: it proves `ext_refresh()` really does flip
+/// `ext_registry_fetching`, so a green second half means the call was
+/// *skipped* rather than that the flag is inert.
+#[test]
+fn test_startup_without_session_restore_skips_ambient_plugins_and_registry_fetch() {
+    // Control: `ext_refresh()` flips the flag when it does run. Clear the
+    // registry URLs first so the control itself performs no network I/O.
+    let mut control = Engine::new_for_test();
+    control.settings.extension_registries.clear();
+    control.ext_refresh();
+    assert!(
+        control.ext_registry_fetching,
+        "control: ext_refresh must set ext_registry_fetching, otherwise the \
+         assertion below proves nothing"
+    );
+
+    // Subject: the deterministic startup path must perform neither read.
+    let mut deterministic = Engine::new_for_test();
+    deterministic.settings.swap_file = false;
+    deterministic.startup_without_session_restore(None);
+    assert!(
+        !deterministic.ext_registry_fetching,
+        "startup_without_session_restore must not kick off the networked \
+         extension-registry fetch"
+    );
+    assert!(
+        deterministic.ext_registry_rx.is_none(),
+        "startup_without_session_restore must not leave a registry-fetch \
+         channel behind"
+    );
+    assert!(
+        deterministic.plugin_manager.is_none(),
+        "startup_without_session_restore must not load or execute the user's \
+         real ~/.config/vimcode/{{plugins,extensions}} Lua — a machine with \
+         plugins installed would otherwise run them inside every driver test"
+    );
+}
+
 #[test]
 fn test_restore_session_files_opens_separate_tabs() {
     use crate::core::session::SessionState;
