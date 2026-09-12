@@ -7980,6 +7980,123 @@ fn test_vis_selects_sentence_in_visual() {
     );
 }
 
+// #888 (`to:das last sentence`): `das` on the buffer's last sentence has no
+// trailing whitespace to absorb, so Vim falls back to the whitespace
+// *before* it instead of leaving it behind untouched.
+#[test]
+fn test_das_last_sentence_absorbs_leading_whitespace() {
+    let text = "One two.  Three four.";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 11; // inside "Three"
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('a'), false);
+    engine.handle_key("", Some('s'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "One two.",
+        "das on the last sentence should absorb the leading whitespace, not leave it trailing"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        7,
+        "cursor should land on the last char"
+    );
+}
+
+// #888 (`to:dis on whitespace between`): `is` with the cursor sitting on the
+// whitespace *between* two sentences selects that whitespace run itself, not
+// either neighbouring sentence's text.
+#[test]
+fn test_dis_on_inter_sentence_whitespace_selects_only_whitespace() {
+    let text = "One two.  Three four.";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 9; // second of the two spaces after "One two."
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('i'), false);
+    engine.handle_key("", Some('s'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "One two.Three four.",
+        "dis on the gap between sentences should delete only the whitespace"
+    );
+}
+
+// #888 (`to:d5aw too many`): `aw` always needs a word to pair with; a count
+// asking for more words than exist aborts the operator with no edit, but
+// still walks the cursor to the end of the line (the same "abort but the
+// cursor already moved" shape as failed word motions elsewhere).
+#[test]
+fn test_d5aw_too_many_aborts_but_moves_cursor_to_eol() {
+    let text = "a b";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    engine.handle_key("", Some('5'), false);
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('a'), false);
+    engine.handle_key("", Some('w'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "a b",
+        "d5aw with only 2 words should not delete anything"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "cursor should still walk to the last char of the line"
+    );
+}
+
+// #888 (`to:daw on only whitespace line`): a line of only whitespace has no
+// word for `aw` to pair with, so it degenerates the same way as an
+// impossible count — no edit, cursor clamped to the line's last char.
+#[test]
+fn test_daw_on_whitespace_only_line_is_a_noop_with_cursor_at_eol() {
+    let text = "   ";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 1;
+    engine.handle_key("", Some('d'), false);
+    engine.handle_key("", Some('a'), false);
+    engine.handle_key("", Some('w'), false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "   ",
+        "daw on an all-whitespace line should not delete anything"
+    );
+    assert_eq!(
+        engine.view().cursor.col,
+        2,
+        "cursor should still walk to the last char of the line"
+    );
+}
+
+// #888 (`to:cip`): `cip`/`cap` are linewise like `cc` — the selected lines
+// disappear entirely and a single (indented) line opens for the typed
+// replacement, leaving any lines after the object (e.g. a following blank
+// line) untouched. Before this fix vimcode swallowed that trailing blank
+// line too.
+#[test]
+fn test_cip_leaves_trailing_blank_line_intact() {
+    let text = "a\nb\n\nc";
+    let mut engine = make_paragraph_engine(text);
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 0;
+    engine.handle_key("", Some('c'), false);
+    engine.handle_key("", Some('i'), false);
+    engine.handle_key("", Some('p'), false);
+    assert_eq!(engine.mode, Mode::Insert, "cip should enter insert mode");
+    engine.handle_key("", Some('X'), false);
+    engine.handle_key("Escape", None, false);
+    let result: String = engine.buffer().content.chars().collect();
+    assert_eq!(
+        result, "X\n\nc",
+        "cip should replace the paragraph with one line, leaving the blank line and 'c' alone"
+    );
+}
+
 // ── Project search ────────────────────────────────────────────────────────
 
 fn make_search_dir(test_name: &str) -> std::path::PathBuf {
