@@ -13254,6 +13254,58 @@ fn test_vscode_mode_comment_toggle() {
 }
 
 #[test]
+fn test_vscode_mode_multi_cursor_indent_keeps_each_cursor_on_its_own_line() {
+    // #883 review: `indent_lines` grew a Vim-only cursor-repositioning side
+    // effect (land on `start_line`) that VSCode's multi-cursor Ctrl+] loop
+    // never expected — it iterates `indent_lines` once per selected line and
+    // then bumps every cursor's *column* itself, relying on the shared
+    // helper leaving each cursor's *line* alone. Before the `reposition_cursor`
+    // opt-in fix, the primary cursor ended up dragged onto the last line
+    // touched by the loop instead of staying on line 0.
+    let mut engine = make_vscode_engine("aaa\nbbb\nccc\n");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 1;
+    engine.view_mut().extra_cursors = vec![Cursor { line: 2, col: 1 }];
+
+    vscode_key(&mut engine, "bracketright", None, true);
+
+    assert_eq!(engine.buffer().to_string(), "    aaa\nbbb\n    ccc\n");
+    assert_eq!(
+        engine.view().cursor,
+        Cursor { line: 0, col: 5 },
+        "primary cursor must stay on its own line, only shifted by the indent size"
+    );
+    assert_eq!(
+        engine.view().extra_cursors,
+        vec![Cursor { line: 2, col: 5 }],
+        "extra cursor must stay on its own line, only shifted by the indent size"
+    );
+}
+
+#[test]
+fn test_vscode_mode_multi_cursor_outdent_keeps_each_cursor_on_its_own_line() {
+    // Same regression as the indent test above, for Ctrl+[ / `dedent_lines`.
+    let mut engine = make_vscode_engine("    aaa\n    bbb\n    ccc\n");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 5;
+    engine.view_mut().extra_cursors = vec![Cursor { line: 2, col: 5 }];
+
+    vscode_key(&mut engine, "bracketleft", None, true);
+
+    assert_eq!(engine.buffer().to_string(), "aaa\n    bbb\nccc\n");
+    assert_eq!(
+        engine.view().cursor,
+        Cursor { line: 0, col: 1 },
+        "primary cursor must stay on its own line, only shifted by the outdent size"
+    );
+    assert_eq!(
+        engine.view().extra_cursors,
+        vec![Cursor { line: 2, col: 1 }],
+        "extra cursor must stay on its own line, only shifted by the outdent size"
+    );
+}
+
+#[test]
 fn test_vscode_mode_f1_opens_palette() {
     let mut engine = make_vscode_engine("hello");
     // F1 should open the command palette (matches real VSCode).

@@ -3077,9 +3077,9 @@ impl Engine {
                     .char_to_line(end_pos.saturating_sub(1).max(start_pos));
                 let count = end_line - start_line + 1;
                 if operator == '>' {
-                    self.indent_lines(start_line, count, changed);
+                    self.indent_lines(start_line, count, changed, true);
                 } else if operator == '<' {
-                    self.dedent_lines(start_line, count, changed);
+                    self.dedent_lines(start_line, count, changed, true);
                 } else {
                     self.auto_indent_lines(start_line, count, changed);
                 }
@@ -6092,7 +6092,22 @@ impl Engine {
     }
 
     /// Indent `count` lines starting at `start_line` by shift_width.
-    pub(crate) fn indent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
+    ///
+    /// `reposition_cursor` opts into Vim's `>>`/`>motion` cursor landing (on
+    /// the on-screen column, or first non-blank under `'startofline'`, per
+    /// `:h 'startofline'` — #883, "op:>> cursor sol"). VSCode-mode Ctrl+]
+    /// call sites pass `false`: they manage cursor position themselves
+    /// (per-cursor column bump, including under multi-cursor), and this
+    /// helper repositioning the shared cursor to `start_line` on every call
+    /// stomped every cursor but the last one under a multi-cursor selection
+    /// (#883 review).
+    pub(crate) fn indent_lines(
+        &mut self,
+        start_line: usize,
+        count: usize,
+        changed: &mut bool,
+        reposition_cursor: bool,
+    ) {
         let sw = self.effective_shift_width();
         let ts = (self.settings.tabstop as usize).max(1);
         let expand = self.settings.expand_tab;
@@ -6171,12 +6186,15 @@ impl Engine {
         // when set, land on the first non-blank of the (first) shifted line
         // instead of the screen column the cursor was sitting on (#883,
         // "op:>> cursor sol"). Off (the default, matching Neovim) restores
-        // that screen column via `col_for_vcol`/`target_vcol` above.
-        self.view_mut().cursor.line = start_line;
-        if self.settings.startofline {
-            self.move_cursor_to_first_non_blank(start_line);
-        } else {
-            self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+        // that screen column via `col_for_vcol`/`target_vcol` above. Gated by
+        // `reposition_cursor` — see the doc comment on this function.
+        if reposition_cursor {
+            self.view_mut().cursor.line = start_line;
+            if self.settings.startofline {
+                self.move_cursor_to_first_non_blank(start_line);
+            } else {
+                self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+            }
         }
         *changed = true;
     }
@@ -6185,7 +6203,16 @@ impl Engine {
     /// Removes up to shift_width columns, but caps removal at the minimum
     /// indent across all non-blank lines in the selection to preserve
     /// relative nesting structure.
-    pub(crate) fn dedent_lines(&mut self, start_line: usize, count: usize, changed: &mut bool) {
+    ///
+    /// `reposition_cursor` — see [`Engine::indent_lines`]'s matching doc
+    /// comment (#883 review).
+    pub(crate) fn dedent_lines(
+        &mut self,
+        start_line: usize,
+        count: usize,
+        changed: &mut bool,
+        reposition_cursor: bool,
+    ) {
         let sw = self.effective_shift_width();
         let ts = (self.settings.tabstop as usize).max(1);
         let expand = self.settings.expand_tab;
@@ -6290,12 +6317,15 @@ impl Engine {
             let end_line = (start_line + count.saturating_sub(1)).min(total.saturating_sub(1));
             let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
             self.last_change_end = Some((end_line, end_col));
-            // See `indent_lines`'s matching 'startofline' comment (#883).
-            self.view_mut().cursor.line = start_line;
-            if self.settings.startofline {
-                self.move_cursor_to_first_non_blank(start_line);
-            } else {
-                self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+            // See `indent_lines`'s matching 'startofline' comment (#883),
+            // gated by `reposition_cursor` (#883 review).
+            if reposition_cursor {
+                self.view_mut().cursor.line = start_line;
+                if self.settings.startofline {
+                    self.move_cursor_to_first_non_blank(start_line);
+                } else {
+                    self.view_mut().cursor.col = self.col_for_vcol(start_line, target_vcol);
+                }
             }
         }
     }
