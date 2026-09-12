@@ -24221,6 +24221,47 @@ fn test_nvim_dd_last_line() {
     nvim_case("first\nsecond\n", 1, 0, "dd", "first\n", 0, 0);
 }
 
+// ── #882: operator counts (`2cc`, `5dd` past end, `c3c`, `2dd` on last
+// line, count beyond buffer) — verified directly against the oracle
+// (`tests/nvim_conformance.rs`, cases "op:2cc" / "op:5dd from last line" /
+// "misc:c3c" / "misc:2dd on last" / "misc:cc with count beyond").
+
+#[test]
+fn test_nvim_2cc_changes_two_lines() {
+    // `2cc` changes 2 lines, preserving the first line's indent
+    // ('autoindent' defaults on, matching Neovim) and dropping the rest.
+    nvim_case("  a\n  b\nc\n", 0, 0, "2ccX<Esc>", "  X\nc\n", 0, 2);
+}
+
+#[test]
+fn test_nvim_c3c_count_between_operator_and_doubled_letter() {
+    // `c3c` puts the count *between* the operator and its doubled letter —
+    // legal, and equivalent to `3cc`. If only a leading count parsed, this
+    // would behave like plain `cc` (changing just the first line).
+    nvim_case("a\nb\nc\nd\n", 0, 0, "c3cX<Esc>", "X\nd\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_cc_count_beyond_buffer_clamps_not_aborts() {
+    // Unlike `[count]dd`, `[count]cc` clamps to however many lines exist
+    // rather than aborting the whole command.
+    nvim_case("a\nb\n", 0, 0, "5ccX<Esc>", "X\n", 0, 0);
+}
+
+#[test]
+fn test_nvim_5dd_from_last_line_aborts() {
+    // `[count]dd` acts like `dd` plus `count - 1` applications of `j` under
+    // the hood: already on the last line, that `j` can't move at all, so
+    // the whole command aborts (Vim beeps) rather than deleting fewer lines.
+    nvim_case("a\nb\nc\n", 2, 0, "5dd", "a\nb\nc\n", 2, 0);
+}
+
+#[test]
+fn test_nvim_2dd_on_last_line_aborts() {
+    // Smallest-count version of the same "already on the last line" abort.
+    nvim_case("a\nb\n", 1, 0, "2dd", "a\nb\n", 1, 0);
+}
+
 #[test]
 fn test_nvim_yy_does_not_move_cursor() {
     nvim_case("aaa\nbbb\nccc\n", 1, 2, "yy", "aaa\nbbb\nccc\n", 1, 2);

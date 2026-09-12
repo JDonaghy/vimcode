@@ -3744,8 +3744,16 @@ impl Engine {
                 self.finish_undo_group();
             }
             Some('c') if operator == 'c' => {
-                // cc: change line (like S). With 'autoindent' on, Vim preserves
-                // the leading indent of the first line instead of dropping it.
+                // cc: change [count] lines (like S). With 'autoindent' on,
+                // Vim preserves the leading indent of the first line instead
+                // of dropping it.
+                //
+                // Unlike `[count]dd` (which aborts the whole command when
+                // the count overruns the buffer, #882 "op:5dd from last
+                // line"/"misc:2dd on last"), `[count]cc` just clamps to
+                // however many lines exist — verified directly against the
+                // oracle (#882, "misc:cc with count beyond": `5cc` on a
+                // 2-line buffer changes both lines, it does not abort).
                 let count = self.take_count();
                 let start_line = self.view().cursor.line;
 
@@ -3757,43 +3765,43 @@ impl Engine {
 
                 self.start_undo_group();
 
-                // Delete content of lines
-                for i in 0..count {
-                    let line_idx = start_line + i;
-                    if line_idx >= self.buffer().len_lines() {
-                        break;
-                    }
+                let num_lines = self.buffer().len_lines();
+                let end_line = (start_line + count.saturating_sub(1)).min(num_lines - 1);
 
-                    let line_start = self.buffer().line_to_char(line_idx);
-                    let line_len = self.buffer().line_len_chars(line_idx);
-                    let line_content = self.buffer().content.line(line_idx);
-
-                    let delete_end = if line_content.chars().last() == Some('\n') && line_len > 0 {
-                        line_start + line_len - 1
+                let line_start = self.buffer().line_to_char(start_line);
+                let end_line_start = self.buffer().line_to_char(end_line);
+                let end_line_len = self.buffer().line_len_chars(end_line);
+                let end_line_content = self.buffer().content.line(end_line);
+                // Delete through the last line's content, excluding its
+                // trailing newline (if it has one) so exactly one newline is
+                // left in place — either the boundary with the next
+                // surviving line, or none at all if `end_line` was the last
+                // line in the buffer.
+                let delete_end =
+                    if end_line_content.chars().last() == Some('\n') && end_line_len > 0 {
+                        end_line_start + end_line_len - 1
                     } else {
-                        line_start + line_len
+                        end_line_start + end_line_len
                     };
 
-                    if line_start < delete_end {
-                        let deleted: String = self
-                            .buffer()
-                            .content
-                            .slice(line_start..delete_end)
-                            .chars()
-                            .collect();
-                        // `cc` register content is linewise (`:h registers`)
-                        // even though the buffer edit itself only clears the
-                        // line's content and leaves the newline in place —
-                        // `"1p` after `cc` must paste back a whole line
-                        // (#806, "reg:\"1 after cc").
-                        let reg = self.active_register();
-                        self.set_delete_register(reg, format!("{}\n", deleted), true);
-                        self.clear_selected_register();
+                if line_start < delete_end {
+                    let deleted: String = self
+                        .buffer()
+                        .content
+                        .slice(line_start..delete_end)
+                        .chars()
+                        .collect();
+                    // `cc` register content is linewise (`:h registers`)
+                    // even though the buffer edit itself only clears the
+                    // lines' content and leaves one newline in place —
+                    // `"1p` after `cc` must paste back whole line(s)
+                    // (#806, "reg:\"1 after cc").
+                    let reg = self.active_register();
+                    self.set_delete_register(reg, format!("{}\n", deleted), true);
+                    self.clear_selected_register();
 
-                        self.delete_with_undo(line_start, delete_end);
-                        *changed = true;
-                        break;
-                    }
+                    self.delete_with_undo(line_start, delete_end);
+                    *changed = true;
                 }
 
                 // Re-insert preserved indent
@@ -3802,6 +3810,7 @@ impl Engine {
                     self.insert_with_undo(line_start, &indent);
                 }
 
+                self.view_mut().cursor.line = start_line;
                 self.view_mut().cursor.col = indent.chars().count();
                 self.insert_text_buffer.clear();
                 self.mode = Mode::Insert;
