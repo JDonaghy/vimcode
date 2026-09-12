@@ -3660,7 +3660,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "op:>> cursor sol",
     "op:<< mixed tab space",
     "op:o esc removes indent",
-    "op:cw on empty line",
     // Remaining `dot:` deviations: each fails for a reason outside `.` itself
     // -- linewise-`p` cursor placement (see "op:p linewise cursor first
     // nonblank"), past-eol cursor clamping on entering insert, and `2>>`
@@ -3796,9 +3795,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "to:d5aw too many",
     "to:cip",
     "to:daw on only whitespace line",
-    "misc:gp charwise multi",
-    "misc:cw on space at eol",
-    "misc:S then P",
     "misc:: with count",
     "misc:3:s",
     "misc:count then : then range",

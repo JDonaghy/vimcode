@@ -1649,8 +1649,14 @@ impl Engine {
                             .slice(line_start..delete_end)
                             .chars()
                             .collect();
+                        // `S` register content is linewise (`:h registers`) —
+                        // same as `cc` (#806, "reg:\"1 after cc"): even though
+                        // the buffer edit only clears the line's content and
+                        // leaves the newline in place, a subsequent `P` must
+                        // paste the yanked text back as a whole line above
+                        // the cursor, not inline.
                         let reg = self.active_register();
-                        self.set_register(reg, deleted, false);
+                        self.set_delete_register(reg, format!("{}\n", deleted), true);
                         self.clear_selected_register();
 
                         self.delete_with_undo(line_start, delete_end);
@@ -5021,7 +5027,47 @@ impl Engine {
                         self.apply_charwise_operator('c', start_pos, end_pos, changed);
                     }
                 } else {
+                    // Two edge cases the shared `dw` path
+                    // (`apply_operator_with_motion`) gets wrong specifically
+                    // for `cw`:
+                    //
+                    //  - A completely empty line: real `dw` deletes the
+                    //    line's own newline and joins with the next line
+                    //    (Neovim behavior, matched inside
+                    //    `apply_operator_with_motion`) — but `cw` must NOT
+                    //    join. There is nothing on the line to change, so
+                    //    `cw` just enters insert mode on the (still empty)
+                    //    line, like `s` does.
+                    //  - Trailing whitespace at the very end of the buffer
+                    //    (no following word and no further line to land
+                    //    on): the shared `w`-motion clamps back onto the
+                    //    same last character instead of advancing, which
+                    //    turns into a no-op range — `cw` must still consume
+                    //    that trailing whitespace and enter insert mode.
+                    let line = start_cursor.line;
+                    let line_len = self.buffer().line_len_chars(line);
+                    let is_empty_line = line_len == 0
+                        || (line_len == 1
+                            && self.buffer().content.line(line).chars().next() == Some('\n'));
+                    if is_empty_line {
+                        self.start_undo_group();
+                        self.insert_text_buffer.clear();
+                        self.mode = Mode::Insert;
+                        self.count = None;
+                        return;
+                    }
                     self.apply_operator_with_motion('c', 'w', count, changed);
+                    if self.mode != Mode::Insert {
+                        // The shared `w`-motion didn't move at all (ran off
+                        // the end of the buffer while still inside the
+                        // whitespace run under the cursor) — consume the
+                        // remaining whitespace to the end of the buffer
+                        // directly instead of leaving `cw` a no-op.
+                        let total = self.buffer().len_chars();
+                        if start_pos < total {
+                            self.apply_charwise_operator('c', start_pos, total, changed);
+                        }
+                    }
                 }
                 return;
             }

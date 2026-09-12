@@ -5101,6 +5101,14 @@ impl Engine {
                     end_pos.min(self.buffer().len_chars()) - self.buffer().line_to_char(new_line);
                 self.view_mut().cursor.line = new_line;
                 self.view_mut().cursor.col = new_col;
+                // With a charwise multi-line register, `end_pos` (one past
+                // the last pasted char) can land exactly on that line's own
+                // trailing newline when the last pasted char is immediately
+                // followed by pre-existing text that used to continue the
+                // line (#892). A normal-mode cursor can never rest on/after
+                // a line's newline, so pull it back onto the last real
+                // column — same clamp `p`/every other command relies on.
+                self.clamp_cursor_col();
             }
         }
 
@@ -5162,6 +5170,10 @@ impl Engine {
                     end_pos.min(self.buffer().len_chars()) - self.buffer().line_to_char(new_line);
                 self.view_mut().cursor.line = new_line;
                 self.view_mut().cursor.col = new_col;
+                // See the matching clamp in `paste_after_cursor_after` (#892):
+                // a charwise multi-line register can put `end_pos` right on
+                // the line's own trailing newline.
+                self.clamp_cursor_col();
             }
         }
 
