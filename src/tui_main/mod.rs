@@ -221,6 +221,10 @@ impl TuiSidebar {
 /// a native-tool fallback leg for local-X11-inside-tmux — see
 /// `quadraui::tui::services` for the full writeup. Reads stay arboard-only
 /// (OSC 52 read is disabled in most terminals for security reasons).
+///
+/// Compiled only for real builds — see the `cfg(test)` twin below for why the
+/// in-crate suite gets a hermetic stand-in instead.
+#[cfg(not(test))]
 fn setup_tui_clipboard(engine: &mut Engine) {
     use quadraui::PlatformServices;
 
@@ -236,6 +240,55 @@ fn setup_tui_clipboard(engine: &mut Engine) {
 
     engine.clipboard_write = Some(Box::new(move |text: &str| {
         services.clipboard().write_text(text);
+        Ok(())
+    }));
+}
+
+/// Hermetic per-test stand-in for [`setup_tui_clipboard`].
+///
+/// `TuiShellApp::new_for_test` funnels through the same `from_engine` body as
+/// the production constructor, so until this twin existed every driver-tier
+/// test installed the **real** `TuiPlatformServices` clipboard — arboard
+/// talking to the live X11/Wayland selection of whatever desktop `cargo test`
+/// happens to run on. Two consequences, both bugs:
+///
+/// * Tests *wrote* the developer's actual clipboard: `sync_tui_clipboard`
+///   pushes the unnamed register out after every keypress that yanked.
+/// * Tests *read* it back: `p`/`P` in Normal or Visual mode go through
+///   `render::preload_paste_clipboard` → `Engine::needs_clipboard_for_paste`,
+///   which overwrites the `"` register with whatever the desktop selection
+///   holds before the paste runs.
+///
+/// Together those make every paste test a race against every yank test (and
+/// against the human at the keyboard). That is what made
+/// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`
+/// intermittent: it yanks `ab\nc`, but a sibling test's yank reached the X11
+/// selection in the window between the `y` and the `p`, so the `gp` preload
+/// replaced the register with that sibling's text and pasted a stray
+/// character instead.
+///
+/// The replacement keeps the same round-trip shape — write-then-read returns
+/// what was written, so `clipboard=unnamedplus` behaviour is still genuinely
+/// exercised — but backs it with a `thread_local!` cell. Rust's test harness
+/// gives each test its own thread, so the store is per-test: deterministic
+/// under `--test-threads` of any size, and invisible to the host desktop.
+///
+/// See `clipboard_hermeticity_tests` at the bottom of this file.
+#[cfg(test)]
+fn setup_tui_clipboard(engine: &mut Engine) {
+    thread_local! {
+        static TEST_CLIPBOARD: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    engine.clipboard_read = Some(Box::new(|| {
+        TEST_CLIPBOARD
+            .with(|slot| slot.borrow().clone())
+            .ok_or_else(|| "clipboard empty or unavailable".to_string())
+    }));
+
+    engine.clipboard_write = Some(Box::new(|text: &str| {
+        TEST_CLIPBOARD.with(|slot| *slot.borrow_mut() = Some(text.to_string()));
         Ok(())
     }));
 }
@@ -569,3 +622,239 @@ fn rc(c: Color) -> RColor {
 
 // #826: the `translate_key_tests` module that used to live here moved to
 // `render::engine_key_from_ui_tests` alongside the function it now tests.
+
+// ─── Clipboard hermeticity (#197 follow-up) ─────────────────────────────────
+
+/// Coverage for the `cfg(test)` [`setup_tui_clipboard`] twin.
+///
+/// These live here rather than in `shell_app.rs`'s suite because the unit
+/// under test is this file's clipboard wiring — the thing `from_engine`
+/// installs on *every* `TuiShellApp::new_for_test`.
+#[cfg(test)]
+mod clipboard_hermeticity_tests {
+    use crate::tui_main::shell_app::TuiShellApp;
+    use quadraui::tui::testing::driver_with_shell;
+
+    /// How long to let a *shared* clipboard propagate before concluding the
+    /// one under test is not shared. `write_text` is asynchronous on X11 — it
+    /// hands off to arboard's selection-owner thread and returns before the
+    /// selection has actually changed hands — so a single read straight after
+    /// a sibling's write races it and can miss contamination that is about to
+    /// arrive. Polling for this long makes "the sibling's text never shows up
+    /// here" a real assertion rather than a won race.
+    const PROPAGATION_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+    const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// Poll `read` for `PROPAGATION_WINDOW`, returning `true` as soon as it
+    /// yields `wanted`.
+    fn clipboard_shows(read: &dyn Fn() -> Result<String, String>, wanted: &str) -> bool {
+        let deadline = std::time::Instant::now() + PROPAGATION_WINDOW;
+        loop {
+            if read().ok().as_deref() == Some(wanted) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(POLL_STEP);
+        }
+    }
+
+    /// Minimal shell config — mirrors `shell_app.rs`'s test-local `config()`
+    /// (1-row title bar, one panel) so geometry matches the live config.
+    fn config() -> quadraui::ShellConfig {
+        let mut cfg = quadraui::ShellConfig::new(
+            "VimCode",
+            vec![quadraui::PanelDefinition {
+                id: quadraui::WidgetId::new("panel:explorer"),
+                title: "Explorer".to_string(),
+                icon: String::new(),
+                tooltip: String::new(),
+            }],
+        );
+        cfg.title_bar_height_lh = 1.0;
+        cfg
+    }
+
+    /// A sibling test app that has yanked `text` and is **still alive**.
+    ///
+    /// Staying alive matters. The pre-fix clipboard was arboard, whose X11
+    /// backend owns the selection from a helper thread tied to the live
+    /// `TuiPlatformServices` object; let the sibling drop first and the
+    /// selection evaporates with it, so the contamination these tests are
+    /// about vanishes before they can see it. (A first draft of this helper
+    /// joined the thread immediately and consequently passed against the very
+    /// bug it exists to catch.) Holding the sibling open is also the honest
+    /// shape of the bug: `cargo test` runs ~2.6k tests across threads, so the
+    /// yanking test is *concurrent* with the pasting one, not finished first.
+    ///
+    /// Dropping the handle releases the sibling and joins it.
+    struct LiveSiblingYank {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl LiveSiblingYank {
+        fn new(text: &'static str) -> Self {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                let mut sibling = TuiShellApp::new_for_test();
+                // Exactly what `sync_tui_clipboard` does after a yank.
+                let write = sibling
+                    .engine
+                    .clipboard_write
+                    .take()
+                    .expect("new_for_test must install a clipboard_write hook");
+                write(text).expect("clipboard write must succeed");
+                ready_tx.send(()).ok();
+                // Keep `write` — and with it the services object that owns the
+                // selection — alive until the test says otherwise.
+                release_rx.recv().ok();
+                drop(write);
+                drop(sibling);
+            });
+            ready_rx
+                .recv()
+                .expect("sibling clipboard thread panicked before yanking");
+            Self {
+                release: Some(release_tx),
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for LiveSiblingYank {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// The clipboard a test app gets must round-trip its *own* writes and stay
+    /// invisible to a concurrently-running test app — no shared desktop
+    /// selection, no process-global store.
+    ///
+    /// **Verified RED against unfixed `develop`, on any machine:**
+    /// * With a desktop session (`DISPLAY`/`WAYLAND_DISPLAY` set) both apps
+    ///   shared the one real X11/Wayland selection, so the live sibling's
+    ///   marker showed up here inside the propagation window and the
+    ///   isolation assertion tripped.
+    /// * Headless, the real `TuiPlatformServices` write leg has nowhere to
+    ///   land (OSC 52 goes to a stdout nobody reads) and the arboard read
+    ///   fails, so the round-trip assertion tripped instead.
+    #[test]
+    fn test_app_clipboard_round_trips_locally_and_is_isolated_per_thread() {
+        const SIBLING: &str = "ZQXW197_SIBLING_YANK";
+        const MINE: &str = "ZQXW197_MY_YANK";
+
+        let mut app = TuiShellApp::new_for_test();
+        let write = app
+            .engine
+            .clipboard_write
+            .take()
+            .expect("new_for_test must install a clipboard_write hook");
+        let read = app
+            .engine
+            .clipboard_read
+            .take()
+            .expect("new_for_test must install a clipboard_read hook");
+
+        // Round-trip: `clipboard=unnamedplus` behaviour is still genuinely
+        // exercised, so what follows is isolation and not a dead no-op hook.
+        write(MINE).expect("clipboard write must succeed");
+        assert_eq!(
+            read().ok().as_deref(),
+            Some(MINE),
+            "a test app must read back its own clipboard write"
+        );
+
+        // Isolation: a concurrently-running test app's yank must never become
+        // visible here, however long we give it to propagate.
+        let _sibling = LiveSiblingYank::new(SIBLING);
+        assert!(
+            !clipboard_shows(&|| read(), SIBLING),
+            "a test app must not see a concurrently-running test app's clipboard \
+             write — that shared selection is what made paste tests race yank tests"
+        );
+        assert_eq!(
+            read().ok().as_deref(),
+            Some(MINE),
+            "and our own write must still be what we read back"
+        );
+    }
+
+    /// End-to-end proof through the rendered screen: `gp` pastes the text
+    /// *this* app yanked, never a concurrently-running app's.
+    ///
+    /// `p`/`P` in Normal mode run `render::preload_paste_clipboard`, which
+    /// overwrites the `"` register from the clipboard *before* the paste
+    /// happens. With the pre-fix real-desktop clipboard, any other test
+    /// yanking in that window refilled the register — the intermittent
+    /// failure of
+    /// `gp_charwise_multiline_lands_cursor_on_rendered_last_pasted_char_via_shell_app`,
+    /// which pasted a stray character a sibling test had left in the X11
+    /// selection instead of the `ab\nc` it had just yanked itself.
+    ///
+    /// Note the ordering below: the sibling has to poison the clipboard
+    /// *between* this app's `y` and its `p`. Yank first and the poison is
+    /// simply overwritten by our own `sync_tui_clipboard` push, which is why
+    /// an earlier draft of this test passed against the bug.
+    ///
+    /// **Verified RED against unfixed `develop`** on a machine with a desktop
+    /// clipboard: `ZQXW197POISON` reached the buffer and painted on screen.
+    /// (Headless the bug cannot manifest at all — which is why CI never caught
+    /// it and only developer machines saw the flake.)
+    #[test]
+    fn gp_pastes_own_yank_not_a_concurrent_apps_clipboard_via_shell_app() {
+        const POISON: &str = "ZQXW197POISON";
+
+        // A same-thread probe onto whatever clipboard `new_for_test` installs.
+        // `driver.app()` reaches the shell adapter, not `TuiShellApp`, so this
+        // is how the test observes what the driven app's own paste hook will
+        // see a moment later.
+        let probe = TuiShellApp::new_for_test()
+            .engine
+            .clipboard_read
+            .take()
+            .expect("new_for_test must install a clipboard_read hook");
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ab\ncd");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // v j y: charwise-yank "ab\nc" into the unnamed register.
+        for c in ['v', 'j', 'y'] {
+            driver.type_char(c);
+        }
+
+        // ...now a concurrent test app yanks something else, and we wait for
+        // that to become visible on a shared clipboard (it never does on a
+        // hermetic one).
+        let _sibling = LiveSiblingYank::new(POISON);
+        clipboard_shows(&probe, POISON);
+
+        // $ gp: paste our own yank back after the cursor.
+        for c in ['$', 'g', 'p'] {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(POISON),
+            "gp must paste this app's own yank — a concurrent app's clipboard \
+             text must never reach the buffer; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("abab"),
+            "gp should have pasted the charwise-yanked \"ab\\nc\" after the \
+             cursor, splicing \"ab\" onto line 0; screen:\n{screen}"
+        );
+    }
+}
