@@ -3667,14 +3667,28 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // not aborting when the count exceeds the lines available.
     "dot:i<C-w> .",
     "dot:>> 2.",
-    "undo:xxxx 3u",
+    // "undo:U" / "undo:UU" (#885): verified this is a fixture-loading
+    // artifact of the harness's `undolevels = -1` dance around the initial
+    // `nvim_buf_set_lines` write (see the "Harness fidelity" doc comment
+    // at the top of this file), not a real Vim/Neovim behaviour difference:
+    //   - `:edit`-loading "abcdef" for real, then feeding `xxxU`, gives the
+    //     documented `U` result ("abcdef" restored) — vimcode already
+    //     matches this.
+    //   - The harness's synthetic `nvim_buf_set_lines` fixture write leaves
+    //     line 1's "U-saved-original" pointer stale at "" (the buffer's
+    //     pre-existing empty line, from *before* the fixture text was
+    //     written) because that write itself isn't undo-synced. Only line 1
+    //     of a freshly-loaded fixture is affected — the same `xU` on line 2
+    //     of a multi-line fixture undoes correctly.
+    // Left in deliberately: "fixing" vimcode to match would mean making `U`
+    // always discard real line content on a freshly-opened single-line
+    // buffer, which is wrong for actual usage.
     "undo:U",
     "undo:UU",
     "undo:A xyz u cursor",
     "undo:u after :%s cursor",
     "undo:u after visual d",
     "undo:u restores cursor after :g",
-    "undo:2u after insert ×3",
     "reg:\": last cmd",
     "mac:\"ay then @a executes text",
     "mac:q register letter uppercase Q",
