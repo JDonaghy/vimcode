@@ -105,6 +105,32 @@ fn test_manifests() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
             language_ids: vec!["java".to_string()],
             lsp: LspConfig {
                 binary: "jdtls".to_string(),
+                // #918: jdtls previously had no install command on any
+                // platform, so a user without it got a silent "No LSP
+                // server found" with no indication java was even
+                // involved. `brew install jdtls` is a real Homebrew-core
+                // formula (confirmed via `brew info jdtls`) — fill in
+                // macOS here. Linux/Windows are deliberately left empty:
+                // neither has a comparable one-line package-manager
+                // install for eclipse-jdtls, so filling them in is
+                // deferred rather than shipping a bad command.
+                install_macos: "brew install jdtls".to_string(),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "java-debug".to_string(),
+                binary: "java-debug-adapter".to_string(),
+                // Deliberately left without an install command: the
+                // java-debug adapter is a jar built from the
+                // microsoft/java-debug sources with no portable one-line
+                // install on any platform (see
+                // `dap_manager::install_cmd_for_adapter`'s existing
+                // "requires complex multi-step builds" fallback for
+                // java-debug/js-debug). Defect 2's fix in
+                // `ensure_server_for_language` means an empty LSP install
+                // command still surfaces a named, actionable error instead
+                // of a silent dead end; this DAP side is out of this
+                // issue's file scope (`dap_manager.rs`).
                 ..Default::default()
             },
             workspace_markers: vec!["pom.xml".to_string()],
@@ -3115,4 +3141,149 @@ fn resolve_command_finds_keg_only_clangd_under_homebrew_opt() {
     );
 
     let _ = std::fs::remove_dir_all(&prefix);
+}
+
+// ---------------------------------------------------------------------------
+// #918: extension install failures must name a runnable, platform-correct fix
+// ---------------------------------------------------------------------------
+//
+// Confirmed RED against unfixed `develop` before these were added: the
+// missing-dependency message was `"{name} requires npm — install npm and
+// try again"` (no runnable command at all — asserting `.contains("brew")` or
+// `.contains("apt")` failed), and the empty-install-command path returned
+// `None` from `ensure_server_for_language` without ever touching
+// `last_start_error`, so `mgr.last_start_error` stayed `None` (the
+// `.is_some()` assertion below failed).
+
+#[test]
+fn missing_dependency_error_includes_runnable_command_for_platform() {
+    // Defect 1: naming the missing binary ("requires npm") is not
+    // actionable on its own. Drives `missing_dependency_message` directly
+    // (a pure function with no PATH access) rather than going through
+    // `ensure_server_for_language`'s live `resolve_command` check, so this
+    // doesn't depend on whether npm/dotnet/go/etc. happen to be installed
+    // on whatever machine runs the test suite (see the Homebrew tests above
+    // for the same concern in a different corner of this file).
+    use vimcode_core::core::extensions::{ExtensionManifest, LspConfig};
+    use vimcode_core::core::lsp_manager::missing_dependency_message;
+
+    let manifest = ExtensionManifest {
+        name: "bash".to_string(),
+        display_name: "Bash / Shell Support".to_string(),
+        lsp: LspConfig {
+            binary: "bash-language-server".to_string(),
+            install: "npm install -g bash-language-server".to_string(),
+            dependencies: vec!["npm".to_string()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let msg = missing_dependency_message(&manifest, &["npm"]);
+    assert!(
+        msg.contains("Bash / Shell Support") && msg.contains("npm"),
+        "message should still name the extension and the missing binary: {msg}"
+    );
+    // The real regression: the message must contain a *runnable command*,
+    // not just the bare binary name repeated back.
+    #[cfg(target_os = "linux")]
+    assert!(
+        msg.contains("sudo apt install nodejs npm"),
+        "expected a runnable Linux install command: {msg}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        msg.contains("brew install node"),
+        "expected a runnable macOS install command: {msg}"
+    );
+    #[cfg(target_os = "windows")]
+    assert!(
+        msg.contains("winget install OpenJS.NodeJS"),
+        "expected a runnable Windows install command: {msg}"
+    );
+}
+
+#[test]
+fn missing_dependency_error_falls_back_generically_for_unknown_prereq() {
+    // A dependency name outside the built-in prereq table (#918's
+    // `PREREQ_INSTALLS`) should still produce a message — just without a
+    // specific command, since none is known.
+    use vimcode_core::core::extensions::ExtensionManifest;
+    use vimcode_core::core::lsp_manager::missing_dependency_message;
+
+    let manifest = ExtensionManifest {
+        name: "obscure".to_string(),
+        display_name: "Obscure Extension".to_string(),
+        ..Default::default()
+    };
+    let msg = missing_dependency_message(&manifest, &["some-obscure-tool"]);
+    assert!(
+        msg.contains("Obscure Extension") && msg.contains("some-obscure-tool"),
+        "fallback message should still name the extension and dependency: {msg}"
+    );
+}
+
+#[test]
+fn ensure_server_for_language_names_extension_when_no_install_command() {
+    // Defect 2: when a matching extension manifest has no install command
+    // (empty `install`/`install_*` AND/OR empty `lsp.binary`) for this
+    // platform, `ensure_server_for_language` must still set
+    // `last_start_error` — never silently `return None` with nothing set.
+    use vimcode_core::core::extensions::ExtensionManifest;
+    use vimcode_core::core::lsp_manager::LspManager;
+
+    let manifest = ExtensionManifest {
+        name: "no-installer-lang".to_string(),
+        display_name: "No Installer Extension".to_string(),
+        language_ids: vec!["no-installer-lang".to_string()],
+        // lsp left fully default: empty binary, empty install/install_*.
+        // This is exactly the shape of the real `java` manifest before
+        // #918 (no install path anywhere).
+        ..Default::default()
+    };
+
+    let mut mgr = LspManager::new(std::env::temp_dir(), &[]);
+    mgr.set_ext_manifests(vec![manifest.clone()], vec![manifest]);
+
+    let result = mgr.ensure_server_for_language("no-installer-lang");
+    assert!(
+        result.is_none(),
+        "no binary/install command means no server can start"
+    );
+    let err = mgr
+        .last_start_error
+        .clone()
+        .expect("last_start_error must be set — never a silent dead end (#918)");
+    assert!(
+        err.contains("No Installer Extension"),
+        "error should name the extension: {err}"
+    );
+}
+
+#[test]
+fn java_lsp_install_command_resolves_on_macos() {
+    // Defect 3 concrete instance: `java` had no install command on any
+    // platform, anywhere in its manifest — the one registry extension with
+    // no install path at all. Confirm the macOS fill-in (`brew install
+    // jdtls`, a real Homebrew-core formula) actually resolves through
+    // `install_cmd_for_platform()`.
+    use vimcode_core::core::extensions::find_manifest_by_name;
+    let manifests = test_manifests();
+    let java = find_manifest_by_name(&manifests, "java").expect("java manifest");
+
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        java.lsp.install_cmd_for_platform(),
+        "brew install jdtls",
+        "java should resolve a non-empty macOS install command"
+    );
+
+    // Linux/Windows are deliberately deferred (#918) — no comparable
+    // one-line package-manager install exists for eclipse-jdtls on either.
+    // Confirm the macOS field itself is wired up regardless of which
+    // platform runs this test, so it can't silently regress to empty.
+    assert_eq!(
+        java.lsp.install_macos, "brew install jdtls",
+        "java's macOS install command must be set"
+    );
 }

@@ -245,6 +245,88 @@ fn platform_install_field<'a>(linux: &'a str, macos: &'a str, windows: &'a str) 
     }
 }
 
+// ─── Prerequisite install guidance (#918) ─────────────────────────────────────
+
+/// Per-platform install guidance for the handful of runtime prerequisites
+/// shared across many extensions' `lsp.dependencies` (e.g. `["npm"]`).
+///
+/// `dependencies` is intentionally a bare `Vec<String>` of binary names —
+/// extending the manifest schema so each entry could carry its own install
+/// metadata would break the `dependencies = ["npm"]` shorthand already used
+/// by 10+ registry manifests (it would need to accept both a bare string and
+/// a `{name, install_linux, ...}` object, and every extension author would
+/// need to fill it in). A small built-in table for the six prerequisites
+/// actually shared across the registry today — `npm`, `dotnet`, `go`, `gem`,
+/// `cargo`, `rustup` — is simpler, keeps the manifest format backward
+/// compatible, and covers every affected extension without a schema change.
+struct PrereqInstall {
+    linux: &'static str,
+    macos: &'static str,
+    windows: &'static str,
+}
+
+const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
+    (
+        "npm",
+        PrereqInstall {
+            linux: "sudo apt install nodejs npm",
+            macos: "brew install node",
+            windows: "winget install OpenJS.NodeJS",
+        },
+    ),
+    (
+        "dotnet",
+        PrereqInstall {
+            linux: "sudo apt install dotnet-sdk-8.0",
+            macos: "brew install dotnet-sdk",
+            windows: "winget install Microsoft.DotNet.SDK.8",
+        },
+    ),
+    (
+        "go",
+        PrereqInstall {
+            linux: "sudo apt install golang-go",
+            macos: "brew install go",
+            windows: "winget install GoLang.Go",
+        },
+    ),
+    (
+        "gem",
+        PrereqInstall {
+            linux: "sudo apt install ruby",
+            macos: "brew install ruby",
+            windows: "winget install RubyInstallerTeam.Ruby",
+        },
+    ),
+    (
+        "cargo",
+        PrereqInstall {
+            linux: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            macos: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            windows: "winget install Rustlang.Rustup",
+        },
+    ),
+    (
+        "rustup",
+        PrereqInstall {
+            linux: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            macos: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+            windows: "winget install Rustlang.Rustup",
+        },
+    ),
+];
+
+/// Return a runnable install command for a known prerequisite binary (e.g.
+/// `"npm"`), chosen for the current platform. Returns `None` for names
+/// outside the built-in table above — callers should fall back to a
+/// generic "install X and try again" message in that case.
+pub fn prereq_install_cmd(dep: &str) -> Option<&'static str> {
+    PREREQ_INSTALLS
+        .iter()
+        .find(|(name, _)| *name == dep)
+        .map(|(_, t)| platform_install_field(t.linux, t.macos, t.windows))
+}
+
 impl ExtensionManifest {
     /// Parse a manifest from a TOML string. Returns `None` on parse failure.
     #[allow(dead_code)]
