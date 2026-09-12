@@ -14208,4 +14208,226 @@ mod tests {
              actually reaches the LSP (#889); screen:\n{screen}"
         );
     }
+
+    // ── #891 (Vim compat: changelist g;/g, and `] after yank) ───────────────
+    //
+    // Driver-level counterparts to `test_changelist_g_semi_then_g_comma_
+    // lands_on_second_newest`, `test_changelist_collapses_same_line_changes`
+    // and `test_backtick_close_bracket_after_yank_lands_on_last_char` in
+    // `src/core/engine/tests.rs`: those assert on `engine.change_list` /
+    // `engine.view().cursor` directly, which is sufficient to pin the engine
+    // bookkeeping but proves nothing about what actually reaches the screen.
+    // These three assert on the rendered block cursor cell (the same
+    // `cursor_cell`-by-background-colour pattern
+    // `d5aw_too_many_aborts_edit_but_walks_cursor_to_eol_via_shell_app`
+    // above uses) and rendered buffer text instead.
+
+    /// Locates the Normal-mode block cursor cell by background colour —
+    /// shared by all three tests below. Returns `(x, y)` in screen cells.
+    fn find_block_cursor(
+        driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        cursor_bg: quadraui::tui::testing::Color,
+        width: u16,
+        height: u16,
+    ) -> Option<(u16, u16)> {
+        for y in 0..height {
+            for x in 0..width {
+                if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    /// Oracle case "jump:g; g; g," — two changes on different lines, then
+    /// `gg` off the changelist entirely, then `g;g;g,`. The walk is a stable
+    /// pointer into a list, so two steps back then one step forward must
+    /// land back on the second-most-recent (i.e. newer) of the two changes,
+    /// not re-visit the oldest one.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `g,`'s fix reverted
+    /// (looking up `change_list[change_list_pos]` *before* incrementing,
+    /// instead of after), the final `g,` re-visited the entry the preceding
+    /// `g;` had already landed on (the oldest change, AAA891's row) instead
+    /// of advancing to the newer one, and the cursor-row assertion below
+    /// failed. Restored before this commit.
+    #[test]
+    fn changelist_g_semi_g_semi_g_comma_lands_on_newer_change_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "AAA891\nBBB891\nCCC891");
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Change #1: line 0, col 0.
+        driver.type_char('x');
+        // Down to line 2.
+        driver.type_char('j');
+        driver.type_char('j');
+        // Change #2: line 2, col 0.
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AA891") && screen.contains("CC891"),
+            "both x deletions should have landed; screen:\n{screen}"
+        );
+
+        // Off the changelist entirely, then walk it: back, back, forward.
+        driver.type_char('g');
+        driver.type_char('g');
+        driver.type_char('g');
+        driver.type_char(';');
+        driver.type_char('g');
+        driver.type_char(';');
+        driver.type_char('g');
+        driver.type_char(',');
+        driver.render();
+
+        let target = driver
+            .find_bounds("CC891")
+            .expect("the edited CCC891 line must still paint");
+        let (cursor_x, cursor_y) = find_block_cursor(&driver, cursor_bg, 100, 24)
+            .expect("a Normal-mode block cursor must paint after g;g;g,");
+        let screen = driver.screen();
+        assert_eq!(
+            cursor_y, target.y as u16,
+            "g;g;g, should land back on the newer of the two changes \
+             (CCC891's row), not the oldest; screen:\n{screen}"
+        );
+        assert_eq!(
+            cursor_x, target.x as u16,
+            "the cursor should land on column 0 of that row; screen:\n{screen}"
+        );
+    }
+
+    /// Oracle case "jump:g; after 2 changes same line" — a second change on
+    /// the line already at the head of the changelist must update that
+    /// entry in place rather than appending a second one: a single `g;`
+    /// jumps straight to the (collapsed) entry, and a further `g;` reports
+    /// "already at oldest" instead of walking to a nonexistent earlier
+    /// duplicate.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `push_change_
+    /// location`'s collapsing `if last.0 == line` branch reverted to the
+    /// old "avoid duplicate consecutive entries" check (only skipping an
+    /// exact `(line, col)` repeat), the two `x` deletions here — same line,
+    /// different columns — pushed two separate entries instead of one, so
+    /// the first `g;` landed on the *second* change's column by coincidence
+    /// but the second `g;` walked to a real (bogus) earlier entry instead of
+    /// reporting "Already at oldest change", and the message assertion
+    /// below failed. Restored before this commit.
+    #[test]
+    fn changelist_collapses_same_line_changes_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "abcdef");
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('x'); // change #1: (line 0, col 0), deletes 'a'
+        driver.type_char('$'); // to the last column, 'f'
+        driver.type_char('x'); // change #2: same line, deletes 'f'
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("bcde"),
+            "both x deletions should have landed; screen:\n{screen}"
+        );
+        let line_start_col = driver
+            .find_bounds("bcde")
+            .expect("the edited line must paint")
+            .x as u16;
+
+        driver.type_char('g');
+        driver.type_char('g');
+        driver.type_char('0');
+        driver.render();
+
+        driver.type_char('g');
+        driver.type_char(';');
+        driver.render();
+
+        let screen = driver.screen();
+        let (cursor_x, _) = find_block_cursor(&driver, cursor_bg, 100, 24)
+            .expect("a Normal-mode block cursor must paint after g;");
+        assert_eq!(
+            cursor_x,
+            line_start_col + 3,
+            "g; should land on column 3 (the collapsed entry, 'e'); screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Already at oldest change"),
+            "there is exactly one changelist entry left to visit; screen:\n{screen}"
+        );
+
+        driver.type_char('g');
+        driver.type_char(';');
+        driver.render();
+
+        let screen = driver.screen();
+        let (cursor_x_after, _) = find_block_cursor(&driver, cursor_bg, 100, 24)
+            .expect("the block cursor must still paint after the second g;");
+        assert_eq!(
+            cursor_x_after,
+            line_start_col + 3,
+            "a second g; must not move the cursor — there is only one entry; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Already at oldest change"),
+            "a second g; with no earlier entry should report already-at-oldest; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// Oracle case "mark:`] after yank" — `` `[ ``/`` `] `` bracket the last
+    /// changed *or yanked* text (`:h '[`). `` `] `` must land on the last
+    /// character of the yanked region, not one past it.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `'['`/`']'` arm
+    /// removed from the backtick-mark dispatch (so `` `] `` fell through to
+    /// "no such mark" and left the cursor at column 0), the cursor-column
+    /// assertion below failed.
+    #[test]
+    fn backtick_close_bracket_after_yank_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "abc def");
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let line_start_col = driver
+            .find_bounds("abc def")
+            .expect("the line must paint")
+            .x as u16;
+
+        driver.type_char('w'); // to 'd' in "def"
+        driver.type_char('y');
+        driver.type_char('i');
+        driver.type_char('w'); // yiw: yank "def"
+        driver.type_char('0'); // back to column 0
+        driver.type_char('`');
+        driver.type_char(']');
+        driver.render();
+
+        let screen = driver.screen();
+        let (cursor_x, _) = find_block_cursor(&driver, cursor_bg, 100, 24)
+            .expect("a Normal-mode block cursor must paint after `]");
+        assert_eq!(
+            cursor_x,
+            line_start_col + 6,
+            "`] should land on the 'f' in \"def\", the last yanked char; \
+             screen:\n{screen}"
+        );
+    }
 }
