@@ -451,6 +451,48 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     None
 }
 
+/// Build the actionable "missing prerequisite" error message for a manifest,
+/// given the dependency names that failed to resolve on PATH.
+///
+/// Pulled out of `ensure_server_for_language` as a pure function (no PATH
+/// access) so tests can drive the message-building logic directly with a
+/// synthetic `missing` list instead of depending on which of `npm`,
+/// `dotnet`, `go`, etc. happen to be installed on the machine running the
+/// test suite (#918) — mirrors the `install_cmd_with(rustup_available:
+/// bool)` split already used in `extensions.rs` for the same reason.
+///
+/// `pub` (rather than crate-private) so `tests/extensions.rs` — a separate
+/// integration-test crate — can call it directly.
+pub fn missing_dependency_message(
+    manifest: &extensions::ExtensionManifest,
+    missing: &[&str],
+) -> String {
+    let name = if manifest.display_name.is_empty() {
+        &manifest.name
+    } else {
+        &manifest.display_name
+    };
+    // #918: naming the missing binary alone ("requires npm — install npm
+    // and try again") tells the user what's missing but not what to
+    // actually run. Attach a runnable, platform-specific command for the
+    // prerequisites shared across the registry (npm, dotnet, go, gem,
+    // cargo, rustup); fall back to the old generic phrasing for any
+    // dependency name outside that table.
+    let hints: Vec<String> = missing
+        .iter()
+        .map(|dep| match extensions::prereq_install_cmd(dep) {
+            Some(cmd) => format!("{dep}: {cmd}"),
+            None => format!("install {dep} and try again"),
+        })
+        .collect();
+    format!(
+        "{} requires {} — {}",
+        name,
+        missing.join(", "),
+        hints.join("; ")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // LspManager — coordinates multiple language servers
 // ---------------------------------------------------------------------------
@@ -753,17 +795,7 @@ impl LspManager {
                 .map(|s| s.as_str())
                 .collect();
             if !missing.is_empty() {
-                let name = if manifest.display_name.is_empty() {
-                    &manifest.name
-                } else {
-                    &manifest.display_name
-                };
-                self.last_start_error = Some(format!(
-                    "{} requires {} — install {} and try again",
-                    name,
-                    missing.join(", "),
-                    missing.join(", "),
-                ));
+                self.last_start_error = Some(missing_dependency_message(manifest, &missing));
                 return None;
             }
         }
@@ -806,12 +838,29 @@ impl LspManager {
                     extensions::find_manifest_for_language_id(&self.ext_manifests, language_id)
                 {
                     let install_cmd = manifest.lsp.install_cmd_for_platform();
-                    if !install_cmd.is_empty() && !manifest.lsp.binary.is_empty() {
-                        self.last_start_error = Some(format!(
-                            "{} not found. Run: {}",
-                            manifest.lsp.binary, install_cmd
-                        ));
-                    }
+                    let name = if manifest.display_name.is_empty() {
+                        &manifest.name
+                    } else {
+                        &manifest.display_name
+                    };
+                    self.last_start_error = Some(
+                        if !install_cmd.is_empty() && !manifest.lsp.binary.is_empty() {
+                            format!("{} not found. Run: {}", manifest.lsp.binary, install_cmd)
+                        } else {
+                            // #918: previously this branch fell through to
+                            // `return None` with `last_start_error` left
+                            // untouched, so the user saw the generic "No
+                            // LSP server found" with no hint an extension
+                            // was even involved (`java` hits this on every
+                            // platform — no install command anywhere in
+                            // its manifest). Always name the extension and
+                            // say plainly that it has no installer here.
+                            format!(
+                                "{name} extension declares no LSP install command for this \
+                                 platform — install its language server manually."
+                            )
+                        },
+                    );
                 }
                 return None;
             }
