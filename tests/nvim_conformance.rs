@@ -3698,10 +3698,6 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // buffer, which is wrong for actual usage.
     "undo:U",
     "undo:UU",
-    "undo:A xyz u cursor",
-    "undo:u after :%s cursor",
-    "undo:u after visual d",
-    "undo:u restores cursor after :g",
     "reg:\": last cmd",
     "mac:\"ay then @a executes text",
     "mac:q register letter uppercase Q",

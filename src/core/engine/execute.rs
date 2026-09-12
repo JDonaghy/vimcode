@@ -2548,7 +2548,15 @@ impl Engine {
         let mut executed = 0usize;
         let mut pending: Vec<isize> = matching.iter().map(|&l| l as isize).collect();
         let mut idx = 0usize;
-        self.start_undo_group();
+        // `:g` is one undoable step in Vim, however many lines it touches —
+        // save the undo depth so the per-line sub-command entries below can
+        // be merged into a single one (#886). A bare `start_undo_group()`
+        // here doesn't work: the first sub-command that itself calls
+        // `start_undo_group()` (nearly all of them — `d`, `s`, `normal`, …)
+        // immediately finishes this outer group (empty, so it's discarded)
+        // and starts its own, so without the merge below `u` only reverts
+        // the *last* matching line, and the buffer + cursor are both wrong.
+        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
         while idx < pending.len() {
             let line = pending[idx];
             idx += 1;
@@ -2573,7 +2581,25 @@ impl Engine {
                 }
             }
         }
-        self.finish_undo_group();
+        // Finalize the last open undo group (e.g. from a trailing insert-mode
+        // sub-command).
+        self.active_buffer_state_mut().finish_undo_group();
+
+        // Merge every undo entry created by the sub-commands above into a
+        // single step, so `u` reverts all of `:g`'s edits at once and lands
+        // on the position of the *first* one (#886).
+        let state = self.active_buffer_state_mut();
+        if state.undo_stack.len() > saved_undo_len + 1 {
+            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
+            let cursor_before = new_entries[0].cursor_before;
+            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
+            if !merged_ops.is_empty() {
+                state.undo_stack.push(UndoEntry {
+                    ops: merged_ops,
+                    cursor_before,
+                });
+            }
+        }
 
         let max_line = self.buffer().len_lines().saturating_sub(1);
         if self.view().cursor.line > max_line {
@@ -3399,6 +3425,10 @@ impl Engine {
         let mut n_subs = 0usize;
         let mut last_end_in_out: Option<usize> = None;
         let mut last_was_multiline = false;
+        // Byte offset (into `body`, i.e. pre-substitution) of the very first
+        // match — Vim's `u` restores the cursor here, not to the cursor
+        // position when `:s` was invoked (#886).
+        let mut first_change_pos: Option<usize> = None;
 
         while at <= body.len() {
             let Some(caps) = compiled.regex.captures_at(body, at) else {
@@ -3446,6 +3476,9 @@ impl Engine {
             last_end_in_out = Some(out.len());
             copied = mend;
             n_subs += 1;
+            if first_change_pos.is_none() {
+                first_change_pos = Some(mstart);
+            }
 
             let eline = line_of(mend);
             last_was_multiline = eline > sline;
@@ -3519,8 +3552,19 @@ impl Engine {
             None
         };
 
+        // `u` restores the cursor here — Vim uses the position of the first
+        // substitution, not wherever the cursor was when `:s` ran (#886).
+        let first_change_cursor = first_change_pos
+            .map(|pos| {
+                let line = line_of(pos);
+                let line_start = line_starts[line];
+                let col = body[line_start..pos].chars().count();
+                Cursor { line, col }
+            })
+            .unwrap_or(Cursor { line: cur, col: 0 });
+
         let new_full = format!("{out}{trailing}");
-        self.splice_buffer_text(&new_full);
+        self.splice_buffer_text_at(&new_full, first_change_cursor);
 
         let max_line = self.buffer().len_lines().saturating_sub(1);
         let target_line = target_line.min(max_line);
@@ -3547,7 +3591,11 @@ impl Engine {
 
     /// Replace the buffer's text with `new_text` as a single undo step,
     /// touching only the region that actually differs so undo stays tight.
-    pub(crate) fn splice_buffer_text(&mut self, new_text: &str) {
+    ///
+    /// `cursor_before` is what `u` restores the cursor to; Vim uses the
+    /// position of the *first* change, which is not always wherever the
+    /// (real) cursor happens to be at the time of the call (#886).
+    pub(crate) fn splice_buffer_text_at(&mut self, new_text: &str, cursor_before: Cursor) {
         let old: Vec<char> = self.buffer().to_string().chars().collect();
         let new: Vec<char> = new_text.chars().collect();
         if old == new {
@@ -3565,7 +3613,7 @@ impl Engine {
             suffix += 1;
         }
         let inserted: String = new[prefix..new.len() - suffix].iter().collect();
-        self.start_undo_group();
+        self.start_undo_group_at(cursor_before);
         if old.len() - suffix > prefix {
             self.delete_with_undo(prefix, old.len() - suffix);
         }
@@ -3573,6 +3621,13 @@ impl Engine {
             self.insert_with_undo(prefix, &inserted);
         }
         self.finish_undo_group();
+    }
+
+    /// [`splice_buffer_text_at`](Self::splice_buffer_text_at) using the
+    /// engine's current cursor as `cursor_before`.
+    pub(crate) fn splice_buffer_text(&mut self, new_text: &str) {
+        let cursor_before = *self.cursor();
+        self.splice_buffer_text_at(new_text, cursor_before);
     }
 
     // --- Search ---

@@ -1794,6 +1794,68 @@ fn test_undo_cursor_position_restored() {
     assert_eq!(engine.view().cursor.col, 6);
 }
 
+// #886: `u` restores the cursor to the position of the *first* change the
+// undo group reverted — verified directly against Neovim 0.12.5 in
+// tests/nvim_conformance.rs ("undo:A xyz u cursor" / "undo:u after :%s
+// cursor" / "undo:u after visual d" / "undo:u restores cursor after :g").
+// These are tight regression tests for the same fixes, in-crate.
+
+#[test]
+fn test_undo_after_append_at_eol_restores_cursor_to_last_char() {
+    // `A` moves the cursor to the append position *before* any text is
+    // inserted; `u` must restore to that position (clamped back into the
+    // line), not to wherever the cursor was before `A` was pressed.
+    let mut engine = setup_engine("abc", 0, 0);
+    send_keys(&mut engine, "A xyz<Esc>");
+    assert_eq!(engine.buffer().to_string(), "abc xyz");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "abc");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 2); // clamped onto the last 'c'
+}
+
+#[test]
+fn test_undo_after_percent_s_restores_cursor_to_first_changed_line() {
+    let mut engine = setup_engine("a\na\na", 2, 0);
+    engine.execute_command("%s/a/b/");
+    assert_eq!(engine.buffer().to_string(), "b\nb\nb");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "a\na\na");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_undo_after_visual_delete_restores_cursor_to_selection_start() {
+    // `vll` leaves the (real) cursor at the *end* of the selection; `u`
+    // must restore to the *start* of what was deleted, not the cursor's
+    // position when `d` was pressed.
+    let mut engine = setup_engine("abcdef", 0, 1);
+    send_keys(&mut engine, "vlld");
+    assert_eq!(engine.buffer().to_string(), "aef");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "abcdef");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+#[test]
+fn test_undo_after_global_command_reverts_all_lines_in_one_step() {
+    // `:g/pat/cmd` is one undo block covering every matched line — a
+    // regression here used to leave one undo entry *per line*, so `u`
+    // only reverted the last one.
+    let mut engine = setup_engine("a\nb\na", 0, 0);
+    engine.execute_command("g/a/d");
+    assert_eq!(engine.buffer().to_string().trim_end_matches('\n'), "b");
+    send_keys(&mut engine, "u");
+    assert_eq!(
+        engine.buffer().to_string().trim_end_matches('\n'),
+        "a\nb\na"
+    );
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
 #[test]
 fn test_undo_line_basic() {
     let mut engine = Engine::new();
