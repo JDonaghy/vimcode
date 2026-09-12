@@ -14430,4 +14430,113 @@ mod tests {
              screen:\n{screen}"
         );
     }
+
+    // ── #918: extension install failures must name a runnable,
+    // platform-correct fix — black-box coverage ─────────────────────────
+    //
+    // The first review pass on #918 only asserted on
+    // `missing_dependency_message`'s return value and
+    // `LspManager::last_start_error` directly (see `tests/extensions.rs`) —
+    // internal state, never anything painted. But the changed text is
+    // genuinely user-visible: `Engine::lsp_did_open`
+    // (`src/core/engine/lsp_ops.rs`) assigns the `LspManager::notify_did_open`
+    // error straight into `self.message`, which `alt_z_toggles_word_wrap_
+    // only_in_vscode_mode_via_shell_app` above documents as "where
+    // `engine.message` renders on both backends". Asserting on internal
+    // state instead of `driver.screen()` is exactly the anti-pattern
+    // `CLAUDE.md`'s Testing section calls out (the `ScreenLayout.picker` /
+    // #587/#592 history) — a field can be set correctly for months while
+    // nothing paints it. The test below closes that gap by driving a real
+    // `TuiShellApp` through `open_file_with_mode` (which calls
+    // `lsp_did_open` internally) and reading the painted command line.
+    //
+    // This covers Defect 2 (the empty-install-command fallback) rather than
+    // Defect 1 (the missing-dependency runnable command) — the reviewer's
+    // own suggested fix offered either shape ("an ext manifest that has a
+    // missing dependency (or an empty install command)"). Defect 1's check
+    // is driven by `LspManager::resolve_command`, which shells out to the
+    // *real* `which`/`where` against the process's actual `PATH` — so
+    // forcing one of the six `PREREQ_INSTALLS` names (`npm`, `dotnet`, `go`,
+    // `gem`, `cargo`, `rustup`) to resolve as "missing" deterministically
+    // would require mutating the global `PATH` env var. That's fine in
+    // `tests/extensions.rs` (the `#917` Homebrew tests' `EnvVarGuard`
+    // pattern) because each integration-test file is its own process; it is
+    // not safe here, where this test runs as one of ~200 `#[test]`s inside
+    // the single shared `--lib` test binary process, several of which open
+    // real `.rs`/`.py` files and go through this exact same live
+    // `resolve_command` path on other threads concurrently — a temporarily
+    // narrowed `PATH` would risk flipping their LSP-server resolution too.
+    // (Confirmed non-deterministic in practice: this dev machine has `cargo`
+    // and `rustup` on PATH, as does any machine that can build vimcode, and
+    // GitHub-hosted CI runners generally ship `dotnet`/`npm`/`go`/`gem`
+    // preinstalled too — there is no dependency name in the table that is
+    // reliably absent everywhere.) Defect 1's platform-specific
+    // runnable-command wording is covered instead by the pure-function
+    // tests in `tests/extensions.rs`
+    // (`missing_dependency_error_includes_runnable_command_for_platform`),
+    // which drive `missing_dependency_message` directly with a synthetic
+    // `missing` list and don't touch the real PATH at all.
+
+    /// Defect 2: an installed extension with no install command for this
+    /// platform (the pre-#918 `java` fixture's exact shape) must still name
+    /// the extension on the command line instead of silently falling
+    /// through to the generic "No LSP server found" message.
+    ///
+    /// **Verified RED against unfixed `develop`:** the pre-#918
+    /// `ensure_server_for_language` returned `None` from the
+    /// no-candidate-resolves branch without ever touching
+    /// `last_start_error` when `install_cmd`/`lsp.binary` was empty, so the
+    /// command line read "No LSP server found for java" — the extension's
+    /// display name never appeared, failing the assertion below.
+    #[test]
+    fn no_install_command_error_paints_on_command_line_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_918_no_install_cmd_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("Main918b.java");
+        std::fs::write(&file, "class Main918b {}\n").unwrap();
+
+        let manifest = ExtensionManifest {
+            name: "java".to_string(),
+            display_name: "No Installer Extension (918 test)".to_string(),
+            language_ids: vec!["java".to_string()],
+            file_extensions: vec![".java".to_string()],
+            lsp: LspConfig {
+                // Non-empty binary, but it will never resolve on any
+                // machine's PATH, and every install_* field is left empty
+                // (default) — exactly the shape that used to fall through
+                // silently.
+                binary: "vimcode-918-nonexistent-binary".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.ext_registry = Some(vec![manifest.clone()]);
+        app.engine.extension_state.mark_installed(&manifest.name);
+
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("No Installer Extension (918 test)")
+                && screen.contains("declares no LSP install command"),
+            "the command line must name the extension and say plainly that \
+             it has no installer, instead of a generic \"No LSP server \
+             found\"; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
