@@ -5228,36 +5228,35 @@ mod command_center {
         );
     }
 
-    /// #676 design note: GTK forces `menu_bar_visible = true` at startup
-    /// (`App::setup`), unlike TUI where it's optional, so in practice the
-    /// Command Center is always visible on GTK. This guards the other half
-    /// of that contract anyway (mirroring TUI's identical gate,
-    /// `render_content_does_not_paint_menu_bar_when_hidden_via_shell_app`):
-    /// when the flag is off, clicking where the Command Center used to be
-    /// must no longer trigger Command Center behaviour (stale hit-region),
-    /// not just clear the layout-cache field in isolation.
+    /// #676 design note (superseded by #939, see below): GTK forces
+    /// `menu_bar_visible = true` at startup (`App::setup`), unlike TUI where
+    /// it's optional, so in practice the Command Center is always visible on
+    /// GTK. `menu_bar_visible` can still be flipped off at runtime though
+    /// (`Engine::toggle_menu_bar`, e.g. an F10/Alt binding), and this test
+    /// pins what that does to the Command Center.
     ///
-    /// #677 audit: the original version of this test asserted only
-    /// `command_center_layout.borrow().is_none()` — a state check with no
-    /// observable-behaviour probe, exactly the #553/#592 shape (a flag
-    /// flips, nothing confirms the click path actually changed). A first
-    /// attempt at replacing it with a raw pixel-region probe (same
-    /// coordinates, `region_has_non_background_pixel` before/after) turned
-    /// out to be a false-positive risk rather than a strengthening: hiding
-    /// the menu bar reserves one fewer title-bar row, so `main_content`
-    /// reflows upward and the tab bar's own (non-background) pixels land on
-    /// the old Command Center coordinates — that probe went red against
-    /// *correct*, unmodified code, which would have made this a flaky/wrong
-    /// test rather than a fixed one. Click-behaviour is layout-shift-proof
-    /// and directly exercises the actual risk the doc above names (a stale
-    /// cached rect still accepting clicks): verified non-vacuous by
-    /// mutation — commenting out the `command_center_layout.replace(None)`
-    /// clear (`src/gtk/mod.rs`, the `else` arm right after the Command
-    /// Center paint block) makes `assert!(!h.engine.borrow().picker_open, ...)`
-    /// below fail, because `handle()`'s click dispatch still finds a
-    /// (stale) `Some(layout)` to hit-test against and opens the picker.
+    /// #939 changed the answer. `menu_bar_visible` used to gate all three
+    /// title-bar rungs — menu row, its dropdown, *and* the Command Center —
+    /// as one `title_bar` flag (`FramePresence::from_screen`). That was
+    /// convenient here but wrong on a native-menu backend (macOS): setting
+    /// `menu_bar_visible = false` there suppresses the redundant in-window
+    /// `File Edit View` row under AppKit's real menu bar (#901), and dragged
+    /// the Command Center down with it — the omnibar never painted on macOS
+    /// at all. #939 split the gate so the Command Center depends only on the
+    /// title-bar *band* existing, not on `menu_bar_visible`; this test's
+    /// GTK-only trigger for that same flag now falls out of the identical
+    /// rule, so hiding the drawn menu row must no longer clear the Command
+    /// Center — the same title-bar band VS Code's own "Toggle Menu Bar"
+    /// leaves the Command Center in.
+    ///
+    /// RED-verified against this fix: reverted to a pre-#939
+    /// `title_bar`-only presence gate (`command_center: title_bar` instead
+    /// of `title_bar_band_live`) and re-ran — the
+    /// `command_center_layout` assertion below failed (`None`) and the
+    /// search-box click assertion never ran because there was no rect left
+    /// to click.
     #[test]
-    fn command_center_layout_clears_when_menu_bar_is_hidden() {
+    fn command_center_stays_live_when_menu_bar_is_hidden() {
         let mut h = harness(engine_with_tab_history(), 1400, 900);
         h.driver.render();
         assert!(
@@ -5265,43 +5264,68 @@ mod command_center {
             "fixture must start with back-navigation available"
         );
         let tab_before = h.engine.borrow().active_tab().id;
+        assert!(
+            h.driver.screen_contains("File"),
+            "fixture must start with the drawn menu row visible"
+        );
+
+        h.engine.borrow_mut().menu_bar_visible = false;
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("File"),
+            "hiding the menu bar must stop the drawn `File Edit View` row \
+             from painting; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        // The #939 regression pin: the Command Center's own layout must
+        // still be live and re-measured for this frame's (possibly
+        // reflowed) band -- not cleared just because the drawn menu row
+        // went dark.
         let layout = h
             .engine
             .borrow()
             .command_center_layout
             .borrow()
             .clone()
-            .expect("must be painted while the menu bar is visible");
-        let back = layout.back_bounds.expect("back arrow must be painted");
-        let search = layout.search_bounds.expect("search box must be painted");
+            .expect(
+                "the Command Center must stay live when the menu bar is \
+                 hidden -- only the drawn menu row/dropdown are coupled to \
+                 `menu_bar_visible` (#939)",
+            );
+        let back = layout
+            .back_bounds
+            .expect("the back arrow must still have a painted bounds");
+        let search = layout
+            .search_bounds
+            .expect("the search box must still have a painted bounds");
 
-        h.engine.borrow_mut().menu_bar_visible = false;
-        h.driver.render();
-
-        // Click at the *old* back-arrow and search-box coordinates: with the
-        // menu bar hidden neither must still behave like Command Center
-        // controls, even though the layout has reflowed and something else
-        // (editor/tab bar) may now occupy those pixels.
+        // And it must still be *clickable*, not just present in the cache --
+        // the #587 class of bug is state populated with nothing wired to it.
         h.driver
             .click(back.x + back.width / 2.0, back.y + back.height / 2.0);
-        assert_eq!(
+        assert_ne!(
             h.engine.borrow().active_tab().id,
             tab_before,
-            "clicking the old back-arrow coordinates after hiding the menu bar \
-             must not navigate tab history"
+            "clicking the back arrow must still navigate tab history while \
+             the drawn menu row is hidden"
         );
+
         h.driver.click(
             search.x + search.width / 2.0,
             search.y + search.height / 2.0,
         );
         assert!(
-            !h.engine.borrow().picker_open,
-            "clicking the old search-box coordinates after hiding the menu bar \
-             must not open the Command Center picker"
+            h.engine.borrow().picker_open,
+            "clicking the search box must still open the Command Center \
+             picker while the drawn menu row is hidden"
         );
-        assert!(
-            h.engine.borrow().command_center_layout.borrow().is_none(),
-            "hiding the menu bar must clear the cached Command Center layout"
+        assert_eq!(
+            h.engine.borrow().picker_source,
+            PickerSource::CommandCenter,
+            "the search box must still open the picker with the \
+             CommandCenter source while the drawn menu row is hidden"
         );
     }
 }
