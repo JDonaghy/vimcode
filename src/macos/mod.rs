@@ -708,4 +708,86 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
     }
+
+    // ── #940: client-side titlebar / native traffic-light inset ────────
+
+    /// #940's acceptance section asks for a `MacDriver` black-box test
+    /// proving two things end to end: vimcode's drawn window controls do
+    /// not paint when the backend reports it draws its own, and painted
+    /// title-band content starts clear of the reported control inset. No
+    /// such test exists in this file, and — as of the pinned rev
+    /// (`b6000c4`) — none can: `MacDriver::new` above never calls
+    /// `MacBackend::set_window`, and there is no other way to make it do
+    /// so from this crate.
+    ///
+    /// Three independent things all have to be true simultaneously for
+    /// `Backend::titlebar_control_inset()` to return anything other than
+    /// `Rect::default()`, and all three currently hold:
+    ///
+    /// 1. `MacBackend::titlebar_control_inset` (`macos/backend.rs:1351`)
+    ///    short-circuits to `Rect::default()` whenever no window has been
+    ///    set — pinned by quadraui's own
+    ///    `titlebar_control_inset_default_without_window` test right next
+    ///    to it (`macos/backend.rs:3816`).
+    /// 2. The only setter, `MacBackend::set_window`
+    ///    (`macos/backend.rs:451`), is `pub(crate)` to quadraui — this
+    ///    crate cannot call it, and `MacDriver::new` (this file's
+    ///    quadraui counterpart, `macos/testing.rs:130`) never does either.
+    /// 3. `Backend` itself is sealed (`backend.rs:488-614`, a
+    ///    `pub(crate) sealed::Sealed` supertrait), so vimcode cannot work
+    ///    around (2) by substituting its own `Backend` impl that reports a
+    ///    fake inset — not even a thin wrapper delegating everything else
+    ///    to a real backend. `quadraui::testing::RecordingBackend`, the
+    ///    one other publicly constructible `Backend` impl this crate can
+    ///    reach, does not override `titlebar_control_inset` either, so it
+    ///    inherits the same all-zero default the trait itself declares
+    ///    (`backend.rs:1193`) — checked directly against the pinned
+    ///    source, not assumed.
+    ///
+    /// A live `NSWindow` is unavoidable, and quadraui's own `MacDriver`
+    /// doc says as much in its "Limitations" section: real `NSEvent`
+    /// delivery and window-backed behaviour "need a live-window smoke
+    /// test instead" of the headless `CGBitmapContext` path every test in
+    /// this file uses. This gap is exactly that category — a real Mac
+    /// running the actual app is the only thing that can drive a non-zero
+    /// inset today, which is why it is one of this PR's `SMOKE_TESTS`
+    /// items rather than an automated test here.
+    ///
+    /// Closing this properly needs a quadraui-side testing hook (e.g. a
+    /// `MacDriver` constructor, or a `MacBackend` setter, that can inject
+    /// a non-default `titlebar_control_inset()` without a real window) —
+    /// a quadraui issue to file, not a vimcode workaround
+    /// (`CLAUDE.md`'s Platform-Neutrality Rule: file upstream, wait, then
+    /// implement). Until it lands, the logic this test would otherwise
+    /// exercise is covered as pure, backend-independent unit tests
+    /// instead — `render::backend_draws_own_window_controls`,
+    /// `render::should_draw_window_controls`, and
+    /// `render::inset_titlebar_row_leading_edge` in `src/render.rs` — and
+    /// the trip wire right below pins today's status quo so this comment
+    /// cannot silently go stale if quadraui ever does start setting a
+    /// window here.
+    ///
+    /// RED-verification note: there is nothing to make RED here — this
+    /// test asserts what the pinned quadraui rev provably always returns,
+    /// not a vimcode behaviour that could regress. Its job is the
+    /// opposite: it goes RED the day `MacDriver` starts setting a window
+    /// (or a version bump otherwise changes this), which is exactly the
+    /// signal that the black-box test the issue actually asks for finally
+    /// becomes possible.
+    #[test]
+    fn control_inset_is_default_because_mac_driver_never_sets_a_window() {
+        use quadraui::Backend;
+
+        let (_guards, driver) = driver(plain_engine());
+
+        assert_eq!(
+            driver.backend().titlebar_control_inset(),
+            quadraui::Rect::default(),
+            "MacDriver's backend reported a non-default titlebar control \
+             inset without ever calling MacBackend::set_window -- if this \
+             fires, quadraui has changed and the #940 suppression/inset \
+             path can likely now get real MacDriver black-box coverage; \
+             see this test's doc comment"
+        );
+    }
 }
