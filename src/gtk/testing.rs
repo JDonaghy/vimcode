@@ -7727,6 +7727,105 @@ mod modal_rung {
         );
     }
 
+    /// #902: `menu_style` only ever changes anything on a backend that
+    /// advertises `BackendCaps::native_menu` — `render::
+    /// context_menu_should_be_native` gates every variant on that
+    /// capability, mirroring #901's identical gate for the menu bar. GTK's
+    /// `native_menu` is `false`, so even the most aggressive setting
+    /// (`Native`) must still fall back to painting the in-window
+    /// `ContextMenuPanel`, exactly like the default `Inherit`.
+    ///
+    /// RED-verified: temporarily changing `context_menu_should_be_native`
+    /// to `MenuStyle::Native | MenuStyle::Inherit => true` (dropping the
+    /// `caps.native_menu` gate) makes this fail — GTK's `show_context_menu`
+    /// is quadraui's no-op default, so the menu item never reaches the
+    /// screen and `screen_contains` comes back `false`. Restored before
+    /// committing.
+    #[test]
+    fn context_menu_style_native_still_paints_in_window_on_gtk() {
+        let mut engine = small_engine();
+        engine.settings.menu_style = crate::core::settings::MenuStyle::Native;
+        engine.open_editor_context_menu(4, 4);
+        assert!(
+            engine
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty()),
+            "fixture needs a non-empty context menu"
+        );
+
+        let h = harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.screen_contains("Go to Definition"),
+            "GTK has no native context menu (`BackendCaps::native_menu` is \
+             false) so `menu_style = Native` must still fall back to the \
+             in-window path; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #902: a native popup's activation (`UiEvent::ContextMenuItemActivated`,
+    /// fired by `Backend::show_context_menu` on a backend that has one) must
+    /// resolve through the exact same `context_menu_hit_to_idx` /
+    /// `apply_context_menu_route` dispatch the in-window click path already
+    /// uses — one routing table, not two. Driven here through GTK purely to
+    /// exercise `App::handle`'s new arm in a headless, non-macOS-only test:
+    /// the dispatch logic has no backend dependency, even though GTK itself
+    /// never emits this event in real use (`native_menu` is `false` there).
+    ///
+    /// "Command Palette" is *not* usable as the "did it open" marker here —
+    /// it is also the context menu's own last item label, so it is already
+    /// on screen before the dispatch and stays on screen if the dispatch is
+    /// silently dropped (the menu never closes), which would make the
+    /// assertion pass even with the routing arm missing entirely. "File:
+    /// Quit" is a `PALETTE_COMMANDS` entry that appears only once the
+    /// palette itself is populated and painted, with no such collision.
+    ///
+    /// RED against a build with no `UiEvent::ContextMenuItemActivated` arm
+    /// in `App::handle` (this issue's pre-fix state — `grep -rn
+    /// ContextMenuItemActivated src/` was empty): the event falls through
+    /// unhandled, the palette never opens, and this assertion fails.
+    #[test]
+    fn context_menu_item_activated_reaches_the_same_action_as_the_in_window_click() {
+        let mut engine = small_engine();
+        engine.open_editor_context_menu(4, 4);
+        let idx = engine
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .position(|i| i.label == "Command Palette")
+            .expect("fixture must offer a Command Palette item");
+        assert!(
+            engine.context_menu.as_ref().unwrap().items[idx].enabled,
+            "Command Palette must be enabled unconditionally, or this test \
+             can't tell a routed activation from a silently-dropped one"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        assert!(
+            !h.driver.screen_contains("File: Quit"),
+            "bad fixture: the palette should start closed; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver
+            .dispatch(quadraui::UiEvent::ContextMenuItemActivated(
+                quadraui::WidgetId::new(format!("context:{idx}")),
+            ));
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("File: Quit"),
+            "ContextMenuItemActivated(\"context:{idx}\") must open the \
+             command palette the same way the in-window click on \
+             \"Command Palette\" does; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// #751: the find/replace overlay must be clickable where it is *painted*.
     ///
     /// The panel is anchored to the active editor group

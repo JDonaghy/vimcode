@@ -2154,6 +2154,17 @@ impl ShellApp for TuiShellApp {
                             screen_row: ctx_menu.screen_row + 1,
                             ..ctx_menu.clone()
                         };
+                        // #902: `native` is always `false` on TUI —
+                        // `TuiBackend` never declares `native_menu`, so
+                        // `context_menu_should_be_native` always falls back
+                        // to the in-window path here regardless of the
+                        // `menu_style` setting. Computed the same way GTK
+                        // does so a future TUI native-menu capability picks
+                        // this up for free.
+                        let native = render::context_menu_should_be_native(
+                            self.engine.settings.menu_style,
+                            backend.backend_caps(),
+                        );
                         let menu_layout = render::paint_context_menu_rung(
                             backend,
                             &inset_panel,
@@ -2161,9 +2172,13 @@ impl ShellApp for TuiShellApp {
                             1.0,
                             1.0,
                             1.0,
+                            native,
                         );
-                        *self.context_menu_layout.borrow_mut() = Some(menu_layout);
-                        composed.push(render::FrameOp::ContextMenu);
+                        let painted = menu_layout.is_some();
+                        *self.context_menu_layout.borrow_mut() = menu_layout;
+                        if painted {
+                            composed.push(render::FrameOp::ContextMenu);
+                        }
                     }
                 }
 

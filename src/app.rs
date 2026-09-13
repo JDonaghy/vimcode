@@ -6775,6 +6775,36 @@ impl App {
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
             }
+            UiEvent::ContextMenuItemActivated(id) => {
+                // #902: fired by a *native* right-click popup (macOS
+                // `NSMenu` via `Backend::show_context_menu`, only reachable
+                // when `render::context_menu_should_be_native` resolved
+                // `true`). `id` is one of `context_menu_panel_to_quadraui_
+                // context_menu`'s synthesised `"context:N"` ids — the exact
+                // same ids `route_modal_overlay_click`'s in-window hit-test
+                // (`ContextMenuHit::Item` → `context_menu_hit_to_idx`)
+                // resolves, so routing the activation through
+                // `apply_context_menu_route` reuses that one conversion
+                // instead of duplicating it.
+                let idx = crate::core::engine::context_menu_hit_to_idx(
+                    &quadraui::ContextMenuHit::Item(id),
+                );
+                let route = match idx {
+                    Some(idx) => render::ContextMenuRoute::Item(idx),
+                    None => render::ContextMenuRoute::Dismiss,
+                };
+                self.apply_context_menu_route(route);
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
+            UiEvent::ContextMenuDismissed => {
+                // #902: the native popup was dismissed without a selection
+                // (Escape, click-away). Same close path a `ContextMenuRoute
+                // ::Dismiss` from the in-window hit-test already takes.
+                self.apply_context_menu_route(render::ContextMenuRoute::Dismiss);
+                self.draw_needed.set(true);
+                return quadraui::Reaction::Redraw;
+            }
             UiEvent::MouseDown {
                 button,
                 position,
@@ -7704,6 +7734,16 @@ impl quadraui::ShellApp for App {
                     if let Some(panel) =
                         screen.context_menu.as_ref().filter(|p| !p.items.is_empty())
                     {
+                        // #902: a native popup (`Backend::show_context_menu`)
+                        // paints nothing in-window — no layout to cache, and
+                        // no in-window rung to record as painted. Gated on
+                        // the same `BackendCaps::native_menu` capability
+                        // #901 uses for the menu bar, via the `menu_style`
+                        // setting.
+                        let native = render::context_menu_should_be_native(
+                            engine.settings.menu_style,
+                            backend.backend_caps(),
+                        );
                         let mlayout = render::paint_context_menu_rung(
                             backend,
                             panel,
@@ -7711,9 +7751,13 @@ impl quadraui::ShellApp for App {
                             cw,
                             lh,
                             0.0,
+                            native,
                         );
-                        *self.context_menu_layout.borrow_mut() = Some(mlayout);
-                        composed.push(render::FrameOp::ContextMenu);
+                        let painted = mlayout.is_some();
+                        *self.context_menu_layout.borrow_mut() = mlayout;
+                        if painted {
+                            composed.push(render::FrameOp::ContextMenu);
+                        }
                     }
                 }
 

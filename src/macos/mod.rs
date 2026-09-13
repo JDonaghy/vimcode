@@ -348,4 +348,71 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
     }
+
+    // ── #902: native macOS context menus ────────────────────────────────
+
+    /// #902: `menu_style` defaults to `Inherit`, which resolves to native
+    /// whenever the backend advertises one (`BackendCaps::native_menu`,
+    /// `true` for `MacBackend`) — see `render::context_menu_should_be_native`.
+    /// So by default, a right-click on macOS must **not** paint the
+    /// in-window `ContextMenuPanel` at all; `Backend::show_context_menu`
+    /// takes over instead. This test never triggers that native popup at
+    /// all (setting `engine.context_menu` directly, not going through a
+    /// real right-click), so it only proves the *other* half of the
+    /// acceptance bar — the one a headless test *can* prove: nothing paints
+    /// in-window when native is resolved.
+    ///
+    /// RED against the pre-#902 body (`paint_context_menu_rung` had no
+    /// native branch and always drew in-window): every item label,
+    /// including "Go to Definition", painted onto the screen regardless of
+    /// backend capability.
+    #[test]
+    fn native_menu_style_suppresses_the_in_window_context_menu() {
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.open_editor_context_menu(4, 4);
+        assert!(
+            engine
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty()),
+            "fixture needs a non-empty context menu — an empty one is not \
+             painted either way and would make this test meaningless"
+        );
+
+        let (_guards, driver) = driver(engine);
+
+        assert!(
+            !driver.screen_contains("Go to Definition"),
+            "MacBackend declares `native_menu: true` and `menu_style` \
+             defaults to `Inherit`, so the in-window context menu must not \
+             paint; painted text was {:?}",
+            driver.painted_texts()
+        );
+    }
+
+    /// #902: `menu_style = Custom` opts back into the in-window path even
+    /// on a backend that has a native one — the VS Code-parity escape
+    /// hatch (`window.menuStyle: custom`) this setting exists to mirror.
+    ///
+    /// RED against a body that ignores `menu_style` and always resolves
+    /// native on a capable backend: the in-window menu never paints even
+    /// with `Custom` explicitly set, and this assertion fails.
+    #[test]
+    fn custom_menu_style_still_paints_the_in_window_context_menu() {
+        let mut engine = plain_engine();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.settings.menu_style = crate::core::settings::MenuStyle::Custom;
+        engine.open_editor_context_menu(4, 4);
+
+        let (_guards, driver) = driver(engine);
+
+        assert!(
+            driver.screen_contains("Go to Definition"),
+            "menu_style = Custom must still paint the in-window context \
+             menu even though MacBackend has a native one; painted text \
+             was {:?}",
+            driver.painted_texts()
+        );
+    }
 }
