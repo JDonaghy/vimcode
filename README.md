@@ -17,7 +17,7 @@ Like Neovim, VimCode supports **Lua 5.4** for extensions — but with its own AP
 | Platform | GUI | TUI |
 |----------|-----|-----|
 | **Linux** | GTK4 + Cairo + Pango | ratatui + crossterm |
-| **macOS** | GTK4 via Homebrew | ratatui + crossterm |
+| **macOS** | Native AppKit + Core Graphics + Core Text, or GTK4 via Homebrew | ratatui + crossterm |
 | **Windows** | Native Win32 + Direct2D + DirectWrite (**alpha**) | ratatui + crossterm |
 
 ### Status — Beta
@@ -110,8 +110,9 @@ Download `vcd-windows-x86_64.exe` from the release page (rename to `vcd.exe` for
 
 ### Prerequisites
 
-some more test text
-The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windows GUI** is built separately with a Cargo feature flag.
+The default build produces the **GTK4 GUI** + **TUI** binary. The **native macOS**
+and **native Windows** GUIs are each built separately behind their own Cargo
+feature flag — neither is part of the default build, and neither needs GTK4.
 
 | Platform | GTK4 GUI deps |
 |---|---|
@@ -123,32 +124,77 @@ The default build produces the **GTK4 GUI** + **TUI** binary. The **native Windo
 
 **Platform notes:**
 - **TUI-only mode** (`--tui` or `-t`) works without GTK4 — only a terminal emulator is needed
+- **macOS native GUI** does not require GTK4; it uses AppKit + Core Graphics + Core Text directly (see below)
 - **Windows native GUI** does not require GTK4; it uses the Win32 API directly (see below)
 - **Nerd Font icons:** VimCode uses Nerd Font icons throughout the UI. **GTK mode** bundles a Nerd Font icon subset and works out of the box. **TUI mode** requires a [Nerd Font](https://www.nerdfonts.com/) (e.g. JetBrainsMono Nerd Font) as your terminal font. If your terminal font lacks Nerd Font glyphs, set `"use_nerd_fonts": false` in `settings.json` (or `:set nonerdfonts`) to switch all icons to ASCII/Unicode fallbacks.
 
 ### Build & run
 
+There are two binaries — `vimcode` (the app) and `vcd` (TUI only) — and no
+`default-run`, so **`--bin` is required on every `cargo run`**. A bare `cargo
+run` does not pick one for you; it fails with *"could not determine which
+binary to run"*.
+
 ```bash
-# Linux / macOS (GTK4 GUI + TUI)
+# Linux / macOS — GTK4 GUI + TUI (the default build)
 cargo build
-cargo run -- <file>                         # GTK window
-cargo run -- --tui <file>                   # Terminal UI (alias: -t)
-cargo run -- --tui --debug /tmp/v.log       # TUI with debug log
-cargo run -- --version                      # Print version and exit (alias: -V)
+cargo run --bin vimcode -- <file>                    # GTK window
+cargo run --bin vimcode -- --tui <file>              # Terminal UI (alias: -t)
+cargo run --bin vimcode -- --tui --debug /tmp/v.log  # TUI with debug log
+cargo run --bin vimcode -- --version                 # Version + backend (alias: -V)
+
+# macOS — Native GUI (AppKit + Core Graphics + Core Text, no GTK4 needed)
+cargo build --release --no-default-features --features macos --bin vimcode
+cargo run --release --no-default-features --features macos --bin vimcode -- <file>
 
 # Windows — Native GUI (Direct2D + DirectWrite, no GTK4 needed)
-cargo build --features win-gui --bin vimcode-win
-cargo run --features win-gui --bin vimcode-win
+cargo build --no-default-features --features win --bin vimcode
+cargo run --no-default-features --features win --bin vimcode -- <file>
 
-# Windows — TUI only (no GTK4 needed)
+# TUI only, any platform (no GTK4 needed)
 cargo build --no-default-features
-cargo run --no-default-features -- <file>
+cargo run --no-default-features --bin vcd -- <file>
 
 # Tests & linting
 cargo test -- --test-threads=1
 cargo clippy -- -D warnings
 cargo fmt
 ```
+
+#### Which backend am I actually running?
+
+The feature flags select the GUI backend **at compile time**, and picking the
+wrong combination does not error — it silently falls back to a different
+backend. `--version` prints which one is compiled in, so use it to confirm
+before concluding a GUI change "had no effect":
+
+```console
+$ cargo run --release --no-default-features --features macos --bin vimcode -- --version
+VimCode 0.10.0 (quadraui dbb3023a904d, macos)
+```
+
+The last field is the backend: `gtk`, `macos`, `win`, or `no-gui`.
+
+| You ran | Backend you get |
+|---|---|
+| `cargo run --bin vimcode` (on macOS) | `gtk` — **not** the native backend; `default = ["gui"]` |
+| `--no-default-features --features macos` (on macOS) | `macos` |
+| `--no-default-features --features win` (on Windows) | `win` |
+| `--no-default-features` alone | `no-gui` — falls back to the terminal UI |
+
+`macos` and `win` deliberately do **not** imply `gui`: the point is a native
+binary with no GTK4 anywhere in the dependency graph. If both are enabled the
+native backend wins, but that combination is untested and unsupported.
+
+> **macOS native currently needs `--release`.** A debug build aborts on its
+> first painted frame — `MacBackend::draw_tab_bar_icons` carries a
+> `debug_assert!` for an unimplemented tab-icon path, and it unwinds across
+> AppKit's Objective-C frame as `libc++abi: terminating due to uncaught foreign
+> exception`. `debug_assert!` is compiled out in release, which paints
+> icon-less tabs instead. Tracked upstream as
+> [quadraui#931](https://github.com/JDonaghy/quadraui/issues/931); drop this
+> note and the `--release` requirement once it lands. To run a debug build
+> before then, set `"use_nerd_fonts": false` in `settings.json`.
 
 ---
 
