@@ -5080,15 +5080,29 @@ mod command_center {
     /// band reservation API yet -- see the #710 comment on that call site),
     /// so the band is still an `lh` multiple; per this issue's acceptance
     /// criteria that means the useful assertion is "the pill height matches
-    /// the intended target at the default size", pinned with a tolerance
-    /// band around what this measures in the headless harness at the
-    /// chosen multiplier -- **34px band / 30px pill at the current `2.0`**
-    /// (#940 raised it from `1.7`, which measured only 29px here: 1px of
-    /// margin over macOS's ~28pt native titlebar height is not a safety
-    /// margin, it's a rounding error, and #940 adopts the client-side
-    /// titlebar specifically so this band shares its vertical space with
-    /// the real traffic-light cluster -- see the `shell_config` call site's
-    /// comment for the full analysis). The second assertion pins the
+    /// the intended target at the default size".
+    ///
+    /// **Because the band is an `lh` multiple, its pixel height is a
+    /// function of the host's font metrics and is NOT the same number on
+    /// every machine** -- it measures 34px where the headless harness
+    /// resolves `lh == 17.07` and 36px where it resolves `lh == 17.9`, and
+    /// pinning it to one machine's literal is what turned this test red on
+    /// the #940 test-stage host while it stayed green on the author's. So
+    /// the *discriminating* assertion here is the metric-independent one:
+    /// the band must be `with_title_bar`'s multiple of the line height the
+    /// frame actually painted with. The absolute px windows below are kept
+    /// as the VS-Code-parity sanity check, widened to span the `lh` spread
+    /// real hosts produce rather than one host's rounding.
+    ///
+    /// #940 raised the multiple from `1.7` to `2.0`: `1.7` measured 29px
+    /// here, and 1px of margin over macOS's ~28pt native titlebar height is
+    /// not a safety margin, it's a rounding error -- #940 adopts the
+    /// client-side titlebar specifically so this band shares its vertical
+    /// space with the real traffic-light cluster, hence the explicit
+    /// "clears macOS's titlebar" assertion below (see the `shell_config`
+    /// call site's comment for the full analysis).
+    ///
+    /// The last assertion pins the
     /// residual this doc note calls out: because the GTK runner paints the
     /// editor at a hardcoded font regardless of `settings.font_size` (see
     /// the sibling dropdown-font test's doc comment), the row height a
@@ -5102,6 +5116,9 @@ mod command_center {
         let mut h = harness(engine_with_tab_history(), 1400, 900);
         h.driver.render();
         let band = h.title_bar_rect.get().height;
+        let lh = h
+            .painted_line_height()
+            .expect("render_content must publish the painted line height") as f32;
         let layout = h
             .engine
             .borrow()
@@ -5115,16 +5132,42 @@ mod command_center {
             .height
             - 4.0;
 
+        // The regression guard, stated in the unit the knob is actually
+        // expressed in. `with_title_bar(1.0)` -- the pre-#710 bug -- makes
+        // this one line height, not two, and fails here on every host
+        // regardless of what that line height measures.
+        const TITLE_BAR_LH_MULTIPLE: f32 = 2.0;
         assert!(
-            (25.0..=35.0).contains(&band),
-            "title-bar band height should land near VS Code's 35px title \
-             bar (pre-#710 with_title_bar(1.0) measured ~18px here, one \
-             editor text line): got {band}px"
+            (band - TITLE_BAR_LH_MULTIPLE * lh).abs() <= 1.0,
+            "the title-bar band must be `with_title_bar({TITLE_BAR_LH_MULTIPLE})` \
+             line heights tall; this frame painted lh={lh}px, so the band should \
+             be ~{}px: got {band}px",
+            TITLE_BAR_LH_MULTIPLE * lh
+        );
+        // #940: the band shares its vertical space with macOS's native
+        // traffic-light cluster once the client-side titlebar is on, and the
+        // standard macOS titlebar is 28pt -- a band at or under that clips
+        // the controls this issue exists to keep intact. `1.7` measured 29px
+        // here (1px of margin); `2.0` measures 34-36px depending on the
+        // host's `lh`.
+        const MACOS_TITLEBAR_PT: f32 = 28.0;
+        const MIN_CLEARANCE_PX: f32 = 2.0;
+        assert!(
+            band >= MACOS_TITLEBAR_PT + MIN_CLEARANCE_PX,
+            "title-bar band must clear macOS's {MACOS_TITLEBAR_PT}pt native \
+             titlebar by at least {MIN_CLEARANCE_PX}px, not by rounding noise \
+             (#940): got {band}px at lh={lh}px"
         );
         assert!(
-            (22.0..=31.0).contains(&pill),
+            (28.0..=42.0).contains(&band),
+            "title-bar band height should land near VS Code's 35px title \
+             bar (pre-#710 with_title_bar(1.0) measured ~18px here, one \
+             editor text line): got {band}px at lh={lh}px"
+        );
+        assert!(
+            (24.0..=38.0).contains(&pill),
             "command-centre pill height should land near VS Code's ~26px \
-             pill (pre-#710 measured ~14px here): got {pill}px"
+             pill (pre-#710 measured ~14px here): got {pill}px at lh={lh}px"
         );
 
         // Stable across `settings.font_size` (see doc comment above for why
@@ -9548,17 +9591,38 @@ mod issue_857_titlebar_close_button {
     //! at.
     use super::*;
 
-    /// Presses then releases the left mouse button over the last-painted
-    /// window-control band's rightmost segment. The three controls
-    /// (minimize/maximize/close) paint left-to-right
-    /// (`render::window_controls_status_bar`'s `right_segments` order),
-    /// so landing a couple of pixels in from the band's right edge always
-    /// lands inside the close segment's padded `"  X  "` text regardless
-    /// of exact glyph width — this derives the click point from the last
-    /// *painted* `title_bar_rect` rather than a hardcoded pixel (CLAUDE.md's
-    /// "locate targets, never hardcode coordinates" rule), the same rect
-    /// `command_center_paints_between_menu_labels_and_window_controls`
-    /// above asserts against.
+    /// Presses then releases the left mouse button over the centre of the
+    /// close button **as it was actually painted** this frame — located by
+    /// searching the driver's painted-text log for the close segment's own
+    /// padded `"  ✕  "` label, built from the very
+    /// `crate::icons::WINDOW_CLOSE` constant
+    /// `render::window_controls_status_bar` paints with (CLAUDE.md's "locate
+    /// targets, never hardcode coordinates" rule — no glyph and no pixel is
+    /// restated here). The two spaces of padding on each side make the needle
+    /// unique: no other painted run in this fixture contains that string.
+    ///
+    /// This used to aim at `title_bar_rect`'s vertical *centre*, which is a
+    /// different point and — as of #940 — no longer on the button. The band
+    /// `title_bar_rect` describes is `ShellConfig::with_title_bar`'s
+    /// line-height multiple (`2.0`), but quadraui's `draw_status_bar` paints
+    /// a status bar exactly **one line height** tall anchored at the rect's
+    /// *top* edge, and `StatusBar::layout` gives its hit regions that same
+    /// one-line height — so the controls occupy only the band's top `lh`
+    /// pixels and the band's centre (`2.0 * lh / 2.0 == lh`) is the first row
+    /// *past* them. That made the old aim a coin flip decided by the host's
+    /// font metrics: it landed 0.07px inside the button where `lh == 17.07`
+    /// (band 34px) and outside it where `lh == 17.9` (band 36px), which is
+    /// exactly how this test passed on one machine and failed on another
+    /// with `Reaction::Redraw` instead of `Exit`. Aiming at painted content
+    /// is metric-independent.
+    ///
+    /// (The controls being top-anchored rather than centred inside the taller
+    /// band is cosmetic, pre-dates #940 — the band was already `1.7 * lh`, so
+    /// the controls already filled only its top ~59% — and is not fixable
+    /// from vimcode: the `line_height`-not-`rect.height` choice is inside
+    /// quadraui's own `GtkBackend::draw_status_bar`. Per the
+    /// Platform-Neutrality Rule that is a quadraui gap to file, not something
+    /// to paper over with backend code here.)
     ///
     /// Down+up (not `GtkDriver::click`, which is a bare press with no
     /// release) because `StatusBarInteraction` fires `Clicked` only on a
@@ -9571,8 +9635,22 @@ mod issue_857_titlebar_close_button {
             "window controls must have painted a non-degenerate rect \
              before a click can be aimed at them"
         );
-        let x = controls.x + controls.width - 2.0;
-        let y = controls.y + controls.height / 2.0;
+        let needle = format!("  {}  ", crate::icons::WINDOW_CLOSE.s());
+        let close = h.driver.find_bounds(&needle).unwrap_or_else(|| {
+            panic!(
+                "the inline titlebar close button must have painted its \
+                 {needle:?} label before a click can be aimed at it; painted \
+                 runs this frame: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        assert!(
+            close.x >= controls.x && close.x + close.width <= controls.x + controls.width + 0.5,
+            "sanity: the painted close label must sit inside the window-control \
+             band this frame; close={close:?} controls={controls:?}"
+        );
+        let x = close.x + close.width / 2.0;
+        let y = close.y + close.height / 2.0;
         h.driver.mouse_down(x, y);
         h.driver.mouse_up(x, y)
     }
