@@ -1277,11 +1277,43 @@ impl App {
         // the shell. `App::render_content` paints vimcode's own menu bar and
         // inline window controls into it, so a GUI backend that does not
         // reserve it loses the menu bar entirely. `height_lh` is a
-        // line-height *multiple* (no fixed-px reservation API exists yet);
-        // 1.7 measures ~31px, close to VS Code's 35px title bar.
+        // line-height *multiple* (no fixed-px reservation API exists yet).
+        //
+        // #940 raised this from `1.7` to `2.0`. `1.7` measured only ~29px in
+        // `gtk::testing::command_center`'s headless harness — a single
+        // pixel over the ~28pt macOS traffic-light cluster this band now
+        // shares space with (quadraui#947's client-side titlebar, opted
+        // into below), which is not a safety margin, it is rounding noise:
+        // any font metrics difference between that harness and a real
+        // window (different backend, different DPI/hinting) could put the
+        // band at or under 28px and collide with the native controls this
+        // issue exists to keep clip-free. `2.0` measures ~34px in the same
+        // harness — VS Code's own title bar is ~35px, so this is *closer*
+        // to VS Code parity than `1.7` was, not a compromise for it — and
+        // leaves ~6px of margin instead of ~1px.
+        //
+        // This is still not an absolute guarantee: `height_lh` is a
+        // *multiple* of the live line height, which tracks
+        // `settings.ui_font_size`/`settings.font_size` (both user-settable
+        // down to 6, see `core::settings`'s clamps), and is fixed once here
+        // at `ShellConfig`-construction time while `AppShell` recomputes the
+        // band's pixel height from the *current* line height every frame —
+        // there is no runtime hook to re-derive the multiple when the user
+        // later shrinks their font, and no fixed-pixel-floor knob on
+        // `ShellConfig::with_title_bar` to fall back to (unlike
+        // `with_activity_bar_width_px` below, which exists for exactly this
+        // reason on the activity bar). Concretely: a user who runs
+        // `:set font_size=6` at runtime can still shrink the band under
+        // macOS's real traffic-light height, and nothing in this file can
+        // stop that without quadraui growing a `with_title_bar_min_px`-style
+        // option (mirroring #657's activity-bar pattern) that this call
+        // site could opt into. That is a quadraui issue to file, not a
+        // vimcode-side fix (Platform-Neutrality Rule) — `2.0` closes the
+        // realistic gap at default and adjusted-but-still-reasonable font
+        // sizes; the pathological extreme remains open pending that API.
         let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
             .with_bottom_items(bottom_items)
-            .with_title_bar(1.7)
+            .with_title_bar(2.0)
             // #940/quadraui#947: opt into the client-side titlebar so a
             // capable backend (macOS today) puts the reserved band *in* the
             // real titlebar, beside the native traffic lights, instead of
@@ -7501,22 +7533,28 @@ impl quadraui::ShellApp for App {
             // own native controls already occupy. `Rect::default()` — the
             // trait default, and the only value GTK/Win-GUI/TUI ever return —
             // means "nothing of the backend's own is in this band", so
-            // `has_native_controls` is `false` and `leading_inset` is `0.0`
-            // there: every line below is then a no-op and this arm behaves
-            // exactly as it did before #940.
+            // `render::backend_draws_own_window_controls` is `false` and
+            // `leading_inset` is `0.0` there: every line below is then a
+            // no-op and this arm behaves exactly as it did before #940.
             let control_inset = backend.titlebar_control_inset();
-            let has_native_controls = control_inset.width > 0.0 || control_inset.height > 0.0;
             let leading_inset = control_inset.width.max(0.0);
-            let inset_menu_row_rect = quadraui::Rect::new(
-                menu_row_rect.x + leading_inset.min(menu_row_rect.width),
-                menu_row_rect.y,
-                (menu_row_rect.width - leading_inset).max(0.0),
-                menu_row_rect.height,
-            );
+            let inset_menu_row_rect =
+                render::inset_titlebar_row_leading_edge(menu_row_rect, leading_inset);
 
             let (real_icon_rect, real_items_rect) =
                 render::split_menu_row_for_app_icon(menu_row_rect, leading_inset);
             let (items_for_measure, bar_for_measure) = if presence.menu_row {
+                // `app_icon_rect` is only ever assigned here, so on macOS
+                // (where `presence.menu_row` is always `false` — #901, the
+                // AppKit system menu bar owns the drawn row) it never picks
+                // up a real value. That is fine today: its only reader
+                // (`FrameOp::MenuDropdown`'s `paint_title_bar_band`) is
+                // itself gated on `presence.menu_dropdown`, which stays
+                // coupled to `menu_bar_visible` and so is also always
+                // `false` on macOS — the app icon genuinely does not paint
+                // via this path there yet (pre-existing from #939/#901, not
+                // a #940 regression; the omnibar is the only thing #940
+                // actually offsets clear of the native controls).
                 app_icon_rect = real_icon_rect;
                 (real_items_rect, engine.menu_system.borrow().menu_bar())
             } else {
@@ -7538,8 +7576,11 @@ impl quadraui::ShellApp for App {
             // exactly the bug #940 exists to prevent (see the module doc's
             // "keeps the native traffic lights" section). `presence.menu_row`
             // still gates it the same way it always did on every other
-            // backend.
-            let draw_controls = presence.menu_row && !has_native_controls;
+            // backend. Pure decision extracted to
+            // `render::should_draw_window_controls` so it has a unit test
+            // independent of any backend/driver (see that function's tests).
+            let draw_controls =
+                render::should_draw_window_controls(presence.menu_row, control_inset);
             let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
             let controls_bar =
                 draw_controls.then(|| render::window_controls_status_bar(&theme, maximized));
