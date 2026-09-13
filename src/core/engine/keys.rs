@@ -9526,6 +9526,28 @@ impl Engine {
             return;
         }
 
+        // Settings panel search/edit input (#937 discovery, quadraui pin bump
+        // to 68f0ef9). Before that bump, TUI's own dispatch caught the raw
+        // `Ctrl+V` `KeyPressed` ahead of this function
+        // (`shell_app.rs::handle_key_pressed`'s `FocusKeyRoute::Settings`
+        // arm) and called `settings_paste` directly — this function never
+        // saw a settings-panel paste at all, so it never needed this branch.
+        // quadraui#813 moved Ctrl-V/Ctrl-Shift-V interception into the
+        // shared `runtime::preprocess_event` every backend's
+        // `dispatch_event` (TUI included, for the first time) now runs
+        // *before* `AppLogic::handle`, so the raw keypress no longer reaches
+        // that TUI-only arm — every Ctrl-V now arrives here as `route_paste`'s
+        // `text` argument instead, on every backend uniformly. Without this
+        // branch, a Settings-panel paste would fall through to the
+        // mode-based match below (whatever `self.mode` happens to be behind
+        // the panel) instead of the settings input the user is looking at.
+        // `settings_paste` already no-ops if neither settings state is
+        // active, so this mirrors `ai_has_focus` above exactly.
+        if self.settings_input_active || self.settings_editing.is_some() {
+            self.settings_paste(text);
+            return;
+        }
+
         match self.mode {
             Mode::Command | Mode::Search => {
                 self.paste_text_to_input(text);

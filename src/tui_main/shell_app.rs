@@ -1731,6 +1731,10 @@ impl ShellApp for TuiShellApp {
         self.engine.menu_bar_toggleable = true;
 
         render::sync_nerd_fonts(backend, &self.engine);
+        // (#937) No-op on TUI's fixed-cell backend (no font concept), but a
+        // shared platform-neutral call site — see
+        // `render::register_nerd_font_fallback`'s doc.
+        render::register_nerd_font_fallback(backend);
         render::register_panel_accelerators(backend, &self.engine.settings.panel_keys);
         self.engine
             .menu_system
@@ -10957,29 +10961,41 @@ mod tests {
     /// VisualBlock,Insert,Replace}` — `Mode::Command` fell into its `_ => {}`
     /// arm, so Ctrl+Shift+V while typing a `:command` silently did nothing
     /// but still consumed the keypress. `route_paste`'s `Mode::Command |
-    /// Mode::Search` arm pastes into the command-line buffer instead, so this
-    /// is RED against the pre-#760 code: the command line stays empty there.
+    /// Mode::Search` arm pastes into the command-line buffer instead.
+    ///
+    /// **Dispatched as `ClipboardPaste` directly, not a raw `KeyPressed`
+    /// (quadraui pin bump for #937, quadraui#813).** Before that bump, a raw
+    /// `Ctrl+Shift+V` `KeyPressed` reached `TuiShellApp::handle` unchanged
+    /// and this crate's own dispatch read `engine.clipboard_read` to
+    /// simulate paste content headlessly. quadraui#813 moved Ctrl-V/
+    /// Ctrl-Shift-V interception into the shared `runtime::preprocess_event`
+    /// every backend's `dispatch_event` (and so `TuiDriver::dispatch`) now
+    /// runs *before* `AppLogic::handle` — it reads the backend's real
+    /// clipboard service and redelivers the chord as `UiEvent::
+    /// ClipboardPaste(text)`, the same event `bracketed_paste_reaches_the_
+    /// buffer_via_shell_app` above already uses. The raw keypress this test
+    /// used to inject no longer reaches `TuiShellApp::handle` at all on a
+    /// real run, and `engine.clipboard_read` is never consulted for this
+    /// chord any more — dispatching the raw `KeyPressed` here would just
+    /// depend on whatever `TuiDriver`'s (headless, no real clipboard)
+    /// backend resolves, not on anything this test controls. Dispatching
+    /// `ClipboardPaste` directly is what actually reaches `TuiShellApp::
+    /// handle` in production too, so this keeps testing the real thing:
+    /// `route_paste`'s `Mode::Command` branch.
     #[test]
     fn ctrl_shift_v_pastes_into_the_command_line_via_shell_app() {
         let mut app = TuiShellApp::new(None);
         app.engine.mode = crate::core::Mode::Command;
-        app.engine.clipboard_read = Some(Box::new(|| Ok("ZQXW_SHIFT_PASTE_MARKER".to_string())));
         let mut driver = driver_with_shell(app, config(), 80, 24);
 
-        driver.dispatch(quadraui::UiEvent::KeyPressed {
-            key: quadraui::Key::Char('V'),
-            modifiers: quadraui::Modifiers {
-                ctrl: true,
-                shift: true,
-                ..quadraui::Modifiers::default()
-            },
-            repeat: false,
-        });
+        driver.dispatch(quadraui::UiEvent::ClipboardPaste(
+            "ZQXW_SHIFT_PASTE_MARKER".to_string(),
+        ));
         driver.render();
 
         assert!(
             driver.screen_contains(":ZQXW_SHIFT_PASTE_MARKER"),
-            "Ctrl+Shift+V must route through Engine::route_paste into the \
+            "ClipboardPaste must route through Engine::route_paste into the \
              command line; screen:\n{}",
             driver.screen()
         );

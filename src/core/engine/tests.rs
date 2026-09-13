@@ -21117,6 +21117,36 @@ fn test_explorer_rename_route_paste() {
     assert_eq!(rename.input, "pasted_name.rs");
 }
 
+/// #937 discovery (quadraui pin bump to 68f0ef9): the same #593 gap class as
+/// `test_explorer_rename_route_paste` above, found in the settings panel
+/// instead of explorer rename. Before the bump, TUI's own dispatch caught
+/// the raw `Ctrl+V` `KeyPressed` ahead of `route_paste`
+/// (`shell_app.rs::handle_key_pressed`'s `FocusKeyRoute::Settings` arm) and
+/// called `settings_paste` directly, so `route_paste` never needed a
+/// settings-panel arm — GTK had no equivalent raw-keypress fallback at all,
+/// meaning settings-panel paste-via-Ctrl+V was already silently broken on
+/// GTK the whole time (nothing else routes it through `settings_paste`).
+/// quadraui#813 moved Ctrl-V/Ctrl-Shift-V interception into the shared
+/// `runtime::preprocess_event` every backend's `dispatch_event` (TUI
+/// included, for the first time) now runs before `AppLogic::handle`, so the
+/// raw keypress no longer reaches TUI's arm either — every Ctrl-V now
+/// arrives as `route_paste`'s `text` argument, on every backend uniformly,
+/// which made this gap immediately observable (RED without `route_paste`'s
+/// `settings_input_active`/`settings_editing` branch: `settings_query`
+/// stays empty and the paste silently falls through to the mode-based
+/// dispatch at the bottom of `route_paste` instead).
+#[test]
+fn test_settings_panel_route_paste() {
+    let mut e = Engine::new();
+    e.settings_input_active = true;
+    e.route_paste("filter_text");
+    assert_eq!(
+        e.settings_query, "filter_text",
+        "route_paste must reach the settings search input while \
+         settings_input_active is set"
+    );
+}
+
 #[test]
 fn test_explorer_rename_ctrl_c_copies_selection() {
     use std::sync::{Arc, Mutex};

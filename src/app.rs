@@ -7096,6 +7096,12 @@ impl quadraui::ShellApp for App {
         // falling back to ASCII icons. (That arm had still never regained a
         // producer, so #732 deleted it; this call is the live replacement.)
         render::sync_nerd_fonts(backend, &self.engine.borrow());
+        // (#937) Register the bundled Nerd Font subset and point the
+        // backend's fallback cascade at it — required for glyphs to resolve
+        // at all on Core Text/DirectWrite backends (macOS/Win-GUI); see
+        // `render::register_nerd_font_fallback`'s doc for why this is a
+        // one-time `setup()` call, not part of the per-frame sync above.
+        render::register_nerd_font_fallback(backend);
 
         // Try to grab the runner-created GTK window now so minimize/maximize/
         // close work and the server-side WM titlebar is dropped in favour of
