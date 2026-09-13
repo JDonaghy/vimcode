@@ -2098,7 +2098,7 @@ dependencies = [
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=68f0ef9#68f0ef9075ad87ab5f0641beb3cb8f57c0ce4f9f"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=b6000c4#b6000c442d962e6df394ae5781438c32d6703f9f"
 dependencies = [
  "arboard",
  "core-foundation",
