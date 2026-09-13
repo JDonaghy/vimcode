@@ -10,6 +10,13 @@
 //! resolving these names unchanged; the one function that genuinely needs
 //! GTK (`build_editor_click_context`, which builds a `pango::Context`)
 //! stayed behind in `src/gtk/click.rs`.
+//!
+//! #937's quadraui pin bump deprecated `TabBarHits` (quadraui#823) that this
+//! file reads; migrating to its `TabBarLayout` replacement is an unrelated,
+//! cross-backend refactor deferred to a follow-up, so it's silenced here
+//! rather than left as a stray warning under `-D warnings`.
+#![allow(deprecated)]
+
 use crate::core::engine::EngineAction;
 use crate::core::window::GroupId;
 use crate::core::{Engine, WindowId};

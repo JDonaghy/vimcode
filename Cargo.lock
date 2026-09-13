@@ -528,6 +528,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.1",
+ "block2",
+ "libc",
  "objc2",
 ]
 
@@ -2096,12 +2098,14 @@ dependencies = [
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=dbb3023a904deaef3f0d01eeb99682c17674b684#dbb3023a904deaef3f0d01eeb99682c17674b684"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=68f0ef9#68f0ef9075ad87ab5f0641beb3cb8f57c0ce4f9f"
 dependencies = [
  "arboard",
  "core-foundation",
  "core-graphics",
  "core-text",
+ "dispatch2",
+ "foreign-types",
  "gtk4",
  "objc2",
  "objc2-app-kit",

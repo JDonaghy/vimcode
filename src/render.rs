@@ -10,7 +10,16 @@
 // Many public fields and methods are part of the rendering API consumed by the
 // Cairo backend and reserved for the future TUI backend; dead_code warnings
 // are expected for unused-in-this-binary items.
-#![allow(dead_code)]
+//
+// #937's mandatory quadraui pin bump (dbb3023 -> 68f0ef9, needed for
+// `register_font_from_memory`/`set_nerd_font_fallback`) newly deprecated
+// `Backend::draw_status_bar`/`draw_toolbar`/`draw_sidebar_panel` (quadraui#819)
+// and `TabBarHits`/`SyntaxSpan` (quadraui#822/#823) that this file still uses.
+// Migrating every call site to the `_interactive` hover/pressed API and the
+// new `TabBarLayout`/`MinimapSpan` shapes is an unrelated, cross-backend
+// refactor, not part of #937's nerd-font fix; tracked for follow-up instead
+// of bundled in here.
+#![allow(dead_code, deprecated)]
 
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;

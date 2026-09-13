@@ -60,6 +60,14 @@
 //! are exactly the parts that still need quadraui-side infrastructure (a
 //! backend-neutral window-chrome/file-watcher/file-picker surface) rather
 //! than new per-backend code — see `docs/IRREDUCIBLE_SURFACE.md`.
+//!
+//! #937's quadraui pin bump deprecated `Backend::draw_status_bar`
+//! (quadraui#819, replacement is `draw_status_bar_interactive`) that this
+//! file's status-bar paint calls still use; migrating them to the
+//! hover/pressed `InteractionState` API is an unrelated refactor deferred to
+//! a follow-up, so it's silenced here rather than left as a stray warning
+//! under `-D warnings`.
+#![allow(deprecated)]
 
 #[cfg(feature = "gui")]
 use gio::prelude::{FileExt, FileMonitorExt};
