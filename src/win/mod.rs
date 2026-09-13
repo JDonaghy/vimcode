@@ -121,3 +121,138 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     let config = app.shell_config();
     quadraui::win::shell_runner::run_with_shell(app, config)
 }
+
+// ── #928: `crate::harness::ConformanceHarness` on `WinDriver` ──────────────
+//
+// `quadraui::win::testing` (the module holding `WinDriver`/`driver_with_shell`)
+// is `#[cfg(target_os = "windows")]`-gated *inside* quadraui regardless of
+// `feature = "win"` alone (unlike `quadraui::win::backend`/`run`/`shell_runner`,
+// which this module's own doc explains are deliberately not target-gated so
+// `cargo check --features win` type-checks `WinBackend` on an ordinary Linux
+// host). So this test module has to carry the same double gate `src/macos/mod.rs`
+// uses for its own driver-tier tests — on any host but real Windows it simply
+// does not exist, proving nothing there (same posture, same reason).
+//
+// Bodies mirror `src/macos/mod.rs::mac_driver_tests::conformance_proof_slice`
+// exactly, `MacDriver`/`MacBackend` swapped for `WinDriver`/`WinBackend` — see
+// that module for the scenarios' own doc comments (RED-verification notes,
+// why scenario 3 clicks outside the popup rather than a specific row, …).
+#[cfg(target_os = "windows")]
+#[cfg(test)]
+mod win_driver_tests {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
+    use quadraui::win::testing::driver_with_shell;
+
+    use crate::app::TextMetricsBackend;
+    use crate::core::Engine;
+    use crate::harness::ConformanceHarness;
+
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+    }
+
+    fn conformance_harness(
+        engine: Engine,
+        width: u32,
+        height: u32,
+    ) -> ConformanceHarness<quadraui::win::testing::WinDriver<impl quadraui::AppLogic>> {
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+        let engine = Rc::new(RefCell::new(engine));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
+        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let driver = driver_with_shell(app, config, width, height);
+        ConformanceHarness::new(driver, engine, paint, cwd)
+    }
+
+    fn conformance_harness_with_folder_picker(
+        engine: Engine,
+        dir: PathBuf,
+        width: u32,
+        height: u32,
+    ) -> ConformanceHarness<quadraui::win::testing::WinDriver<impl quadraui::AppLogic>> {
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+        let engine = Rc::new(RefCell::new(engine));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
+        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        crate::harness::install_folder_picker(&app, dir);
+        let driver = driver_with_shell(app, config, width, height);
+        ConformanceHarness::new(driver, engine, paint, cwd)
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_928_win_conformance_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Scenario 1 (#928): open/filter/Esc-dismiss the folder picker via
+    /// `WinDriver` — the identical body `crate::gtk::testing`'s and
+    /// `src/macos/mod.rs`'s own copies run against `GtkDriver`/`MacDriver`.
+    #[test]
+    fn folder_picker_filters_and_escape_dismisses() {
+        let dir = scratch_dir("scenario1");
+        std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+        std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+        let mut h = conformance_harness_with_folder_picker(plain_engine(), dir.clone(), 1400, 900);
+
+        crate::harness::folder_picker_filters_and_escape_dismisses(
+            &mut h.driver,
+            "kkxxqq_distinctive_928",
+            "another_unrelated_dir_928",
+            "kkxxqq_distinctive_928",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scenario 2 (#928): the command palette's open/filter/Esc cycle, via
+    /// `WinDriver`.
+    #[test]
+    fn command_palette_filters_and_escape_dismisses() {
+        let mut h = conformance_harness(plain_engine(), 1400, 900);
+
+        crate::harness::command_palette_filters_and_escape_dismisses(&mut h.driver);
+    }
+
+    /// Scenario 3 (#928): a click outside the open folder picker's popup
+    /// must dismiss it, via `WinDriver::click`'s raw pixel-coordinate
+    /// dispatch.
+    #[test]
+    fn folder_picker_click_outside_dismisses_it() {
+        let dir = scratch_dir("scenario3");
+        std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+        std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+        let (width, height) = (1400.0, 900.0);
+        let mut h = conformance_harness_with_folder_picker(
+            plain_engine(),
+            dir.clone(),
+            width as u32,
+            height as u32,
+        );
+
+        crate::harness::folder_picker_click_outside_dismisses_it(
+            &mut h.driver,
+            "kkxxqq_distinctive_928",
+            "another_unrelated_dir_928",
+            width - 10.0,
+            height - 10.0,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

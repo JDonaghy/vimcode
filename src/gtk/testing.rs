@@ -496,6 +496,48 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     }
 }
 
+/// The `GtkDriver` instantiation of `crate::harness::ConformanceHarness`
+/// (#928) — alongside, not replacing, [`harness`]/[`Harness`] above.
+/// [`harness`] exposes ~20 GTK-only `Rc`-cloned fields for the existing
+/// 134-test suite; this constructor hands back only what
+/// `quadraui::testing::ConformanceDriver` needs, so a scenario written
+/// against it also runs unmodified on `MacDriver`/`WinDriver` — see
+/// `crate::harness`'s module doc for the full design and its proof slice.
+pub fn conformance_harness(
+    engine: Engine,
+    width: i32,
+    height: i32,
+) -> crate::harness::ConformanceHarness<GtkDriver<impl AppLogic>> {
+    let paint = crate::test_paint::PaintGuard::acquire();
+    let cwd = crate::test_cwd::CwdReadGuard::acquire();
+    let engine = Rc::new(RefCell::new(engine));
+    let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+        Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
+    let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    let driver = driver_with_shell(app, config, width, height);
+    crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
+}
+
+/// The same as [`conformance_harness`], but with `dir`'s shared
+/// folder/workspace picker (#815) already open on the returned driver's
+/// first painted frame — see `crate::harness::install_folder_picker`.
+pub fn conformance_harness_with_folder_picker(
+    engine: Engine,
+    dir: std::path::PathBuf,
+    width: i32,
+    height: i32,
+) -> crate::harness::ConformanceHarness<GtkDriver<impl AppLogic>> {
+    let paint = crate::test_paint::PaintGuard::acquire();
+    let cwd = crate::test_cwd::CwdReadGuard::acquire();
+    let engine = Rc::new(RefCell::new(engine));
+    let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+        Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
+    let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    crate::harness::install_folder_picker(&app, dir);
+    let driver = driver_with_shell(app, config, width, height);
+    crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
+}
+
 #[cfg(test)]
 mod tests {
     //! Per the #646 scope note: the harness above is the deliverable; tests are
@@ -9787,5 +9829,96 @@ mod engine_key_from_ui_gtk_tests {
              one character (col 1) — proving the ctrl flag reached \
              handle_vscode_key's word-level branch"
         );
+    }
+}
+
+// ── #928 proof slice: `crate::harness::ConformanceHarness` on `GtkDriver` ──
+//
+// Each scenario body lives in `crate::harness` and is written once
+// against `quadraui::testing::ConformanceDriver`; `src/macos/mod.rs`
+// runs the identical bodies against `MacDriver`. Directory names below
+// use disjoint character sets deliberately — see
+// `crate::harness::folder_picker_filters_and_escape_dismisses`'s doc
+// for why a query that could fuzzy-match both names would make the
+// "filtered out" assertion pass unconditionally.
+#[cfg(test)]
+mod conformance_proof_slice {
+    use super::{conformance_harness, conformance_harness_with_folder_picker};
+    use crate::core::Engine;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_928_gtk_conformance_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Scenario 1 (#928): open/filter/Esc-dismiss the folder picker via
+    /// `GtkDriver`.
+    ///
+    /// RED-verified: with `App::apply_folder_picker_event` (`src/app.rs`)
+    /// temporarily made an unconditional no-op (an early `return` before
+    /// its body), this test fails on the `screen_has(other)` assertion
+    /// right after `type_text` — the query never reaches
+    /// `FolderPickerController::handle`, so nothing gets filtered.
+    /// Reverted after confirming; see this issue's PR notes.
+    #[test]
+    fn folder_picker_filters_and_escape_dismisses() {
+        let dir = scratch_dir("scenario1");
+        std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+        std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+        let mut h =
+            conformance_harness_with_folder_picker(Engine::new_for_test(), dir.clone(), 800, 480);
+
+        crate::harness::folder_picker_filters_and_escape_dismisses(
+            &mut h.driver,
+            "kkxxqq_distinctive_928",
+            "another_unrelated_dir_928",
+            "kkxxqq_distinctive_928",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scenario 2 (#928): the command palette's own open/filter/Esc
+    /// cycle, via `GtkDriver` — no pre-seeded field, exercises the
+    /// `:CommandPalette` ex-command path live.
+    #[test]
+    fn command_palette_filters_and_escape_dismisses() {
+        let mut h = conformance_harness(Engine::new_for_test(), 800, 480);
+
+        crate::harness::command_palette_filters_and_escape_dismisses(&mut h.driver);
+    }
+
+    /// Scenario 3 (#928): a click outside the open folder picker's
+    /// popup must dismiss it, via `GtkDriver::click`'s raw
+    /// pixel-coordinate dispatch.
+    #[test]
+    fn folder_picker_click_outside_dismisses_it() {
+        let dir = scratch_dir("scenario3");
+        std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+        std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+        let (width, height) = (800.0, 480.0);
+        let mut h = conformance_harness_with_folder_picker(
+            Engine::new_for_test(),
+            dir.clone(),
+            width as i32,
+            height as i32,
+        );
+
+        crate::harness::folder_picker_click_outside_dismisses_it(
+            &mut h.driver,
+            "kkxxqq_distinctive_928",
+            "another_unrelated_dir_928",
+            width - 10.0,
+            height - 10.0,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
