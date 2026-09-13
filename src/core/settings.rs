@@ -25,6 +25,37 @@ pub enum EditorMode {
     Vscode,
 }
 
+/// How right-click context menus are presented — platform look-and-feel,
+/// **not** a keybinding paradigm (that's [`EditorMode`]; the two are
+/// orthogonal and must not be folded together).
+///
+/// Mirrors VS Code's `window.menuStyle` (v1.101), which the release notes
+/// describe as controlling "the menu style ... for context menus on
+/// macOS" specifically — the macOS menu *bar* is always native and has no
+/// such setting (see `native_menu`/`install_menu_bar`, vimcode#901); this
+/// setting only ever changes anything on a backend that advertises
+/// `quadraui::BackendCaps::native_menu` (macOS's `MacBackend` today). GTK
+/// and TUI report `native_menu: false`, so every variant here resolves to
+/// the same in-window `paint_context_menu_rung` path on those backends —
+/// see `render::context_menu_should_be_native`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MenuStyle {
+    /// Always use the backend's native context menu when it has one
+    /// (`BackendCaps::native_menu`); fall back to the in-window rasteriser
+    /// on a backend that doesn't (GTK, TUI never draw nothing).
+    Native,
+    /// Always paint the in-window `ContextMenuPanel`, even on a backend
+    /// that could show a native one.
+    Custom,
+    /// Follow the window's title-bar style, matching VS Code. vimcode has
+    /// no `titleBarStyle` setting yet, so until it does this resolves the
+    /// same as `Native` (capability-gated) — revisit this arm once
+    /// `titleBarStyle` exists.
+    #[default]
+    Inherit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LineNumberMode {
     #[default]
@@ -131,6 +162,13 @@ pub struct Settings {
     /// Editing mode: `vim` (modal) or `vscode` (always-insert).
     #[serde(default)]
     pub editor_mode: EditorMode,
+
+    /// How right-click context menus are presented (native OS popup vs.
+    /// the in-window rasteriser). See [`MenuStyle`] — orthogonal to
+    /// `editor_mode`, only observable on a backend with
+    /// `BackendCaps::native_menu` (macOS today).
+    #[serde(default)]
+    pub menu_style: MenuStyle,
 
     /// Single character used as the leader key prefix in normal mode.
     /// Default is Space (' '). Override in settings.json: { "leader": "\\" }
@@ -869,6 +907,7 @@ impl Default for Settings {
             panel_keys: PanelKeys::default(),
             completion_keys: CompletionKeys::default(),
             editor_mode: EditorMode::Vim,
+            menu_style: MenuStyle::Inherit,
             leader: default_leader(),
             wrap: false,
             spell: false,
@@ -1625,6 +1664,11 @@ impl Settings {
                 EditorMode::Vim => "vim".to_string(),
                 EditorMode::Vscode => "vscode".to_string(),
             },
+            "menu_style" => match self.menu_style {
+                MenuStyle::Native => "native".to_string(),
+                MenuStyle::Custom => "custom".to_string(),
+                MenuStyle::Inherit => "inherit".to_string(),
+            },
             "explorer_visible_on_startup" => self.explorer_visible_on_startup.to_string(),
             "autoread" => self.autoread.to_string(),
             "splitbelow" => self.splitbelow.to_string(),
@@ -1726,6 +1770,14 @@ impl Settings {
                     "vim" => EditorMode::Vim,
                     "vscode" => EditorMode::Vscode,
                     _ => return Err(format!("Unknown editor_mode: {value}")),
+                };
+            }
+            "menu_style" => {
+                self.menu_style = match value {
+                    "native" => MenuStyle::Native,
+                    "custom" => MenuStyle::Custom,
+                    "inherit" => MenuStyle::Inherit,
+                    _ => return Err(format!("Unknown menu_style: {value}")),
                 };
             }
             "explorer_visible_on_startup" => self.explorer_visible_on_startup = value == "true",
@@ -2105,6 +2157,15 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Vim (modal) or VSCode (always-insert) key bindings",
         category: "Workspace",
         setting_type: SettingType::Enum(&["vim", "vscode"]),
+    },
+    SettingDef {
+        key: "menu_style",
+        label: "Context Menu Style",
+        description: "Native OS context menu, the in-window one, or inherit \
+                       from the window style (only observable on a backend \
+                       with a native context menu, e.g. macOS)",
+        category: "Workspace",
+        setting_type: SettingType::Enum(&["native", "custom", "inherit"]),
     },
     SettingDef {
         key: "explorer_visible_on_startup",
@@ -3048,5 +3109,32 @@ mod tests {
         assert_eq!(s2.ctrl_f_action, Some("find".to_string()));
         assert_eq!(s2.auto_pairs, Some(true));
         assert_eq!(s2.completion_keys.accept, Some("<C-y>".to_string()));
+    }
+
+    /// #902: `menu_style` defaults to `Inherit`, matching VS Code's
+    /// `window.menuStyle` default.
+    #[test]
+    fn menu_style_defaults_to_inherit() {
+        assert_eq!(Settings::default().menu_style, MenuStyle::Inherit);
+    }
+
+    /// #902: `get_value_str`/`set_value_str` round-trip every `MenuStyle`
+    /// variant, the same contract every other `SETTING_DEFS` `Enum` entry
+    /// (e.g. `editor_mode`, `line_numbers`) already has to hold for the
+    /// Settings sidebar UI to read/write it.
+    #[test]
+    fn menu_style_round_trips_through_value_str() {
+        let mut s = Settings::default();
+        for (text, variant) in [
+            ("native", MenuStyle::Native),
+            ("custom", MenuStyle::Custom),
+            ("inherit", MenuStyle::Inherit),
+        ] {
+            s.set_value_str("menu_style", text).unwrap();
+            assert_eq!(s.menu_style, variant);
+            assert_eq!(s.get_value_str("menu_style"), text);
+        }
+
+        assert!(s.set_value_str("menu_style", "bogus").is_err());
     }
 }
