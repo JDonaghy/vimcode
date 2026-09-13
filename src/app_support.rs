@@ -276,6 +276,16 @@ pub(crate) fn open_url(url: &str) {
     crate::core::engine::open_url_in_browser(url);
 }
 
+/// The bundled Nerd Font icon subset (Symbols Nerd Font 3.5.1), embedded in
+/// the binary. Shared by [`install_bundled_icon_font_into`] (the fontconfig
+/// filesystem-install route #920 used, still needed on Linux/BSD) and
+/// `render::register_nerd_font_fallback` (#937's `Backend::
+/// register_font_from_memory` route, which makes the filesystem install
+/// redundant on macOS/Win-GUI — see that function's doc for why Core
+/// Text/DirectWrite need it in addition to `set_nerd_fonts`'s glyph-vs-
+/// fallback flag).
+pub(crate) static ICON_FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
+
 /// Install the bundled Nerd Font icon subset so the platform's text-shaping
 /// stack can resolve the Nerd Font glyphs without a user-installed Nerd Font.
 /// The font file is embedded in the binary via `include_bytes!` and only
@@ -322,21 +332,19 @@ fn icon_font_dest_dir(home: &std::path::Path) -> std::path::PathBuf {
 /// engine — see `src/test_cwd.rs`'s doc comment for the shape of trouble a
 /// process-wide env mutation causes under `cargo test`'s parallel threads).
 fn install_bundled_icon_font_into(fonts_dir: &std::path::Path) {
-    static FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
-
     let _ = std::fs::create_dir_all(fonts_dir);
     let dest = fonts_dir.join("vimcode-icons.ttf");
 
     // Skip write if the file already exists with the correct size.
     if dest.exists() {
         if let Ok(meta) = std::fs::metadata(&dest) {
-            if meta.len() == FONT_BYTES.len() as u64 {
+            if meta.len() == ICON_FONT_BYTES.len() as u64 {
                 return;
             }
         }
     }
 
-    if std::fs::write(&dest, FONT_BYTES).is_ok() {
+    if std::fs::write(&dest, ICON_FONT_BYTES).is_ok() {
         refresh_font_cache(fonts_dir);
     }
 }

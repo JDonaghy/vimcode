@@ -914,6 +914,50 @@ pub fn sync_nerd_fonts(b: &mut dyn quadraui::Backend, engine: &Engine) {
     b.set_nerd_fonts(engine.settings.use_nerd_fonts);
 }
 
+/// The family name the bundled Nerd Font icon subset (`ICON_FONT_BYTES`)
+/// registers under on every platform it's actually been checked against
+/// (GTK's own hardcoded fallback, `quadraui::gtk::NERD_FONT_FALLBACK_FAMILY`,
+/// is this same literal). Used as a fallback when
+/// `Backend::register_font_from_memory` reports failure for a reason other
+/// than "not a font" — see [`register_nerd_font_fallback`].
+const NERD_FONT_FALLBACK_FAMILY: &str = "Symbols Nerd Font";
+
+/// Register the bundled Nerd Font icon subset with the backend and point its
+/// fallback cascade at it, so Nerd-Font glyphs resolve instead of painting
+/// as tofu (#937).
+///
+/// `sync_nerd_fonts` above only ever toggles the glyph-vs-fallback *flag*
+/// (`Backend::set_nerd_fonts`) — it never tells a backend which font to
+/// resolve a glyph against. On GTK that's enough: fontconfig cascades to a
+/// system-installed Nerd Font automatically. It is not enough on macOS
+/// (Core Text) or Windows (DirectWrite): neither cascades to an arbitrary
+/// installed font for Private-Use-Area codepoints without an explicit
+/// per-font fallback list, which is exactly what
+/// `Backend::register_font_from_memory` +
+/// `Backend::set_nerd_font_fallback` install. Both are defaulted no-ops per
+/// quadraui's rule that the *app* must call them (quadraui#929) — GTK and
+/// TUI take the default harmlessly (GTK already has its own hardcoded
+/// fallback; TUI is a fixed-cell backend with no font concept), so this one
+/// call is platform-neutral: no `#[cfg(target_os)]` needed here or at either
+/// call site.
+///
+/// Call once, from `setup()` — **not** the per-frame
+/// `sync_nerd_fonts`/`sync_per_frame_backend_state` path. Unlike the
+/// nerd-fonts flag, there is no runtime setting to re-sync every frame, and
+/// on macOS a second `register_font_from_memory` call in the same process
+/// (e.g. a test harness constructing more than one `App`/backend) fails with
+/// "duplicate PostScript name already registered" — harmless here because a
+/// `None` falls back to [`NERD_FONT_FALLBACK_FAMILY`], the literal name the
+/// font is known to register under, so `set_nerd_font_fallback` still gets
+/// a usable family either way.
+pub fn register_nerd_font_fallback(b: &mut dyn quadraui::Backend) {
+    let family = b
+        .register_font_from_memory(crate::app_support::ICON_FONT_BYTES)
+        .and_then(|families| families.into_iter().next())
+        .unwrap_or_else(|| NERD_FONT_FALLBACK_FAMILY.to_string());
+    b.set_nerd_font_fallback(&family);
+}
+
 /// One tab bar ready to be painted via `Surface::TabBar` (GTK) or
 /// `render_tab_bar` (TUI).
 pub struct TabBarDrawTarget<'a> {

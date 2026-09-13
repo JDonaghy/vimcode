@@ -552,4 +552,63 @@ mod mac_driver_tests {
             driver.painted_texts()
         );
     }
+
+    // ── #937: Nerd-Font fallback registration ───────────────────────────
+
+    /// A plain engine with nerd fonts explicitly **on**. Every fixture above
+    /// (`plain_engine`, `engine_with_minimap`) deliberately sets it `false`
+    /// to dodge the #620 tab-icon `debug_assert!`, an already-documented,
+    /// unrelated macOS gap — which means no test in this file, before this
+    /// one, ever exercised the nerd-fonts-on paint path on `MacBackend` at
+    /// all.
+    fn engine_with_nerd_fonts_on() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.buffer_mut().insert(0, "fn main() {}\n");
+        engine.settings.use_nerd_fonts = true;
+        engine
+    }
+
+    /// #937: `App::setup` now calls `render::register_nerd_font_fallback`,
+    /// which registers the bundled Nerd Font subset with the backend and
+    /// points its glyph-fallback cascade at it
+    /// (`Backend::register_font_from_memory` + `Backend::
+    /// set_nerd_font_fallback`, quadraui#929) — the two methods this issue
+    /// is about ("app never calls register_font_from_memory/
+    /// set_nerd_font_fallback anywhere in src/").
+    ///
+    /// **What this test can and cannot prove.** It proves the first frame
+    /// completes — with activity bar / status bar icon glyphs actually on
+    /// the paint path — the moment nerd fonts are genuinely on, which no
+    /// other test in this file exercised before (see
+    /// `engine_with_nerd_fonts_on`'s doc). A broken
+    /// `register_nerd_font_fallback` call (e.g. bytes `MacBackend::
+    /// register_font_from_memory` can't parse, or a panic in the new call
+    /// itself) would surface here first.
+    ///
+    /// It does **not** prove the icon glyph actually resolves against the
+    /// registered Nerd Font rather than painting as a tofu box.
+    /// quadraui's own conformance suite documents that no black-box
+    /// vocabulary it exposes can observe that: `FrameInventory`'s painted
+    /// *text runs* record the same requested string regardless of which
+    /// font family Core Text resolved it against
+    /// (`tests/conformance.rs`'s `UNGATED_CAPS` entry for
+    /// `app_font_registration`), `Backend` is `sealed` so vimcode cannot
+    /// substitute a spying implementation, and `MacBackend`'s
+    /// `nerd_font_fallback_family`/`current_font` fields are private with no
+    /// public getter — nothing outside quadraui's own crate can read them.
+    /// Confirming the glyph itself paints correctly needs a human looking
+    /// at a real Mac's screen, or a future quadraui-side introspection API
+    /// added for exactly this; see this PR's notes.
+    #[test]
+    fn setup_with_nerd_fonts_on_registers_the_fallback_and_still_paints() {
+        let (_guards, driver) = driver(engine_with_nerd_fonts_on());
+
+        assert!(
+            driver.screen_contains("fn main"),
+            "the first frame must still complete and paint the buffer with \
+             nerd fonts on, exercising the new `register_nerd_font_fallback` \
+             call from `App::setup`; painted text was {:?}",
+            driver.painted_texts()
+        );
+    }
 }
