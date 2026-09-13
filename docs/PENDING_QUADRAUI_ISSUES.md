@@ -111,3 +111,60 @@ adoption, replacing `TabDragState` and the drop-zone code) is the
 remaining scope and depends on this. Leave #822 open behind this one, per
 `GOALS.md`'s milestone-discipline rule — do not close #822 on the first
 fix pass alone.
+
+---
+
+## `quadraui::win::testing` is hard `target_os = "windows"`-gated, not WinAPI-stubbed like `win::backend`/`run`/`shell_runner` (blocks vimcode#928 AC2)
+
+**Title:** `win::testing` needs the same `cfg(target_os = "windows")`-per-call
+stubbing as `win::backend`/`run`/`shell_runner`, not a module-level
+`target_os` gate
+
+**Body:**
+
+vimcode#928 adopts `quadraui::testing::ConformanceDriver` as a single
+backend-neutral black-box test harness and requires (acceptance criterion
+#2) that `cargo check --no-default-features --features win` type-check the
+`WinDriver` instantiation of that harness on an ordinary Linux host — the
+same posture `quadraui::win::backend`/`run`/`shell_runner` already have:
+gated on `feature = "win"` alone, with every real WinAPI call individually
+`cfg(target_os = "windows")`-gated internally and falling back to a stub
+everywhere else, specifically so a Linux CI runner can type-check
+`WinBackend` (see quadraui's own `ci.yml` "Compile check (win feature)"
+step, and `docs/RELEASING.md` §1.4 on the vimcode side, which documents
+this as the existing, working pattern).
+
+At the pinned rev (`dbb3023`), `quadraui/src/win/mod.rs:190-192` declares
+`pub mod testing;` — the module defining `WinDriver`/`driver_with_shell` —
+`#[cfg(target_os = "windows")]`-gated at the module level, with no
+internal WinAPI stubbing inside it the way `win::backend`/`run` have. That
+means the module (and everything in it) simply does not exist to the
+compiler off Windows; there is no `cargo check`/`cargo test --no-run`
+invocation on Linux that can even *see* `WinDriver`, let alone type-check
+code that constructs one.
+
+vimcode's own `src/win/mod.rs::win_driver_tests` module (added by #928) has
+to compound that with its own `#[cfg(target_os = "windows")]` (on top of
+`#[cfg(test)]`), so its `ConformanceHarness<WinDriver<...>>` instantiation
+is verified only on a real Windows host — never on the Linux fleet this
+project develops on day to day. That directly blocks #928's acceptance
+criterion #2, which is currently **unmet** and will stay unmet until this
+lands.
+
+**Ask:** gate `quadraui::win::testing` the same way `win::backend`/`run`/
+`shell_runner` are gated — `feature = "win"` alone, with `WinDriver`'s
+internals individually `cfg(target_os = "windows")`-stubbing their WinAPI
+calls (window creation, message loop, hit-testing surface) — so
+`cargo check --no-default-features --features win` (and
+`cargo check --tests` / `cargo test --no-run` with the same flags) type-checks
+`WinDriver`/`driver_with_shell`/`ConformanceHarness<WinDriver<...>>` on an
+ordinary Linux host, exactly as it already does for `WinBackend` itself.
+
+**Blocks:** `JDonaghy/vimcode#928` — acceptance criterion #2
+("`cargo check --no-default-features --features win` type-checks the Win
+instantiation on an ordinary Linux host") is unmet until this lands.
+`src/win/mod.rs::win_driver_tests` stays double-gated
+(`#[cfg(target_os = "windows")]` + `#[cfg(test)]`) in the interim — inert,
+and known to be inert, on every host but real Windows. Leave #928 open
+behind this one per `GOALS.md`'s milestone-discipline rule; do not treat
+the double gate as a workaround that closes the gap.
