@@ -586,30 +586,48 @@ mod mac_driver_tests {
     /// itself) would surface here first.
     ///
     /// It does **not** prove the icon glyph actually resolves against the
-    /// registered Nerd Font rather than painting as a tofu box, and this
-    /// doc previously cited a quadraui `UNGATED_CAPS` entry
-    /// (`app_font_registration`) as the reason — that citation was wrong
-    /// and has been removed. Checked directly against quadraui `68f0ef9`:
-    /// `BackendCaps`/`vocabulary()` has no font-registration capability of
-    /// any name, and `tests/conformance.rs`'s `UNGATED_CAPS` list (seven
-    /// entries: `native_menu`, `window_chrome`, `pointer_cursor`, `ime`,
-    /// `file_dialogs`, `native_dialogs`, `notifications`) does not mention
-    /// font registration either. No such capability exists to cite.
+    /// registered Nerd Font rather than painting as a tofu box. quadraui
+    /// reaches the same conclusion about its own conformance suite, and
+    /// says so in writing. Verified by reading the pinned rev's source
+    /// (`68f0ef9075ad87ab5f0641beb3cb8f57c0ce4f9f`, the full hash
+    /// `Cargo.lock` resolves for this branch):
     ///
-    /// The real reason this can't be tested black-box today: `FrameInventory`'s
-    /// painted *text runs* record the same requested string regardless of
-    /// which font family Core Text actually resolved it against, `Backend`
-    /// is `sealed` (verified in quadraui's `backend.rs`) so vimcode cannot
-    /// substitute a spying implementation, and `MacBackend`'s
-    /// `nerd_font_fallback_family`/`current_font` fields are private with no
-    /// public getter — nothing outside quadraui's own crate can read them.
-    /// This is an honest, unverified gap: confirming the glyph itself paints
-    /// correctly needs either a human looking at a real Mac's screen, or a
-    /// new quadraui-side introspection API (e.g. exposing which font family
-    /// a painted run actually resolved against) added for exactly this. No
-    /// such API exists yet in quadraui as of `68f0ef9` — a quadraui issue
-    /// requesting it should be filed as a follow-up rather than assumed to
-    /// already exist.
+    /// - `quadraui/src/backend.rs:359` — `BackendCaps` has a
+    ///   `pub app_font_registration: bool` field, and it is part of the
+    ///   `vocabulary()` name list (`backend.rs:484`).
+    /// - `quadraui/src/macos/backend.rs:1255` — `MacBackend` declares
+    ///   `app_font_registration: true`, with a dedicated test at
+    ///   `backend.rs:4072`
+    ///   (`mac_backend_declares_app_font_registration_capability`).
+    /// - `quadraui/quadraui/tests/conformance.rs:1105` — the crate-local
+    ///   `UNGATED_CAPS` array (nine entries, in
+    ///   `every_capability_is_required_by_some_scenario_or_named_as_unused`)
+    ///   lists `app_font_registration` with this reason: "declared by GTK
+    ///   (which already had a working fallback before #929 and overrides
+    ///   `set_nerd_font_fallback` for portability) plus macOS/Win-GUI,
+    ///   neither of which has a `ConformanceDriver` (#493) — and even GTK's
+    ///   own coverage would need per-glyph font-resolution inspection
+    ///   `FrameInventory` doesn't do (it records painted text runs, not
+    ///   which family resolved each character), so there is no headless
+    ///   assertion this suite's vocabulary can gate on".
+    ///
+    /// That last point is the same wall this test hits, for the same
+    /// reason: `FrameInventory`'s painted *text runs* record the requested
+    /// string, not the family each character resolved against. On top of
+    /// it, `Backend` is sealed (`backend.rs:494`, a `pub(crate) mod sealed`
+    /// supertrait) so vimcode cannot substitute a spying implementation,
+    /// and `MacBackend`'s `nerd_font_fallback_family` field
+    /// (`macos/backend.rs:166`) is private with no public getter — nothing
+    /// outside quadraui's own crate can read it.
+    ///
+    /// So this is an honest, unverified gap, independently corroborated by
+    /// quadraui's own reasoning above: confirming the glyph itself paints
+    /// correctly needs either a human looking at a real Mac's screen (see
+    /// this PR's smoke items), or a new quadraui-side introspection API
+    /// (e.g. exposing which font family a painted run actually resolved
+    /// against) added for exactly this. No such API exists at `68f0ef9` —
+    /// a quadraui issue requesting it should be filed as a follow-up
+    /// rather than assumed to already exist.
     ///
     /// **RED-verification honesty note.** This test's assertion
     /// (`screen_contains("fn main")`) does not depend on nerd-font
