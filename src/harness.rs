@@ -164,12 +164,18 @@ pub(crate) fn install_folder_picker(app: &App, dir: PathBuf) {
 /// this issue's scope — see `GOALS.md`), so this is new coverage for the
 /// GUI backends, not a duplicate of that test.
 ///
-/// `distinctive`/`other` must be two sibling directory names with no
-/// fuzzy-subsequence overlap (disjoint character sets is simplest — see
-/// the callers) so that filtering on `query` can only ever keep
-/// `distinctive`: a query that happened to also fuzzy-match `other` would
-/// make the "filtered out" assertion pass whether or not filtering
-/// actually ran.
+/// `distinctive`/`other` must be two sibling directory names such that a
+/// fuzzy-subsequence match of `query` (the full `distinctive` string)
+/// against `other` cannot succeed. **Not** "disjoint character sets" — the
+/// names the callers below use (`kkxxqq_distinctive_928` /
+/// `another_unrelated_dir_928`) share several characters (`d`, `i`, `t`,
+/// `n`, `e`, `_`, digits), and that's fine. What actually rules `other` out
+/// is that `distinctive` contains characters absent from `other` entirely
+/// (`k`, `x`, `q`): a subsequence match needs *every* character of `query`
+/// to appear, in order, somewhere in the candidate, so one query character
+/// with no match anywhere in `other` is enough to guarantee the miss. A
+/// query that happened to also fuzzy-match `other` would make the
+/// "filtered out" assertion pass whether or not filtering actually ran.
 pub fn folder_picker_filters_and_escape_dismisses<D: ConformanceDriver>(
     driver: &mut D,
     distinctive: &str,

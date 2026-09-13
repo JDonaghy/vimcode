@@ -290,9 +290,16 @@ mod mac_driver_tests {
         /// Scenario 1 (#928): open/filter/Esc-dismiss the folder picker via
         /// `MacDriver` — the identical body
         /// `crate::gtk::testing::conformance_proof_slice` runs against
-        /// `GtkDriver`; see that module's doc for the RED-verification note
-        /// (the same mutation to the pinned quadraui checkout takes both
-        /// backends' copies of this test red).
+        /// `GtkDriver`. RED-verified on real Mach-O hardware (an
+        /// `aarch64-apple-darwin` Mac mini, not inferred from the GTK
+        /// result): temporarily making `App::apply_folder_picker_event`
+        /// (`src/app.rs`) an unconditional no-op — the same vimcode-side
+        /// mutation `crate::gtk::testing::conformance_proof_slice`'s own doc
+        /// describes, since both backends drive that one shared dispatch
+        /// path — takes *this* test red too (fails on the `screen_has(other)`
+        /// assertion, same as the GTK copy), confirmed with
+        /// `cargo test --no-default-features --features macos` and reverted
+        /// after confirming; see this issue's PR notes.
         #[test]
         fn folder_picker_filters_and_escape_dismisses() {
             let dir = scratch_dir("scenario1");

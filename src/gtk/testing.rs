@@ -9837,14 +9837,28 @@ mod engine_key_from_ui_gtk_tests {
 // Each scenario body lives in `crate::harness` and is written once
 // against `quadraui::testing::ConformanceDriver`; `src/macos/mod.rs`
 // runs the identical bodies against `MacDriver`. Directory names below
-// use disjoint character sets deliberately — see
-// `crate::harness::folder_picker_filters_and_escape_dismisses`'s doc
-// for why a query that could fuzzy-match both names would make the
-// "filtered out" assertion pass unconditionally.
+// are picked so a fuzzy-subsequence match of the query against the other
+// name can't succeed (not "disjoint character sets" — the two names below
+// share several characters) — see
+// `crate::harness::folder_picker_filters_and_escape_dismisses`'s doc for
+// the actual rule and why a query that could fuzzy-match both names would
+// make the "filtered out" assertion pass unconditionally.
 #[cfg(test)]
 mod conformance_proof_slice {
     use super::{conformance_harness, conformance_harness_with_folder_picker};
     use crate::core::Engine;
+
+    /// Same nerd-fonts-off rationale as `src/macos/mod.rs`'s and
+    /// `src/win/mod.rs`'s own `plain_engine()` twins: icon glyphs are
+    /// normally separate painted runs from the text labels these scenarios'
+    /// `screen_has` checks look for, but keeping the three backends'
+    /// fixtures identical (rather than one relying on the default) is one
+    /// less thing to double-check when a scenario body moves between them.
+    fn plain_engine() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+    }
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -9871,8 +9885,7 @@ mod conformance_proof_slice {
         std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
         std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
 
-        let mut h =
-            conformance_harness_with_folder_picker(Engine::new_for_test(), dir.clone(), 800, 480);
+        let mut h = conformance_harness_with_folder_picker(plain_engine(), dir.clone(), 800, 480);
 
         crate::harness::folder_picker_filters_and_escape_dismisses(
             &mut h.driver,
@@ -9889,7 +9902,7 @@ mod conformance_proof_slice {
     /// `:CommandPalette` ex-command path live.
     #[test]
     fn command_palette_filters_and_escape_dismisses() {
-        let mut h = conformance_harness(Engine::new_for_test(), 800, 480);
+        let mut h = conformance_harness(plain_engine(), 800, 480);
 
         crate::harness::command_palette_filters_and_escape_dismisses(&mut h.driver);
     }
@@ -9905,7 +9918,7 @@ mod conformance_proof_slice {
 
         let (width, height) = (800.0, 480.0);
         let mut h = conformance_harness_with_folder_picker(
-            Engine::new_for_test(),
+            plain_engine(),
             dir.clone(),
             width as i32,
             height as i32,

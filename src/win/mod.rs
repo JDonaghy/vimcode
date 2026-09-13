@@ -133,10 +133,35 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
 // uses for its own driver-tier tests — on any host but real Windows it simply
 // does not exist, proving nothing there (same posture, same reason).
 //
+// **This is a known, currently-unmet acceptance criterion, not an oversight.**
+// #928's AC2 is "`cargo check --no-default-features --features win`
+// type-checks the Win [ConformanceHarness] instantiation on an ordinary Linux
+// host" — and as long as `quadraui::win::testing` is gated the way described
+// above, there is no `cargo check`/`cargo check --tests`/`cargo test --no-run`
+// invocation on Linux (or any non-Windows host) that reaches this module at
+// all, let alone type-checks the `ConformanceHarness<WinDriver<...>>`
+// instantiation inside it. The fix is a quadraui-side change — gate
+// `win::testing` on `feature = "win"` alone with internally
+// `cfg(target_os = "windows")`-stubbed WinAPI calls, the same treatment
+// `win::backend`/`run`/`shell_runner` already have — **not** a workaround
+// here. That gap is drafted, ready to file, in
+// `docs/PENDING_QUADRAUI_ISSUES.md` ("`quadraui::win::testing` is hard
+// `target_os = "windows"`-gated…", blocks vimcode#928 AC2); it is not filed
+// yet because filing GitHub issues is a coordinator/human action this
+// worker session cannot perform (`git`-only). AC2 stays unmet until that
+// lands — treat that as an open, disclosed gap, not a silently-passed
+// acceptance bar.
+//
 // Bodies mirror `src/macos/mod.rs::mac_driver_tests::conformance_proof_slice`
 // exactly, `MacDriver`/`MacBackend` swapped for `WinDriver`/`WinBackend` — see
 // that module for the scenarios' own doc comments (RED-verification notes,
 // why scenario 3 clicks outside the popup rather than a specific row, …).
+// RED-verification itself could not be run against `WinDriver` for the same
+// reason AC2 is unmet: there is no Windows host in this fleet and no way to
+// compile this module elsewhere. GTK and macOS were both RED-verified on
+// real hardware (a Linux lane and an `aarch64-apple-darwin` Mac mini
+// respectively) against the identical vimcode-side mutation — see
+// `src/macos/mod.rs`'s copy of this scenario for that note.
 #[cfg(target_os = "windows")]
 #[cfg(test)]
 mod win_driver_tests {
