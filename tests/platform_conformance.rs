@@ -47,6 +47,7 @@ fn run_script(args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
         "PLATCONF_CMD_MACOS",
         "PLATCONF_CMD_WIN",
         "PLATCONF_CMD_WIN_CHECKONLY",
+        "PLATCONF_TEST_FORCE_UNHANDLED_EXIT",
     ] {
         cmd.env_remove(var);
     }
@@ -92,6 +93,38 @@ fn zero_tests_executed_fails_the_lane_not_passes_it() {
     assert!(
         tui_line.contains("failed"),
         "0-test lane's matrix line should say failed: {tui_line}"
+    );
+}
+
+/// #933 cause 2: the script must not exit 0 if it terminates unexpectedly
+/// (a bash abort, a killing signal, a future bug that bypasses every
+/// intentional exit point) -- that is a *separate* defect from the zero-test
+/// vacuous-pass guard above, and needs its own guard (an EXIT trap that
+/// checks whether a real exit point was reached) rather than relying on the
+/// lane-result bookkeeping to happen to catch it.
+///
+/// This is exactly the shape of bug #933 reported on macOS: `declare -A`
+/// failed (bash 3.2 has no associative arrays), a later reference to the
+/// never-populated array tripped `set -u`, and the script died mid-run yet
+/// still reported exit code 0 -- zero lanes run, vacuously green. The
+/// `PLATCONF_TEST_FORCE_UNHANDLED_EXIT` hook reproduces "died mid-run with
+/// an underlying exit status of 0" deterministically on any host's bash,
+/// without needing an actual bash-3.2 install in CI.
+///
+/// THE RED-VERIFIED ASSERTION: with the `on_exit` trap / `finish` plumbing
+/// in `scripts/platform-conformance.sh` temporarily reverted to a bare
+/// `exit "$OVERALL_FAILURE"` (no trap), this test was re-run against the
+/// `PLATCONF_TEST_FORCE_UNHANDLED_EXIT=1` hook and observed to fail (exit
+/// code 0) before the trap was restored.
+#[test]
+fn unexpected_termination_forces_nonzero_exit() {
+    let (stdout, stderr, code) = run_script(
+        &["--print-plan"],
+        &[("PLATCONF_TEST_FORCE_UNHANDLED_EXIT", "1")],
+    );
+    assert_ne!(
+        code, 0,
+        "a script that dies mid-run must not exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 

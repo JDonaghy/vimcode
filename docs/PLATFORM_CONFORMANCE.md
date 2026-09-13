@@ -162,6 +162,41 @@ Four states, each meaning something different:
   `cargo-xwin` installed as a bare cross tool (no attached Windows host)
   reports this instead of silently claiming either `passed` or `skipped`.
 
+## Bash compatibility — target bash 3.2, not just "bash" (#933)
+
+The script's shebang is `#!/usr/bin/env bash`, but on macOS that resolves to
+**bash 3.2.57** — Apple has shipped that exact build since 2007 (frozen at the
+last GPLv2 release) and there is no newer bash on a stock Mac. Any bash-4+
+construct (`declare -A`, `mapfile`/`readarray`, namerefs, `;;&` case
+fallthrough, `**` globstar) silently breaks the very lane this script exists to
+run on macOS. #933 was exactly this: `declare -A FORCED=()` failed on 3.2,
+`set -u` then tripped on the never-populated array, and the script died
+mid-run while still reporting **exit 0** — zero lanes run, vacuously green,
+inside the tool built to prevent vacuous green.
+
+Two guards now cover this, and both are worth preserving in any future edit:
+
+- **No bash-4 syntax.** The forced-lane set is tracked as a space-delimited
+  string matched with a `case` glob (`is_forced()`), not an associative array.
+  If you need a new lookup table, reach for a `case` or a second parallel
+  indexed array before reaching for `declare -A`.
+- **An EXIT trap that cannot itself report a false green.** `finish()` is the
+  only way the script exits intentionally; it sets `SCRIPT_DONE=1` right
+  before calling `exit`. The `on_exit` trap fires on *every* termination and
+  forces a non-zero status if `SCRIPT_DONE` was never set — i.e. bash died out
+  from under the script (a parse error, a `set -u` abort, a signal) rather
+  than reaching a real exit point. This is deliberately independent of the
+  bash-3.2 fix: it's the general "this script's own exit code must never lie"
+  contract, so the *next* unanticipated bash bug is loud instead of silently
+  green. `PLATCONF_TEST_FORCE_UNHANDLED_EXIT=1` is a test-only hook that
+  exercises this deterministically without needing a real crash.
+
+No CI job here runs the script on a Mac (see #933's provenance note — there is
+no `capability_rules` entry routing `scripts/` to a `macos`-capable machine;
+that's a `coordinator.yml` change filed separately, not in this repo). Anyone
+editing this script should sanity-check unfamiliar bash constructs against
+3.2 by hand, since nothing will catch a regression here automatically.
+
 ## Out of scope — follow-ups, not attempted here
 
 - **Growing the shared scenario table.** A green conformance run today proves

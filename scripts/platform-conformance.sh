@@ -64,9 +64,43 @@
 #       that lane's full tier (TUI, GTK, MACOS, WIN).
 #   PLATCONF_CMD_WIN_CHECKONLY="<shell command>" replaces the win check-only
 #       tier's command specifically.
+#   PLATCONF_TEST_FORCE_UNHANDLED_EXIT=1         exits 0 immediately, bypassing
+#       `finish`, to prove the EXIT trap forces failure on any termination
+#       that didn't go through a real exit point (#933).
 # <LANE> is the upper-cased lane name (TUI, GTK, MACOS, WIN).
 
 set -uo pipefail
+
+# #933: this script's entire contract is "a lane that didn't run is a
+# failure, not a silent pass" -- so it must never itself terminate with
+# status 0 by accident. Route every intentional exit through `finish` so
+# `SCRIPT_DONE` is set right before it; the EXIT trap below then knows the
+# difference between "we reached a real exit point" and "bash died out from
+# under us" (a parse error, an unbound-variable abort under `set -u`, a
+# killing signal, ...) and forces the latter non-zero even if the aborting
+# command's own status happened to be 0.
+SCRIPT_DONE=0
+finish() {
+    SCRIPT_DONE=1
+    exit "${1:-0}"
+}
+on_exit() {
+    local status=$?
+    if [ "$SCRIPT_DONE" -ne 1 ]; then
+        echo "error: ${BASH_SOURCE[0]}: terminated unexpectedly before completing (status $status) -- forcing failure (#933)" >&2
+        exit 1
+    fi
+}
+trap on_exit EXIT
+
+if [ -n "${PLATCONF_TEST_FORCE_UNHANDLED_EXIT:-}" ]; then
+    # Test-only hook (tests/platform_conformance.rs): simulate a bash abort
+    # or an accidental bare `exit 0` that terminates the script without
+    # going through `finish`, so the EXIT trap's guard (#933) can be
+    # exercised deterministically on any host's bash, without needing to
+    # reproduce an actual bash-3.2 crash in every CI environment.
+    exit 0
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -76,8 +110,18 @@ usage() {
 }
 
 LANE_ORDER=(tui gtk macos win)
-declare -A FORCED=()
+# Bash 3.2 (stock macOS, frozen at the last GPLv2 release) has no associative
+# arrays -- `declare -A` needs bash 4.0. Track the forced-lane set as a
+# space-delimited string instead, matched with a `case` glob (#933).
+FORCED_LANES=""
 PRINT_PLAN=0
+
+is_forced() {
+    case " $FORCED_LANES " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -85,7 +129,7 @@ while [ $# -gt 0 ]; do
             name="${2:-}"
             if [ -z "$name" ]; then
                 echo "error: --lane requires an argument" >&2
-                exit 2
+                finish 2
             fi
             valid=0
             for l in "${LANE_ORDER[@]}"; do
@@ -93,26 +137,26 @@ while [ $# -gt 0 ]; do
             done
             if [ "$valid" -eq 0 ]; then
                 echo "error: unknown lane '$name' (known lanes: ${LANE_ORDER[*]})" >&2
-                exit 2
+                finish 2
             fi
-            FORCED["$name"]=1
+            FORCED_LANES="$FORCED_LANES $name"
             shift 2
             ;;
         --print-plan) PRINT_PLAN=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        -h|--help) usage; finish 0 ;;
+        *) echo "error: unknown argument: $1" >&2; usage >&2; finish 2 ;;
     esac
 done
 
 SCOPE=()
-if [ "${#FORCED[@]}" -gt 0 ]; then
+if [ -n "$FORCED_LANES" ]; then
     for l in "${LANE_ORDER[@]}"; do
-        [ -n "${FORCED[$l]:-}" ] && SCOPE+=("$l")
+        is_forced "$l" && SCOPE+=("$l")
     done
 else
     SCOPE=("${LANE_ORDER[@]}")
 fi
-FORCE_MODE=$([ "${#FORCED[@]}" -gt 0 ] && echo 1 || echo 0)
+FORCE_MODE=$([ -n "$FORCED_LANES" ] && echo 1 || echo 0)
 
 # --- probing -----------------------------------------------------------
 
@@ -270,7 +314,7 @@ run_lane() {
     probe_lane "$lane"
     local capable="$CAPABLE" auto="$AUTO" reason="$REASON" tier="$TIER"
     local forced=0
-    [ -n "${FORCED[$lane]:-}" ] && forced=1
+    is_forced "$lane" && forced=1
 
     if [ "$capable" -ne 1 ]; then
         if [ "$forced" -eq 1 ]; then
@@ -366,4 +410,4 @@ if [ "$FORCE_MODE" -eq 1 ]; then
     echo "(forced lane subset: ${SCOPE[*]} -- lanes outside this set were not probed)"
 fi
 
-exit "$OVERALL_FAILURE"
+finish "$OVERALL_FAILURE"
