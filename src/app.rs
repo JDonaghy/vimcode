@@ -1282,6 +1282,17 @@ impl App {
         let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
             .with_bottom_items(bottom_items)
             .with_title_bar(1.7)
+            // #940/quadraui#947: opt into the client-side titlebar so a
+            // capable backend (macOS today) puts the reserved band *in* the
+            // real titlebar, beside the native traffic lights, instead of
+            // underneath it. Requested unconditionally rather than gated on
+            // `target_os = "macos"` (the Platform-Neutrality Rule) — GTK and
+            // Win-GUI simply don't honour this field yet
+            // (`ShellConfig::client_side_titlebar`'s own doc, and
+            // `ACCEPTED_DEFAULTS` in quadraui's `tests/conformance/caps.rs`),
+            // so setting it there is inert today and each backend adopts it
+            // on its own schedule with no vimcode-side change needed.
+            .with_client_side_titlebar()
             // #719/quadraui#657: the activity bar's row height is the fixed
             // `ACTIVITY_ROW_PX = 48.0` (VS Code parity), so sizing its
             // *width* from the editor font makes it oblong. Pin to 48px.
@@ -7483,15 +7494,34 @@ impl quadraui::ShellApp for App {
         // itself still coupled to `menu_bar_visible` — so this does not
         // resurrect drawn window controls under AppKit's own traffic lights.
         if presence.command_center {
+            // #940: a client-side-titlebar-capable backend (macOS's
+            // `MacBackend`, which honours `ShellConfig::client_side_titlebar`
+            // as of quadraui#947 — requested unconditionally in
+            // `shell_config`) reports how much of the band's leading edge its
+            // own native controls already occupy. `Rect::default()` — the
+            // trait default, and the only value GTK/Win-GUI/TUI ever return —
+            // means "nothing of the backend's own is in this band", so
+            // `has_native_controls` is `false` and `leading_inset` is `0.0`
+            // there: every line below is then a no-op and this arm behaves
+            // exactly as it did before #940.
+            let control_inset = backend.titlebar_control_inset();
+            let has_native_controls = control_inset.width > 0.0 || control_inset.height > 0.0;
+            let leading_inset = control_inset.width.max(0.0);
+            let inset_menu_row_rect = quadraui::Rect::new(
+                menu_row_rect.x + leading_inset.min(menu_row_rect.width),
+                menu_row_rect.y,
+                (menu_row_rect.width - leading_inset).max(0.0),
+                menu_row_rect.height,
+            );
+
             let (real_icon_rect, real_items_rect) =
-                render::split_menu_row_for_app_icon(menu_row_rect);
+                render::split_menu_row_for_app_icon(menu_row_rect, leading_inset);
             let (items_for_measure, bar_for_measure) = if presence.menu_row {
                 app_icon_rect = real_icon_rect;
-                menu_items_rect = real_items_rect;
                 (real_items_rect, engine.menu_system.borrow().menu_bar())
             } else {
                 (
-                    menu_row_rect,
+                    inset_menu_row_rect,
                     quadraui::MenuBar {
                         id: quadraui::WidgetId::new("native_menu_row_suppressed"),
                         items: Vec::new(),
@@ -7500,12 +7530,19 @@ impl quadraui::ShellApp for App {
                     },
                 )
             };
+            menu_items_rect = items_for_measure;
             self.menu_items_rect.set(menu_items_rect);
 
+            // A backend that draws its own controls must never *also* get
+            // vimcode's drawn `controls_bar` — two sets of window controls is
+            // exactly the bug #940 exists to prevent (see the module doc's
+            // "keeps the native traffic lights" section). `presence.menu_row`
+            // still gates it the same way it always did on every other
+            // backend.
+            let draw_controls = presence.menu_row && !has_native_controls;
             let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
-            let controls_bar = presence
-                .menu_row
-                .then(|| render::window_controls_status_bar(&theme, maximized));
+            let controls_bar =
+                draw_controls.then(|| render::window_controls_status_bar(&theme, maximized));
             let bands = render::measure_title_bar_bands(
                 backend,
                 menu_row_rect,
@@ -7514,7 +7551,7 @@ impl quadraui::ShellApp for App {
                 controls_bar.as_ref(),
             );
             self.title_bar_rect.set(bands.controls);
-            controls_rect = presence.menu_row.then_some(bands.controls);
+            controls_rect = draw_controls.then_some(bands.controls);
             command_center_rect = Some(bands.command_center);
         }
 
@@ -8040,6 +8077,19 @@ mod portable_entry_point_tests {
         assert!(
             cfg.has_title_bar && cfg.title_bar_height_lh > 1.0,
             "title-bar band not reserved: render_content paints the menu bar into it"
+        );
+        // #940: the opt-in itself must reach the runner — a capable backend
+        // (macOS's `MacBackend`) reads this flag to fold the reserved band
+        // into the real titlebar instead of reserving space underneath it.
+        // GTK/Win-GUI don't honour it yet (see the call site's comment in
+        // `shell_config`), so setting it here is inert on them today, but
+        // that is exactly why this must be a plain, unconditional assertion
+        // rather than one gated on `target_os` — the Platform-Neutrality
+        // Rule means `shell_config` cannot special-case macOS to set it.
+        assert!(
+            cfg.client_side_titlebar,
+            "shell_config must opt into the client-side titlebar (quadraui#947) \
+             unconditionally, not behind a target_os gate"
         );
         assert_eq!(cfg.min_sidebar_width, render::ALT_SIDEBAR_WIDTH_MIN as f32);
         assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);

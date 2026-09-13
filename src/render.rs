@@ -20696,38 +20696,51 @@ pub fn menu_bar_app_icon_slot_width_px(menu_row_height: f32) -> f32 {
 /// `icon_rect` is a square inset vertically inside the slot by
 /// [`APP_ICON_INSET_FRACTION`], horizontally centred in the reserved slot.
 ///
+/// `leading_inset` (#940) shifts where the band effectively *starts*,
+/// without moving its trailing edge — the region
+/// [`quadraui::Backend::titlebar_control_inset`] reports as occupied by the
+/// backend's own drawn controls (macOS's native traffic lights, floating
+/// over the leading edge of the client-side titlebar; see
+/// [`quadraui::shell::ShellConfig::client_side_titlebar`]'s doc for why a
+/// non-empty inset there means "AppKit owns these pixels", not "the app must
+/// draw here"). `0.0` on every backend before #940, and on GTK/Win-GUI
+/// forever until they grow the same opt-in — `Backend::titlebar_control_inset`
+/// defaults to `Rect::default()` there. Clamped to `menu_row_rect.width` so a
+/// pathologically large inset cannot produce a negative-width row.
+///
 /// A zero/negative-height row (menu bar hidden) yields an empty icon rect and
-/// an unchanged items rect, so callers can split unconditionally.
+/// an unchanged (inset-adjusted) items rect, so callers can split
+/// unconditionally.
 pub fn split_menu_row_for_app_icon(
     menu_row_rect: quadraui::Rect,
+    leading_inset: f32,
 ) -> (quadraui::Rect, quadraui::Rect) {
-    let slot = menu_bar_app_icon_slot_width_px(menu_row_rect.height).min(menu_row_rect.width);
+    let leading_inset = leading_inset.max(0.0).min(menu_row_rect.width);
+    let row = quadraui::Rect::new(
+        menu_row_rect.x + leading_inset,
+        menu_row_rect.y,
+        (menu_row_rect.width - leading_inset).max(0.0),
+        menu_row_rect.height,
+    );
+    let slot = menu_bar_app_icon_slot_width_px(row.height).min(row.width);
     if slot <= 0.0 {
-        return (
-            quadraui::Rect::new(menu_row_rect.x, menu_row_rect.y, 0.0, 0.0),
-            menu_row_rect,
-        );
+        return (quadraui::Rect::new(row.x, row.y, 0.0, 0.0), row);
     }
-    let inset = menu_row_rect.height * APP_ICON_INSET_FRACTION;
+    let inset = row.height * APP_ICON_INSET_FRACTION;
     // Clamp to `slot`: `slot = height.min(width)`, so in the pathological
     // case of a row narrower than it is tall, an unclamped `side` (derived
     // from height alone) could extend past `items`' left edge. Not
     // reachable with any real window -- row height is always far smaller
     // than window width -- but keeping the icon inside its own reserved
     // slot is a one-line invariant worth holding regardless (#720 review).
-    let side = (menu_row_rect.height - 2.0 * inset).max(1.0).min(slot);
+    let side = (row.height - 2.0 * inset).max(1.0).min(slot);
     let icon = quadraui::Rect::new(
-        menu_row_rect.x + ((slot - side) / 2.0).max(0.0),
-        menu_row_rect.y + inset,
+        row.x + ((slot - side) / 2.0).max(0.0),
+        row.y + inset,
         side,
         side,
     );
-    let items = quadraui::Rect::new(
-        menu_row_rect.x + slot,
-        menu_row_rect.y,
-        (menu_row_rect.width - slot).max(0.0),
-        menu_row_rect.height,
-    );
+    let items = quadraui::Rect::new(row.x + slot, row.y, (row.width - slot).max(0.0), row.height);
     (icon, items)
 }
 
@@ -26218,7 +26231,7 @@ mod tests {
     #[test]
     fn app_icon_slot_shifts_menu_items_by_exactly_its_width() {
         let row = quadraui::Rect::new(10.0, 5.0, 800.0, 30.0);
-        let (icon, items) = split_menu_row_for_app_icon(row);
+        let (icon, items) = split_menu_row_for_app_icon(row, 0.0);
         let slot = menu_bar_app_icon_slot_width_px(row.height);
 
         assert_eq!(slot, 30.0, "the slot is the row height, making it square");
@@ -26238,8 +26251,8 @@ mod tests {
     /// applied to the activity bar's width.
     #[test]
     fn app_icon_size_tracks_row_height_only() {
-        let short = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0)).0;
-        let tall = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 800.0, 48.0)).0;
+        let short = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 800.0, 24.0), 0.0).0;
+        let tall = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 800.0, 48.0), 0.0).0;
         assert!(tall.height > short.height);
         // Square, and strictly inside the row on both edges.
         for (icon, h) in [(short, 24.0_f32), (tall, 48.0_f32)] {
@@ -26254,7 +26267,7 @@ mod tests {
             );
         }
         // Widening the row (a wider window) must not change the icon at all.
-        let wide = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 4000.0, 24.0)).0;
+        let wide = split_menu_row_for_app_icon(quadraui::Rect::new(0.0, 0.0, 4000.0, 24.0), 0.0).0;
         assert_eq!(wide, short);
     }
 
@@ -26263,7 +26276,7 @@ mod tests {
     #[test]
     fn zero_height_menu_row_reserves_no_icon_slot() {
         let row = quadraui::Rect::new(0.0, 0.0, 800.0, 0.0);
-        let (icon, items) = split_menu_row_for_app_icon(row);
+        let (icon, items) = split_menu_row_for_app_icon(row, 0.0);
         assert_eq!(menu_bar_app_icon_slot_width_px(row.height), 0.0);
         assert_eq!(icon.width, 0.0);
         assert_eq!(icon.height, 0.0);
@@ -26275,7 +26288,7 @@ mod tests {
     #[test]
     fn menu_row_narrower_than_the_icon_slot_clamps_to_zero_width_items() {
         let row = quadraui::Rect::new(0.0, 0.0, 8.0, 30.0);
-        let (_, items) = split_menu_row_for_app_icon(row);
+        let (_, items) = split_menu_row_for_app_icon(row, 0.0);
         assert!(items.width >= 0.0, "got {items:?}");
         assert_eq!(items.width, 0.0);
     }
@@ -26289,7 +26302,7 @@ mod tests {
     #[test]
     fn menu_row_narrower_than_the_icon_slot_keeps_the_icon_inside_the_slot() {
         let row = quadraui::Rect::new(0.0, 0.0, 8.0, 30.0);
-        let (icon, items) = split_menu_row_for_app_icon(row);
+        let (icon, items) = split_menu_row_for_app_icon(row, 0.0);
         let slot = menu_bar_app_icon_slot_width_px(row.height).min(row.width);
         assert!(
             icon.x + icon.width <= row.x + slot,
@@ -26300,6 +26313,62 @@ mod tests {
             icon.x + icon.width <= items.x,
             "icon must not extend into the items rect; icon={icon:?} items={items:?}"
         );
+    }
+
+    // ── Client-side titlebar leading-edge inset (#940) ──────────────────
+
+    /// A non-zero `leading_inset` (what `Backend::titlebar_control_inset`
+    /// reports on a capable backend, e.g. macOS's native traffic lights)
+    /// must push both the icon and the items strip clear of it, without
+    /// moving the band's trailing edge.
+    ///
+    /// RED against the pre-#940 signature (no `leading_inset` parameter at
+    /// all — every caller started the icon flush with `menu_row_rect.x`
+    /// regardless of a reported control inset, which is exactly the "app
+    /// icon collides with the traffic lights" bug this issue exists to
+    /// prevent). With the parameter threaded through but ignored (e.g. a
+    /// stub `let _ = leading_inset;`), this assertion fails because `icon.x`
+    /// would still equal `row.x` instead of `row.x + inset`.
+    #[test]
+    fn leading_inset_pushes_icon_and_items_clear_of_native_controls() {
+        let row = quadraui::Rect::new(10.0, 5.0, 800.0, 30.0);
+        let inset = 78.0; // roughly macOS's traffic-light cluster width
+        let (icon, items) = split_menu_row_for_app_icon(row, inset);
+        let (icon_uninset, _) = split_menu_row_for_app_icon(row, 0.0);
+
+        assert_eq!(
+            icon.x,
+            icon_uninset.x + inset,
+            "the icon must be shifted exactly `inset` past where it would \
+             otherwise sit"
+        );
+        assert_eq!(
+            icon.width, icon_uninset.width,
+            "the inset shifts the icon, it must not resize it"
+        );
+        assert!(
+            items.x >= icon.x + icon.width,
+            "items must not overlap the icon; items={items:?} icon={icon:?}"
+        );
+        assert_eq!(
+            items.x + items.width,
+            row.x + row.width,
+            "the trailing edge of the band must not move — only the leading \
+             edge is inset"
+        );
+    }
+
+    /// An inset wider than the whole row must clamp to an empty band rather
+    /// than produce a negative-width rect (which would panic or wrap
+    /// downstream in `MenuBar::layout`, the same hazard
+    /// `menu_row_narrower_than_the_icon_slot_clamps_to_zero_width_items`
+    /// guards against for the icon-slot width alone).
+    #[test]
+    fn leading_inset_wider_than_the_row_clamps_to_an_empty_band() {
+        let row = quadraui::Rect::new(0.0, 0.0, 50.0, 30.0);
+        let (icon, items) = split_menu_row_for_app_icon(row, 500.0);
+        assert!(icon.width >= 0.0 && items.width >= 0.0);
+        assert_eq!(items.width, 0.0);
     }
 
     /// The icon painted in the menu row and the icon installed into the
