@@ -6386,7 +6386,10 @@ mod app_icon {
             row.width > 0.0 && row.height > 0.0,
             "the menu row must have been laid out by the last frame; got {row:?}"
         );
-        crate::render::split_menu_row_for_app_icon(row).0
+        // `0.0`: GTK never reports a non-empty `titlebar_control_inset`
+        // (#940 — the trait default, unchanged for this backend), so its
+        // app icon always starts flush with the band's leading edge.
+        crate::render::split_menu_row_for_app_icon(row, 0.0).0
     }
 
     /// #720 acceptance 1: the VimCode icon renders left of `File`, at
