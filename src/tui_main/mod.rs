@@ -7,8 +7,15 @@
 //!
 //! **No GTK/Cairo/Pango imports here.** All editor logic comes from `core`.
 //! All rendering data comes from `render`.
+// #937's quadraui pin bump deprecated `Backend::draw_status_bar` (quadraui#819)
+// and `TabBarHits`'s tuple fields (quadraui#823) that this module tree (incl.
+// `panels`, `render_impl`, `shell_app`) still uses; migrating to the
+// `_interactive`/`TabBarLayout` replacements is an unrelated refactor
+// deferred to a follow-up, so it's silenced here rather than left as a stray
+// warning under `-D warnings`.
 #![allow(
     unused_assignments,
+    deprecated,
     clippy::collapsible_match,
     clippy::explicit_counter_loop
 )]

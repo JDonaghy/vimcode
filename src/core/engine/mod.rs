@@ -1,3 +1,10 @@
+// #937's quadraui pin bump deprecated `TabBarHits` (quadraui#823) that this
+// module (and its `terminal_ops` child) still reads; migrating to its
+// `TabBarLayout` replacement is an unrelated, cross-backend refactor deferred
+// to a follow-up, so it's silenced here rather than left as a stray warning
+// under `-D warnings`.
+#![allow(deprecated)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
