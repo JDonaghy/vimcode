@@ -224,6 +224,136 @@ mod mac_driver_tests {
         (guards, driver_with_shell(app, config, W, H))
     }
 
+    // ── #928 proof slice: `crate::harness::ConformanceHarness` on `MacDriver` ──
+    //
+    // `driver()` above is #896's own bespoke constructor, kept as-is; these
+    // three helpers instead build a `crate::harness::ConformanceHarness`
+    // (#928) so the shared scenario bodies in `crate::harness` — the same
+    // ones `crate::gtk::testing`'s `conformance_proof_slice` module runs
+    // against `GtkDriver` — also run, unmodified, against `MacDriver`.
+    mod conformance_proof_slice {
+        use std::cell::RefCell;
+        use std::path::PathBuf;
+        use std::rc::Rc;
+
+        use quadraui::macos::testing::driver_with_shell;
+        use quadraui::macos::MacBackend;
+
+        use crate::app::TextMetricsBackend;
+        use crate::core::Engine;
+        use crate::harness::ConformanceHarness;
+
+        fn conformance_harness(
+            engine: Engine,
+            width: u32,
+            height: u32,
+        ) -> ConformanceHarness<quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>>
+        {
+            let paint = crate::test_paint::PaintGuard::acquire();
+            let cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let engine = Rc::new(RefCell::new(engine));
+            let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+                Rc::new(RefCell::new(Box::new(MacBackend::new())));
+            let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+            let driver = driver_with_shell(app, config, width, height);
+            ConformanceHarness::new(driver, engine, paint, cwd)
+        }
+
+        fn conformance_harness_with_folder_picker(
+            engine: Engine,
+            dir: PathBuf,
+            width: u32,
+            height: u32,
+        ) -> ConformanceHarness<quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>>
+        {
+            let paint = crate::test_paint::PaintGuard::acquire();
+            let cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let engine = Rc::new(RefCell::new(engine));
+            let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+                Rc::new(RefCell::new(Box::new(MacBackend::new())));
+            let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+            crate::harness::install_folder_picker(&app, dir);
+            let driver = driver_with_shell(app, config, width, height);
+            ConformanceHarness::new(driver, engine, paint, cwd)
+        }
+
+        fn scratch_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_928_macos_conformance_{tag}_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// Scenario 1 (#928): open/filter/Esc-dismiss the folder picker via
+        /// `MacDriver` — the identical body
+        /// `crate::gtk::testing::conformance_proof_slice` runs against
+        /// `GtkDriver`; see that module's doc for the RED-verification note
+        /// (the same mutation to the pinned quadraui checkout takes both
+        /// backends' copies of this test red).
+        #[test]
+        fn folder_picker_filters_and_escape_dismisses() {
+            let dir = scratch_dir("scenario1");
+            std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+            std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+            let mut h = conformance_harness_with_folder_picker(
+                super::plain_engine(),
+                dir.clone(),
+                1400,
+                900,
+            );
+
+            crate::harness::folder_picker_filters_and_escape_dismisses(
+                &mut h.driver,
+                "kkxxqq_distinctive_928",
+                "another_unrelated_dir_928",
+                "kkxxqq_distinctive_928",
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Scenario 2 (#928): the command palette's open/filter/Esc cycle,
+        /// via `MacDriver`.
+        #[test]
+        fn command_palette_filters_and_escape_dismisses() {
+            let mut h = conformance_harness(super::plain_engine(), 1400, 900);
+
+            crate::harness::command_palette_filters_and_escape_dismisses(&mut h.driver);
+        }
+
+        /// Scenario 3 (#928): a click outside the open folder picker's
+        /// popup must dismiss it, via `MacDriver::click`'s raw
+        /// pixel-coordinate dispatch.
+        #[test]
+        fn folder_picker_click_outside_dismisses_it() {
+            let dir = scratch_dir("scenario3");
+            std::fs::create_dir_all(dir.join("kkxxqq_distinctive_928")).unwrap();
+            std::fs::create_dir_all(dir.join("another_unrelated_dir_928")).unwrap();
+
+            let (width, height) = (1400.0, 900.0);
+            let mut h = conformance_harness_with_folder_picker(
+                super::plain_engine(),
+                dir.clone(),
+                width as u32,
+                height as u32,
+            );
+
+            crate::harness::folder_picker_click_outside_dismisses_it(
+                &mut h.driver,
+                "kkxxqq_distinctive_928",
+                "another_unrelated_dir_928",
+                width - 10.0,
+                height - 10.0,
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// #896: the first painted frame must complete with the minimap enabled.
     ///
     /// RED against the pre-fix quadraui pin (`9eede7fd`): the process aborts

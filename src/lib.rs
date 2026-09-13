@@ -107,6 +107,17 @@ pub mod macos;
 #[cfg(feature = "win")]
 pub mod win;
 
+/// Backend-neutral conformance-test harness (#928) — adopts quadraui's
+/// `ConformanceDriver`/`PixelClickConformance` so a black-box scenario is
+/// written once and run against every GUI backend's own driver
+/// (`GtkDriver`/`MacDriver`/`WinDriver`), instead of a GTK-only suite of
+/// 134 tests and a 4-test macOS one. See that module's doc for the full
+/// design and the proof slice it ships. Test-only; never compiled into a
+/// release binary — same gate as `test_cwd`/`test_paint` below, which it
+/// depends on.
+#[cfg(any(test, feature = "test-support"))]
+pub mod harness;
+
 /// Process-wide working-directory arbitration for the test run (#785) — the
 /// lock that keeps a `chdir`-ing test from moving the ground under a
 /// concurrently painting harness. Test-only; never compiled into a release
