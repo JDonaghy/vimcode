@@ -586,19 +586,48 @@ mod mac_driver_tests {
     /// itself) would surface here first.
     ///
     /// It does **not** prove the icon glyph actually resolves against the
-    /// registered Nerd Font rather than painting as a tofu box.
-    /// quadraui's own conformance suite documents that no black-box
-    /// vocabulary it exposes can observe that: `FrameInventory`'s painted
-    /// *text runs* record the same requested string regardless of which
-    /// font family Core Text resolved it against
-    /// (`tests/conformance.rs`'s `UNGATED_CAPS` entry for
-    /// `app_font_registration`), `Backend` is `sealed` so vimcode cannot
+    /// registered Nerd Font rather than painting as a tofu box, and this
+    /// doc previously cited a quadraui `UNGATED_CAPS` entry
+    /// (`app_font_registration`) as the reason — that citation was wrong
+    /// and has been removed. Checked directly against quadraui `68f0ef9`:
+    /// `BackendCaps`/`vocabulary()` has no font-registration capability of
+    /// any name, and `tests/conformance.rs`'s `UNGATED_CAPS` list (seven
+    /// entries: `native_menu`, `window_chrome`, `pointer_cursor`, `ime`,
+    /// `file_dialogs`, `native_dialogs`, `notifications`) does not mention
+    /// font registration either. No such capability exists to cite.
+    ///
+    /// The real reason this can't be tested black-box today: `FrameInventory`'s
+    /// painted *text runs* record the same requested string regardless of
+    /// which font family Core Text actually resolved it against, `Backend`
+    /// is `sealed` (verified in quadraui's `backend.rs`) so vimcode cannot
     /// substitute a spying implementation, and `MacBackend`'s
     /// `nerd_font_fallback_family`/`current_font` fields are private with no
     /// public getter — nothing outside quadraui's own crate can read them.
-    /// Confirming the glyph itself paints correctly needs a human looking
-    /// at a real Mac's screen, or a future quadraui-side introspection API
-    /// added for exactly this; see this PR's notes.
+    /// This is an honest, unverified gap: confirming the glyph itself paints
+    /// correctly needs either a human looking at a real Mac's screen, or a
+    /// new quadraui-side introspection API (e.g. exposing which font family
+    /// a painted run actually resolved against) added for exactly this. No
+    /// such API exists yet in quadraui as of `68f0ef9` — a quadraui issue
+    /// requesting it should be filed as a follow-up rather than assumed to
+    /// already exist.
+    ///
+    /// **RED-verification honesty note.** This test's assertion
+    /// (`screen_contains("fn main")`) does not depend on nerd-font
+    /// resolution at all — it would stay green even with the entire body
+    /// of `register_nerd_font_fallback` deleted, or with
+    /// `set_nerd_font_fallback` never called, because the buffer text it
+    /// checks paints through an unrelated path. That is not a claim this
+    /// test happens to be weak; it is analytically true from reading the
+    /// assertion, independent of platform, and it could not be
+    /// double-checked by actually deleting the fix and re-running here
+    /// (`#[cfg(all(feature = "macos", target_os = "macos"))]` above means
+    /// this module does not even compile on the Linux host this fix was
+    /// written on — see the file's "Verifying this file without a Mac"
+    /// doc). What this test *does* cover, honestly: that `App::setup`
+    /// calling `register_nerd_font_fallback` does not panic or otherwise
+    /// break the first paint on `MacBackend` with nerd fonts on, a path no
+    /// prior test in this file exercised. Actual glyph-resolution coverage
+    /// remains the open gap described above.
     #[test]
     fn setup_with_nerd_fonts_on_registers_the_fallback_and_still_paints() {
         let (_guards, driver) = driver(engine_with_nerd_fonts_on());
