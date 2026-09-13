@@ -222,6 +222,12 @@ The coordinator drives issues through `Work → Test → Review → Merge`. The 
 - Record the verdict with `coord test --passed <work_aid>` or `coord test --fail <work_aid> --reason "<full repro: expected vs actual, steps, suspected files>"`.
 
 ## Branching & Releases
+
+> **Cutting a release: [`docs/RELEASING.md`](docs/RELEASING.md).** It holds the
+> pre-release architecture gate — the per-backend test lanes, which machine can run
+> each one, and which failures are expected-red on which platform — plus what the
+> release artifacts actually are. Operator-facing; workers don't need it.
+
 - All work happens on `develop`; `main` is the release branch
 - Merge `develop` → `main` via GitHub PR (CI runs on the PR before release)
 - Before creating the PR: bump version in `Cargo.toml`
