@@ -5081,12 +5081,18 @@ mod command_center {
     /// so the band is still an `lh` multiple; per this issue's acceptance
     /// criteria that means the useful assertion is "the pill height matches
     /// the intended target at the default size", pinned with a tolerance
-    /// band around the ~27px this measures in the headless harness at the
-    /// chosen 1.7 multiplier. The second assertion pins the residual this
-    /// doc note calls out: because the GTK runner paints the editor at a
-    /// hardcoded font regardless of `settings.font_size` (see the sibling
-    /// dropdown-font test's doc comment), the row height a single
-    /// `font_size` value produces here is already stable across
+    /// band around what this measures in the headless harness at the
+    /// chosen multiplier -- **34px band / 30px pill at the current `2.0`**
+    /// (#940 raised it from `1.7`, which measured only 29px here: 1px of
+    /// margin over macOS's ~28pt native titlebar height is not a safety
+    /// margin, it's a rounding error, and #940 adopts the client-side
+    /// titlebar specifically so this band shares its vertical space with
+    /// the real traffic-light cluster -- see the `shell_config` call site's
+    /// comment for the full analysis). The second assertion pins the
+    /// residual this doc note calls out: because the GTK runner paints the
+    /// editor at a hardcoded font regardless of `settings.font_size` (see
+    /// the sibling dropdown-font test's doc comment), the row height a
+    /// single `font_size` value produces here is already stable across
     /// `font_size` even with the bug reinstated at 1.0 -- so it does NOT
     /// alone distinguish fixed from unfixed and is kept only as the
     /// "stable across two font_size values" half of the acceptance
@@ -6736,8 +6742,20 @@ mod scrollbar_paint {
         // character cell), short of the pane's own left edge. Bottom
         // `line_height` excluded: that row is the per-window status line
         // (window_status_line, on by default), a real, unrelated feature
-        // painted in a distinct color across the full pane width.
+        // painted in a distinct color across the full pane width. An extra
+        // 1px of margin is subtracted on top of that (#940 review): `rect`
+        // and `line_height` are both fractional (whatever the live window
+        // size and font metrics measure to), so `rect.height - line_height`
+        // lands at a fractional pixel boundary that moves whenever anything
+        // upstream of this window's rect changes size — e.g. #940 raising
+        // `with_title_bar`'s multiplier shifted it from landing just below
+        // an integer row to just above one, which pulled the status line's
+        // own antialiased top-edge blend (a partial-coverage pixel, not a
+        // scrollbar) into the strip and failed this test with no scrollbar
+        // involved at all. The 1px margin absorbs that antialiasing
+        // regardless of which way future fractional shifts round.
         const STRIP_W: f64 = 16.0;
+        const ANTIALIAS_MARGIN_PX: f64 = 1.0;
         let line_height = h
             .painted_line_height()
             .expect("render_content must publish the painted line height");
@@ -6745,7 +6763,7 @@ mod scrollbar_paint {
             (rect.x + rect.width - STRIP_W).max(rect.x) as f32,
             rect.y as f32,
             STRIP_W.min(rect.width) as f32,
-            (rect.height - line_height).max(0.0) as f32,
+            (rect.height - line_height - ANTIALIAS_MARGIN_PX).max(0.0) as f32,
         );
 
         assert!(

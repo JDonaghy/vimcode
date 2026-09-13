@@ -20682,6 +20682,58 @@ pub fn menu_bar_app_icon_slot_width_px(menu_row_height: f32) -> f32 {
     }
 }
 
+/// Shift `row`'s leading edge in by `leading_inset` without moving its
+/// trailing edge, clamping so the result never has negative width or moves
+/// past the row's own trailing edge (a pathologically large inset yields a
+/// zero-width row, not a wrapped/negative one).
+///
+/// Shared (#940 review) by [`split_menu_row_for_app_icon`] — which uses it to
+/// carve the drawn-menu-row's icon/items split clear of the backend's own
+/// controls — and `App::render_content`'s native-menu-row path, which insets
+/// the *whole* row the same way when the drawn menu row itself is suppressed
+/// (#901) and there is no icon/items split to compute. Extracted so those two
+/// call sites can't compute the same clamp arithmetic two different ways.
+pub fn inset_titlebar_row_leading_edge(row: quadraui::Rect, leading_inset: f32) -> quadraui::Rect {
+    let leading_inset = leading_inset.max(0.0).min(row.width);
+    quadraui::Rect::new(
+        row.x + leading_inset,
+        row.y,
+        (row.width - leading_inset).max(0.0),
+        row.height,
+    )
+}
+
+/// True when the backend already draws its own titlebar window controls in
+/// this band — macOS's native traffic lights, reported via a non-default
+/// [`quadraui::Backend::titlebar_control_inset`] once a capable backend has
+/// opted into [`quadraui::shell::ShellConfig::client_side_titlebar`] (#940,
+/// quadraui#947).
+///
+/// `control_inset` is [`quadraui::Rect::default()`] — all-zero — on every
+/// backend before a window exists to query (GTK, Win-GUI, TUI forever; macOS
+/// too until `MacBackend::set_window` runs), so this is `false` there and
+/// every #940 code path that guards on it is a no-op, exactly as it behaved
+/// before #940.
+pub fn backend_draws_own_window_controls(control_inset: quadraui::Rect) -> bool {
+    control_inset.width > 0.0 || control_inset.height > 0.0
+}
+
+/// True when vimcode's own drawn window controls (`render::window_controls_status_bar`)
+/// should paint into the title-bar band this frame.
+///
+/// `menu_row_present` is `presence.menu_row` — vimcode never drew inline
+/// controls without also drawing the menu row itself, on any backend, before
+/// #940. `control_inset` adds the second condition #940 introduces: even
+/// with the menu row present, a backend that reports it draws its own
+/// controls (`backend_draws_own_window_controls`) must never *also* get
+/// vimcode's — two sets of window controls is exactly the bug #940 exists to
+/// prevent. See the module doc's "keeps the native traffic lights" section
+/// for why vimcode does not just draw over/instead of them on a capable
+/// backend.
+pub fn should_draw_window_controls(menu_row_present: bool, control_inset: quadraui::Rect) -> bool {
+    menu_row_present && !backend_draws_own_window_controls(control_inset)
+}
+
 /// Split the full menu row band into `(icon_rect, items_rect)`.
 ///
 /// `items_rect` is the rect the menu *items* live in — it is what must be
@@ -20715,13 +20767,7 @@ pub fn split_menu_row_for_app_icon(
     menu_row_rect: quadraui::Rect,
     leading_inset: f32,
 ) -> (quadraui::Rect, quadraui::Rect) {
-    let leading_inset = leading_inset.max(0.0).min(menu_row_rect.width);
-    let row = quadraui::Rect::new(
-        menu_row_rect.x + leading_inset,
-        menu_row_rect.y,
-        (menu_row_rect.width - leading_inset).max(0.0),
-        menu_row_rect.height,
-    );
+    let row = inset_titlebar_row_leading_edge(menu_row_rect, leading_inset);
     let slot = menu_bar_app_icon_slot_width_px(row.height).min(row.width);
     if slot <= 0.0 {
         return (quadraui::Rect::new(row.x, row.y, 0.0, 0.0), row);
@@ -26369,6 +26415,99 @@ mod tests {
         let (icon, items) = split_menu_row_for_app_icon(row, 500.0);
         assert!(icon.width >= 0.0 && items.width >= 0.0);
         assert_eq!(items.width, 0.0);
+    }
+
+    /// `inset_titlebar_row_leading_edge` is the shared clamp arithmetic
+    /// `split_menu_row_for_app_icon` and `App::render_content`'s
+    /// native-menu-row (`presence.menu_row == false`) path both need (#940
+    /// review — the two were duplicating the same three lines). Pins the
+    /// exact contract both callers depend on: leading edge moves in by
+    /// `leading_inset`, trailing edge never moves, y/height untouched.
+    #[test]
+    fn inset_titlebar_row_leading_edge_moves_only_the_leading_edge() {
+        let row = quadraui::Rect::new(10.0, 5.0, 800.0, 30.0);
+        let inset = inset_titlebar_row_leading_edge(row, 78.0);
+        assert_eq!(inset.x, row.x + 78.0);
+        assert_eq!(inset.y, row.y);
+        assert_eq!(inset.width, row.width - 78.0);
+        assert_eq!(inset.height, row.height);
+        assert_eq!(
+            inset.x + inset.width,
+            row.x + row.width,
+            "trailing edge must not move"
+        );
+    }
+
+    /// Same clamp-to-empty behaviour as `split_menu_row_for_app_icon`'s
+    /// equivalent case, since both now share this helper: an inset wider
+    /// than the row must never produce a negative width.
+    #[test]
+    fn inset_titlebar_row_leading_edge_clamps_an_oversized_inset() {
+        let row = quadraui::Rect::new(0.0, 0.0, 50.0, 30.0);
+        let inset = inset_titlebar_row_leading_edge(row, 500.0);
+        assert_eq!(inset.width, 0.0);
+        assert!(inset.x <= row.x + row.width);
+    }
+
+    /// `backend_draws_own_window_controls` is the pure predicate
+    /// `App::render_content` reads `Backend::titlebar_control_inset()`
+    /// through (#940 review — extracted so it has a driver-independent
+    /// unit test; see the app.rs review note on why an actual `MacDriver`
+    /// can't drive a non-default inset today). `Rect::default()` — the
+    /// value every backend without the client-side-titlebar opt-in reports,
+    /// forever on GTK/Win-GUI/TUI and on macOS before a window exists — must
+    /// read as "no native controls"; any non-zero width *or* height must
+    /// read as "yes", since either alone is what
+    /// `MacBackend::titlebar_control_inset` can report depending on which
+    /// dimension AppKit's own button-cluster container constrains.
+    #[test]
+    fn backend_draws_own_window_controls_reads_either_nonzero_dimension() {
+        assert!(!backend_draws_own_window_controls(quadraui::Rect::default()));
+        assert!(!backend_draws_own_window_controls(quadraui::Rect::new(
+            5.0, 5.0, 0.0, 0.0
+        )));
+        assert!(backend_draws_own_window_controls(quadraui::Rect::new(
+            0.0, 0.0, 78.0, 0.0
+        )));
+        assert!(backend_draws_own_window_controls(quadraui::Rect::new(
+            0.0, 0.0, 0.0, 28.0
+        )));
+    }
+
+    /// `should_draw_window_controls` is the exact "exactly one set of window
+    /// controls" decision #940 exists to get right — extracted so all four
+    /// combinations of (`menu_row_present`, `has_native_controls`) have a
+    /// direct, fast, deterministic test independent of any backend/driver
+    /// (#940 review). Native controls always win: they must suppress
+    /// vimcode's drawn controls regardless of `menu_row_present`, since a
+    /// backend reporting a control inset is macOS today, which also always
+    /// reports `menu_row_present == false` (#901) — but the function must
+    /// not rely on that correlation to be correct.
+    #[test]
+    fn should_draw_window_controls_covers_all_four_combinations() {
+        let none = quadraui::Rect::default();
+        let native = quadraui::Rect::new(0.0, 0.0, 78.0, 28.0);
+
+        assert!(
+            should_draw_window_controls(true, none),
+            "menu row present, no native controls -> vimcode draws its own \
+             (every backend before #940, and GTK/Win-GUI forever)"
+        );
+        assert!(
+            !should_draw_window_controls(false, none),
+            "menu row suppressed, no native controls -> nobody draws \
+             controls (would be a floating button cluster with no menu bar)"
+        );
+        assert!(
+            !should_draw_window_controls(true, native),
+            "menu row present but backend has native controls -> vimcode \
+             must still suppress its own, or two sets of controls paint"
+        );
+        assert!(
+            !should_draw_window_controls(false, native),
+            "menu row suppressed and backend has native controls -> macOS \
+             today: AppKit's traffic lights only, nothing drawn"
+        );
     }
 
     /// The icon painted in the menu row and the icon installed into the
