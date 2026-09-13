@@ -7944,15 +7944,16 @@ impl FramePresence {
         // centre and the window controls a zero-width strip and leave
         // `command_center_layout` disagreeing with the paint).
         //
-        // #766: this single gate now drives all three title-bar rungs. Before
-        // the fold GTK's `MenuDropdown` arm checked only `menu_bar_visible` and
-        // painted into a degenerate band; the measure rung's stricter gate is
-        // the one that survives, which is the same direction #763 converged the
+        // #766: this single gate drives the two rungs that stand in for the
+        // *drawn* menu row (the row itself and its dropdown). Before the fold
+        // GTK's `MenuDropdown` arm checked only `menu_bar_visible` and painted
+        // into a degenerate band; the measure rung's stricter gate is the one
+        // that survives, which is the same direction #763 converged the
         // measure rung itself.
-        let title_bar = screen.menu_bar_visible
-            && layout
-                .title_bar_bounds
-                .is_some_and(|r| metrics.holds_a_line(r));
+        let title_bar_band_live = layout
+            .title_bar_bounds
+            .is_some_and(|r| metrics.holds_a_line(r));
+        let title_bar = screen.menu_bar_visible && title_bar_band_live;
         Self {
             menu_row: title_bar,
             sidebar_panel: layout
@@ -7963,7 +7964,15 @@ impl FramePresence {
             command_line: true,
             folder_picker: false,
             menu_dropdown: title_bar,
-            command_center: title_bar,
+            // #939: the omnibar shares the title-bar *band* with the drawn
+            // menu row but not the drawn row's own liveness gate. A
+            // native-menu backend (macOS) sets `menu_bar_visible = false` to
+            // suppress the redundant in-window `File Edit View` row beneath
+            // AppKit's real menu bar, but the command center still belongs in
+            // that band — same as VS Code on macOS. So this rung depends only
+            // on the band existing, not on whether the drawn menu row is
+            // suppressed.
+            command_center: title_bar_band_live,
             find_replace: screen.find_replace.is_some(),
             unified_picker: screen.picker.is_some(),
             tab_switcher: screen.tab_switcher.is_some(),
@@ -21432,6 +21441,68 @@ mod tests {
                 FrameOp::MenuDropdown,
                 FrameOp::CommandCenter,
             ]
+        );
+    }
+
+    /// #939: `FramePresence::from_screen` must split the Command Center's
+    /// liveness gate from the drawn menu row's. Before this fix, a single
+    /// `title_bar` bool (`screen.menu_bar_visible && title_bar_band_live`)
+    /// drove `menu_row`, `menu_dropdown` **and** `command_center` — so a
+    /// native-menu backend (macOS's `MacBackend`) setting
+    /// `menu_bar_visible = false` to suppress the redundant in-window
+    /// `File Edit View` row (#901) killed the Command Center along with it,
+    /// and the omnibar never painted on macOS at all.
+    ///
+    /// `menu_row` / `menu_dropdown` must stay coupled to `menu_bar_visible`
+    /// — no drawn menu means no drawn dropdown — but `command_center` must
+    /// depend only on the title-bar band existing.
+    ///
+    /// RED-verified against this fix: with `command_center` reverted to
+    /// `title_bar` (the pre-#939 expression) instead of
+    /// `title_bar_band_live`, the `assert!(presence.command_center, ...)`
+    /// below fails once `menu_bar_visible` is `false`.
+    #[test]
+    fn command_center_liveness_is_split_from_menu_bar_visible() {
+        let mut screen = bare_screen_layout();
+        let full_band = quadraui::Rect::new(0.0, 0.0, 1400.0, 17.0);
+        let mut layout = bare_shell_layout();
+        layout.title_bar_bounds = Some(full_band);
+        let px = FrameMetrics::px(17.0, 8.0);
+
+        screen.menu_bar_visible = true;
+        let presence = FramePresence::from_screen(&screen, &layout, px);
+        assert!(
+            presence.menu_row && presence.menu_dropdown && presence.command_center,
+            "with the band live and menu_bar_visible true, all three \
+             title-bar rungs must be live: {presence:?}"
+        );
+
+        screen.menu_bar_visible = false;
+        let presence = FramePresence::from_screen(&screen, &layout, px);
+        assert!(
+            !presence.menu_row,
+            "menu_row must stay coupled to menu_bar_visible: {presence:?}"
+        );
+        assert!(
+            !presence.menu_dropdown,
+            "menu_dropdown must stay coupled to menu_bar_visible -- no drawn \
+             menu means no drawn dropdown: {presence:?}"
+        );
+        assert!(
+            presence.command_center,
+            "command_center must NOT be coupled to menu_bar_visible -- a \
+             native-menu backend suppresses the drawn row but the Command \
+             Center still belongs in the (still-live) band: {presence:?}"
+        );
+
+        // And the band simply not existing still kills it, same as before --
+        // the split is about `menu_bar_visible`, not about dropping the
+        // band-liveness check entirely.
+        layout.title_bar_bounds = None;
+        let presence = FramePresence::from_screen(&screen, &layout, px);
+        assert!(
+            !presence.command_center,
+            "command_center must still require the title-bar band to exist: {presence:?}"
         );
     }
 

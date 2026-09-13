@@ -442,6 +442,56 @@ mod mac_driver_tests {
         );
     }
 
+    /// #939: the omnibar (quadraui `CommandCenter`) must still paint in the
+    /// title-bar band on a native-menu backend, even though the drawn menu
+    /// row sharing that band stays suppressed (the test right above this
+    /// one, unchanged). #901 coupled all three title-bar rungs -- menu row,
+    /// its dropdown, and the Command Center -- to one `menu_bar_visible`
+    /// flag; `App::setup` sets that flag `false` on a native-menu backend to
+    /// suppress the redundant in-window row (#901's own fix), which dragged
+    /// the Command Center down with it as unintended collateral. VS Code's
+    /// own macOS title bar has no drawn menu labels at all but still shows
+    /// the Command Center, which is the behaviour this pins.
+    ///
+    /// RED against the pre-#939 tree: `command_center_rect` was populated
+    /// only inside the `FrameOp::MenuRow` match arm, itself gated on
+    /// `presence.menu_row` (== `menu_bar_visible`), so on this exact backend
+    /// (`native_menu: true` -> `menu_bar_visible = false`) the arm never ran,
+    /// `command_center_rect` stayed `None`, and the search-box label below
+    /// never reached the screen even after separately splitting
+    /// `FramePresence`'s liveness gate -- confirmed by reverting just the
+    /// `app.rs` band-measurement hoist (restoring it to run only inside the
+    /// `MenuRow` arm) and re-running: this assertion fails while the sibling
+    /// test above keeps passing, exactly pinning the second, independent
+    /// coupling the issue describes.
+    #[test]
+    fn command_center_paints_on_a_native_menu_backend() {
+        let mut engine = plain_engine();
+        // A distinctive, non-default `cwd` so the Command Center's "🔍
+        // <project>" search label is unmistakable in `painted_texts()` --
+        // mirrors `gtk::testing::command_center`'s
+        // `engine_with_tab_history` fixture, which does the same for the
+        // identical reason (an empty/default cwd would paint an empty
+        // label, per `render::build_command_center_view`).
+        engine.cwd = std::path::PathBuf::from("omnibar-fixture-939");
+
+        let (_guards, driver) = driver(engine);
+
+        assert!(
+            !driver.screen_contains("File"),
+            "sibling assertion to native_menu_backend_suppresses_the_drawn_menu_row \
+             -- the drawn menu row must stay suppressed; painted text was {:?}",
+            driver.painted_texts()
+        );
+        assert!(
+            driver.screen_contains("omnibar-fixture-939"),
+            "the Command Center's search label must paint in the title-bar \
+             band even though the drawn menu row sharing that band is \
+             suppressed; painted text was {:?}",
+            driver.painted_texts()
+        );
+    }
+
     /// #901: `UiEvent::MenuActivated` (fired by the native NSMenu installed
     /// via `Backend::install_menu_bar`) must reach the exact same
     /// `App::handle_menu_action` dispatch the drawn `MenuSystem` dropdown's

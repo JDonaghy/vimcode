@@ -7459,6 +7459,65 @@ impl quadraui::ShellApp for App {
         // what reached the canvas.
         presence.dialog = screen.dialog.is_some() && !self.native_dialog_shown.get();
 
+        // #939: measure the title-bar band whenever the Command Center rung
+        // is live, independent of whether `FrameOp::MenuRow` itself composes.
+        // Before this, `controls_rect`/`command_center_rect` were populated
+        // *only* inside the `MenuRow` match arm below, which is gated on
+        // `presence.menu_row` — i.e. on `menu_bar_visible`. A native-menu
+        // backend (macOS's `MacBackend`) sets `menu_bar_visible = false` to
+        // suppress the redundant in-window row under AppKit's real menu bar
+        // (#901), which left `command_center_rect` permanently `None` and
+        // the `FrameOp::CommandCenter` arm's `command_center_rect.filter(...)`
+        // guard always failed — the omnibar never painted even once its own
+        // presence gate was split from `menu_row`'s (see
+        // `render::FramePresence::from_screen`).
+        //
+        // When the drawn row itself is suppressed, measure with an *empty*
+        // `MenuBar` and no controls bar: `measure_title_bar_bands` collapses
+        // the menu-item and controls slots to zero width in that case (see
+        // its doc), so the Command Center gets the *entire* band rather than
+        // reserving room for labels and buttons that will never paint. This
+        // is also why `controls_rect` stays `None` on a native-menu backend:
+        // the only arm that ever paints from it (`FrameOp::MenuDropdown`'s
+        // `paint_title_bar_band`) stays gated on `presence.menu_dropdown` —
+        // itself still coupled to `menu_bar_visible` — so this does not
+        // resurrect drawn window controls under AppKit's own traffic lights.
+        if presence.command_center {
+            let (real_icon_rect, real_items_rect) =
+                render::split_menu_row_for_app_icon(menu_row_rect);
+            let (items_for_measure, bar_for_measure) = if presence.menu_row {
+                app_icon_rect = real_icon_rect;
+                menu_items_rect = real_items_rect;
+                (real_items_rect, engine.menu_system.borrow().menu_bar())
+            } else {
+                (
+                    menu_row_rect,
+                    quadraui::MenuBar {
+                        id: quadraui::WidgetId::new("native_menu_row_suppressed"),
+                        items: Vec::new(),
+                        open_item: None,
+                        focused_item: None,
+                    },
+                )
+            };
+            self.menu_items_rect.set(menu_items_rect);
+
+            let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
+            let controls_bar = presence
+                .menu_row
+                .then(|| render::window_controls_status_bar(&theme, maximized));
+            let bands = render::measure_title_bar_bands(
+                backend,
+                menu_row_rect,
+                items_for_measure,
+                &bar_for_measure,
+                controls_bar.as_ref(),
+            );
+            self.title_bar_rect.set(bands.controls);
+            controls_rect = presence.menu_row.then_some(bands.controls);
+            command_center_rect = Some(bands.command_center);
+        }
+
         let mut composed: Vec<render::FrameOp> = Vec::new();
         for op in render::compose_frame(&presence) {
             match op {
@@ -7483,35 +7542,18 @@ impl quadraui::ShellApp for App {
                 // repaints `draw_menu_bar` across the entire band and erases
                 // them (#552 round-2/3 "buttons render blank"), so this rung
                 // only stashes their target rects.
+                //
+                // #939: the actual measurement — the #720 app-icon split,
+                // `menu_items_rect`, `controls_rect`, `command_center_rect` —
+                // moved above the walk, into the `presence.command_center`
+                // block, because the Command Center rung now composes even
+                // when this one does not (native-menu backends). `menu_row`
+                // implies `command_center` (both require the band to exist;
+                // `menu_row` additionally requires `menu_bar_visible`), so
+                // that block has already run with the *real* menu bar by the
+                // time this arm is reached — there is nothing left to do here
+                // but record that the rung composed.
                 render::FrameOp::MenuRow => {
-                    // #720: reserve a square, row-height slot at the leading
-                    // edge of the band for the VimCode app icon (VS Code puts
-                    // its logo left of `File`), and lay the menu items out in
-                    // what's left. This is the *only* place the split is
-                    // computed: `menu_items_rect` is what the measurement below,
-                    // `menu_system.render()` and — via `self.menu_items_rect` —
-                    // `handle()`'s click routing all use, so the icon's x-shift
-                    // can never reach the paint but not the hit-test (quadraui's
-                    // `MenuBar::layout_with_leading` doc names this exact hazard).
-                    let (icon_rect, items_rect) =
-                        render::split_menu_row_for_app_icon(menu_row_rect);
-                    app_icon_rect = icon_rect;
-                    menu_items_rect = items_rect;
-                    self.menu_items_rect.set(menu_items_rect);
-
-                    let maximized = self.window.as_ref().is_some_and(|w| w.win_is_maximized());
-                    let controls_bar = render::window_controls_status_bar(&theme, maximized);
-                    let bar = engine.menu_system.borrow().menu_bar();
-                    let bands = render::measure_title_bar_bands(
-                        backend,
-                        menu_row_rect,
-                        menu_items_rect,
-                        &bar,
-                        Some(&controls_bar),
-                    );
-                    self.title_bar_rect.set(bands.controls);
-                    controls_rect = Some(bands.controls);
-                    command_center_rect = Some(bands.command_center);
                     composed.push(render::FrameOp::MenuRow);
                 }
 
