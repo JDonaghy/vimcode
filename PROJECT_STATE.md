@@ -245,28 +245,50 @@ Still true from earlier in the arc: `fn event_loop` does not exist in `src/`;
 Production lines, `#[cfg(test)]` excluded. **All columns measured with the same
 script** (`scripts/prod_lines.py`, added for this audit) so they are comparable:
 
-| | 2026-05-01 | 2026-07-01 | pre-chain 2026-08-31 | pre-#785 2026-09-03 | **post-#785, now @ `ee26268`** |
-|---|---|---|---|---|---|
-| `src/gtk/` | 18,969 | 13,675 | 12,526 | 9,650 | **2,607** |
-| `src/tui_main/` | 14,649 | 10,358 | 11,125 | 10,345 | **10,366** |
-| `src/app.rs` (hoisted out of `src/gtk/` by #785) | — | — | — | — | **7,131** |
-| **all three files** | 33,618 | 24,033 | 23,651 | 19,995 (2 files) | **20,104** |
-| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | 21,405 | **21,405** |
+| | 2026-05-01 | 2026-07-01 | 08-31 `f867817` | **pre-chain** `6875315` | pre-#785 09-03 | **post-#785 @ `ee26268`** |
+|---|---|---|---|---|---|---|
+| `src/gtk/` | 18,969 | 13,675 | 12,526 | 9,765 | 9,650 | **2,607** |
+| `src/tui_main/` | 14,649 | 10,358 | 11,125 | 10,958 | 10,345 | **10,366** |
+| `src/app.rs` (hoisted out of `src/gtk/` by #785) | — | — | — | — | — | **7,131** |
+| **all three files** | 33,618 | 24,033 | 23,651 | 20,723 | 19,995 (2 files) | **20,104** |
+| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | 15,558 | 21,405 | **21,405** |
+
+The **pre-chain** column is `6875315`, the last #732 commit — the true point before
+#733/#734/#735 and slices #751–#766 began. Everything between the 08-31 and
+pre-chain columns is **#722–#732**, which was dead-code deletion, not convergence;
+collapsing the two is what produced the −3,656 misattribution. Both columns
+regenerated from `git archive` 2026-09-12.
 
 (#785, "stage 1 of #47," hoisted `struct App` verbatim out of `src/gtk/mod.rs` into
 a new `src/app.rs` — see `GOALS.md`'s post-#735 audit for the full account. The
 `src/gtk/` = 9,650 figure this file previously carried as "now" predates that move;
 regenerated at `ee26268` per #827.)
 
-**Projected vs. actual over the chain (08-31 → 09-03):**
+**Projected vs. actual.** Measured over the chain's *own* range
+(`6875315` → `eedebf8`), not 08-31 → 09-03, which silently includes #722–#732's
+dead-code deletion:
 
-| | projected | actual |
-|---|---|---|
-| Backends | −8,700 … −9,500, landing near 14,000–15,000 | **−3,656, landing at 19,995** |
-| `render.rs` | +4,000 … +5,000 | **+6,396** |
-| Net across the three files | ≈ −4,000 | **+2,740** |
+| | projected | actual over the chain | (08-31 → 09-03, for reference) |
+|---|---|---|---|
+| Backends | −8,700 … −9,500, landing near 14,000–15,000 | **−728, landing at 19,995** | −3,656 |
+| `render.rs` | +4,000 … +5,000 | **+5,847** | +6,396 |
+| Net across the three files | ≈ −4,000 | **+5,119** | +2,740 |
 
-Where the reduction came from:
+**The chain missed its projection by roughly 12×, not 2.4×**, and the net went the
+wrong way by over 5,000 lines. Of the −3,656, **−2,928** is #722–#732 deleting code
+outright (#731 alone `−1,432/+245`; the #732 tranches `−1,837/+83`, `−535/+461`,
+`−529/+485` in `gtk/mod.rs`), leaving **−728** for convergence proper — the two sum
+exactly. Deleting unreachable code and converging duplicated code are different
+activities and must not be pooled.
+
+**The mechanism, visible in the diff:** moving a *decision* into `render.rs` leaves
+every *apply* body in place at its original size, now preceded by a
+`MouseDragState`/`ModalOverlayState` literal (30–60 lines per call site) and a
+"#NNN moved this" comment. The `FrameOp`/`EditorOp`/`BottomOp` machinery added three
+enums, three order constants, three composers, three validators and ~150 lines of
+doc. A 12-variant `match` is not shorter than 12 `if` blocks.
+
+Where the 08-31 → 09-03 reduction came from:
 
 | File | pre-chain | now | Δ |
 |---|---|---|---|
@@ -526,8 +548,10 @@ mouse routing, #757–#762 keyboard dispatch, #763–#766 frame composition (`Fr
 `gtk` into `[lib] vimcode_core` and sealed `tests/acceptance/`. #730/#593/#731/#732/#658/
 #480/#550/#551 all closed; #146 moved to #4. Milestone #7 reached **0 open**. Ran the
 post-#735 sizing audit the previous revision mandated and added `scripts/prod_lines.py`
-so it is reproducible: backends **−3,656** against a −8,700…−9,500 projection, `render.rs`
-**+6,396**, net **+2,740**. #47 closed having shipped **no code** (`44882e9`) with its
+so it is reproducible: over the chain's own range backends **−728** against a
+−8,700…−9,500 projection, `render.rs` **+5,847**, net **+5,119**. (The −3,656/+6,396/
++2,740 figures this entry first carried measure 08-31 → 09-03, which pools in
+#722–#732's dead-code deletion — see the corrected section above.) #47 closed having shipped **no code** (`44882e9`) with its
 `Backend`-trait Rc-handle blocker filed nowhere — the top open action. *(Corrected
 2026-09-05, issue #827: that blocker — quadraui#699, at 19 not 44 call sites — was
 filed and closed the same day, 16:38Z–17:11Z, and #47 was reopened 16:38Z. This

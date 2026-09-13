@@ -130,29 +130,41 @@ rather than assuming the chain finishes the job."* Done, on `develop @ eedebf8`.
 Production lines, `#[cfg(test)]` excluded, all columns measured with the same
 script (`scripts/prod_lines.py`) so they are comparable to each other:
 
-| | 2026-05-01 | 2026-07-01 | pre-chain 2026-08-31 | pre-#785 2026-09-03 | **post-#785, now @ `ee26268`** |
-|---|---|---|---|---|---|
-| `src/gtk/` | 18,969 | 13,675 | 12,526 | 9,650 | **2,607** |
-| `src/tui_main/` | 14,649 | 10,358 | 11,125 | 10,345 | **10,366** |
-| `src/app.rs` (hoisted out of `src/gtk/` by #785) | — | — | — | — | **7,131** |
-| **all three files** | 33,618 | 24,033 | 23,651 | 19,995 (2 files) | **20,104** |
-| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | 21,405 | **21,405** |
+| | 2026-05-01 | 2026-07-01 | 08-31 `f867817` | **pre-chain** `6875315` | pre-#785 09-03 | **post-#785 @ `ee26268`** |
+|---|---|---|---|---|---|---|
+| `src/gtk/` | 18,969 | 13,675 | 12,526 | 9,765 | 9,650 | **2,607** |
+| `src/tui_main/` | 14,649 | 10,358 | 11,125 | 10,958 | 10,345 | **10,366** |
+| `src/app.rs` (hoisted out of `src/gtk/` by #785) | — | — | — | — | — | **7,131** |
+| **all three files** | 33,618 | 24,033 | 23,651 | 20,723 | 19,995 (2 files) | **20,104** |
+| `src/render.rs` (shared) | 10,574 | 12,807 | 15,009 | 15,558 | 21,405 | **21,405** |
 
-(All five 2026-09 revisions confirmed by re-running `prod_lines.py` against
-`git archive ee26268`; the pre-#785 column is a snapshot at an earlier commit,
-not a stale guess — it's what the tree actually was before #785 moved
-`struct App`.)
+The **pre-chain** column is `6875315`, the last #732 commit — the true point before
+#733/#734/#735 and slices #751–#766 began. Everything between the 08-31 and
+pre-chain columns is **#722–#732**, which was dead-code deletion, not convergence.
+Collapsing those two columns into one is what produced the −3,656 misattribution
+corrected below (#827, refined by #792).
 
-**Projected vs. actual, over the chain (08-31 → 09-03):**
+(All 2026-09 columns confirmed by re-running `prod_lines.py` against a
+`git archive` of the revision named in the header — the pre-#785 column against
+`ee26268`, and the `6875315` and `eedebf8` columns regenerated 2026-09-12 when
+#792's correction was folded in: 9,765 / 10,958 / 15,558 and 9,650 / 10,345 /
+21,405 respectively. None of these is a stale guess re-typed from prose; that
+failure mode is why the script exists.)
 
-| | projected | actual |
-|---|---|---|
-| Backends | −8,700 … −9,500, landing near 14,000–15,000 | **−3,656, landing at 19,995** |
-| `render.rs` | +4,000 … +5,000 | **+6,396** |
-| Net across the three | ≈ −4,000 | **+2,740** |
+**Projected vs. actual.** Measure the chain against *its own* range
+(`6875315` → `eedebf8`), not 08-31 → 09-03 — the latter silently includes
+#722–#732's dead-code deletion and is what made the chain look 5× better than it
+was:
 
-The chain removed roughly **40% of the low end** of its own estimate, and the
-shared engine grew *more* than projected. Where the reduction actually came from:
+| | projected | actual over the chain | (08-31 → 09-03, for reference) |
+|---|---|---|---|
+| Backends | −8,700 … −9,500, landing near 14,000–15,000 | **−728, landing at 19,995** | −3,656 |
+| `render.rs` | +4,000 … +5,000 | **+5,847** | +6,396 |
+| Net across the three | ≈ −4,000 | **+5,119** | +2,740 |
+
+**The chain missed its projection by roughly 12×, not 2.4×**, and the net across the
+three files went the *wrong way* by over 5,000 lines. Where the 08-31 → 09-03
+reduction actually came from:
 
 | File | pre-chain | now | Δ |
 |---|---|---|---|
@@ -165,15 +177,23 @@ shared engine grew *more* than projected. Where the reduction actually came from
 `gtk/mod.rs` alone is 78% of the cut. Notably `tui_main/mouse.rs` — the file #733
 was sized against at −3,000…−3,500 — lost **316 lines**.
 
-**Attribution correction (#827): the −3,656 is mostly dead-code removal, not
-convergence.** Of the −3,656 backend reduction, roughly **−2,825** is #731
-(orphan Relm4 handles) and #732 (the GTK `Msg` bus) deleting code outright —
-that is almost all of the −2,834 booked against `src/gtk/mod.rs` above.
-Convergence proper (#751–#766 actually sharing logic through `render.rs`)
-moved something closer to **900 lines** out of the backends, while
-`render.rs` absorbed roughly **7,000**. State it plainly: the chain did not
-converge anywhere near as much as the raw −3,656/+6,396 pair implies: most of
-the shrinkage is code that was simply dead.
+**Attribution correction (#827, made exact by #792): the −3,656 is mostly
+dead-code removal, not convergence.** The decomposition reconciles exactly against
+the table above — **−2,928** of it is #722–#732 deleting code outright (#731 alone
+`−1,432/+245`; the #732 tranches `−1,837/+83`, `−535/+461`, `−529/+485` in
+`gtk/mod.rs`), leaving **−728** for convergence proper. That is almost all of the
+−2,834 booked against `src/gtk/mod.rs` above. −2,928 + −728 = −3,656; an earlier
+revision of this section put the split at "roughly −2,825" and "closer to 900",
+which does not sum and understates the error. Deleting unreachable code and
+converging duplicated code are different activities and must not be pooled.
+
+**The mechanism, visible in the diff.** Moving a *decision* into `render.rs` leaves
+every *apply* body in place at its original size, now preceded by a
+`MouseDragState`/`ModalOverlayState` literal (30–60 lines per call site) and a
+"#NNN moved this" comment. The `FrameOp`/`EditorOp`/`BottomOp` machinery added three
+enums, three order constants, three composers, three validators and ~150 lines of
+doc. A 12-variant `match` is not shorter than 12 `if` blocks. This is why the chain
+moved logic without shrinking anything.
 
 > **#785 (stage 1 of #47) moved the mass, it did not delete it.** `struct App`,
 > its `impl` blocks and `impl quadraui::ShellApp for App` were hoisted verbatim
@@ -354,10 +374,16 @@ oracle-authored test, rather than re-litigating the sequencing.
   shipped `install_menu_bar` / `show_context_menu` and vimcode adopted neither.
   See the milestone section above for the additive-vs-substitutive rule.
 - ✅ **The oracle loop is live here** (#657) and `draw_frame` is gone (#766).
-- 📉 **The audit is run and it missed its projection** — backends −3,656 against a
-  −8,700…−9,500 projection; the three files net **+2,740** lines. But ~−2,825 of
-  that −3,656 is #731/#732 dead-code removal, not convergence — convergence proper
-  moved roughly **900 lines** out of the backends while `render.rs` absorbed **~7,000**.
+- 📉 **The audit is run and the chain missed by ~12×.** Measured over its own range
+  (`6875315`→`eedebf8`), convergence took **−728** off the backends against a
+  −8,700…−9,500 projection while `render.rs` grew **+5,847** — net **+5,119**, the
+  wrong direction. The −3,656 this section used to headline pooled in **−2,928** of
+  #722–#732 dead-code deletion; the two sum exactly (§ above).
+- 🔎 **And most of what is left is not code.** A function-level audit found **39% of
+  the two backends' 11,673 production lines are comments** — 6,958 are code, of which
+  roughly **2,000 ± 500** are genuinely the same logic written twice. Converging all
+  of it nets **−300 to −1,000** across the three files. **Do not plan a convergence
+  campaign here; the returns are not there.**
 - 🔓 **#47 is open again, in milestone #5.** Its blocker (quadraui#699/#704) closed
   2026-09-03; #811 already ported the TUI side onto the new API. Stage 1 (GTK side)
   is the actual next actionable item — not a re-filing task.
