@@ -3293,3 +3293,628 @@ fn java_lsp_install_command_resolves_on_macos() {
         "java's macOS install command must be set"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #919: registry conformance gate — every manifest resolves an install
+// command on all three platforms
+// ---------------------------------------------------------------------------
+//
+// Turns "every extension has a working install path on every platform" from
+// an unverifiable 38-row checklist (19 extensions × {lsp, dap}) into a test
+// that fails until it's true. `registry_conformance_snapshot()` below is a
+// manual, point-in-time copy of the live registry (fetched from
+// `JDonaghy/vimcode-ext`'s `registry.json`, trimmed to the `lsp`/`dap` fields
+// this gate inspects — 19 extensions, matching the count in issue #919).
+// It is intentionally NOT a live network fetch: tests must be hermetic and
+// deterministic in CI. If the real registry changes, this snapshot needs a
+// matching update — and per this gate's design, a regression introduced by
+// that update fails loudly here instead of shipping silently.
+//
+// IMPORTANT: this snapshot is a distinct, independent copy of registry data
+// from `test_manifests()` above. `test_manifests()`'s `java` entry carries an
+// aspirational `install_macos = "brew install jdtls"` local-only fixup (from
+// the #918 PR) that was never actually deployed to the live
+// `vimcode-ext` registry — confirmed by re-fetching the real registry.json
+// while building this gate. `registry_conformance_snapshot()`'s `java` entry
+// deliberately reflects the *real* live state (no install command anywhere)
+// so this gate's failure/allow-list matches reality, not the other fixture's
+// aspiration.
+fn registry_conformance_snapshot() -> Vec<vimcode_core::core::extensions::ExtensionManifest> {
+    use vimcode_core::core::extensions::*;
+
+    fn lsp(binary: &str, install: &str, linux: &str, macos: &str, windows: &str) -> LspConfig {
+        LspConfig {
+            binary: binary.to_string(),
+            install: install.to_string(),
+            install_linux: linux.to_string(),
+            install_macos: macos.to_string(),
+            install_windows: windows.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn dap(adapter: &str, binary: &str, install: &str) -> DapConfig {
+        DapConfig {
+            adapter: adapter.to_string(),
+            binary: binary.to_string(),
+            install: install.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn manifest(name: &str, lsp: LspConfig, dap: DapConfig) -> ExtensionManifest {
+        ExtensionManifest {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            lsp,
+            dap,
+            ..Default::default()
+        }
+    }
+
+    vec![
+        manifest(
+            "bash",
+            lsp(
+                "bash-language-server",
+                "npm install -g bash-language-server",
+                "",
+                "",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "bicep",
+            lsp(
+                "bicep-langserver",
+                "",
+                r#"mkdir -p ~/.local/bin ~/.local/share/bicep-langserver && DOTNET_MAJOR=$(dotnet --version 2>/dev/null | cut -d. -f1); if [ "$DOTNET_MAJOR" -ge 10 ] 2>/dev/null; then BICEP_TAG=$(curl -s https://api.github.com/repos/Azure/bicep/releases/latest | grep tag_name | cut -d'"' -f4); else BICEP_TAG="v0.39.26"; fi; echo "Installing bicep-langserver $BICEP_TAG (dotnet $DOTNET_MAJOR)"; curl -sL "https://github.com/Azure/bicep/releases/download/$BICEP_TAG/bicep-langserver.zip" -o /tmp/bicep-langserver.zip && unzip -o /tmp/bicep-langserver.zip -d ~/.local/share/bicep-langserver && printf '#!/bin/sh\nexec dotnet ~/.local/share/bicep-langserver/Bicep.LangServer.dll "$@"\n' > ~/.local/bin/bicep-langserver && chmod +x ~/.local/bin/bicep-langserver && rm /tmp/bicep-langserver.zip"#,
+                "brew install bicep && mkdir -p ~/.local/bin && ln -sf $(brew --prefix)/bin/bicep-langserver ~/.local/bin/bicep-langserver",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "cpp",
+            lsp(
+                "clangd",
+                "",
+                "sudo apt-get install -y clangd",
+                "brew install llvm",
+                "",
+            ),
+            dap("codelldb", "codelldb", ""),
+        ),
+        manifest(
+            "csharp",
+            lsp(
+                "csharp-ls",
+                "dotnet tool install -g csharp-ls",
+                "",
+                "",
+                "",
+            ),
+            dap("netcoredbg", "netcoredbg", ""),
+        ),
+        manifest(
+            "git-insights",
+            LspConfig::default(),
+            DapConfig::default(),
+        ),
+        manifest(
+            "go",
+            lsp(
+                "gopls",
+                "go install golang.org/x/tools/gopls@latest",
+                "",
+                "",
+                "",
+            ),
+            dap(
+                "delve",
+                "dlv",
+                "go install github.com/go-delve/delve/cmd/dlv@latest",
+            ),
+        ),
+        manifest(
+            "java",
+            // Real live state (re-verified against the vimcode-ext registry
+            // while building this gate): no install command anywhere. See
+            // the module-level doc comment above for why this differs from
+            // `test_manifests()`'s `java` entry.
+            lsp("jdtls", "", "", "", ""),
+            dap("java-debug", "java-debug-adapter", ""),
+        ),
+        manifest(
+            "javascript",
+            lsp(
+                "typescript-language-server",
+                "npm install -g typescript typescript-language-server",
+                "",
+                "",
+                "",
+            ),
+            dap("js-debug", "node", ""),
+        ),
+        manifest(
+            "latex",
+            lsp(
+                "texlab",
+                "cargo install --git https://github.com/latex-lsp/texlab",
+                "cargo install --git https://github.com/latex-lsp/texlab",
+                "brew install texlab",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "json",
+            lsp(
+                "vscode-json-languageserver",
+                "npm install -g vscode-langservers-extracted",
+                "",
+                "",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "lua",
+            lsp(
+                "lua-language-server",
+                "",
+                r#"mkdir -p ~/.local/share/lua-language-server ~/.local/bin && curl -sL "$(curl -s https://api.github.com/repos/LuaLS/lua-language-server/releases/latest | grep browser_download_url | grep linux-x64.tar.gz | head -1 | cut -d'"' -f4)" | tar xz -C ~/.local/share/lua-language-server && ln -sf ~/.local/share/lua-language-server/bin/lua-language-server ~/.local/bin/lua-language-server"#,
+                "brew install lua-language-server",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "markdown",
+            lsp(
+                "marksman",
+                "",
+                r#"mkdir -p ~/.local/bin && curl -sL "$(curl -s https://api.github.com/repos/artempyanykh/marksman/releases/latest | grep browser_download_url | grep marksman-linux-x64 | head -1 | cut -d'"' -f4)" -o ~/.local/bin/marksman && chmod +x ~/.local/bin/marksman"#,
+                "brew install marksman",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "php",
+            lsp("intelephense", "npm install -g intelephense", "", "", ""),
+            DapConfig::default(),
+        ),
+        manifest(
+            "python",
+            lsp(
+                "pyright-langserver",
+                "npm install -g pyright",
+                "",
+                "",
+                "",
+            ),
+            dap("debugpy", "python", ""),
+        ),
+        manifest(
+            "ruby",
+            lsp("ruby-lsp", "gem install ruby-lsp", "", "", ""),
+            DapConfig::default(),
+        ),
+        manifest(
+            "rust",
+            lsp(
+                "rust-analyzer",
+                "rustup component add rust-analyzer",
+                "",
+                "",
+                "rustup component add rust-analyzer",
+            ),
+            dap("codelldb", "codelldb", ""),
+        ),
+        manifest(
+            "terraform",
+            lsp(
+                "terraform-ls",
+                "",
+                r#"mkdir -p ~/.local/bin && curl -sL "$(curl -s https://api.github.com/repos/hashicorp/terraform-ls/releases/latest | grep browser_download_url | grep linux_amd64.zip | head -1 | cut -d'"' -f4)" -o /tmp/terraform-ls.zip && unzip -o /tmp/terraform-ls.zip terraform-ls -d ~/.local/bin && chmod +x ~/.local/bin/terraform-ls && rm /tmp/terraform-ls.zip"#,
+                "brew install hashicorp/tap/terraform-ls",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "xml",
+            lsp(
+                "lemminx",
+                "",
+                r#"mkdir -p ~/.local/bin && curl -sL "$(curl -s https://api.github.com/repos/eclipse/lemminx/releases/latest | grep browser_download_url | grep linux-x86_64 | grep -v sha256 | head -1 | cut -d'"' -f4)" -o ~/.local/bin/lemminx && chmod +x ~/.local/bin/lemminx"#,
+                r#"mkdir -p ~/.local/bin && curl -sL "$(curl -s https://api.github.com/repos/eclipse/lemminx/releases/latest | grep browser_download_url | grep osx-x86_64 | grep -v sha256 | head -1 | cut -d'"' -f4)" -o ~/.local/bin/lemminx && chmod +x ~/.local/bin/lemminx"#,
+                "",
+            ),
+            DapConfig::default(),
+        ),
+        manifest(
+            "yaml",
+            lsp(
+                "yaml-language-server",
+                "npm install -g yaml-language-server",
+                "",
+                "",
+                "",
+            ),
+            DapConfig::default(),
+        ),
+    ]
+}
+
+/// Which manifest component (`lsp` or `dap`) an allow-list entry covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtComponent {
+    Lsp,
+    Dap,
+}
+
+impl std::fmt::Display for ExtComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExtComponent::Lsp => "lsp",
+            ExtComponent::Dap => "dap",
+        })
+    }
+}
+
+/// A single known-missing (manifest, component, platform) install command.
+/// Every entry names the issue that will remove it — the gate ratchets: this
+/// list only ever shrinks as gaps get filled in, and it is a *request-changes*
+/// to delete an entry without also fixing its manifest (the whole point of
+/// this test).
+struct AllowedGap {
+    manifest: &'static str,
+    component: ExtComponent,
+    platform: vimcode_core::core::extensions::Platform,
+    issue: &'static str,
+}
+
+#[test]
+fn registry_conformance_every_manifest_resolves_install_on_all_platforms() {
+    use vimcode_core::core::extensions::Platform;
+
+    // Confirmed RED against unfixed `develop` before this allow-list existed:
+    // with `ALLOWED_GAPS` emptied out, this test fails with 27 unexpected
+    // gaps (9 lsp + 18 dap) — see the PR description for the itemised list.
+    //
+    // #919 is this issue itself: it introduces the gate and inventories the
+    // debt as of today. Splitting each row below into its own tracking issue
+    // is follow-up filing work for the coordinator (a `gh issue create` step
+    // this worker session cannot perform per its operating rules) — until
+    // that happens every row cites #919 as the issue that will remove it.
+    const ALLOWED_GAPS: &[AllowedGap] = &[
+        // --- lsp: java has no install command anywhere (#918 filled in
+        // macOS only in the *local test fixture*; the live registry was
+        // never updated to match — see `registry_conformance_snapshot`'s
+        // doc comment). ---
+        AllowedGap {
+            manifest: "java",
+            component: ExtComponent::Lsp,
+            platform: Platform::Linux,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "java",
+            component: ExtComponent::Lsp,
+            platform: Platform::MacOS,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "java",
+            component: ExtComponent::Lsp,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        // --- lsp: Windows has no winget/generic equivalent for these
+        // brew-only / curl+mkdir-only installs yet. ---
+        AllowedGap {
+            manifest: "bicep",
+            component: ExtComponent::Lsp,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "cpp",
+            component: ExtComponent::Lsp,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "lua",
+            component: ExtComponent::Lsp,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "markdown",
+            component: ExtComponent::Lsp,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "terraform",
+            component: ExtComponent::Lsp,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "xml",
+            component: ExtComponent::Lsp,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        // --- dap: these six adapters install via `dap_manager.rs`'s
+        // hardcoded fallback table (VSIX/tarball extraction, a managed
+        // venv, or "no automated install" for js-debug/java-debug), never
+        // through the manifest's own `dap.install*` fields. That fallback
+        // table lives outside this issue's file scope
+        // (`src/core/extensions.rs`, `tests/extensions.rs`) — moving it
+        // into the registry data (or otherwise making the manifest
+        // self-describing) is follow-up work, not a `#919` fix-in-place.
+        AllowedGap {
+            manifest: "cpp",
+            component: ExtComponent::Dap,
+            platform: Platform::Linux,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "cpp",
+            component: ExtComponent::Dap,
+            platform: Platform::MacOS,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "cpp",
+            component: ExtComponent::Dap,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "csharp",
+            component: ExtComponent::Dap,
+            platform: Platform::Linux,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "csharp",
+            component: ExtComponent::Dap,
+            platform: Platform::MacOS,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "csharp",
+            component: ExtComponent::Dap,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "java",
+            component: ExtComponent::Dap,
+            platform: Platform::Linux,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "java",
+            component: ExtComponent::Dap,
+            platform: Platform::MacOS,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "java",
+            component: ExtComponent::Dap,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "javascript",
+            component: ExtComponent::Dap,
+            platform: Platform::Linux,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "javascript",
+            component: ExtComponent::Dap,
+            platform: Platform::MacOS,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "javascript",
+            component: ExtComponent::Dap,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "python",
+            component: ExtComponent::Dap,
+            platform: Platform::Linux,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "python",
+            component: ExtComponent::Dap,
+            platform: Platform::MacOS,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "python",
+            component: ExtComponent::Dap,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "rust",
+            component: ExtComponent::Dap,
+            platform: Platform::Linux,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "rust",
+            component: ExtComponent::Dap,
+            platform: Platform::MacOS,
+            issue: "#919",
+        },
+        AllowedGap {
+            manifest: "rust",
+            component: ExtComponent::Dap,
+            platform: Platform::Windows,
+            issue: "#919",
+        },
+    ];
+
+    // A conservative deny-list of Unix-shell-only constructs that `cmd /C`
+    // (the Windows invocation in `lsp_manager.rs`) cannot run. Prose over a
+    // real shell parser: good enough to catch the two ways this repo's
+    // manifests break (a `mkdir -p ...&&...` pipeline, or `curl ... | cut`),
+    // and a real shell parser is more machinery than a deny-list of
+    // substrings that have never once been valid `cmd /C` syntax.
+    const WINDOWS_UNSAFE_SUBSTRINGS: &[&str] = &[
+        "mkdir -p", // cmd's `mkdir` has no `-p` flag
+        "| cut",    // `cut` doesn't exist on Windows
+        "ln -sf",   // symlinking via `ln` doesn't exist on Windows
+        "$(",       // `$(...)` command substitution is shell-only
+        "chmod +x", // no execute bit / `chmod` on Windows
+        "sudo ",    // no `sudo` on Windows
+        "'",        // single-quote quoting is a no-op string in `cmd /C`, not string quoting
+    ];
+
+    let manifests = registry_conformance_snapshot();
+    assert_eq!(
+        manifests.len(),
+        19,
+        "snapshot should mirror the live registry's 19 extensions (#919)"
+    );
+
+    let mut unexpected_gaps: Vec<String> = Vec::new();
+    let mut stale_allowlist_entries: Vec<String> = Vec::new();
+    let mut windows_unsafe: Vec<String> = Vec::new();
+
+    let find_gap = |manifest: &str, component: ExtComponent, platform: Platform| {
+        ALLOWED_GAPS
+            .iter()
+            .find(|g| g.manifest == manifest && g.component == component && g.platform == platform)
+    };
+
+    for m in &manifests {
+        // --- lsp: every manifest that actually ships an LSP server (i.e.
+        // declares a binary) must resolve an install command on all three
+        // platforms. Manifests with no LSP at all (git-insights: Lua
+        // scripts only) are correctly exempt — there is nothing to install.
+        if !m.lsp.binary.is_empty() {
+            for platform in Platform::ALL {
+                let resolves = !m.lsp.install_cmd_for(platform).is_empty();
+                let gap = find_gap(&m.name, ExtComponent::Lsp, platform);
+                match (resolves, gap) {
+                    (false, None) => unexpected_gaps.push(format!(
+                        "{} (lsp) has no install command for {platform} and is not in ALLOWED_GAPS",
+                        m.name
+                    )),
+                    (true, Some(gap)) => stale_allowlist_entries.push(format!(
+                        "{} (lsp/{platform}) is allow-listed under {} but already resolves a \
+                         non-empty install command — remove this ALLOWED_GAPS entry",
+                        m.name, gap.issue
+                    )),
+                    _ => {}
+                }
+
+                if platform == Platform::Windows && resolves {
+                    let cmd = m.lsp.install_cmd_for(platform);
+                    for needle in WINDOWS_UNSAFE_SUBSTRINGS {
+                        if cmd.contains(needle) {
+                            windows_unsafe.push(format!(
+                                "{} (lsp) Windows install command contains Unix-shell-only \
+                                 `{needle}`, which `cmd /C` cannot run: {cmd}",
+                                m.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- dap: every manifest that declares a dap.adapter must resolve
+        // an install command on all three platforms.
+        if !m.dap.adapter.is_empty() {
+            for platform in Platform::ALL {
+                let resolves = !m.dap.install_cmd_for(platform).is_empty();
+                let gap = find_gap(&m.name, ExtComponent::Dap, platform);
+                match (resolves, gap) {
+                    (false, None) => unexpected_gaps.push(format!(
+                        "{} (dap/{}) has no install command for {platform} and is not in \
+                         ALLOWED_GAPS",
+                        m.name, m.dap.adapter
+                    )),
+                    (true, Some(gap)) => stale_allowlist_entries.push(format!(
+                        "{} (dap/{}/{platform}) is allow-listed under {} but already resolves a \
+                         non-empty install command — remove this ALLOWED_GAPS entry",
+                        m.name, m.dap.adapter, gap.issue
+                    )),
+                    _ => {}
+                }
+
+                if platform == Platform::Windows && resolves {
+                    let cmd = m.dap.install_cmd_for(platform);
+                    for needle in WINDOWS_UNSAFE_SUBSTRINGS {
+                        if cmd.contains(needle) {
+                            windows_unsafe.push(format!(
+                                "{} (dap/{}) Windows install command contains Unix-shell-only \
+                                 `{needle}`, which `cmd /C` cannot run: {cmd}",
+                                m.name, m.dap.adapter
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        unexpected_gaps.is_empty(),
+        "registry conformance gate (#919): every manifest must resolve an install command on \
+         every platform unless explicitly allow-listed. Unexpected gaps (not covered by \
+         ALLOWED_GAPS):\n{}",
+        unexpected_gaps.join("\n")
+    );
+    assert!(
+        stale_allowlist_entries.is_empty(),
+        "registry conformance gate (#919): the allow-list only ever shrinks — these entries now \
+         resolve a working install command and must be deleted:\n{}",
+        stale_allowlist_entries.join("\n")
+    );
+    assert!(
+        windows_unsafe.is_empty(),
+        "registry conformance gate (#919): Windows install commands must not use Unix-shell-only \
+         syntax `cmd /C` cannot run:\n{}",
+        windows_unsafe.join("\n")
+    );
+
+    // Sanity check on the allow-list's own bookkeeping: every entry must
+    // reference a manifest that actually exists in the snapshot, so a typo'd
+    // `manifest`/`component` pair can't silently allow-list nothing (and
+    // thus never get exercised by the loop above).
+    for gap in ALLOWED_GAPS {
+        let m = manifests
+            .iter()
+            .find(|m| m.name == gap.manifest)
+            .unwrap_or_else(|| panic!("ALLOWED_GAPS references unknown manifest {}", gap.manifest));
+        match gap.component {
+            ExtComponent::Lsp => assert!(
+                !m.lsp.binary.is_empty(),
+                "ALLOWED_GAPS has an lsp entry for {}, which has no lsp.binary",
+                gap.manifest
+            ),
+            ExtComponent::Dap => assert!(
+                !m.dap.adapter.is_empty(),
+                "ALLOWED_GAPS has a dap entry for {}, which has no dap.adapter",
+                gap.manifest
+            ),
+        }
+    }
+}

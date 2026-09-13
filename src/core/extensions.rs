@@ -130,21 +130,78 @@ pub struct LspConfig {
     pub initialization_options: Option<serde_json::Value>,
 }
 
+// ─── Target platform (testable seam, #919) ────────────────────────────────────
+
+/// A target platform for install-command resolution. Install commands are
+/// naturally platform-specific (`apt`/`brew`/`winget`, `sh -c` vs `cmd /C`);
+/// this type makes "which platform" an explicit parameter passed to
+/// `install_cmd_for` instead of a `cfg!` baked into the compiled binary, so a
+/// single test run can assert every manifest resolves an install command on
+/// *all three* platforms regardless of which one the test binary happens to
+/// be compiled for. See the registry conformance gate in `tests/extensions.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Platform {
+    Linux,
+    MacOS,
+    Windows,
+}
+
+impl Platform {
+    /// All platforms vimcode ships a backend for, in a stable order.
+    pub const ALL: [Platform; 3] = [Platform::Linux, Platform::MacOS, Platform::Windows];
+
+    /// The platform this binary was actually compiled for — what
+    /// `install_cmd_for_platform()` resolves against by default.
+    pub fn host() -> Platform {
+        #[cfg(target_os = "windows")]
+        {
+            Platform::Windows
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Platform::MacOS
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            Platform::Linux
+        }
+    }
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Platform::Linux => "linux",
+            Platform::MacOS => "macos",
+            Platform::Windows => "windows",
+        })
+    }
+}
+
 impl LspConfig {
-    /// Return the install command for the current platform.
+    /// Return the install command for the current (host) platform.
     /// Prefers the platform-specific field; falls back to the generic `install` field.
     /// Applies known fixups (e.g. rust-analyzer falls back to `rustup component add`
     /// when rustup is available, since `cargo install rust-analyzer` compiles
     /// from source and is slow).
     pub fn install_cmd_for_platform(&self) -> &str {
-        self.install_cmd_with(rustup_on_path())
+        self.install_cmd_for(Platform::host())
     }
 
-    /// Inner helper for `install_cmd_for_platform`, parameterised over rustup
+    /// Same as `install_cmd_for_platform`, but for an explicitly-named
+    /// platform rather than the one this binary happens to be compiled for.
+    /// This is the seam the #919 registry conformance test uses to check a
+    /// manifest resolves an install command on all three platforms from a
+    /// single (any-OS) test binary.
+    pub fn install_cmd_for(&self, platform: Platform) -> &str {
+        self.install_cmd_with(platform, rustup_on_path())
+    }
+
+    /// Inner helper for `install_cmd_for`, parameterised over rustup
     /// availability so the fixup can be tested without depending on the host's
     /// PATH.
-    fn install_cmd_with(&self, rustup_available: bool) -> &str {
-        let raw = self.platform_install_cmd_raw();
+    fn install_cmd_with(&self, platform: Platform, rustup_available: bool) -> &str {
+        let raw = self.platform_install_cmd_raw(platform);
         // rust-analyzer: prefer `rustup component add` over `cargo install`.
         // Anyone with a Rust toolchain has rustup; the component is a
         // ~30-second binary download vs the ~10-minute source build.
@@ -154,16 +211,17 @@ impl LspConfig {
         raw
     }
 
-    fn platform_install_cmd_raw(&self) -> &str {
-        let platform = platform_install_field(
+    fn platform_install_cmd_raw(&self, platform: Platform) -> &str {
+        let platform_field = platform_install_field(
+            platform,
             &self.install_linux,
             &self.install_macos,
             &self.install_windows,
         );
-        if platform.is_empty() {
+        if platform_field.is_empty() {
             &self.install
         } else {
-            platform
+            platform_field
         }
     }
 }
@@ -210,38 +268,41 @@ pub struct DapConfig {
 }
 
 impl DapConfig {
-    /// Return the install command for the current platform.
+    /// Return the install command for the current (host) platform.
     /// Prefers the platform-specific field; falls back to the generic `install` field.
     pub fn install_cmd_for_platform(&self) -> &str {
-        let platform = platform_install_field(
+        self.install_cmd_for(Platform::host())
+    }
+
+    /// Same as `install_cmd_for_platform`, but for an explicitly-named
+    /// platform. See `LspConfig::install_cmd_for` / `Platform` for why this
+    /// seam exists (#919).
+    pub fn install_cmd_for(&self, platform: Platform) -> &str {
+        let platform_field = platform_install_field(
+            platform,
             &self.install_linux,
             &self.install_macos,
             &self.install_windows,
         );
-        if platform.is_empty() {
+        if platform_field.is_empty() {
             &self.install
         } else {
-            platform
+            platform_field
         }
     }
 }
 
-/// Pick the install command string for the current OS.
-fn platform_install_field<'a>(linux: &'a str, macos: &'a str, windows: &'a str) -> &'a str {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (linux, macos);
-        windows
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (linux, windows);
-        macos
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = (macos, windows);
-        linux
+/// Pick the install command string for the given platform.
+fn platform_install_field<'a>(
+    platform: Platform,
+    linux: &'a str,
+    macos: &'a str,
+    windows: &'a str,
+) -> &'a str {
+    match platform {
+        Platform::Linux => linux,
+        Platform::MacOS => macos,
+        Platform::Windows => windows,
     }
 }
 
@@ -324,7 +385,7 @@ pub fn prereq_install_cmd(dep: &str) -> Option<&'static str> {
     PREREQ_INSTALLS
         .iter()
         .find(|(name, _)| *name == dep)
-        .map(|(_, t)| platform_install_field(t.linux, t.macos, t.windows))
+        .map(|(_, t)| platform_install_field(Platform::host(), t.linux, t.macos, t.windows))
 }
 
 impl ExtensionManifest {
@@ -549,7 +610,7 @@ binary = "test-lsp"
             ..Default::default()
         };
         assert_eq!(
-            cfg.install_cmd_with(true),
+            cfg.install_cmd_with(Platform::host(), true),
             "rustup component add rust-analyzer"
         );
     }
@@ -563,7 +624,10 @@ binary = "test-lsp"
             install: "cargo install rust-analyzer".to_string(),
             ..Default::default()
         };
-        assert_eq!(cfg.install_cmd_with(false), "cargo install rust-analyzer");
+        assert_eq!(
+            cfg.install_cmd_with(Platform::host(), false),
+            "cargo install rust-analyzer"
+        );
     }
 
     #[test]
@@ -581,7 +645,9 @@ binary = "test-lsp"
         };
         // The platform-specific field is selected (not the cargo command),
         // so the fixup does not match `starts_with("cargo install")`.
-        assert!(!cfg.install_cmd_with(true).starts_with("rustup"));
+        assert!(!cfg
+            .install_cmd_with(Platform::host(), true)
+            .starts_with("rustup"));
     }
 
     #[test]
@@ -593,8 +659,48 @@ binary = "test-lsp"
             ..Default::default()
         };
         assert_eq!(
-            cfg.install_cmd_with(true),
+            cfg.install_cmd_with(Platform::host(), true),
             "cargo install some-other-server"
         );
+    }
+
+    #[test]
+    fn install_cmd_for_resolves_explicit_platform_regardless_of_host() {
+        // #919: the whole point of `install_cmd_for(Platform)` is that a
+        // test running on any host OS can ask "what would this resolve to
+        // on Windows/macOS/Linux specifically" — not just "what does it
+        // resolve to on the OS I happen to be compiled for".
+        let cfg = LspConfig {
+            binary: "clangd".to_string(),
+            install_linux: "sudo apt-get install -y clangd".to_string(),
+            install_macos: "brew install llvm".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.install_cmd_for(Platform::Linux),
+            "sudo apt-get install -y clangd"
+        );
+        assert_eq!(cfg.install_cmd_for(Platform::MacOS), "brew install llvm");
+        // No install_windows and no generic `install` fallback set → empty.
+        assert_eq!(cfg.install_cmd_for(Platform::Windows), "");
+    }
+
+    #[test]
+    fn dap_install_cmd_for_resolves_explicit_platform() {
+        let cfg = DapConfig {
+            adapter: "netcoredbg".to_string(),
+            install_linux: "sudo apt-get install -y netcoredbg".to_string(),
+            install_windows: "winget install netcoredbg".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.install_cmd_for(Platform::Linux),
+            "sudo apt-get install -y netcoredbg"
+        );
+        assert_eq!(
+            cfg.install_cmd_for(Platform::Windows),
+            "winget install netcoredbg"
+        );
+        assert_eq!(cfg.install_cmd_for(Platform::MacOS), "");
     }
 }
