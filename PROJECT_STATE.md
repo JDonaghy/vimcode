@@ -1,6 +1,50 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected). Prior revisions: September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 14, 2026 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change). Prior revisions: September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #970 — the two "failing" GTK click-geometry tests are the #926/#933 Darwin font divergence, already documented; no fix needed
+
+#970 reported `gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`
+and `gtk::testing::tests::window_split_divider_drag_repaints_the_line_at_the_new_position`
+red on a clean `develop` checkout, on an `aarch64-apple-darwin` host with Homebrew
+gtk4 4.22.4, and asked (a) whether CI (Linux) is also red, and (b) whether this
+is a GTK-side instance of the #967 paint/hit-test `line_height`-disagreement bug
+family.
+
+**Reproduced on this session's Linux host** (`ubuntu`-class WSL2, headless, no
+`DISPLAY`/`WAYLAND_DISPLAY` — matches CI's `runs-on: ubuntu-24.04`, no display,
+default features so `gui` is on): `cargo test --features gui --lib
+gtk::testing::` is **141 passed, 0 failed**, including both named tests, both
+single-threaded and default-parallel, across 5 repeated runs — solidly green,
+not a flake.
+
+**Both open questions are already answered — by #926/#933, which landed two
+days before this issue was filed (2026-09-12, before #970 was reported against
+`adb88bb`):** `docs/PLATFORM_CONFORMANCE.md`'s macOS section names these exact
+two tests (plus a third, `chrome_paint_tests::window_control_buttons_are_visible_against_their_background_in_every_theme`)
+as failing on a real Darwin/Homebrew-gtk4 box and gives the root cause: **on
+Quartz, Pangocairo rasterises via Core Text rather than FreeType, so glyph ink
+and colour compositing differ from the Linux baseline these pixel-probe tests
+were written against.** That is a rendering-*input* difference (which font
+backend paints the glyphs), not a metrics-*disagreement* bug — unlike #967,
+where two code paths computed `line_height` differently for the same paint,
+here every assertion already reads its expected geometry off the same frame
+it's checking (`h.painted_line_height()`, `h.painted_char_width()`, the
+divider's own read-back colour) rather than a hardcoded value, and there is no
+second, disagreeing code path to fix. `scripts/platform-conformance.sh`
+already encodes this as policy: the `gtk` lane is `skipped
+(opt-in on Darwin...)` by default specifically because of this divergence,
+and forcing it with `--lane gtk` reproduces the three failures without "fixing"
+them, by design.
+
+**Conclusion: no code change.** The suite is not broken as a Linux/CI gate for
+GTK click geometry (140→141 passed reflects #950's new glyph test, still 0
+failed) — it only ever fails on the Darwin GTK lane, which was already known,
+already investigated, already documented with the correct root cause, and
+already excluded from the default run before #970 was filed. Nothing under
+`src/gtk/` or `src/core/` needed touching; this PR is documentation only (a
+cross-reference in `PROJECT_STATE.md`), which is why no driver-tier test
+accompanies it.
 
 ## #950 — TUI-as-second-ShellApp convergence: decomposition written, cheap wins landed
 
