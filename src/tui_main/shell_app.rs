@@ -7755,18 +7755,50 @@ mod tests {
     /// through the real driver, still reaches the painted screen — i.e. the
     /// `shell_command()` seam didn't break the existing user-visible
     /// behaviour on the platform these tests actually run on.
+    ///
+    /// **Asserts on the marker's painted *row*, not merely `screen.contains`.**
+    /// The first version of this test passed `"!echo ..."` without the leading
+    /// `:`, so `run_ex_command` (which types from whatever mode the driver is
+    /// in, and does *not* itself enter command-line mode) never reached the ex
+    /// parser at all: on the empty `new_for_test` buffer the `!`/`e`/`c`/`h`
+    /// chain degenerated to no-op motions, `o` opened a line in Insert mode,
+    /// and the rest of the string was typed into the **document** as literal
+    /// text — so a bare `contains` went green with no process ever spawned and
+    /// stayed green with the `execute.rs` fix fully reverted. Pinning the hit
+    /// to the last row (the command line, where `Engine::message` paints) is
+    /// what makes this test able to fail: buffer text cannot land there.
+    ///
+    /// **Verified RED:** with `execute.rs`'s `:!` branch reverted to a
+    /// hardcoded shell literal that does not resolve (`Command::new("sh-948-\
+    /// nonexistent")` — precisely the #948 bug shape, since Windows has no
+    /// `sh` on `PATH`), this test fails on the `find` panic. The pre-fix
+    /// no-colon version of this same test passed GREEN against that identical
+    /// breakage, which is what made it a false positive.
     #[test]
     fn bang_command_shell_output_paints_on_command_line_via_shell_app() {
+        const HEIGHT: u16 = 24;
         let app = TuiShellApp::new_for_test();
-        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
 
-        run_ex_command(&mut driver, "!echo ZQXW_948_BANG_MARKER");
+        // Leading `:` is load-bearing — it is what enters command-line mode so
+        // the rest reaches the ex parser's `:!` branch (matching every sibling
+        // `run_ex_command` call site in this file).
+        run_ex_command(&mut driver, ":!echo ZQXW_948_BANG_MARKER");
 
         let screen = driver.screen();
-        assert!(
-            screen.contains("ZQXW_948_BANG_MARKER"),
-            "`:!echo ...` must run through shell_command() and paint its \
-             stdout on the command line; screen:\n{screen}"
+        let (_, y) = driver.find("ZQXW_948_BANG_MARKER").unwrap_or_else(|| {
+            panic!(
+                "`:!echo ...` must run through shell_command() and paint its \
+                 stdout on the command line; screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "`:!` stdout must paint on the command line (last row), not in \
+             the document body — a hit anywhere else means the keystrokes \
+             were swallowed as normal/insert-mode edits instead of reaching \
+             the ex `:!` branch; screen:\n{screen}"
         );
     }
 
