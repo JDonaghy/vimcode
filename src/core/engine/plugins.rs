@@ -423,8 +423,9 @@ impl Engine {
             self.async_shell_tasks.insert(req.callback_event, rx);
             std::thread::spawn(move || {
                 use std::process::{Command, Stdio};
-                let mut cmd = Command::new("sh");
-                cmd.arg("-c").arg(&req.command);
+                let (shell, flag) = shell_command();
+                let mut cmd = Command::new(shell);
+                cmd.arg(flag).arg(&req.command);
                 if let Some(ref cwd) = req.cwd {
                     cmd.current_dir(cwd);
                 }

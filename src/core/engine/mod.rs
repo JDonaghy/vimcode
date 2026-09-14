@@ -32,7 +32,7 @@ use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionSt
 use super::settings::{EditorMode, Settings};
 use super::syntax::Syntax;
 use super::tab::{Tab, TabId};
-use super::terminal::{default_shell, InstallContext};
+use super::terminal::{default_shell, shell_command, InstallContext};
 use super::view::{FoldRegion, View};
 use super::vim_regex;
 use super::window::{

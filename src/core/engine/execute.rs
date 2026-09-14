@@ -1439,8 +1439,9 @@ impl Engine {
                 self.message = "Usage: :!command".to_string();
                 return EngineAction::None;
             }
-            match std::process::Command::new("sh")
-                .arg("-c")
+            let (shell, flag) = shell_command();
+            match std::process::Command::new(shell)
+                .arg(flag)
                 .arg(shell_cmd)
                 .output()
             {
@@ -1479,8 +1480,9 @@ impl Engine {
                     self.message = "Usage: :r !command".to_string();
                     return EngineAction::None;
                 }
-                match std::process::Command::new("sh")
-                    .arg("-c")
+                let (shell, flag) = shell_command();
+                match std::process::Command::new(shell)
+                    .arg(flag)
                     .arg(shell_cmd)
                     .output()
                 {

@@ -674,9 +674,91 @@ fn test_echo_empty_clears_message() {
 
 #[test]
 fn test_shell_command_shows_output() {
+    // Shares `SHELL_ENV_LOCK` with `test_bang_command_honours_shell_env_var`
+    // below: that test points process-global `$SHELL` at a fake shell for
+    // its duration, which would otherwise race this test's `:!` (both run
+    // in the same test binary, in parallel, by default).
+    let _lock = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut e = engine_with("hello\n");
     exec(&mut e, "!echo test_output");
     assert!(e.message.contains("test_output"));
+}
+
+/// #948: `:!` used to hardcode `Command::new("sh")`, ignoring `$SHELL`
+/// entirely (and having no Windows leg at all — `sh` doesn't exist there).
+/// Point `$SHELL` at a fake shell script that unconditionally prints a
+/// marker regardless of the command string it's handed, then run `:!` with
+/// a *different* command. If `:!` really resolves the shell binary through
+/// quadraui's `shell_command()` seam (as fixed), the fake shell runs and the
+/// marker shows up in the output instead of the real command's output.
+/// Verified RED against unfixed develop: reverting #948's `execute.rs`
+/// change back to `Command::new("sh")` makes this fail because a real `sh`
+/// ignores `$SHELL` and runs `echo real_sh_output` literally, never
+/// producing the marker.
+#[test]
+#[cfg(unix)]
+fn test_bang_command_honours_shell_env_var() {
+    let _lock = SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = std::env::temp_dir().join(format!("vimcode_test_fake_shell_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create fake-shell temp dir");
+    let script = dir.join("fake_shell.sh");
+    std::fs::write(&script, "#!/bin/sh\necho FAKE_SHELL_MARKER\n").expect("write fake shell");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script)
+            .expect("stat fake shell")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod fake shell");
+    }
+
+    let _guard = EnvVarGuard::set("SHELL", script.as_os_str());
+
+    let mut e = engine_with("hello\n");
+    exec(&mut e, "!echo real_sh_output");
+    assert!(
+        e.message.contains("FAKE_SHELL_MARKER"),
+        "expected :! to resolve the shell via $SHELL (fake shell script), got: {:?}",
+        e.message
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serializes tests in this file that mutate the process-global `$SHELL`
+/// env var (shared with every other test in this binary), and an RAII guard
+/// that restores the prior value on drop — including on panic. Mirrors the
+/// pattern in `tests/extensions.rs`'s `HOMEBREW_ENV_LOCK`/`EnvVarGuard`.
+static SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Only ever constructed by `test_bang_command_honours_shell_env_var` above,
+// which is itself `#[cfg(unix)]`-gated — gate the whole type the same way so
+// a non-unix build doesn't carry an unused struct + `Drop` impl.
+#[cfg(unix)]
+struct EnvVarGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let old = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 // ── ignorecase / smartcase ──────────────────────────────────────────────────
