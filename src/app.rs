@@ -1092,7 +1092,7 @@ impl App {
     /// non-GTK quadraui backend calls to get the *same* `App`, and therefore
     /// the same `impl ShellApp`, the GTK entry point runs.
     ///
-    /// This is [`App::new`] minus exactly two steps in its prologue that
+    /// This is [`App::new`] minus exactly three steps in its prologue that
     /// need a live GTK display, each of which is a platform *resource*
     /// rather than a decision:
     ///
@@ -1109,8 +1109,26 @@ impl App {
     /// portable equivalent here, since `Engine::check_settings_reload`'s
     /// mtime poll (already the sole mechanism on TUI) now runs from the
     /// shared `handle_poll_tick`, which both constructors' `App`s reach via
-    /// `ShellApp::tick`. That closes this gap for `new_portable`'s callers
-    /// (macOS, Win-GUI) for free — nothing needed adding here at all.
+    /// `ShellApp::tick`. That closes this gap **for macOS** for free —
+    /// nothing needed adding here at all — because quadraui's
+    /// `macos::run` keeps the same `IDLE_POLL_CEILING` (250ms) idle-tick
+    /// fallback GTK does (quadraui#940's `idlePollTick:` timer).
+    ///
+    /// **Win-GUI is only half-fixed, per the very doc this claim leans
+    /// on** (quadraui#832/#940's `AppLogic::tick` table, `runner.rs`):
+    /// Windows gets *no* idle-poll fallback at all — `tick` there only
+    /// runs after a batch of native events or an explicit
+    /// `RedrawAfter`/`request_frame_in` ask, neither of which this diff
+    /// arranges. So a future Win-GUI backend picks up an
+    /// externally-edited `settings.json` while the user is actively
+    /// generating native events (typing, moving the mouse), but not while
+    /// the app sits idle — the exact "edit settings.json externally, come
+    /// back to it" scenario hot-reload exists for. Whoever builds the
+    /// Win-GUI backend (quadraui#19–#31) needs an explicit periodic
+    /// `RedrawAfter`/`request_frame_in` nudge for this to work there the
+    /// way it does on GTK/macOS/TUI; there is no such backend in this
+    /// repo yet, so this is not a live regression today, only a caveat
+    /// for that future work.
     ///
     /// **`install_bundled_icon_font()` is *not* in that skipped list (#920).**
     /// It used to be — `App::new` called it and this constructor didn't, so
@@ -8204,5 +8222,75 @@ mod portable_entry_point_tests {
         );
         assert_eq!(cfg.min_sidebar_width, render::ALT_SIDEBAR_WIDTH_MIN as f32);
         assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);
+    }
+
+    /// #949 review: makes the "closes the macOS/Win-GUI settings hot-reload
+    /// gap for free" claim testable. `handle_poll_tick` used to be reached
+    /// only via a GTK-only `gio::FileMonitor` callback
+    /// (`DeferredAction::SettingsFileChanged`, now deleted); it now calls
+    /// `settings_file_changed` — and so `Engine::check_settings_reload`'s
+    /// portable mtime poll — unconditionally, every tick, for every GUI
+    /// backend `App` serves (this constructor is the backend-neutral one:
+    /// see `App::new_headless`'s doc). This drives that exact call site
+    /// directly against a real `App` + `Engine`, pointed at a private temp
+    /// file via `core::settings::TestSettingsPathGuard` (see that type's
+    /// doc for why a thread-local override, not a `$HOME` mutation — the
+    /// seam this test needed and the codebase didn't have before this fix
+    /// round), and asserts the reload actually took: `line_numbers` moves
+    /// from the constructor's default (`None`) to what the on-disk file
+    /// says (`Absolute`) purely from calling `handle_poll_tick()`, with no
+    /// `DeferredAction`/file-monitor callback involved anywhere.
+    ///
+    /// This is a state assertion, not a painted-pixel one — CLAUDE.md's
+    /// "assert on rendered output, not state" rule exists to catch a paint
+    /// path that never reads the state it populates (#587/#592). That
+    /// specific failure mode doesn't apply here: `check_settings_reload`
+    /// mutates `engine.settings` directly, and every frame already reads
+    /// `engine.settings` (colorscheme, the line-number gutter, tabstop,
+    /// …) — there is no separate "did the paint path get wired up"
+    /// question left to ask, only "did the poll fire", which this answers
+    /// unambiguously. A genuine pixel-level check — repaint via
+    /// `GtkDriver` after the reload and assert the gutter appears — needs
+    /// `GtkDriver`/`ConformanceDriver` to expose a way to pump
+    /// `AppLogic::tick` headlessly; as of this repo's pinned quadraui rev
+    /// neither does (`GtkDriver` has no `tick()`/mutable-`Backend`
+    /// accessor, unlike `quadraui::tui::testing::TuiDriver::tick()` —
+    /// confirmed by reading `quadraui/src/gtk/testing.rs` and
+    /// `quadraui/src/testing/mod.rs::ConformanceDriver` at the pinned rev;
+    /// this repo's own `crate::gtk::testing` module doc already says as
+    /// much: "No main loop. `tick()` is never pumped by the driver.").
+    /// Adding that pump is quadraui-side test infrastructure, not a
+    /// vimcode backend fix, so per CLAUDE.md's Platform-Neutrality Rule it
+    /// belongs in a quadraui issue, not a vimcode-side workaround.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn handle_poll_tick_reloads_settings_changed_on_disk() {
+        use crate::core::settings::{LineNumberMode, TestSettingsPathGuard};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "vimcode_test_949_handle_poll_tick_{:?}.json",
+            std::thread::current().id()
+        ));
+        std::fs::write(&tmp, r#"{"line_numbers":"Absolute"}"#).expect("write temp settings.json");
+        let _guard = TestSettingsPathGuard::install(tmp.clone());
+
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        assert_eq!(
+            engine.borrow().settings.line_numbers,
+            LineNumberMode::None,
+            "precondition: the constructor's default must differ from the \
+             on-disk value, or a reload would be indistinguishable from a no-op"
+        );
+        let mut app = App::new_headless(Rc::clone(&engine));
+
+        app.handle_poll_tick();
+
+        assert_eq!(
+            engine.borrow().settings.line_numbers,
+            LineNumberMode::Absolute,
+            "handle_poll_tick did not pick up the externally-edited settings file"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
