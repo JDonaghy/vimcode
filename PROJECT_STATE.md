@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#949 — GTK-only settings-reload watcher deleted). Prior revisions: September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 14, 2026 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected). Prior revisions: September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
 
 ## #949 — GTK's `gio::FileMonitor` settings watcher deleted; mtime poll is now the sole reload mechanism
 
@@ -15,8 +15,7 @@ Fixed: deleted the `gio::FileMonitor`, the `settings_monitor` field, the
 path entirely. `App::handle_poll_tick` (shared by every GUI entry point,
 GTK/macOS/Win-GUI alike, since it's called from the portable
 `tick_dispatch`) now calls `settings_file_changed` — and so
-`check_settings_reload` — every tick, closing the macOS/Win-GUI gap for
-free with no per-backend code.
+`check_settings_reload` — every tick.
 
 Cadence check (the issue's "confirm first"): quadraui's GTK/macOS idle-poll
 tick fallback is a 250ms ceiling (`runner.rs`'s `ShellApp::tick` doc,
@@ -24,17 +23,57 @@ quadraui#832) — same order of magnitude as the old watcher's near-immediate
 `ChangesDoneHint`, and identical to what TUI has always shipped with no
 complaints. No poll-frequency tightening needed.
 
-Pure internal mechanism swap, but user-visible (hot-reload lag is a UX
-property) — no driver-tier test added: `check_settings_reload`'s own
-behavior (self-save suppression, `Settings::load_with_validation`) is
-already covered where it lives in `core/engine`, and the GTK/TUI driver
-harnesses don't model real filesystem mtime changes across ticks, so there
-was nothing new to assert on that the existing coverage didn't already
-reach through `check_settings_reload` itself. Manual verification only
-(see the PR's SMOKE_TESTS).
+**"Closes the macOS/Win-GUI gap for free" — corrected, review round 1.**
+That claim is only half true. quadraui's `AppLogic::tick` doc
+(quadraui#832/#940, `runner.rs`) gives macOS the same 250ms
+`IDLE_POLL_CEILING` idle-poll fallback GTK has, so macOS really is fixed
+for free. **Windows gets no idle-poll fallback at all** — `tick` there
+only runs after native-event batches or an explicit
+`RedrawAfter`/`request_frame_in` ask, and nothing in this diff arranges
+either. A future Win-GUI backend would only pick up an externally-edited
+`settings.json` while the user is actively generating native events, not
+while the app sits idle — not the full fix the original claim implied.
+Not a live regression (no Win-GUI backend exists in this repo yet), but
+whoever builds one (quadraui#19–#31) needs to arrange an explicit
+periodic nudge for hot-reload to work there. Corrected in `src/app.rs`'s
+`new_portable` doc table and here.
+
+**Driver-tier test — added, review round 1.** Round 1 review rightly
+rejected "pure internal mechanism swap... no driver-tier test added" as
+self-contradictory: the PR itself says the change is user-visible
+(hot-reload lag is a UX property), and CLAUDE.md's black-box-coverage bar
+only exempts a *claimed* pure refactor, not a "hard to test" excuse.
+Added `src/app.rs::portable_entry_point_tests::
+handle_poll_tick_reloads_settings_changed_on_disk` — constructs a real
+`App` via `App::new_headless`, points `Settings::settings_file_path()` at
+a private temp file via the new `core::settings::TestSettingsPathGuard`
+(thread-local override, not a `$HOME` mutation — parallel-test-safe,
+unlike env-var mutation would be), calls `handle_poll_tick()` directly
+(the exact call site that changed), and asserts `engine.settings`
+actually picked up the on-disk edit.
+
+That test asserts on engine state, not painted pixels — CLAUDE.md's
+"assert on rendered output, not state" rule (from #587/#592) targets a
+*different* failure mode than applies here: a paint path that populates
+state nothing ever reads. That's not in question for `check_settings_reload`
+— every frame already reads `engine.settings` for colorscheme, the
+line-number gutter, tabstop, etc. — so "did the poll fire" is the only
+open question, and the added test answers it directly. A true
+pixel-level check (repaint via `GtkDriver` after the reload, assert the
+gutter changed) is currently **blocked by a quadraui gap, not a vimcode
+one**: neither `GtkDriver` nor the backend-neutral `ConformanceDriver`
+expose a way to pump `AppLogic::tick` headlessly in this repo's pinned
+quadraui rev (`GtkDriver` has no `tick()`/mutable-`Backend` accessor,
+unlike `quadraui::tui::testing::TuiDriver::tick()` — confirmed by reading
+the pinned rev's `quadraui/src/gtk/testing.rs` and
+`quadraui/src/testing/mod.rs`). Per the Platform-Neutrality Rule, adding
+that pump is quadraui-side test infrastructure, so it belongs in a
+quadraui issue (**not yet filed** — this worker cannot open GitHub issues;
+flagging here for whoever can) rather than a vimcode-side workaround.
 
 Verified: `cargo build`/`cargo clippy -- -D warnings`/`cargo clippy
---no-default-features -- -D warnings`/`cargo fmt --check` all clean.
+--no-default-features -- -D warnings`/`cargo fmt --check` all clean, plus
+the new test passing under `cargo test --lib`.
 
 ## #862 — `src/app.rs` compiles without `gui` (prerequisite for #859)
 

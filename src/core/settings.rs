@@ -14,6 +14,42 @@ pub fn save_revision() -> u64 {
     SAVE_REVISION.load(Ordering::Acquire)
 }
 
+/// Test-only seam (#949 review) — see [`Settings::settings_file_path`]'s
+/// doc for why this is a thread-local rather than a `$HOME` mutation.
+#[cfg(test)]
+thread_local! {
+    static TEST_SETTINGS_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII installer for the [`Settings::settings_file_path`] test override —
+/// mirrors `crate::test_cwd::CwdReadGuard`/`crate::test_paint::PaintGuard`'s
+/// "acquire on construct, restore on `Drop`" shape, so a test that panics
+/// mid-assertion still clears the thread-local instead of leaking the
+/// override into whatever other `#[test]` fn Rust's runner schedules next
+/// on the same pooled thread.
+#[cfg(test)]
+pub(crate) struct TestSettingsPathGuard {
+    _private: (),
+}
+
+#[cfg(test)]
+impl TestSettingsPathGuard {
+    /// Point `settings_file_path()` at `path` for the calling test thread
+    /// only until the returned guard drops.
+    pub(crate) fn install(path: PathBuf) -> Self {
+        TEST_SETTINGS_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
+        Self { _private: () }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSettingsPathGuard {
+    fn drop(&mut self) {
+        TEST_SETTINGS_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Which editing paradigm the editor uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -1623,7 +1659,28 @@ impl Settings {
         Ok(())
     }
 
+    /// Where `settings.json` lives — `~/.config/vimcode/settings.json`
+    /// (or the platform equivalent, see [`super::paths::vimcode_config_dir`]).
+    ///
+    /// Under `#[cfg(test)]`, a per-thread override installed via
+    /// [`TestSettingsPathGuard::install`] takes priority when set (#949
+    /// review).
+    /// This is a `thread_local`, not a `$HOME` env-var mutation, precisely
+    /// because `std::env::set_var` is process-global: Rust's default test
+    /// runner executes tests in parallel on multiple threads within the
+    /// same process, so mutating `$HOME` from one test would race every
+    /// other concurrently-running test that (transitively, via
+    /// `Engine::new`/`check_settings_reload`) also resolves this path.
+    /// A thread-local override carries no such risk — each test thread
+    /// gets its own slot — and needs no `serial_test`/lock discipline this
+    /// codebase doesn't otherwise have.
     pub fn settings_file_path() -> PathBuf {
+        #[cfg(test)]
+        {
+            if let Some(p) = TEST_SETTINGS_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+                return p;
+            }
+        }
         super::paths::vimcode_config_dir().join("settings.json")
     }
 
