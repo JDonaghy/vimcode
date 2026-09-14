@@ -2213,7 +2213,7 @@ impl Engine {
             }
             "v" if ctrl => {
                 // Paste clipboard into picker query
-                if let Some(text) = Self::clipboard_paste() {
+                if let Some(text) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
                     // Take first line only, strip control chars
                     let line = text.lines().next().unwrap_or("");
                     for c in line.chars() {

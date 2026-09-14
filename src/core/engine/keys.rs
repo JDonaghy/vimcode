@@ -7038,16 +7038,7 @@ impl Engine {
         }
         // --- Ctrl-V: paste from clipboard ---
         if ctrl && key_name == "v" && !self.history_search_active {
-            if let Some(text) = Self::clipboard_paste() {
-                let line = text.lines().next().unwrap_or("");
-                for ch in line.chars() {
-                    if !ch.is_control() {
-                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
-                        self.command_buffer.insert(byte_off, ch);
-                        self.command_cursor += 1;
-                    }
-                }
-            }
+            self.paste_clipboard_to_input();
             return EngineAction::None;
         }
 
@@ -7395,19 +7386,7 @@ impl Engine {
         }
         // Ctrl-V: paste from clipboard
         if ctrl && key_name == "v" {
-            if let Some(text) = Self::clipboard_paste() {
-                let line = text.lines().next().unwrap_or("");
-                for ch in line.chars() {
-                    if !ch.is_control() {
-                        let byte_off = cmd_char_to_byte(&self.command_buffer, self.command_cursor);
-                        self.command_buffer.insert(byte_off, ch);
-                        self.command_cursor += 1;
-                    }
-                }
-                if self.settings.incremental_search {
-                    self.perform_incremental_search();
-                }
-            }
+            self.paste_clipboard_to_input();
             return;
         }
         match key_name {
@@ -9402,7 +9381,6 @@ impl Engine {
     /// Paste the first line from the system clipboard into the command buffer.
     /// Works in Command and Search modes. For Search mode with incremental search,
     /// also triggers a search update.
-    #[allow(dead_code)]
     pub fn paste_clipboard_to_input(&mut self) {
         let text = match self.clipboard_read {
             Some(ref cb_read) => match cb_read() {
@@ -9454,6 +9432,18 @@ impl Engine {
             } else if !text.is_empty() {
                 self.terminal_paste(text);
             }
+            return;
+        }
+
+        // Find/replace overlay. Checked ahead of `picker_open` — same
+        // relative priority `Engine::handle_key` gives the two overlays
+        // (`find_replace_open` is tested before `picker_open` there too;
+        // #946 discovery: this branch used to be entirely missing, so
+        // Ctrl+V while the overlay was open fell through to the
+        // `Mode::Normal` arm below and pasted into the editor buffer
+        // instead of the focused query/replacement field).
+        if self.find_replace_open {
+            self.find_replace_paste(text);
             return;
         }
 
