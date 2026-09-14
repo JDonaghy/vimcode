@@ -6171,15 +6171,23 @@ impl App {
     /// Show the shared folder/workspace picker modal (#815).
     ///
     /// Before #815 this opened a *native* `gtk4::FileDialog` in
-    /// "select folder" mode: `quadraui::PlatformServices` has no
+    /// "select folder" mode: at the time, `quadraui::PlatformServices` had no
     /// directory-select primitive (only `show_file_open_dialog` /
     /// `show_file_save_dialog`, both file pickers), so a native chooser was
-    /// the only option at the time. `quadraui::FolderPickerController`
-    /// (shipped 2026-05-25, quadraui#166) makes that escape hatch
-    /// unnecessary — it does its own filesystem walk — so this now opens the
-    /// identical `Palette`-based picker TUI does; see `FrameOp::FolderPicker`
-    /// and `handle_key_press`'s folder-picker rung. TUI's
+    /// the only option. `quadraui::FolderPickerController` (shipped
+    /// 2026-05-25, quadraui#166) made that escape hatch unnecessary — it does
+    /// its own filesystem walk — so this opens the identical `Palette`-based
+    /// picker TUI does; see `FrameOp::FolderPicker` and
+    /// `handle_key_press`'s folder-picker rung. TUI's
     /// `new_folder_picker_controller` builds the same controller.
+    ///
+    /// `PlatformServices` has since gained `show_folder_open_dialog`
+    /// (quadraui#935) — the premise above is now stale on its own, but the
+    /// decision it led to isn't: this stays on `FolderPickerController`
+    /// deliberately (#815; see issue #945), because it's the shape that
+    /// behaves identically on every backend, whereas
+    /// `show_folder_open_dialog` is a native-only primitive that TUI can't
+    /// implement the same way GTK/macOS/Win-GUI would.
     fn open_folder_dialog(&mut self) {
         let engine = self.engine.borrow();
         let controller = quadraui::FolderPickerController::new(
