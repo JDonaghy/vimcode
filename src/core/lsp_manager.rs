@@ -928,19 +928,21 @@ impl LspManager {
                 std::env::var("PATH").unwrap_or_else(|_| "(unset)".into()),
             ));
 
-            // Run via shell so npm/pip/dotnet etc. resolve from user PATH
+            // Run via shell so npm/pip/dotnet etc. resolve from user PATH.
+            // `shell_command()` (quadraui#970) picks `sh -c` vs `cmd /C` —
+            // this used to be a hand-rolled cfg split duplicating that same
+            // decision; #948 collapsed it into the shared seam. The only
+            // platform-specific bit left is hiding the console window on
+            // Windows, which has no portable equivalent.
+            let (shell, flag) = crate::core::terminal::shell_command();
+            let mut command = std::process::Command::new(&shell);
+            command.args([&flag, &install_cmd]);
             #[cfg(target_os = "windows")]
-            let result = {
+            {
                 use std::os::windows::process::CommandExt;
-                std::process::Command::new("cmd")
-                    .args(["/C", &install_cmd])
-                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                    .output()
-            };
-            #[cfg(not(target_os = "windows"))]
-            let result = std::process::Command::new("sh")
-                .args(["-c", &install_cmd])
-                .output();
+                command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+            let result = command.output();
 
             match result {
                 Ok(out) => {

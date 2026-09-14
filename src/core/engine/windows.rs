@@ -3907,8 +3907,9 @@ impl Engine {
         #[cfg(not(test))]
         let result = {
             use std::io::Write;
-            let mut child = match std::process::Command::new("sh")
-                .arg("-c")
+            let (shell, flag) = shell_command();
+            let mut child = match std::process::Command::new(shell)
+                .arg(flag)
                 .arg(filter_cmd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())

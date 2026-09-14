@@ -1,5 +1,11 @@
 /// Re-export the quadraui primitive so engine/render code can import from one place.
 pub use quadraui::terminal_engine::default_shell;
+/// Portable "run a command string through the shell" seam (quadraui#970):
+/// returns `(shell, flag)` — `("sh", "-c")` on Unix, `("cmd", "/C")` on
+/// Windows (honouring `$SHELL`/`%COMSPEC%` where set). Sibling of
+/// `default_shell()` above; use this instead of hardcoding `Command::new("sh")`
+/// anywhere a single command string needs to run through "the user's shell".
+pub use quadraui::terminal_engine::shell_command;
 pub use quadraui::terminal_engine::TerminalSelection as TermSelection;
 
 /// Context for a terminal pane running an install command.
