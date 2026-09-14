@@ -561,6 +561,63 @@ pub fn conformance_harness_with_folder_picker(
     crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
 }
 
+/// The GTK leg of the hit-band integrity sweep — the same
+/// `crate::harness::sweep_hit_band_integrity` body `src/macos/mod.rs`'s
+/// `hit_band_sweep` runs, wired to `GtkDriver` instead of `MacDriver`, on
+/// the same shared explorer fixture. Its whole purpose is to answer "is
+/// this macOS-specific or shared?" for any hit-band defect the macOS leg
+/// finds, so the two must stay identical apart from the driver type.
+///
+/// There is deliberately **no TUI leg**: a TUI row is one cell tall, so a
+/// painted run has no interior for a top/middle/bottom probe to
+/// distinguish. The sweep would report every run as "too thin to probe" —
+/// an honest zero, not a pass — which is why it is not worth wiring rather
+/// than being an oversight.
+#[cfg(test)]
+mod hit_band_sweep {
+    use std::path::PathBuf;
+
+    use crate::harness::{explorer_engine, explorer_repro_tree, ConformanceHarness};
+
+    const W: i32 = 1400;
+    const H: i32 = 900;
+
+    fn harness_for(
+        root: &PathBuf,
+    ) -> ConformanceHarness<super::GtkDriver<impl quadraui::AppLogic>> {
+        super::conformance_harness(explorer_engine(root), W, H)
+    }
+
+    /// Diagnostic twin of the macOS one: prints painted geometry, asserts
+    /// nothing, so it is not part of the gate.
+    #[test]
+    #[ignore = "diagnostic: prints painted geometry, asserts nothing"]
+    fn dump_painted_sidebar_runs() {
+        let root = explorer_repro_tree("gtk_dump");
+        let h = harness_for(&root);
+        let inv = quadraui::testing::ConformanceDriver::inventory(&h.driver);
+        eprintln!("\n=== painted runs (x < 500) ===");
+        for r in inv.text_runs.iter().filter(|r| r.bounds.x < 500.0) {
+            eprintln!(
+                "  {:>8.1},{:>8.1}  {:>6.1}x{:<6.1}  {:?}",
+                r.bounds.x, r.bounds.y, r.bounds.width, r.bounds.height, r.text
+            );
+        }
+    }
+
+    /// Every point inside one painted explorer row must resolve to that row.
+    #[test]
+    fn explorer_rows_resolve_uniformly_across_their_painted_band() {
+        let root = explorer_repro_tree("gtk_sweep");
+        let report = crate::harness::sweep_hit_band_integrity(
+            || harness_for(&root),
+            |text, _| crate::harness::EXPLORER_ROW_LABELS.contains(&text.trim()),
+            "gtk/explorer-tree",
+        );
+        assert!(report.is_clean(), "{}", report.report());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Per the #646 scope note: the harness above is the deliverable; tests are

@@ -97,9 +97,39 @@ use crate::app::{App, TextMetricsBackend};
 /// `MacBackend`, **not** arithmetic in this file. Recorded here so the next
 /// person does not have to re-derive which side of the boundary it is on.
 impl TextMetricsBackend for quadraui::macos::MacBackend {
+    /// Genuinely a no-op, unlike the two setters below: CoreText
+    /// measurement (`quadraui::macos::text::measure_text(&CTFont, &str)`)
+    /// takes the font per call rather than storing a context, and the
+    /// trait's one context producer (`click::build_editor_click_context`)
+    /// is GTK-only. See this trait's doc on `App`.
     fn set_text_measurement_context(&mut self, _ctx: Box<dyn std::any::Any>) {}
-    fn set_current_line_height(&mut self, _line_height: f64) {}
-    fn set_current_char_width(&mut self, _char_width: f64) {}
+
+    /// Forwards to `MacBackend`'s inherent setter — it is **not** optional.
+    ///
+    /// `App::explorer_ui_event` (and its AI-chat sibling) re-applies the
+    /// metrics the widget was *painted* with immediately before hit-testing,
+    /// because `current_line_height` is mutable and whatever painted last
+    /// may have left a different value behind. That is #540's drift guard.
+    /// While this was a stub, the guard silently did nothing on macOS: the
+    /// hit-test ran against `MacBackend::new()`'s default `16.0` instead of
+    /// the real CoreText metric, so the explorer's row pitch was
+    /// `round(16.0 * 1.4) = 22` for clicks against `round(16.296875 * 1.4)
+    /// = 23` for paint — a 1px-per-row drift that put clicks on the wrong
+    /// row from the fourth row down (`hit_band_sweep` below).
+    ///
+    /// Stubbing all three was correct when #859 wrote this impl — the
+    /// inherent setters did not exist on `MacBackend` yet. They do now
+    /// (quadraui#934), and the Win impl on `App` has forwarded its two
+    /// since #866.
+    fn set_current_line_height(&mut self, line_height: f64) {
+        quadraui::macos::MacBackend::set_current_line_height(self, line_height);
+    }
+
+    /// Forwards for the same reason as [`Self::set_current_line_height`];
+    /// the column math a click resolves through reads this one.
+    fn set_current_char_width(&mut self, char_width: f64) {
+        quadraui::macos::MacBackend::set_current_char_width(self, char_width);
+    }
 }
 
 /// Entry point for the native macOS GUI, mirroring `crate::gtk::run`.
@@ -778,4 +808,112 @@ mod mac_driver_tests {
              see this test's doc comment"
         );
     }
+
+    // ── Hit-band integrity sweep (explorer tree) ──────────────────────────
+    //
+    // Aims `crate::harness::sweep_hit_band_integrity` at the native macOS
+    // explorer tree, reproducing the reported folder-tree shape: a root with
+    // `src/` expanded over a `core/` child, so a row-band offset shows up as
+    // the lower half of `src` resolving to `core`.
+    mod hit_band_sweep {
+        use std::cell::RefCell;
+        use std::path::PathBuf;
+        use std::rc::Rc;
+
+        use quadraui::macos::testing::driver_with_shell;
+        use quadraui::macos::MacBackend;
+
+        use crate::app::TextMetricsBackend;
+        use crate::harness::{explorer_engine, explorer_repro_tree, ConformanceHarness};
+
+        const W: u32 = 1400;
+        const H: u32 = 900;
+
+        fn harness_for(
+            root: &PathBuf,
+        ) -> ConformanceHarness<quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>>
+        {
+            let paint = crate::test_paint::PaintGuard::acquire();
+            let cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let engine = Rc::new(RefCell::new(explorer_engine(root)));
+            let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+                Rc::new(RefCell::new(Box::new(MacBackend::new())));
+            let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+            let driver = driver_with_shell(app, config, W, H);
+            ConformanceHarness::new(driver, engine, paint, cwd)
+        }
+
+        /// Diagnostic: what the explorer actually paints, and where. Run with
+        /// `--ignored --nocapture` when pointing the sweep at a new surface;
+        /// it asserts nothing, so it is not part of the gate.
+        #[test]
+        #[ignore = "diagnostic: prints painted geometry, asserts nothing"]
+        fn dump_painted_sidebar_runs() {
+            let root = explorer_repro_tree("macos_dump");
+            let h = harness_for(&root);
+            let inv = quadraui::testing::ConformanceDriver::inventory(&h.driver);
+            eprintln!("\n=== painted runs (x < 500) ===");
+            for r in inv.text_runs.iter().filter(|r| r.bounds.x < 500.0) {
+                eprintln!(
+                    "  {:>8.1},{:>8.1}  {:>6.1}x{:<6.1}  {:?}",
+                    r.bounds.x, r.bounds.y, r.bounds.width, r.bounds.height, r.text
+                );
+            }
+        }
+
+        /// Diagnostic: walk y down the explorer's row column one step at a
+        /// time and print every y where the outcome changes — i.e. the
+        /// *actual* hit-band boundaries, to compare against the painted row
+        /// boundaries the dump reports. Asserts nothing.
+        #[test]
+        #[ignore = "diagnostic: prints measured hit-band boundaries"]
+        fn scan_explorer_hit_bands() {
+            use quadraui::testing::ConformanceDriver;
+
+            let root = explorer_repro_tree("macos_scan");
+            // Inside the row-label column for every row in the fixture.
+            let x = 130.0;
+            let mut prev: Option<String> = None;
+            eprintln!("\n=== measured hit-band boundaries (x={x}) ===");
+            for step in 0..=120 {
+                let y = 40.0 + step as f32;
+                let label = {
+                    let mut h = harness_for(&root);
+                    h.driver.click(x, y);
+                    let inv = ConformanceDriver::inventory(&h.driver);
+                    let editor: Vec<String> = inv
+                        .text_runs
+                        .iter()
+                        .filter(|r| r.bounds.x > 300.0 && r.bounds.y < 200.0)
+                        .map(|r| r.text.trim().to_string())
+                        .collect();
+                    let chevrons: Vec<String> = inv
+                        .text_runs
+                        .iter()
+                        .filter(|r| r.text == "\u{25be}" || r.text == "\u{25b8}")
+                        .map(|r| format!("{}@{:.0}", r.text, r.bounds.y))
+                        .collect();
+                    format!("editor[{}] tree[{}]", editor.join(","), chevrons.join(" "))
+                };
+                if prev.as_deref() != Some(label.as_str()) {
+                    eprintln!("  y={y:6.1}  -> {label}");
+                    prev = Some(label);
+                }
+            }
+        }
+
+        /// Every point inside one painted explorer row must resolve to that
+        /// row. See `crate::harness::sweep_hit_band_integrity`.
+        #[test]
+        fn explorer_rows_resolve_uniformly_across_their_painted_band() {
+            let root = explorer_repro_tree("macos_sweep");
+            let report = crate::harness::sweep_hit_band_integrity(
+                || harness_for(&root),
+                |text, _| crate::harness::EXPLORER_ROW_LABELS.contains(&text.trim()),
+                "macos/explorer-tree",
+            );
+            assert!(report.is_clean(), "{}", report.report());
+        }
+    }
+
 }

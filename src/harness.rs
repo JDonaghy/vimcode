@@ -309,3 +309,262 @@ pub fn folder_picker_click_outside_dismisses_it<D: ConformanceDriver + DriverInp
          (route_folder_picker_click's Dismiss arm)"
     );
 }
+
+// ── Explorer hit-band fixture (shared) ───────────────────────────────────
+
+/// Row labels the explorer paints for [`explorer_repro_tree`], in visual
+/// order below the root. Pass to [`sweep_hit_band_integrity`]'s selector so
+/// the sweep targets the tree's own rows — a bounding box would also catch
+/// the tab bar, which paints inside the sidebar's x-range.
+pub const EXPLORER_ROW_LABELS: [&str; 7] =
+    ["src", "core", "mod.rs", "app.rs", "click.rs", "tests", "README.md"];
+
+/// The reported macOS repro's directory shape, materialised on disk so the
+/// real explorer walker populates from it: a root holding `src/` (with a
+/// `core/` child and two files), a `tests/` sibling and a `README.md`.
+///
+/// Returns the **canonical** path. On macOS `std::env::temp_dir()` is a
+/// `/var/...` symlink into `/private/var/...` and the explorer keys
+/// `Engine::explorer_expanded` by the resolved path, so an uncanonicalised
+/// root silently fails to match the expand set and the tree paints
+/// collapsed — which would let a sweep "pass" by having almost nothing to
+/// sweep. `tag` keeps concurrent backends' trees apart.
+pub fn explorer_repro_tree(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("vimcode_hitband_{tag}"));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src").join("core")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(root.join("src").join("core").join("mod.rs"), "// mod\n").unwrap();
+    std::fs::write(root.join("src").join("app.rs"), "// app\n").unwrap();
+    std::fs::write(root.join("src").join("click.rs"), "// click\n").unwrap();
+    std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+    std::fs::canonicalize(&root).unwrap()
+}
+
+/// An [`Engine`] rooted at `root` with the explorer visible and both the
+/// root and `src/` expanded — the state the macOS report describes ("open
+/// the folder, expand src, click near the bottom of the word src").
+pub fn explorer_engine(root: &PathBuf) -> Engine {
+    use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+    let mut engine = Engine::new_for_test();
+    engine.cwd = root.clone();
+    engine.buffer_mut().insert(0, "fn main() {}\n");
+    engine.explorer_expanded.insert(root.clone());
+    engine.explorer_expanded.insert(root.join("src"));
+    engine.explorer_rebuild_rows();
+    engine
+        .app_shell
+        .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+    engine.session.explorer_visible = true;
+    // Tab icons off for the same reason `src/macos/mod.rs`'s own fixtures
+    // turn them off: the macOS per-tab icon gap (quadraui#620) is a
+    // documented backend gap, not this sweep's subject, and leaving it on
+    // would fire a `debug_assert!` that has nothing to do with hit bands.
+    engine.settings.use_nerd_fonts = false;
+    engine
+}
+
+// ── Hit-band integrity sweep ─────────────────────────────────────────────
+//
+// The gap this closes: every click-driven test in this repo, in quadraui's
+// conformance scenarios, and in `click_text`/`click_text_at` itself, aims at
+// a painted run's *centre* (or an `Anchor` edge). A hit region that is
+// offset from the glyphs it belongs to — so the top of a row resolves to
+// that row and the bottom resolves to its neighbour — passes every one of
+// them. That is not hypothetical: it is the reported macOS explorer-tree
+// symptom (clicking the lower half of `src` toggles the `core` row beneath
+// it), and it is the same family as quadraui#552 (activity row) and
+// vimcode#515 (tab close vs tab body).
+//
+// The invariant below needs no per-row expected-value table, which is what
+// makes it cheap to point at a new surface: a painted text run is emitted by
+// one widget for one row, so **every point inside one run must resolve to
+// the same thing**. Two probes inside one run that disagree is a defect
+// regardless of which one is "right" — and the report says which run, which
+// probe points, and how the outcomes differed, so a failure converts to an
+// issue without re-deriving anything.
+
+/// One painted run whose interior did not resolve uniformly.
+#[derive(Debug, Clone)]
+pub struct BandMismatch {
+    /// The painted text whose box was probed.
+    pub text: String,
+    /// That text's painted bounds, in the driver's native unit.
+    pub bounds: quadraui::Rect,
+    /// The probe that established the baseline outcome.
+    pub baseline_probe: (&'static str, f32, f32),
+    /// The probe that disagreed with it.
+    pub divergent_probe: (&'static str, f32, f32),
+    /// First painted line that differs between the two outcomes,
+    /// `(baseline, divergent)`.
+    pub first_difference: (String, String),
+}
+
+/// Outcome of a [`sweep_hit_band_integrity`] run.
+#[derive(Debug, Clone, Default)]
+pub struct BandReport {
+    pub label: String,
+    pub runs_swept: usize,
+    /// Runs too thin to hold distinct interior probes (TUI's one-cell rows).
+    pub runs_too_thin: usize,
+    pub mismatches: Vec<BandMismatch>,
+}
+
+impl BandReport {
+    pub fn is_clean(&self) -> bool {
+        self.mismatches.is_empty()
+    }
+
+    /// Issue-ready rendering: every mismatch with the coordinates and the
+    /// observed divergence, so a failure can be pasted into a bug report
+    /// without re-running anything.
+    pub fn report(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "hit-band integrity [{}]: {} run(s) swept, {} too thin to probe, {} mismatch(es)",
+            self.label,
+            self.runs_swept,
+            self.runs_too_thin,
+            self.mismatches.len()
+        );
+        for m in &self.mismatches {
+            let (bl, bx, by) = m.baseline_probe;
+            let (dl, dx, dy) = m.divergent_probe;
+            let _ = writeln!(
+                s,
+                "\n  run {:?} painted at x={:.1} y={:.1} w={:.1} h={:.1}\n    \
+                 {bl:>6} ({bx:.1}, {by:.1}) -> {:?}\n    \
+                 {dl:>6} ({dx:.1}, {dy:.1}) -> {:?}\n    \
+                 ^ two points inside one painted run resolved differently",
+                m.text,
+                m.bounds.x,
+                m.bounds.y,
+                m.bounds.width,
+                m.bounds.height,
+                m.first_difference.0,
+                m.first_difference.1,
+            );
+        }
+        s
+    }
+}
+
+/// Paint signature: every painted run in paint order, with position. Two
+/// clicks that leave the app in the same visible state produce the same
+/// signature; any difference in what is drawn, or where, shows up here.
+fn paint_signature<D: ConformanceDriver>(driver: &D) -> Vec<String> {
+    driver
+        .inventory()
+        .text_runs
+        .iter()
+        .map(|r| format!("{} @ {:.1},{:.1}", r.text, r.bounds.x, r.bounds.y))
+        .collect()
+}
+
+fn first_difference(a: &[String], b: &[String]) -> (String, String) {
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i), b.get(i));
+        if x != y {
+            return (
+                x.cloned().unwrap_or_else(|| "<nothing>".into()),
+                y.cloned().unwrap_or_else(|| "<nothing>".into()),
+            );
+        }
+    }
+    ("<identical>".into(), "<identical>".into())
+}
+
+/// Sweep the interior of every painted text run inside `region` and report
+/// any run whose interior does not resolve uniformly.
+///
+/// `make` must return a **fresh** harness each call: every probe click is
+/// applied to a pristine instance, so probes cannot contaminate each other
+/// and a click that opens a menu or expands a folder is measured in
+/// isolation. Each harness is dropped before the next is built (the paint
+/// and cwd guards are process-wide — holding two at once would deadlock).
+///
+/// `select` chooses which painted runs to sweep, by text and bounds — a
+/// caller names the surface it means (the explorer's row labels, say)
+/// rather than trusting a bounding box, because sibling chrome can and does
+/// paint inside the same rectangle.
+///
+/// Probes five points per run: the vertical triple (top / middle / bottom)
+/// that catches a row-band offset, and the horizontal pair (left / right)
+/// that catches the tab-bar class (vimcode#515, where a right-edge click
+/// landed on the next tab). Runs under 3 units tall or wide cannot hold
+/// distinct interior points — one TUI cell — and are counted, not probed,
+/// so a TUI run of this sweep honestly reports "nothing to probe" rather
+/// than a misleading pass.
+pub fn sweep_hit_band_integrity<D, F, P>(make: F, select: P, label: &str) -> BandReport
+where
+    D: ConformanceDriver + DriverInput,
+    F: Fn() -> ConformanceHarness<D>,
+    P: Fn(&str, quadraui::Rect) -> bool,
+{
+    // Collect the target runs from one frame, then drop that harness before
+    // building any probe instance.
+    let targets: Vec<(String, quadraui::Rect)> = {
+        let h = make();
+        h.driver
+            .inventory()
+            .text_runs
+            .iter()
+            .filter(|r| !r.text.trim().is_empty() && select(&r.text, r.bounds))
+            .map(|r| (r.text.clone(), r.bounds))
+            .collect()
+    };
+
+    let mut report = BandReport {
+        label: label.to_string(),
+        ..Default::default()
+    };
+
+    for (text, b) in targets {
+        if b.height < 3.0 || b.width < 3.0 {
+            report.runs_too_thin += 1;
+            continue;
+        }
+        report.runs_swept += 1;
+
+        let cx = b.x + b.width / 2.0;
+        let cy = b.y + b.height / 2.0;
+        let probes: [(&'static str, f32, f32); 5] = [
+            ("mid", cx, cy),
+            ("top", cx, b.y + 1.0),
+            ("bottom", cx, b.y + b.height - 1.0),
+            ("left", b.x + 1.0, cy),
+            ("right", b.x + b.width - 1.0, cy),
+        ];
+
+        let mut baseline: Option<(&'static str, f32, f32, Vec<String>)> = None;
+        for (name, px, py) in probes {
+            let sig = {
+                let mut h = make();
+                h.driver.click(px, py);
+                paint_signature(&h.driver)
+            };
+            match &baseline {
+                None => baseline = Some((name, px, py, sig)),
+                Some((bn, bx, by, bsig)) => {
+                    if *bsig != sig {
+                        report.mismatches.push(BandMismatch {
+                            text: text.clone(),
+                            bounds: b,
+                            baseline_probe: (bn, *bx, *by),
+                            divergent_probe: (name, px, py),
+                            first_difference: first_difference(bsig, &sig),
+                        });
+                        // One mismatch per run is enough to file on; keep
+                        // sweeping the remaining runs.
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    report
+}
