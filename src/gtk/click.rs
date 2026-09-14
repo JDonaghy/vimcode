@@ -41,53 +41,39 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::rc::Rc;
 
-/// Build the Pango context the *click* backend uses to resolve editor
-/// columns, matched to the editor's **painted** font.
+/// Build the Pango context the *click* backend (`App::backend`) uses to
+/// resolve editor columns.
 ///
 /// vimcode keeps a separate `GtkBackend` for click hit-testing than the one
-/// quadraui's ShellApp runner paints with (see `App::render_content`). At
-/// click time `editor_col_at_x` runs `xy_to_index` against *this* context's
-/// Pango layout, so its glyph advances must reproduce the ones the painted
-/// glyphs actually used — otherwise column resolution scales by the wrong
-/// cell width and drifts left, the drift growing with `x` (#560 iter-3
-/// smoke failure).
+/// quadraui's ShellApp runner paints with (see `App::render_content`). That
+/// click backend needs *some* stored `pango::Context` for
+/// `GtkBackend::editor_col_at_x`'s last-resort `editor_pango_layout()`
+/// fallback (quadraui#971) to have anything to build a `pango::Layout` from
+/// at all — hence this function, called once per frame from
+/// `App::render_content` via `set_text_measurement_context`.
 ///
-/// The runner paints the editor with a hardcoded monospace font
-/// (`quadraui::gtk::run` → `"Monospace 11"`), **ignoring** `settings.font_*`;
-/// the resulting painted cell advance is what `Backend::char_width()` reports
-/// and what `build_screen_layout` / `editor_text_layout` positioned glyphs
-/// with. The earlier fix fonted this context from `settings.font_size` (14 by
-/// default) while the paint ran at 11 — a ~1.27× scale error that produced
-/// exactly the reported left-growing drift on plain text, bold, italic and
-/// scrolled lines alike.
+/// Before #947 this context also had to *reproduce the painted font*: the
+/// old `editor_col_at_x` fallback built a layout straight off this context's
+/// own font description, so this function hardcoded a `"Monospace"` family
+/// (mirroring the runner's then-hardcoded paint font) and probed a point
+/// size that reproduced the painted `char_width` — because neither backend
+/// read `settings.font_*` at all (#947's root problem: `grep -rn
+/// "set_editor_font" src/` returned zero hits). Getting that probe's family
+/// or size even slightly wrong reintroduced #560's left-growing click drift.
 ///
-/// So we mirror the runner's family (`Monospace`) and tune only the point
-/// size: measure a probe `'0'` advance and scale until it equals the painted
-/// `char_width`. Because it is the same family at the reproduced size, *all*
-/// glyph advances — including emoji/CJK fallback — line up with the paint.
-pub(crate) fn build_editor_click_context(paint_char_width: f64) -> Option<pango::Context> {
+/// quadraui#971's `editor_pango_layout()` fallback instead fonts the layout
+/// from the backend's *own* `editor_font_family`/`editor_font_size_pt`
+/// state (set via `Backend::set_editor_font`), ignoring whatever font
+/// description this context itself carries. `App::render_content` now calls
+/// `set_editor_font` on both the paint backend (so painted text honours
+/// `settings.font_family`/`font_size`, #947) and this click backend with the
+/// *same* family/size, every frame — so the two agree by construction and
+/// there is nothing left for this function to reproduce by probing. It only
+/// needs to hand back a context to store.
+pub(crate) fn build_editor_click_context() -> Option<pango::Context> {
     let surface = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 1, 1).ok()?;
     let cr = gtk4::cairo::Context::new(&surface).ok()?;
-    let ctx = pangocairo::create_context(&cr);
-
-    // Mirror the runner's editor font family; only the size is tuned so the
-    // measured '0' advance reproduces the painted cell width.
-    let family = "Monospace";
-    let mut size = 11.0_f64;
-    let probe = pango::Layout::new(&ctx);
-    probe.set_font_description(Some(&pango::FontDescription::from_string(&format!(
-        "{family} {size}"
-    ))));
-    probe.set_text("0");
-    let w0 = probe.pixel_size().0 as f64;
-    if w0 > 0.1 && paint_char_width > 0.1 {
-        size = (size * paint_char_width / w0).clamp(1.0, 400.0);
-    }
-
-    ctx.set_font_description(&pango::FontDescription::from_string(&format!(
-        "{family} {size}"
-    )));
-    Some(ctx)
+    Some(pangocairo::create_context(&cr))
 }
 
 #[cfg(test)]
@@ -287,15 +273,18 @@ mod emoji_click_column_tests {
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
         let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
-        // Mirror `App::render_content`: hand the click backend an editor-fonted
-        // PangoCairo context (built from a throwaway surface, NOT the paint
-        // layout) so the click-time fallback is per-glyph accurate.
+        // Mirror `App::render_content` (#947): `set_editor_font` with the
+        // same family/size the paint side used, plus a throwaway Pango
+        // context (NOT the paint layout) for `editor_pango_layout()`'s
+        // fallback to build a layout from — that layout fonts itself from
+        // `editor_font_family`/`editor_font_size_pt`, not from anything set
+        // on this context directly.
+        backend.borrow_mut().set_editor_font("Monospace", 12.0);
         {
             let click_surface =
                 ImageSurface::create(Format::ARgb32, 1, 1).expect("click ImageSurface");
             let click_cr = Context::new(&click_surface).expect("click Context");
             let click_ctx = pangocairo::create_context(&click_cr);
-            click_ctx.set_font_description(&font_desc);
             backend.borrow_mut().set_pango_context(click_ctx);
         }
 
@@ -363,55 +352,56 @@ mod emoji_click_column_tests {
         assert_emoji_columns_resolve(false);
     }
 
-    /// #560 iteration 3 (the smoke failure this fix targets): plain / bold /
-    /// italic / scrolled clicks landed LEFT of the target, the drift growing
-    /// with `x`. Root cause: the quadraui runner paints the editor with a
-    /// hardcoded "Monospace 11" (ignoring `settings.font_*`), but the previous
-    /// fix fonted the click backend's Pango context from `settings.font_size`
-    /// (14) — so `editor_col_at_x`'s `xy_to_index` measured against glyphs
-    /// ~1.27× too wide and scaled every column down, drifting left more the
-    /// further right the click. The earlier emoji tests use ONE self-consistent
-    /// font for both paint and resolve, so they never caught this size split.
-    ///
-    /// This test reproduces the split: paint at one size, resolve through the
-    /// context `App::render_content` actually builds (`build_editor_click_context`,
-    /// matched to the *painted* `char_width`), and assert every column on a long
-    /// plain ASCII line resolves exactly — including the far right where a
-    /// size-mismatched context drifts. The `bad_drift_seen` assertion pins that
-    /// a mismatched context genuinely fails, so this test can't silently pass by
-    /// resolving on a too-short line.
+    /// #947: click-to-column resolution must track `settings.font_family`/
+    /// `font_size` — not a hardcoded `"Monospace"` family matched only by a
+    /// probed size. Before #947, `build_editor_click_context` always fonted
+    /// the click backend as `"Monospace"` (mirroring the *paint* side's own
+    /// former hardcode) no matter what `App::render_content` was asked to
+    /// paint, so a non-monospace family would have silently resolved clicks
+    /// against the wrong glyph advances — structurally, not just as a bug,
+    /// since the family itself was never a parameter. `Backend::set_editor_font`
+    /// (quadraui#422, wired for both paint and click in #947) is now the
+    /// single source of truth for both, so this drives them from the SAME
+    /// live `(family, size)` pair, asserted at two sizes and at a
+    /// non-`Monospace` family. It also paints NO frame, so resolution must
+    /// go through `GtkBackend::editor_col_at_x`'s `editor_pango_layout()`
+    /// fallback (quadraui#971) — proving the live `set_editor_font` state
+    /// drives correctness, not a stashed `last_editor_pango_layout`.
     #[test]
-    fn click_context_matches_painted_font_not_settings_size() {
+    fn click_column_resolves_at_non_monospace_family_and_two_sizes() {
+        for (family, size_pt) in [("Sans", 10.0_f32), ("Sans", 22.0_f32)] {
+            assert_click_columns_resolve_for_font(family, size_pt);
+        }
+    }
+
+    /// Shared body for the test above: run the exact production sequence
+    /// `App::render_content` runs for the click backend (`set_editor_font`,
+    /// then a throwaway `set_pango_context` via `build_editor_click_context`
+    /// — #947's `sync_per_frame_backend_state` runs the paint-backend half
+    /// of this same call with the same `(family, size)`), then assert every
+    /// character on a plain ASCII line resolves to its own column via
+    /// `GtkBackend::editor_col_at_x` — the exact trait method
+    /// `pixel_to_click_target` calls on a live click.
+    fn assert_click_columns_resolve_for_font(family: &str, size_pt: f32) {
         // Concurrent Pango/Cairo text work from two test threads segfaults
         // inside FreeType — see `src/test_paint.rs`.
         let _paint = crate::test_paint::PaintGuard::acquire();
-        // ── The runner's painted editor font (see quadraui `gtk::run`). ──
-        let paint_surface =
-            ImageSurface::create(Format::ARgb32, 2000, 60).expect("paint ImageSurface");
-        let pcr = Context::new(&paint_surface).expect("paint Context");
-        let pctx = pangocairo::create_context(&pcr);
-        let paint_font = pango::FontDescription::from_string("Monospace 11");
-        pctx.set_font_description(&paint_font);
-        let probe = pango::Layout::new(&pctx);
-        probe.set_font_description(Some(&paint_font));
+        use quadraui::Backend as _;
+
+        // ── The font this iteration paints AND resolves with. ──
+        let font_desc = pango::FontDescription::from_string(&format!("{family} {size_pt}"));
+        let measure_surface =
+            ImageSurface::create(Format::ARgb32, 2000, 60).expect("measure ImageSurface");
+        let mcr = Context::new(&measure_surface).expect("measure Context");
+        let mctx = pangocairo::create_context(&mcr);
+        mctx.set_font_description(&font_desc);
+        let probe = pango::Layout::new(&mctx);
+        probe.set_font_description(Some(&font_desc));
         probe.set_text("0");
-        let paint_cw = probe.pixel_size().0 as f64;
-        let metrics = pctx.metrics(Some(&paint_font), None);
+        let char_width = probe.pixel_size().0 as f64;
+        let metrics = mctx.metrics(Some(&font_desc), None);
         let line_height = (metrics.ascent() + metrics.descent()) as f64 / pango::SCALE as f64;
 
-        // ── The click context production actually builds, matched to the
-        //    painted char width — NOT to any `settings.font_size`. ──
-        let click_ctx = super::build_editor_click_context(paint_cw).expect("click ctx");
-        let click_probe = pango::Layout::new(&click_ctx);
-        click_probe.set_text("0");
-        let click_cw = click_probe.pixel_size().0 as f64;
-        assert!(
-            (click_cw - paint_cw).abs() <= 1.0,
-            "build_editor_click_context('0' adv {click_cw}) must reproduce the painted \
-             char width {paint_cw}, else column resolution scales by the wrong cell width"
-        );
-
-        // ── End-to-end on a long plain ASCII line. ──
         let text = "The quick brown fox jumps over the lazy dog end AAAA BBBB CCCC DDDD EEEE";
         let mut engine = Engine::new();
         engine.buffer_mut().insert(0, text);
@@ -424,7 +414,7 @@ mod emoji_click_column_tests {
             &theme,
             &rects,
             line_height,
-            paint_cw,
+            char_width,
             false,
             8.0,
             crate::render::gtk_minimap_sizing(),
@@ -432,25 +422,22 @@ mod emoji_click_column_tests {
         let rw = &screen.windows[0];
         assert_eq!(rw.lines[0].raw_text, text, "line should not wrap");
 
-        let (editor, editor_layout) = render::editor_text_layout(rw, paint_cw, line_height);
-        let line = &editor.lines[0];
+        let (editor, editor_layout) = render::editor_text_layout(rw, char_width, line_height);
 
-        // Glyph geometry from the PAINT font (what draw_editor rendered with).
-        let measure = pango::Layout::new(&pctx);
-        measure.set_font_description(Some(&paint_font));
+        // Glyph geometry from the same font — what the paint side would
+        // have rendered this line with.
+        let measure = pango::Layout::new(&mctx);
+        measure.set_font_description(Some(&font_desc));
         measure.set_text(text);
 
-        // The good resolver: the production click context.
-        let good_layout = pango::Layout::new(&click_ctx);
+        // ── The exact production sequence for the click backend (#947):
+        // `set_editor_font` with the live `(family, size)`, then a
+        // throwaway Pango context — NO frame ever painted. ──
+        let backend = Rc::new(RefCell::new(super::backend::GtkBackend::new()));
+        backend.borrow_mut().set_editor_font(family, size_pt);
+        let click_ctx = super::build_editor_click_context().expect("click ctx");
+        backend.borrow_mut().set_pango_context(click_ctx);
 
-        // The pre-fix bug: font the resolver from `settings.font_size` (14).
-        let bad_surface = ImageSurface::create(Format::ARgb32, 1, 1).expect("bad ImageSurface");
-        let bad_cr = Context::new(&bad_surface).expect("bad Context");
-        let bad_ctx = pangocairo::create_context(&bad_cr);
-        bad_ctx.set_font_description(&pango::FontDescription::from_string("Monospace 14"));
-        let bad_layout = pango::Layout::new(&bad_ctx);
-
-        let mut bad_drift_seen = false;
         for (char_idx, (byte_idx, ch)) in text.char_indices().enumerate() {
             let pos = measure.index_to_pos(byte_idx as i32);
             let glyph_left =
@@ -458,23 +445,16 @@ mod emoji_click_column_tests {
             let gw = (pos.width() as f64 / pango::SCALE as f64).max(2.0);
             let click_x = (glyph_left + gw * 0.25) as f32;
 
-            let good = quadraui::gtk::editor_col_at_x(&good_layout, line, &editor_layout, click_x);
+            let resolved = backend
+                .borrow()
+                .editor_col_at_x(&editor_layout, &editor, 0, click_x);
             assert_eq!(
-                good, char_idx,
-                "clicking char {char_idx} ({ch:?}) resolved to col {good} — the \
-                 production click context has drifted from the painted font"
+                resolved, char_idx,
+                "family={family:?} size={size_pt}: clicking char {char_idx} ({ch:?}) \
+                 resolved to col {resolved}, not {char_idx} — the click backend's \
+                 editor_col_at_x has drifted from the (family, size) it was set to"
             );
-
-            let bad = quadraui::gtk::editor_col_at_x(&bad_layout, line, &editor_layout, click_x);
-            if bad != char_idx {
-                bad_drift_seen = true;
-            }
         }
-        assert!(
-            bad_drift_seen,
-            "a size-mismatched click context (the pre-fix bug) must drift on this line, \
-             else the test can't prove the width-match is what fixes it"
-        );
     }
 }
 

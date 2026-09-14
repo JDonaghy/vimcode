@@ -92,11 +92,30 @@ pub struct Harness<A: AppLogic> {
     pub picker_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// Line height the last frame actually painted with (#555).
     pub painted_line_height: Rc<std::cell::Cell<Option<f64>>>,
-    /// Character-cell advance (pixels) the shell last reported to `App`.
-    /// The horizontal twin of [`Self::painted_line_height`] — needed to turn
+    /// Character-cell advance (pixels) the last `render_content` frame
+    /// actually painted with. The horizontal twin of
+    /// [`Self::painted_line_height`] — needed to turn
     /// `RenderedWindow::gutter_char_width` (char cells) into the pixel band
     /// the line-number gutter occupies (#701).
-    pub painted_char_width: Rc<Cell<f64>>,
+    ///
+    /// **#947 fix:** this used to alias `App::char_width_cell` — set only
+    /// from `tick_dispatch`/`WindowResized` (real GTK event-loop ticks a
+    /// headless `GtkDriver` test never fires), not from `render_content`
+    /// itself — so it stayed at whatever `Backend::char_width()` returned
+    /// the one time some other event happened to run `tick_dispatch`
+    /// (often quadraui's own hardcoded `GtkBackend::new()` default, 8.0px),
+    /// regardless of the font any given test actually painted with. That
+    /// was masked while the paint backend was itself hardcoded to
+    /// `"Monospace 11"` (~8.8px, close enough to the stale 8.0px default
+    /// not to matter for most assertions); #947 wiring the real (larger)
+    /// `settings.font_size` default (14pt, ~11.2px) through to paint
+    /// widened the gap enough to break every test that trusted this
+    /// accessor for anything font-size-sensitive (the minimap-visibility
+    /// threshold below among them). `App::painted_char_width` (aliased
+    /// here now) is the correct source — set inside `render_content`
+    /// itself, alongside `painted_line_height`, from the exact `cw` that
+    /// frame's `build_screen_layout` call used.
+    pub painted_char_width: Rc<Cell<Option<f64>>>,
     /// Completion popup layout the last frame painted, or `None` if that
     /// frame drew no completion popup — the completion twin of
     /// [`Self::picker_popup_rect`] (#669).
@@ -376,7 +395,11 @@ impl<A: AppLogic> Harness<A> {
     /// [`crate::render::RenderedWindow::gutter_char_width`] to get the pixel
     /// width of the line-number gutter (#701).
     pub fn painted_char_width(&self) -> f64 {
-        self.painted_char_width.get()
+        // `unwrap_or` only bites before the first `render_content` frame —
+        // matches `App::cached_char_width`'s own init default (#947, see
+        // the field doc for why this no longer aliases the stale
+        // `char_width_cell`).
+        self.painted_char_width.get().unwrap_or(9.0)
     }
 
     /// Geometry of the painted picker's result list: `(popup_x, list_w,
@@ -447,7 +470,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let screen_layout = Rc::clone(&app.cached_screen_layout);
     let picker_popup_rect = Rc::clone(&app.picker_popup_rect);
     let painted_line_height = Rc::clone(&app.painted_line_height);
-    let painted_char_width = Rc::clone(&app.char_width_cell);
+    let painted_char_width = Rc::clone(&app.painted_char_width);
     let painted_sidebar_bounds = Rc::clone(&app.painted_sidebar_bounds);
     let completion_layout = Rc::clone(&app.completion_layout);
     let editor_hover_popup_rect = Rc::clone(&app.editor_hover_popup_rect);
@@ -3557,6 +3580,7 @@ second line here
                 rw.rect.y + lh * 2.5,
             )
         };
+        eprintln!("DEBUG cw={cw} lh={lh} text_x={text_x} row_y={row_y}");
         let probe = ((text_x + cw * 3.5) as i32, row_y as i32);
         // Park the caret on the probe's row *first*, so the `before` sample
         // already includes the cursor-line highlight and the only thing left
@@ -5102,15 +5126,24 @@ mod command_center {
     /// "clears macOS's titlebar" assertion below (see the `shell_config`
     /// call site's comment for the full analysis).
     ///
-    /// The last assertion pins the
-    /// residual this doc note calls out: because the GTK runner paints the
-    /// editor at a hardcoded font regardless of `settings.font_size` (see
-    /// the sibling dropdown-font test's doc comment), the row height a
-    /// single `font_size` value produces here is already stable across
-    /// `font_size` even with the bug reinstated at 1.0 -- so it does NOT
-    /// alone distinguish fixed from unfixed and is kept only as the
-    /// "stable across two font_size values" half of the acceptance
-    /// criteria, not as the regression guard (that's the first assertion).
+    /// **#947 update:** the last assertion used to pin the opposite of what
+    /// it says now -- before #947 wired `settings.font_family`/`font_size`
+    /// onto the paint backend's `Backend::set_editor_font`, the GTK runner
+    /// painted the editor at a hardcoded font regardless of that setting,
+    /// so the band height a single `font_size` produced here was
+    /// (accidentally) *stable* across `font_size` even with the #710 bug
+    /// reinstated -- it did not distinguish fixed from unfixed on its own.
+    /// Now that the editor genuinely paints at `settings.font_size` (#947),
+    /// `lh` -- and so this `TITLE_BAR_LH_MULTIPLE`-derived band -- legitimately
+    /// scales with it: the assertion below now checks that growth directly,
+    /// which makes it a real #947 regression guard (a build that silently
+    /// dropped `set_editor_font` again would go back to a flat band here).
+    /// The absolute px windows above were tuned assuming the *previously
+    /// hardcoded* paint size (~11pt, `lh` around 17-18px); `settings.font_size`
+    /// defaults to 14pt (`core::settings::default_font_size`), which now
+    /// genuinely reaches paint, so both windows are widened to include the
+    /// resulting ~46px/~42px default-size band/pill alongside the original
+    /// VS-Code-parity target.
     #[test]
     fn title_bar_band_and_command_center_pill_hit_vs_code_parity_target() {
         let mut h = harness(engine_with_tab_history(), 1400, 900);
@@ -5159,19 +5192,27 @@ mod command_center {
              (#940): got {band}px at lh={lh}px"
         );
         assert!(
-            (28.0..=42.0).contains(&band),
+            (28.0..=56.0).contains(&band),
             "title-bar band height should land near VS Code's 35px title \
-             bar (pre-#710 with_title_bar(1.0) measured ~18px here, one \
+             bar, widened to cover the real default `settings.font_size` \
+             (14pt, ~46px band -- #947) rather than the old hardcoded ~11pt \
+             paint (pre-#710 with_title_bar(1.0) measured ~18px here, one \
              editor text line): got {band}px at lh={lh}px"
         );
         assert!(
-            (24.0..=38.0).contains(&pill),
+            (24.0..=52.0).contains(&pill),
             "command-centre pill height should land near VS Code's ~26px \
-             pill (pre-#710 measured ~14px here): got {pill}px at lh={lh}px"
+             pill, widened to cover the real default `settings.font_size` \
+             (14pt, ~42px pill -- #947) rather than the old hardcoded ~11pt \
+             paint (pre-#710 measured ~14px here): got {pill}px at lh={lh}px"
         );
 
-        // Stable across `settings.font_size` (see doc comment above for why
-        // this doesn't distinguish fixed from unfixed on its own).
+        // #947 regression guard: the band must now GROW with
+        // `settings.font_size` (see the doc comment above for why this used
+        // to assert the opposite). A build that silently dropped
+        // `Backend::set_editor_font` again would go back to painting every
+        // `font_size` at the same hardcoded size, and `band_big` here would
+        // collapse back to ~`band_small`.
         let mut engine_small = engine_with_tab_history();
         engine_small.settings.font_size = 10;
         let mut h_small = harness(engine_small, 1400, 900);
@@ -5185,9 +5226,10 @@ mod command_center {
         let band_big = h_big.title_bar_rect.get().height;
 
         assert!(
-            (band_small - band_big).abs() < 0.5,
-            "title-bar band height must be stable across settings.font_size \
-             (10 vs 40): got small={band_small} big={band_big}"
+            band_big > band_small + 20.0,
+            "title-bar band height must grow with settings.font_size (10 vs \
+             40) once #947 wires the editor font through to paint: got \
+             small={band_small} big={band_big}"
         );
     }
 
@@ -5917,7 +5959,17 @@ mod minimap {
     /// narrower than GTK's own pixel-denominated formula computes below.
     #[test]
     fn minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one() {
-        let h = harness(engine_with_shaped_buffer(), 900, 900);
+        // #947: was `900` — wide enough for `MINIMAP_MIN_TEXT_COLS`'s
+        // suppression check at the old, settings-ignoring paint font
+        // (~11pt, ~8.8px char width) but not at the real default
+        // `settings.font_size` (14pt, ~11.2px) once #947 wired it through
+        // to paint: `MINIMAP_MIN_TEXT_COLS * cw` (30 columns) grows with
+        // `cw`, and this fixture's default-visible sidebar+activity-bar
+        // chrome left too little of a 900px window for the editor pane to
+        // clear that larger threshold, so the minimap stopped painting at
+        // all. `1050` clears it with margin at the real default font while
+        // staying well short of the 1600px "wide pane" sibling test below.
+        let h = harness(engine_with_shaped_buffer(), 1050, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win)
             .expect("editor pane must paint with the default settings");
@@ -6739,17 +6791,25 @@ mod scrollbar_paint {
         false
     }
 
-    /// No vertical scrollbar affordance is painted along the right edge of
+    /// A vertical scrollbar affordance IS painted along the right edge of
     /// an editor pane that needs one (500 lines in an 900px-tall window).
-    /// A native `gtk4::Scrollbar` would be invisible to this test either
-    /// way (see module doc), but quadraui's shared rasteriser paints
-    /// scrollbars as ordinary Cairo pixels on TUI (`super::draw_scrollbar`
-    /// in `quadraui::tui::editor`) — if GTK ever grows the same inline
-    /// paint, this test starts failing and must be updated alongside it,
-    /// which is exactly the point: it pins today's (lack of) behavior so
-    /// that change is deliberate, not silent.
+    ///
+    /// This test used to pin the opposite — no GTK scrollbar pixels at all
+    /// — by design (its doc comment said so explicitly: "if GTK ever grows
+    /// the same inline paint, this test starts failing and must be updated
+    /// alongside it, which is exactly the point: it pins today's (lack of)
+    /// behavior so that change is deliberate, not silent"). Landing on
+    /// #947's quadraui pin bump (`b6000c4` → `f3b3aed`) is exactly that
+    /// deliberate moment: quadraui#968 taught `gtk::editor::draw_editor` to
+    /// paint both scrollbars itself (mirroring
+    /// `tui::editor::draw_editor`), closing the gap #731 left when it
+    /// deleted vimcode's own native `gtk4::Scrollbar` overlay without a
+    /// replacement. So this test now pins the opposite fact — GTK does
+    /// paint one, filling the same `scrollbar_reserve()` strip the
+    /// `scrollbar_paint` tests below already prove is reserved — and would
+    /// fail again, deliberately, the day that inline paint disappears.
     #[test]
-    fn no_scrollbar_pixels_paint_for_an_overflowing_editor_pane() {
+    fn scrollbar_pixels_paint_for_an_overflowing_editor_pane() {
         let mut h = harness(engine_with_long_buffer(), 1400, 900);
         let win = h.engine.borrow().active_window_id();
         let rect = {
@@ -6810,22 +6870,24 @@ mod scrollbar_paint {
         );
 
         assert!(
-            !region_has_non_background_pixel(&mut h.driver, strip, bg),
-            "no scrollbar should be painted on GTK today (#731's \
-             re-diagnosis of #723) — if this now fails, GTK has grown a \
-             live scrollbar paint and this test's doc comment needs \
-             updating to match, not silently deleting"
+            region_has_non_background_pixel(&mut h.driver, strip, bg),
+            "a scrollbar should now be painted on GTK (quadraui#968, #947's \
+             pin bump) — if this now fails, GTK has lost its inline \
+             scrollbar paint and this test's doc comment needs updating to \
+             match, not silently deleting"
         );
     }
 
     /// #828 acceptance (driver tier): "editor viewport width with the
-    /// scrollbar present". GTK does not clip painted glyphs to
+    /// scrollbar present". GTK does not clip painted *text* glyphs to
     /// `text_viewport_cols` at the pixel level — a long line's characters
-    /// are drawn continuously and simply run to the pane's own edge (no
-    /// live native scrollbar widget currently exists to protect; see
-    /// `no_scrollbar_pixels_paint_for_an_overflowing_editor_pane`'s doc
-    /// comment above) — so a pixel-clipping assertion would not be testing
-    /// real behaviour. What *is* real, observable behaviour driven by the
+    /// are drawn continuously and simply run to the pane's own edge; the
+    /// inline scrollbar quadraui#968 added (see
+    /// `scrollbar_pixels_paint_for_an_overflowing_editor_pane`'s doc
+    /// comment above) overlays on top of that same reserved strip rather
+    /// than clipping it — so a pixel-clipping assertion would not be
+    /// testing real behaviour. What *is* real, observable behaviour driven
+    /// by the
     /// exact column count is `Engine::ensure_cursor_visible`
     /// (`core/engine/search.rs`), which reads `paint_viewport_cols` —
     /// populated *only* by a real `build_screen_layout` call
@@ -6854,87 +6916,141 @@ mod scrollbar_paint {
     #[test]
     fn cursor_past_the_scrollbar_reserved_viewport_triggers_a_horizontal_scroll_at_the_real_boundary(
     ) {
-        let mut engine = Engine::new_for_test();
-        // Sidebar pinned hidden rather than left ambient: the runner only
-        // reconciles its own shadow copy of `sidebar_visible` against the
-        // engine's at the tail of a *key* dispatch
-        // (`App::run_post_key_epilogue`'s "Runner <-> shadow
-        // sidebar-visibility sync", `app.rs`), never on construction — so
-        // without this settle, the very first `l` keypress below could be
-        // the one that first reconciles a mismatched ambient sidebar state,
-        // silently resizing the pane (and `text_viewport_cols` with it)
-        // mid-walk.
-        engine.app_shell.hide_sidebar();
-        engine.session.explorer_visible = false;
-        engine.settings.minimap = false;
-        engine.settings.cursorline = false;
-        engine.settings.wrap = false;
-        // Alternating ink/blank columns (not a solid run of `X`) so this
-        // test's own `measure_char_width_px` below can locate each glyph's
-        // left edge unambiguously — a solid run's glyphs can visually touch,
-        // which would undercount the real cell pitch.
-        let text = format!("{}\n", "X ".repeat(200));
-        engine.buffer_mut().insert(0, &text);
-        let mut h = harness(engine, 1400, 900);
-        // Settle the sidebar-visibility sync once, up front (see the field
-        // comment above) — a single no-op `Escape` in Normal mode, the same
-        // technique `tui_editor_text_drag_paints_a_selection_through_the_shared_drag_router`
-        // (`tui_main/shell_app.rs`) uses for the identical settle on TUI.
-        h.driver.press_named(quadraui::NamedKey::Escape);
-        let win = h.engine.borrow().active_window_id();
-        h.window_center(win)
-            .expect("editor pane must paint with the default settings");
+        fn make_engine() -> Engine {
+            let mut engine = Engine::new_for_test();
+            // Sidebar pinned hidden rather than left ambient: the runner only
+            // reconciles its own shadow copy of `sidebar_visible` against the
+            // engine's at the tail of a *key* dispatch
+            // (`App::run_post_key_epilogue`'s "Runner <-> shadow
+            // sidebar-visibility sync", `app.rs`), never on construction — so
+            // without this settle, the very first `l` keypress below could be
+            // the one that first reconciles a mismatched ambient sidebar state,
+            // silently resizing the pane (and `text_viewport_cols` with it)
+            // mid-walk.
+            engine.app_shell.hide_sidebar();
+            engine.session.explorer_visible = false;
+            engine.settings.minimap = false;
+            engine.settings.cursorline = false;
+            engine.settings.wrap = false;
+            // Alternating ink/blank columns (not a solid run of `X`) so this
+            // test's own pixel-pitch measurement below can locate each
+            // glyph's left edge unambiguously — a solid run's glyphs can
+            // visually touch, which would undercount the real cell pitch.
+            let text = format!("{}\n", "X ".repeat(400));
+            engine.buffer_mut().insert(0, &text);
+            engine
+        }
 
-        let (rect, gutter, viewport_cols) = {
-            let layout = h.screen_layout.borrow();
-            let l = layout.as_ref().unwrap();
-            let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
-            (rw.rect, rw.gutter_char_width, rw.text_viewport_cols)
-        };
-        let lh = h
-            .painted_line_height()
-            .expect("render_content must publish the painted line height");
-        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
-        let bg = {
-            let c = theme.background;
-            (c.r, c.g, c.b)
-        };
+        /// Settle, paint, and read back `(rect, gutter, viewport_cols, cw)`
+        /// for a freshly built harness at `width`. `cw` is the real
+        /// per-glyph pixel pitch measured directly off the painted row —
+        /// `Harness::painted_char_width` (`app.char_width_cell`) can lag one
+        /// frame behind the exact value `render_content` actually laid this
+        /// frame's columns out with (a separate `App::painted_char_width`
+        /// cell — distinct despite the name — is what really tracks it, and
+        /// `Harness` doesn't expose it). Scans the *right* half of the pane
+        /// (comfortably past any gutter) for `X`/blank rising edges — one
+        /// every two cells, given the `"X "` fixture above — and averages
+        /// their spacing.
+        fn settle_and_measure<A: quadraui::AppLogic>(
+            h: &mut Harness<A>,
+            width: i32,
+        ) -> (crate::core::WindowRect, usize, usize, f64) {
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            let win = h.engine.borrow().active_window_id();
+            h.window_center(win)
+                .expect("editor pane must paint with the default settings");
 
-        // `Harness::painted_char_width` (`app.char_width_cell`) can lag one
-        // frame behind the exact `cw` `render_content` actually laid this
-        // frame's columns out with (a separate `App::painted_char_width`
-        // cell — distinct despite the name — is what really tracks it, and
-        // `Harness` doesn't expose it), so this test measures the real
-        // per-glyph pixel pitch directly off the painted row instead of
-        // trusting that accessor for the precision `cols_without_reserve`
-        // below needs. Scans the *right* half of the pane (comfortably past
-        // any gutter) for `X`/blank rising edges — one every two cells,
-        // given the `"X "` fixture above — and averages their spacing.
-        let cw = {
-            let row_y = (rect.y + lh / 2.0) as i32;
-            let x0 = (rect.x + rect.width * 0.5) as i32;
-            let x1 = (rect.x + rect.width - 2.0) as i32;
-            let mut edges = Vec::new();
-            let mut prev_ink = h.driver.pixel(x0 - 1, row_y) != bg;
-            for x in x0..x1 {
-                let ink = h.driver.pixel(x, row_y) != bg;
-                if ink && !prev_ink {
-                    edges.push(x);
+            let (rect, gutter, viewport_cols) = {
+                let layout = h.screen_layout.borrow();
+                let l = layout.as_ref().unwrap();
+                let rw = l.windows.iter().find(|w| w.window_id == win).unwrap();
+                (rw.rect, rw.gutter_char_width, rw.text_viewport_cols)
+            };
+            let lh = h
+                .painted_line_height()
+                .expect("render_content must publish the painted line height");
+            let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+            let bg = {
+                let c = theme.background;
+                (c.r, c.g, c.b)
+            };
+
+            let cw = {
+                let row_y = (rect.y + lh / 2.0) as i32;
+                let x0 = (rect.x + rect.width * 0.5) as i32;
+                let x1 = (rect.x + (width as f64 - rect.x).min(rect.width) - 2.0) as i32;
+                let mut edges = Vec::new();
+                let mut prev_ink = h.driver.pixel(x0 - 1, row_y) != bg;
+                for x in x0..x1 {
+                    let ink = h.driver.pixel(x, row_y) != bg;
+                    if ink && !prev_ink {
+                        edges.push(x);
+                    }
+                    prev_ink = ink;
                 }
-                prev_ink = ink;
-            }
-            let diffs: Vec<i32> = edges.windows(2).map(|w| w[1] - w[0]).collect();
-            assert!(
-                diffs.len() >= 4,
-                "setup sanity: the alternating `X `/blank fixture must paint \
-                 several detectable glyph edges in the pane's right half to \
-                 measure the real character pitch from, found {} \
-                 (edges={edges:?})",
-                diffs.len()
-            );
-            let avg_period = diffs.iter().sum::<i32>() as f64 / diffs.len() as f64;
-            avg_period / 2.0 // one `X`/blank pair per two cells
+                let diffs: Vec<i32> = edges.windows(2).map(|w| w[1] - w[0]).collect();
+                assert!(
+                    diffs.len() >= 4,
+                    "setup sanity: the alternating `X `/blank fixture must paint \
+                     several detectable glyph edges in the pane's right half to \
+                     measure the real character pitch from, found {} \
+                     (edges={edges:?})",
+                    diffs.len()
+                );
+                let avg_period = diffs.iter().sum::<i32>() as f64 / diffs.len() as f64;
+                avg_period / 2.0 // one `X`/blank pair per two cells
+            };
+
+            (rect, gutter, viewport_cols, cw)
+        }
+
+        // ── Pass 1 (probe): measure this host's real editor char pitch and
+        // the fixed chrome overhead (activity bar etc — sidebar hidden) at
+        // an arbitrary width, so pass 2 can choose a window width that
+        // reliably straddles the `scrollbar_reserve()` boundary regardless
+        // of exactly how wide `settings.font_family`/`font_size` paints on
+        // this host.
+        //
+        // #947: this test used to paint at a hardcoded width alone
+        // (`1400`), which only reliably discriminated the two boundaries by
+        // coincidence — it depended on `rect.width` happening to floor-divide
+        // by the *old, settings-ignoring* paint font's char width such that
+        // an 8px `scrollbar_reserve()` crossed an integer column boundary.
+        // Once `settings.font_size` genuinely reached paint (`Backend::
+        // set_editor_font`), the same width no longer reliably discriminated
+        // the boundary at the new (larger, default 14pt) char width — this
+        // test's own "setup sanity" assertion below caught exactly that,
+        // firing with `without_reserve == with_reserve` at the old fixed
+        // width. Rather than hunt for a new lucky constant (equally fragile
+        // the next time a font default changes), pass 2 derives a width
+        // from the *measured* `cw`, so this holds for any font metrics.
+        const PROBE_WIDTH: i32 = 1400;
+        let (cw_probe, overhead) = {
+            let mut h = harness(make_engine(), PROBE_WIDTH, 900);
+            let (rect, _, _, cw) = settle_and_measure(&mut h, PROBE_WIDTH);
+            (cw, PROBE_WIDTH as f64 - rect.width)
         };
+
+        // ── Pass 2 (real): a window width whose content area sits at
+        // `N * cw + reserve / 2` — the midpoint of the 8px `scrollbar_reserve()`
+        // window — so `floor(rect.width / cw) == N` (no reserve) while
+        // `floor((rect.width - reserve) / cw) == N - 1` (with reserve),
+        // for ANY `cw` bigger than `scrollbar_reserve()` itself (true for
+        // any real font size this test would plausibly run at). ──
+        const N_COLS: f64 = 160.0;
+        const SCROLLBAR_RESERVE_PX: f64 = 8.0; // mirrors `GtkBackend::scrollbar_reserve()`
+        assert!(
+            cw_probe > SCROLLBAR_RESERVE_PX,
+            "setup sanity: this derivation needs a char width bigger than \
+             the {SCROLLBAR_RESERVE_PX}px scrollbar reserve to place an \
+             unambiguous boundary; measured cw={cw_probe}px"
+        );
+        let target_rect_width = N_COLS * cw_probe + SCROLLBAR_RESERVE_PX / 2.0;
+        let width = (target_rect_width + overhead).round() as i32;
+
+        let mut h = harness(make_engine(), width, 900);
+        let (rect, gutter, viewport_cols, cw) = settle_and_measure(&mut h, width);
 
         let cols_without_reserve = ((rect.width / cw).floor() as usize)
             .saturating_sub(gutter)
@@ -6944,8 +7060,9 @@ mod scrollbar_paint {
             "setup sanity: a real, non-zero scrollbar_reserve must shrink \
              the painted viewport below what the same pane width would \
              allow with no reserve at all (without_reserve={cols_without_reserve}, \
-             with_reserve={viewport_cols}, measured cw={cw}px) — otherwise \
-             this test cannot distinguish the two boundaries at all"
+             with_reserve={viewport_cols}, measured cw={cw}px, target \
+             width={width}) — otherwise this test cannot distinguish the \
+             two boundaries at all"
         );
         assert_eq!(
             h.engine.borrow().cursor().col,
@@ -8607,7 +8724,12 @@ mod editor_mouse_rungs {
     /// hardcoded, so it survives any change to `minimap_reserved_width`.
     #[test]
     fn minimap_click_scrolls_the_editor_on_gtk() {
-        let mut h = harness(long_engine(), 900, 600);
+        // #947: was `900` — see the sibling
+        // `minimap_strip_is_narrower_on_a_narrow_pane_than_on_a_wide_one`'s
+        // doc comment for why a fixed-visible-sidebar 900px window no
+        // longer clears `MINIMAP_MIN_TEXT_COLS`'s suppression threshold now
+        // that the real default `settings.font_size` (14pt) reaches paint.
+        let mut h = harness(long_engine(), 1050, 600);
         h.driver.render();
 
         assert!(
@@ -10124,7 +10246,15 @@ mod conformance_proof_slice {
     /// `:CommandPalette` ex-command path live.
     #[test]
     fn command_palette_filters_and_escape_dismisses() {
-        let mut h = conformance_harness(plain_engine(), 800, 480);
+        // #947: height was `480` — tall enough to list both "Toggle
+        // Sidebar" and "Toggle Terminal" (this scenario's unfiltered
+        // precondition) at the old, settings-ignoring paint font (~11pt)
+        // but not at the real default `settings.font_size` (14pt) once
+        // #947 wired it through to paint: taller painted rows mean fewer
+        // palette rows fit in the same pixel height, and one of the two
+        // entries this scenario needs fell off the visible list before any
+        // filter narrowed it.
+        let mut h = conformance_harness(plain_engine(), 800, 700);
 
         crate::harness::command_palette_filters_and_escape_dismisses(&mut h.driver);
     }
