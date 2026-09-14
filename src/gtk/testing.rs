@@ -3580,7 +3580,6 @@ second line here
                 rw.rect.y + lh * 2.5,
             )
         };
-        eprintln!("DEBUG cw={cw} lh={lh} text_x={text_x} row_y={row_y}");
         let probe = ((text_x + cw * 3.5) as i32, row_y as i32);
         // Park the caret on the probe's row *first*, so the `before` sample
         // already includes the cursor-line highlight and the only thing left
@@ -5230,6 +5229,101 @@ mod command_center {
             "title-bar band height must grow with settings.font_size (10 vs \
              40) once #947 wires the editor font through to paint: got \
              small={band_small} big={band_big}"
+        );
+    }
+
+    /// #947 acceptance criteria, end-to-end. Every assertion above (and the
+    /// non-monospace/two-size click test in `gtk::click`) drives the new
+    /// settings->paint/click wiring by poking `engine.settings.font_family`/
+    /// `font_size` directly in test setup — real coverage of the wiring
+    /// itself, but it never proves the ex-command *parser* the issue names
+    /// (`:set guifont`/`:set font_size=N`, `zoomin`/`zoomout`,
+    /// `core/engine/execute.rs`) still resolves to those same fields. This
+    /// drives it through `Engine::execute_command` — the exact call
+    /// `App`'s ex-command dispatch makes for a real `:set ...` / `zoomin` /
+    /// `zoomout` keystroke — and confirms the resulting paint moves the
+    /// same way the direct-settings tests above already proved it should.
+    #[test]
+    fn set_font_family_size_and_zoomin_zoomout_commands_reach_paint() {
+        let mut h = harness(engine_with_tab_history(), 1400, 900);
+        h.driver.render();
+        let band_default = h.title_bar_rect.get().height;
+        assert_eq!(h.engine.borrow().settings.font_size, 14);
+
+        // `:set font_size=N` — the literal command the #947 issue names.
+        h.engine.borrow_mut().execute_command("set font_size=40");
+        assert_eq!(
+            h.engine.borrow().settings.font_size,
+            40,
+            "`:set font_size=40` must reach settings.font_size"
+        );
+        // A runtime font change is only picked up by `set_editor_font`
+        // inside `render_content`, which quadraui's runner reads back
+        // BEFORE the *following* frame's own grid measurement (see the
+        // `App::shell_config`/`sync_per_frame_backend_state` doc comments)
+        // — so one settle frame is required before the new metrics show up
+        // in `title_bar_rect`, exactly like a real running app.
+        h.driver.render();
+        h.driver.render();
+        let band_after_set = h.title_bar_rect.get().height;
+        assert!(
+            band_after_set > band_default + 20.0,
+            "`:set font_size=40` must reach painted editor text through the \
+             same execute.rs ex-command path a real `:set` keystroke uses: \
+             got default={band_default} after={band_after_set}"
+        );
+
+        // `:set font_family=<non-monospace>` — must reach settings; the
+        // non-monospace/two-size click-column regression is covered end to
+        // end by `gtk::click::click_column_resolves_at_non_monospace_family_and_two_sizes`.
+        h.engine
+            .borrow_mut()
+            .execute_command("set font_family=Sans");
+        assert_eq!(
+            h.engine.borrow().settings.font_family,
+            "Sans",
+            "`:set font_family=Sans` must reach settings.font_family"
+        );
+
+        // `zoomin`/`zoomout` — the other acceptance-criteria entry point.
+        let mut h2 = harness(engine_with_tab_history(), 1400, 900);
+        h2.driver.render();
+        let band_before_zoom = h2.title_bar_rect.get().height;
+        for _ in 0..30 {
+            h2.engine.borrow_mut().execute_command("zoomin");
+        }
+        assert_eq!(
+            h2.engine.borrow().settings.font_size,
+            44,
+            "30x `zoomin` from the default font_size=14 must land at 44 \
+             (clamped to 72)"
+        );
+        h2.driver.render();
+        h2.driver.render();
+        let band_after_zoomin = h2.title_bar_rect.get().height;
+        assert!(
+            band_after_zoomin > band_before_zoom + 20.0,
+            "repeated `zoomin` must grow settings.font_size enough to grow \
+             the painted title-bar band: before={band_before_zoom} \
+             after={band_after_zoomin}"
+        );
+
+        for _ in 0..40 {
+            h2.engine.borrow_mut().execute_command("zoomout");
+        }
+        assert_eq!(
+            h2.engine.borrow().settings.font_size,
+            6,
+            "40x `zoomout` from 44 must land at the floor, 6"
+        );
+        h2.driver.render();
+        h2.driver.render();
+        let band_after_zoomout = h2.title_bar_rect.get().height;
+        assert!(
+            band_after_zoomout < band_after_zoomin - 20.0,
+            "repeated `zoomout` must shrink settings.font_size enough to \
+             shrink the painted title-bar band back down: \
+             after_zoomin={band_after_zoomin} after_zoomout={band_after_zoomout}"
         );
     }
 
