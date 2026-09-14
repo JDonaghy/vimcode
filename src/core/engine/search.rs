@@ -1829,6 +1829,43 @@ impl Engine {
         true
     }
 
+    /// Paste already-resolved clipboard text into the focused find/replace
+    /// field (query or replacement), replacing the selection if any.
+    ///
+    /// Shared by [`handle_find_replace_key`]'s own Ctrl+V arm (which reads
+    /// `self.clipboard_read` itself) and [`Engine::route_paste`] (`keys.rs`)
+    /// — the latter is the one real backends actually reach for Ctrl+V today
+    /// (#946): quadraui#813 intercepts Ctrl+V/Ctrl+Shift+V ahead of
+    /// `AppLogic::handle` on every backend and delivers the resolved text as
+    /// `UiEvent::ClipboardPaste` → `route_paste`, so a raw `KeyPressed`
+    /// Ctrl+V never reaches [`handle_find_replace_key`]'s own arm in
+    /// practice. Before this method existed, `route_paste` had no branch for
+    /// `find_replace_open` at all, so Ctrl+V while the find/replace overlay
+    /// was focused fell through to `route_paste`'s `Mode::Normal` arm and
+    /// pasted into the *editor buffer* instead of the overlay field — a
+    /// live, user-visible bug on both GTK and TUI, not a dead-code gap.
+    ///
+    /// [`handle_find_replace_key`]: Self::handle_find_replace_key
+    pub(crate) fn find_replace_paste(&mut self, clip: &str) {
+        let paste = clip.lines().next().unwrap_or("").to_string();
+        self.fr_delete_selection(); // remove selected text first
+        let (field, is_find) = if self.find_replace_focus == 0 {
+            (&mut self.find_replace_query, true)
+        } else {
+            (&mut self.find_replace_replacement, false)
+        };
+        let byte_idx = field
+            .char_indices()
+            .nth(self.find_replace_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(field.len());
+        field.insert_str(byte_idx, &paste);
+        self.find_replace_cursor += paste.chars().count();
+        if is_find {
+            self.run_find_replace_search();
+        }
+    }
+
     /// Handle a key press in the find/replace overlay.
     pub(crate) fn handle_find_replace_key(
         &mut self,
@@ -1994,24 +2031,8 @@ impl Engine {
 
                 // Ctrl+V paste (replaces selection if any)
                 if ctrl && key_name == "v" {
-                    if let Some(clip) = Self::clipboard_paste() {
-                        let paste = clip.lines().next().unwrap_or("").to_string();
-                        self.fr_delete_selection(); // remove selected text first
-                        let (field, is_find) = if self.find_replace_focus == 0 {
-                            (&mut self.find_replace_query, true)
-                        } else {
-                            (&mut self.find_replace_replacement, false)
-                        };
-                        let byte_idx = field
-                            .char_indices()
-                            .nth(self.find_replace_cursor)
-                            .map(|(i, _)| i)
-                            .unwrap_or(field.len());
-                        field.insert_str(byte_idx, &paste);
-                        self.find_replace_cursor += paste.chars().count();
-                        if is_find {
-                            self.run_find_replace_search();
-                        }
+                    if let Some(clip) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
+                        self.find_replace_paste(&clip);
                     }
                     return;
                 }

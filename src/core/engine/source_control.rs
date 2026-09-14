@@ -429,7 +429,7 @@ impl Engine {
                 if ctrl {
                     // Ctrl+V paste from system clipboard.
                     if unicode == Some('v') || unicode == Some('V') || key == "v" {
-                        if let Some(text) = Self::clipboard_paste() {
+                        if let Some(text) = self.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
                             self.sc_commit_message
                                 .insert_str(self.sc_commit_cursor, &text);
                             self.sc_commit_cursor += text.len();
@@ -453,54 +453,6 @@ impl Engine {
                 } else {
                     false
                 }
-            }
-        }
-    }
-
-    /// Try to paste from the system clipboard. Returns None on failure.
-    pub fn clipboard_paste() -> Option<String> {
-        #[cfg(test)]
-        {
-            None
-        }
-        #[cfg(not(test))]
-        {
-            use std::process::Command;
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                if let Ok(out) = Command::new("powershell")
-                    .args(["-NoProfile", "-Command", "Get-Clipboard"])
-                    .creation_flags(0x08000000) // CREATE_NO_WINDOW
-                    .output()
-                {
-                    if out.status.success() {
-                        let text = String::from_utf8_lossy(&out.stdout)
-                            .trim_end_matches("\r\n")
-                            .to_string();
-                        if !text.is_empty() {
-                            return Some(text);
-                        }
-                    }
-                }
-                None
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                // Try xclip first, then xsel, then wl-paste (Wayland), then pbpaste (macOS).
-                for cmd in &[
-                    &["xclip", "-selection", "clipboard", "-o"][..],
-                    &["xsel", "--clipboard", "--output"][..],
-                    &["wl-paste", "--no-newline"][..],
-                    &["pbpaste"][..],
-                ] {
-                    if let Ok(out) = Command::new(cmd[0]).args(&cmd[1..]).output() {
-                        if out.status.success() {
-                            return Some(String::from_utf8_lossy(&out.stdout).into_owned());
-                        }
-                    }
-                }
-                None
             }
         }
     }

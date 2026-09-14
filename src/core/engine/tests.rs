@@ -13534,6 +13534,121 @@ fn test_paste_clipboard_multiline_takes_first() {
     assert_eq!(engine.command_buffer, "first line");
 }
 
+// ── #946: clipboard paste routed through `engine.clipboard_read` ─────────
+//
+// `Engine::clipboard_paste()` (the hand-rolled xclip/xsel/pbpaste/
+// powershell shell-out) always returned `None` under `#[cfg(test)]`, so a
+// raw Ctrl+V key press into any of its six call sites was a silent no-op in
+// every unit test — there was no way to assert the paste actually landed.
+// Now that all six read `engine.clipboard_read` (the same callback every
+// backend already installs), a mocked callback makes the *real* key-press
+// path testable for the first time. Each test below fails against
+// unfixed `develop` (with `Self::clipboard_paste()` still in place) because
+// the mocked `clipboard_read` callback is never consulted and the target
+// field stays empty.
+
+#[test]
+fn test_ctrl_v_paste_in_command_mode_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.clipboard_read = Some(Box::new(|| Ok("cmd_paste".to_string())));
+
+    press_char(&mut engine, ':');
+    assert_eq!(engine.mode, Mode::Command);
+
+    press_ctrl(&mut engine, 'v');
+    assert_eq!(engine.command_buffer, "cmd_paste");
+}
+
+#[test]
+fn test_ctrl_v_paste_in_search_mode_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.clipboard_read = Some(Box::new(|| Ok("search_paste".to_string())));
+
+    press_char(&mut engine, '/');
+    assert_eq!(engine.mode, Mode::Search);
+
+    press_ctrl(&mut engine, 'v');
+    assert_eq!(engine.command_buffer, "search_paste");
+}
+
+#[test]
+fn test_ctrl_v_paste_into_sc_commit_message_via_clipboard_read() {
+    let mut engine = make_sc_engine_with_files();
+    engine.clipboard_read = Some(Box::new(|| Ok("commit message from clipboard".to_string())));
+    engine.sc_commit_input_active = true;
+
+    engine.handle_sc_commit_input_key("v", true, Some('v'));
+
+    assert_eq!(engine.sc_commit_message, "commit message from clipboard");
+}
+
+#[test]
+fn test_ctrl_v_paste_into_find_replace_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+    engine.clipboard_read = Some(Box::new(|| Ok("needle".to_string())));
+
+    engine.open_find_replace();
+    engine.find_replace_focus = 0;
+    engine.find_replace_query.clear();
+    engine.find_replace_cursor = 0;
+
+    engine.handle_find_replace_key("v", None, true, false);
+
+    assert_eq!(engine.find_replace_query, "needle");
+}
+
+#[test]
+fn test_ctrl_v_paste_into_picker_query_via_clipboard_read() {
+    let mut engine = Engine::new();
+    engine.clipboard_read = Some(Box::new(|| Ok("query text".to_string())));
+
+    engine.open_picker(PickerSource::Files);
+    engine.handle_picker_key("v", Some('v'), true);
+
+    assert_eq!(engine.picker_query, "query text");
+}
+
+/// #946: `Engine::route_paste` is the function every backend's real Ctrl+V
+/// actually reaches — quadraui#813 intercepts Ctrl+V/Ctrl+Shift+V ahead of
+/// `AppLogic::handle` on every backend and redelivers the already-resolved
+/// clipboard text as `UiEvent::ClipboardPaste` → `route_paste`, so a raw
+/// `KeyPressed` Ctrl+V never reaches `handle_find_replace_key`'s own arm
+/// (see `tui_main::shell_app::tests::ctrl_v_paste_reaches_the_search_panel_via_clipboard_paste_event`'s
+/// doc comment for how this was confirmed empirically). Before this fix,
+/// `route_paste` had a branch for `picker_open`, `sc_commit_input_active`,
+/// `search_has_focus` and four other overlay flags but none for
+/// `find_replace_open`, so Ctrl+V while the overlay was open fell through to
+/// the `Mode::Normal` arm and pasted into the buffer instead of the query
+/// field — a live bug on both GTK and TUI, not just a dead-code gap.
+///
+/// **Verified RED:** temporarily deleting the `if self.find_replace_open
+/// { self.find_replace_paste(text); return; }` branch this fix adds to
+/// `route_paste` (`src/core/engine/keys.rs`) makes this test fail —
+/// `find_replace_query` stays empty because the paste falls through to the
+/// `Mode::Normal` arm and mutates the buffer instead.
+#[test]
+fn test_route_paste_into_find_replace_query_when_overlay_open() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world");
+    engine.update_syntax();
+
+    engine.open_find_replace();
+    engine.find_replace_focus = 0;
+    engine.find_replace_query.clear();
+    engine.find_replace_cursor = 0;
+
+    engine.route_paste("needle");
+
+    assert_eq!(engine.find_replace_query, "needle");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "hello world",
+        "the paste must not have fallen through to Mode::Normal's buffer paste"
+    );
+}
+
 // ── VSCode editing mode tests ────────────────────────────────────────────
 
 fn make_vscode_engine(text: &str) -> Engine {

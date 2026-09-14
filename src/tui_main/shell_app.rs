@@ -3252,11 +3252,26 @@ fn handle_focus_owner_key(
 
     // ── Search panel ────────────────────────────────────────────────────
     if route == render::FocusKeyRoute::Search {
-        // Ctrl+V paste (backend-specific clipboard access)
+        // Ctrl+V paste (backend-specific clipboard access).
+        //
+        // #946: quadraui#813 intercepts every Ctrl+V/Ctrl+Shift+V
+        // `KeyPressed` ahead of `AppLogic::handle` on every backend
+        // (`quadraui::runtime::preprocess_event`, step 6) and redelivers it
+        // as `UiEvent::ClipboardPaste(text)` instead — so in practice this
+        // arm's `ctrl && key_val == Key::Char('v')` guard never matches a
+        // real keypress; `Engine::route_paste`'s own `search_has_focus`
+        // branch (`keys.rs`) is the one live backends actually reach, via
+        // the `UiEvent::ClipboardPaste` arm in `handle()` above. Kept here
+        // (reading `engine.clipboard_read` rather than the deleted
+        // `Engine::clipboard_paste()` shell-out #946 removed) as the
+        // documented, still-correct fallback for any caller that reaches
+        // this function with an already-raw `KeyPressed` Ctrl+V — e.g. a
+        // synthetic/replayed event that bypasses quadraui's own runtime
+        // preprocessing.
         if ctrl && key_val == Key::Char('v') {
             let is_replace =
                 engine.search_panel_form_focus.borrow().as_deref() == Some("search:replace");
-            if let Some(text) = Engine::clipboard_paste() {
+            if let Some(text) = engine.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
                 engine.search_input_paste(is_replace, &text);
             }
             return Reaction::Redraw;
@@ -10890,6 +10905,107 @@ mod tests {
         assert_eq!(
             scratch.quickfix_scroll_top, 0,
             "closing the quickfix panel resets its scroll"
+        );
+    }
+
+    /// #946: Ctrl+V while the search panel is focused must land the pasted
+    /// text in the search query field.
+    ///
+    /// Dispatched as `UiEvent::ClipboardPaste` directly, **not** a raw
+    /// `KeyPressed` Ctrl+V — a real Ctrl+V keypress never reaches
+    /// `TuiShellApp::handle` as `KeyPressed` in the first place.
+    /// `quadraui::runtime::preprocess_event` (quadraui#813) intercepts every
+    /// Ctrl+V/Ctrl+Shift+V ahead of `AppLogic::handle` on every backend,
+    /// reads the real system clipboard itself, and redelivers the text as
+    /// `UiEvent::ClipboardPaste` — confirmed empirically while writing this
+    /// test: dispatching a raw `KeyPressed(Char('v'), ctrl)` through
+    /// `driver.dispatch` here pasted this machine's *actual* clipboard
+    /// contents into the panel, never reaching
+    /// `handle_focus_owner_key`'s `FocusKeyRoute::Search` Ctrl+V arm at all
+    /// (verified with temporary `eprintln!`s in `handle_key_pressed` and
+    /// `handle_focus_owner_key` that never fired). `UiEvent::ClipboardPaste`
+    /// is the one both backends actually receive, so it is what this test
+    /// — and the mirror below for the find/replace overlay — dispatch.
+    ///
+    /// Asserts on the rendered search-panel query field, not on
+    /// `engine.project_search_query`, per CLAUDE.md rule 1 — the field is
+    /// painted by `render_search_panel` via `populate_search_sidebar_system`
+    /// (`FieldKind::TextInput { value: engine.project_search_query, .. }`),
+    /// so a real paint bug in that wiring would still show as an empty
+    /// query field even with the engine state correctly populated.
+    ///
+    /// This is a regression guard, not new coverage of a bug: `route_paste`
+    /// already had a `search_has_focus` branch before #946. It exists here
+    /// as the paint-level twin of the find/replace test below, which *does*
+    /// cover a real #946 fix (`route_paste` was missing a `find_replace_open`
+    /// branch entirely).
+    #[test]
+    fn ctrl_v_paste_reaches_the_search_panel_via_clipboard_paste_event() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.focus_sidebar_panel(PANEL_SEARCH);
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.dispatch(UiEvent::ClipboardPaste(
+            "ZQXW_SEARCH_PANEL_MARKER".to_string(),
+        ));
+        driver.render();
+
+        assert!(
+            driver.screen_contains("ZQXW_SEARCH_PANEL_MARKER"),
+            "ClipboardPaste with the search panel focused must reach \
+             Engine::route_paste's search_has_focus branch and paint the \
+             pasted text into the search query field; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #946: Ctrl+V while the find/replace overlay is open and focused must
+    /// land the pasted text in the focused query/replacement field — not in
+    /// the editor buffer behind it.
+    ///
+    /// This is the real bug #946 found while auditing the six clipboard call
+    /// sites: `Engine::route_paste` (the one function every backend's real
+    /// Ctrl+V now reaches — see the search-panel test above for why) had a
+    /// branch for `picker_open`, `sc_commit_input_active`, `search_has_focus`
+    /// and four other overlay flags, but **no branch for `find_replace_open`
+    /// at all**. Before the fix, Ctrl+V while the overlay was open fell
+    /// through every one of those checks to `route_paste`'s `Mode::Normal`
+    /// arm instead, which pastes into the buffer via a normal-mode `p`
+    /// rather than the overlay's own query field.
+    ///
+    /// **Verified RED:** temporarily removing the `if self.find_replace_open
+    /// { self.find_replace_paste(text); return; }` branch this fix adds to
+    /// `Engine::route_paste` (`src/core/engine/keys.rs`) fails this test's
+    /// first assertion — the marker never reaches the query field (the
+    /// `Mode::Normal` `p` fallback instead pastes it into the buffer at the
+    /// cursor, off the narrow visible editor column in this fixture's
+    /// wide-sidebar layout, which is itself further evidence the paste went
+    /// to the wrong place rather than nowhere at all).
+    #[test]
+    fn ctrl_v_paste_reaches_the_find_replace_overlay_via_clipboard_paste_event() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "fn main() {}\n");
+        app.engine.find_replace_open = true;
+        app.engine.find_replace_focus = 0; // query field
+        app.engine.find_replace_query.clear();
+        app.engine.find_replace_cursor = 0;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.dispatch(UiEvent::ClipboardPaste("ZQXW_FR_MARKER".to_string()));
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_FR_MARKER"),
+            "ClipboardPaste with the find/replace overlay open must land in \
+             its query field; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("fn main() {}"),
+            "the editor buffer line must stay unchanged — a mis-routed paste \
+             would insert the marker into it via the Mode::Normal `p` \
+             fallback instead of the query field; screen:\n{screen}"
         );
     }
 
