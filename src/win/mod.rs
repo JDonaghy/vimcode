@@ -93,19 +93,7 @@ use crate::app::{App, TextMetricsBackend};
 pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The same panic hook `crate::gtk::run` / `crate::macos::run` install:
     // flush every dirty buffer to its swap file, then write a crash log.
-    {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            crate::core::swap::run_emergency_flush();
-
-            if let Some(path) = crate::core::swap::write_crash_log(info) {
-                eprintln!("VimCode crashed. Details written to {}", path.display());
-                eprintln!("Unsaved buffers written to swap files for recovery.");
-                eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
-            }
-            prev_hook(info);
-        }));
-    }
+    crate::core::swap::install_gui_crash_hook();
 
     // The concrete backend is chosen here, at the entry point, and handed to
     // `App` — the seam #861 opened and `src/gtk/mod.rs::run` names in its

@@ -48,20 +48,7 @@ pub fn run(file_path: Option<PathBuf>) {
     }
 
     // Install panic hook that flushes swap files + writes crash log.
-    {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            // Emergency: flush swap files for all dirty buffers.
-            crate::core::swap::run_emergency_flush();
-
-            if let Some(path) = crate::core::swap::write_crash_log(info) {
-                eprintln!("VimCode crashed. Details written to {}", path.display());
-                eprintln!("Unsaved buffers written to swap files for recovery.");
-                eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
-            }
-            prev_hook(info);
-        }));
-    }
+    crate::core::swap::install_gui_crash_hook();
 
     install_icon_and_desktop();
     unsafe {

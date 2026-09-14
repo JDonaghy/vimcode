@@ -93,12 +93,20 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// Create a `git` Command with `CREATE_NO_WINDOW` on Windows to prevent
 /// console window flashes in GUI mode.
 fn git_command() -> Command {
+    hidden_command("git")
+}
+
+/// Like [`hidden_command`], but also puts the child in a new process group
+/// on Windows (`CREATE_NEW_PROCESS_GROUP`). Used by long-running child
+/// processes (LSP/DAP servers) that need to be signaled as a group without
+/// affecting our own console, in addition to not flashing a console window.
+pub fn hidden_command_new_process_group(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[allow(unused_mut)]
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.creation_flags(0x00000200 | 0x08000000); // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
     }
     cmd
 }

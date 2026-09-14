@@ -1,6 +1,50 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected). Prior revisions: September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 14, 2026 (#950 — ShellApp convergence decomposition + cheap wins). Prior revisions: September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #950 — TUI-as-second-ShellApp convergence: decomposition written, cheap wins landed
+
+#950 found `TuiShellApp` (`src/tui_main/shell_app.rs`) is a second, independent
+`impl ShellApp` alongside `App` (`src/app.rs`), and that it converts quadraui
+`UiEvent`s back into crossterm `MouseEvent`s (`events::uievent_to_crossterm`)
+to feed the TUI-private `src/tui_main/mouse.rs` click router instead of the
+shared, already-backend-neutral `src/click.rs` — a direct violation of
+quadraui's portability rule 6. The issue was explicitly scoped as an epic
+("do not attempt a single convergence PR"): write a decomposition, land the
+cheap independent wins, leave the mouse-router convergence to follow-ups.
+
+**Decomposition:** `docs/SHELLAPP_CONVERGENCE.md` — sorts #950's four findings
+into essential (px-vs-cell tick geometry, the TUI-only hamburger panel, TUI's
+`debug_log!`-based panic hook) vs. accidental (the SEARCH_COD/SEARCH icon
+split, the 3× duplicated GTK/macOS/Win-GUI panic hook, the ~12×-inlined
+`CREATE_NO_WINDOW` idiom), and proposes an ordered slice plan for the mouse
+router itself (inventory/parity-test stage, then one panel intercept at a
+time onto `click.rs`, ending when `uievent_to_crossterm` has no TUI callers
+left to delete). No mouse-router code was touched in this PR — see that
+doc's "Why the mouse router is not in this PR" section for why it doesn't
+qualify as a cheap win.
+
+**Cheap wins landed:**
+- One icon table: `crate::icons::SEARCH_COD` deleted, `App::shell_config()`
+  now uses the same `SEARCH` constant `TuiShellApp::shell_config()` always
+  used — the two backends' search icons now match.
+- One panic hook: `core::swap::install_gui_crash_hook()` is new; GTK/macOS/
+  Win-GUI's three byte-identical panic-hook closures now call it instead of
+  each carrying its own copy. TUI's hook is untouched (essential difference
+  — it can't `eprintln!` over raw-mode/alt-screen the way a GUI backend can).
+- One `hidden_command`: every inlined `creation_flags(0x08000000)` in
+  `core/` (`swap.rs`, `lsp_manager.rs` ×3, `dap_manager.rs`,
+  `engine/mod.rs`) now goes through `core::git::hidden_command`; the two
+  LSP/DAP sites needing `CREATE_NEW_PROCESS_GROUP` too go through a new
+  `core::git::hidden_command_new_process_group`; `git_command()` itself now
+  delegates to `hidden_command("git")` instead of re-inlining the flag a
+  third time in the same file.
+
+Pure internal refactor + a glyph-consistency bug fix already covered by
+existing icon-resolution tests (`app::portable_entry_point_tests::
+shell_config_resolves_every_activity_bar_icon_and_reserves_the_title_bar`,
+`tui_main::shell_app::tests::shell_config_registers_every_build_activity_bar_panel`)
+— no new driver-tier test added, per CLAUDE.md's pure-refactor exemption.
 
 ## #949 — GTK's `gio::FileMonitor` settings watcher deleted; mtime poll is now the sole reload mechanism
 

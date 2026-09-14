@@ -58,16 +58,11 @@ pub fn cargo_bin_probe_ok(path: &Path, binary: &str) -> bool {
     }
 
     // Quick probe: run `<binary> --version` and check for a successful exit.
-    let mut cmd = std::process::Command::new(path);
+    let mut cmd = crate::core::git::hidden_command(path);
     cmd.arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
     match cmd.output() {
         Ok(output) => {
             if output.status.success() {
@@ -435,13 +430,8 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
     #[cfg(not(target_os = "windows"))]
     let which_cmd = "which";
 
-    let mut cmd = std::process::Command::new(which_cmd);
+    let mut cmd = crate::core::git::hidden_command(which_cmd);
     cmd.arg(binary);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
     let output = cmd.output().ok()?;
     if output.status.success() {
         let path_str = String::from_utf8_lossy(&output.stdout);
@@ -940,13 +930,8 @@ impl LspManager {
             // already covered by `:!`'s tests, so a future divergence here
             // wouldn't be caught by this PR's tests.
             let (shell, flag) = crate::core::terminal::shell_command();
-            let mut command = std::process::Command::new(&shell);
+            let mut command = crate::core::git::hidden_command(&shell);
             command.args([&flag, &install_cmd]);
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-            }
             let result = command.output();
 
             match result {

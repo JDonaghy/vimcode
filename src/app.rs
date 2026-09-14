@@ -1249,7 +1249,7 @@ impl App {
             .map(|mut p| {
                 p.icon = match p.id.as_str() {
                     "panel:explorer" => crate::icons::EXPLORER.s().to_string(),
-                    "panel:search" => crate::icons::SEARCH_COD.s().to_string(),
+                    "panel:search" => crate::icons::SEARCH.s().to_string(),
                     "panel:debug" => crate::icons::DEBUG.s().to_string(),
                     "panel:git" => crate::icons::GIT_BRANCH.s().to_string(),
                     "panel:extensions" => crate::icons::EXTENSIONS.s().to_string(),
