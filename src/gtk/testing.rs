@@ -2674,6 +2674,16 @@ mod tests {
         const OLD_SEARCH_COD_GLYPH: &str = "\u{ea6d}";
 
         fn activity_bar_strip(icon_override: Option<&str>) -> Vec<(u8, u8, u8)> {
+            // This helper calls `driver_with_shell` by hand (rather than
+            // going through `harness`) because it has to patch
+            // `build_shell_config`'s output *between* build and render, so
+            // it must take `harness`'s two guards itself — in the same
+            // order, paint then cwd (see `src/test_paint.rs`). Declared
+            // first so they drop *last*, after `driver`: a GTK driver
+            // rasterises activity-bar glyphs through Pango/Cairo, and two
+            // threads doing that at once segfaults inside `FT_Load_Glyph`.
+            let _paint = crate::test_paint::PaintGuard::acquire();
+            let _cwd = crate::test_cwd::CwdReadGuard::acquire();
             let mut engine = Engine::new();
             engine.settings.use_nerd_fonts = true;
             let engine = Rc::new(RefCell::new(engine));
