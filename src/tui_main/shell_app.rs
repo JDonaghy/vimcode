@@ -7721,6 +7721,55 @@ mod tests {
         );
     }
 
+    /// #948: `:!` used to hardcode `Command::new("sh")`. Drives the real
+    /// event pipeline — `:`, then `!echo ...`, then Enter, exactly as a user
+    /// types it — rather than calling `Engine::execute` directly, and reads
+    /// the painted command line rather than `engine.message`, per
+    /// `render_content_paints_command_line_via_shell_app` above (that test
+    /// establishes the command line renders `engine.message` verbatim). This
+    /// is the driver-tier counterpart the #948 review asked for:
+    /// `tests/new_vim_features.rs`'s `test_shell_command_shows_output` and
+    /// `test_bang_command_honours_shell_env_var` only ever call
+    /// `common::exec`/read `e.message` — they never go through
+    /// `TuiShellApp::handle` or a paint pass.
+    ///
+    /// **Deliberately does not** mutate `$SHELL` the way
+    /// `test_bang_command_honours_shell_env_var` does to prove the fix
+    /// resolves the shell via `shell_command()` rather than a hardcoded
+    /// `"sh"` literal: this test lives in the same shared `--lib` test
+    /// binary process as `terminal_new_tab`'s real-PTY-spawning tests
+    /// (several in this very file, e.g.
+    /// `driver_with_shell_click_dispatches_through_shell_app_handle`'s
+    /// fixtures, plus more in `src/render.rs` and `src/gtk/testing.rs`),
+    /// which also read `$SHELL` (via `default_shell()`) to spawn real
+    /// interactive shells and run concurrently with this test under the
+    /// default multi-threaded test runner. Overriding process-global
+    /// `$SHELL` here — even briefly — risks handing one of those unrelated
+    /// tests a non-interactive one-shot script instead of a real shell,
+    /// exactly the class of cross-test global-state race the `PATH`-mutation
+    /// comment on `no_install_command_error_paints_on_command_line_via_
+    /// shell_app` above already ruled out for the same reason. The
+    /// `$SHELL`-divergence proof is safe only in `tests/new_vim_features.rs`
+    /// because each integration-test file runs as its own separate process.
+    /// This test instead covers the *other* half: that a real `:!` run,
+    /// through the real driver, still reaches the painted screen — i.e. the
+    /// `shell_command()` seam didn't break the existing user-visible
+    /// behaviour on the platform these tests actually run on.
+    #[test]
+    fn bang_command_shell_output_paints_on_command_line_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        run_ex_command(&mut driver, "!echo ZQXW_948_BANG_MARKER");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_948_BANG_MARKER"),
+            "`:!echo ...` must run through shell_command() and paint its \
+             stdout on the command line; screen:\n{screen}"
+        );
+    }
+
     /// A modal dialog must paint *and* cache its `DialogLayout` — the layout
     /// is what `handle_key_pressed`'s dialog tier and `handle_mouse_event`
     /// hit-test against, so a paint that doesn't publish it is only half
