@@ -69,8 +69,14 @@ impl Icon {
 
 pub const HAMBURGER: Icon = Icon::new("\u{f035c}", "\u{2630}"); // ☰
 pub const EXPLORER: Icon = Icon::new("\u{f07c}", "\u{229e}"); // ⊞
+
+// #950: GTK's `App::shell_config()` used to carry its own `SEARCH_COD`
+// (nf-cod-search, `\u{ea6d}`) instead of this constant, so the activity bar
+// showed a different search glyph per backend for no product reason — an
+// accidental fork, not a deliberate per-platform choice (nothing about a
+// search icon is GTK- or TUI-specific). Converged onto the one table both
+// backends already shared for every other activity-bar icon.
 pub const SEARCH: Icon = Icon::new("\u{f002}", "/"); // /
-pub const SEARCH_COD: Icon = Icon::new("\u{ea6d}", "/"); // nf-cod-search (GTK only)
 pub const DEBUG: Icon = Icon::new("\u{f188}", "!"); // !
 pub const GIT_BRANCH: Icon = Icon::new("\u{e702}", "Y"); // Y (branch shape)
 pub const GIT_BRANCH_ALT: Icon = Icon::new("\u{e725}", "Y"); // nf-dev-git_branch alt

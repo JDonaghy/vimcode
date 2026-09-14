@@ -96,6 +96,39 @@ pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> 
     append_to_crash_log(&crash_msg)
 }
 
+/// Install the crash-recovery panic hook shared by every *GUI* entry point
+/// (GTK, macOS, Win-GUI): flush every dirty buffer to its swap file, write a
+/// crash log, print where to find it, then chain to whatever hook was
+/// already installed. `src/gtk/mod.rs::run`, `src/macos/mod.rs::run`, and
+/// `src/win/mod.rs::run` used to each carry an identical copy of this
+/// closure — one of the drift items #950 catalogued ("the panic hook copied
+/// four times"). Centralizing the three identical copies here means a
+/// change to the message or the flush/log call order only has to be made
+/// once, and it can never be made in only two of the three by accident.
+///
+/// **Not shared with the TUI entry point** (`tui_main::mod::run`) — that is
+/// an essential difference, not a fourth accidental copy to fold in here.
+/// TUI's hook writes via `debug_log!` instead of `eprintln!`, because a
+/// terminal backend runs in raw mode / the alternate screen: writing to
+/// stderr mid-panic there is invisible to the user (or corrupts the
+/// terminal state they're looking at) in a way that isn't a concern for any
+/// GUI backend. See #950's decomposition doc for the full essential-vs-
+/// accidental accounting.
+pub fn install_gui_crash_hook() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Emergency: flush swap files for all dirty buffers.
+        run_emergency_flush();
+
+        if let Some(path) = write_crash_log(info) {
+            eprintln!("VimCode crashed. Details written to {}", path.display());
+            eprintln!("Unsaved buffers written to swap files for recovery.");
+            eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
+        }
+        prev_hook(info);
+    }));
+}
+
 /// Parsed swap-file header.
 #[derive(Debug, Clone)]
 pub struct SwapHeader {
@@ -200,12 +233,10 @@ pub fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
         // Use tasklist to check if the PID exists.
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("tasklist")
+        crate::core::git::hidden_command("tasklist")
             .args(["/FI", &format!("PID eq {}", pid), "/NH"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
