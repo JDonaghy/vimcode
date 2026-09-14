@@ -2626,6 +2626,102 @@ mod tests {
         );
     }
 
+    /// #950 review: `App::shell_config()`'s `"panel:search"` arm used to
+    /// build its own GTK-only `SEARCH_COD` (nf-cod-search, `\u{ea6d}`)
+    /// instead of the shared `crate::icons::SEARCH` (nf-fa-search,
+    /// `\u{f002}`) TUI always used — an accidental per-backend icon fork
+    /// with no product reason, converged onto the shared constant. That is
+    /// a user-visible rendered-output change (the activity-bar search glyph
+    /// literally changes shape whenever Nerd Fonts are on), so per #555 it
+    /// must be asserted in *pixels*, not by reading `PanelDefinition.icon`
+    /// back out — a string-equality assertion against `crate::icons::SEARCH`
+    /// would keep passing even if `App::shell_config()`'s match arm were
+    /// reverted to build the string by hand instead of calling through the
+    /// constant.
+    ///
+    /// Mirrors `extension_panel_contributes_an_activity_bar_icon` immediately
+    /// above (render the same app twice, diff the activity-bar column), but
+    /// deliberately keeps Nerd Fonts **on** rather than off: unlike that
+    /// test's synthetic extension icon, `SEARCH` and the deleted
+    /// `SEARCH_COD` shared the exact same ASCII fallback (`"/"`, see
+    /// `icons.rs`'s pre-#950 history) — the whole bug only ever showed with
+    /// Nerd Fonts enabled, so a fallback-glyph probe cannot see it at all.
+    ///
+    /// # Why this fails if `"panel:search"` reverts to the deleted glyph
+    ///
+    /// `current` renders the real, live `App::shell_config()` output
+    /// unmodified. `reverted` renders the identical app/engine with only
+    /// `"panel:search"`'s `icon` field patched back to the deleted
+    /// `SEARCH_COD` codepoint (`\u{ea6d}`) *after* `build_shell_config` runs
+    /// — i.e. exactly the string `App::shell_config()` used to produce
+    /// before #950. If the fix is reverted, `current` starts producing that
+    /// same string again, `current == reverted`, and `differing` collapses
+    /// to `0`: the assertion below goes red. Verified this fails (0/…
+    /// differing) with `"panel:search" => crate::icons::SEARCH.s()`
+    /// hand-reverted to `"panel:search" => crate::icons::SEARCH_COD.s()`-style
+    /// literal `"\u{ea6d}".to_string()` locally.
+    #[test]
+    fn activity_bar_search_icon_paints_the_shared_glyph_not_the_deleted_cod_variant() {
+        /// Comfortably inside the activity bar and below the title-bar band
+        /// — same window/scan geometry as
+        /// `extension_panel_contributes_an_activity_bar_icon` just above.
+        const STRIP_W: i32 = 40;
+        const STRIP_Y: std::ops::Range<i32> = 100..800;
+        /// The deleted `crate::icons::SEARCH_COD` constant's Nerd Font
+        /// codepoint (nf-cod-search) — inlined because the constant itself
+        /// is gone; this is what `"panel:search"`'s `icon` field used to
+        /// hold before #950.
+        const OLD_SEARCH_COD_GLYPH: &str = "\u{ea6d}";
+
+        fn activity_bar_strip(icon_override: Option<&str>) -> Vec<(u8, u8, u8)> {
+            let mut engine = Engine::new();
+            engine.settings.use_nerd_fonts = true;
+            let engine = Rc::new(RefCell::new(engine));
+            let app = App::new_headless(Rc::clone(&engine));
+            let mut config = crate::gtk::build_shell_config(&app);
+            if let Some(icon) = icon_override {
+                let panel = config
+                    .panels
+                    .iter_mut()
+                    .find(|p| p.id.as_str() == "panel:search")
+                    .expect("fixture: shell_config must register panel:search");
+                panel.icon = icon.to_string();
+            }
+            let mut driver = driver_with_shell(app, config, 1400, 900);
+            let mut px = Vec::new();
+            for y in STRIP_Y.step_by(2) {
+                for x in (0..STRIP_W).step_by(2) {
+                    px.push(driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let current = activity_bar_strip(None);
+        let reverted = activity_bar_strip(Some(OLD_SEARCH_COD_GLYPH));
+
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let differing = current
+            .iter()
+            .zip(reverted.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differing > 0,
+            "panel:search's live rendering must differ from the deleted \
+             SEARCH_COD (nf-cod-search, \\u{{ea6d}}) glyph it used to paint \
+             pre-#950 — {}/{} sampled pixels differed; a revert of the \
+             SEARCH_COD → SEARCH convergence would make these two renders \
+             identical",
+            differing,
+            current.len()
+        );
+    }
+
     /// #727: a natively-expressible dialog (no `DialogTable`, no text
     /// input — `quit_unsaved`, the "Unsaved Changes" confirm, is exactly
     /// this shape) must be presented via a real `PlatformServices::

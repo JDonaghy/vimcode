@@ -1,6 +1,6 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#950 — ShellApp convergence decomposition + cheap wins). Prior revisions: September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 14, 2026 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected). Prior revisions: September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
 
 ## #950 — TUI-as-second-ShellApp convergence: decomposition written, cheap wins landed
 
@@ -40,11 +40,34 @@ qualify as a cheap win.
   delegates to `hidden_command("git")` instead of re-inlining the flag a
   third time in the same file.
 
-Pure internal refactor + a glyph-consistency bug fix already covered by
-existing icon-resolution tests (`app::portable_entry_point_tests::
+**Driver-tier test — added, review round 1.** The panic-hook and
+`hidden_command` wins are pure internal refactors (byte-identical behavior,
+just de-duplicated). The icon-table win is not: switching
+`App::shell_config()`'s `"panel:search"` arm from GTK's own `SEARCH_COD`
+(nf-cod-search, `\u{ea6d}`) to the shared `SEARCH` constant (nf-fa-search,
+`\u{f002}`) changes what glyph the GTK activity bar actually paints whenever
+Nerd Fonts are on — a rendered-output change, not a refactor, so claiming
+the pure-refactor exemption for it was wrong (round-1 review caught this).
+The two existing tests cited below are plain unit tests over
+`shell_config()`'s return value (`!p.icon.is_empty()` on the GTK side) and
+would keep passing through a revert to `SEARCH_COD` — they don't cover the
+regression. Added
+`gtk::testing::tests::activity_bar_search_icon_paints_the_shared_glyph_not_the_deleted_cod_variant`
+(`src/gtk/testing.rs`): renders the real `App::shell_config()` activity bar
+through `GtkDriver` twice — once unmodified, once with `"panel:search"`'s
+icon patched back to the deleted `SEARCH_COD` codepoint after
+`build_shell_config` runs — and asserts the two rasterised activity-bar
+columns differ in pixels (per #555, since the icon strip paints straight to
+Cairo and never reaches `painted_texts()`). Verified this fails (0/7000
+sampled pixels differed) with `App::shell_config()`'s `"panel:search"` arm
+hand-reverted to the `\u{ea6d}` literal, confirming the test actually
+catches the regression it names.
+
+The two pre-existing tests (`app::portable_entry_point_tests::
 shell_config_resolves_every_activity_bar_icon_and_reserves_the_title_bar`,
 `tui_main::shell_app::tests::shell_config_registers_every_build_activity_bar_panel`)
-— no new driver-tier test added, per CLAUDE.md's pure-refactor exemption.
+still stand as coverage that every panel resolves *some* non-empty icon —
+just not this specific regression.
 
 ## #949 — GTK's `gio::FileMonitor` settings watcher deleted; mtime poll is now the sole reload mechanism
 
