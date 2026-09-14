@@ -28,20 +28,25 @@
 //! #862 closed the three items the previous revision of this doc comment
 //! listed as the remaining blockers to dropping the `gui` gate:
 //!
-//! 1. **The three platform-typed fields** (`settings_monitor`, `window`,
-//!    `css_provider`) are now type-erased: `window`/`css_provider` behind
-//!    the small local traits [`PlatformWindowHandle`]/[`PlatformCssProvider`]
-//!    (the same shape as [`TextMetricsBackend`] and
-//!    `Engine::clipboard_read`/`clipboard_write`, #417), `settings_monitor`
-//!    behind a `Box<dyn Any>` drop-guard (nothing ever calls a method on it).
+//! 1. **The platform-typed fields** (`window`, `css_provider`) are now
+//!    type-erased behind the small local traits
+//!    [`PlatformWindowHandle`]/[`PlatformCssProvider`] (the same shape as
+//!    [`TextMetricsBackend`] and `Engine::clipboard_read`/`clipboard_write`,
+//!    #417). A third field used to live in this list, `settings_monitor`,
+//!    holding a GTK-only `gio::FileMonitor` behind a `Box<dyn Any>`
+//!    drop-guard; #949 deleted it outright rather than type-erasing it —
+//!    `Engine::check_settings_reload`'s portable mtime poll (already the
+//!    sole reload mechanism on TUI, and already called from GTK's own
+//!    `handle_poll_tick` every tick) made it redundant, and deleting it
+//!    closed the settings-hot-reload gap on macOS/Win-GUI that this file's
+//!    `new_portable` doc table used to list as deliberately skipped.
 //! 2. **The platform hook call sites** (colorscheme reload, OS window title /
 //!    default size / minimize / maximized-check, CSD capture) now go through
 //!    those same traits and compile for every feature set; only window
 //!    *discovery* (`find_visible_window` — quadraui has no portable "find the
 //!    runner's window" surface yet) and the handful of literal
-//!    `gtk4::Settings`/`gtk4::IconTheme`/`gio::File` calls inside
-//!    `App::new`/`handle_poll_tick` stay behind inline `#[cfg(feature =
-//!    "gui")]`.
+//!    `gtk4::Settings`/`gtk4::IconTheme` calls inside `App::new`/
+//!    `handle_poll_tick` stay behind inline `#[cfg(feature = "gui")]`.
 //! 3. **`crate::gtk::{click, css, util}`.** The portable majority of these —
 //!    `pixel_to_click_target` and the rest of the click-resolution/tab-bar
 //!    pixel-geometry functions, `make_theme_css`/`STATIC_CSS`, `open_url`/
@@ -69,8 +74,6 @@
 //! under `-D warnings`.
 #![allow(deprecated)]
 
-#[cfg(feature = "gui")]
-use gio::prelude::{FileExt, FileMonitorExt};
 #[cfg(feature = "gui")]
 use gtk4::gdk;
 #[cfg(feature = "gui")]
@@ -149,14 +152,18 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
 /// Work that a GTK callback with no `&mut App` in hand must hand back to the
 /// next frame.
 ///
-/// #732 tranche 3: the eight deferrals below are all that is left of the
+/// #732 tranche 3: the six deferrals below are all that is left of the
 /// Relm4-era `Msg` bus. They are genuine deferrals, not translations — each
-/// originates somewhere that cannot call an `&mut self` method at all: a
-/// file-watcher signal, or [`GtkAccelHost`], which holds only a clone of
-/// the queue. (The 200 ms yank-highlight one-shot used to be a ninth,
-/// scheduled via a one-shot toolkit timer; #813 ported it to the portable
-/// `yank_hl_deadline` poll-in-`tick` pattern TUI already used — see
-/// [`App::yank_hl_deadline`] — so it no longer needs this queue at all.)
+/// originates somewhere that cannot call an `&mut self` method at all:
+/// [`GtkAccelHost`], which holds only a clone of the queue. (The 200 ms
+/// yank-highlight one-shot used to be a seventh, scheduled via a one-shot
+/// toolkit timer; #813 ported it to the portable `yank_hl_deadline`
+/// poll-in-`tick` pattern TUI already used — see [`App::yank_hl_deadline`] —
+/// so it no longer needs this queue at all. #949 dropped an eighth,
+/// `SettingsFileChanged`, the same way: the GTK-only `gio::FileMonitor` that
+/// used to construct it is gone, replaced by `Engine::check_settings_reload`'s
+/// portable mtime poll, which `handle_poll_tick` now calls directly every
+/// tick instead of waiting on a deferred signal.)
 ///
 /// quadraui has no deferral seam of its own to move onto — `ShellApp::tick`
 /// *is* the seam (its doc names "draining channels" as the intended use), and
@@ -166,13 +173,6 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
 enum DeferredAction {
     /// Redraw after an accelerator mutated engine state directly.
     Resize,
-    /// `settings.json` changed on disk. Only `App::new`'s (`gui`-gated) `gio`
-    /// file-watcher callback ever constructs this variant, so a
-    /// `--no-default-features` build never does — allowed rather than
-    /// `#[cfg]`-gating the variant, since the match arm that handles it
-    /// (`tick_dispatch`) is itself portable.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
-    SettingsFileChanged,
     /// Toggle focus between the explorer and the editor.
     ToggleFocusExplorer,
     /// Toggle focus between the search panel and the editor.
@@ -465,13 +465,6 @@ pub(crate) struct App {
     pub(crate) h_sb_drag_cell: Rc<Cell<Option<core::WindowId>>>,
     /// True while user is drag-selecting text inside a find/replace input field.
     pub(crate) fr_input_dragging: bool,
-    /// Type-erased platform file-watcher handle (`gio::FileMonitor` on GTK),
-    /// kept alive only to continue monitoring `settings.json` — nothing here
-    /// ever calls a method on it, so a `Box<dyn Any>` drop-guard names no
-    /// toolkit type (#862), unlike `window`/`css_provider` below which do
-    /// need call-through and so go via a small local trait instead.
-    #[allow(dead_code)] // Kept alive to continue monitoring settings.json
-    pub(crate) settings_monitor: Option<Box<dyn std::any::Any>>,
     pub(crate) deferred: DeferredQueue,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
@@ -1087,40 +1080,19 @@ impl App {
 
         let deferred = DeferredQueue::new();
 
-        // File watcher for settings.json hot-reload.
-        let settings_path = std::env::var("HOME")
-            .map(|h| format!("{}/.config/vimcode/settings.json", h))
-            .unwrap_or_else(|_| ".config/vimcode/settings.json".to_string());
-        let file = gio::File::for_path(&settings_path);
-        let settings_monitor: Option<Box<dyn std::any::Any>> =
-            match file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
-                Ok(monitor) => {
-                    let deferred_for_monitor = deferred.clone();
-                    monitor.connect_changed(move |_, _, _, event| {
-                        if event == gio::FileMonitorEvent::ChangesDoneHint {
-                            deferred_for_monitor.send(DeferredAction::SettingsFileChanged);
-                        }
-                    });
-                    Some(Box::new(monitor))
-                }
-                Err(_) => None,
-            };
-
-        Self::assemble(
-            engine,
-            deferred,
-            css_provider,
-            last_colorscheme,
-            settings_monitor,
-            backend,
-        )
+        // #949: settings.json hot-reload used to need a GTK-only
+        // `gio::FileMonitor` constructed here. It's gone — `handle_poll_tick`
+        // now calls `Engine::check_settings_reload`'s portable mtime poll on
+        // every tick, the same mechanism TUI has always used, so there is
+        // nothing left for this constructor to set up.
+        Self::assemble(engine, deferred, css_provider, last_colorscheme, backend)
     }
 
     /// Backend-neutral twin of [`App::new`] (#859) — what a wrapper over a
     /// non-GTK quadraui backend calls to get the *same* `App`, and therefore
     /// the same `impl ShellApp`, the GTK entry point runs.
     ///
-    /// This is [`App::new`] minus exactly three steps in its prologue that
+    /// This is [`App::new`] minus exactly two steps in its prologue that
     /// need a live GTK display, each of which is a platform *resource*
     /// rather than a decision:
     ///
@@ -1129,7 +1101,16 @@ impl App {
     /// | `gdk::Display` icon-theme search path | GDK-only; no portable icon-theme concept exists off GTK | nothing — no other backend has an icon theme to seed |
     /// | `crate::gtk::css::load_css` | `unwrap()`s `gdk::Display::default()` | `css_provider: None` — a GTK stylesheet styles nothing on another toolkit |
     /// | `gtk4::Settings::set_gtk_application_prefer_dark_theme` | GTK-only | the backend's own light/dark handling |
-    /// | the `gio::FileMonitor` on `settings.json` | GIO-only | `settings_monitor: None` — settings hot-reload is a known gap off GTK, tracked as the file-watcher half of the quadraui-side surface `src/app.rs`'s module doc item 2 names |
+    ///
+    /// A fourth row used to live in this table: the GTK-only
+    /// `gio::FileMonitor` on `settings.json`, replaced here by
+    /// `settings_monitor: None` — a known hot-reload gap off GTK. #949
+    /// deleted the monitor from [`App::new`] entirely rather than adding a
+    /// portable equivalent here, since `Engine::check_settings_reload`'s
+    /// mtime poll (already the sole mechanism on TUI) now runs from the
+    /// shared `handle_poll_tick`, which both constructors' `App`s reach via
+    /// `ShellApp::tick`. That closes this gap for `new_portable`'s callers
+    /// (macOS, Win-GUI) for free — nothing needed adding here at all.
     ///
     /// **`install_bundled_icon_font()` is *not* in that skipped list (#920).**
     /// It used to be — `App::new` called it and this constructor didn't, so
@@ -1199,7 +1180,6 @@ impl App {
             DeferredQueue::new(),
             None,
             last_colorscheme,
-            None,
             backend,
         )
     }
@@ -1389,7 +1369,6 @@ impl App {
         deferred: DeferredQueue,
         css_provider: Option<Box<dyn PlatformCssProvider>>,
         last_colorscheme: String,
-        settings_monitor: Option<Box<dyn std::any::Any>>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
     ) -> Self {
         App {
@@ -1411,7 +1390,6 @@ impl App {
             mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
             h_sb_drag_cell: Rc::new(Cell::new(None)),
             fr_input_dragging: false,
-            settings_monitor,
             deferred,
             last_clipboard_content: None,
             tab_close_hover: None,
@@ -1536,7 +1514,6 @@ impl App {
             DeferredQueue::new(),
             None,
             last_colorscheme,
-            None,
             backend,
         )
     }
@@ -2540,6 +2517,18 @@ impl App {
                 self.draw_needed.set(true);
             }
         }
+
+        // #949: reload settings.json if it changed on disk. This used to be
+        // driven by a GTK-only `gio::FileMonitor` that sent a
+        // `DeferredAction::SettingsFileChanged` on a native file-change
+        // event; that watcher is gone, and `check_settings_reload`'s
+        // portable mtime poll (inside `settings_file_changed`) now runs
+        // unconditionally every tick instead — the same mechanism TUI's own
+        // `tick` has always used. quadraui's GTK/macOS idle-poll fallback
+        // ceiling is 250ms (`runner.rs`'s `ShellApp::tick` doc), so the
+        // reload lag here matches what TUI already ships, not a regression
+        // from the watcher's near-immediate `ChangesDoneHint`.
+        self.settings_file_changed();
 
         // #731: a ~135-line block used to live here polling
         // `self.mouse_pos_cell` at 20Hz for four distinct hover features —
@@ -7154,7 +7143,6 @@ impl App {
         for action in self.deferred.drain() {
             match action {
                 DeferredAction::Resize => self.handle_resize(),
-                DeferredAction::SettingsFileChanged => self.settings_file_changed(),
                 DeferredAction::ToggleFocusExplorer => self.toggle_focus_explorer(),
                 DeferredAction::ToggleFocusSearch => self.toggle_focus_search(),
                 DeferredAction::ToggleSidebar => self.toggle_sidebar_panel(),

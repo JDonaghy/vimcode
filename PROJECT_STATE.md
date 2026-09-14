@@ -1,6 +1,40 @@
 # VimCode Project State
 
-**Last updated:** September 11, 2026 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened). Prior revisions: September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 14, 2026 (#949 — GTK-only settings-reload watcher deleted). Prior revisions: September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+
+## #949 — GTK's `gio::FileMonitor` settings watcher deleted; mtime poll is now the sole reload mechanism
+
+`App::new` built a `gio::FileMonitor` over a hardcoded `$HOME/.config/…`
+path purely to trigger settings.json hot-reload — GTK-only, so hot-reload
+was a documented gap on macOS/Win-GUI. But `Engine::check_settings_reload`
+already polls the settings file's mtime and was already TUI's sole reload
+mechanism (`tui_main/shell_app.rs`'s `tick`, unconditional every tick).
+
+Fixed: deleted the `gio::FileMonitor`, the `settings_monitor` field, the
+`DeferredAction::SettingsFileChanged` variant, and the hardcoded `$HOME`
+path entirely. `App::handle_poll_tick` (shared by every GUI entry point,
+GTK/macOS/Win-GUI alike, since it's called from the portable
+`tick_dispatch`) now calls `settings_file_changed` — and so
+`check_settings_reload` — every tick, closing the macOS/Win-GUI gap for
+free with no per-backend code.
+
+Cadence check (the issue's "confirm first"): quadraui's GTK/macOS idle-poll
+tick fallback is a 250ms ceiling (`runner.rs`'s `ShellApp::tick` doc,
+quadraui#832) — same order of magnitude as the old watcher's near-immediate
+`ChangesDoneHint`, and identical to what TUI has always shipped with no
+complaints. No poll-frequency tightening needed.
+
+Pure internal mechanism swap, but user-visible (hot-reload lag is a UX
+property) — no driver-tier test added: `check_settings_reload`'s own
+behavior (self-save suppression, `Settings::load_with_validation`) is
+already covered where it lives in `core/engine`, and the GTK/TUI driver
+harnesses don't model real filesystem mtime changes across ticks, so there
+was nothing new to assert on that the existing coverage didn't already
+reach through `check_settings_reload` itself. Manual verification only
+(see the PR's SMOKE_TESTS).
+
+Verified: `cargo build`/`cargo clippy -- -D warnings`/`cargo clippy
+--no-default-features -- -D warnings`/`cargo fmt --check` all clean.
 
 ## #862 — `src/app.rs` compiles without `gui` (prerequisite for #859)
 

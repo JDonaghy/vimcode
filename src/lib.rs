@@ -54,10 +54,12 @@ pub mod gtk;
 /// `struct App` — the backend-neutral editor shell application, hoisted out
 /// of `src/gtk/mod.rs` by #785 (stage 1 of #47) so a second native backend
 /// can reuse it instead of re-implementing ~6,900 lines of portable shell
-/// logic. #862 dropped the `gui` gate itself: the three remaining
-/// platform-typed fields (`window`, `css_provider`, `settings_monitor`) are
-/// now type-erased (a small local trait for `window`/`css_provider`, an
-/// opaque `Box<dyn Any>` drop-guard for `settings_monitor`), and the
+/// logic. #862 dropped the `gui` gate itself: the remaining platform-typed
+/// fields (`window`, `css_provider`) are now type-erased behind small local
+/// traits. A third, `settings_monitor` (a GTK-only `gio::FileMonitor` behind
+/// an opaque `Box<dyn Any>` drop-guard), was deleted outright by #949 rather
+/// than type-erased — `Engine::check_settings_reload`'s portable mtime poll,
+/// already the sole reload mechanism on TUI, made it redundant. The
 /// `crate::gtk::{click, css, util}` reliance moved to the neutral
 /// `crate::click`/`crate::app_support`/`crate::css` above. What's left
 /// behind `#[cfg(feature = "gui")]` *inside* `src/app.rs` is the handful of

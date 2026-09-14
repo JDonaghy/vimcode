@@ -57,11 +57,16 @@ mappers. #785 (stage 1 of #47, the native macOS GUI) hoisted all ~6,900 lines
 out of `src/gtk/mod.rs`, which shrank from 9,650 to ~2,580 production lines.
 
 #862 dropped the `#[cfg(feature = "gui")]` gate `pub mod app;` carried in
-`src/lib.rs`: the three platform-typed fields (`window`, `css_provider`,
-`settings_monitor`) are now type-erased (a small local trait for the first
-two — `PlatformWindowHandle`/`PlatformCssProvider`, the same shape as
-`TextMetricsBackend` and `Engine::clipboard_read`/`clipboard_write` — and a
-`Box<dyn Any>` drop-guard for the third), and the portable majority of
+`src/lib.rs`: the platform-typed fields `window`/`css_provider` are now
+type-erased behind small local traits — `PlatformWindowHandle`/
+`PlatformCssProvider`, the same shape as `TextMetricsBackend` and
+`Engine::clipboard_read`/`clipboard_write`. A third field, `settings_monitor`
+(a GTK-only `gio::FileMonitor` behind a `Box<dyn Any>` drop-guard), was
+type-erased the same way at first but #949 deleted it outright instead:
+`Engine::check_settings_reload`'s portable mtime poll — already the sole
+settings-hot-reload mechanism on TUI — made the GTK-only watcher redundant,
+and `handle_poll_tick` now calls it every tick on every backend, closing the
+settings-hot-reload gap on macOS/Win-GUI for free. The portable majority of
 `crate::gtk::{click, css, util}` moved to the backend-neutral `crate::click`/
 `crate::css`/`crate::app_support` (below). What is still behind inline
 `#[cfg(feature = "gui")]` *inside* `src/app.rs` is genuinely platform-bound:
@@ -69,8 +74,8 @@ two — `PlatformWindowHandle`/`PlatformCssProvider`, the same shape as
 `TextMetricsBackend`/`PlatformWindowHandle`/`PlatformCssProvider` impls for the
 concrete GTK types, window *discovery* (`find_visible_window` — quadraui has
 no portable "find the runner's window" surface yet), and a few literal
-`gtk4::Settings`/`gio::File` call sites. `src/app.rs`'s own module doc has the
-full inventory.
+`gtk4::Settings`/`gtk4::IconTheme` call sites. `src/app.rs`'s own module doc
+has the full inventory.
 
 ### GTK directory (`src/gtk/`)
 
