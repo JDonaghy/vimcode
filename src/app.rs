@@ -1329,6 +1329,34 @@ impl App {
             // `ACTIVITY_ROW_PX = 48.0` (VS Code parity), so sizing its
             // *width* from the editor font makes it oblong. Pin to 48px.
             .with_activity_bar_width_px(48.0);
+        // #947: seed the *initial* editor font from `settings.font_family`/
+        // `font_size` before the runner's first frame, not just via
+        // `sync_per_frame_backend_state`'s per-frame `set_editor_font` call.
+        //
+        // quadraui's GTK runner measures `char_width()`/`line_height()` from
+        // `Backend::editor_font_pango_string()` ONCE PER FRAME, but that
+        // measurement happens *before* it calls into `App::render_content`
+        // (`gtk/run.rs`'s per-frame prologue seeds `current_char_width`/
+        // `current_line_height`, then hands control to the `ShellApp`).
+        // `sync_per_frame_backend_state`'s `set_editor_font` call, made
+        // *inside* `render_content`, therefore only takes effect for the
+        // *next* frame's measurement — for exactly one frame (the very
+        // first), the backend's `editor_font_*` would still be its own
+        // built-in default ("Monospace 11") rather than
+        // `settings.font_size` (14 by default), so that first frame's grid
+        // math (gutter width, cursor position, click resolution) would use
+        // the wrong `char_width`/`line_height` even though the glyphs
+        // painted that same frame already used the new font description.
+        // `with_editor_font` closes that gap: the runner applies it via
+        // `Backend::set_editor_font` during its own one-time `setup()`,
+        // before the first frame's measurement ever runs, so frame 1 is
+        // already consistent — `sync_per_frame_backend_state`'s per-frame
+        // call remains the only thing that matters for a runtime `:set
+        // guifont`/`:set font_size=N`/`zoomin`/`zoomout` after that.
+        cfg = cfg.with_editor_font(
+            self.engine.borrow().settings.font_family.clone(),
+            self.engine.borrow().settings.font_size as f32,
+        );
         // #759: the shared Alt rung clamps sidebar width, so Alt+Left/Right
         // resolve identically on every backend.
         cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
@@ -3393,6 +3421,19 @@ impl App {
         // effect immediately, matching `sync_ui_font_size`/`sync_nerd_fonts`
         // just above.
         backend.set_ui_font(&UI_FONT());
+        // #947 / quadraui#422: push `settings.font_family`/`font_size` onto
+        // the *paint* backend's editor font every frame, so a runtime
+        // `:set guifont`/`:set font_size=N`/`zoomin`/`zoomout` reaches the
+        // painted editor text on the very next frame — mirroring
+        // `set_ui_font` immediately above. Before this call nothing in
+        // vimcode ever read `settings.font_family`/`font_size` (`grep -rn
+        // "set_editor_font" src/` returned zero hits before this issue), so
+        // the editor painted at whatever default quadraui's `GtkBackend`/
+        // `MacBackend` ship with ("Monospace 11") regardless of the setting.
+        backend.set_editor_font(
+            &engine.settings.font_family,
+            engine.settings.font_size as f32,
+        );
 
         // #672: scroll surfaces are re-registered from scratch every frame
         // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)
@@ -4379,7 +4420,19 @@ impl App {
         // GTK-specific selection implementation.
         if render::command_line_selection_allowed(&self.engine.borrow()) {
             let data = render::build_command_line(&self.engine.borrow());
-            let char_width = self.backend.borrow().char_width();
+            // #947: was `self.backend.borrow().char_width()` — the click
+            // backend's OWN `current_char_width`, which nothing here ever
+            // seeded (it stays at `GtkBackend::new()`'s hardcoded default,
+            // 8.0px), not the width this frame actually painted the command
+            // line with. That silently drifted from the real painted
+            // `painted_char_width()` (#751's fix for the identical class of
+            // bug elsewhere) — masked before #947 because the old
+            // hardcoded-11pt paint's char width (~8.8px) was close enough to
+            // the stale 8.0px default not to cross a column boundary at
+            // small click offsets; #947 wiring the real (larger) default
+            // `settings.font_size` (14pt, ~11px) through to paint widened
+            // the gap enough to resolve clicks one column off.
+            let char_width = self.painted_char_width() as f32;
             let rect = self.engine.borrow().command_line_rect.get();
             let point = quadraui::Point::new(x as f32, y as f32);
             if let Some(char_idx) =
@@ -5119,8 +5172,21 @@ impl App {
                         &**self.backend.borrow(),
                         x,
                         y,
-                        self.cached_line_height,
-                        self.cached_char_width,
+                        // #947/#555: was `self.cached_line_height`/
+                        // `self.cached_char_width` — those are seeded once
+                        // in `setup()` (before the runner's first real
+                        // font-metrics measurement ever runs) and only
+                        // refreshed by `tick_dispatch`/`WindowResized`, so a
+                        // driver that never fires a tick between `setup()`
+                        // and a drag (every headless `GtkDriver` test) reads
+                        // them permanently stale. `painted_line_height()`/
+                        // `painted_char_width()` are #555's fix for exactly
+                        // this class of bug — set fresh every
+                        // `render_content` frame — and every OTHER
+                        // painted-geometry hit-test in this file already
+                        // uses them; this arm was the one holdout.
+                        self.painted_line_height(),
+                        self.painted_char_width(),
                         layout,
                         &self.cached_tab_pixel_hits.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
@@ -5135,7 +5201,10 @@ impl App {
                 // drag arm in `mouse::handle_mouse`.
                 if let Some(mut sel) = self.engine.borrow().cmd_sel.get() {
                     let data = render::build_command_line(&self.engine.borrow());
-                    let char_width = self.backend.borrow().char_width();
+                    // #947: same fix as the press rung above — use the real
+                    // painted char width, not the click backend's never-seeded
+                    // `current_char_width` default.
+                    let char_width = self.painted_char_width() as f32;
                     let rect = self.engine.borrow().command_line_rect.get();
                     let point = quadraui::Point::new(x as f32, y as f32);
                     if let Some(char_idx) =
@@ -7322,9 +7391,9 @@ impl quadraui::ShellApp for App {
         let screen_ref = self.cached_screen_layout.borrow();
         let screen = screen_ref.as_ref().unwrap();
 
-        // #560: give the *click* backend a correctly-fonted editor Pango
-        // context so mouse clicks resolve columns via the per-glyph Pango
-        // inverse rather than a naive uniform-cell division.
+        // #560 / #947: give the *click* backend a correctly-fonted editor
+        // Pango context so mouse clicks resolve columns via the per-glyph
+        // Pango inverse rather than a naive uniform-cell division.
         //
         // vimcode keeps a SEPARATE `GtkBackend` (`self.backend`) for click-time
         // hit-testing than the one quadraui's ShellApp runner creates and
@@ -7338,26 +7407,31 @@ impl quadraui::ShellApp for App {
         // editor layout nor a Pango context of its own and fell through to
         // `EditorLayout::col_at_x`'s uniform per-cell division: exact for
         // monospace glyphs, but drifting +1 column for every preceding wide
-        // glyph (emoji ✅/🟡/❌/⏭, CJK) — the reported #560 symptom. Mirroring
-        // what the runner does for its own backend (`gtk::run` sets the
-        // DrawingArea's Pango context), we hand the click backend an
-        // editor-fonted PangoCairo context, so `editor_col_at_x` resolves via
-        // `quadraui::gtk::editor_col_at_x`'s exact per-glyph `xy_to_index` path.
-        // Rebuilt each frame so runtime font changes (`:set guifont`) take
-        // effect immediately.
+        // glyph (emoji ✅/🟡/❌/⏭, CJK) — the reported #560 symptom.
         //
-        // CRITICAL: the context must reproduce the *painted* font's glyph
-        // advances, NOT `settings.font_*`. The runner paints the editor with a
-        // hardcoded "Monospace 11" (see `quadraui::gtk::run`), ignoring
-        // `settings.font_family`/`font_size`; `cw` (== `backend.char_width()`)
-        // is that painted cell width, and `build_screen_layout` above used it.
-        // Fonting this context from `settings.font_size` (14) while the paint
-        // ran at 11 was the #560 iteration-3 smoke failure: `xy_to_index`
-        // scaled columns by the wrong cell width and drifted left, the drift
-        // growing with `x`, on plain/bold/italic/scrolled lines alike.
-        // `build_editor_click_context` matches by measuring against `cw`.
+        // quadraui#971 added `GtkBackend::editor_pango_layout()`, a last-resort
+        // fallback inside `editor_col_at_x` that builds a layout from the
+        // backend's *own* `pango_ctx` fonted with its own `editor_font_*`
+        // state (set via `Backend::set_editor_font`) — so a `GtkBackend` that
+        // has never painted a frame still resolves per-glyph, as long as (a)
+        // it has a `pango_ctx` at all, which only `set_text_measurement_context`
+        // below gives it, and (b) its `editor_font_*` matches what got painted.
+        // Before #971 this seam had to hand-fake (b) by measuring a probe glyph
+        // against the *painted* `char_width` and hardcoding the `"Monospace"`
+        // family to match `quadraui::gtk::run`'s old default — see the #947
+        // issue's "the trap" for why the two had to be kept in lockstep by hand.
+        // Now that `sync_per_frame_backend_state` above pushes the *live*
+        // `settings.font_family`/`font_size` onto the paint backend via
+        // `set_editor_font`, we push the exact same values onto the click
+        // backend here — both track the setting, so there is nothing left to
+        // reproduce by probing. Re-set every frame so a runtime `:set guifont`
+        // takes effect immediately.
+        self.backend.borrow_mut().set_editor_font(
+            &engine.settings.font_family,
+            engine.settings.font_size as f32,
+        );
         #[cfg(feature = "gui")]
-        if let Some(click_ctx) = crate::gtk::click::build_editor_click_context(cw) {
+        if let Some(click_ctx) = crate::gtk::click::build_editor_click_context() {
             self.backend
                 .borrow_mut()
                 .set_text_measurement_context(Box::new(click_ctx));
