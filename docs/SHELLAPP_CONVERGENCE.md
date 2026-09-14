@@ -4,7 +4,10 @@
 > `App` (`src/app.rs`, GTK/macOS/Win-GUI) and `TuiShellApp`
 > (`src/tui_main/shell_app.rs`, TUI) — and that the TUI one converts
 > quadraui `UiEvent`s *back* into crossterm `MouseEvent`s to feed a
-> 2,800+-production-line TUI-private click router (`src/tui_main/mouse.rs`),
+> 2,800+-production-line TUI-private click router (`src/tui_main/mouse.rs`)
+> — production lines only, excluding its `#[cfg(test)] mod tests`; the
+> parent issue's "3,750-line" figure is the whole-file count *including*
+> tests, so the two numbers measure different things, not a discrepancy —
 > in violation of quadraui's portability rule 6 ("events are unified at the
 > `UiEvent` boundary"). The issue is explicitly scoped as an epic: propose a
 > decomposition, land the cheap independent wins, leave the actual
