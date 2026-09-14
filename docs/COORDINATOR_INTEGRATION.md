@@ -12,6 +12,12 @@
 >
 > **Both of Track A's external pre-reqs are now CLOSED** — see §13. This doc read as
 > "blocked on quadraui#362 and coord#550" for months after both had landed.
+>
+> **Standing constraint (owner decision, 2026-09-13): no coordinator dependency in vimcode
+> core.** A vimcode *extension* that requires `coord` is fine; the editor requiring it is
+> not. `src/core/` and `src/render.rs` carry **no coord subcommand names, no coord schema,
+> no coord lifecycle vocabulary** — see §6. Track B (§10) has no coordinator dependency of
+> any kind.
 
 ## 1. Goal — client parity (Track A)
 
@@ -123,7 +129,7 @@ wheel scroll). vimcode and coord-tui both already lean on quadraui's paint↔cli
 **Consumers:**
 - **coord-tui** migrates its bespoke `tui/src/app.rs` board onto the component (reference
   implementation; proves parity).
-- **vimcode** hosts it in the Issues panel (§7).
+- **vimcode** hosts it in the Board panel (§7).
 
 ## 5. The data bridge
 
@@ -172,31 +178,68 @@ already has the pattern for this: background poll loops like `poll_ext_registry`
 
 ## 6. Where the code lives in vimcode
 
-Follows the platform-neutrality rule (`CLAUDE.md`): shared logic in `render.rs`/engine,
-**1–3 lines of wiring per backend**, no bespoke GTK/TUI board code.
+Two rules govern placement, and they compose.
 
-- **`src/render.rs`** — `BoardData` (the vimcode-side view model) built from the
-  `coord board --json` payload; handed to `quadraui::Board`. New `ScreenLayout.board`
-  slot, like `ext_sidebar`.
-- **`src/core/`** — engine fields for the coordinator panel (selection, focus, last
-  fetched model, poll receiver). Pure; no Python, no GTK. Subprocess calls go through a
-  thin `coord_client.rs` (spawn `coord …`, parse JSON) — `core` stays testable in
-  isolation by mocking the client.
-- **`src/gtk/` + `src/tui_main/`** — register the *Issues* entry in the activity bar and
-  draw `quadraui::Board` (the component does the work). Click/key → `BoardAction` →
-  engine → `coord_client`.
-- **Lua extension bundle** — the *packaging and glue*: registers the Issues activity entry
-  + `:Coord*` commands (`:CoordRefine N`, `:CoordReview <id>`, `:CoordDispatch …`), and
-  carries the manifest. It does **not** render the board (that's the shared component) and
-  does **not** hold pipeline logic.
+**The platform-neutrality rule** (`CLAUDE.md`): shared logic in `render.rs`/engine, **1–3
+lines of wiring per backend**, no bespoke GTK/TUI board code.
 
-## 7. The Issues panel
+**The no-coord-in-core rule** (owner decision, 2026-09-13): vimcode is not a coordinator
+client — it is an editor that can *host* one. `src/core/` and `src/render.rs` contain **no
+`coord` subcommand names, no coord JSON schema, no coord lifecycle or gate vocabulary**.
+vimcode must build, run and pass its full suite on a machine with no `coord` installed and
+no coordinator config, **with no feature flag needed to achieve that**. Every coord-specific
+fact lives in the coordinator extension bundle.
 
-A new activity-bar entry — **Issues** — alongside Explorer / Search / Source Control / Run /
-Extensions. Selecting it shows the coordinator board (the shared component) in the sidebar
-or a full editor-area surface. Reuses the activity-bar + panel machinery vimcode already
-has (the SC and Extensions panels are the template — `TuiPanel`, `ext_sidebar`,
-`PanelRegistration`).
+The consequence: what was designed as a coord-aware `coord_client.rs` compiled into the
+binary becomes a **generic external-tool seam** (#522), and the board panel becomes a
+**generic host** (#521).
+
+- **`src/render.rs`** — `BoardData` built from **vimcode's own board contract** (§6.1),
+  handed to `quadraui::Board`. New `ScreenLayout.board` slot, like `ext_sidebar`.
+- **`src/core/tool_client.rs`** — a `ToolClient` trait: spawn a configured argv, capture
+  stdout, parse JSON, map failure modes to typed errors. **Knows nothing about
+  coordinator.** Mockable, so every consumer is testable with no provider installed.
+- **`src/core/`** — engine fields for the Board panel (selection, focus, last fetched
+  model, poll receiver), fed through `ToolClient`.
+- **`src/gtk/` + `src/tui_main/`** — register the **Board** activity entry and draw
+  `quadraui::Board`. Click/key → `BoardAction` → engine → the configured provider command.
+  (The panel is *Board*, not *Coordinator*: a generic host is not named after one provider.)
+- **Coordinator extension bundle** — the *packaging and glue*, and **the only place `coord`
+  is named**: declares the board-provider command and poll interval in its manifest,
+  registers its activity entry and the `:Coord*` commands (`:CoordRefine N`,
+  `:CoordReview <id>`, `:CoordDispatch …`). It does **not** render the board (shared
+  component) and holds **no** pipeline logic.
+
+### 6.1 The board contract, and who adapts to it
+
+vimcode defines the JSON shape it renders — `BoardModel` / `BoardColumn` / `BoardCard` plus
+stage badges, matching quadraui's `Board` (quadraui#638). **The contract is vimcode's, not
+coordinator's.** Any provider emitting that shape gets a board.
+
+Coordinator's daemon emits *coord's* schema (`GET /board`, port 7435), so something must
+adapt one to the other — and it must not be vimcode core. The design decision is open in
+#522, with three candidates: a **shim shipped in the extension bundle** (recommended — the
+manifest's command is whatever the bundle wants, so all coord knowledge stays there); a
+**declarative mapping** in the manifest; or coordinator emitting vimcode's shape natively
+(**rejected** — that is the same coupling pointing the other way).
+
+Note that the Lua API has **no subprocess execution** today (`EXTENSIONS.md` §Lua Plugin
+API), which is why the adapter is a script-plus-manifest rather than a Lua function.
+Widening the Lua API so extensions can spawn processes and host panels is a real
+alternative — it would let provider integrations be *pure* extensions — but it is
+deliberately out of scope for #522, and it is a security surface worth designing on its own.
+
+## 7. The Board panel
+
+A new activity-bar entry — **Board** — alongside Explorer / Search / Source Control / Run /
+Extensions. Selecting it shows whatever board its configured provider supplies (the shared
+`quadraui::Board` component) in the sidebar or a full editor-area surface. Reuses the
+activity-bar + panel machinery vimcode already has (the SC and Extensions panels are the
+template — `TuiPanel`, `ext_sidebar`, `PanelRegistration`).
+
+Named **Board** rather than *Issues* or *Coordinator* per §6: the host is generic, and with
+no provider configured it says so rather than implying a missing coordinator. The
+coordinator extension may label its own entry however it likes.
 
 ## 8. Parity matrix (the acceptance bar)
 
@@ -340,7 +383,7 @@ keep.
 
 ### 10.5 Where the two tracks touch
 
-Two shared **components** — not shared issues. §5's `coord_client.rs` (#522) is unrelated:
+Two shared **components** — not shared issues. #522's generic `tool_client.rs` seam is unrelated:
 it is a one-shot `coord … --json` subprocess, not a persistent session, and is not a fourth
 JSON-RPC copy.
 
@@ -437,18 +480,24 @@ adapter requires `ANTHROPIC_API_KEY` is now stale (§10.6).
   timer, but only opt-in (a passive viewer shouldn't silently dispatch metered work).
 - **Worktree locality** — review-where-the-code-is (ssh) vs pull-local (`coord pull`).
   Support both; the issue→branch→files mapping is the core data the extension needs.
-- **vimcode ↔ coord coupling** — the extension requires a `coord` install on PATH; `core`
-  stays pure by isolating subprocess calls behind `coord_client.rs` (mockable in tests).
+- **vimcode ↔ coord coupling** — bounded by the no-coord-in-core rule (§6). The
+  *extension* requires a `coord` install on PATH; **the editor does not**. `core` sees only
+  the generic `ToolClient` seam and vimcode's own board contract, and the constraint is
+  enforced mechanically (#522 asserts that `src/core/` and `src/render.rs` carry no
+  coordinator vocabulary) rather than by reviewer vigilance. Earlier drafts of this doc
+  called `core` "pure" while placing a coord-aware client inside it — that is the drift the
+  rule exists to prevent.
 
 ## 12. Phased plan — Track A
 
 _Issue numbers in brackets; epic [#531](https://github.com/JDonaghy/vimcode/issues/531) is the live tracker.
 Track B's plan is §10.7._
 
-- **Foundation** — `coord_client.rs` subprocess + JSON bridge. **[#522]** _(blocks all)_
-- **Phase 0 — read-only board panel** — Issues activity entry renders the shared component
-  from the daemon's `GET /board`. **[#521]** _(needs #522; quadraui#362 and coord#550 are
-  both closed — see §13)_
+- **Foundation** — generic external-tool JSON seam (`tool_client.rs`), no coord in core
+  (§6). **[#522]** _(blocks all of Track A)_
+- **Phase 0 — read-only board panel** — generic **Board** activity entry renders the shared
+  component from whatever provider an extension declares. **[#521]** _(needs #522;
+  quadraui#362 and coord#550 are both closed — see §13)_
 - **Phase 0b — board actions** — wire `BoardAction` → `coord` (dispatch/test/review/merge).
   **[#523]**
 - **Phase 1 — issue authoring as buffers** — `:CoordRefine`, `:w` pushes. **[#524]**
@@ -475,8 +524,9 @@ today**; the only remaining foundation is in-repo (#522).
   OpenAPI-documented JSON (coord#757). #550 was rescoped to moving coord-tui's *Rust gate
   projection* server-side, which is a coord-tui concern, **not a vimcode dependency**.
   Wherever this doc says `coord board --json` (§5, §8, §11), read `GET /board`.
-- **[vimcode#521](https://github.com/JDonaghy/vimcode/issues/521)** — *Issues* activity-bar
-  panel + coordinator extension hosting the quadraui Board. Open; in-repo; needs #522.
+- **[vimcode#521](https://github.com/JDonaghy/vimcode/issues/521)** — generic **Board**
+  activity-bar panel hosting the quadraui Board, with the coordinator extension as one
+  provider. Open; in-repo; needs #522.
 
 ## 14. Open questions
 
