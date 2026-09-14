@@ -934,6 +934,11 @@ impl LspManager {
             // decision; #948 collapsed it into the shared seam. The only
             // platform-specific bit left is hiding the console window on
             // Windows, which has no portable equivalent.
+            //
+            // #948 review (non-blocking): no dedicated regression test for
+            // this call site — same identical `shell_command()` pattern
+            // already covered by `:!`'s tests, so a future divergence here
+            // wouldn't be caught by this PR's tests.
             let (shell, flag) = crate::core::terminal::shell_command();
             let mut command = std::process::Command::new(&shell);
             command.args([&flag, &install_cmd]);
