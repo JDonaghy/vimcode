@@ -70,17 +70,18 @@ mod tests {
         assert!(!engine.poll_acp());
     }
 
+    /// An `Engine` holding a freshly-`initialize`d fake ACP agent.
+    ///
+    /// Full transport-level lifecycle coverage (initialize -> session/new ->
+    /// session/prompt -> stopReason: end_turn, and the bidirectional
+    /// dispatch/parking acceptance criteria) lives in `src/core/acp.rs`'s own
+    /// tests against this same fixture — that's the transport's contract, not
+    /// the engine's. What the engine adds on top is exactly one thing:
+    /// draining `AgentExited` clears `acp_client` and surfaces a message.
+    /// The two tests below cover that from both sides, with the real fixture
+    /// rather than by re-deriving the whole lifecycle.
     #[cfg(unix)]
-    #[test]
-    fn poll_acp_drains_agent_exit_into_the_status_message_and_clears_the_client() {
-        // Full transport-level lifecycle coverage (initialize -> session/new
-        // -> session/prompt -> stopReason: end_turn, and the bidirectional
-        // dispatch/parking acceptance criteria) lives in
-        // `src/core/acp.rs`'s own tests against the fake agent fixture —
-        // that's the transport's contract, not the engine's. What the
-        // engine adds on top is exactly one thing: draining `AgentExited`
-        // clears `acp_client` and surfaces a message. Cover that here with
-        // the real fixture rather than re-deriving the whole lifecycle.
+    fn engine_with_fixture_agent(extra_env: &[(&str, &str)]) -> Engine {
         let argv = vec![
             "sh".to_string(),
             concat!(
@@ -90,43 +91,89 @@ mod tests {
             .to_string(),
         ];
         let cwd = std::env::temp_dir();
-        let mut client = crate::core::acp::AcpClient::spawn_with_env(
-            &argv,
-            &cwd,
-            &[("ACP_FAKE_DIE_AFTER_INIT", "1")],
-        )
-        .expect("fixture agent should spawn");
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, extra_env)
+            .expect("fixture agent should spawn");
         client.initialize();
 
         let mut engine = Engine::new_for_test();
         engine.acp_client = Some(client);
+        engine
+    }
 
-        // First poll: Initialized event only, client stays alive.
+    /// Poll `engine` until `done` holds or five seconds pass.
+    #[cfg(unix)]
+    fn poll_acp_until(engine: &mut Engine, done: impl Fn(&Engine) -> bool) {
         let start = std::time::Instant::now();
         loop {
-            if engine.poll_acp() || start.elapsed() > std::time::Duration::from_secs(5) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            engine.acp_client.is_some(),
-            "still running after Initialized"
-        );
-
-        // Second poll: AgentExited — engine clears the client and reports it.
-        let start = std::time::Instant::now();
-        loop {
-            if engine.acp_client.is_none() || start.elapsed() > std::time::Duration::from_secs(5) {
-                break;
-            }
             engine.poll_acp();
+            if done(engine) || start.elapsed() > std::time::Duration::from_secs(5) {
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_acp_drains_agent_exit_into_the_status_message_and_clears_the_client() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_DIE_AFTER_INIT", "1")]);
+
+        // Deliberately *one* loop, not "first poll sees Initialized, second
+        // poll sees AgentExited": `AcpClient::poll` drains whatever the
+        // reader thread has queued at that instant, and this fixture answers
+        // `initialize` and exits in the same breath, so both events can land
+        // in a single drain. A staged version of this test asserted
+        // `acp_client.is_some()` between the two polls and failed at random
+        // whenever they batched — the flake seen at #984's test stage. The
+        // engine contract under test is the end state, and
+        // `poll_acp_stays_alive_while_the_agent_is_alive` below covers the
+        // "doesn't clear it early" half deterministically, against an agent
+        // that is still running rather than against a scheduling race.
+        poll_acp_until(&mut engine, |e| e.acp_client.is_none());
         assert!(
             engine.acp_client.is_none(),
             "agent exit should clear the client"
         );
         assert_eq!(engine.message, "ACP agent exited");
+    }
+
+    /// The other half: an agent that is *alive* must not be cleared, and must
+    /// not post the exit message, however many times we poll. Uses the same
+    /// fixture without `ACP_FAKE_DIE_AFTER_INIT`, so it stays parked on its
+    /// read loop (and is killed by `AcpClient`'s `Drop` when the engine goes
+    /// out of scope at the end of the test).
+    #[cfg(unix)]
+    #[test]
+    fn poll_acp_stays_alive_while_the_agent_is_alive() {
+        let mut engine = engine_with_fixture_agent(&[]);
+
+        // Wait for the `Initialized` event to actually be drained — `poll_acp`
+        // reports a redraw for it — so the assertions below can't pass
+        // vacuously by running before the agent ever answered.
+        let start = std::time::Instant::now();
+        let mut redrew = false;
+        while !redrew && start.elapsed() < std::time::Duration::from_secs(5) {
+            redrew = engine.poll_acp();
+            if !redrew {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        assert!(
+            redrew,
+            "the fixture's initialize response should have produced at least one drained event"
+        );
+        // A few more drains for good measure: nothing further is coming, and
+        // none of them may decide the agent has gone away.
+        for _ in 0..3 {
+            engine.poll_acp();
+        }
+        assert!(
+            engine.acp_client.is_some(),
+            "a live agent must stay attached after Initialized"
+        );
+        assert_ne!(
+            engine.message, "ACP agent exited",
+            "no exit message while the agent is still running"
+        );
     }
 }

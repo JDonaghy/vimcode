@@ -463,9 +463,25 @@ const fn mfc(
 
 /// Write `case.files` to a fresh temp dir; returns the dir (caller must clean
 /// it up) and each file's absolute path in `files` order.
+///
+/// The directory is **canonicalized before any fixture path is derived from
+/// it**, and that is load-bearing rather than tidy-up: on macOS
+/// `std::env::temp_dir()` is `/var/folders/...`, and `/var` is a symlink to
+/// `/private/var`. Handing the un-resolved form to both oracles produces a
+/// spurious file mismatch whenever one side resolves symlinks and the other
+/// echoes back what it was given — nvim's `expand('%:p')` does not resolve
+/// them, vimcode's open path does, so the two disagree on a file they both
+/// actually have open. `canon_opt` below cannot repair that after the fact
+/// because every caller deletes `dir` *before* comparing, at which point
+/// `canonicalize` fails and falls back to the raw (still-divergent) strings.
+/// Resolving once here means both sides are fed the already-final
+/// `/private/var/...` form and there is nothing left to normalize. Linux,
+/// where `/tmp` is usually not a symlink, never saw this — hence a failure
+/// that reproduced only on macOS.
 fn write_multi_fixture(case: &MultiFileCase) -> (PathBuf, Vec<PathBuf>) {
     let dir = std::env::temp_dir().join(format!("vimcode_multi_probe_{}", probe_id()));
     std::fs::create_dir_all(&dir).expect("create temp dir for multi-file probe");
+    let dir = dir.canonicalize().unwrap_or(dir);
     let paths = case
         .files
         .iter()
@@ -494,6 +510,74 @@ fn resolve_multi_keys(keys: &str, paths: &[PathBuf]) -> String {
 fn canon_opt(p: &Option<PathBuf>) -> Option<PathBuf> {
     p.as_ref()
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+}
+
+/// Regression guard for the `write_multi_fixture` canonicalization above —
+/// the macOS-only failure that took `nvim_conformance_jumplist_multi_file`
+/// red with two "path mismatch" regressions whose two paths named the *same*
+/// file (`/var/folders/...` vs `/private/var/folders/...`).
+///
+/// Two assertions, in the order they would fail:
+///
+/// 1. **The `canon_opt`-can't-save-us demonstration.** Two paths reaching one
+///    file, one of them through a symlinked parent, normalize equal *while
+///    the file exists* and diverge the moment it is deleted — which is
+///    exactly the state `run_multi_case`/`run_jumps_case` compare in, since
+///    both `remove_dir_all` the scratch dir before calling `canon_opt`. Built
+///    on an explicit symlink rather than on whatever `std::env::temp_dir()`
+///    happens to be, so it carries the same meaning on Linux (where `/tmp` is
+///    usually already canonical and this bug was invisible) as on macOS.
+/// 2. **The guard on the real call site.** The dir `write_multi_fixture`
+///    hands back is its own canonicalization, so no fixture path derived from
+///    it can carry an unresolved symlink into the comparison in the first
+///    place. This is the assertion that fails on unfixed macOS and passes
+///    after the fix.
+#[cfg(unix)]
+#[test]
+fn multi_fixture_paths_are_canonical_so_a_symlinked_tempdir_is_not_a_file_mismatch() {
+    let base = std::env::temp_dir().join(format!("vimcode_canon_guard_{}", probe_id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let real = base.join("real");
+    std::fs::create_dir_all(&real).expect("create real scratch dir");
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink the scratch dir");
+    std::fs::write(real.join("f.txt"), b"x").expect("write fixture file");
+
+    let via_link = Some(link.join("f.txt"));
+    let via_real = Some(real.join("f.txt"));
+    assert_ne!(
+        via_link, via_real,
+        "precondition: the two spellings must differ textually, or this proves nothing"
+    );
+    assert_eq!(
+        canon_opt(&via_link),
+        canon_opt(&via_real),
+        "while the file exists, canon_opt resolves both spellings to one path"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+    assert_ne!(
+        canon_opt(&via_link),
+        canon_opt(&via_real),
+        "once the scratch dir is deleted canon_opt falls back to the raw strings and \
+         the two spellings of one file read as a file MISMATCH — so normalizing at \
+         comparison time is powerless and the fixture must hand out resolved paths"
+    );
+
+    // The actual guard: what `write_multi_fixture` returns is already resolved.
+    let case = mfc("canon-guard", &[("a.txt", &["one"])], 0, 1, 1, "");
+    let (dir, paths) = write_multi_fixture(&case);
+    let resolved = dir.canonicalize().expect("fixture dir exists");
+    assert_eq!(
+        dir, resolved,
+        "write_multi_fixture must canonicalize its scratch dir before deriving \
+         fixture paths from it (macOS /var -> /private/var)"
+    );
+    assert!(
+        paths.iter().all(|p| p.starts_with(&resolved)),
+        "every fixture path must be rooted at the resolved dir: {paths:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 struct MultiNvimResult {
