@@ -2658,6 +2658,135 @@ const CASES_EX: &[Case] = &[
         1,
         "<C-v>j:s/a/b/<CR>",
     ),
+    // ── #986: v0.11.0 bug suite -- `:s///c` confirm-prompt spec (#801
+    // Phase 2 never built). Every "sub:c ..." case below is listed in
+    // KNOWN_DEVIATIONS: `execute.rs`'s `flags.contains('c')` check always
+    // errors loudly instead of entering a confirm loop today, so the `c`
+    // flag's follow-up keystrokes (`y`/`n`/`a`/`q`/`l`/`<Esc>`) land on
+    // whatever ordinary Normal-mode command they happen to spell on the
+    // vimcode side (an operator-pending `y`, a `q` macro-record start,
+    // etc.) instead of driving a confirm loop -- never a crash, just a
+    // guaranteed buffer/cursor mismatch against the real oracle. See this
+    // issue's PR description for the full confirm contract as captured
+    // from a real `nvim --headless` v0.12.5 (the exact prompt text, and
+    // this table), which every case below exercises:
+    //
+    //   y        replace this match, continue
+    //   n        skip this match, continue
+    //   a        replace this and all remaining matches
+    //   q        quit substituting (this match left unreplaced)
+    //   l        replace this match, then quit ("last")
+    //   <Esc>    quit substituting (this match left unreplaced)
+    //
+    // `^E`/`^Y` (scroll the window while the prompt is up) are not covered
+    // here: fed directly at a real headless oracle they don't hang it, but
+    // they produce no buffer/cursor difference for *this* harness to
+    // observe (window scroll position isn't part of what `run_case`
+    // compares) -- confirmed by direct probe, not assumed. An honest gap,
+    // same treatment as the #805 headless-scroll exclusions above.
+    c(
+        "sub:c y accepts each prompted match (g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>yyyy",
+    ),
+    c(
+        "sub:c n skips each prompted match (g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>nnnn",
+    ),
+    c(
+        "sub:c a accepts this and all remaining (g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>a",
+    ),
+    c(
+        "sub:c q quits after partial replace (g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>yq",
+    ),
+    c(
+        "sub:c l replaces then quits (g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>yl",
+    ),
+    c(
+        "sub:c Esc quits after partial replace (g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>y<Esc>",
+    ),
+    // Deliverable 3 (cursor after quitting mid-substitute): the match is
+    // *not* at the cursor's starting column, so these two pin that a real
+    // `:%s///gc` moves the cursor onto the first candidate match before
+    // ever prompting -- quitting immediately (no replacement made at all)
+    // still leaves the cursor there, not at the start position. Confirmed
+    // against the oracle: nvim reports cursor (1,5) here (the "abc" inside
+    // "xxx abc abc"), not (1,1).
+    c(
+        "sub:c q quits before any replace, cursor at match (g)",
+        &["xxx abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>q",
+    ),
+    c(
+        "sub:c Esc quits before any replace, cursor at match (g)",
+        &["xxx abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR><Esc>",
+    ),
+    // Without the `g` flag: confirm still prompts once per line (only the
+    // line's first match), not once for the whole buffer.
+    c(
+        "sub:c y accepts first match per line (no g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/c<CR>yyy",
+    ),
+    c(
+        "sub:c n then y across lines (no g)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/c<CR>nyy",
+    ),
+    // Skip-then-accept across the whole buffer (also drives the
+    // report-line-excludes-skipped-matches contract pinned via a rendered
+    // `screen_has` check in `src/harness.rs`'s
+    // `confirm_report_line_excludes_skipped_matches` -- this case covers
+    // the buffer/cursor half, that one covers the "3 substitutions on 3
+    // lines" report text specifically).
+    c(
+        "sub:c skip counted correctly across buffer (g)",
+        &["abc", "abc", "abc", "abc"],
+        1,
+        1,
+        ":%s/abc/def/gc<CR>ynyy",
+    ),
+    // Regression guard (deliverable 4): plain `:s` with no `c` flag must be
+    // completely unaffected by this issue -- same fixture as the `y`/`n`
+    // cases above, but no `c` in the flags. NOT listed in
+    // KNOWN_DEVIATIONS: this already passes today and must keep passing.
+    c(
+        "sub:c plain :s unaffected by confirm gate (regression guard)",
+        &["abc abc", "abc", "xyz abc"],
+        1,
+        1,
+        ":%s/abc/def/g<CR>",
+    ),
 ];
 
 // ─────────────────────────── I. insert mode keys ───────────────────────────
@@ -4501,6 +4630,27 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     "word:gg indented (sol)",
     "word:G indented (sol)",
     "word:5G then j col (sol)",
+    // ── #986: v0.11.0 bug suite -- `:s///c` confirm-prompt spec (#801
+    // Phase 2 never built). `execute.rs`'s `flags.contains('c')` check
+    // always errors loudly instead of entering a confirm loop, so the
+    // keystrokes meant for the confirm prompt (y/n/a/q/l/<Esc>) fall
+    // through to ordinary Normal-mode command dispatch on the vimcode side
+    // instead -- see each case's own doc, in `CASES_EX`, for what that
+    // dispatch actually does today (never a crash, always a mismatch).
+    // "sub:c plain :s unaffected by confirm gate (regression guard)" is
+    // deliberately NOT listed here -- it already passes and must stay
+    // that way.
+    "sub:c y accepts each prompted match (g)",
+    "sub:c n skips each prompted match (g)",
+    "sub:c a accepts this and all remaining (g)",
+    "sub:c q quits after partial replace (g)",
+    "sub:c l replaces then quits (g)",
+    "sub:c Esc quits after partial replace (g)",
+    "sub:c q quits before any replace, cursor at match (g)",
+    "sub:c Esc quits before any replace, cursor at match (g)",
+    "sub:c y accepts first match per line (no g)",
+    "sub:c n then y across lines (no g)",
+    "sub:c skip counted correctly across buffer (g)",
 ];
 
 // ---------------------------------------------------------------------------
