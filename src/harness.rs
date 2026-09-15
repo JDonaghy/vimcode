@@ -174,6 +174,89 @@ pub(crate) fn build_app_and_config(
 /// Call before handing `app` to a `driver_with_shell` — `App::folder_picker`
 /// is a `RefCell`, so this only needs `&App`, but the picker has to exist
 /// before the first frame paints or that frame won't show it.
+// ── #991: a real merge-conflict fixture repo ────────────────────────────
+
+/// Name of the one conflicted file [`make_conflicted_repo`] leaves behind.
+/// Short on purpose — the SC sidebar is 30 cells wide on TUI, and a row
+/// that gets truncated is a row a `find_bounds`/`screen_has` assertion
+/// can't see.
+pub const CONFLICT_FIXTURE_FILE: &str = "zqxw991conf.txt";
+
+/// Build a throwaway git repo in a temp dir with **one real merge
+/// conflict** (`UU` — both modified, the common case), created with plain
+/// `git` exactly as a user would hit it: two branches editing the same
+/// line, then a failing `git merge` (#991).
+///
+/// `tag` disambiguates concurrently-running callers; the returned path
+/// additionally carries the pid and a per-process counter, so two
+/// backends' arms of the same scenario never collide on disk.
+///
+/// Panics if `git` is unavailable or the merge does *not* conflict — a
+/// silently-clean fixture would make every assertion built on it pass
+/// vacuously.
+pub fn make_conflicted_repo(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    let dir = std::env::temp_dir().join(format!(
+        "vimcode_991_{tag}_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp fixture dir");
+
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=vimcode991@example.com",
+                "-c",
+                "user.name=VimCode 991",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .expect("git must be runnable for the #991 conflict fixture");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let file = dir.join(CONFLICT_FIXTURE_FILE);
+    git(&["init"]);
+    std::fs::write(&file, "base\n").expect("write fixture file");
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+    // Read the default branch name back rather than assuming `main` —
+    // `init.defaultBranch` is ignored by git < 2.28, where it is `master`.
+    let base_branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .trim()
+        .to_string();
+
+    git(&["checkout", "-b", "zqxw991-other"]);
+    std::fs::write(&file, "theirs\n").expect("write fixture file");
+    git(&["commit", "-am", "theirs"]);
+
+    git(&["checkout", &base_branch]);
+    std::fs::write(&file, "ours\n").expect("write fixture file");
+    git(&["commit", "-am", "ours"]);
+
+    // Expected to fail — that failure *is* the fixture.
+    git(&["merge", "zqxw991-other"]);
+
+    let porcelain = git(&["status", "--porcelain"]);
+    assert!(
+        porcelain.contains("UU"),
+        "the #991 fixture must leave a real UU merge conflict behind, but \
+         `git status --porcelain` in {} said {porcelain:?}",
+        dir.display()
+    );
+    dir
+}
+
 pub(crate) fn install_folder_picker(app: &App, dir: PathBuf) {
     *app.folder_picker.borrow_mut() =
         Some(quadraui::FolderPickerController::new(dir, vec![], false));

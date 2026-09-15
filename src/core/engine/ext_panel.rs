@@ -770,11 +770,14 @@ impl Engine {
 
     /// Generate hover markdown for a Source Control panel item at the given flat index.
     pub(crate) fn sc_hover_markdown(&self, flat_index: usize) -> Option<String> {
+        use crate::core::engine::{
+            SC_SECTION_CHANGES, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+        };
         let (section, idx) = self.sc_flat_to_section_idx(flat_index);
 
-        // Section headers: show branch info on the "Staged Changes" header (section 0)
+        // Section headers: show branch info on the "Staged Changes" header.
         if idx == usize::MAX {
-            if section == 0 {
+            if section == SC_SECTION_STAGED {
                 // Branch info hover
                 return self.sc_hover_branch_info();
             }
@@ -782,25 +785,14 @@ impl Engine {
         }
 
         match section {
-            // Staged/Unstaged file items
-            0 | 1 => {
-                let is_staged = section == 0;
-                let files: Vec<&git::FileStatus> = if is_staged {
-                    self.sc_file_statuses
-                        .iter()
-                        .filter(|f| f.staged.is_some())
-                        .collect()
-                } else {
-                    self.sc_file_statuses
-                        .iter()
-                        .filter(|f| f.unstaged.is_some())
-                        .collect()
-                };
+            // Merge / Staged / Unstaged file items
+            SC_SECTION_MERGE | SC_SECTION_STAGED | SC_SECTION_CHANGES => {
+                let files = self.sc_section_files(section);
                 let file = files.get(idx)?;
-                self.sc_hover_file(file, is_staged)
+                self.sc_hover_file(file, section == SC_SECTION_STAGED)
             }
             // Log items
-            3 => {
+            SC_SECTION_LOG => {
                 let entry = self.sc_log.get(idx)?;
                 self.sc_hover_log_entry(entry)
             }
@@ -835,23 +827,22 @@ impl Engine {
 
     /// File hover: show status and diff stats.
     pub(crate) fn sc_hover_file(&self, file: &git::FileStatus, staged: bool) -> Option<String> {
-        let status = if staged {
-            file.staged.unwrap_or(git::StatusKind::Modified)
-        } else {
-            file.unstaged.unwrap_or(git::StatusKind::Modified)
-        };
-        let status_label = match status {
-            git::StatusKind::Added => "Added",
-            git::StatusKind::Modified => "Modified",
-            git::StatusKind::Deleted => "Deleted",
-            git::StatusKind::Renamed => "Renamed",
-            git::StatusKind::Untracked => "Untracked",
+        // #991: a conflicted file reports the conflict (and git's own
+        // wording for which side did what) rather than a staged/unstaged
+        // change it isn't.
+        let (status, where_) = match file.unmerged {
+            Some(kind) => (git::StatusKind::Unmerged, kind.description()),
+            None if staged => (file.staged.unwrap_or(git::StatusKind::Modified), "staged"),
+            None => (
+                file.unstaged.unwrap_or(git::StatusKind::Modified),
+                "unstaged",
+            ),
         };
         let mut md = format!("### {}\n\n", file.path);
         md.push_str(&format!(
             "**Status:** {} ({})\n\n",
-            status_label,
-            if staged { "staged" } else { "unstaged" }
+            status.description(),
+            where_
         ));
         // Get diff stats (blocking but fast for a single file)
         let cwd = std::env::current_dir().ok()?;

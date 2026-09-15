@@ -8583,7 +8583,7 @@ pub struct DebugSidebarItem {
 #[derive(Debug, Clone)]
 pub struct ScFileItem {
     pub path: String,
-    /// Single-char status label: A / M / D / R / ?
+    /// Single-char status label: A / M / D / R / C / ? / ! (conflict)
     pub status_char: char,
     pub is_staged: bool,
 }
@@ -8615,6 +8615,10 @@ pub struct SourceControlData {
     pub ahead: u32,
     /// Number of commits behind the upstream.
     pub behind: u32,
+    /// Unmerged (conflicted) files — the "Merge Changes" section (#991).
+    /// Empty in a conflict-free tree, which is what keeps that section
+    /// from being always-on.
+    pub merge: Vec<ScFileItem>,
     /// Staged files (index changes).
     pub staged: Vec<ScFileItem>,
     /// Unstaged / untracked files (working-tree changes).
@@ -8623,8 +8627,9 @@ pub struct SourceControlData {
     pub worktrees: Vec<ScWorktreeItem>,
     /// Recent git log entries.
     pub log: Vec<ScLogItem>,
-    /// Which sections are expanded: [staged, unstaged, worktrees, log].
-    pub sections_expanded: [bool; 4],
+    /// Which sections are expanded, indexed by the `SC_SECTION_*`
+    /// constants: [merge, staged, unstaged, worktrees, log].
+    pub sections_expanded: [bool; crate::core::engine::SC_SECTION_COUNT],
     /// Flat selection index.
     pub selected: usize,
     /// Whether the panel currently has keyboard focus.
@@ -8834,15 +8839,26 @@ fn panel_hover_anchor_y(
     // each. Staged + Unstaged always show; Worktrees only when there's more
     // than one; Log always shows — mirrors the SC sidebar's own section
     // list.
+    use crate::core::engine::{
+        SC_SECTION_CHANGES, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+        SC_SECTION_WORKTREES,
+    };
     let show_worktrees = sc.worktrees.len() > 1;
-    let mut sections: Vec<(usize, bool)> = vec![
-        (sc.staged.len(), sc.sections_expanded[0]),
-        (sc.unstaged.len(), sc.sections_expanded[1]),
-    ];
-    if show_worktrees {
-        sections.push((sc.worktrees.len(), sc.sections_expanded[2]));
+    let mut sections: Vec<(usize, bool)> = Vec::new();
+    // #991: Merge Changes sits above Staged and is present only when the
+    // tree has conflicts — mirrors `Engine::sc_visible_sections`.
+    if !sc.merge.is_empty() {
+        sections.push((sc.merge.len(), sc.sections_expanded[SC_SECTION_MERGE]));
     }
-    sections.push((sc.log.len(), sc.sections_expanded[3]));
+    sections.push((sc.staged.len(), sc.sections_expanded[SC_SECTION_STAGED]));
+    sections.push((sc.unstaged.len(), sc.sections_expanded[SC_SECTION_CHANGES]));
+    if show_worktrees {
+        sections.push((
+            sc.worktrees.len(),
+            sc.sections_expanded[SC_SECTION_WORKTREES],
+        ));
+    }
+    sections.push((sc.log.len(), sc.sections_expanded[SC_SECTION_LOG]));
 
     let mut y_off = section_top;
     let mut fi = 0usize;
@@ -13930,6 +13946,19 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         .clone()
         .unwrap_or_else(|| "HEAD".to_string());
 
+    // #991: conflicted files carry neither side, so they land here and
+    // nowhere else.
+    let merge: Vec<ScFileItem> = engine
+        .sc_file_statuses
+        .iter()
+        .filter(|f| f.is_unmerged())
+        .map(|f| ScFileItem {
+            path: f.path.clone(),
+            status_char: crate::core::git::StatusKind::Unmerged.label(),
+            is_staged: false,
+        })
+        .collect();
+
     let staged: Vec<ScFileItem> = engine
         .sc_file_statuses
         .iter()
@@ -13978,6 +14007,7 @@ fn build_source_control_data(engine: &Engine) -> Option<SourceControlData> {
         branch,
         ahead: engine.sc_ahead,
         behind: engine.sc_behind,
+        merge,
         staged,
         unstaged,
         worktrees,
@@ -14485,9 +14515,13 @@ pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetric
 }
 
 /// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
-/// row data for all 4 SC sections. Call once per frame before
+/// row data for all 5 SC sections. Call once per frame before
 /// `sidebar_system.render()` or `.handle_cached()`.
 pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
+    use crate::core::engine::{
+        SC_SECTION_CHANGES, SC_SECTION_LOG, SC_SECTION_MERGE, SC_SECTION_STAGED,
+        SC_SECTION_WORKTREES,
+    };
     use quadraui::{Decoration, StyledSpan, StyledText, TreeRow};
 
     let add_fg = theme.git_added;
@@ -14495,24 +14529,27 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     let mod_fg = theme.git_modified;
     let dim_fg = theme.status_inactive_fg;
 
-    let staged: Vec<_> = engine
-        .sc_file_statuses
-        .iter()
-        .filter(|f| f.staged.is_some())
-        .collect();
-    let unstaged: Vec<_> = engine
-        .sc_file_statuses
-        .iter()
-        .filter(|f| f.unstaged.is_some())
-        .collect();
+    let merge = engine.sc_section_files(SC_SECTION_MERGE);
+    let staged = engine.sc_section_files(SC_SECTION_STAGED);
+    let unstaged = engine.sc_section_files(SC_SECTION_CHANGES);
     let show_worktrees = engine.sc_worktrees.len() > 1;
+    // #991: the Merge Changes section is only shown when the tree actually
+    // has a conflict, so a clean repo still paints exactly two file
+    // sections (the "not always-on" half of this issue).
+    let show_merge = !merge.is_empty();
 
-    let file_row = |i: usize, f: &crate::core::git::FileStatus, is_staged: bool| {
-        let kind = if is_staged { f.staged } else { f.unstaged };
+    let file_row = |i: usize, f: &crate::core::git::FileStatus, section: usize| {
+        let kind = match section {
+            // Conflict rows carry the '!' marker, VS Code's conflict char.
+            SC_SECTION_MERGE => Some(crate::core::git::StatusKind::Unmerged),
+            SC_SECTION_STAGED => f.staged,
+            _ => f.unstaged,
+        };
         let ch = kind.map(|k| k.label()).unwrap_or('?');
         let color = match ch {
             'A' => add_fg,
             'D' => del_fg,
+            '!' => del_fg,
             _ => mod_fg,
         };
         TreeRow {
@@ -14532,16 +14569,22 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
         }
     };
 
+    let merge_rows: Vec<TreeRow> = merge
+        .iter()
+        .enumerate()
+        .map(|(i, f)| file_row(i, f, SC_SECTION_MERGE))
+        .collect();
+
     let staged_rows: Vec<TreeRow> = staged
         .iter()
         .enumerate()
-        .map(|(i, f)| file_row(i, f, true))
+        .map(|(i, f)| file_row(i, f, SC_SECTION_STAGED))
         .collect();
 
     let unstaged_rows: Vec<TreeRow> = unstaged
         .iter()
         .enumerate()
-        .map(|(i, f)| file_row(i, f, false))
+        .map(|(i, f)| file_row(i, f, SC_SECTION_CHANGES))
         .collect();
 
     let worktree_rows: Vec<TreeRow> = engine
@@ -14590,7 +14633,9 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
     let mut sidebar = engine.sc_sidebar_system.borrow_mut();
     sidebar.set_has_focus(engine.sc_has_focus);
     if engine.sc_has_focus && sidebar.active_section().is_none() {
-        sidebar.set_active_section(Some(0));
+        // Never land on the (possibly hidden) Merge Changes section by
+        // default — its actions resolve conflicts (#991).
+        sidebar.set_active_section(Some(SC_SECTION_STAGED));
     }
 
     let badge = |n: usize| {
@@ -14600,16 +14645,19 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
             None
         }
     };
-    sidebar.set_section_badge(0, badge(staged.len()));
-    sidebar.set_section_badge(1, badge(unstaged.len()));
-    sidebar.set_section_badge(2, badge(engine.sc_worktrees.len()));
-    sidebar.set_section_badge(3, badge(engine.sc_log.len()));
-    sidebar.set_section_visible(2, show_worktrees);
+    sidebar.set_section_badge(SC_SECTION_MERGE, badge(merge.len()));
+    sidebar.set_section_badge(SC_SECTION_STAGED, badge(staged.len()));
+    sidebar.set_section_badge(SC_SECTION_CHANGES, badge(unstaged.len()));
+    sidebar.set_section_badge(SC_SECTION_WORKTREES, badge(engine.sc_worktrees.len()));
+    sidebar.set_section_badge(SC_SECTION_LOG, badge(engine.sc_log.len()));
+    sidebar.set_section_visible(SC_SECTION_MERGE, show_merge);
+    sidebar.set_section_visible(SC_SECTION_WORKTREES, show_worktrees);
 
-    sidebar.set_rows(0, staged_rows);
-    sidebar.set_rows(1, unstaged_rows);
-    sidebar.set_rows(2, worktree_rows);
-    sidebar.set_rows(3, log_rows);
+    sidebar.set_rows(SC_SECTION_MERGE, merge_rows);
+    sidebar.set_rows(SC_SECTION_STAGED, staged_rows);
+    sidebar.set_rows(SC_SECTION_CHANGES, unstaged_rows);
+    sidebar.set_rows(SC_SECTION_WORKTREES, worktree_rows);
+    sidebar.set_rows(SC_SECTION_LOG, log_rows);
 }
 
 /// Populate the Search panel's `SidebarSystem` with current form + tree
@@ -21697,11 +21745,12 @@ mod tests {
             branch: "main".into(),
             ahead: 0,
             behind: 0,
+            merge: vec![],
             staged: vec![],
             unstaged: vec![],
             worktrees: vec![],
             log: vec![],
-            sections_expanded: [true; 4],
+            sections_expanded: [true; crate::core::engine::SC_SECTION_COUNT],
             selected: 0,
             has_focus: false,
             commit_message: String::new(),

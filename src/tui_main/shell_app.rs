@@ -7052,6 +7052,7 @@ mod tests {
             path: "sc817file.txt".to_string(),
             staged: None,
             unstaged: Some(crate::core::git::StatusKind::Untracked),
+            unmerged: None,
         }];
         app.engine
             .app_shell
@@ -7078,6 +7079,293 @@ mod tests {
              this issue's shared verdict), but the file's body text never \
              appeared in the editor pane; screen:\n{}",
             driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── #991: merge conflicts in the Source Control panel ────────────
+    //
+    // Every assertion below reads *painted* content (`find_bounds` /
+    // `screen_contains`), never `engine.sc_file_statuses` — a
+    // state-populated assertion passes against exactly the bug these
+    // cover (`UU`/`UA` rows dropped, `AA`/`DD`/`AU`/`DU`/`UD` rows
+    // mislabelled into the ordinary staged/unstaged sections).
+    //
+    // **RED against unfixed `develop`:** all four fail. There is no
+    // "MERGE CHANGES" section to find at all before this fix, so
+    // `find_bounds("MERGE CHANGES")` returns `None` and the
+    // `.expect(...)` fires; for `UU`/`UA` the file row itself is also
+    // absent from the screen entirely.
+
+    /// Build a `TuiShellApp` with the Source Control panel showing, its
+    /// statuses parsed from a literal `git status --porcelain` block
+    /// through the **real** parser. Lets one test drive all seven
+    /// unmerged `XY` codes end-to-end (parse → engine → paint) without
+    /// needing seven separate real merge conflicts on disk.
+    fn sc_app_with_porcelain(porcelain: &str) -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.sc_file_statuses = crate::core::git::parse_status_porcelain(porcelain);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        app
+    }
+
+    /// #991, the whole table from the issue: **one case per unmerged XY
+    /// code**. `UU`/`UA` used to vanish from the panel entirely (both
+    /// sides parsed to `None` and `status_detailed` dropped the entry);
+    /// `AA`/`DD`/`AU`/`DU`/`UD` used to be painted as ordinary
+    /// staged/unstaged changes, which is the dangerous half — staging one
+    /// from the panel runs `git add` and marks the conflict resolved with
+    /// the markers still in the file.
+    ///
+    /// Section membership is asserted *geometrically*, from the painted
+    /// row's own y against the two painted section headers, rather than
+    /// from any engine field.
+    #[test]
+    fn sc_panel_paints_every_unmerged_xy_code_under_merge_changes() {
+        for (code, path) in [
+            ("UU", "zqxw991uu.txt"),
+            ("UA", "zqxw991ua.txt"),
+            ("AU", "zqxw991au.txt"),
+            ("DU", "zqxw991du.txt"),
+            ("UD", "zqxw991ud.txt"),
+            ("AA", "zqxw991aa.txt"),
+            ("DD", "zqxw991dd.txt"),
+        ] {
+            let app = sc_app_with_porcelain(&format!("{code} {path}\n"));
+            let driver = driver_with_shell(app, config(), 100, 30);
+            let screen = driver.screen();
+
+            let merge = driver.find_bounds("MERGE CHANGES").unwrap_or_else(|| {
+                panic!(
+                    "{code}: the SC panel must paint a MERGE CHANGES section \
+                     for a conflicted file; screen:\n{screen}"
+                )
+            });
+            let staged = driver.find_bounds("STAGED CHANGES").unwrap_or_else(|| {
+                panic!("{code}: STAGED CHANGES header missing; screen:\n{screen}")
+            });
+            // The row carries VS Code's '!' conflict marker, from
+            // `StatusKind::Unmerged::label()`.
+            let row = driver.find_bounds(&format!("! {path}")).unwrap_or_else(|| {
+                panic!(
+                    "{code}: the conflicted file must be painted with the \
+                         '!' conflict marker; screen:\n{screen}"
+                )
+            });
+
+            assert!(
+                merge.y < row.y && row.y < staged.y,
+                "{code}: the conflicted row must be painted *inside* the \
+                 MERGE CHANGES section (between its header at y={} and the \
+                 STAGED CHANGES header at y={}), but it painted at y={}; \
+                 screen:\n{screen}",
+                merge.y,
+                staged.y,
+                row.y
+            );
+        }
+    }
+
+    /// #991 regression case: a *non*-conflicted tree must still render
+    /// exactly the two file sections it always did — Merge Changes is not
+    /// always-on. Guards the other direction of the fix, where the new
+    /// section leaks into every repo.
+    #[test]
+    fn sc_panel_without_conflicts_paints_no_merge_changes_section() {
+        let app = sc_app_with_porcelain("M  zqxw991stg.txt\n M zqxw991drt.txt\n");
+        let driver = driver_with_shell(app, config(), 100, 30);
+        let screen = driver.screen();
+
+        assert!(
+            !screen.contains("MERGE CHANGES"),
+            "a conflict-free tree must not paint a MERGE CHANGES section; \
+             screen:\n{screen}"
+        );
+        assert!(
+            driver.find_bounds("M zqxw991stg.txt").is_some(),
+            "the staged file must still paint; screen:\n{screen}"
+        );
+        assert!(
+            driver.find_bounds("M zqxw991drt.txt").is_some(),
+            "the unstaged file must still paint; screen:\n{screen}"
+        );
+    }
+
+    /// #991 end-to-end: a **real** `git merge` conflict (`UU`, the common
+    /// case) created with plain `git` in a temp dir, read back through
+    /// `Engine::sc_refresh` → `git status --porcelain` → the panel. The
+    /// synthetic-porcelain tests above pin the classifier's coverage; this
+    /// one pins that real git output actually reaches the painted panel.
+    #[test]
+    fn sc_panel_paints_a_real_merge_conflict_under_merge_changes() {
+        let dir = crate::harness::make_conflicted_repo("tui991");
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.sc_refresh();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+
+        let driver = driver_with_shell(app, config(), 100, 30);
+        let screen = driver.screen();
+
+        let merge = driver.find_bounds("MERGE CHANGES").unwrap_or_else(|| {
+            panic!(
+                "a real merge conflict must paint a MERGE CHANGES section; \
+                 screen:\n{screen}"
+            )
+        });
+        let staged = driver
+            .find_bounds("STAGED CHANGES")
+            .unwrap_or_else(|| panic!("STAGED CHANGES header missing; screen:\n{screen}"));
+        let row = driver
+            .find_bounds(&format!("! {}", crate::harness::CONFLICT_FIXTURE_FILE))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the conflicted file must paint with the '!' marker; \
+                     screen:\n{screen}"
+                )
+            });
+        assert!(
+            merge.y < row.y && row.y < staged.y,
+            "the conflicted row must paint inside MERGE CHANGES; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #991 deliverable 5 — **staging a conflicted file from the panel**.
+    /// `git add` on a conflicted path is how git marks a conflict
+    /// resolved, so this stays allowed, but only as a deliberate per-file
+    /// action taken from the Merge Changes section. Driven through the
+    /// panel's own stage action and asserted on the *painted* result: the
+    /// row leaves Merge Changes (the whole section disappears, since it
+    /// was the only conflict) and reappears under Staged Changes.
+    #[test]
+    fn staging_a_conflicted_file_from_merge_changes_marks_it_resolved() {
+        let dir = crate::harness::make_conflicted_repo("tui991stage");
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.sc_refresh();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+
+        let before = driver_with_shell(app, config(), 100, 30);
+        assert!(
+            before.screen_contains("MERGE CHANGES"),
+            "precondition: the conflict must be shown first; screen:\n{}",
+            before.screen()
+        );
+        drop(before);
+
+        // Select the conflicted row in the Merge Changes section — the
+        // same `(active_section, selected_path)` state a click or a
+        // keyboard move leaves behind — and run the panel's own stage
+        // action against it.
+        {
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.cwd = dir.clone();
+            engine.sc_refresh();
+            {
+                let mut sidebar = engine.sc_sidebar_system.borrow_mut();
+                sidebar.set_active_section(Some(crate::core::engine::SC_SECTION_MERGE));
+                sidebar.set_selected_path(crate::core::engine::SC_SECTION_MERGE, Some(vec![0]));
+            }
+            engine.sc_stage_selected();
+            assert!(
+                engine.message.contains("Marked resolved"),
+                "staging from Merge Changes must report that it marked the \
+                 conflict resolved, not stage it silently; message was {:?}",
+                engine.message
+            );
+        }
+
+        // Repaint from a fresh app over the same (now-resolved) repo.
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.sc_refresh();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        let driver = driver_with_shell(app, config(), 100, 30);
+        let screen = driver.screen();
+
+        assert!(
+            !screen.contains("MERGE CHANGES"),
+            "after staging the only conflicted file, the Merge Changes \
+             section must be gone; screen:\n{screen}"
+        );
+        let staged = driver
+            .find_bounds("STAGED CHANGES")
+            .unwrap_or_else(|| panic!("STAGED CHANGES header missing; screen:\n{screen}"));
+        let row = driver
+            .find_bounds(crate::harness::CONFLICT_FIXTURE_FILE)
+            .unwrap_or_else(|| panic!("the resolved file must still paint; screen:\n{screen}"));
+        assert!(
+            staged.y < row.y,
+            "the resolved file must now paint under STAGED CHANGES; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #991 deliverable 6: bulk "stage all" (`S`) must **not** sweep a
+    /// conflicted file in. `git add` on a conflicted path marks it
+    /// resolved, so the old `git add .` silently resolved every conflict
+    /// with the markers still in the files. Asserted on painted output:
+    /// after a stage-all the conflict is still painted under MERGE
+    /// CHANGES, while the ordinary dirty file has moved to STAGED CHANGES.
+    #[test]
+    fn stage_all_does_not_sweep_conflicted_files_in() {
+        let dir = crate::harness::make_conflicted_repo("tui991stageall");
+        std::fs::write(dir.join("zqxw991plain.txt"), "dirty\n").expect("write plain file");
+
+        {
+            let mut engine = crate::core::Engine::new_for_test();
+            engine.cwd = dir.clone();
+            engine.sc_refresh();
+            engine.sc_stage_all();
+        }
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.sc_refresh();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        let driver = driver_with_shell(app, config(), 100, 30);
+        let screen = driver.screen();
+
+        let merge = driver.find_bounds("MERGE CHANGES").unwrap_or_else(|| {
+            panic!(
+                "stage-all must leave the conflict unresolved and still \
+                 painted under MERGE CHANGES; screen:\n{screen}"
+            )
+        });
+        let staged = driver
+            .find_bounds("STAGED CHANGES")
+            .unwrap_or_else(|| panic!("STAGED CHANGES header missing; screen:\n{screen}"));
+        let conflict = driver
+            .find_bounds(&format!("! {}", crate::harness::CONFLICT_FIXTURE_FILE))
+            .unwrap_or_else(|| panic!("the conflicted row must still paint; screen:\n{screen}"));
+        let plain = driver
+            .find_bounds("zqxw991plain.txt")
+            .unwrap_or_else(|| panic!("the ordinary file must paint; screen:\n{screen}"));
+
+        assert!(
+            merge.y < conflict.y && conflict.y < staged.y,
+            "the conflict must still be in MERGE CHANGES after stage-all; \
+             screen:\n{screen}"
+        );
+        assert!(
+            staged.y < plain.y,
+            "the ordinary dirty file must have been staged by stage-all; \
+             screen:\n{screen}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

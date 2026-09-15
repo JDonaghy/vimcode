@@ -14967,14 +14967,16 @@ fn make_sc_engine_with_files() -> Engine {
             path: "a.rs".to_string(),
             staged: Some(git::StatusKind::Modified),
             unstaged: None,
+            unmerged: None,
         },
         git::FileStatus {
             path: "b.rs".to_string(),
             staged: None,
             unstaged: Some(git::StatusKind::Modified),
+            unmerged: None,
         },
     ];
-    engine.sc_sections_expanded = [true, true, false, true];
+    engine.sc_sections_expanded = [true, true, true, false, true];
     engine
 }
 
@@ -15075,11 +15077,14 @@ fn test_sc_nav_clamps_at_top() {
 #[test]
 fn test_sc_tab_toggles_section() {
     let mut engine = make_sc_engine_with_files();
-    assert!(engine.sc_sections_expanded[0]);
+    // flat 0 is the first *visible* section header. With no conflicts the
+    // Merge Changes section is hidden (#991), so that is STAGED CHANGES.
+    let sec = source_control::SC_SECTION_STAGED;
+    assert!(engine.sc_sections_expanded[sec]);
     engine.handle_sc_key("Tab", false, None);
-    assert!(!engine.sc_sections_expanded[0]);
+    assert!(!engine.sc_sections_expanded[sec]);
     engine.handle_sc_key("Tab", false, None);
-    assert!(engine.sc_sections_expanded[0]);
+    assert!(engine.sc_sections_expanded[sec]);
 }
 
 #[test]
@@ -15385,9 +15390,10 @@ fn test_sc_visual_row_to_flat_tui_empty_staged() {
         path: "b.rs".to_string(),
         staged: None,
         unstaged: Some(git::StatusKind::Modified),
+        unmerged: None,
     }];
-    engine.sc_sections_expanded = [true, true, false, false]; // staged expanded but empty; log collapsed
-                                                              // Row 3: STAGED header (flat 0)
+    engine.sc_sections_expanded = [true, true, true, false, false]; // staged expanded but empty; log collapsed
+                                                                    // Row 3: STAGED header (flat 0)
     assert_eq!(engine.sc_visual_row_to_flat(3, true), Some((0, true)));
     // Row 4: "(no changes)" hint — None
     assert_eq!(engine.sc_visual_row_to_flat(4, true), None);
@@ -16996,8 +17002,9 @@ fn test_sc_hover_file_generates_markdown() {
         path: "src/main.rs".to_string(),
         staged: None,
         unstaged: Some(crate::core::git::StatusKind::Modified),
+        unmerged: None,
     }];
-    e.sc_sections_expanded = [true, true, false, false];
+    e.sc_sections_expanded = [true, true, true, false, false];
     // flat index: 0=staged header, 1=unstaged header, 2=file item
     let md = e.sc_hover_markdown(2);
     assert!(md.is_some());
@@ -17014,7 +17021,7 @@ fn test_sc_hover_file_generates_markdown() {
 fn test_sc_hover_section_header_returns_none_for_non_branch() {
     let mut e = engine_with_text("hello\n");
     e.sc_file_statuses = vec![];
-    e.sc_sections_expanded = [true, true, false, false];
+    e.sc_sections_expanded = [true, true, true, false, false];
     // flat index 0 = Staged Changes header (section 0 → branch info)
     // flat index 1 = Unstaged Changes header (section 1 → None)
     let md = e.sc_hover_markdown(1);
@@ -17029,7 +17036,7 @@ fn test_sc_hover_log_entry_generates_markdown() {
         hash: "abc1234".to_string(),
         message: "feat: add hover popups".to_string(),
     }];
-    e.sc_sections_expanded = [true, true, false, true];
+    e.sc_sections_expanded = [true, true, true, false, true];
     // flat indices: 0=staged hdr, 1=unstaged hdr, 2=log hdr, 3=log item
     let md = e.sc_hover_markdown(3);
     assert!(md.is_some());
@@ -17043,13 +17050,15 @@ fn test_sc_hover_log_entry_generates_markdown() {
 // ─── SC SidebarSystem (#321) ────────────────────────────────────────────
 
 #[test]
-fn test_sc_sidebar_system_initialized_with_4_sections() {
+fn test_sc_sidebar_system_initialized_with_5_sections() {
     let engine = Engine::new();
     let sidebar = engine.sc_sidebar_system.borrow();
-    assert!(sidebar.is_section_visible(0));
-    assert!(sidebar.is_section_visible(1));
-    assert!(sidebar.is_section_visible(2));
-    assert!(sidebar.is_section_visible(3));
+    for section in 0..source_control::SC_SECTION_COUNT {
+        assert!(
+            sidebar.is_section_visible(section),
+            "section {section} should exist"
+        );
+    }
 }
 
 #[test]
@@ -17704,11 +17713,13 @@ fn test_explorer_indicators_git_status() {
             path: "src/main.rs".to_string(),
             staged: None,
             unstaged: Some(git::StatusKind::Modified),
+            unmerged: None,
         },
         git::FileStatus {
             path: "new_file.txt".to_string(),
             staged: None,
             unstaged: Some(git::StatusKind::Untracked),
+            unmerged: None,
         },
     ];
     let (git_st, _) = e.explorer_indicators();

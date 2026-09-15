@@ -233,7 +233,13 @@ impl Engine {
         let repo_root = git::find_repo_root(&self.cwd);
         if let Some(ref root) = repo_root {
             for fs in &self.sc_file_statuses {
-                let kind = fs.unstaged.or(fs.staged);
+                // #991: a conflicted path carries neither side, so without
+                // the `unmerged` arm it got no explorer badge at all.
+                let kind = fs
+                    .unmerged
+                    .map(|_| git::StatusKind::Unmerged)
+                    .or(fs.unstaged)
+                    .or(fs.staged);
                 if let Some(k) = kind {
                     let abs = root.join(&fs.path);
                     let canon = abs.canonicalize().unwrap_or(abs);
