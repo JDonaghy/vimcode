@@ -289,6 +289,90 @@ pub fn command_palette_filters_and_escape_dismisses<D: ConformanceDriver>(driver
 /// and this scenario would fail for the wrong reason. Each per-backend
 /// caller picks a point near its own surface's bottom-right corner, well
 /// clear of the centered popup.
+/// Sweep several points inside one painted text run's vertical band and
+/// assert every one resolves to the same interactive target (#967).
+///
+/// #967's bug was exactly this: `App::explorer_ui_event`'s #540 drift guard
+/// re-applies the metrics the tree was *painted* with before hit-testing,
+/// but macOS's `TextMetricsBackend` impl stubbed both setters, so the
+/// hit-test silently ran against `MacBackend::new()`'s default line height
+/// instead. `tree_layout`'s row pitch (`(line_height * 1.4).round()`) then
+/// disagreed with the painted pitch by a growing, row-index-dependent
+/// amount, so a click in the *lower* part of a row's own glyphs resolved to
+/// the row below. Every existing click-driven test in this repo (and in
+/// quadraui's own conformance scenarios) aims at a run's centre or an
+/// `Anchor` edge, which sits inside the slack this bug never ate into — so
+/// none of them could have caught it (same family as quadraui#552/#515).
+///
+/// A run is emitted by exactly one widget for exactly one row, so no point
+/// inside its own painted bounds can legitimately resolve to a different
+/// target. That makes this check need no per-row expected-value table
+/// (unlike a coordinate-literal test) — it can be pointed at any new
+/// toggleable row cheaply.
+///
+/// `needle` locates the run via `inventory().text_runs()` — never a literal
+/// coordinate, same rule as every other body in this module. `samples`
+/// (>=2) evenly spans the run's full painted vertical bounds, always
+/// including the very top and the very bottom edge — a point away from
+/// centre is exactly what #967's bug needed to reproduce.
+///
+/// `fingerprint` reads back whatever painted, binary signal identifies
+/// *which* row a click landed on — e.g. "is this directory row's child
+/// still painted". Each sample point is clicked once (to observe
+/// `fingerprint`) and then clicked again at the identical `(x, y)` to
+/// restore state before the next sample, so the caller's toggle must be
+/// idempotent under two clicks at the same point; that is true of the
+/// explorer's directory-row expand/collapse toggle this issue's own test
+/// uses; a scenario whose click isn't a self-restoring toggle needs a
+/// different tool than this one.
+pub fn sweep_hit_band_integrity<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+    needle: &str,
+    samples: usize,
+    mut fingerprint: impl FnMut(&mut D) -> bool,
+) {
+    assert!(
+        samples >= 2,
+        "sweep_hit_band_integrity: need at least 2 samples to compare, got {samples}"
+    );
+    let bounds = driver
+        .inventory()
+        .text_runs()
+        .iter()
+        .find(|r| r.text.contains(needle))
+        .map(|r| r.bounds)
+        .unwrap_or_else(|| panic!("sweep_hit_band_integrity: {needle:?} not painted"));
+
+    let x = bounds.x + bounds.width / 2.0;
+    let top = bounds.y + 0.5;
+    let bottom = (bounds.y + bounds.height - 0.5).max(top);
+
+    let mut outcomes = Vec::with_capacity(samples);
+    let mut ys = Vec::with_capacity(samples);
+    for i in 0..samples {
+        let t = i as f32 / (samples - 1) as f32;
+        let y = top + (bottom - top) * t;
+        driver.click(x, y);
+        outcomes.push(fingerprint(driver));
+        driver.click(x, y); // restore — see doc above
+        ys.push(y);
+    }
+
+    let baseline = outcomes[0];
+    for (i, outcome) in outcomes.iter().enumerate() {
+        assert_eq!(
+            *outcome,
+            baseline,
+            "sweep_hit_band_integrity: point {i}/{} inside {needle:?}'s painted \
+             band (x={x:.1}, y={:.1}) resolved to a different target than the \
+             top of the row (#967 hit-band drift) — outcomes were {outcomes:?} \
+             at y-offsets {ys:?}",
+            samples - 1,
+            ys[i],
+        );
+    }
+}
+
 pub fn folder_picker_click_outside_dismisses_it<D: ConformanceDriver + DriverInput>(
     driver: &mut D,
     distinctive: &str,

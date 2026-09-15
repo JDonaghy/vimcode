@@ -74,32 +74,39 @@ use crate::app::{App, TextMetricsBackend};
 
 /// [`TextMetricsBackend`] for quadraui's `MacBackend`.
 ///
-/// All three methods are no-ops, and that is what the trait's own doc
-/// comment predicts for this backend rather than an omission:
-///
-/// - `set_text_measurement_context` — "a backend with no persistent-context
-///   concept … can implement this as a no-op"; macOS text measurement
+/// - `set_text_measurement_context` stays a no-op, and that is what the
+///   trait's own doc comment predicts for this backend rather than an
+///   omission: "a backend with no persistent-context concept … can
+///   implement this as a no-op"; macOS text measurement
 ///   (`quadraui::macos::text::measure_text(&CTFont, &str)`) takes the font
 ///   per call instead of storing a context. The only producer of a context
 ///   (`click::build_editor_click_context`) is GTK-only and its call site in
 ///   `render_content` is `#[cfg(feature = "gui")]`, so nothing ever calls
 ///   this here anyway.
-/// - the two metric setters — `MacBackend` has no public counterparts
-///   (`GtkBackend::set_current_line_height` / `set_current_char_width` have
-///   no `MacBackend` twin at the pinned rev `9eede7fd`). It keeps the same
-///   two fields but derives them from its own font inside `set_font`
-///   (`quadraui/src/macos/backend.rs:414`), i.e. the macOS backend owns its
-///   metrics where the GTK backend is told them.
-///
-/// **If that turns out to be wrong on a real Mac** — glyph-grid drift
-/// between what `App` thinks a line is and what `MacBackend` paints — the
-/// fix is a quadraui issue asking for public metric setters on
-/// `MacBackend`, **not** arithmetic in this file. Recorded here so the next
-/// person does not have to re-derive which side of the boundary it is on.
+/// - the two metric setters forward to `MacBackend`'s own public
+///   `set_current_line_height`/`set_current_char_width` (`f64`, matching
+///   Pango's unit — quadraui#934, pinned rev `f3b3aed9`), the macOS
+///   counterparts of `GtkBackend`'s methods of the same name and the
+///   `WinBackend` impl below. Before quadraui#934 `MacBackend` had no such
+///   setters and both were stubbed no-ops (#859); #967 found that stub left
+///   `App::explorer_ui_event`'s #540 drift guard — which re-applies the
+///   metrics the tree was *painted* with immediately before hit-testing —
+///   silently doing nothing on macOS, so hit-testing ran against
+///   `MacBackend::new()`'s default `current_line_height` instead of the
+///   real CoreText metric the paint used. `tree_layout`'s row pitch is
+///   `(line_height * 1.4).round()`, so a stale default drifted the hit
+///   bands by a pixel per row, growing with row index until clicks
+///   resolved to the row below.
 impl TextMetricsBackend for quadraui::macos::MacBackend {
     fn set_text_measurement_context(&mut self, _ctx: Box<dyn std::any::Any>) {}
-    fn set_current_line_height(&mut self, _line_height: f64) {}
-    fn set_current_char_width(&mut self, _char_width: f64) {}
+
+    fn set_current_line_height(&mut self, line_height: f64) {
+        quadraui::macos::MacBackend::set_current_line_height(self, line_height);
+    }
+
+    fn set_current_char_width(&mut self, char_width: f64) {
+        quadraui::macos::MacBackend::set_current_char_width(self, char_width);
+    }
 }
 
 /// Entry point for the native macOS GUI, mirroring `crate::gtk::run`.
@@ -777,5 +784,87 @@ mod mac_driver_tests {
              path can likely now get real MacDriver black-box coverage; \
              see this test's doc comment"
         );
+    }
+
+    // ── #967: explorer row hit-band integrity ───────────────────────────
+
+    /// Build a temp directory with `filler_dirs` sibling directories (so
+    /// `src` is not row 1 — #967's drift is row-index-dependent, with no
+    /// visible effect on the first two or three rows and a growing mis-hit
+    /// below that) plus a `src/core` child, matching this issue's own
+    /// live-use repro: "with a folder open and `src/` expanded, clicking
+    /// near the bottom of the word `src` toggles the `core/` row beneath
+    /// it".
+    fn scratch_explorer_dir(tag: &str, filler_dirs: usize) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_967_macos_explorer_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..filler_dirs {
+            std::fs::create_dir_all(dir.join(format!("aaa_filler_{i}"))).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("src").join("core")).unwrap();
+        dir
+    }
+
+    /// An engine whose explorer tree is open, rooted at `dir`, with both
+    /// the root and `src` expanded — the precondition #967's repro needs:
+    /// `src`'s child `core` painted directly beneath it.
+    fn engine_with_expanded_explorer(dir: &std::path::Path) -> Engine {
+        let mut engine = plain_engine();
+        engine.cwd = dir.to_path_buf();
+        engine.explorer_expanded.insert(dir.to_path_buf());
+        engine.explorer_expanded.insert(dir.join("src"));
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine
+    }
+
+    /// #967: a click anywhere inside the `src` row's own painted glyphs
+    /// must resolve to `src` — the row it is painted on — never to `core`,
+    /// its child painted immediately below it. A single mouse-down on a
+    /// directory row toggles that row's expansion
+    /// (`Engine::handle_explorer_mouse_event`'s `RowSelected` arm →
+    /// `explorer_toggle_dir`), and toggling twice at the same point always
+    /// restores whichever row actually got hit — so
+    /// [`crate::harness::sweep_hit_band_integrity`] can use "is `core` still
+    /// painted after one click-then-click-again round-trip" as its
+    /// fingerprint with no per-sample bookkeeping of its own: correctly
+    /// hitting `src` collapses it (hiding `core`) before the second click
+    /// re-expands it; incorrectly hitting `core` merely flips `core`'s own
+    /// (empty, so invisible) expansion twice, leaving `core` visible the
+    /// whole time. Any sweep point that disagrees with the top-of-row
+    /// baseline is exactly #967's bug.
+    ///
+    /// **RED-verification (#967):** reverting `TextMetricsBackend for
+    /// quadraui::macos::MacBackend`'s two metric setters in this file back
+    /// to their pre-fix no-op bodies takes this test red — the sweep's
+    /// lower sample points mis-hit `core` a row down instead of `src`,
+    /// disagreeing with the top-of-row baseline, and
+    /// `sweep_hit_band_integrity`'s `assert_eq!` fires. Confirmed locally
+    /// with `cargo test --no-default-features --features macos
+    /// explorer_click_hit_band_matches_the_painted_row` before restoring
+    /// the fix; see this issue's PR notes.
+    #[test]
+    fn explorer_click_hit_band_matches_the_painted_row() {
+        use quadraui::testing::ConformanceDriver;
+
+        let dir = scratch_explorer_dir("scenario1", 6);
+        let (_guards, mut driver) = driver(engine_with_expanded_explorer(&dir));
+
+        assert!(
+            driver.screen_contains("src") && driver.screen_contains("core"),
+            "precondition: the explorer must paint both `src` and its \
+             expanded child `core`; painted text was {:?}",
+            driver.painted_texts()
+        );
+
+        crate::harness::sweep_hit_band_integrity(&mut driver, "src", 5, |d| {
+            ConformanceDriver::inventory(d).screen_has("core")
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
