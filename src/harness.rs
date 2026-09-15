@@ -488,6 +488,102 @@ pub fn sweep_hit_band_integrity_resetting<D: ConformanceDriver + DriverInput>(
     }
 }
 
+/// #983: a click anywhere inside `needle`'s own **painted row band** —
+/// not just its text glyph, but the full vertical slot the panel
+/// allocates it before the next painted row (`next_row_needle`) begins —
+/// must act on `needle`'s own row, never silently act on the row painted
+/// immediately below it.
+///
+/// This is a different bug shape than [`sweep_hit_band_integrity`]'s
+/// #967 family: that helper samples strictly within a run's own painted
+/// glyph bounds, which is exactly the zone this issue's bug does *not*
+/// live in. #983's report (v0.11.0: "settings / git insights row click
+/// selects the row below") traces to a GTK-only gap between a row's own
+/// text-glyph height and the panel's real row pitch — e.g. the Settings
+/// panel measured 23px-tall label glyphs spaced 32px apart, and
+/// `render::handle_settings_form_ui_event`'s `handle_cached` path (the
+/// `backend: None` branch of `quadraui::FormController::click_inner`)
+/// resolves a click anywhere in that ~9px gap to the *next* field — a
+/// point still visually inside the clicked row's own 32px band, by any
+/// reasonable reading of "this row's own area" (there is no drawn
+/// boundary at the glyph's own bottom edge for a user to see). The same
+/// shape reproduces on the plugin/marketplace ext-panel's `SidebarSystem`
+/// rows (the "git insights" report) with an even larger ~15-18px gap.
+/// Both are a **constant** per-row offset, not a #967-style
+/// accumulating one — measured identical (~4.5px into a 32px settings
+/// row, both near row 3 and row 48) regardless of row index; see this
+/// function's callers for the measurements.
+///
+/// TUI cannot reproduce this bug *by construction*, not merely "doesn't
+/// happen to today": its row pitch is a fixed 1 cell, always exactly
+/// equal to its own glyph height (`TextMetricsBackend` is a genuine
+/// no-op there — see `src/tui_main/mod.rs`'s own doc), so there is no
+/// sub-row gap for a click to land in. The sanity assert below makes
+/// that structural claim self-checking rather than assumed: it fails
+/// loudly (not silently no-ops) if this is ever pointed at a backend
+/// whose glyph height already equals its row pitch, rather than
+/// reporting a false "pass" that proves nothing.
+///
+/// `effect_after_click` reads back, from **painted** output only (never
+/// engine state — CLAUDE.md's "assert on rendered output" rule, #587/
+/// #592), whether the click acted on `needle`'s own row: `true` only
+/// when the correct-row outcome is observed.
+pub fn row_click_hits_its_own_row_not_the_row_below<D: ConformanceDriver + DriverInput>(
+    driver: &mut D,
+    needle: &str,
+    next_row_needle: &str,
+    mut effect_after_click: impl FnMut(&mut D) -> bool,
+) {
+    let locate = |d: &mut D, text: &str| -> quadraui::Rect {
+        d.inventory()
+            .text_runs()
+            .iter()
+            .find(|r| r.text.contains(text))
+            .unwrap_or_else(|| {
+                panic!("row_click_hits_its_own_row_not_the_row_below: {text:?} not painted")
+            })
+            .bounds
+    };
+
+    let bounds = locate(driver, needle);
+    let next_bounds = locate(driver, next_row_needle);
+    assert!(
+        next_bounds.y > bounds.y,
+        "sanity: {next_row_needle:?} (y={}) must paint below {needle:?} (y={}) \
+         — picked the wrong pair of rows",
+        next_bounds.y,
+        bounds.y
+    );
+
+    let x = bounds.x + bounds.width / 2.0;
+    // Just inside `needle`'s own row slot, immediately above where the
+    // next row's own label begins — self-measured from two real painted
+    // positions, never a literal coordinate.
+    let y = next_bounds.y - 0.5;
+    assert!(
+        y > bounds.y + bounds.height,
+        "sanity: the probe point (y={y:.1}) must fall below {needle:?}'s own \
+         text glyph (bottom={:.1}) — otherwise this only re-tests the glyph's \
+         own centre, which every pre-existing click test in this panel \
+         already covers, not the gap between a row's glyph and the next \
+         row's own label this issue is about. A backend whose row pitch \
+         already equals its glyph height (TUI, by construction) has no such \
+         gap and will fail here — that is the point, not a bug in the probe: \
+         this scenario should not be registered for that backend.",
+        bounds.y + bounds.height,
+    );
+
+    driver.click(x, y);
+
+    assert!(
+        effect_after_click(driver),
+        "a click inside {needle:?}'s own painted row band (x={x:.1}, y={y:.1}) \
+         — below its text glyph, but still above where {next_row_needle:?} \
+         begins painting — must act on {needle:?}'s own row, not the row \
+         painted below it (#983)"
+    );
+}
+
 pub fn folder_picker_click_outside_dismisses_it<D: ConformanceDriver + DriverInput>(
     driver: &mut D,
     distinctive: &str,
@@ -581,12 +677,26 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 /// module-level section above. Each entry carries its issue number in a
 /// trailing comment, same as `KNOWN_DEVIATIONS`.
 ///
-/// Empty as of #982: this issue ships the mechanism and a self-test of both
-/// gate directions (below), not any of the six real bug scenarios — those
-/// are separate issues chained `--after` this one, each adding its own
-/// label here alongside its scenario.
+/// Empty as of #982 (that issue shipped the mechanism and a self-test of
+/// both gate directions, below, not any of the six real bug scenarios).
+/// #983 is the first of those chained follow-ups to land a real entry —
+/// two, one per backend-scoped scenario it adds (settings panel, ext-panel/
+/// "git insights"). The remaining v0.11.0 bugs are separate issues chained
+/// `--after` this one, each adding its own label here alongside its
+/// scenario.
 pub(crate) const KNOWN_BUGS: &[&str] = &[
-    // (none yet)
+    // #983: v0.11.0 bug report -- a click inside a settings-panel row's own
+    // painted band, below its text glyph but still above the next row's own
+    // label, resolves to the row below instead of the row clicked. GTK-only
+    // by construction (TUI's row pitch always equals its glyph height, so it
+    // has no such gap to fall into) -- see
+    // `row_click_hits_its_own_row_not_the_row_below`'s own doc.
+    "settings_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983
+    // #983: the same shared-cause report against the "git insights" plugin
+    // panel, reproduced here via the ext-panel/marketplace `SidebarSystem`
+    // plumbing that panel id actually routes through today (see this
+    // scenario's own fixture doc for why). GTK-only, same reason as above.
+    "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk", // #983
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
@@ -1102,6 +1212,287 @@ mod tests {
             !second.driver.screen_contains("__never_painted_982__"),
             "a fresh harness built after a guard-holding panic must still \
              paint normally, not deadlock/panic on a poisoned lock"
+        );
+    }
+}
+
+// ── #983: settings / git-insights row click selects the row below ──────
+//
+// v0.11.0 bug suite. Both panels share the same root cause (see
+// `row_click_hits_its_own_row_not_the_row_below`'s own doc): a GTK-only
+// gap between a row's painted text-glyph height and the panel's real row
+// pitch, constant per row (not growing like #967), that resolves a click
+// in that gap to the row below. Reported and confirmed here on both the
+// Settings panel (`FormController`) and the ext-panel/marketplace
+// `SidebarSystem` that "git insights" (a plugin panel) routes through —
+// see the second fixture's own doc for why that's the closest in-repo
+// reproduction of the plugin panel specifically. TUI is excluded from
+// both `backend_conformance!` registrations below, not silently skipped:
+// its row pitch always equals its glyph height by construction (fixed
+// `TextMetricsBackend` no-op, `src/tui_main/mod.rs`), so there is no gap
+// for this bug to live in.
+#[cfg(test)]
+mod issue_983_row_click_selects_the_row_below {
+    use super::*;
+    use crate::core::engine::sidebar::PANEL_SETTINGS;
+    use crate::core::extensions::ExtensionManifest;
+
+    /// The Settings panel, scrolled so the "LSP" category — flat row 47 of
+    /// 62, well below row 0 per this issue's own instruction not to reuse
+    /// `settings_panel_click_toggles_the_clicked_category`'s row-0 target —
+    /// paints inside a normal 1400x900 viewport instead of needing an
+    /// oversized window. LSP's own first two settings ("Enable LSP",
+    /// "Format on Save") are both `Bool`, chosen deliberately: collapsing
+    /// LSP hides both their labels outright, giving a clean, unambiguous
+    /// painted signal that the *category* row (not the row below it) was
+    /// hit — mirrors `settings_panel_click_toggles_the_clicked_category`'s
+    /// own "does the child label vanish" technique, just pointed lower.
+    fn engine_settings_scrolled_to_lsp() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        engine.settings_scroll_top = 40;
+        engine
+    }
+
+    /// The ext-panel / plugin-panel family, with enough filler *installed*
+    /// rows (20) ahead of one *available* extension that the "AVAILABLE"
+    /// section header itself paints well below row 0 — same "well below
+    /// row 0" requirement as the settings fixture above, applied to the
+    /// panel this repo can actually paint content rows for.
+    ///
+    /// `ext_panel_active` is set to `"git-insights"` — the actual reported
+    /// panel's name — rather than opening the built-in Extensions
+    /// marketplace panel (`PANEL_EXTENSIONS`) directly. This is not merely
+    /// cosmetic: `Engine::populate_ext_sidebar_system` (the function every
+    /// `ext:<plugin>` panel id paints through, per `App`'s `id.starts_with
+    /// ("ext:")` render arm) always builds its rows from the *marketplace*
+    /// manifest list, regardless of which plugin id is active — a
+    /// separate, already-documented gap (see
+    /// `gtk::testing::focused_plugin_panel_outranks_a_stale_explorer_flag_on_gtk`'s
+    /// own doc), not this issue's to fix. So this fixture genuinely routes
+    /// through the git-insights plugin panel's own click/paint path; what
+    /// it happens to *show* while doing so is marketplace content, which is
+    /// exactly the shared `SidebarSystem` plumbing the actual git-insights
+    /// panel would use for its own rows once that other gap is closed.
+    fn engine_git_insights_scrolled_to_available() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = false;
+        let mut manifests: Vec<ExtensionManifest> = (0..20)
+            .map(|i| ExtensionManifest {
+                name: format!("zqxw983installed{i}"),
+                display_name: format!("Zqxw983Installed{i}"),
+                ..Default::default()
+            })
+            .collect();
+        for m in &manifests {
+            engine
+                .extension_state
+                .mark_installed_version(&m.name, "1.0.0");
+        }
+        manifests.push(ExtensionManifest {
+            name: "zqxw983avail".to_string(),
+            display_name: "Zqxw983Avail".to_string(),
+            ..Default::default()
+        });
+        engine.ext_registry = Some(manifests);
+        engine.ext_panel_active = Some("git-insights".to_string());
+        engine.ext_panel_has_focus = true;
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        engine
+    }
+
+    // ── Deliverable 1: click well below row 0, assert the painted
+    // selection landed on the clicked row, not the row below ──────────
+
+    // RED-verification (#983): with the KNOWN_BUGS entry below removed,
+    // `cargo test --features gui --lib
+    // issue_983_row_click_selects_the_row_below::settings_row_click_selects_the_clicked_row_not_the_row_below::gtk`
+    // fails on the final assertion inside
+    // `row_click_hits_its_own_row_not_the_row_below` — "Enable LSP"/"Format
+    // on Save" are still painted after the click, proving it landed on
+    // LSP's own first setting row instead of the LSP category header.
+    // Restored (KNOWN_BUGS entry back in place) and confirmed green again.
+    crate::backend_conformance! {
+        label: settings_row_click_selects_the_clicked_row_not_the_row_below,
+        backends: [gtk],
+        engine: engine_settings_scrolled_to_lsp(),
+        size: (1400, 900),
+        body: |driver| {
+            crate::harness::known_bug_gate(
+                "settings_row_click_selects_the_clicked_row_not_the_row_below::gtk",
+                || {
+                    assert!(
+                        driver.screen_has("Enable LSP") && driver.screen_has("Format on Save"),
+                        "precondition: scrolling to the LSP category must paint both \
+                         of its settings; painted: {:?}",
+                        driver.inventory().text_runs()
+                    );
+                    crate::harness::row_click_hits_its_own_row_not_the_row_below(
+                        driver,
+                        "▼ LSP",
+                        "Enable LSP",
+                        |d| !(d.screen_has("Enable LSP") || d.screen_has("Format on Save")),
+                    );
+                },
+            );
+        },
+    }
+
+    // RED-verification (#983): same procedure as above, against
+    // `ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk`
+    // — with its KNOWN_BUGS entry removed, the final assertion fails
+    // because "Zqxw983Avail" is still painted after the click (the
+    // AVAILABLE header failed to collapse; the click landed on the
+    // available row itself, one row below the header). Restored and
+    // confirmed green again.
+    crate::backend_conformance! {
+        label: ext_panel_row_click_selects_the_clicked_row_not_the_row_below,
+        backends: [gtk],
+        engine: engine_git_insights_scrolled_to_available(),
+        size: (1400, 900),
+        body: |driver| {
+            crate::harness::known_bug_gate(
+                "ext_panel_row_click_selects_the_clicked_row_not_the_row_below::gtk",
+                || {
+                    assert!(
+                        driver.screen_has("AVAILABLE") && driver.screen_has("Zqxw983Avail"),
+                        "precondition: the ext panel must paint the pushed-down \
+                         AVAILABLE header and its one row; painted: {:?}",
+                        driver.inventory().text_runs()
+                    );
+                    crate::harness::row_click_hits_its_own_row_not_the_row_below(
+                        driver,
+                        "AVAILABLE",
+                        "Zqxw983Avail",
+                        |d| !d.screen_has("Zqxw983Avail"),
+                    );
+                },
+            );
+        },
+    }
+
+    // ── Deliverable 2: sweep_hit_band_integrity over a settings row and
+    // an ext-panel row — the "similar bugs" generalization. These sample
+    // strictly inside the needle's own painted glyph bounds (per that
+    // helper's own contract), which is the #967-shaped zone #983's own
+    // bug does *not* live in (it lives in the gap *below* the glyph — see
+    // `row_click_hits_its_own_row_not_the_row_below`'s doc) — so both are
+    // expected to pass today, on every backend, with no KNOWN_BUGS entry.
+    // What they protect against is a *different*, #967-style regression
+    // creeping into either row-pitch formula later, and they cost nothing
+    // extra to also run on TUI (`ConformanceDriver + DriverInput` is
+    // TUI's own bound, not a GTK-only one — see this module's top doc on
+    // "Which trait bound a scenario needs").
+    crate::backend_conformance! {
+        label: settings_row_sweep_hit_band_integrity,
+        backends: [gtk, tui],
+        engine: engine_settings_scrolled_to_lsp(),
+        size: (1400, 900),
+        body: |driver| {
+            assert!(
+                driver.screen_has("Enable"),
+                "precondition: LSP's first setting must be painted"
+            );
+            crate::harness::sweep_hit_band_integrity(driver, "LSP", 5, |d| {
+                // "Enable", not "Enable LSP" -- TUI paints multi-word labels
+                // as one text run per word (`Enable`/`LSP` separately), so a
+                // needle spanning both never matches there; GTK's single
+                // combined-string run still contains "Enable" too.
+                d.screen_has("Enable")
+            });
+        },
+    }
+
+    // Not via `backend_conformance!`: this probe's fingerprint (the
+    // AVAILABLE section's collapsed flag) needs to be force-reset via
+    // direct `engine` access between samples, which the macro's
+    // `|driver|`-only body has no way to reach. Same reason #971's own
+    // GTK/macOS twins of this exact probe
+    // (`ext_panel_header_click_hit_band_matches_the_painted_row_gtk`)
+    // are hand-written rather than macro-generated — mirrored here,
+    // just with the AVAILABLE header pushed well below row 0 instead of
+    // sitting at the top of an empty installed section.
+    //
+    // `sweep_hit_band_integrity` (used for the settings probe above, and
+    // for #971's *own* explorer/picker probes) assumes two clicks at the
+    // same point cancel out. That assumption breaks here: quadraui's
+    // `DoubleClickDetector` folds two same-spot `MouseDown`s in quick
+    // succession into a `DoubleClick` on every backend, and
+    // `SidebarSystem::double_click` has no header case (see #971's own
+    // doc on `sc_panel_header_click_hit_band_matches_the_painted_row_gtk`
+    // for the full mechanism) — so a plain same-point restore click
+    // silently no-ops instead of re-expanding the section, and later
+    // samples (landing at different y offsets, which *don't* trip the
+    // detector) toggle from whatever state was actually left behind
+    // rather than from a known baseline. Confirmed by observation before
+    // settling on `_resetting` here: the plain sweep produced an
+    // alternating true/false/true/false/true outcome sequence — exactly
+    // the shape a silently-skipped restore produces, not a real
+    // row-index-dependent hit-band disagreement.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn ext_panel_row_sweep_hit_band_integrity_gtk() {
+        let mut h = crate::gtk::testing::conformance_harness(
+            engine_git_insights_scrolled_to_available(),
+            1400,
+            900,
+        );
+        assert!(
+            h.driver.screen_has("Zqxw983Avail"),
+            "precondition: the pushed-down AVAILABLE row must be painted"
+        );
+        let engine = h.engine.clone();
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut h.driver,
+            "AVAILABLE",
+            5,
+            |d| {
+                // Break the `DoubleClickDetector`'s position match before
+                // every real probe (a harmless corner of the window, well
+                // clear of the sidebar) — see this test's own doc.
+                d.click(1380.0, 880.0);
+                engine
+                    .borrow_mut()
+                    .ext_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(1, false);
+                d.render();
+            },
+            |d| ConformanceDriver::screen_has(d, "Zqxw983Avail"),
+        );
+    }
+
+    #[test]
+    fn ext_panel_row_sweep_hit_band_integrity_tui() {
+        let mut h = crate::tui_main::testing::conformance_harness(
+            engine_git_insights_scrolled_to_available(),
+            1400,
+            900,
+        );
+        assert!(
+            h.driver.screen_has("Zqxw983Avail"),
+            "precondition: the pushed-down AVAILABLE row must be painted"
+        );
+        let engine = h.engine.clone();
+        crate::harness::sweep_hit_band_integrity_resetting(
+            &mut h.driver,
+            "AVAILABLE",
+            5,
+            |d| {
+                d.click(1380.0, 880.0);
+                engine
+                    .borrow_mut()
+                    .ext_sidebar_system
+                    .borrow_mut()
+                    .set_collapsed(1, false);
+                d.render();
+            },
+            |d| ConformanceDriver::screen_has(d, "Zqxw983Avail"),
         );
     }
 }
