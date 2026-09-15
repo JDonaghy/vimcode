@@ -154,6 +154,32 @@ that can *host* a pipeline-management client, not one itself.
 ### Key Functions
 - `fetch_board_model(client, argv)` — run argv and parse stdout into `quadraui::BoardModel` (vimcode's board contract, reused directly from quadraui's `Board` primitive rather than duplicated)
 
+## acp.rs — 959 lines (#951, ACP-0)
+ACP (Agent Client Protocol) transport — NDJSON JSON-RPC 2.0 over a subprocess's stdio, plus
+client<->agent session lifecycle. Foundation of the ACP track (epic #531); no UI here.
+Differs from `lsp.rs` in two load-bearing ways: NDJSON framing (one JSON message per line, no
+`Content-Length`), and agent->client requests are dispatched by method name and **parked**
+(not blanket-answered with `result: null`) via `AcpEvent::ClientRequest` +
+`respond_to_client_request`, answerable later out of band through the same `Arc<Mutex<_>>`
+stdin the reader thread holds.
+### Types
+- `AcpClient` — manages one agent subprocess (spawn, reader thread, stderr ring, shared stdin)
+- `AcpEvent` — `Initialized`, `SessionCreated`, `PromptStopped`, `SessionUpdate`,
+  `ClientRequest`, `RequestFailed`, `AgentExited`
+- `ParsedLine` (private) — pure classification of one NDJSON line (request/notification/response/unusable)
+### Key Functions
+- `AcpClient::spawn(argv, cwd)` / `spawn_with_env(argv, cwd, extra_env)` — start the agent process
+- `initialize()` / `new_session(cwd, mcp_servers)` / `prompt(session_id, blocks)` / `cancel(session_id)` — client->agent calls, protocol version pinned at 1
+- `respond_to_client_request(id, result)` — answer a parked agent->client request
+- `poll()` — non-blocking drain, capped at 50 events/call like `LspManager::poll_events`
+- `classify_line(line)` / `encode_ndjson_line(value)` — pure NDJSON framing helpers
+- `Engine::poll_acp()` (`src/core/engine/acp_ops.rs`) — the one `poll_idle` call site; today only handles `AgentExited` (clears `acp_client`, sets `self.message`)
+### Test fixture
+`tests/fixtures/fake_acp_agent.sh` — deterministic `/bin/sh` NDJSON echo agent (no
+jq/python/node) shared by the whole ACP track; drives initialize -> session/new ->
+session/prompt -> `stopReason: end_turn`, including a scripted mid-turn agent->client request
+that blocks until answered out of band.
+
 ## settings.rs — 2,206 lines
 User settings with serde JSON persistence.
 ### Types
